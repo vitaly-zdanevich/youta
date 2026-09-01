@@ -1289,21 +1289,17 @@ mod tests {
     }
 
     #[test]
-    fn dropping_server_closes_its_listener() {
+    fn dropping_server_signals_and_joins_its_listener_thread() {
         let directory = canonical_tempdir("lan-drop");
         let audio = directory.path().join("episode.opus");
         fs::write(&audio, b"audio").expect("write audio");
         let server = LanShareServer::start(prepare_file_share(&audio).expect("prepare file"))
             .expect("start server");
-        let address = server
-            .url()
-            .strip_prefix("http://")
-            .and_then(|url| url.split('/').next())
-            .expect("server authority")
-            .to_owned();
+        let listener_stop = Arc::clone(&server.stop);
         drop(server);
 
-        assert!(TcpStream::connect(address).is_err());
+        assert!(listener_stop.load(Ordering::Acquire));
+        assert_eq!(Arc::strong_count(&listener_stop), 1);
     }
 
     fn request(address: &str, request: &str) -> String {

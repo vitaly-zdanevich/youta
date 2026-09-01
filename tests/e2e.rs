@@ -77,7 +77,8 @@ fn wait_for_text_file(path: &std::path::Path, expected: &str, label: &str) {
     }
 }
 
-/// Runs one deterministic key sequence against Youta in a pseudo-terminal.
+/// Runs one deterministic key sequence after the pseudo-terminal renders its
+/// caller-selected readiness marker.
 #[cfg(all(target_os = "linux", feature = "tui"))]
 fn run_tui_session(
     launcher: &std::path::Path,
@@ -87,6 +88,7 @@ fn run_tui_session(
     transcript: &std::path::Path,
     opened_links: &std::path::Path,
     subscriptions_layout_override: Option<&str>,
+    readiness_text: &str,
     inputs: &[(&[u8], u64)],
 ) -> std::process::Output {
     use std::io::Write as _;
@@ -126,9 +128,9 @@ fn run_tui_session(
         command.env("YOUTA_UI__SUBSCRIPTIONS_LAYOUT", layout);
     }
     let mut child = command.spawn().expect("launch Youta in a pseudo-terminal");
+    wait_for_text_file(transcript, readiness_text, "terminal transcript");
     {
         let input = child.stdin.as_mut().expect("pseudo-terminal input");
-        thread::sleep(Duration::from_millis(500));
         for (bytes, delay_millis) in inputs {
             input.write_all(bytes).expect("write pseudo-terminal input");
             input.flush().expect("flush pseudo-terminal input");
@@ -490,6 +492,7 @@ fn tui_subscriptions_openers_and_preferences_persist_end_to_end() {
         &first_transcript,
         &opened_links,
         None,
+        "Video search",
         &[
             (b"S", 300),
             // Both opener hotkeys must be accepted while the first helper is
@@ -560,6 +563,7 @@ fn tui_subscriptions_openers_and_preferences_persist_end_to_end() {
         &locked_transcript,
         &opened_links,
         Some("drill-down"),
+        "Sources",
         &[
             (b"p", 300),
             (b"s", 200),
@@ -844,6 +848,7 @@ fn tui_history_enter_reports_a_removed_local_file_without_deleting_history() {
         &transcript,
         &opened_links,
         None,
+        "Removed History fixture",
         &[(b"\r", 700), (b"\x1b", 200), (b"q", 200)],
     );
 
