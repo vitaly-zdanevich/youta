@@ -358,43 +358,48 @@ jobs:
   desktop-linux-i686:
     name: Desktop window (Linux i686)
     runs-on: ubuntu-24.04
-    # Debian publishes the complete i386 WebKitGTK dependency graph; the
-    # hosted Ubuntu image currently does not publish GLib's i386 build tools.
-    container: rust:1.95.0-bookworm
+    # Jammy publishes matching i386 WebKitGTK and GLib development tools. Use
+    # it as a container so this job does not depend on the Jammy runner label.
+    container: ubuntu:22.04
     timeout-minutes: 360
     env:
+      CARGO_HOME: /usr/local/cargo
+      RUSTUP_HOME: /usr/local/rustup
       PKG_CONFIG_ALLOW_CROSS: '1'
       PKG_CONFIG_LIBDIR: /usr/lib/i386-linux-gnu/pkgconfig:/usr/share/pkgconfig
       CARGO_TARGET_I686_UNKNOWN_LINUX_GNU_LINKER: gcc
       CARGO_TARGET_I686_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-m32
     steps:
-      - name: Check out sources
-        uses: actions/checkout@v6
-
-      - name: Install the minimum Rust toolchain
-        run: |
-          rustup toolchain install "${RUST_VERSION}" --profile minimal
-          rustup default "${RUST_VERSION}"
-          rustup target add i686-unknown-linux-gnu
-
       - name: Install the Linux i686 desktop toolchain
         run: |
           dpkg --add-architecture i386
           apt-get update
           apt-get install --yes --no-install-recommends \
+            ca-certificates \
+            curl \
+            file \
             gcc-multilib \
+            git \
             libc6-dev:i386 \
             libwebkit2gtk-4.1-dev:i386 \
             libgtk-3-dev:i386 \
-            libdbus-1-dev:i386 \
-            file
+            libdbus-1-dev:i386
+
+      - name: Check out sources
+        uses: actions/checkout@v6
+
+      - name: Install the minimum Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 --silent --show-error --fail https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain "${RUST_VERSION}" --target i686-unknown-linux-gnu
+          echo "${CARGO_HOME}/bin" >> "${GITHUB_PATH}"
 
       - name: Restore Cargo registry cache
         uses: actions/cache@v5
         with:
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
+            /usr/local/cargo/registry
+            /usr/local/cargo/git
           key: desktop-linux-i686-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
 
       - name: Build the unbundled Linux i686 GUI executable

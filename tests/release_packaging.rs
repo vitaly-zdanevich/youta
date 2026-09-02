@@ -1144,12 +1144,12 @@ fn the_desktop_window_ships_one_bundle_contract_across_every_file_that_states_it
     assert!(readme.contains("standalone GUI executable"));
 }
 
-/// The hosted Ubuntu image carries native development packages that can make
-/// APT's i386 dependency solver request unpublished Ubuntu helper binaries.
-/// Keep the 32-bit WebKitGTK build in Debian's complete multilib archive and
-/// lock its container toolchain to the workflow's declared Rust version.
+/// Ubuntu 24.04 does not publish every matching i386 GLib helper, while Debian
+/// Bookworm's WebKitGTK development graph requests an uninstallable i386
+/// Python toolchain. Keep this cross-build in an isolated Jammy container,
+/// whose archive publishes the complete matching i386 dependency graph.
 #[test]
-fn i686_desktop_jobs_use_the_complete_debian_multilib_archive() {
+fn i686_desktop_jobs_use_the_complete_jammy_multilib_archive() {
     for (path, job_start, job_end) in [
         (
             ".github/workflows/ci.yml",
@@ -1163,10 +1163,6 @@ fn i686_desktop_jobs_use_the_complete_debian_multilib_archive() {
         ),
     ] {
         let workflow = read_repository_file(path);
-        let rust_version = workflow
-            .lines()
-            .find_map(|line| line.strip_prefix("  RUST_VERSION: "))
-            .expect("the workflow pins its Rust version");
         let job = workflow
             .split_once(job_start)
             .unwrap_or_else(|| panic!("{path} retains its i686 desktop job"))
@@ -1176,16 +1172,21 @@ fn i686_desktop_jobs_use_the_complete_debian_multilib_archive() {
             .0;
 
         assert!(
-            job.contains(&format!("container: rust:{rust_version}-bookworm")),
-            "{path} must isolate i686 GUI packages from the hosted Ubuntu image"
+            job.contains("container: ubuntu:22.04"),
+            "{path} must use Jammy's complete i386 GUI package set"
         );
         assert!(job.contains("dpkg --add-architecture i386"));
         assert!(job.contains("apt-get install --yes --no-install-recommends"));
+        assert!(job.contains("ca-certificates"));
+        assert!(job.contains("curl"));
         assert!(job.contains("libwebkit2gtk-4.1-dev:i386"));
         assert!(job.contains("file"));
+        assert!(job.contains("https://sh.rustup.rs"));
+        assert!(job.contains("--default-toolchain \"${RUST_VERSION}\""));
+        assert!(job.contains("--target i686-unknown-linux-gnu"));
         assert!(
             !job.contains("sudo "),
-            "the pinned container runs as root and should not require sudo"
+            "the Jammy container runs as root and should not require sudo"
         );
     }
 }
