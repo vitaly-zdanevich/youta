@@ -258,6 +258,14 @@ export function ChannelDownloadPopup({ popup }: { popup: ChannelDownloadPopupVie
 					Youta currently downloads audio only. Videos, Shorts, and live uploads are included;
 					existing archive entries are skipped.
 				</p>
+				<label className='mt-4 flex cursor-pointer items-center gap-2 text-ink'>
+					<input
+						type='checkbox'
+						checked={popup.ignore_items_before}
+						onChange={() => void dispatch('ToggleChannelDownloadIgnoreBefore')}
+					/>
+					Ignore items before this item
+				</label>
 			</Body>
 		</Popup>
 	);

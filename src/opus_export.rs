@@ -157,6 +157,7 @@ fn prepare_public_page_opus(
             destination: staging_directory.to_owned(),
             format: DownloadFormat::TranscodeToOpus,
             scope: DownloadScope::SingleItem,
+            playlist_start: None,
             write_thumbnail: false,
         })
         .map_err(|error| format!("Could not start yt-dlp audio preparation: {error}"))?;

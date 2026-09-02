@@ -3113,6 +3113,8 @@ struct ChannelDownloadSelection {
     destination: PathBuf,
     format: DownloadFormat,
     estimated_video_count: Option<u64>,
+    /// One-based provider-order position of the selected channel item.
+    playlist_start: u64,
 }
 
 /// Exact local or YouTube boundary retained outside the serialized popup.
@@ -19085,12 +19087,19 @@ impl AppController {
             .filter(|count| *count > 0);
         let estimated_video_count = provider_count.or(loaded_count);
         let estimate_is_lower_bound = provider_count.is_none() && loaded_count.is_some();
+        let playlist_start = u64::try_from(
+            self.selected_subscription_cache_index()
+                .unwrap_or(self.view.subscriptions.selected_item),
+        )
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
         self.channel_download_selection = Some(ChannelDownloadSelection {
             channel_name: channel_name.clone(),
             source_url,
             destination: destination.clone(),
             format,
             estimated_video_count,
+            playlist_start,
         });
         self.view.channel_download_popup = Some(ChannelDownloadPopupView {
             channel_name,
@@ -19098,6 +19107,7 @@ impl AppController {
             estimate_is_lower_bound,
             available_space_bytes,
             destination: destination.display().to_string(),
+            ignore_items_before: false,
         });
         self.view.help_open = false;
         self.view.status_line = "Review the full-channel audio download".to_owned();
@@ -19114,6 +19124,21 @@ impl AppController {
                 "One download is already running; wait for it to finish or cancel it".to_owned();
             return;
         }
+        let ignore_items_before = self
+            .view
+            .channel_download_popup
+            .as_ref()
+            .is_some_and(|popup| popup.ignore_items_before);
+        let playlist_start = ignore_items_before.then_some(selection.playlist_start);
+        let estimated_video_count = selection.estimated_video_count.map(|count| {
+            if ignore_items_before {
+                count
+                    .saturating_sub(selection.playlist_start.saturating_sub(1))
+                    .max(1)
+            } else {
+                count
+            }
+        });
         clear_download_completion_notice(
             &mut self.view,
             &mut self.download_completion_notice_deadline,
@@ -19123,6 +19148,7 @@ impl AppController {
             destination: selection.destination.clone(),
             format: selection.format,
             scope: DownloadScope::Collection,
+            playlist_start,
             write_thumbnail: self.config.subscriptions.download_thumbnails,
         };
         let process = match self.download_launcher.start(&request) {
@@ -19136,7 +19162,7 @@ impl AppController {
             selection.channel_name.clone(),
             selection.destination,
             true,
-            selection.estimated_video_count,
+            estimated_video_count,
             process,
         ) {
             Ok(active) => active,
@@ -19147,18 +19173,33 @@ impl AppController {
         };
         self.view.download = Some(DownloadView {
             title: selection.channel_name.clone(),
-            total_files: selection.estimated_video_count,
+            total_files: estimated_video_count,
             collection: true,
             active: true,
             ..DownloadView::default()
         });
         self.view.channel_download_popup = None;
         self.channel_download_selection = None;
-        self.view.status_line = format!(
-            "Downloading every public upload from {} as audio",
-            selection.channel_name
-        );
+        self.view.status_line = if ignore_items_before {
+            format!(
+                "Downloading public uploads from {} starting with the selected item",
+                selection.channel_name
+            )
+        } else {
+            format!(
+                "Downloading every public upload from {} as audio",
+                selection.channel_name
+            )
+        };
         self.active_download = Some(active);
+    }
+
+    /// Toggles the inclusive selected-item boundary in channel-download review.
+    #[cfg(feature = "yt-dlp")]
+    fn toggle_channel_download_ignore_before(&mut self) {
+        if let Some(popup) = self.view.channel_download_popup.as_mut() {
+            popup.ignore_items_before = !popup.ignore_items_before;
+        }
     }
 
     #[cfg(feature = "yt-dlp")]
@@ -19245,6 +19286,7 @@ impl AppController {
             destination: destination.clone(),
             format,
             scope: DownloadScope::SingleItem,
+            playlist_start: None,
             write_thumbnail: self.config.subscriptions.download_thumbnails,
         };
         let process = match self.download_launcher.start(&request) {
@@ -33645,6 +33687,10 @@ impl UiController for AppController {
             UiAction::OpenChannelDownload => self.open_channel_download(),
             #[cfg(feature = "yt-dlp")]
             UiAction::ConfirmChannelDownload => self.confirm_channel_download(),
+            #[cfg(feature = "yt-dlp")]
+            UiAction::ToggleChannelDownloadIgnoreBefore => {
+                self.toggle_channel_download_ignore_before();
+            }
             #[cfg(feature = "yt-dlp")]
             UiAction::DismissChannelDownload => self.dismiss_channel_download(),
             #[cfg(feature = "yt-dlp")]
@@ -70492,6 +70538,26 @@ mod tests {
         controller.view.screen = Screen::Subscriptions;
         controller.view.subscriptions.source_kind = SubscriptionKind::YouTube;
         controller.view.subscriptions.source_video_count = Some(412);
+        controller.config.ui.show_youtube_shorts = false;
+        controller.active_subscription_channel_id = Some("UCfixture".to_owned());
+        let mut hidden_short_item = indexed_subscription_video(1);
+        let SearchItem::Video(hidden_short) = &mut hidden_short_item else {
+            panic!("fixture must be a video");
+        };
+        hidden_short.orientation = VideoOrientation::Vertical;
+        controller.subscription_video_cache.insert(
+            "UCfixture".to_owned(),
+            CachedSubscriptionVideos {
+                items: vec![
+                    indexed_subscription_video(0),
+                    hidden_short_item,
+                    indexed_subscription_video(2),
+                ],
+                ..CachedSubscriptionVideos::default()
+            },
+        );
+        controller.refresh_subscription_video_rows();
+        controller.view.subscriptions.selected_item = 1;
         controller.view.details = Some(DetailView {
             title: "Fixture upload".to_owned(),
             channel_name: "Fixture channel".to_owned(),
@@ -70511,9 +70577,18 @@ mod tests {
         assert_eq!(popup.channel_name, "Fixture channel");
         assert_eq!(popup.estimated_video_count, Some(412));
         assert!(!popup.estimate_is_lower_bound);
+        assert!(!popup.ignore_items_before);
         assert!(popup.destination.ends_with("downloads"));
         assert!(requests.lock().expect("download requests").is_empty());
 
+        controller.dispatch(UiAction::ToggleChannelDownloadIgnoreBefore);
+        assert!(
+            controller
+                .view
+                .channel_download_popup
+                .as_ref()
+                .is_some_and(|popup| popup.ignore_items_before)
+        );
         controller.dispatch(UiAction::ConfirmChannelDownload);
 
         let request = requests
@@ -70523,6 +70598,7 @@ mod tests {
             .cloned()
             .expect("one reviewed request");
         assert_eq!(request.scope, DownloadScope::Collection);
+        assert_eq!(request.playlist_start, Some(3));
         assert_eq!(
             request.source_url.as_str(),
             "https://www.youtube.com/channel/UCfixture"
@@ -70530,7 +70606,7 @@ mod tests {
         let download = controller.view.download.as_ref().expect("active download");
         assert!(download.active);
         assert!(download.collection);
-        assert_eq!(download.total_files, Some(412));
+        assert_eq!(download.total_files, Some(410));
         assert!(controller.view.channel_download_popup.is_none());
 
         for _ in 0..100 {
@@ -70549,7 +70625,7 @@ mod tests {
         assert_eq!(download.current_file, Some(3));
         assert_eq!(
             download.total_files,
-            Some(412),
+            Some(410),
             "a nested yt-dlp playlist count must not replace the larger channel estimate"
         );
 

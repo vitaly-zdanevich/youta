@@ -156,6 +156,8 @@ pub struct DownloadRequest {
     pub format: DownloadFormat,
     /// Whether yt-dlp may traverse a collection URL.
     pub scope: DownloadScope,
+    /// One-based first collection entry, or every entry when absent.
+    pub playlist_start: Option<u64>,
     /// Download the provider thumbnail alongside the audio.
     pub write_thumbnail: bool,
 }
@@ -647,6 +649,11 @@ fn build_download_command(config: &YtDlpConfig, request: &DownloadRequest) -> Co
                 .arg("--yes-playlist")
                 .arg("--download-archive")
                 .arg(request.destination.join(".youta-download-archive"));
+            if let Some(playlist_start) = request.playlist_start {
+                command
+                    .arg("--playlist-start")
+                    .arg(playlist_start.to_string());
+            }
         }
     }
 
@@ -833,6 +840,7 @@ mod tests {
             destination: PathBuf::from("/tmp/youta-fixture-downloads"),
             format: DownloadFormat::OpusWithoutTranscoding,
             scope: DownloadScope::SingleItem,
+            playlist_start: None,
             write_thumbnail: true,
         };
         let command = build_download_command(&config, &request);
@@ -853,6 +861,11 @@ mod tests {
                 .any(|pair| { pair[0] == "--paths" && pair[1] == "/tmp/youta-fixture-downloads" })
         );
         assert!(arguments.iter().any(|argument| argument == "--no-playlist"));
+        assert!(
+            !arguments
+                .iter()
+                .any(|argument| argument == "--playlist-start")
+        );
         assert!(
             arguments
                 .iter()
@@ -930,6 +943,7 @@ mod tests {
             destination: PathBuf::from("/tmp/youta-fixture-downloads"),
             format: DownloadFormat::OpusWithoutTranscoding,
             scope: DownloadScope::Collection,
+            playlist_start: Some(17),
             write_thumbnail: true,
         };
         let command = build_download_command(&config, &request);
@@ -948,6 +962,11 @@ mod tests {
             pair[0] == "--download-archive"
                 && pair[1] == "/tmp/youta-fixture-downloads/.youta-download-archive"
         }));
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair[0] == "--playlist-start" && pair[1] == "17")
+        );
         assert!(arguments.windows(2).any(|pair| {
             pair[0] == "--output" && pair[1].starts_with("%(channel).100B [%(channel_id)s]/")
         }));

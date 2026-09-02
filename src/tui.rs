@@ -10889,7 +10889,7 @@ fn render_channel_download_popup(
     let wrapped = wrap_text_lines(&message, message_width);
     let message_height = u16::try_from(wrapped.len()).unwrap_or(u16::MAX);
     let height = message_height
-        .saturating_add(5)
+        .saturating_add(6)
         .clamp(1, frame.area().height.saturating_sub(2).max(1));
     let area = centered_sized_rect(width, height, frame.area());
     frame.render_widget(Clear, area);
@@ -10901,13 +10901,35 @@ fn render_channel_download_popup(
     if inner.is_empty() {
         return;
     }
-    let sections = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
+    let sections = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .split(inner);
     frame.render_widget(
         Paragraph::new(wrapped.join("\n"))
             .style(theme.base)
             .wrap(Wrap { trim: false }),
         sections[0],
     );
+    let checkbox = format!(
+        "[{}] Ignore items before this item",
+        if popup.ignore_items_before { 'x' } else { ' ' }
+    );
+    frame.render_widget(
+        Paragraph::new(checkbox.as_str()).style(theme.accent),
+        sections[1],
+    );
+    hit_map.channel_download_buttons.push((
+        UiAction::ToggleChannelDownloadIgnoreBefore,
+        Rect::new(
+            sections[1].x,
+            sections[1].y,
+            terminal_text_width(&checkbox).min(sections[1].width),
+            1,
+        ),
+    ));
     let confirm_label = "[Enter] Download";
     let cancel_label = "[Esc] Cancel";
     let controls = format!("{confirm_label}   {cancel_label}");
@@ -10915,12 +10937,12 @@ fn render_channel_download_popup(
         Paragraph::new(controls.as_str())
             .alignment(Alignment::Center)
             .style(theme.accent),
-        sections[1],
+        sections[2],
     );
-    let start = centered_line_x(sections[1], terminal_text_width(&controls));
+    let start = centered_line_x(sections[2], terminal_text_width(&controls));
     hit_map.channel_download_buttons.push((
         UiAction::ConfirmChannelDownload,
-        Rect::new(start, sections[1].y, terminal_text_width(confirm_label), 1),
+        Rect::new(start, sections[2].y, terminal_text_width(confirm_label), 1),
     ));
     hit_map.channel_download_buttons.push((
         UiAction::DismissChannelDownload,
@@ -10928,7 +10950,7 @@ fn render_channel_download_popup(
             start
                 .saturating_add(terminal_text_width(confirm_label))
                 .saturating_add(3),
-            sections[1].y,
+            sections[2].y,
             terminal_text_width(cancel_label),
             1,
         ),
@@ -20185,6 +20207,7 @@ mod tests {
                 estimate_is_lower_bound: false,
                 available_space_bytes: 24 * 1024 * 1024 * 1024,
                 destination: "/home/listener/.config/youta/downloads".to_owned(),
+                ignore_items_before: false,
             }),
             ..ViewModel::default()
         };
@@ -20199,8 +20222,13 @@ mod tests {
         assert!(rendered.contains("Estimated videos: about 412 public uploads"));
         assert!(rendered.contains("Free space remaining: 24.0 GiB"));
         assert!(rendered.contains("videos, Shorts, and live uploads"));
+        assert!(rendered.contains("[ ] Ignore items before this item"));
         assert!(rendered.contains("[Enter] Download"));
         assert!(rendered.contains("[Esc] Cancel"));
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &view),
+            Some(UiAction::ToggleChannelDownloadIgnoreBefore)
+        );
         assert_eq!(
             key_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &view),
             Some(UiAction::ConfirmChannelDownload)
@@ -20228,6 +20256,26 @@ mod tests {
                 &view,
             ),
             Some(UiAction::ConfirmChannelDownload)
+        );
+        let checkbox_area = hit_map
+            .channel_download_buttons
+            .iter()
+            .find_map(|(action, area)| {
+                (action == &UiAction::ToggleChannelDownloadIgnoreBefore).then_some(*area)
+            })
+            .expect("boundary checkbox mouse target");
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: checkbox_area.x,
+                    row: checkbox_area.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            Some(UiAction::ToggleChannelDownloadIgnoreBefore)
         );
     }
 

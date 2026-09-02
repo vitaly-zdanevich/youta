@@ -1766,7 +1766,9 @@ On a subscribed YouTube channel, `[D] Download full channel` opens a review
 popup before starting anything. It shows the provider's estimated video count
 when available, marks a loaded-row count as a lower bound when necessary,
 shows the exact destination and currently available disk space, and uses the
-configured audio download format. Confirmation starts one supervised `yt-dlp`
+configured audio download format. Its default-off **Ignore items before this
+item** checkbox starts with the currently selected video, using the complete
+provider order even when Shorts are hidden. Confirmation starts one supervised `yt-dlp`
 collection download with per-file and aggregate progress, speed, ETA, completed
 file count, and cancellation. It downloads public uploads as audio and can
 write each provider thumbnail beside its audio file.

@@ -462,6 +462,7 @@ fn the_typescript_contract_names_only_fields_the_reducer_emits() {
             estimate_is_lower_bound: false,
             available_space_bytes: 0,
             destination: String::new(),
+            ignore_items_before: false,
         }),
     );
     #[cfg(feature = "commons-upload")]
@@ -664,6 +665,8 @@ fn the_window_reviews_and_can_cancel_a_full_channel_download() {
     for required in [
         "Estimated videos",
         "Free space remaining",
+        "Ignore items before this item",
+        "ToggleChannelDownloadIgnoreBefore",
         "dispatch(\"ConfirmChannelDownload\")",
         "dispatch(\"DismissChannelDownload\")",
     ] {

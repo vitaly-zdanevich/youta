@@ -2063,6 +2063,8 @@ pub struct ChannelDownloadPopupView {
     pub available_space_bytes: u64,
     /// Exact Youta-owned destination directory.
     pub destination: String,
+    /// Whether yt-dlp should start at the currently selected channel item.
+    pub ignore_items_before: bool,
 }
 
 /// A live Radio stream capture that remains private until it is finalized.
@@ -2801,6 +2803,9 @@ pub enum UiAction {
     /// Start the reviewed full-channel audio download.
     #[cfg(feature = "yt-dlp")]
     ConfirmChannelDownload,
+    /// Toggle the inclusive selected-item boundary for a channel download.
+    #[cfg(feature = "yt-dlp")]
+    ToggleChannelDownloadIgnoreBefore,
     /// Close the full-channel confirmation without starting it.
     #[cfg(feature = "yt-dlp")]
     DismissChannelDownload,

@@ -608,6 +608,7 @@ export interface ChannelDownloadPopupView {
 	estimate_is_lower_bound: boolean;
 	available_space_bytes: number;
 	destination: string;
+	ignore_items_before: boolean;
 }
 
 /** Free license selected for a Wikimedia Commons upload. */

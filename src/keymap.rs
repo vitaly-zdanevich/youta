@@ -1332,6 +1332,7 @@ fn unfiltered_key_action(
     #[cfg(feature = "yt-dlp")]
     if view.channel_download_popup.is_some() {
         return match key.key {
+            Key::Char(' ') => Some(UiAction::ToggleChannelDownloadIgnoreBefore),
             Key::Enter => Some(UiAction::ConfirmChannelDownload),
             Key::Esc => Some(UiAction::DismissChannelDownload),
             _ => None,
