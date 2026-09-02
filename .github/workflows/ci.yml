@@ -388,6 +388,11 @@ jobs:
       - name: Check out sources
         uses: actions/checkout@v6
 
+      - name: Install Node for the window page
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+
       - name: Install the minimum Rust toolchain
         run: |
           curl --proto '=https' --tlsv1.2 --silent --show-error --fail https://sh.rustup.rs \

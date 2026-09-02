@@ -1184,6 +1184,8 @@ fn i686_desktop_jobs_use_the_complete_jammy_multilib_archive() {
         assert!(job.contains("https://sh.rustup.rs"));
         assert!(job.contains("--default-toolchain \"${RUST_VERSION}\""));
         assert!(job.contains("--target i686-unknown-linux-gnu"));
+        assert!(job.contains("uses: actions/setup-node@v6"));
+        assert!(job.contains("node-version: '22'"));
         assert!(
             !job.contains("sudo "),
             "the Jammy container runs as root and should not require sudo"
