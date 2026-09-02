@@ -1144,6 +1144,52 @@ fn the_desktop_window_ships_one_bundle_contract_across_every_file_that_states_it
     assert!(readme.contains("standalone GUI executable"));
 }
 
+/// The hosted Ubuntu image carries native development packages that can make
+/// APT's i386 dependency solver request unpublished Ubuntu helper binaries.
+/// Keep the 32-bit WebKitGTK build in Debian's complete multilib archive and
+/// lock its container toolchain to the workflow's declared Rust version.
+#[test]
+fn i686_desktop_jobs_use_the_complete_debian_multilib_archive() {
+    for (path, job_start, job_end) in [
+        (
+            ".github/workflows/ci.yml",
+            "  desktop-linux-i686:\n",
+            "\n  windows-compile:\n",
+        ),
+        (
+            ".github/workflows/release.yml",
+            "  desktop-i686:\n",
+            "\n  vendor:\n",
+        ),
+    ] {
+        let workflow = read_repository_file(path);
+        let rust_version = workflow
+            .lines()
+            .find_map(|line| line.strip_prefix("  RUST_VERSION: "))
+            .expect("the workflow pins its Rust version");
+        let job = workflow
+            .split_once(job_start)
+            .unwrap_or_else(|| panic!("{path} retains its i686 desktop job"))
+            .1
+            .split_once(job_end)
+            .unwrap_or_else(|| panic!("{path} keeps the i686 job boundary"))
+            .0;
+
+        assert!(
+            job.contains(&format!("container: rust:{rust_version}-bookworm")),
+            "{path} must isolate i686 GUI packages from the hosted Ubuntu image"
+        );
+        assert!(job.contains("dpkg --add-architecture i386"));
+        assert!(job.contains("apt-get install --yes --no-install-recommends"));
+        assert!(job.contains("libwebkit2gtk-4.1-dev:i386"));
+        assert!(job.contains("file"));
+        assert!(
+            !job.contains("sudo "),
+            "the pinned container runs as root and should not require sudo"
+        );
+    }
+}
+
 #[test]
 fn readme_displays_the_canonical_desktop_icon_below_its_badges() {
     let readme = read_repository_file("README.md");
