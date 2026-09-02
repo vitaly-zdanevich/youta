@@ -51557,6 +51557,7 @@ mod tests {
                 id: "UCfixture".to_owned(),
                 title: "Fixture channel".to_owned(),
                 extractor: Some("YoutubeTab".to_owned()),
+                thumbnail_url: None,
                 entries: vec![crate::playback::ytdlp::CollectionEntry {
                     id: "dQw4w9WgXcQ".to_owned(),
                     title: "Fixture episode".to_owned(),

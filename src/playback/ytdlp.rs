@@ -94,6 +94,8 @@ pub struct ExtractedCollection {
     pub title: String,
     /// Extractor that handled the URL.
     pub extractor: Option<String>,
+    /// Collection artwork, preferring a square channel avatar when available.
+    pub thumbnail_url: Option<Url>,
     /// Flat entries in provider order.
     pub entries: Vec<CollectionEntry>,
 }
@@ -472,6 +474,10 @@ struct ExtractedCollectionJson {
     #[serde(default)]
     extractor_key: Option<String>,
     #[serde(default)]
+    thumbnail: Option<String>,
+    #[serde(default)]
+    thumbnails: Vec<ExtractedThumbnailJson>,
+    #[serde(default)]
     entries: Vec<ExtractedCollectionEntryJson>,
 }
 
@@ -498,12 +504,19 @@ struct ExtractedCollectionEntryJson {
 #[derive(Debug, Deserialize)]
 struct ExtractedThumbnailJson {
     url: String,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    width: Option<u32>,
+    #[serde(default)]
+    height: Option<u32>,
 }
 
 impl TryFrom<ExtractedCollectionJson> for ExtractedCollection {
     type Error = PlaybackError;
 
     fn try_from(value: ExtractedCollectionJson) -> Result<Self> {
+        let thumbnail_url = preferred_collection_thumbnail(value.thumbnail, value.thumbnails);
         let mut entries = Vec::new();
         let mut pending = VecDeque::from(value.entries);
         while let Some(entry) = pending.pop_front() {
@@ -548,9 +561,47 @@ impl TryFrom<ExtractedCollectionJson> for ExtractedCollection {
             id: value.id,
             title: value.title,
             extractor: value.extractor_key.or(value.extractor),
+            thumbnail_url,
             entries,
         })
     }
+}
+
+/// Selects a collection cover without mistaking a wide channel banner for an
+/// avatar when yt-dlp exposes both kinds in one thumbnail list.
+fn preferred_collection_thumbnail(
+    thumbnail: Option<String>,
+    thumbnails: Vec<ExtractedThumbnailJson>,
+) -> Option<Url> {
+    thumbnails
+        .into_iter()
+        .filter_map(|candidate| {
+            let url = Url::parse(&candidate.url)
+                .ok()
+                .filter(|url| matches!(url.scheme(), "http" | "https"))?;
+            let named_avatar = candidate
+                .id
+                .as_deref()
+                .is_some_and(|id| id.to_ascii_lowercase().contains("avatar"));
+            let square = candidate
+                .width
+                .zip(candidate.height)
+                .is_some_and(|(width, height)| width == height);
+            let known_area = candidate
+                .width
+                .zip(candidate.height)
+                .map_or(0, |(width, height)| u64::from(width) * u64::from(height));
+            Some(((named_avatar || square, square, known_area), url))
+        })
+        .max_by_key(|(preference, _)| *preference)
+        .map(|(_, url)| url)
+        .or_else(|| {
+            thumbnail.and_then(|raw| {
+                Url::parse(&raw)
+                    .ok()
+                    .filter(|url| matches!(url.scheme(), "http" | "https"))
+            })
+        })
 }
 
 fn build_base_command(config: &YtDlpConfig) -> Command {
@@ -951,6 +1002,10 @@ mod tests {
 			"id": "collection-1",
 			"title": "Mock channel",
 			"extractor_key": "PeerTubePlaylist",
+			"thumbnails": [
+				{"url": "https://images.example/banner.jpg", "width": 1280, "height": 240},
+				{"url": "https://images.example/avatar.jpg", "width": 900, "height": 900}
+			],
 			"entries": [
 				{
 					"id": "entry-1",
@@ -966,6 +1021,10 @@ mod tests {
 
         assert_eq!(collection.title, "Mock channel");
         assert_eq!(collection.entries.len(), 1);
+        assert_eq!(
+            collection.thumbnail_url.as_ref().map(Url::as_str),
+            Some("https://images.example/avatar.jpg")
+        );
         assert_eq!(collection.entries[0].duration_seconds, Some(90));
         assert_eq!(
             collection.entries[0]

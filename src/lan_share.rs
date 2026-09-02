@@ -36,6 +36,7 @@ const MAX_REQUEST_HEADER_BYTES: usize = 64 * 1024;
 const IO_POLL: Duration = Duration::from_millis(100);
 const REMOTE_SETUP_TIMEOUT: Duration = Duration::from_secs(20);
 const REMOTE_RESOLUTION_CACHE_TTL: Duration = Duration::from_mins(30);
+const MAX_REMOTE_RESUME_ATTEMPTS: usize = 4;
 const YOUTUBE_PODCAST_AUDIO_FORMAT: &str = "bestaudio[ext=webm]";
 const YOUTUBE_PODCAST_MIME: &str = "audio/webm";
 
@@ -53,6 +54,7 @@ pub enum LanShareKind {
 pub struct PreparedLocalShare {
     kind: LanShareKind,
     title: String,
+    feed_artwork_route: Option<String>,
     files: Vec<SharedFile>,
     artwork: Vec<SharedArtwork>,
     remote_config: Option<YouTubePrewarmConfig>,
@@ -291,6 +293,11 @@ fn prepare_local_share(
             LanShareKind::Files
         },
         title,
+        feed_artwork_route: if podcast {
+            files.iter().find_map(|file| file.artwork_route.clone())
+        } else {
+            None
+        },
         files,
         artwork,
         remote_config: None,
@@ -383,10 +390,21 @@ fn prepare_youtube_podcast_share_with_boundary(
     let title = if collection.title.trim().is_empty() {
         "YouTube channel".to_owned()
     } else {
-        collection.title
+        std::mem::take(&mut collection.title)
     };
     let mut files = Vec::new();
     let mut artwork = Vec::new();
+    let mut feed_artwork_route = collection.thumbnail_url.take().map(|thumbnail_url| {
+        let route = "/artwork/0".to_owned();
+        artwork.push(SharedArtwork {
+            mime: "image/jpeg",
+            source: SharedArtworkSource::YouTube {
+                media_index: 0,
+                initial_url: Some(thumbnail_url),
+            },
+        });
+        route
+    });
     for entry in collection.entries {
         if validate_youtube_video_id(&entry.id).is_err() {
             continue;
@@ -409,7 +427,7 @@ fn prepare_youtube_podcast_share_with_boundary(
             "/media/{index}/{}.webm",
             utf8_percent_encode(&entry.id, NON_ALPHANUMERIC)
         );
-        let artwork_route = format!("/artwork/{index}");
+        let artwork_route = format!("/artwork/{}", artwork.len());
         files.push(SharedFile {
             guid: format!("urn:youta:youtube:{}", entry.id),
             label,
@@ -443,6 +461,9 @@ fn prepare_youtube_podcast_share_with_boundary(
             "yt-dlp found no valid YouTube videos for the podcast feed",
         ));
     }
+    if feed_artwork_route.is_none() {
+        feed_artwork_route = files.iter().find_map(|file| file.artwork_route.clone());
+    }
     // A podcast enclosure must advertise a stable media type before the
     // signed stream exists. Prefer cookie-free embedded extraction and an
     // audio-only Opus/WebM representation rather than importing credentials.
@@ -451,6 +472,7 @@ fn prepare_youtube_podcast_share_with_boundary(
     Ok(PreparedLocalShare {
         kind: LanShareKind::Podcast,
         title,
+        feed_artwork_route,
         files,
         artwork,
         remote_config: Some(config),
@@ -540,6 +562,7 @@ enum SharedArtworkSource {
 struct ServerState {
     kind: LanShareKind,
     title: String,
+    feed_artwork_route: Option<String>,
     base_url: String,
     files: Vec<SharedFile>,
     artwork: Vec<SharedArtwork>,
@@ -570,6 +593,7 @@ impl ServerState {
         Self {
             kind: prepared.kind,
             title: prepared.title,
+            feed_artwork_route: prepared.feed_artwork_route,
             base_url,
             files: prepared.files,
             artwork: prepared.artwork,
@@ -579,6 +603,16 @@ impl ServerState {
 
     fn rss(&self) -> String {
         let title = escape_xml(&self.title);
+        let channel_link = escape_xml(&format!("{}/", self.base_url));
+        let channel_artwork = self.feed_artwork_route.as_ref().map_or_else(
+            String::new,
+            |route| {
+                let artwork_url = format!("{}{}", self.base_url, escape_xml(route));
+                format!(
+                    "\n<itunes:image href=\"{artwork_url}\"/>\n<image>\n<url>{artwork_url}</url>\n<title>{title}</title>\n<link>{channel_link}</link>\n</image>"
+                )
+            },
+        );
         let channel_description = if self.remote.is_some() {
             "YouTube audio resolved and shared by Youta while the application is running."
         } else {
@@ -624,8 +658,7 @@ impl ServerState {
 			.collect::<Vec<_>>()
 			.join("\n");
         format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<rss version=\"2.0\" xmlns:itunes=\"http://www.itunes.com/dtds/podcast-1.0.dtd\">\n<channel>\n<title>{title}</title>\n<link>{}</link>\n<description>{channel_description}</description>\n<language>und</language>\n{items}\n</channel>\n</rss>\n",
-            escape_xml(&format!("{}/", self.base_url)),
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<rss version=\"2.0\" xmlns:itunes=\"http://www.itunes.com/dtds/podcast-1.0.dtd\">\n<channel>\n<title>{title}</title>\n<link>{channel_link}</link>\n<description>{channel_description}</description>\n<language>und</language>{channel_artwork}\n{items}\n</channel>\n</rss>\n",
         )
     }
 
@@ -971,29 +1004,14 @@ fn proxy_remote_response(
     let Some(remote) = state.remote.as_ref() else {
         return write_text_response(stream, 502, "Bad Gateway", "Remote proxy unavailable", head);
     };
-    let mut request = remote
-        .agent
-        .get(url.as_str())
-        .header("Accept-Encoding", "identity");
-    for (name, value) in headers {
-        if proxy_request_header_allowed(name) {
-            request = request.header(*name, *value);
-        }
-    }
-    if let Some(range) = range {
-        request = request.header("Range", range);
-    }
-    let response = match request.call() {
-        Ok(response) => response,
-        Err(_) => {
-            return write_text_response(
-                stream,
-                502,
-                "Bad Gateway",
-                "Remote media request failed",
-                head,
-            );
-        }
+    let Ok(response) = request_remote_response(remote, url, headers, range) else {
+        return write_text_response(
+            stream,
+            502,
+            "Bad Gateway",
+            "Remote media request failed",
+            head,
+        );
     };
     let status = response.status().as_u16();
     let reason = if status == 206 {
@@ -1026,26 +1044,165 @@ fn proxy_remote_response(
     if let Some(content_length) = content_length {
         write!(stream, "Content-Length: {content_length}\r\n")?;
     }
-    if let Some(content_range) = content_range {
+    if let Some(content_range) = &content_range {
         write!(stream, "Content-Range: {content_range}\r\n")?;
     }
     write!(stream, "Connection: close\r\n\r\n")?;
     if head {
         return Ok(());
     }
-    let (_, body) = response.into_parts();
-    let mut reader = body.into_reader();
-    let mut buffer = [0_u8; 64 * 1024];
-    while !stop.load(Ordering::Acquire) {
-        let read = reader.read(&mut buffer).map_err(|_| {
-            io::Error::new(io::ErrorKind::ConnectionAborted, "remote media read failed")
-        })?;
-        if read == 0 {
-            break;
+    proxy_remote_body(
+        stream,
+        remote,
+        url,
+        headers,
+        response,
+        status,
+        content_range.as_deref(),
+        content_length,
+        stop,
+    )
+}
+
+/// Sends one upstream request while retaining only headers that yt-dlp may
+/// require for the signed media URL.
+fn request_remote_response(
+    remote: &RemoteRuntime,
+    url: &Url,
+    headers: &[(&str, &str)],
+    range: Option<&str>,
+) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
+    let mut request = remote
+        .agent
+        .get(url.as_str())
+        .header("Accept-Encoding", "identity");
+    for (name, value) in headers {
+        if proxy_request_header_allowed(name) {
+            request = request.header(*name, *value);
         }
-        write_media_bytes(stream, &buffer[..read], stop)?;
     }
-    Ok(())
+    if let Some(range) = range {
+        request = request.header("Range", range);
+    }
+    request.call()
+}
+
+/// Streams a remote body and resumes an interrupted response from its first
+/// missing byte before the advertised downstream length can be truncated.
+#[allow(clippy::too_many_arguments)]
+fn proxy_remote_body(
+    stream: &mut TcpStream,
+    remote: &RemoteRuntime,
+    url: &Url,
+    headers: &[(&str, &str)],
+    response: ureq::http::Response<ureq::Body>,
+    initial_status: u16,
+    initial_content_range: Option<&str>,
+    expected_length: Option<u64>,
+    stop: &AtomicBool,
+) -> io::Result<()> {
+    let absolute_start = if initial_status == 206 {
+        initial_content_range
+            .and_then(parse_content_range)
+            .map(|(start, _)| start)
+    } else {
+        Some(0)
+    };
+    let absolute_end = absolute_start
+        .zip(expected_length)
+        .and_then(|(start, length)| {
+            (length > 0).then(|| start.saturating_add(length.saturating_sub(1)))
+        });
+    let mut response = response;
+    let mut forwarded = 0_u64;
+    let mut resume_attempts = 0_usize;
+
+    loop {
+        let (_, body) = response.into_parts();
+        let mut reader = body.into_reader();
+        let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+        let mut read_error = None;
+        loop {
+            if stop.load(Ordering::Acquire) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "LAN media share stopped",
+                ));
+            }
+            let wanted = expected_length.map_or(buffer.len(), |length| {
+                usize::try_from(length.saturating_sub(forwarded).min(buffer.len() as u64))
+                    .unwrap_or(buffer.len())
+            });
+            if wanted == 0 {
+                return Ok(());
+            }
+            let read = match reader.read(&mut buffer[..wanted]) {
+                Ok(0) => break,
+                Ok(read) => read,
+                Err(error) => {
+                    read_error = Some(error);
+                    break;
+                }
+            };
+            write_media_bytes(stream, &buffer[..read], stop)?;
+            forwarded = forwarded.saturating_add(read as u64);
+        }
+
+        let Some(expected_length) = expected_length else {
+            return read_error.map_or(Ok(()), |error| {
+                Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    format!("remote media read failed: {error}"),
+                ))
+            });
+        };
+        if forwarded >= expected_length {
+            return Ok(());
+        }
+        let Some((absolute_start, absolute_end)) = absolute_start.zip(absolute_end) else {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "remote partial response ended before its advertised length",
+            ));
+        };
+        let resume_start = absolute_start.saturating_add(forwarded);
+        let resume_range = format!("bytes={resume_start}-{absolute_end}");
+        response = loop {
+            if resume_attempts >= MAX_REMOTE_RESUME_ATTEMPTS {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "remote media ended after {forwarded} of {expected_length} advertised bytes"
+                    ),
+                ));
+            }
+            resume_attempts += 1;
+            let Ok(candidate) =
+                request_remote_response(remote, url, headers, Some(resume_range.as_str()))
+            else {
+                continue;
+            };
+            let starts_at_missing_byte = candidate.status().as_u16() == 206
+                && candidate
+                    .headers()
+                    .get("content-range")
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(parse_content_range)
+                    .is_some_and(|(start, _)| start == resume_start);
+            if starts_at_missing_byte {
+                break candidate;
+            }
+        };
+    }
+}
+
+/// Parses the inclusive byte bounds from an HTTP `Content-Range` value.
+fn parse_content_range(value: &str) -> Option<(u64, u64)> {
+    let bounds = value.strip_prefix("bytes ")?.split_once('/')?.0;
+    let (start, end) = bounds.split_once('-')?;
+    let start = start.parse::<u64>().ok()?;
+    let end = end.parse::<u64>().ok()?;
+    (start <= end).then_some((start, end))
 }
 
 fn proxy_request_header_allowed(name: &str) -> bool {
@@ -1315,6 +1472,28 @@ mod tests {
     }
 
     #[test]
+    fn local_podcast_feed_publishes_item_artwork_as_the_channel_cover() {
+        let directory = canonical_tempdir("lan-podcast-cover");
+        fs::write(directory.path().join("episode.opus"), b"audio").expect("write audio");
+        fs::write(
+            directory.path().join("episode.png"),
+            b"\x89PNG\r\n\x1a\nfixture",
+        )
+        .expect("write sidecar cover");
+        let prepared = prepare_podcast_share(directory.path(), &directory.path().join("cache"))
+            .expect("prepare feed");
+        let mut state = ServerState::new(prepared, "http://192.0.2.10:8123".to_owned());
+        state.title = "Local fixture".to_owned();
+
+        let rss = state.rss();
+        assert!(rss.contains("<itunes:image href=\"http://192.0.2.10:8123/artwork/0\"/>"));
+        assert!(rss.contains(
+            "<image>\n<url>http://192.0.2.10:8123/artwork/0</url>\n<title>Local fixture</title>\n<link>http://192.0.2.10:8123/</link>\n</image>"
+        ));
+        assert_eq!(rss.matches("<itunes:image href=").count(), 2);
+    }
+
+    #[test]
     fn podcast_share_ignores_non_media_and_symlinks() {
         let directory = canonical_tempdir("lan-safe-scan");
         fs::write(directory.path().join("episode.opus"), b"audio").expect("write audio");
@@ -1365,6 +1544,10 @@ mod tests {
             id: "UCfixture".to_owned(),
             title: "Fixture channel".to_owned(),
             extractor: Some("YoutubeTab".to_owned()),
+            thumbnail_url: Some(
+                Url::parse("https://yt3.example/fixture-channel-avatar.jpg")
+                    .expect("channel avatar"),
+            ),
             entries: vec![
                 crate::playback::ytdlp::CollectionEntry {
                     id: "dQw4w9WgXcQ".to_owned(),
@@ -1388,10 +1571,10 @@ mod tests {
         let prepared = prepare_youtube_podcast_share(collection, YouTubePrewarmConfig::default())
             .expect("prepare YouTube feed");
         assert_eq!(prepared.files.len(), 2);
-        assert_eq!(prepared.artwork.len(), 2);
+        assert_eq!(prepared.artwork.len(), 3);
         assert!(prepared.files.iter().all(|file| file.length == 0));
         assert!(matches!(
-            &prepared.artwork[1].source,
+            &prepared.artwork[2].source,
             SharedArtworkSource::YouTube {
                 initial_url: Some(_),
                 ..
@@ -1415,7 +1598,10 @@ mod tests {
 
         let rss = state.rss();
         assert!(rss.contains("<title>First &amp; episode</title>"));
-        assert_eq!(rss.matches("<itunes:image href=").count(), 2);
+        assert_eq!(rss.matches("<itunes:image href=").count(), 3);
+        assert!(rss.contains(
+            "<image>\n<url>http://192.0.2.10:8123/artwork/0</url>\n<title>Fixture channel</title>"
+        ));
         assert!(rss.contains("<itunes:duration>42</itunes:duration>"));
         assert!(rss.contains("length=\"0\" type=\"audio/webm\""));
         assert!(rss.contains("http://192.0.2.10:8123/media/0/"));
@@ -1436,6 +1622,7 @@ mod tests {
             id: "UCfixture".to_owned(),
             title: "Fixture channel".to_owned(),
             extractor: Some("YoutubeTab".to_owned()),
+            thumbnail_url: None,
             entries: vec![
                 entry("dQw4w9WgXcQ", "Before selection"),
                 entry("M7lc1UVf-VE", "Selected episode"),
@@ -1459,6 +1646,10 @@ mod tests {
             ["Selected episode", "After selection"]
         );
         assert_eq!(prepared.files[0].route, "/media/0/M7lc1UVf%2DVE.webm");
+        let state = ServerState::new(prepared, "http://192.0.2.10:8123".to_owned());
+        assert!(state.rss().contains(
+            "<image>\n<url>http://192.0.2.10:8123/artwork/0</url>\n<title>Fixture channel</title>"
+        ));
     }
 
     #[test]
@@ -1541,6 +1732,97 @@ mod tests {
             usize::try_from(audio_length).expect("fixture length fits usize")
         );
         server.stop();
+    }
+
+    #[test]
+    fn youtube_proxy_resumes_an_incomplete_upstream_body() {
+        let upstream = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind mock upstream");
+        upstream
+            .set_nonblocking(true)
+            .expect("make mock upstream nonblocking");
+        let upstream_url = Url::parse(&format!(
+            "http://{}/audio.webm",
+            upstream.local_addr().expect("mock upstream address")
+        ))
+        .expect("mock upstream URL");
+        let upstream_thread = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut request_count = 0;
+            while request_count < 2 && Instant::now() < deadline {
+                let Ok((mut stream, _)) = upstream.accept() else {
+                    thread::sleep(Duration::from_millis(10));
+                    continue;
+                };
+                let mut request = [0_u8; 2_048];
+                let read = stream.read(&mut request).expect("read proxy request");
+                let request = String::from_utf8_lossy(&request[..read]);
+                if request_count == 0 {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: audio/webm\r\nAccept-Ranges: bytes\r\nContent-Length: 10\r\nConnection: close\r\n\r\n0123",
+                        )
+                        .expect("write truncated upstream response");
+                } else {
+                    assert!(request.to_ascii_lowercase().contains("range: bytes=4-9"));
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 206 Partial Content\r\nContent-Type: audio/webm\r\nAccept-Ranges: bytes\r\nContent-Range: bytes 4-9/10\r\nContent-Length: 6\r\nConnection: close\r\n\r\n456789",
+                        )
+                        .expect("write resumed upstream response");
+                }
+                request_count += 1;
+            }
+            request_count
+        });
+
+        let downstream = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind proxy client");
+        let downstream_address = downstream.local_addr().expect("proxy client address");
+        let state = ServerState {
+            kind: LanShareKind::Podcast,
+            title: "Fixture".to_owned(),
+            feed_artwork_route: None,
+            base_url: "http://127.0.0.1".to_owned(),
+            files: Vec::new(),
+            artwork: Vec::new(),
+            remote: Some(RemoteRuntime {
+                resolver: YouTubePrewarmResolver::new(YouTubePrewarmConfig::default()),
+                cancellation: YouTubePrewarmCancellation::new(),
+                cache: Mutex::new(HashMap::new()),
+                agent: ureq::Agent::config_builder()
+                    .https_only(false)
+                    .build()
+                    .into(),
+            }),
+        };
+        let proxy_thread = thread::spawn(move || {
+            let (mut stream, _) = downstream.accept().expect("accept proxy client");
+            proxy_remote_response(
+                &mut stream,
+                &state,
+                &upstream_url,
+                &[],
+                None,
+                false,
+                &AtomicBool::new(false),
+                "audio/webm",
+            )
+        });
+        let mut client = TcpStream::connect(downstream_address).expect("connect proxy client");
+        let mut response = Vec::new();
+        client
+            .read_to_end(&mut response)
+            .expect("read proxy response");
+        let proxy_result = proxy_thread.join().expect("join proxy thread");
+        let upstream_requests = upstream_thread.join().expect("join mock upstream");
+        let header_end = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|index| index + 4)
+            .expect("proxy response headers");
+
+        assert!(proxy_result.is_ok(), "proxy failed: {proxy_result:?}");
+        assert_eq!(upstream_requests, 2);
+        assert_eq!(&response[header_end..], b"0123456789");
     }
 
     #[test]

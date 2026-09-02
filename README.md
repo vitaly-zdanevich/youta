@@ -1776,8 +1776,9 @@ LAN` serves the selected regular file or a bounded, recursive folder index.
 `[F12] Podcast feed` serves playable audio under the selection as RSS. When the
 synthetic `..` row is selected, both actions share the directory currently on
 screen. A local podcast episode uses embedded artwork when available and then
-Youta's normal sidecar-artwork fallback. The popup shows a local-IP URL and QR
-code; `[x] Stop sharing` closes the server explicitly.
+Youta's normal sidecar-artwork fallback. The feed itself uses the first retained
+episode that has artwork as its podcast cover. The popup shows a local-IP URL
+and QR code; `[x] Stop sharing` closes the server explicitly.
 
 When the current row is a playable local file or a YouTube video, podcast-feed
 creation first opens a review popup. Its default-off **Ignore items before this
@@ -1791,16 +1792,20 @@ stopping that worker, and preparation failures remain visible in the popup.
 
 `[F12] Podcast feed` is also available on a YouTube channel in Search and in
 YouTube Subscriptions. Feed creation uses flat channel metadata, downloads no
-media, and gives every episode a stable Youta URL and artwork route. When a
-podcast client requests an enclosure, Youta asks `yt-dlp` for a fresh
+media, gives every episode a stable Youta URL and artwork route, and uses the
+channel's square avatar as the podcast cover. The first retained episode image
+is the cover fallback when flat metadata has no channel artwork. When a podcast
+client requests an enclosure, Youta asks `yt-dlp` for a fresh
 audio-only Opus/WebM URL with its cookie-free embedded client first, then its
 normal anonymous clients, and proxies the bytes without publishing YouTube's
-signed URL in the XML. Ambient `yt-dlp` configuration, plugins, and browser
-cookies remain disabled. Videos whose owners prohibit embedded playback may
-therefore remain unavailable. This keeps feed creation fast, but it is
-deliberately session scoped: the HTTP server and every feed URL stop when Youta
-exits. Use the full-channel download first and share the resulting Local folder
-when the feed must remain usable without Youta or without Internet access.
+signed URL in the XML. If an upstream body ends before its advertised length,
+Youta resumes from the first missing byte. Ambient `yt-dlp` configuration,
+plugins, and browser cookies remain disabled. Videos whose owners prohibit
+embedded playback may therefore remain unavailable. This keeps feed creation
+fast, but it is deliberately session scoped: the HTTP server and every feed URL
+stop when Youta exits. Use the full-channel download first and share the
+resulting Local folder when the feed must remain usable without Youta or without
+Internet access.
 
 The server exposes only an immutable manifest prepared for that explicit
 action, ignores symbolic links during folder scans, supports `HEAD` and one
