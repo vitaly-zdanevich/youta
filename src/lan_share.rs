@@ -1043,7 +1043,7 @@ fn proxy_remote_response(
         if read == 0 {
             break;
         }
-        stream.write_all(&buffer[..read])?;
+        write_media_bytes(stream, &buffer[..read], stop)?;
     }
     Ok(())
 }
@@ -1170,8 +1170,45 @@ fn write_file_response(
         if read == 0 {
             break;
         }
-        stream.write_all(&buffer[..read])?;
+        write_media_bytes(stream, &buffer[..read], stop)?;
         remaining = remaining.saturating_sub(read as u64);
+    }
+    Ok(())
+}
+
+/// Writes one media chunk without treating temporary client backpressure as a
+/// truncated download.
+///
+/// Accepted sockets retain a short write timeout so server shutdown can wake
+/// workers whose clients stopped reading. A timeout therefore means "check
+/// cancellation and retry", while every other socket error remains terminal.
+fn write_media_bytes(
+    stream: &mut TcpStream,
+    mut bytes: &[u8],
+    stop: &AtomicBool,
+) -> io::Result<()> {
+    while !bytes.is_empty() {
+        if stop.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "LAN media share stopped",
+            ));
+        }
+        match stream.write(bytes) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "could not write LAN media response",
+                ));
+            }
+            Ok(written) => bytes = &bytes[written..],
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) => {}
+            Err(error) => return Err(error),
+        }
     }
     Ok(())
 }
@@ -1459,6 +1496,50 @@ mod tests {
             ),
         );
         assert!(oversized.starts_with("HTTP/1.1 431 Request Header Fields Too Large"));
+        server.stop();
+    }
+
+    #[test]
+    fn server_does_not_truncate_media_when_client_temporarily_stops_reading() {
+        let directory = canonical_tempdir("lan-slow-client");
+        let audio = directory.path().join("episode.opus");
+        let audio_length = 16 * 1024 * 1024;
+        File::create(&audio)
+            .and_then(|file| file.set_len(audio_length))
+            .expect("create large sparse audio fixture");
+        let mut server = LanShareServer::start(prepare_file_share(&audio).expect("prepare file"))
+            .expect("start server");
+        let address = server
+            .url()
+            .strip_prefix("http://")
+            .and_then(|url| url.split('/').next())
+            .expect("server authority");
+        let mut stream = TcpStream::connect(address).expect("connect to LAN server");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("bound regression-test read");
+        stream
+            .write_all(b"GET /media/0/episode.opus HTTP/1.1\r\nHost: test\r\n\r\n")
+            .expect("request media");
+
+        // Podcast clients can briefly stop draining their socket while moving
+        // a download between buffers or storage. The server must retain the
+        // connection across a pause longer than its listener poll interval.
+        thread::sleep(Duration::from_millis(350));
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .expect("read complete media response");
+        let header_end = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|index| index + 4)
+            .expect("HTTP response headers");
+
+        assert_eq!(
+            response.len() - header_end,
+            usize::try_from(audio_length).expect("fixture length fits usize")
+        );
         server.stop();
     }
 
