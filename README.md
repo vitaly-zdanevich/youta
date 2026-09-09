@@ -1791,7 +1791,9 @@ when available, marks a loaded-row count as a lower bound when necessary,
 shows the exact destination and currently available disk space, and uses the
 configured audio download format. Its default-off **Ignore items before this
 item** checkbox starts with the currently selected video, using the complete
-provider order even when Shorts are hidden. Confirmation starts one supervised `yt-dlp`
+provider order even when Shorts are hidden. The separate default-off **Skip
+Shorts** checkbox excludes entries from YouTube's Shorts tab while retaining
+regular videos and live uploads. Confirmation starts one supervised `yt-dlp`
 collection download with per-file and aggregate progress, speed, ETA, completed
 file count, and cancellation. It downloads public uploads as audio and can
 write each provider thumbnail beside its audio file.
@@ -1809,8 +1811,13 @@ When the current row is a playable local file or a YouTube video, podcast-feed
 creation first opens a review popup. Its default-off **Ignore items before this
 item** checkbox makes that row an inclusive boundary: a local feed starts there
 in the current folder's case-insensitive relative-path order, while a YouTube
-feed starts there in the channel order returned by `yt-dlp`. Leaving it off
-preserves the original one-file or whole-channel behavior.
+feed starts with that video and keeps newer uploads. YouTube episodes run from
+oldest to newest using the combined uploads playlist, including regular videos,
+Shorts, and streams. Leaving the checkbox off preserves the original one-file
+or whole-channel behavior. Every YouTube feed
+review, including a channel selected without a video, also offers a default-off
+**Skip Shorts** checkbox. It omits entries whose provider URL belongs to the
+Shorts tab while retaining regular videos and live uploads.
 After confirmation, YouTube feeds keep a slow preparation animation visible
 while `yt-dlp` enumerates the channel; `[Esc] Hide` returns to browsing without
 stopping that worker, and preparation failures remain visible in the popup.

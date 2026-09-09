@@ -30,7 +30,6 @@ use youta::evernote::EvernoteNoteDraft;
 use youta::keymap::{PopupGeometry, ScrollGeometry};
 #[cfg(feature = "ascii-visualizer")]
 use youta::view::AsciiVisualizerView;
-use youta::view::ChannelDownloadPopupView;
 #[cfg(feature = "commons-upload")]
 use youta::view::CommonsUploadPopupView;
 #[cfg(feature = "evernote")]
@@ -43,6 +42,7 @@ use youta::view::{
     RowView, SubscriptionsView, VideoCommentView, VideoCommentsPopupView, VideoSummaryPopupView,
     ViewModel, WaveformView, YtDlpForbiddenView, YtDlpGentooVersionView, YtDlpVersionLookupView,
 };
+use youta::view::{ChannelDownloadOption, ChannelDownloadPopupView};
 #[cfg(feature = "lan-sharing")]
 use youta::view::{LanSharePopupView, PodcastFeedOptionsPopupView};
 use youta::waveform::PeakPyramid;
@@ -222,6 +222,7 @@ fn action_belongs_to_disabled_feature(name: &str) -> bool {
                     | "ShareYouTubeChannelPodcast"
                     | "StopLanShare"
                     | "TogglePodcastFeedIgnoreBefore"
+                    | "TogglePodcastFeedSkipShorts"
             ))
 }
 
@@ -423,6 +424,10 @@ fn the_typescript_contract_names_only_fields_the_reducer_emits() {
             source: String::new(),
             selected_item: String::new(),
             ignore_items_before: false,
+            ignore_items_before_available: true,
+            skip_shorts: false,
+            skip_shorts_available: true,
+            selected_option: youta::view::PodcastFeedOption::IgnoreItemsBefore,
             phase: youta::view::PodcastFeedOptionsPhase::Review,
             animation_frame: 0,
             error: None,
@@ -466,6 +471,8 @@ fn the_typescript_contract_names_only_fields_the_reducer_emits() {
             available_space_bytes: 0,
             destination: String::new(),
             ignore_items_before: false,
+            skip_shorts: false,
+            selected_option: ChannelDownloadOption::IgnoreItemsBefore,
         }),
     );
     #[cfg(feature = "commons-upload")]
@@ -636,7 +643,9 @@ fn the_window_can_share_local_files_and_podcast_feeds() {
         "dispatch('DismissLanShare')",
         "dispatch('StopLanShare')",
         "dispatch('TogglePodcastFeedIgnoreBefore')",
+        "dispatch('TogglePodcastFeedSkipShorts')",
         "Ignore items before this item",
+        "Skip Shorts",
         "QR code for ${popup.url}",
     ] {
         assert!(
@@ -670,6 +679,8 @@ fn the_window_reviews_and_can_cancel_a_full_channel_download() {
         "Free space remaining",
         "Ignore items before this item",
         "ToggleChannelDownloadIgnoreBefore",
+        "Skip Shorts",
+        "ToggleChannelDownloadSkipShorts",
         "dispatch(\"ConfirmChannelDownload\")",
         "dispatch(\"DismissChannelDownload\")",
     ] {

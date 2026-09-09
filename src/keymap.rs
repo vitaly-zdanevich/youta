@@ -418,6 +418,10 @@ mod wire_tests {
                 source: "Local folder: album".to_owned(),
                 selected_item: "02-selected.opus".to_owned(),
                 ignore_items_before: false,
+                ignore_items_before_available: true,
+                skip_shorts: false,
+                skip_shorts_available: true,
+                selected_option: crate::view::PodcastFeedOption::IgnoreItemsBefore,
                 phase: crate::view::PodcastFeedOptionsPhase::Review,
                 animation_frame: 0,
                 error: None,
@@ -426,7 +430,11 @@ mod wire_tests {
         };
         assert_eq!(
             key_action(KeyPress::new(Key::Char(' ')), &options, None, None),
-            Some(UiAction::TogglePodcastFeedIgnoreBefore)
+            Some(UiAction::ToggleSelectedPodcastFeedOption)
+        );
+        assert_eq!(
+            key_action(KeyPress::new(Key::Down), &options, None, None),
+            Some(UiAction::MovePodcastFeedOption(1))
         );
         assert_eq!(
             key_action(KeyPress::new(Key::Enter), &options, None, None),
@@ -1043,7 +1051,9 @@ fn unfiltered_key_action(
     if let Some(popup) = view.podcast_feed_options_popup.as_ref() {
         return match popup.phase {
             PodcastFeedOptionsPhase::Review => match key.key {
-                Key::Char(' ') => Some(UiAction::TogglePodcastFeedIgnoreBefore),
+                Key::Up | Key::Char('k') => Some(UiAction::MovePodcastFeedOption(-1)),
+                Key::Down | Key::Char('j') | Key::Tab => Some(UiAction::MovePodcastFeedOption(1)),
+                Key::Char(' ') => Some(UiAction::ToggleSelectedPodcastFeedOption),
                 Key::Enter => Some(UiAction::ConfirmPodcastFeed),
                 Key::Esc => Some(UiAction::DismissPodcastFeed),
                 _ => None,
@@ -1332,7 +1342,9 @@ fn unfiltered_key_action(
     #[cfg(feature = "yt-dlp")]
     if view.channel_download_popup.is_some() {
         return match key.key {
-            Key::Char(' ') => Some(UiAction::ToggleChannelDownloadIgnoreBefore),
+            Key::Up | Key::Char('k') => Some(UiAction::MoveChannelDownloadOption(-1)),
+            Key::Down | Key::Char('j') | Key::Tab => Some(UiAction::MoveChannelDownloadOption(1)),
+            Key::Char(' ') => Some(UiAction::ToggleSelectedChannelDownloadOption),
             Key::Enter => Some(UiAction::ConfirmChannelDownload),
             Key::Esc => Some(UiAction::DismissChannelDownload),
             _ => None,

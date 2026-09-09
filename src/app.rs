@@ -241,8 +241,6 @@ use crate::video_summary::{VideoSummaryCancellation, YouTubeCaptionExtractor};
 use crate::view::AsciiVisualizerView;
 #[cfg(feature = "audio-quality")]
 use crate::view::AudioQualityPopupView;
-#[cfg(feature = "yt-dlp")]
-use crate::view::ChannelDownloadPopupView;
 use crate::view::DetailLinkInternalTarget;
 #[cfg(any(feature = "librivox", feature = "yandex-music"))]
 use crate::view::DetailLinkPresentation;
@@ -266,6 +264,8 @@ use crate::view::{
     COMMONS_ACCOUNT_REGISTRATION_GUIDE_URL, COMMONS_BOT_PASSWORD_GUIDE_URL,
     CommonsCredentialsPopupView, CommonsUploadField, CommonsUploadPhase, CommonsUploadPopupView,
 };
+#[cfg(feature = "yt-dlp")]
+use crate::view::{ChannelDownloadOption, ChannelDownloadPopupView};
 use crate::view::{
     ClipboardRequest, ClipboardSubject, DetailTimecodeView, DetailVideoLinkView, DetailView,
     DetailWikidataMediaView, DetailsScroll, DetailsTextSelection, ErrorPopupScroll, ErrorPopupView,
@@ -293,7 +293,7 @@ use crate::view::{
     GENTOO_YT_DLP_PACKAGE_URL, YT_DLP_PROJECT_URL, YtDlpForbiddenView, YtDlpVersionLookupView,
 };
 #[cfg(feature = "lan-sharing")]
-use crate::view::{PodcastFeedOptionsPhase, PodcastFeedOptionsPopupView};
+use crate::view::{PodcastFeedOption, PodcastFeedOptionsPhase, PodcastFeedOptionsPopupView};
 #[cfg(feature = "yandex-music")]
 use crate::view::{
     YandexMusicActionsView, YandexMusicReactionView, YandexMusicRouteView, YandexMusicSearchKind,
@@ -3149,7 +3149,7 @@ enum PodcastFeedSelection {
     YouTube {
         channel_id: String,
         channel_name: String,
-        selected_video_id: String,
+        first_video_id: Option<String>,
     },
 }
 
@@ -3160,6 +3160,7 @@ struct PendingYouTubePodcastFeed {
     channel_id: String,
     channel_name: String,
     first_video_id: Option<String>,
+    skip_shorts: bool,
 }
 
 /// Bounded flat-channel completion returned by the isolated feed worker.
@@ -4673,6 +4674,9 @@ pub struct AppController {
     /// Sole flat channel-enumeration worker, joined after it finishes.
     #[cfg(feature = "lan-sharing")]
     youtube_podcast_feed_thread: Option<JoinHandle<()>>,
+    /// Stops catalogue and episode-date helpers when the application exits.
+    #[cfg(feature = "lan-sharing")]
+    youtube_podcast_feed_cancellation: Option<YouTubePrewarmCancellation>,
     /// Monotonic owner for superseded feed preparations.
     #[cfg(feature = "lan-sharing")]
     youtube_podcast_feed_generation: u64,
@@ -6097,6 +6101,8 @@ impl AppController {
             youtube_podcast_feed_response_sender,
             #[cfg(feature = "lan-sharing")]
             youtube_podcast_feed_thread: None,
+            #[cfg(feature = "lan-sharing")]
+            youtube_podcast_feed_cancellation: None,
             #[cfg(feature = "lan-sharing")]
             youtube_podcast_feed_generation: 0,
             #[cfg(feature = "lan-sharing")]
@@ -10622,6 +10628,10 @@ impl AppController {
             source: format!("Local folder: {source_name}"),
             selected_item,
             ignore_items_before: false,
+            ignore_items_before_available: true,
+            skip_shorts: false,
+            skip_shorts_available: false,
+            selected_option: PodcastFeedOption::IgnoreItemsBefore,
             phase: PodcastFeedOptionsPhase::Review,
             animation_frame: 0,
             error: None,
@@ -10682,9 +10692,70 @@ impl AppController {
             .view
             .podcast_feed_options_popup
             .as_mut()
-            .filter(|popup| popup.phase == PodcastFeedOptionsPhase::Review)
+            .filter(|popup| {
+                popup.phase == PodcastFeedOptionsPhase::Review
+                    && popup.ignore_items_before_available
+            })
         {
             popup.ignore_items_before = !popup.ignore_items_before;
+        }
+    }
+
+    /// Toggles omission of entries exposed through YouTube's Shorts tab.
+    #[cfg(feature = "lan-sharing")]
+    fn toggle_podcast_feed_skip_shorts(&mut self) {
+        if let Some(popup) = self
+            .view
+            .podcast_feed_options_popup
+            .as_mut()
+            .filter(|popup| {
+                popup.phase == PodcastFeedOptionsPhase::Review && popup.skip_shorts_available
+            })
+        {
+            popup.skip_shorts = !popup.skip_shorts;
+        }
+    }
+
+    /// Moves terminal focus between the checkboxes available for this source.
+    #[cfg(feature = "lan-sharing")]
+    fn move_podcast_feed_option(&mut self, delta: i32) {
+        if delta == 0 {
+            return;
+        }
+        if let Some(popup) = self
+            .view
+            .podcast_feed_options_popup
+            .as_mut()
+            .filter(|popup| popup.phase == PodcastFeedOptionsPhase::Review)
+        {
+            popup.selected_option = match popup.selected_option {
+                PodcastFeedOption::IgnoreItemsBefore if popup.skip_shorts_available => {
+                    PodcastFeedOption::SkipShorts
+                }
+                PodcastFeedOption::SkipShorts if popup.ignore_items_before_available => {
+                    PodcastFeedOption::IgnoreItemsBefore
+                }
+                selected => selected,
+            };
+        }
+    }
+
+    /// Toggles the feed option selected by the terminal keyboard.
+    #[cfg(feature = "lan-sharing")]
+    fn toggle_selected_podcast_feed_option(&mut self) {
+        let selected = self
+            .view
+            .podcast_feed_options_popup
+            .as_ref()
+            .map(|popup| popup.selected_option);
+        match selected {
+            Some(PodcastFeedOption::IgnoreItemsBefore) => {
+                self.toggle_podcast_feed_ignore_before();
+            }
+            Some(PodcastFeedOption::SkipShorts) => {
+                self.toggle_podcast_feed_skip_shorts();
+            }
+            None => {}
         }
     }
 
@@ -10698,12 +10769,12 @@ impl AppController {
     /// Applies the reviewed boundary to one captured local file or YouTube video.
     #[cfg(feature = "lan-sharing")]
     fn confirm_podcast_feed_options(&mut self) {
-        let Some(ignore_items_before) = self
+        let Some((ignore_items_before, skip_shorts)) = self
             .view
             .podcast_feed_options_popup
             .as_ref()
             .filter(|popup| popup.phase == PodcastFeedOptionsPhase::Review)
-            .map(|popup| popup.ignore_items_before)
+            .map(|popup| (popup.ignore_items_before, popup.skip_shorts))
         else {
             return;
         };
@@ -10726,7 +10797,7 @@ impl AppController {
             PodcastFeedSelection::YouTube {
                 channel_id,
                 channel_name,
-                selected_video_id,
+                first_video_id,
             } => {
                 if let Some(popup) = self.view.podcast_feed_options_popup.as_mut() {
                     popup.phase = PodcastFeedOptionsPhase::Preparing;
@@ -10736,7 +10807,12 @@ impl AppController {
                 if let Err(error) = self.start_youtube_channel_podcast(
                     channel_id,
                     channel_name,
-                    ignore_items_before.then_some(selected_video_id),
+                    if ignore_items_before {
+                        first_video_id
+                    } else {
+                        None
+                    },
+                    skip_shorts,
                 ) {
                     self.show_youtube_podcast_feed_failure(error);
                 }
@@ -10832,17 +10908,23 @@ impl AppController {
             _ => None,
         });
         let Some(selected_video) = selected_video else {
+            self.podcast_feed_selection = Some(PodcastFeedSelection::YouTube {
+                channel_id,
+                channel_name: channel_name.clone(),
+                first_video_id: None,
+            });
             self.view.podcast_feed_options_popup = Some(PodcastFeedOptionsPopupView {
                 source: format!("YouTube channel: {channel_name}"),
                 selected_item: "Entire channel".to_owned(),
                 ignore_items_before: false,
-                phase: PodcastFeedOptionsPhase::Preparing,
+                ignore_items_before_available: false,
+                skip_shorts: false,
+                skip_shorts_available: true,
+                selected_option: PodcastFeedOption::SkipShorts,
+                phase: PodcastFeedOptionsPhase::Review,
                 animation_frame: 0,
                 error: None,
             });
-            if let Err(error) = self.start_youtube_channel_podcast(channel_id, channel_name, None) {
-                self.show_youtube_podcast_feed_failure(error);
-            }
             return;
         };
         let selected_video_id = selected_video.video_id.clone();
@@ -10850,12 +10932,16 @@ impl AppController {
         self.podcast_feed_selection = Some(PodcastFeedSelection::YouTube {
             channel_id,
             channel_name: channel_name.clone(),
-            selected_video_id,
+            first_video_id: Some(selected_video_id),
         });
         self.view.podcast_feed_options_popup = Some(PodcastFeedOptionsPopupView {
             source: format!("YouTube channel: {channel_name}"),
             selected_item,
             ignore_items_before: false,
+            ignore_items_before_available: true,
+            skip_shorts: false,
+            skip_shorts_available: true,
+            selected_option: PodcastFeedOption::IgnoreItemsBefore,
             phase: PodcastFeedOptionsPhase::Review,
             animation_frame: 0,
             error: None,
@@ -10869,6 +10955,7 @@ impl AppController {
         channel_id: String,
         channel_name: String,
         first_video_id: Option<String>,
+        skip_shorts: bool,
     ) -> Result<(), String> {
         if self
             .youtube_podcast_feed_thread
@@ -10882,10 +10969,12 @@ impl AppController {
         }
         self.youtube_podcast_feed_generation = self.youtube_podcast_feed_generation.wrapping_add(1);
         let generation = self.youtube_podcast_feed_generation;
-        let Some(source_url) = canonical_youtube_channel_url(&channel_id) else {
+        if canonical_youtube_uploads_url(&channel_id).is_none() {
             return Err("The selected YouTube channel ID is invalid".to_owned());
-        };
+        }
         let executable = self.config.providers.yt_dlp_executable.clone();
+        let cancellation = YouTubePrewarmCancellation::new();
+        let worker_cancellation = cancellation.clone();
         let sender = self.youtube_podcast_feed_response_sender.clone();
         let response_channel_id = channel_id.clone();
         let thread = thread::Builder::new()
@@ -10896,7 +10985,12 @@ impl AppController {
                     ..YtDlpConfig::default()
                 });
                 let result = client
-                    .collection(&source_url, u16::MAX)
+                    .youtube_channel_collection_cancellable(
+                        &response_channel_id,
+                        u16::MAX,
+                        skip_shorts,
+                        &worker_cancellation,
+                    )
                     .map_err(|error| error.to_string());
                 let _ = sender.send(YouTubePodcastFeedResponse {
                     generation,
@@ -10907,11 +11001,13 @@ impl AppController {
         match thread {
             Ok(thread) => {
                 self.youtube_podcast_feed_thread = Some(thread);
+                self.youtube_podcast_feed_cancellation = Some(cancellation);
                 self.pending_youtube_podcast_feed = Some(PendingYouTubePodcastFeed {
                     generation,
                     channel_id,
                     channel_name: channel_name.clone(),
                     first_video_id,
+                    skip_shorts,
                 });
                 self.view.status_line =
                     format!("Preparing a podcast feed for {channel_name} with yt-dlp…");
@@ -10946,9 +11042,14 @@ impl AppController {
                         collection,
                         config,
                         first_video_id,
+                        pending.skip_shorts,
                     )
                 } else {
-                    crate::lan_share::prepare_youtube_podcast_share(collection, config)
+                    crate::lan_share::prepare_youtube_podcast_share(
+                        collection,
+                        config,
+                        pending.skip_shorts,
+                    )
                 };
                 match prepared {
                     Ok(prepared) => {
@@ -10997,6 +11098,7 @@ impl AppController {
             .as_ref()
             .is_some_and(JoinHandle::is_finished)
         {
+            self.youtube_podcast_feed_cancellation = None;
             let join_failed = self
                 .youtube_podcast_feed_thread
                 .take()
@@ -19167,6 +19269,8 @@ impl AppController {
             available_space_bytes,
             destination: destination.display().to_string(),
             ignore_items_before: false,
+            skip_shorts: false,
+            selected_option: ChannelDownloadOption::IgnoreItemsBefore,
         });
         self.view.help_open = false;
         self.view.status_line = "Review the full-channel audio download".to_owned();
@@ -19188,6 +19292,11 @@ impl AppController {
             .channel_download_popup
             .as_ref()
             .is_some_and(|popup| popup.ignore_items_before);
+        let skip_shorts = self
+            .view
+            .channel_download_popup
+            .as_ref()
+            .is_some_and(|popup| popup.skip_shorts);
         let playlist_start = ignore_items_before.then_some(selection.playlist_start);
         let estimated_video_count = selection.estimated_video_count.map(|count| {
             if ignore_items_before {
@@ -19208,6 +19317,7 @@ impl AppController {
             format: selection.format,
             scope: DownloadScope::Collection,
             playlist_start,
+            skip_shorts,
             write_thumbnail: self.config.subscriptions.download_thumbnails,
             archive_path: None,
         };
@@ -19240,16 +19350,23 @@ impl AppController {
         });
         self.view.channel_download_popup = None;
         self.channel_download_selection = None;
-        self.view.status_line = if ignore_items_before {
-            format!(
+        self.view.status_line = match (ignore_items_before, skip_shorts) {
+            (true, true) => format!(
+                "Downloading non-Short public uploads from {} starting with the selected item",
+                selection.channel_name
+            ),
+            (true, false) => format!(
                 "Downloading public uploads from {} starting with the selected item",
                 selection.channel_name
-            )
-        } else {
-            format!(
+            ),
+            (false, true) => format!(
+                "Downloading every non-Short public upload from {} as audio",
+                selection.channel_name
+            ),
+            (false, false) => format!(
                 "Downloading every public upload from {} as audio",
                 selection.channel_name
-            )
+            ),
         };
         self.active_download = Some(active);
     }
@@ -19259,6 +19376,47 @@ impl AppController {
     fn toggle_channel_download_ignore_before(&mut self) {
         if let Some(popup) = self.view.channel_download_popup.as_mut() {
             popup.ignore_items_before = !popup.ignore_items_before;
+        }
+    }
+
+    /// Toggles omission of entries from the YouTube Shorts tab.
+    #[cfg(feature = "yt-dlp")]
+    fn toggle_channel_download_skip_shorts(&mut self) {
+        if let Some(popup) = self.view.channel_download_popup.as_mut() {
+            popup.skip_shorts = !popup.skip_shorts;
+        }
+    }
+
+    /// Moves the terminal's keyboard focus between the review checkboxes.
+    #[cfg(feature = "yt-dlp")]
+    fn move_channel_download_option(&mut self, delta: i32) {
+        if delta == 0 {
+            return;
+        }
+        if let Some(popup) = self.view.channel_download_popup.as_mut() {
+            popup.selected_option = match popup.selected_option {
+                ChannelDownloadOption::IgnoreItemsBefore => ChannelDownloadOption::SkipShorts,
+                ChannelDownloadOption::SkipShorts => ChannelDownloadOption::IgnoreItemsBefore,
+            };
+        }
+    }
+
+    /// Toggles the checkbox selected by the terminal keyboard.
+    #[cfg(feature = "yt-dlp")]
+    fn toggle_selected_channel_download_option(&mut self) {
+        let selected = self
+            .view
+            .channel_download_popup
+            .as_ref()
+            .map(|popup| popup.selected_option);
+        match selected {
+            Some(ChannelDownloadOption::IgnoreItemsBefore) => {
+                self.toggle_channel_download_ignore_before();
+            }
+            Some(ChannelDownloadOption::SkipShorts) => {
+                self.toggle_channel_download_skip_shorts();
+            }
+            None => {}
         }
     }
 
@@ -19400,6 +19558,7 @@ impl AppController {
                 DownloadScope::Collection
             },
             playlist_start: None,
+            skip_shorts: false,
             write_thumbnail: !baseline && self.config.subscriptions.download_thumbnails,
             archive_path: Some(archive_path.clone()),
         };
@@ -19531,6 +19690,7 @@ impl AppController {
             format,
             scope: DownloadScope::SingleItem,
             playlist_start: None,
+            skip_shorts: false,
             write_thumbnail: self.config.subscriptions.download_thumbnails,
             archive_path: None,
         };
@@ -33365,6 +33525,13 @@ impl AppController {
         self.dismiss_ascii_visualizer();
         #[cfg(feature = "lan-sharing")]
         {
+            if let Some(cancellation) = self.youtube_podcast_feed_cancellation.take() {
+                cancellation.cancel();
+            }
+            if let Some(thread) = self.youtube_podcast_feed_thread.take() {
+                let _ = thread.join();
+            }
+            self.pending_youtube_podcast_feed = None;
             self.lan_share_server = None;
             self.view.lan_share_popup = None;
             self.podcast_feed_selection = None;
@@ -34081,6 +34248,18 @@ impl UiController for AppController {
                 self.toggle_channel_download_ignore_before();
             }
             #[cfg(feature = "yt-dlp")]
+            UiAction::ToggleChannelDownloadSkipShorts => {
+                self.toggle_channel_download_skip_shorts();
+            }
+            #[cfg(feature = "yt-dlp")]
+            UiAction::MoveChannelDownloadOption(delta) => {
+                self.move_channel_download_option(delta);
+            }
+            #[cfg(feature = "yt-dlp")]
+            UiAction::ToggleSelectedChannelDownloadOption => {
+                self.toggle_selected_channel_download_option();
+            }
+            #[cfg(feature = "yt-dlp")]
             UiAction::DismissChannelDownload => self.dismiss_channel_download(),
             #[cfg(feature = "yt-dlp")]
             UiAction::CancelDownload => self.cancel_active_download(),
@@ -34321,6 +34500,18 @@ impl UiController for AppController {
             #[cfg(feature = "lan-sharing")]
             UiAction::TogglePodcastFeedIgnoreBefore => {
                 self.toggle_podcast_feed_ignore_before();
+            }
+            #[cfg(feature = "lan-sharing")]
+            UiAction::TogglePodcastFeedSkipShorts => {
+                self.toggle_podcast_feed_skip_shorts();
+            }
+            #[cfg(feature = "lan-sharing")]
+            UiAction::MovePodcastFeedOption(delta) => {
+                self.move_podcast_feed_option(delta);
+            }
+            #[cfg(feature = "lan-sharing")]
+            UiAction::ToggleSelectedPodcastFeedOption => {
+                self.toggle_selected_podcast_feed_option();
             }
             #[cfg(feature = "lan-sharing")]
             UiAction::ConfirmPodcastFeed => self.confirm_podcast_feed_options(),
@@ -51975,6 +52166,10 @@ mod tests {
         assert_eq!(popup.source, "Local folder: album");
         assert_eq!(popup.selected_item, "02-selected.opus");
         assert!(!popup.ignore_items_before);
+        assert!(popup.ignore_items_before_available);
+        assert!(!popup.skip_shorts);
+        assert!(!popup.skip_shorts_available);
+        assert_eq!(popup.selected_option, PodcastFeedOption::IgnoreItemsBefore);
         assert!(matches!(
             controller.podcast_feed_selection.as_ref(),
             Some(PodcastFeedSelection::Local {
@@ -52039,17 +52234,24 @@ mod tests {
         assert_eq!(popup.source, "YouTube channel: Fixture channel");
         assert_eq!(popup.selected_item, "Fixture video");
         assert!(!popup.ignore_items_before);
+        assert!(popup.ignore_items_before_available);
+        assert!(!popup.skip_shorts);
+        assert!(popup.skip_shorts_available);
+        assert_eq!(popup.selected_option, PodcastFeedOption::IgnoreItemsBefore);
         assert!(matches!(
             controller.podcast_feed_selection.as_ref(),
             Some(PodcastFeedSelection::YouTube {
                 channel_id,
                 channel_name,
-                selected_video_id,
+                first_video_id: Some(first_video_id),
             }) if channel_id == "UCfixture"
                 && channel_name == "Fixture channel"
-                && selected_video_id == "dQw4w9WgXcQ"
+                && first_video_id == "dQw4w9WgXcQ"
         ));
 
+        controller.dispatch(UiAction::TogglePodcastFeedIgnoreBefore);
+        controller.dispatch(UiAction::MovePodcastFeedOption(1));
+        controller.dispatch(UiAction::ToggleSelectedPodcastFeedOption);
         controller.dispatch(UiAction::ConfirmPodcastFeed);
 
         assert!(
@@ -52060,7 +52262,15 @@ mod tests {
                 .is_some_and(|popup| popup.phase == PodcastFeedOptionsPhase::Preparing),
             "confirmation must retain visible progress until channel enumeration finishes"
         );
-        assert!(controller.pending_youtube_podcast_feed.is_some());
+        assert!(
+            controller
+                .pending_youtube_podcast_feed
+                .as_ref()
+                .is_some_and(
+                    |pending| pending.first_video_id.as_deref() == Some("dQw4w9WgXcQ")
+                        && pending.skip_shorts
+                )
+        );
 
         let generation = controller.youtube_podcast_feed_generation;
         controller.handle_youtube_podcast_feed_response(YouTubePodcastFeedResponse {
@@ -52101,12 +52311,26 @@ mod tests {
             Some(("UCfixture".to_owned(), "Fixture channel".to_owned()))
         );
 
+        controller.dispatch(UiAction::ShareYouTubeChannelPodcast);
+        let options = controller
+            .view
+            .podcast_feed_options_popup
+            .as_ref()
+            .expect("whole-channel feed review");
+        assert_eq!(options.phase, PodcastFeedOptionsPhase::Review);
+        assert_eq!(options.selected_item, "Entire channel");
+        assert!(!options.ignore_items_before_available);
+        assert!(options.skip_shorts_available);
+        assert_eq!(options.selected_option, PodcastFeedOption::SkipShorts);
+        assert!(controller.pending_youtube_podcast_feed.is_none());
+
         controller.youtube_podcast_feed_generation = 7;
         controller.pending_youtube_podcast_feed = Some(PendingYouTubePodcastFeed {
             generation: 7,
             channel_id: "UCfixture".to_owned(),
             channel_name: "Fixture channel".to_owned(),
             first_video_id: None,
+            skip_shorts: false,
         });
         controller.handle_youtube_podcast_feed_response(YouTubePodcastFeedResponse {
             generation: 7,
@@ -71548,16 +71772,31 @@ mod tests {
         assert_eq!(popup.estimated_video_count, Some(412));
         assert!(!popup.estimate_is_lower_bound);
         assert!(!popup.ignore_items_before);
+        assert!(!popup.skip_shorts);
+        assert_eq!(
+            popup.selected_option,
+            ChannelDownloadOption::IgnoreItemsBefore
+        );
         assert!(popup.destination.ends_with("downloads"));
         assert!(requests.lock().expect("download requests").is_empty());
 
         controller.dispatch(UiAction::ToggleChannelDownloadIgnoreBefore);
+        controller.dispatch(UiAction::MoveChannelDownloadOption(1));
+        controller.dispatch(UiAction::ToggleSelectedChannelDownloadOption);
         assert!(
             controller
                 .view
                 .channel_download_popup
                 .as_ref()
                 .is_some_and(|popup| popup.ignore_items_before)
+        );
+        assert!(
+            controller
+                .view
+                .channel_download_popup
+                .as_ref()
+                .is_some_and(|popup| popup.skip_shorts
+                    && popup.selected_option == ChannelDownloadOption::SkipShorts)
         );
         controller.dispatch(UiAction::ConfirmChannelDownload);
 
@@ -71569,6 +71808,7 @@ mod tests {
             .expect("one reviewed request");
         assert_eq!(request.scope, DownloadScope::Collection);
         assert_eq!(request.playlist_start, Some(3));
+        assert!(request.skip_shorts);
         assert_eq!(
             request.source_url.as_str(),
             "https://www.youtube.com/channel/UCfixture"

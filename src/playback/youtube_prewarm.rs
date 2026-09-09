@@ -598,6 +598,41 @@ enum WaitOutcome {
     TimedOut,
 }
 
+/// Runs a metadata command with the same process lifetime and output bounds as
+/// audio prewarming, without exposing signed URLs or raw stderr on failure.
+/// Callers supply the argument vector; this adapter owns supervision and pipes.
+pub(crate) fn run_bounded_json_command(
+    command: &mut Command,
+    timeout: Duration,
+    stdout_limit: usize,
+    cancellation: &YouTubePrewarmCancellation,
+) -> Result<Vec<u8>, YouTubePrewarmError> {
+    if cancellation.is_cancelled() {
+        return Err(YouTubePrewarmError::Cancelled);
+    }
+    crate::child_process::supervised(command);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = run_bounded_command(command, timeout, stdout_limit, 8 * 1024, cancellation)?;
+    if cancellation.is_cancelled() {
+        return Err(YouTubePrewarmError::Cancelled);
+    }
+    if output.stdout.truncated {
+        return Err(YouTubePrewarmError::OutputTooLarge {
+            limit: stdout_limit,
+        });
+    }
+    if !output.status.success() {
+        return Err(YouTubePrewarmError::ProcessExited {
+            status: output.status,
+            stderr_truncated: output.stderr.truncated,
+        });
+    }
+    Ok(output.stdout.bytes)
+}
+
 fn run_bounded_command(
     command: &mut Command,
     timeout: Duration,

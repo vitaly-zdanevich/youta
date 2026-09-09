@@ -374,6 +374,10 @@ export interface PodcastFeedOptionsPopupView {
 	source: string;
 	selected_item: string;
 	ignore_items_before: boolean;
+	ignore_items_before_available: boolean;
+	skip_shorts: boolean;
+	skip_shorts_available: boolean;
+	selected_option: 'IgnoreItemsBefore' | 'SkipShorts';
 	phase: 'Review' | 'Preparing' | 'Failed';
 	animation_frame: number;
 	error: string | null;
@@ -617,6 +621,8 @@ export interface ChannelDownloadPopupView {
 	available_space_bytes: number;
 	destination: string;
 	ignore_items_before: boolean;
+	skip_shorts: boolean;
+	selected_option: 'IgnoreItemsBefore' | 'SkipShorts';
 }
 
 /** Free license selected for a Wikimedia Commons upload. */

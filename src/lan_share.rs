@@ -6,7 +6,7 @@
 //! owns its listener thread and stops it on drop, so sharing never survives a
 //! Youta process that the user has closed.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
@@ -334,31 +334,40 @@ fn retain_podcast_files_from(
 /// audio. The active LAN server supervises each later `yt-dlp` resolver and
 /// proxies the resulting stream so required request headers never leave Youta.
 ///
+/// The input must use the unified newest-first upload order returned by
+/// [`crate::playback::ytdlp::YtDlp::youtube_channel_collection`]. Episodes are
+/// published oldest first so a podcast listener can follow channel chronology.
+///
 /// # Errors
 ///
-/// Returns an error when the collection is empty, exceeds the feed bound, or
-/// contains no valid `YouTube` video identifiers.
+/// When `skip_shorts` is set, entries with canonical `/shorts/` provider URLs
+/// are omitted. Returns an error when the collection is empty, exceeds the
+/// feed bound, or contains no valid `YouTube` video identifiers.
 pub fn prepare_youtube_podcast_share(
     collection: ExtractedCollection,
     config: YouTubePrewarmConfig,
+    skip_shorts: bool,
 ) -> io::Result<PreparedLocalShare> {
-    prepare_youtube_podcast_share_with_boundary(collection, config, None)
+    prepare_youtube_podcast_share_with_boundary(collection, config, None, skip_shorts)
 }
 
 /// Builds a `YouTube` podcast feed beginning with one selected channel video.
 ///
-/// The flat collection's provider order is retained. The selected video is
-/// inclusive, and entries that appeared before it are omitted before Youta's
-/// podcast-size bound is applied.
+/// The unified newest-first upload catalogue is reversed into chronological
+/// order. The selected video is inclusive, and older uploads are omitted
+/// before Youta's podcast-size bound is applied.
 ///
 /// # Errors
 ///
-/// Returns the same errors as [`prepare_youtube_podcast_share`], and also
-/// rejects an invalid or absent selected video identifier.
+/// The inclusive boundary is applied before the optional Shorts filter so a
+/// selected Short can still delimit the retained chronology. Returns the
+/// same errors as [`prepare_youtube_podcast_share`], and also rejects an invalid
+/// or absent selected video identifier.
 pub fn prepare_youtube_podcast_share_from(
     collection: ExtractedCollection,
     config: YouTubePrewarmConfig,
     first_video_id: &str,
+    skip_shorts: bool,
 ) -> io::Result<PreparedLocalShare> {
     if validate_youtube_video_id(first_video_id).is_err() {
         return Err(io::Error::new(
@@ -366,27 +375,85 @@ pub fn prepare_youtube_podcast_share_from(
             "the selected YouTube video ID is invalid",
         ));
     }
-    prepare_youtube_podcast_share_with_boundary(collection, config, Some(first_video_id))
+    prepare_youtube_podcast_share_with_boundary(
+        collection,
+        config,
+        Some(first_video_id),
+        skip_shorts,
+    )
 }
 
+/// Returns retained input indices in oldest-first episode order.
+///
+/// The selected Short remains an inclusive boundary even when Shorts are skipped.
+/// The input is the unified newest-first uploads catalogue.
+///
+/// # Errors
+///
+/// Rejects an invalid or absent selected ID, an empty retained selection, or a
+/// selection exceeding the podcast episode bound.
+pub(crate) fn youtube_podcast_episode_indices(
+    collection: &ExtractedCollection,
+    first_video_id: Option<&str>,
+    skip_shorts: bool,
+) -> io::Result<Vec<usize>> {
+    let end = if let Some(first_video_id) = first_video_id {
+        if validate_youtube_video_id(first_video_id).is_err() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the selected YouTube video ID is invalid",
+            ));
+        }
+        collection
+            .entries
+            .iter()
+            .position(|entry| entry.id == first_video_id)
+            .map(|index| index + 1)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "the selected video is absent from the enumerated YouTube channel",
+                )
+            })?
+    } else {
+        collection.entries.len()
+    };
+    let mut indices = Vec::new();
+    for index in (0..end).rev() {
+        let entry = &collection.entries[index];
+        if validate_youtube_video_id(&entry.id).is_err()
+            || (skip_shorts && youtube_collection_entry_is_short(entry))
+        {
+            continue;
+        }
+        if indices.len() >= MAX_SHARED_FILES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "YouTube channel exceeds Youta's podcast episode limit",
+            ));
+        }
+        indices.push(index);
+    }
+    if indices.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "yt-dlp found no valid YouTube videos for the podcast feed",
+        ));
+    }
+    Ok(indices)
+}
+
+/// Orders the unified catalogue before applying the selected boundary and filter.
 fn prepare_youtube_podcast_share_with_boundary(
     mut collection: ExtractedCollection,
     mut config: YouTubePrewarmConfig,
     first_video_id: Option<&str>,
+    skip_shorts: bool,
 ) -> io::Result<PreparedLocalShare> {
-    if let Some(first_video_id) = first_video_id {
-        let Some(first_index) = collection
-            .entries
-            .iter()
-            .position(|entry| entry.id == first_video_id)
-        else {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "the selected video is absent from the enumerated YouTube channel",
-            ));
-        };
-        collection.entries.drain(..first_index);
-    }
+    let retained_indices =
+        youtube_podcast_episode_indices(&collection, first_video_id, skip_shorts)?
+            .into_iter()
+            .collect::<HashSet<_>>();
     let title = if collection.title.trim().is_empty() {
         "YouTube channel".to_owned()
     } else {
@@ -405,15 +472,9 @@ fn prepare_youtube_podcast_share_with_boundary(
         });
         route
     });
-    for entry in collection.entries {
-        if validate_youtube_video_id(&entry.id).is_err() {
+    for (entry_index, entry) in collection.entries.into_iter().enumerate().rev() {
+        if !retained_indices.contains(&entry_index) {
             continue;
-        }
-        if files.len() >= MAX_SHARED_FILES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "YouTube channel exceeds Youta's podcast episode limit",
-            ));
         }
         let source_url = Url::parse(&format!("https://www.youtube.com/watch?v={}", entry.id))
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
@@ -455,12 +516,6 @@ fn prepare_youtube_podcast_share_with_boundary(
             },
         });
     }
-    if files.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "yt-dlp found no valid YouTube videos for the podcast feed",
-        ));
-    }
     if feed_artwork_route.is_none() {
         feed_artwork_route = files.iter().find_map(|file| file.artwork_route.clone());
     }
@@ -476,6 +531,15 @@ fn prepare_youtube_podcast_share_with_boundary(
         files,
         artwork,
         remote_config: Some(config),
+    })
+}
+
+/// Identifies a Short by yt-dlp's canonical entry URL rather than heuristics.
+fn youtube_collection_entry_is_short(entry: &crate::playback::ytdlp::CollectionEntry) -> bool {
+    entry.webpage_url.as_ref().is_some_and(|url| {
+        url.domain()
+            .is_some_and(|domain| domain == "youtube.com" || domain.ends_with(".youtube.com"))
+            && url.path_segments().and_then(|mut segments| segments.next()) == Some("shorts")
     })
 }
 
@@ -1568,8 +1632,9 @@ mod tests {
                 },
             ],
         };
-        let prepared = prepare_youtube_podcast_share(collection, YouTubePrewarmConfig::default())
-            .expect("prepare YouTube feed");
+        let prepared =
+            prepare_youtube_podcast_share(collection, YouTubePrewarmConfig::default(), false)
+                .expect("prepare YouTube feed");
         assert_eq!(prepared.files.len(), 2);
         assert_eq!(prepared.artwork.len(), 3);
         assert!(prepared.files.iter().all(|file| file.length == 0));
@@ -1610,7 +1675,7 @@ mod tests {
     }
 
     #[test]
-    fn youtube_podcast_boundary_starts_with_the_selected_video_in_provider_order() {
+    fn youtube_podcast_boundary_keeps_the_selected_video_and_newer_uploads_oldest_first() {
         let entry = |id: &str, title: &str| crate::playback::ytdlp::CollectionEntry {
             id: id.to_owned(),
             title: title.to_owned(),
@@ -1624,9 +1689,9 @@ mod tests {
             extractor: Some("YoutubeTab".to_owned()),
             thumbnail_url: None,
             entries: vec![
-                entry("dQw4w9WgXcQ", "Before selection"),
-                entry("M7lc1UVf-VE", "Selected episode"),
                 entry("aqz-KE-bpKQ", "After selection"),
+                entry("M7lc1UVf-VE", "Selected episode"),
+                entry("dQw4w9WgXcQ", "Before selection"),
             ],
         };
 
@@ -1634,6 +1699,7 @@ mod tests {
             collection,
             YouTubePrewarmConfig::default(),
             "M7lc1UVf-VE",
+            false,
         )
         .expect("prepare YouTube feed from selected video");
 
@@ -1650,6 +1716,131 @@ mod tests {
         assert!(state.rss().contains(
             "<image>\n<url>http://192.0.2.10:8123/artwork/0</url>\n<title>Fixture channel</title>"
         ));
+    }
+
+    #[test]
+    fn youtube_podcast_skip_shorts_uses_provider_urls_after_the_selected_boundary() {
+        let entry = |id: &str, title: &str, path: &str| crate::playback::ytdlp::CollectionEntry {
+            id: id.to_owned(),
+            title: title.to_owned(),
+            webpage_url: Some(
+                Url::parse(&format!("https://www.youtube.com/{path}/{id}"))
+                    .expect("YouTube fixture URL"),
+            ),
+            duration_seconds: None,
+            thumbnail_url: None,
+        };
+        let collection = ExtractedCollection {
+            id: "UCfixture".to_owned(),
+            title: "Fixture channel".to_owned(),
+            extractor: Some("YoutubeTab".to_owned()),
+            thumbnail_url: None,
+            entries: vec![
+                entry("aqz-KE-bpKQ", "Retained video", "watch?v="),
+                entry("M7lc1UVf-VE", "Selected Short", "shorts"),
+                entry("dQw4w9WgXcQ", "Before selection", "watch?v="),
+            ],
+        };
+
+        let prepared = prepare_youtube_podcast_share_from(
+            collection,
+            YouTubePrewarmConfig::default(),
+            "M7lc1UVf-VE",
+            true,
+        )
+        .expect("prepare filtered YouTube feed");
+
+        assert_eq!(prepared.item_count(), 1);
+        assert_eq!(prepared.files[0].label, "Retained video");
+    }
+
+    #[test]
+    fn youtube_podcast_global_upload_order_and_short_boundary_do_not_retain_older_tabs() {
+        let entry = |id: &str, title: &str, short: bool| crate::playback::ytdlp::CollectionEntry {
+            id: id.to_owned(),
+            title: title.to_owned(),
+            webpage_url: Some(
+                Url::parse(&if short {
+                    format!("https://www.youtube.com/shorts/{id}")
+                } else {
+                    format!("https://www.youtube.com/watch?v={id}")
+                })
+                .expect("video URL"),
+            ),
+            duration_seconds: None,
+            thumbnail_url: None,
+        };
+        let collection = ExtractedCollection {
+            id: "UCfixture".to_owned(),
+            title: "Fixture channel".to_owned(),
+            extractor: Some("YoutubeTab".to_owned()),
+            thumbnail_url: None,
+            // Unified uploads are newest first, with regular videos and Shorts interleaved.
+            entries: vec![
+                entry("aaaaaaaaaaa", "Newest Short", true),
+                entry("bbbbbbbbbbb", "Newer video", false),
+                entry("ccccccccccc", "Selected Short", true),
+                entry("ddddddddddd", "Older video", false),
+                entry("eeeeeeeeeee", "Oldest Short", true),
+            ],
+        };
+        let labels = |prepared: PreparedLocalShare| {
+            prepared
+                .files
+                .into_iter()
+                .map(|file| file.label)
+                .collect::<Vec<_>>()
+        };
+        let all = prepare_youtube_podcast_share(
+            collection.clone(),
+            YouTubePrewarmConfig::default(),
+            false,
+        )
+        .expect("whole feed");
+        assert_eq!(
+            labels(all),
+            [
+                "Oldest Short",
+                "Older video",
+                "Selected Short",
+                "Newer video",
+                "Newest Short"
+            ]
+        );
+
+        let selected = prepare_youtube_podcast_share_from(
+            collection.clone(),
+            YouTubePrewarmConfig::default(),
+            "ccccccccccc",
+            false,
+        )
+        .expect("selected and newer feed");
+        let state = ServerState::new(selected, "http://192.0.2.10:8123".to_owned());
+        assert_eq!(
+            state
+                .files
+                .iter()
+                .map(|file| file.label.as_str())
+                .collect::<Vec<_>>(),
+            ["Selected Short", "Newer video", "Newest Short"]
+        );
+        let rss = state.rss();
+        assert!(
+            rss.find("Selected Short").expect("selected") < rss.find("Newer video").expect("newer")
+        );
+        assert!(
+            rss.find("Newer video").expect("newer") < rss.find("Newest Short").expect("newest")
+        );
+        assert!(!rss.contains("Older video"));
+
+        let filtered = prepare_youtube_podcast_share_from(
+            collection,
+            YouTubePrewarmConfig::default(),
+            "ccccccccccc",
+            true,
+        )
+        .expect("selected Short remains a valid cutoff");
+        assert_eq!(labels(filtered), ["Newer video"]);
     }
 
     #[test]

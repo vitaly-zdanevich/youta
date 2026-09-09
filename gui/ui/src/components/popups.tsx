@@ -255,8 +255,8 @@ export function ChannelDownloadPopup({ popup }: { popup: ChannelDownloadPopupVie
 					<dd className='break-all font-mono'>{popup.destination}</dd>
 				</dl>
 				<p className='mt-4 text-ink-dim'>
-					Youta currently downloads audio only. Videos, Shorts, and live uploads are included;
-					existing archive entries are skipped.
+					Youta currently downloads audio only. Videos and live uploads are included. Shorts are
+					included unless Skip Shorts is checked; existing archive entries are skipped.
 				</p>
 				<label className='mt-4 flex cursor-pointer items-center gap-2 text-ink'>
 					<input
@@ -265,6 +265,14 @@ export function ChannelDownloadPopup({ popup }: { popup: ChannelDownloadPopupVie
 						onChange={() => void dispatch('ToggleChannelDownloadIgnoreBefore')}
 					/>
 					Ignore items before this item
+				</label>
+				<label className='mt-2 flex cursor-pointer items-center gap-2 text-ink'>
+					<input
+						type='checkbox'
+						checked={popup.skip_shorts}
+						onChange={() => void dispatch('ToggleChannelDownloadSkipShorts')}
+					/>
+					Skip Shorts
 				</label>
 			</Body>
 		</Popup>
@@ -1226,7 +1234,7 @@ export function VideoQrPopup({ popup }: { popup: VideoQrPopupView }) {
   );
 }
 
-/** Review-first inclusive boundary for a local or YouTube podcast feed. */
+/** Review-first source options for a local or YouTube podcast feed. */
 export function PodcastFeedOptionsPopup({
 	popup,
 }: {
@@ -1242,7 +1250,6 @@ export function PodcastFeedOptionsPopup({
 	return (
 		<Popup
 			title={title}
-			subtitle={popup.source}
 			layer={LAYER.podcastFeedOptions}
 			onDismiss={() => void dispatch('DismissPodcastFeed')}
 			dismissLabel={reviewing ? 'Cancel' : popup.phase === 'Preparing' ? 'Hide' : 'Close'}
@@ -1264,22 +1271,33 @@ export function PodcastFeedOptionsPopup({
 			}
 		>
 			<Body>
-				<p className='m-0 text-ink-dim'>
-					Selected item: <span className='text-ink'>{popup.selected_item}</span>
-				</p>
 				{reviewing ? (
-					<label className='mt-4 flex cursor-pointer items-center gap-2 text-ink'>
-						<input
-							type='checkbox'
-							checked={popup.ignore_items_before}
-							onChange={() => void dispatch('TogglePodcastFeedIgnoreBefore')}
-						/>
-						Ignore items before this item
-					</label>
+					<div className='grid gap-2'>
+						{popup.ignore_items_before_available ? (
+							<label className='flex cursor-pointer items-center gap-2 text-ink'>
+								<input
+									type='checkbox'
+									checked={popup.ignore_items_before}
+									onChange={() => void dispatch('TogglePodcastFeedIgnoreBefore')}
+								/>
+								Ignore items before this item
+							</label>
+						) : null}
+						{popup.skip_shorts_available ? (
+							<label className='flex cursor-pointer items-center gap-2 text-ink'>
+								<input
+									type='checkbox'
+									checked={popup.skip_shorts}
+									onChange={() => void dispatch('TogglePodcastFeedSkipShorts')}
+								/>
+								Skip Shorts
+							</label>
+						) : null}
+					</div>
 				) : popup.phase === 'Preparing' ? (
-					<p className='mt-4 text-ink-dim'>Enumerating channel with yt-dlp{activity}</p>
+					<p className='m-0 text-ink-dim'>Enumerating channel with yt-dlp{activity}</p>
 				) : (
-					<p className='mt-4 text-accent'>{popup.error ?? 'Podcast feed preparation failed'}</p>
+					<p className='m-0 text-accent'>{popup.error ?? 'Podcast feed preparation failed'}</p>
 				)}
 			</Body>
 		</Popup>

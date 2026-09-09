@@ -8060,7 +8060,7 @@ fn render_video_qr_close_control(
         .push((UiAction::DismissVideoQr, Rect::new(x, area.y, width, 1)));
 }
 
-/// Renders the inclusive selected-item boundary before feed preparation.
+/// Renders compact feed options without repeating the underlying selection.
 #[cfg(feature = "lan-sharing")]
 fn render_podcast_feed_options_popup(
     frame: &mut Frame<'_>,
@@ -8070,26 +8070,36 @@ fn render_podcast_feed_options_popup(
 ) {
     let width = frame.area().width.saturating_sub(4).clamp(1, 88);
     let message_width = width.saturating_sub(6).max(1);
-    let message = if popup.phase == PodcastFeedOptionsPhase::Failed {
-        format!(
-            "Source: {}\nSelected item: {}\n\n{}",
-            popup.source,
-            popup.selected_item,
+    let wrapped = if popup.phase == PodcastFeedOptionsPhase::Failed {
+        wrap_text_lines(
             popup
                 .error
                 .as_deref()
-                .unwrap_or("Podcast feed preparation failed")
+                .unwrap_or("Podcast feed preparation failed"),
+            message_width,
         )
     } else {
-        format!(
-            "Source: {}\nSelected item: {}",
-            popup.source, popup.selected_item
-        )
+        Vec::new()
     };
-    let wrapped = wrap_text_lines(&message, message_width);
+    let available_options = [
+        (
+            popup.ignore_items_before_available,
+            PodcastFeedOption::IgnoreItemsBefore,
+        ),
+        (popup.skip_shorts_available, PodcastFeedOption::SkipShorts),
+    ]
+    .into_iter()
+    .filter_map(|(available, option)| available.then_some(option))
+    .collect::<Vec<_>>();
+    let option_rows = if popup.phase == PodcastFeedOptionsPhase::Review {
+        available_options.len().max(1)
+    } else {
+        1
+    };
     let height = u16::try_from(wrapped.len())
         .unwrap_or(u16::MAX)
-        .saturating_add(6)
+        .saturating_add(3)
+        .saturating_add(u16::try_from(option_rows).unwrap_or(u16::MAX))
         .clamp(1, frame.area().height.saturating_sub(2).max(1));
     let area = centered_sized_rect(width, height, frame.area());
     frame.render_widget(Clear, area);
@@ -8106,12 +8116,10 @@ fn render_podcast_feed_options_popup(
     if inner.is_empty() {
         return;
     }
-    let sections = Layout::vertical([
-        Constraint::Min(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-    ])
-    .split(inner);
+    let mut constraints = vec![Constraint::Min(0)];
+    constraints.extend(std::iter::repeat_n(Constraint::Length(1), option_rows));
+    constraints.push(Constraint::Length(1));
+    let sections = Layout::vertical(constraints).split(inner);
     frame.render_widget(
         Paragraph::new(wrapped.join("\n"))
             .style(theme.base)
@@ -8120,31 +8128,36 @@ fn render_podcast_feed_options_popup(
     );
     let controls: Vec<(&str, UiAction)> = match popup.phase {
         PodcastFeedOptionsPhase::Review => {
-            let checkbox = format!(
-                "[{}] Ignore items before this item",
-                if popup.ignore_items_before { 'x' } else { ' ' }
-            );
-            frame.render_widget(
-                Paragraph::new(checkbox.as_str()).style(theme.accent),
-                sections[1],
-            );
-            hit_map.podcast_feed_options_buttons.push((
-                UiAction::TogglePodcastFeedIgnoreBefore,
-                Rect::new(
-                    sections[1].x,
-                    sections[1].y,
-                    terminal_text_width(&checkbox).min(sections[1].width),
-                    1,
-                ),
-            ));
-            vec![
-                (
-                    "[Space] Check/uncheck",
-                    UiAction::TogglePodcastFeedIgnoreBefore,
-                ),
-                ("[Enter] Create feed", UiAction::ConfirmPodcastFeed),
-                ("[Esc] Cancel", UiAction::DismissPodcastFeed),
-            ]
+            for (index, option) in available_options.iter().copied().enumerate() {
+                render_podcast_feed_checkbox(
+                    frame,
+                    sections[index + 1],
+                    popup,
+                    option,
+                    theme,
+                    hit_map,
+                );
+            }
+            if available_options.len() > 1 {
+                vec![
+                    ("[↑/↓] Select", UiAction::MovePodcastFeedOption(1)),
+                    (
+                        "[Space] Check/uncheck",
+                        UiAction::ToggleSelectedPodcastFeedOption,
+                    ),
+                    ("[Enter] Create feed", UiAction::ConfirmPodcastFeed),
+                    ("[Esc] Cancel", UiAction::DismissPodcastFeed),
+                ]
+            } else {
+                vec![
+                    (
+                        "[Space] Check/uncheck",
+                        UiAction::ToggleSelectedPodcastFeedOption,
+                    ),
+                    ("[Enter] Create feed", UiAction::ConfirmPodcastFeed),
+                    ("[Esc] Cancel", UiAction::DismissPodcastFeed),
+                ]
+            }
         }
         PodcastFeedOptionsPhase::Preparing => {
             let frames = ["·  ", "·· ", "···", " ··", "  ·", "   "];
@@ -8174,16 +8187,60 @@ fn render_podcast_feed_options_popup(
         Paragraph::new(controls_text.as_str())
             .alignment(Alignment::Center)
             .style(theme.accent),
-        sections[2],
+        sections[option_rows + 1],
     );
-    let mut x = centered_line_x(sections[2], terminal_text_width(&controls_text));
+    let controls_area = sections[option_rows + 1];
+    let mut x = centered_line_x(controls_area, terminal_text_width(&controls_text));
     for (label, action) in controls {
         let control_width = terminal_text_width(label);
         hit_map
             .podcast_feed_options_buttons
-            .push((action, Rect::new(x, sections[2].y, control_width, 1)));
+            .push((action, Rect::new(x, controls_area.y, control_width, 1)));
         x = x.saturating_add(control_width).saturating_add(3);
     }
+}
+
+/// Renders one keyboard-focused podcast-feed option and its mouse target.
+#[cfg(feature = "lan-sharing")]
+fn render_podcast_feed_checkbox(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    popup: &PodcastFeedOptionsPopupView,
+    option: PodcastFeedOption,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+) {
+    let (label, checked, action) = match option {
+        PodcastFeedOption::IgnoreItemsBefore => (
+            "Ignore items before this item",
+            popup.ignore_items_before,
+            UiAction::TogglePodcastFeedIgnoreBefore,
+        ),
+        PodcastFeedOption::SkipShorts => (
+            "Skip Shorts",
+            popup.skip_shorts,
+            UiAction::TogglePodcastFeedSkipShorts,
+        ),
+    };
+    let selected = popup.selected_option == option;
+    let checkbox = format!(
+        "{}[{}] {label}",
+        if selected { "› " } else { "  " },
+        if checked { 'x' } else { ' ' },
+    );
+    frame.render_widget(
+        Paragraph::new(checkbox.as_str()).style(if selected { theme.accent } else { theme.base }),
+        area,
+    );
+    hit_map.podcast_feed_options_buttons.push((
+        action,
+        Rect::new(
+            area.x,
+            area.y,
+            terminal_text_width(&checkbox).min(area.width),
+            1,
+        ),
+    ));
 }
 
 /// Renders the scanner-safe URL for the active session-scoped LAN server.
@@ -10989,7 +11046,7 @@ fn render_channel_download_popup(
         None => "unavailable; yt-dlp will enumerate the channel".to_owned(),
     };
     let message = format!(
-        "Download every public upload from “{}” as audio?\n\nEstimated videos: {estimate}\nFree space remaining: {}\nDestination: {}\n\nThis includes the channel's videos, Shorts, and live uploads. Existing archive entries will be skipped.",
+        "Download every public upload from “{}” as audio?\n\nEstimated videos: {estimate}\nFree space remaining: {}\nDestination: {}\n\nThis includes the channel's videos, Shorts, and live uploads unless Skip Shorts is checked. Existing archive entries will be skipped.",
         popup.channel_name,
         human_bytes(popup.available_space_bytes),
         popup.destination,
@@ -10999,7 +11056,7 @@ fn render_channel_download_popup(
     let wrapped = wrap_text_lines(&message, message_width);
     let message_height = u16::try_from(wrapped.len()).unwrap_or(u16::MAX);
     let height = message_height
-        .saturating_add(6)
+        .saturating_add(7)
         .clamp(1, frame.area().height.saturating_sub(2).max(1));
     let area = centered_sized_rect(width, height, frame.area());
     frame.render_widget(Clear, area);
@@ -11015,6 +11072,7 @@ fn render_channel_download_popup(
         Constraint::Min(1),
         Constraint::Length(1),
         Constraint::Length(1),
+        Constraint::Length(1),
     ])
     .split(inner);
     frame.render_widget(
@@ -11023,45 +11081,94 @@ fn render_channel_download_popup(
             .wrap(Wrap { trim: false }),
         sections[0],
     );
-    let checkbox = format!(
-        "[{}] Ignore items before this item",
-        if popup.ignore_items_before { 'x' } else { ' ' }
-    );
-    frame.render_widget(
-        Paragraph::new(checkbox.as_str()).style(theme.accent),
+    render_channel_download_checkbox(
+        frame,
         sections[1],
+        popup,
+        ChannelDownloadOption::IgnoreItemsBefore,
+        theme,
+        hit_map,
     );
-    hit_map.channel_download_buttons.push((
-        UiAction::ToggleChannelDownloadIgnoreBefore,
-        Rect::new(
-            sections[1].x,
-            sections[1].y,
-            terminal_text_width(&checkbox).min(sections[1].width),
-            1,
-        ),
-    ));
+    render_channel_download_checkbox(
+        frame,
+        sections[2],
+        popup,
+        ChannelDownloadOption::SkipShorts,
+        theme,
+        hit_map,
+    );
     let confirm_label = "[Enter] Download";
     let cancel_label = "[Esc] Cancel";
-    let controls = format!("{confirm_label}   {cancel_label}");
+    let selection_controls = "[↑/↓] Select   [Space] Check/uncheck   ";
+    let controls = format!("{selection_controls}{confirm_label}   {cancel_label}");
     frame.render_widget(
         Paragraph::new(controls.as_str())
             .alignment(Alignment::Center)
             .style(theme.accent),
-        sections[2],
+        sections[3],
     );
-    let start = centered_line_x(sections[2], terminal_text_width(&controls));
+    let start = centered_line_x(sections[3], terminal_text_width(&controls));
+    let confirm_start = start.saturating_add(terminal_text_width(selection_controls));
     hit_map.channel_download_buttons.push((
         UiAction::ConfirmChannelDownload,
-        Rect::new(start, sections[2].y, terminal_text_width(confirm_label), 1),
+        Rect::new(
+            confirm_start,
+            sections[3].y,
+            terminal_text_width(confirm_label),
+            1,
+        ),
     ));
     hit_map.channel_download_buttons.push((
         UiAction::DismissChannelDownload,
         Rect::new(
-            start
+            confirm_start
                 .saturating_add(terminal_text_width(confirm_label))
                 .saturating_add(3),
-            sections[2].y,
+            sections[3].y,
             terminal_text_width(cancel_label),
+            1,
+        ),
+    ));
+}
+
+/// Renders one keyboard-focused channel-download option and its mouse target.
+#[cfg(feature = "yt-dlp")]
+fn render_channel_download_checkbox(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    popup: &ChannelDownloadPopupView,
+    option: ChannelDownloadOption,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+) {
+    let (label, checked, action) = match option {
+        ChannelDownloadOption::IgnoreItemsBefore => (
+            "Ignore items before this item",
+            popup.ignore_items_before,
+            UiAction::ToggleChannelDownloadIgnoreBefore,
+        ),
+        ChannelDownloadOption::SkipShorts => (
+            "Skip Shorts",
+            popup.skip_shorts,
+            UiAction::ToggleChannelDownloadSkipShorts,
+        ),
+    };
+    let selected = popup.selected_option == option;
+    let checkbox = format!(
+        "{}[{}] {label}",
+        if selected { "› " } else { "  " },
+        if checked { 'x' } else { ' ' },
+    );
+    frame.render_widget(
+        Paragraph::new(checkbox.as_str()).style(if selected { theme.accent } else { theme.base }),
+        area,
+    );
+    hit_map.channel_download_buttons.push((
+        action,
+        Rect::new(
+            area.x,
+            area.y,
+            terminal_text_width(&checkbox).min(area.width),
             1,
         ),
     ));
@@ -20463,6 +20570,8 @@ mod tests {
                 available_space_bytes: 24 * 1024 * 1024 * 1024,
                 destination: "/home/listener/.config/youta/downloads".to_owned(),
                 ignore_items_before: false,
+                skip_shorts: false,
+                selected_option: ChannelDownloadOption::IgnoreItemsBefore,
             }),
             ..ViewModel::default()
         };
@@ -20478,11 +20587,17 @@ mod tests {
         assert!(rendered.contains("Free space remaining: 24.0 GiB"));
         assert!(rendered.contains("videos, Shorts, and live uploads"));
         assert!(rendered.contains("[ ] Ignore items before this item"));
+        assert!(rendered.contains("[ ] Skip Shorts"));
+        assert!(rendered.contains("[Space] Check/uncheck"));
         assert!(rendered.contains("[Enter] Download"));
         assert!(rendered.contains("[Esc] Cancel"));
         assert_eq!(
             key_action(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &view),
-            Some(UiAction::ToggleChannelDownloadIgnoreBefore)
+            Some(UiAction::ToggleSelectedChannelDownloadOption)
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &view),
+            Some(UiAction::MoveChannelDownloadOption(1))
         );
         assert_eq!(
             key_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &view),
@@ -20531,6 +20646,13 @@ mod tests {
                 &view,
             ),
             Some(UiAction::ToggleChannelDownloadIgnoreBefore)
+        );
+        assert!(
+            hit_map
+                .channel_download_buttons
+                .iter()
+                .any(|(action, _)| action == &UiAction::ToggleChannelDownloadSkipShorts),
+            "Skip Shorts must have a mouse target"
         );
     }
 
@@ -28742,6 +28864,10 @@ prose 07:25 remains clickable but is not a chapter";
                 source: "Local folder: Fixture album".to_owned(),
                 selected_item: "02-selected.opus".to_owned(),
                 ignore_items_before: true,
+                ignore_items_before_available: true,
+                skip_shorts: false,
+                skip_shorts_available: false,
+                selected_option: PodcastFeedOption::IgnoreItemsBefore,
                 phase: PodcastFeedOptionsPhase::Review,
                 animation_frame: 0,
                 error: None,
@@ -28755,8 +28881,11 @@ prose 07:25 remains clickable but is not a chapter";
             .expect("draw feed boundary options");
         let rendered = rendered_text(&options_terminal);
         assert!(rendered.contains("Create podcast feed?"));
-        assert!(rendered.contains("Selected item: 02-selected.opus"));
+        assert!(!rendered.contains("Selected item:"));
+        assert!(!rendered.contains("02-selected.opus"));
+        assert!(!rendered.contains("Source:"));
         assert!(rendered.contains("[x] Ignore items before this item"));
+        assert!(!rendered.contains("Skip Shorts"));
         assert!(rendered.contains("[Space] Check/uncheck"));
         assert!(rendered.contains("[Enter] Create feed"));
         assert!(rendered.contains("[Esc] Cancel"));
@@ -28777,6 +28906,27 @@ prose 07:25 remains clickable but is not a chapter";
             .podcast_feed_options_popup
             .as_mut()
             .expect("feed-options popup");
+        options_popup.source = "YouTube channel: Fixture channel".to_owned();
+        options_popup.selected_item = "Fixture video".to_owned();
+        options_popup.skip_shorts_available = true;
+        hit_map.podcast_feed_options_buttons.clear();
+        options_terminal
+            .draw(|frame| render(frame, &options, &UiSettings::default(), &mut hit_map))
+            .expect("draw YouTube feed options");
+        let rendered = rendered_text(&options_terminal);
+        assert!(rendered.contains("[ ] Skip Shorts"));
+        assert!(rendered.contains("[↑/↓] Select"));
+        assert!(
+            hit_map
+                .podcast_feed_options_buttons
+                .iter()
+                .any(|(action, _)| action == &UiAction::TogglePodcastFeedSkipShorts)
+        );
+
+        let options_popup = options
+            .podcast_feed_options_popup
+            .as_mut()
+            .expect("feed-options popup");
         options_popup.phase = PodcastFeedOptionsPhase::Preparing;
         options_popup.animation_frame = 8;
         options_terminal
@@ -28784,6 +28934,8 @@ prose 07:25 remains clickable but is not a chapter";
             .expect("draw feed preparation");
         let rendered = rendered_text(&options_terminal);
         assert!(rendered.contains("Preparing podcast feed…"));
+        assert!(!rendered.contains("Source:"));
+        assert!(!rendered.contains("Selected item:"));
         assert!(rendered.contains("Enumerating channel with yt-dlp…"));
         assert!(rendered.contains("[Esc] Hide"));
         assert!(!rendered.contains("[Enter] Create feed"));
@@ -28799,6 +28951,8 @@ prose 07:25 remains clickable but is not a chapter";
             .expect("draw feed failure");
         let rendered = rendered_text(&options_terminal);
         assert!(rendered.contains("Could not create podcast feed"));
+        assert!(!rendered.contains("Source:"));
+        assert!(!rendered.contains("Selected item:"));
         assert!(rendered.contains("fixture yt-dlp failure"));
         assert!(rendered.contains("[Esc] Close"));
 

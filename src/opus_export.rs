@@ -158,6 +158,7 @@ fn prepare_public_page_opus(
             format: DownloadFormat::TranscodeToOpus,
             scope: DownloadScope::SingleItem,
             playlist_start: None,
+            skip_shorts: false,
             write_thumbnail: false,
             archive_path: None,
         })

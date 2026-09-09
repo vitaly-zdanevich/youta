@@ -3,7 +3,7 @@
 //! Arguments are passed directly to the executable. Youta never constructs a
 //! shell command from a media URL or title.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
@@ -12,6 +12,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use url::Url;
 
+use super::youtube_prewarm::{YouTubePrewarmCancellation, run_bounded_json_command};
 use super::{PlaybackError, Result};
 
 const MAX_METADATA_BYTES: usize = 16 * 1024 * 1024;
@@ -160,6 +161,8 @@ pub struct DownloadRequest {
     pub scope: DownloadScope,
     /// One-based first collection entry, or every entry when absent.
     pub playlist_start: Option<u64>,
+    /// Reject YouTube collection entries whose canonical source is a Shorts URL.
+    pub skip_shorts: bool,
     /// Download the provider thumbnail alongside the audio.
     pub write_thumbnail: bool,
     /// Explicit archive used instead of the shared manual collection archive.
@@ -368,6 +371,75 @@ impl YtDlp {
         collection.try_into()
     }
 
+    /// Enumerates all upload types in one newest-first channel catalogue.
+    ///
+    /// The uploads playlist supplies the global order, while the channel page
+    /// supplies its title and avatar. When `classify_shorts` is enabled, channel
+    /// tabs are fully enumerated to restore Shorts URLs omitted by the uploads
+    /// playlist. Otherwise only one entry per channel tab is requested for its
+    /// metadata. Neither request resolves or downloads media streams.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`PlaybackError`] for an invalid channel ID or zero limit,
+    /// and propagates collection extraction errors from either request.
+    pub fn youtube_channel_collection(
+        &self,
+        channel_id: &str,
+        max_entries: u16,
+        classify_shorts: bool,
+    ) -> Result<ExtractedCollection> {
+        youtube_channel_collection_with(channel_id, max_entries, classify_shorts, |url, limit| {
+            self.collection(url, limit)
+        })
+    }
+
+    /// Enumerates a channel with bounded helpers that are killed and reaped on
+    /// cancellation. Each catalogue request has a two-minute deadline.
+    ///
+    /// # Errors
+    ///
+    /// Returns the usual catalogue errors, or a sanitized cancellation, timeout,
+    /// output-size, or helper failure without including extractor diagnostics.
+    pub fn youtube_channel_collection_cancellable(
+        &self,
+        channel_id: &str,
+        max_entries: u16,
+        classify_shorts: bool,
+        cancellation: &YouTubePrewarmCancellation,
+    ) -> Result<ExtractedCollection> {
+        youtube_channel_collection_with(channel_id, max_entries, classify_shorts, |url, limit| {
+            let mut command = self.base_command();
+            command
+                .args([
+                    "--flat-playlist",
+                    "--dump-single-json",
+                    "--skip-download",
+                    "--socket-timeout",
+                    "15",
+                    "--retries",
+                    "1",
+                    "--extractor-retries",
+                    "1",
+                    "--playlist-end",
+                ])
+                .arg(limit.to_string())
+                .arg("--")
+                .arg(url.as_str());
+            let output = run_bounded_json_command(
+                &mut command,
+                Duration::from_secs(120),
+                MAX_METADATA_BYTES,
+                cancellation,
+            )
+            .map_err(|error| {
+                PlaybackError::Protocol(format!("YouTube channel metadata: {error}"))
+            })?;
+            let collection: ExtractedCollectionJson = serde_json::from_slice(&output)?;
+            collection.try_into()
+        })
+    }
+
     /// Starts an audio download and returns a supervised child process.
     ///
     /// # Errors
@@ -466,6 +538,88 @@ impl TryFrom<ExtractedMedia> for ResolvedMedia {
             audio_codec: value.acodec,
             extractor: value.extractor,
         })
+    }
+}
+
+/// Loads channel metadata and the unified uploads playlist through one adapter.
+fn youtube_channel_collection_with(
+    channel_id: &str,
+    max_entries: u16,
+    classify_shorts: bool,
+    mut extract: impl FnMut(&Url, u16) -> Result<ExtractedCollection>,
+) -> Result<ExtractedCollection> {
+    let suffix = channel_id
+        .strip_prefix("UC")
+        .filter(|suffix| !suffix.is_empty());
+    if max_entries == 0
+        || suffix.is_none()
+        || channel_id.len() > 128
+        || !channel_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(PlaybackError::InvalidValue(
+            "YouTube channel catalogue requires a valid UC channel ID and a positive limit"
+                .to_owned(),
+        ));
+    }
+    let channel_url = Url::parse(&format!("https://www.youtube.com/channel/{channel_id}"))
+        .map_err(|error| {
+            PlaybackError::InvalidValue(format!("invalid YouTube channel URL: {error}"))
+        })?;
+    let mut uploads_url = Url::parse("https://www.youtube.com/playlist").map_err(|error| {
+        PlaybackError::InvalidValue(format!("invalid YouTube uploads URL: {error}"))
+    })?;
+    uploads_url
+        .query_pairs_mut()
+        .append_pair("list", &format!("UU{}", suffix.unwrap_or_default()));
+    let channel_limit = if classify_shorts { max_entries } else { 1 };
+    let channel = extract(&channel_url, channel_limit)?;
+    let uploads = extract(&uploads_url, max_entries)?;
+    Ok(merge_youtube_channel_collections(channel, uploads))
+}
+
+/// Keeps global upload order and restores channel artwork and canonical Shorts URLs.
+///
+/// Shorts are marked rather than removed so a selected Short remains available
+/// as an inclusive podcast boundary. Repeated uploads retain their first,
+/// newest occurrence before the podcast preparation reverses the catalogue.
+fn merge_youtube_channel_collections(
+    channel: ExtractedCollection,
+    mut uploads: ExtractedCollection,
+) -> ExtractedCollection {
+    let shorts = channel
+        .entries
+        .into_iter()
+        .filter_map(|entry| {
+            let url = entry.webpage_url?;
+            let is_short = url
+                .domain()
+                .is_some_and(|domain| domain == "youtube.com" || domain.ends_with(".youtube.com"))
+                && url.path_segments().and_then(|mut segments| segments.next()) == Some("shorts");
+            is_short.then_some((entry.id, url))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut seen = HashSet::new();
+    uploads.entries.retain_mut(|entry| {
+        if !seen.insert(entry.id.clone()) {
+            return false;
+        }
+        if let Some(short_url) = shorts.get(&entry.id) {
+            entry.webpage_url = Some(short_url.clone());
+        }
+        true
+    });
+    ExtractedCollection {
+        id: channel.id,
+        title: if channel.title.trim().is_empty() {
+            uploads.title
+        } else {
+            channel.title
+        },
+        extractor: channel.extractor.or(uploads.extractor),
+        thumbnail_url: channel.thumbnail_url.or(uploads.thumbnail_url),
+        entries: uploads.entries,
     }
 }
 
@@ -667,6 +821,11 @@ fn build_download_command(config: &YtDlpConfig, request: &DownloadRequest) -> Co
                     .arg("--playlist-start")
                     .arg(playlist_start.to_string());
             }
+            if request.skip_shorts {
+                command
+                    .arg("--match-filters")
+                    .arg("original_url!*=/shorts/");
+            }
         }
     }
 
@@ -854,6 +1013,7 @@ mod tests {
             format: DownloadFormat::OpusWithoutTranscoding,
             scope: DownloadScope::SingleItem,
             playlist_start: None,
+            skip_shorts: false,
             write_thumbnail: true,
             archive_path: None,
         };
@@ -958,6 +1118,7 @@ mod tests {
             format: DownloadFormat::OpusWithoutTranscoding,
             scope: DownloadScope::Collection,
             playlist_start: Some(17),
+            skip_shorts: true,
             write_thumbnail: true,
             archive_path: None,
         };
@@ -985,6 +1146,25 @@ mod tests {
         assert!(arguments.windows(2).any(|pair| {
             pair[0] == "--output" && pair[1].starts_with("%(channel).100B [%(channel_id)s]/")
         }));
+        assert!(
+            arguments.windows(2).any(|pair| {
+                pair[0] == "--match-filters" && pair[1] == "original_url!*=/shorts/"
+            })
+        );
+
+        let include_shorts_request = DownloadRequest {
+            skip_shorts: false,
+            ..request
+        };
+        let include_shorts_arguments = build_download_command(&config, &include_shorts_request)
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            !include_shorts_arguments
+                .iter()
+                .any(|argument| argument == "--match-filters")
+        );
     }
 
     #[test]
@@ -997,6 +1177,7 @@ mod tests {
             format: DownloadFormat::OpusWithoutTranscoding,
             scope: DownloadScope::Collection,
             playlist_start: None,
+            skip_shorts: false,
             write_thumbnail: true,
             archive_path: Some(PathBuf::from(
                 "/tmp/youta-fixture-downloads/.youta-auto-download/UCfixture.archive",
@@ -1029,6 +1210,7 @@ mod tests {
             format: DownloadFormat::OpusWithoutTranscoding,
             scope: DownloadScope::CollectionArchiveOnly,
             playlist_start: None,
+            skip_shorts: false,
             write_thumbnail: false,
             archive_path: Some(PathBuf::from("/tmp/UCfixture.archive")),
         };
@@ -1149,6 +1331,129 @@ mod tests {
         let collection = ExtractedCollection::try_from(extracted).expect("collection");
 
         assert_eq!(collection.extractor.as_deref(), Some("YoutubeTab"));
+    }
+
+    #[test]
+    fn youtube_channel_catalogue_keeps_upload_order_and_channel_short_metadata() {
+        let channel_json = r#"{
+            "id": "UCfixture", "title": "Fixture channel",
+            "thumbnail": "https://images.example/avatar.jpg",
+            "entries": [
+                {"id": "videos", "entries": [
+                    {"id": "new-video", "title": "New video"},
+                    {"id": "old-video", "title": "Old video"}
+                ]},
+                {"id": "shorts", "entries": [
+                    {"id": "new-short", "url": "https://www.youtube.com/shorts/new-short"},
+                    {"id": "selected-short", "url": "https://www.youtube.com/shorts/selected-short"},
+                    {"id": "old-short", "url": "https://www.youtube.com/shorts/old-short"}
+                ]}
+            ]
+        }"#;
+        let uploads_json = r#"{
+            "id": "UUfixture", "title": "Uploads from Fixture channel",
+            "thumbnail": "https://images.example/first-video.jpg",
+            "entries": [
+                {"id": "new-short", "title": "New Short", "url": "https://www.youtube.com/watch?v=new-short"},
+                {"id": "new-video", "title": "New video", "url": "https://www.youtube.com/watch?v=new-video"},
+                {"id": "selected-short", "title": "Selected Short", "url": "https://www.youtube.com/watch?v=selected-short"},
+                {"id": "old-video", "title": "Old video", "url": "https://www.youtube.com/watch?v=old-video"},
+                {"id": "old-short", "title": "Old Short", "url": "https://www.youtube.com/watch?v=old-short"},
+                {"id": "new-video", "title": "Duplicate video"}
+            ]
+        }"#;
+        let channel: ExtractedCollectionJson =
+            serde_json::from_str(channel_json).expect("channel fixture");
+        let uploads: ExtractedCollectionJson =
+            serde_json::from_str(uploads_json).expect("uploads fixture");
+        let collection = merge_youtube_channel_collections(
+            channel.try_into().expect("channel"),
+            uploads.try_into().expect("uploads"),
+        );
+
+        assert_eq!(collection.title, "Fixture channel");
+        assert_eq!(
+            collection.thumbnail_url.as_ref().map(Url::as_str),
+            Some("https://images.example/avatar.jpg")
+        );
+        assert_eq!(
+            collection
+                .entries
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "new-short",
+                "new-video",
+                "selected-short",
+                "old-video",
+                "old-short"
+            ]
+        );
+        assert_eq!(
+            collection.entries[0].webpage_url.as_ref().map(Url::as_str),
+            Some("https://www.youtube.com/shorts/new-short")
+        );
+        assert_eq!(
+            collection.entries[1].webpage_url.as_ref().map(Url::as_str),
+            Some("https://www.youtube.com/watch?v=new-video")
+        );
+        assert_eq!(collection.entries[1].title, "New video");
+        assert_eq!(
+            collection.entries[2].webpage_url.as_ref().map(Url::as_str),
+            Some("https://www.youtube.com/shorts/selected-short")
+        );
+    }
+
+    #[test]
+    fn youtube_channel_catalogue_limits_metadata_work_when_shorts_are_not_filtered() {
+        for (classify_shorts, channel_limit) in [(false, 1), (true, 2000)] {
+            let mut calls = Vec::new();
+            youtube_channel_collection_with("UCfixture", 2000, classify_shorts, |url, limit| {
+                calls.push((url.to_string(), limit));
+                Ok(ExtractedCollection {
+                    id: "fixture".to_owned(),
+                    title: "Fixture".to_owned(),
+                    extractor: None,
+                    thumbnail_url: None,
+                    entries: Vec::new(),
+                })
+            })
+            .expect("channel catalogue");
+            assert_eq!(
+                calls,
+                [
+                    (
+                        "https://www.youtube.com/channel/UCfixture".to_owned(),
+                        channel_limit
+                    ),
+                    (
+                        "https://www.youtube.com/playlist?list=UUfixture".to_owned(),
+                        2000
+                    ),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn youtube_channel_catalogue_rejects_invalid_ids_and_zero_limits_before_extraction() {
+        for (channel_id, limit) in [
+            ("", 20),
+            ("UC", 20),
+            ("@fixture", 20),
+            ("UCfixture/shorts", 20),
+            ("UCfixture?list=x", 20),
+            ("UCfixture", 0),
+        ] {
+            let result = youtube_channel_collection_with(channel_id, limit, false, |_, _| {
+                panic!("invalid catalogue request must not execute yt-dlp")
+            });
+            assert!(
+                matches!(result, Err(PlaybackError::InvalidValue(_))),
+                "{channel_id:?}"
+            );
+        }
     }
 
     #[test]

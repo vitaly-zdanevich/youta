@@ -1726,12 +1726,31 @@ pub struct PodcastFeedOptionsPopupView {
     pub selected_item: String,
     /// Whether entries before [`Self::selected_item`] are omitted.
     pub ignore_items_before: bool,
+    /// Whether the visible selection supplies a meaningful inclusive boundary.
+    pub ignore_items_before_available: bool,
+    /// Whether this YouTube feed should omit entries from the Shorts tab.
+    pub skip_shorts: bool,
+    /// Whether this feed source is a YouTube channel with identifiable Shorts.
+    pub skip_shorts_available: bool,
+    /// Checkbox currently selected for keyboard interaction.
+    pub selected_option: PodcastFeedOption,
     /// Current review, preparation, or failure phase.
     pub phase: PodcastFeedOptionsPhase,
     /// Slow indeterminate-animation frame advanced by the controller tick.
     pub animation_frame: usize,
     /// Visible preparation failure retained until the popup is closed.
     pub error: Option<String>,
+}
+
+/// Keyboard-selectable option in podcast-feed review.
+#[cfg(feature = "lan-sharing")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub enum PodcastFeedOption {
+    /// Inclusive boundary anchored to the selected file or video.
+    #[default]
+    IgnoreItemsBefore,
+    /// Exclusion of videos exposed through YouTube's Shorts tab.
+    SkipShorts,
 }
 
 /// One source-control commit rendered in the offline-first project-history popup.
@@ -2073,6 +2092,21 @@ pub struct ChannelDownloadPopupView {
     pub destination: String,
     /// Whether yt-dlp should start at the currently selected channel item.
     pub ignore_items_before: bool,
+    /// Whether yt-dlp should reject entries exposed through YouTube Shorts URLs.
+    pub skip_shorts: bool,
+    /// Checkbox currently selected for keyboard interaction.
+    pub selected_option: ChannelDownloadOption,
+}
+
+/// Keyboard-selectable option in the full-channel download confirmation.
+#[cfg(feature = "yt-dlp")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub enum ChannelDownloadOption {
+    /// Inclusive boundary anchored to the selected channel item.
+    #[default]
+    IgnoreItemsBefore,
+    /// Exclusion of videos exposed through YouTube's Shorts tab.
+    SkipShorts,
 }
 
 /// A live Radio stream capture that remains private until it is finalized.
@@ -2829,6 +2863,15 @@ pub enum UiAction {
     /// Toggle the inclusive selected-item boundary for a channel download.
     #[cfg(feature = "yt-dlp")]
     ToggleChannelDownloadIgnoreBefore,
+    /// Toggle omission of YouTube Shorts for a channel download.
+    #[cfg(feature = "yt-dlp")]
+    ToggleChannelDownloadSkipShorts,
+    /// Move keyboard focus between channel-download checkboxes.
+    #[cfg(feature = "yt-dlp")]
+    MoveChannelDownloadOption(i32),
+    /// Toggle the keyboard-focused channel-download checkbox.
+    #[cfg(feature = "yt-dlp")]
+    ToggleSelectedChannelDownloadOption,
     /// Close the full-channel confirmation without starting it.
     #[cfg(feature = "yt-dlp")]
     DismissChannelDownload,
@@ -3023,6 +3066,15 @@ pub enum UiAction {
     /// Toggle whether a reviewed feed omits items before its selected boundary.
     #[cfg(feature = "lan-sharing")]
     TogglePodcastFeedIgnoreBefore,
+    /// Toggle omission of YouTube Shorts from a reviewed podcast feed.
+    #[cfg(feature = "lan-sharing")]
+    TogglePodcastFeedSkipShorts,
+    /// Move keyboard focus between available podcast-feed checkboxes.
+    #[cfg(feature = "lan-sharing")]
+    MovePodcastFeedOption(i32),
+    /// Toggle the keyboard-focused podcast-feed checkbox.
+    #[cfg(feature = "lan-sharing")]
+    ToggleSelectedPodcastFeedOption,
     /// Create the reviewed local or YouTube podcast feed.
     #[cfg(feature = "lan-sharing")]
     ConfirmPodcastFeed,
