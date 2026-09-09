@@ -1797,6 +1797,8 @@ regular videos and live uploads. Confirmation starts one supervised `yt-dlp`
 collection download with per-file and aggregate progress, speed, ETA, completed
 file count, and cancellation. It downloads public uploads as audio and can
 write each provider thumbnail beside its audio file.
+After cancellation with `[C]`, the stopped-download line disappears after
+10 seconds. A new download replaces that notice without waiting for its expiry.
 
 The default-on `lan-sharing` feature adds two Local actions. `[F11] Share over
 LAN` serves the selected regular file or a bounded, recursive folder index.

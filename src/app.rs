@@ -3387,6 +3387,9 @@ const DOWNLOAD_COMPLETED_PATHS: usize = 4;
 /// How long a successful download path remains visible after completion.
 #[cfg(feature = "yt-dlp")]
 const DOWNLOAD_COMPLETION_NOTICE_DURATION: Duration = Duration::from_secs(30);
+/// How long an explicitly cancelled download remains visible after cancellation.
+#[cfg(feature = "yt-dlp")]
+const DOWNLOAD_CANCELLATION_NOTICE_DURATION: Duration = Duration::from_secs(10);
 /// Interval between background checks while Youta remains open.
 #[cfg(feature = "yt-dlp")]
 const AUTO_DOWNLOAD_INTERVAL: Duration = Duration::from_secs(60 * 60);
@@ -5336,6 +5339,9 @@ pub struct AppController {
     /// Deadline for removing only a successful completed-path notice.
     #[cfg(feature = "yt-dlp")]
     download_completion_notice_deadline: Option<Instant>,
+    /// Owned by explicit cancellation; replacement downloads or progress invalidate it.
+    #[cfg(feature = "yt-dlp")]
+    download_cancellation_notice_deadline: Option<Instant>,
     /// Selected provider media and private authentication behind the Commons popup.
     #[cfg(feature = "commons-upload")]
     commons_upload_selection: Option<CommonsUploadSelection>,
@@ -6584,6 +6590,8 @@ impl AppController {
             channel_download_selection: None,
             #[cfg(feature = "yt-dlp")]
             download_completion_notice_deadline: None,
+            #[cfg(feature = "yt-dlp")]
+            download_cancellation_notice_deadline: None,
             #[cfg(feature = "commons-upload")]
             commons_upload_selection: None,
             #[cfg(feature = "commons-upload")]
@@ -8146,6 +8154,10 @@ impl AppController {
                     if generation != self.yandex_music_download_generation {
                         continue;
                     }
+                    #[cfg(feature = "yt-dlp")]
+                    {
+                        self.download_cancellation_notice_deadline = None;
+                    }
                     self.view.download = Some(DownloadView {
                         title,
                         downloaded_bytes: progress.bytes_written,
@@ -8178,6 +8190,7 @@ impl AppController {
                     });
                     #[cfg(feature = "yt-dlp")]
                     {
+                        self.download_cancellation_notice_deadline = None;
                         self.download_completion_notice_deadline =
                             Some(Instant::now() + DOWNLOAD_COMPLETION_NOTICE_DURATION);
                     }
@@ -8724,6 +8737,10 @@ impl AppController {
             Ok(handle) => {
                 self.yandex_music_download_thread = Some(handle);
                 self.yandex_music_download_cancel = Some(cancellation);
+                #[cfg(feature = "yt-dlp")]
+                {
+                    self.download_cancellation_notice_deadline = None;
+                }
                 self.view.download = Some(DownloadView {
                     title: batch_title.clone(),
                     active: true,
@@ -19544,6 +19561,7 @@ impl AppController {
                 return;
             }
         };
+        self.download_cancellation_notice_deadline = None;
         self.view.download = Some(DownloadView {
             title: selection.channel_name.clone(),
             total_files: estimated_video_count,
@@ -19797,6 +19815,7 @@ impl AppController {
             }
         };
         self.automatic_download_queue.pop_front();
+        self.download_cancellation_notice_deadline = None;
         self.view.download = Some(DownloadView {
             title: job.channel_name.clone(),
             collection: true,
@@ -19814,8 +19833,15 @@ impl AppController {
         self.active_download = Some(active);
     }
 
+    /// Cancels the running download and briefly retains its stopped progress row.
     #[cfg(feature = "yt-dlp")]
     fn cancel_active_download(&mut self) {
+        self.cancel_active_download_at(Instant::now());
+    }
+
+    /// Schedules only an explicit cancellation notice using the supplied monotonic time.
+    #[cfg(feature = "yt-dlp")]
+    fn cancel_active_download_at(&mut self, now: Instant) {
         self.automatic_download_queue.clear();
         let Some(mut active) = self.active_download.take() else {
             self.view.status_line = "No download is running".to_owned();
@@ -19828,6 +19854,8 @@ impl AppController {
             download.eta_seconds = None;
         }
         self.download_completion_notice_deadline = None;
+        self.download_cancellation_notice_deadline =
+            Some(now + DOWNLOAD_CANCELLATION_NOTICE_DURATION);
         self.view.status_line = format!("Cancelled download: {title}");
     }
 
@@ -19912,6 +19940,7 @@ impl AppController {
                 return;
             }
         };
+        self.download_cancellation_notice_deadline = None;
         self.view.download = Some(DownloadView {
             title: title.clone(),
             active: true,
@@ -19932,9 +19961,14 @@ impl AppController {
             "Download support was disabled when this Youta binary was built".to_owned();
     }
 
-    /// Polls one active download and expires a completed-path notice at `now`.
+    /// Polls one active download and expires successful or cancelled notices at `now`.
     #[cfg(feature = "yt-dlp")]
     fn poll_download_at(&mut self, now: Instant) {
+        expire_download_cancellation_notice(
+            &mut self.view,
+            &mut self.download_cancellation_notice_deadline,
+            now,
+        );
         expire_download_completion_notice(
             &mut self.view,
             &mut self.download_completion_notice_deadline,
@@ -42329,6 +42363,28 @@ fn expire_download_completion_notice(
         return;
     }
     clear_download_completion_notice(view, deadline);
+}
+
+/// Removes an explicitly cancelled notice at its deadline, not arbitrary stopped state.
+///
+/// Failed downloads also look inactive, so only cancellation schedules this deadline.
+/// A replacement download or accepted native response invalidates it before expiry.
+#[cfg(feature = "yt-dlp")]
+fn expire_download_cancellation_notice(
+    view: &mut ViewModel,
+    deadline: &mut Option<Instant>,
+    now: Instant,
+) {
+    if deadline.is_some_and(|expires_at| now >= expires_at) {
+        *deadline = None;
+        if view
+            .download
+            .as_ref()
+            .is_some_and(|download| !download.active && download.completed_path.is_none())
+        {
+            view.download = None;
+        }
+    }
 }
 
 #[cfg(feature = "yt-dlp")]
@@ -72083,7 +72139,10 @@ mod tests {
                     .expect("uploads URL"),
                 });
         }
+        let cancelled_deadline = Instant::now();
+        controller.download_cancellation_notice_deadline = Some(cancelled_deadline);
         controller.start_next_automatic_download();
+        assert!(controller.download_cancellation_notice_deadline.is_none());
         controller.poll_download_at(Instant::now());
         assert!(controller.active_download.is_none());
         assert!(controller.view.error_popup.is_some());
@@ -72092,6 +72151,9 @@ mod tests {
             controller.automatic_download_queue[0].channel_id,
             "UChealthy"
         );
+        let failed_download = controller.view.download.clone();
+        controller.poll_download_at(cancelled_deadline + Duration::from_secs(60));
+        assert_eq!(controller.view.download, failed_download);
         controller.shutdown();
     }
 
@@ -72275,7 +72337,9 @@ mod tests {
                 .is_some_and(|popup| popup.skip_shorts
                     && popup.selected_option == ChannelDownloadOption::SkipShorts)
         );
+        controller.download_cancellation_notice_deadline = Some(Instant::now());
         controller.dispatch(UiAction::ConfirmChannelDownload);
+        assert!(controller.download_cancellation_notice_deadline.is_none());
 
         let request = requests
             .lock()
@@ -72327,6 +72391,239 @@ mod tests {
                 .is_some_and(|download| !download.active)
         );
         assert!(controller.view.status_line.contains("Cancelled download"));
+        let deadline = controller
+            .download_cancellation_notice_deadline
+            .expect("cancellation deadline");
+        controller.poll_download_at(deadline - Duration::from_nanos(1));
+        assert!(controller.view.download.is_some());
+        controller.poll_download_at(deadline);
+        assert!(controller.view.download.is_none());
+        assert!(controller.download_cancellation_notice_deadline.is_none());
+    }
+
+    #[cfg(feature = "yt-dlp")]
+    #[test]
+    fn cancelled_download_notice_expires_after_ten_seconds() {
+        let temporary = crate::test_support::canonical_tempdir("cancelled download notice");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let process = MockRunningDownload {
+            progress: Some(Cursor::new(Vec::new())),
+            errors: Some(Cursor::new(Vec::new())),
+            exits: VecDeque::from([Ok(None)]),
+            cancelled: Arc::clone(&cancelled),
+        };
+        let (mut controller, _, _) = controller_with_mock_download(config, process);
+        controller.dispatch(UiAction::Download);
+        controller
+            .view
+            .download
+            .as_mut()
+            .expect("active download")
+            .eta_seconds = Some(12);
+        let cancelled_at = Instant::now();
+        controller.cancel_active_download_at(cancelled_at);
+
+        assert!(cancelled.load(Ordering::SeqCst));
+        assert!(controller.active_download.is_none());
+        assert!(controller.download_completion_notice_deadline.is_none());
+        assert_eq!(
+            controller
+                .view
+                .download
+                .as_ref()
+                .expect("cancelled download")
+                .eta_seconds,
+            None,
+        );
+        let deadline = cancelled_at + Duration::from_secs(10);
+        assert_eq!(
+            controller.download_cancellation_notice_deadline,
+            Some(deadline)
+        );
+        controller.poll_download_at(deadline - Duration::from_nanos(1));
+        assert!(controller.view.download.is_some());
+        let status_line = controller.view.status_line.clone();
+        controller.poll_download_at(deadline);
+        assert!(
+            controller.view.download.is_none(),
+            "a cancelled download row must disappear after ten seconds"
+        );
+        assert!(controller.download_cancellation_notice_deadline.is_none());
+        assert_eq!(controller.view.status_line, status_line);
+        controller.poll_download_at(deadline + Duration::from_secs(1));
+        assert!(controller.view.download.is_none());
+    }
+
+    #[cfg(feature = "yt-dlp")]
+    #[test]
+    fn cancelled_download_notice_is_not_extended_by_noop_cancel_or_failed_start() {
+        let temporary = crate::test_support::canonical_tempdir("cancel notice ownership");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let process = MockRunningDownload {
+            progress: Some(Cursor::new(Vec::new())),
+            errors: Some(Cursor::new(Vec::new())),
+            exits: VecDeque::from([Ok(None)]),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+        let (mut controller, _, _) = controller_with_mock_download(config, process);
+        let now = Instant::now();
+        controller.cancel_active_download_at(now);
+        assert!(controller.download_cancellation_notice_deadline.is_none());
+        assert!(controller.view.download.is_none());
+
+        controller.dispatch(UiAction::Download);
+        controller.cancel_active_download_at(now);
+        let deadline = now + Duration::from_secs(10);
+        controller.cancel_active_download_at(now + Duration::from_secs(5));
+        assert_eq!(
+            controller.download_cancellation_notice_deadline,
+            Some(deadline)
+        );
+        controller.dispatch(UiAction::Download);
+        assert!(
+            controller.view.error_popup.is_some(),
+            "the mock launcher has no replacement"
+        );
+        assert_eq!(
+            controller.download_cancellation_notice_deadline,
+            Some(deadline)
+        );
+        let error_popup = controller.view.error_popup.clone();
+        controller.poll_download_at(deadline);
+        assert!(controller.view.download.is_none());
+        assert_eq!(controller.view.error_popup, error_popup);
+    }
+
+    #[cfg(feature = "yt-dlp")]
+    #[test]
+    fn cancelled_download_notice_never_expires_replacement_progress_success_or_failure() {
+        for replacement_success in [None, Some(true), Some(false)] {
+            let temporary = crate::test_support::canonical_tempdir("replacement download notice");
+            let config = Config::for_dir(temporary.path().join("youta"));
+            let completed = config.downloads_dir().join("replacement.opus");
+            std::fs::create_dir_all(config.downloads_dir()).expect("download directory");
+            std::fs::write(&completed, b"mock opus").expect("completed replacement");
+            let process = MockRunningDownload {
+                progress: Some(Cursor::new(Vec::new())),
+                errors: Some(Cursor::new(Vec::new())),
+                exits: VecDeque::from([Ok(None)]),
+                cancelled: Arc::new(AtomicBool::new(false)),
+            };
+            let (mut controller, requests, _) = controller_with_mock_download(config, process);
+            controller.dispatch(UiAction::Download);
+            let cancelled_at = Instant::now();
+            controller.cancel_active_download_at(cancelled_at);
+            let old_deadline = cancelled_at + Duration::from_secs(10);
+            let cancelled_title = controller
+                .view
+                .download
+                .as_ref()
+                .expect("cancelled row")
+                .title
+                .clone();
+            controller.download_launcher = Box::new(MockDownloadLauncher {
+                requests,
+                process: Some(Box::new(MockRunningDownload {
+                    progress: Some(Cursor::new(
+                        format!("youta-file|{}\n", completed.display()).into_bytes(),
+                    )),
+                    errors: Some(Cursor::new(b"replacement diagnostic\n".to_vec())),
+                    exits: VecDeque::from([
+                        Ok(None),
+                        Ok(replacement_success.map(|success| DownloadExit {
+                            success,
+                            description: format!("exit status: {}", u8::from(!success)),
+                        })),
+                    ]),
+                    cancelled: Arc::new(AtomicBool::new(false)),
+                })),
+            });
+            controller.dispatch(UiAction::Download);
+            assert!(controller.download_cancellation_notice_deadline.is_none());
+            controller
+                .active_download
+                .as_mut()
+                .expect("replacement process")
+                .join_readers();
+            assert_eq!(
+                controller
+                    .view
+                    .download
+                    .as_ref()
+                    .expect("replacement row")
+                    .title,
+                cancelled_title
+            );
+            controller.poll_download_at(cancelled_at + Duration::from_secs(5));
+            assert!(
+                controller
+                    .view
+                    .download
+                    .as_ref()
+                    .is_some_and(|download| download.active)
+            );
+            let settled_at = cancelled_at + Duration::from_secs(6);
+            controller.poll_download_at(settled_at);
+            let replacement = controller.view.download.clone();
+            let popup = controller.view.error_popup.clone();
+            controller.poll_download_at(old_deadline);
+            assert_eq!(controller.view.download, replacement);
+            assert_eq!(controller.view.error_popup, popup);
+            if replacement_success == Some(true) {
+                let completed_deadline = settled_at + Duration::from_secs(30);
+                assert_eq!(
+                    controller.download_completion_notice_deadline,
+                    Some(completed_deadline)
+                );
+                controller.poll_download_at(completed_deadline - Duration::from_nanos(1));
+                assert_eq!(controller.view.download, replacement);
+                controller.poll_download_at(completed_deadline);
+                assert!(controller.view.download.is_none());
+            } else {
+                controller.poll_download_at(old_deadline + Duration::from_secs(60));
+                assert_eq!(controller.view.download, replacement);
+                assert_eq!(controller.view.error_popup, popup);
+                assert_eq!(popup.is_some(), replacement_success == Some(false));
+            }
+            controller.shutdown();
+        }
+    }
+
+    #[cfg(feature = "yt-dlp")]
+    #[test]
+    fn cancelled_download_notice_uses_the_latest_actual_cancellation_deadline() {
+        let temporary = crate::test_support::canonical_tempdir("consecutive cancellation notices");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let process = MockRunningDownload {
+            progress: Some(Cursor::new(Vec::new())),
+            errors: Some(Cursor::new(Vec::new())),
+            exits: VecDeque::from([Ok(None)]),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+        let (mut controller, requests, _) = controller_with_mock_download(config, process);
+        controller.dispatch(UiAction::Download);
+        let now = Instant::now();
+        controller.cancel_active_download_at(now);
+        controller.download_launcher = Box::new(MockDownloadLauncher {
+            requests,
+            process: Some(Box::new(MockRunningDownload {
+                progress: Some(Cursor::new(Vec::new())),
+                errors: Some(Cursor::new(Vec::new())),
+                exits: VecDeque::from([Ok(None)]),
+                cancelled: Arc::new(AtomicBool::new(false)),
+            })),
+        });
+        controller.dispatch(UiAction::Download);
+        controller.cancel_active_download_at(now + Duration::from_secs(5));
+        assert_eq!(
+            controller.download_cancellation_notice_deadline,
+            Some(now + Duration::from_secs(15)),
+        );
+        controller.poll_download_at(now + Duration::from_secs(10));
+        assert!(controller.view.download.is_some());
+        controller.poll_download_at(now + Duration::from_secs(15));
+        assert!(controller.view.download.is_none());
     }
 
     #[cfg(feature = "yt-dlp")]
@@ -72363,6 +72660,7 @@ mod tests {
         controller.shutdown();
         assert!(cancelled.load(Ordering::SeqCst));
         assert!(controller.active_download.is_none());
+        assert!(controller.download_cancellation_notice_deadline.is_none());
     }
 
     #[cfg(feature = "yt-dlp")]
@@ -72428,6 +72726,151 @@ mod tests {
         controller.shutdown();
     }
 
+    #[cfg(all(feature = "yandex-music", feature = "yt-dlp"))]
+    #[test]
+    fn cancelled_download_notice_is_invalidated_only_by_current_native_responses() {
+        for success in [None, Some(true), Some(false)] {
+            let temporary = crate::test_support::canonical_tempdir("overlapping download notice");
+            let config = Config::for_dir(temporary.path().join("youta"));
+            let completed_path = config.downloads_dir().join("native.opus");
+            let process = MockRunningDownload {
+                progress: Some(Cursor::new(Vec::new())),
+                errors: Some(Cursor::new(Vec::new())),
+                exits: VecDeque::from([Ok(None)]),
+                cancelled: Arc::new(AtomicBool::new(false)),
+            };
+            let (mut controller, _, _) = controller_with_mock_download(config, process);
+            controller.dispatch(UiAction::Download);
+            let cancelled_at = Instant::now();
+            controller.cancel_active_download_at(cancelled_at);
+            let cancelled_deadline = controller.download_cancellation_notice_deadline;
+            let cancelled_view = controller.view.download.clone();
+            controller.yandex_music_download_generation = 4;
+            let response = |generation| match success {
+                None => YandexMusicMediaJobResponse::DownloadProgress {
+                    generation,
+                    title: "Native overlap".to_owned(),
+                    progress: YandexMusicDownloadProgress {
+                        bytes_written: 512,
+                        total_bytes: Some(1024),
+                    },
+                },
+                Some(success) => YandexMusicMediaJobResponse::DownloadFinished {
+                    generation,
+                    batch_title: "Native overlap".to_owned(),
+                    completed_paths: if success {
+                        vec![completed_path.clone()]
+                    } else {
+                        Vec::new()
+                    },
+                    failures: if success {
+                        Vec::new()
+                    } else {
+                        vec!["fixture failure".to_owned()]
+                    },
+                },
+            };
+            controller
+                .yandex_music_media_job_sender
+                .send(response(3))
+                .expect("stale response");
+            controller.drain_yandex_music_media_job_responses();
+            assert_eq!(
+                controller.download_cancellation_notice_deadline,
+                cancelled_deadline
+            );
+            assert_eq!(controller.view.download, cancelled_view);
+
+            // A native batch already running before cancellation can still publish its own row.
+            controller
+                .yandex_music_media_job_sender
+                .send(response(4))
+                .expect("current response");
+            controller.drain_yandex_music_media_job_responses();
+            assert!(
+                controller.download_cancellation_notice_deadline.is_none(),
+                "an accepted native response owns the replacement row"
+            );
+            let replacement = controller.view.download.clone();
+            let popup = controller.view.error_popup.clone();
+            controller.poll_download_at(cancelled_at + Duration::from_secs(10));
+            assert_eq!(controller.view.download, replacement);
+            assert_eq!(controller.view.error_popup, popup);
+            if success == Some(true) {
+                let deadline = controller
+                    .download_completion_notice_deadline
+                    .expect("success notice deadline");
+                controller.poll_download_at(deadline - Duration::from_nanos(1));
+                assert_eq!(controller.view.download, replacement);
+                controller.poll_download_at(deadline);
+                assert!(controller.view.download.is_none());
+            } else {
+                controller.poll_download_at(cancelled_at + Duration::from_secs(60));
+                assert_eq!(controller.view.download, replacement);
+                assert_eq!(controller.view.error_popup, popup);
+            }
+            controller.shutdown();
+        }
+    }
+
+    #[cfg(all(feature = "yandex-music", feature = "yt-dlp"))]
+    #[test]
+    fn cancelled_download_notice_does_not_expire_a_native_yandex_replacement_failure() {
+        let temporary = crate::test_support::canonical_tempdir("native replacement notice");
+        let mut config = Config::for_dir(temporary.path().join("youta"));
+        config.providers.yandex_music_token = Some("fixture-token".to_owned());
+        let process = MockRunningDownload {
+            progress: Some(Cursor::new(Vec::new())),
+            errors: Some(Cursor::new(Vec::new())),
+            exits: VecDeque::from([Ok(None)]),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+        let (mut controller, _, _) = controller_with_mock_download(config, process);
+        controller.dispatch(UiAction::Download);
+        let cancelled_at = Instant::now();
+        controller.cancel_active_download_at(cancelled_at);
+        assert!(controller.download_cancellation_notice_deadline.is_some());
+        // Invalid IDs fail before account validation or any provider request.
+        let mut track = yandex_music_track_fixture();
+        track.id.clear();
+        controller.start_yandex_music_download_batch(
+            "Native replacement".to_owned(),
+            vec![YandexMusicDownloadItem {
+                track,
+                file_stem: "Native replacement".to_owned(),
+            }],
+        );
+        assert!(controller.download_cancellation_notice_deadline.is_none());
+        assert!(
+            controller
+                .view
+                .download
+                .as_ref()
+                .is_some_and(|download| download.active)
+        );
+        controller
+            .yandex_music_download_thread
+            .take()
+            .expect("native worker started")
+            .join()
+            .expect("locally rejected track ID");
+        controller.drain_yandex_music_media_job_responses();
+        let failed_download = controller.view.download.clone();
+        let popup = controller.view.error_popup.clone();
+        assert!(
+            failed_download
+                .as_ref()
+                .is_some_and(|download| !download.active && download.completed_path.is_none())
+        );
+        controller.poll_download_at(cancelled_at + Duration::from_secs(10));
+        assert_eq!(controller.view.download, failed_download);
+        assert_eq!(controller.view.error_popup, popup);
+        controller.poll_download_at(cancelled_at + Duration::from_secs(60));
+        assert_eq!(controller.view.download, failed_download);
+        assert_eq!(controller.view.error_popup, popup);
+        controller.shutdown();
+    }
+
     #[cfg(feature = "yt-dlp")]
     #[test]
     fn failed_download_opens_the_complete_diagnostic_popup() {
@@ -72479,6 +72922,7 @@ mod tests {
             "download errors must remain until explicitly dismissed"
         );
         assert!(controller.download_completion_notice_deadline.is_none());
+        assert!(controller.download_cancellation_notice_deadline.is_none());
     }
 
     #[cfg(feature = "yt-dlp")]

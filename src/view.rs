@@ -2048,8 +2048,9 @@ pub enum YouTubeSetupField {
 
 /// Progress and completion information for one supervised media download.
 ///
-/// Only one download can be active at a time. A completed view remains visible
-/// until another download starts so the destination path is easy to inspect.
+/// Only one download can be active at a time. The controller owns successful
+/// and cancelled notice expiry; renderers do not run separate timers. Failed
+/// downloads remain available for inspection.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct DownloadView {
     /// Human-readable title of the selected remote media.

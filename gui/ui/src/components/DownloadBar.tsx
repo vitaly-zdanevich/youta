@@ -25,9 +25,8 @@ function downloadRatio(download: DownloadView, completed: boolean): number {
 /**
  * The supervised download's progress.
  *
- * A finished download keeps its bar until another one starts, because the
- * destination path is the useful part and it would otherwise vanish the moment
- * it became relevant.
+ * The controller expires successful and cancelled notices. Render this view
+ * while it exists, without a second timer that could hide a newer download.
  */
 export function DownloadBar({ download }: { download: DownloadView }) {
   const completed = !download.active && download.completed_path !== null;
