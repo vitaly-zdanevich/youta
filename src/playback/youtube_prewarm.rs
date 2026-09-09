@@ -427,21 +427,48 @@ impl YouTubePrewarmResolver {
         request: YouTubePrewarmRequest,
         cancellation: &YouTubePrewarmCancellation,
     ) -> YouTubePrewarmResult {
+        self.resolve_with_format_check(request, cancellation, false)
+    }
+
+    /// Resolves again after a rejected stream, checking candidate accessibility.
+    ///
+    /// This uses yt-dlp's `--check-formats` recovery, also used by normal
+    /// playback. The helper downloads small format-test samples rather than a
+    /// complete recording. Configuration/plugin policy, cancellation, and the
+    /// whole-operation timeout are unchanged. Call only on a worker thread.
+    #[must_use]
+    pub fn resolve_checked(
+        &self,
+        request: YouTubePrewarmRequest,
+        cancellation: &YouTubePrewarmCancellation,
+    ) -> YouTubePrewarmResult {
+        self.resolve_with_format_check(request, cancellation, true)
+    }
+
+    /// Shares process supervision between fast resolution and checked recovery.
+    fn resolve_with_format_check(
+        &self,
+        request: YouTubePrewarmRequest,
+        cancellation: &YouTubePrewarmCancellation,
+        check_formats: bool,
+    ) -> YouTubePrewarmResult {
         let YouTubePrewarmRequest {
             generation,
             source_url,
         } = request;
-        let outcome = self.resolve_inner(&source_url, cancellation);
+        let outcome = self.resolve_inner(&source_url, cancellation, check_formats);
         YouTubePrewarmResult {
             generation,
             outcome,
         }
     }
 
+    /// Validates inputs and drains the bounded helper under the shared cancellation policy.
     fn resolve_inner(
         &self,
         source_url: &Url,
         cancellation: &YouTubePrewarmCancellation,
+        check_formats: bool,
     ) -> Result<PrewarmedYouTubeAudio, YouTubePrewarmError> {
         validate_config(&self.config)?;
         validate_source_url(source_url)?;
@@ -449,7 +476,7 @@ impl YouTubePrewarmResolver {
             return Err(YouTubePrewarmError::Cancelled);
         }
 
-        let mut command = build_command(&self.config, source_url);
+        let mut command = build_command(&self.config, source_url, check_formats);
         let output = run_bounded_command(
             &mut command,
             self.config.timeout,
@@ -545,7 +572,8 @@ fn validate_source_url(url: &Url) -> Result<(), YouTubePrewarmError> {
     Ok(())
 }
 
-fn build_command(config: &YouTubePrewarmConfig, source_url: &Url) -> Command {
+/// Builds an isolated helper invocation, optionally probing candidate formats.
+fn build_command(config: &YouTubePrewarmConfig, source_url: &Url, check_formats: bool) -> Command {
     let socket_timeout = config.timeout.as_secs().max(1);
     let mut command = Command::new(&config.executable);
     crate::child_process::supervised(&mut command);
@@ -567,6 +595,9 @@ fn build_command(config: &YouTubePrewarmConfig, source_url: &Url) -> Command {
         .arg("1");
     if let Some(argument) = config.player_client_policy.extractor_argument() {
         command.arg("--extractor-args").arg(argument);
+    }
+    if check_formats {
+        command.arg("--check-formats");
     }
     command
         .arg("--format")
@@ -1147,7 +1178,7 @@ mod tests {
             executable: PathBuf::from("mock yt-dlp; still one executable"),
             ..YouTubePrewarmConfig::default()
         };
-        let command = build_command(&config, &watch_url());
+        let command = build_command(&config, &watch_url(), false);
         let arguments = command
             .get_args()
             .map(|argument| argument.to_string_lossy().into_owned())
@@ -1179,12 +1210,33 @@ mod tests {
     }
 
     #[test]
+    fn checked_resolution_changes_only_the_format_probe_option() {
+        let config = YouTubePrewarmConfig::default();
+        let normal = build_command(&config, &watch_url(), false);
+        let checked = build_command(&config, &watch_url(), true);
+        let normal = normal.get_args().collect::<Vec<_>>();
+        let mut checked = checked.get_args().collect::<Vec<_>>();
+        let probe = checked
+            .iter()
+            .position(|arg| *arg == "--check-formats")
+            .expect("checked recovery probes formats");
+        let separator = checked
+            .iter()
+            .position(|arg| *arg == "--")
+            .expect("source URL is separated from options");
+        assert!(probe < separator);
+        checked.remove(probe);
+        assert_eq!(checked, normal);
+        assert!(!normal.iter().any(|arg| *arg == "--check-formats"));
+    }
+
+    #[test]
     fn embedded_client_policy_is_explicit_and_keeps_config_disabled() {
         let config = YouTubePrewarmConfig {
             player_client_policy: YouTubePlayerClientPolicy::EmbeddedThenDefault,
             ..YouTubePrewarmConfig::default()
         };
-        let command = build_command(&config, &watch_url());
+        let command = build_command(&config, &watch_url(), false);
         let arguments = command
             .get_args()
             .map(|argument| argument.to_string_lossy().into_owned())
@@ -1206,7 +1258,7 @@ mod tests {
             allow_plugins: true,
             ..YouTubePrewarmConfig::default()
         };
-        let command = build_command(&config, &watch_url());
+        let command = build_command(&config, &watch_url(), false);
         let arguments = command
             .get_args()
             .map(|argument| argument.to_string_lossy().into_owned())
@@ -1273,6 +1325,45 @@ mod tests {
         let audio = completion.outcome().expect("successful prewarm");
         assert_eq!(audio.audio_codec(), "opus");
         assert_eq!(audio.expires_at_unix(), Some(2_000_000_000));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checked_resolver_uses_the_supervised_helper_and_honors_cancellation() {
+        let _process_guard = process_test_guard();
+        let executable = MockExecutable::new(
+            r#"checked=false
+for arg in "$@"; do
+    [ "$arg" = '--check-formats' ] && checked=true
+done
+[ "$checked" = true ] || exit 64
+printf '%s\n' '{"url":"https://media.example/checked.webm","acodec":"opus","vcodec":"none"}'"#,
+        );
+        let resolver = resolver_for(&executable, Duration::from_secs(2), 4 * 1024, 4 * 1024);
+        let cancellation = YouTubePrewarmCancellation::new();
+        let normal = resolver.resolve(YouTubePrewarmRequest::new(1, watch_url()), &cancellation);
+        assert!(matches!(
+            normal.outcome(),
+            Err(YouTubePrewarmError::ProcessExited { .. })
+        ));
+        let checked =
+            resolver.resolve_checked(YouTubePrewarmRequest::new(2, watch_url()), &cancellation);
+        assert_eq!(checked.generation(), 2);
+        assert_eq!(
+            checked
+                .outcome()
+                .expect("checked fixture stream")
+                .media_url()
+                .path(),
+            "/checked.webm"
+        );
+        cancellation.cancel();
+        let cancelled =
+            resolver.resolve_checked(YouTubePrewarmRequest::new(3, watch_url()), &cancellation);
+        assert!(matches!(
+            cancelled.outcome(),
+            Err(YouTubePrewarmError::Cancelled)
+        ));
     }
 
     #[cfg(unix)]

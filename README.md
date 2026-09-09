@@ -1850,8 +1850,22 @@ is the cover fallback when flat metadata has no channel artwork. When a podcast
 client requests an enclosure, Youta asks `yt-dlp` for a fresh
 audio-only Opus/WebM URL with its cookie-free embedded client first, then its
 normal anonymous clients, and proxies the bytes without publishing YouTube's
-signed URL in the XML. If an upstream body ends before its advertised length,
-Youta resumes from the first missing byte. Ambient `yt-dlp` configuration,
+signed URL in the XML. A quick, transient upstream connection or server failure
+gets one delayed retry before Youta returns an error to the podcast app. A
+signed audio URL rejected with HTTP 403 or 410 is discarded and resolved again
+once using yt-dlp's `--check-formats`, the same recovery used by normal playback.
+This checks small audio samples without downloading a complete episode.
+Rate limits and other permanent errors are not retried automatically. Failure messages
+include the upstream HTTP status or a safe error category, never signed URLs
+or credentials. If an upstream body ends before its advertised length,
+Youta resumes from the first missing byte. Full YouTube downloads and open-ended
+resume requests (`Range: bytes=N-`) use sequential 10 MiB upstream byte ranges,
+following yt-dlp's approach to avoid throttled full-file responses. The podcast
+app still receives one correctly sized response: HTTP 200 for a full download,
+or HTTP 206 with the original requested offset and remaining length for a resume.
+Explicit bounded and suffix ranges retain their existing handling.
+Healthy downloads have no whole-body deadline; stalled upstream reads still
+time out. Ambient `yt-dlp` configuration,
 plugins, and browser cookies remain disabled. Videos whose owners prohibit
 embedded playback may therefore remain unavailable. This keeps feed creation
 independent of audio downloads. It is session scoped: the HTTP server and every
@@ -1861,7 +1875,18 @@ Internet access.
 
 The server exposes only an immutable manifest prepared for that explicit
 action, ignores symbolic links during folder scans, supports `HEAD` and one
-HTTP byte range, and handles a bounded number of concurrent clients. It uses
+HTTP byte range, and reserves separate capacity for eight audio transfers and
+four artwork transfers, so thumbnail requests cannot use audio slots. Short
+bursts can wait in bounded, first-in-first-out queues (eight audio requests and
+four artwork requests) for up to two seconds. The server allows at most 32
+normal request workers; a separate bounded pool keeps podcast
+`GET`/`HEAD /feed.xml` requests available when those workers are occupied.
+Requests exceeding their queue limit or waiting deadline receive HTTP 503 with
+`Retry-After: 1`. Extreme overload still closes excess connections promptly
+instead of allowing an unbounded queue.
+Media clients that make no write progress for 60 seconds are disconnected so
+stalled downloads cannot retain all worker slots. This is an idle limit, not a
+limit on the duration of a progressing download. The server uses
 plain HTTP on the local network and does not change firewall rules, authenticate
 clients, or continue in the background. Share only on a trusted LAN. Custom
 builds can omit the server, QR UI, network proxy, and embedded-artwork path by
@@ -2267,6 +2292,51 @@ Youta's saved credentials, and never prints the key. Ordinary `cargo test`
 compiles but skips this network-dependent test. CI can invoke the same script
 in a separate live-service job with a chosen channel; cold-cache runs are
 intentional so cached dates cannot mask a performance regression.
+
+A separate opt-in smoke test checks episode downloads through the real LAN
+proxy, fetching only the first 1 KiB of audio per video:
+
+```sh
+YOUTA_RUN_LIVE_YOUTUBE_PODCAST_AUDIO_TEST=1 cargo test --locked \
+  --test live_youtube_podcast_audio --features lan-sharing \
+  youtube_podcast_first_audio_range_is_complete -- --ignored --exact --nocapture
+```
+
+The default fixture is *Big Buck Bunny*. Set `YOUTA_LIVE_PODCAST_VIDEO_IDS` to a
+comma-separated list of up to four public YouTube video IDs to reproduce a
+specific download failure. This transport test uses synthetic catalogue dates;
+the large-channel test above separately verifies publication metadata. Normal
+test runs skip live audio requests and use mock servers to cover transient
+upstream errors, retry limits, and cancellation.
+
+A separately guarded test checks the complete first download of one episode,
+including exact `Content-Length`, WebM identification, and EOF:
+
+```sh
+YOUTA_RUN_LIVE_YOUTUBE_PODCAST_FULL_AUDIO_TEST=1 cargo test --locked \
+  --test live_youtube_podcast_audio --features lan-sharing \
+  youtube_podcast_full_audio_matches_advertised_length -- --ignored --exact --nocapture
+```
+
+This test transfers the actual complete audio, capped at 128 MiB and a five-minute
+absolute deadline. It streams through a 64 KiB buffer without retaining an audio
+file and does not retry the client request. The default is *Big Buck Bunny*;
+`YOUTA_LIVE_PODCAST_VIDEO_IDS` must contain exactly one public video ID for this
+test. Progress output contains only byte counts and elapsed time. Offline tests
+also reject truncated, overlong, oversized, and ambiguous response bodies.
+
+The resume equivalent checks an open-ended byte range, validating its HTTP 206
+headers, exact remaining byte count, and EOF under the same size/time limits:
+
+```sh
+YOUTA_RUN_LIVE_YOUTUBE_PODCAST_RESUME_TEST=1 cargo test --locked \
+  --test live_youtube_podcast_audio --features lan-sharing \
+  youtube_podcast_resumed_audio_matches_advertised_length -- --ignored --exact --nocapture
+```
+
+It starts at 1 MiB by default. Set `YOUTA_LIVE_PODCAST_RESUME_OFFSET` to a
+positive byte offset and `YOUTA_LIVE_PODCAST_VIDEO_IDS` to one video ID to
+reproduce a particular partial download. The remaining audio is not saved.
 
 ## License
 
