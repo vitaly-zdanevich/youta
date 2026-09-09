@@ -1843,7 +1843,9 @@ Local episodes use each file's modification time. Dates are serialized in UTC
 and do not change the selected cutoff, item order, or episode identifiers.
 
 `[F12] Podcast feed` is also available on a YouTube channel in Search and in
-YouTube Subscriptions. Feed creation uses channel and publication metadata,
+YouTube Subscriptions. Its button is shown only for channel selections; the
+F12 shortcut also works on a selected episode to open the inclusive-boundary
+review described above. Feed creation uses channel and publication metadata,
 downloads no media, gives every episode a stable Youta URL and artwork route, and uses the
 channel's square avatar as the podcast cover. The first retained episode image
 is the cover fallback when flat metadata has no channel artwork. When a podcast

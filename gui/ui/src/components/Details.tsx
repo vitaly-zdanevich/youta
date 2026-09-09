@@ -301,8 +301,10 @@ export function Details({ view, kind }: { view: ViewModel; kind: InformationPane
 				<Action onClick={() => void dispatch('ShareLocalPodcast')}>Podcast feed</Action>
 			</>
 		) : null}
+		{/* A channel has no media ID, including search channels using the Video layout.
+		    Episodes carry channel metadata too, but must not show this channel button. */}
 		{view.lan_share_supported &&
-		(kind === 'Channel' || (kind === 'Video' && details.media_id?.source === YOUTUBE)) &&
+		details.media_id === null &&
 		details.channel_id !== '' &&
 		(view.screen === 'Search' ||
 			(view.screen === 'Subscriptions' && view.subscriptions.source_kind === YOUTUBE)) ? (

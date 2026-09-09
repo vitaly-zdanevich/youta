@@ -4587,18 +4587,21 @@ fn render_information_panel(
             UiAction::ShareLocalPodcast,
         )
     });
+    // Keep the visible action on channel entities. The episode shortcut still
+    // opens feed review with the selected video's inclusive boundary.
     #[cfg(feature = "lan-sharing")]
-    let youtube_podcast_button = view.youtube_podcast_feed_available().then(|| {
-        push_left_detail_button(
-            &mut lines,
-            &right_buttons,
-            &mut next_left_row,
-            inner.width,
-            button("F12", "Podcast feed", show_hotkeys),
-            theme.accent,
-            UiAction::ShareYouTubeChannelPodcast,
-        )
-    });
+    let youtube_podcast_button =
+        (view.youtube_podcast_feed_available() && details.media_id.is_none()).then(|| {
+            push_left_detail_button(
+                &mut lines,
+                &right_buttons,
+                &mut next_left_row,
+                inner.width,
+                button("F12", "Podcast feed", show_hotkeys),
+                theme.accent,
+                UiAction::ShareYouTubeChannelPodcast,
+            )
+        });
     #[cfg(feature = "yt-dlp")]
     let channel_download_button = (view.screen == Screen::Subscriptions
         && view.subscriptions.source_kind == SubscriptionKind::YouTube
@@ -20370,10 +20373,8 @@ mod tests {
         );
         assert_eq!(
             subscribe_area.y,
-            open_area
-                .y
-                .saturating_add(1 + u16::from(cfg!(feature = "lan-sharing"))),
-            "Subscribe should follow the grouped openers and optional podcast-feed action"
+            open_area.y.saturating_add(1),
+            "Subscribe should immediately follow the grouped episode openers"
         );
         let expected_right = hit_map
             .details_panel
@@ -20715,7 +20716,6 @@ mod tests {
             UiAction::OpenInBrowser,
             UiAction::OpenPlaylistPopup,
             UiAction::EditPrivateNote,
-            UiAction::ShareYouTubeChannelPodcast,
             UiAction::ToggleSubscription,
         ];
         let ordered_areas = ordered_actions.each_ref().map(area_for);
@@ -20929,7 +20929,6 @@ mod tests {
             UiAction::OpenInBrowser,
             UiAction::OpenPlaylistPopup,
             UiAction::EditPrivateNote,
-            UiAction::ShareYouTubeChannelPodcast,
             UiAction::ToggleSubscription,
         ];
         let mut action_areas = expected_actions
@@ -20978,7 +20977,6 @@ mod tests {
             "[o] open video".to_owned(),
             "[P] Playlist…".to_owned(),
             "[n] Add private note".to_owned(),
-            "[F12] Podcast feed".to_owned(),
             "[s] Subscribe (locally)".to_owned(),
         ];
         for ((expected, expected_label), area) in expected_actions
@@ -22220,14 +22218,12 @@ mod tests {
         assert!(rendered.contains("Subscribe (locally)"));
         assert!(!rendered.contains("[s] Subscribe (locally)"));
         assert!(!rendered.contains("Auto-download"));
+        assert!(!rendered.contains("Podcast feed"));
         assert!(!rendered.contains("Select mode"));
         assert!(rendered.contains("open video"));
         assert!(!rendered.contains("[o] open video"));
         assert!(!rendered.contains("[O] open channel"));
-        assert_eq!(
-            hit_map.detail_buttons.len(),
-            2 + usize::from(cfg!(feature = "lan-sharing"))
-        );
+        assert_eq!(hit_map.detail_buttons.len(), 2);
         assert!(
             hit_map
                 .detail_buttons
@@ -28390,51 +28386,58 @@ prose 07:25 remains clickable but is not a chapter";
 
     #[cfg(feature = "lan-sharing")]
     #[test]
-    fn selected_youtube_subscription_video_renders_podcast_feed_action() {
-        let mut view = ViewModel {
-            screen: Screen::Subscriptions,
-            right_panel_mode: RightPanelMode::Details,
-            details: Some(DetailView {
-                media_id: Some(MediaId::new(SourceKind::YouTube, "dQw4w9WgXcQ")),
-                title: "Fixture video".to_owned(),
-                channel_id: "UCfixture".to_owned(),
-                ..DetailView::default()
-            }),
-            ..ViewModel::default()
-        };
-        view.subscriptions.source_kind = SubscriptionKind::YouTube;
-        view.subscriptions.route = SubscriptionRoute::Items;
-        view.subscriptions.focus = SubscriptionPane::Items;
-        let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("terminal");
-        let mut hit_map = HitMap::default();
-        let theme = Theme::new(false);
+    fn youtube_episode_hides_podcast_button_but_keeps_shortcut() {
+        for screen in [Screen::Search, Screen::Subscriptions] {
+            let mut view = ViewModel {
+                screen,
+                right_panel_mode: RightPanelMode::Details,
+                details: Some(DetailView {
+                    media_id: Some(MediaId::new(SourceKind::YouTube, "dQw4w9WgXcQ")),
+                    title: "Fixture video".to_owned(),
+                    channel_id: "UCfixture".to_owned(),
+                    ..DetailView::default()
+                }),
+                ..ViewModel::default()
+            };
+            view.subscriptions.source_kind = SubscriptionKind::YouTube;
+            view.subscriptions.route = SubscriptionRoute::Items;
+            view.subscriptions.focus = SubscriptionPane::Items;
+            let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("terminal");
+            let mut hit_map = HitMap::default();
+            let theme = Theme::new(false);
 
-        terminal
-            .draw(|frame| {
-                render_information_panel(
-                    frame,
-                    frame.area(),
-                    &view,
-                    true,
-                    &theme,
-                    &mut hit_map,
-                    " Details ",
-                    "No video is selected.",
-                    InformationPanelKind::Video,
-                    true,
-                    ThumbnailSizing::fixed(12),
-                    None,
-                );
-            })
-            .expect("draw selected subscription video");
+            terminal
+                .draw(|frame| {
+                    render_information_panel(
+                        frame,
+                        frame.area(),
+                        &view,
+                        true,
+                        &theme,
+                        &mut hit_map,
+                        " Details ",
+                        "No video is selected.",
+                        InformationPanelKind::Video,
+                        true,
+                        ThumbnailSizing::fixed(12),
+                        None,
+                    );
+                })
+                .expect("draw selected subscription video");
 
-        assert!(rendered_text(&terminal).contains("[F12] Podcast feed"));
-        assert!(
-            hit_map
-                .detail_buttons
-                .iter()
-                .any(|(action, _)| *action == UiAction::ShareYouTubeChannelPodcast)
-        );
+            assert!(!rendered_text(&terminal).contains("[F12] Podcast feed"));
+            assert!(
+                !hit_map
+                    .detail_buttons
+                    .iter()
+                    .any(|(action, _)| *action == UiAction::ShareYouTubeChannelPodcast)
+            );
+            assert_eq!(
+                key_action(KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE), &view),
+                Some(UiAction::ShareYouTubeChannelPodcast),
+                "the episode shortcut must retain the inclusive feed boundary"
+            );
+        }
     }
 
     #[test]

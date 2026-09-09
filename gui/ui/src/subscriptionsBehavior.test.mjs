@@ -49,3 +49,17 @@ test('explicit refresh claims Items only after its page-one command', () => {
 	);
 	assert.doesNotMatch(source, /data-pane-footer-control/);
 });
+
+/** Channel metadata on an episode must not expose the channel podcast button. */
+test('YouTube podcast buttons are limited to channel entities, including search channels', async () => {
+	const details = await readFile(
+		new URL('./components/Details.tsx', import.meta.url),
+		'utf8',
+	);
+	const beforeButton = details.split("dispatch('ShareYouTubeChannelPodcast')")[0];
+	const guard = beforeButton.slice(beforeButton.lastIndexOf('{view.lan_share_supported &&'));
+	assert.match(guard, /details\.media_id === null/);
+	assert.match(guard, /details\.channel_id !== ''/);
+	assert.doesNotMatch(guard, /kind === 'Channel'/);
+	assert.doesNotMatch(guard, /kind === 'Video'/);
+});
