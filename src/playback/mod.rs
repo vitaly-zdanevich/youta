@@ -29,6 +29,9 @@ pub mod ytdlp;
 #[cfg(feature = "yt-dlp")]
 pub mod youtube_prewarm;
 
+#[cfg(all(feature = "yt-dlp", feature = "network"))]
+pub(crate) mod youtube_dates;
+
 /// Errors returned by a playback or extraction backend.
 #[derive(Debug, Error)]
 pub enum PlaybackError {

@@ -6,6 +6,7 @@
 //! owns its listener thread and stops it on drop, so sharing never survives a
 //! Youta process that the user has closed.
 
+use chrono::{DateTime, Datelike, Utc};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -14,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use sha2::{Digest, Sha256};
@@ -157,11 +158,14 @@ pub fn prepare_file_share(target: &Path) -> io::Result<PreparedLocalShare> {
 ///
 /// Embedded artwork is extracted into `artwork_cache`; a valid sidecar image
 /// remains the fallback used by Youta's normal local-artwork policy.
+/// Episode dates use each file's modification time; a filesystem does not
+/// reliably expose the audio's original publication date.
 ///
 /// # Errors
 ///
 /// Returns an error for unsafe targets, traversal failures, an empty playable
-/// selection, or a directory that exceeds the traversal bounds.
+/// selection, a missing or invalid modification date, or a directory that
+/// exceeds the traversal bounds.
 pub fn prepare_podcast_share(
     target: &Path,
     artwork_cache: &Path,
@@ -276,9 +280,19 @@ fn prepare_local_share(
                     Some(route)
                 })
         });
+        let published_at = if podcast {
+            Some(local_podcast_date(metadata.modified()?)?)
+        } else {
+            // Plain file serving does not depend on publication metadata.
+            metadata
+                .modified()
+                .ok()
+                .and_then(|time| local_podcast_date(time).ok())
+        };
         files.push(SharedFile {
             guid: local_guid(&path, &metadata),
             label,
+            published_at,
             length: metadata.len(),
             mime: mime_type(&path),
             source: SharedFileSource::Local(path),
@@ -330,9 +344,10 @@ fn retain_podcast_files_from(
 /// Builds a feed whose stable local enclosure routes resolve fresh `YouTube`
 /// audio only when a podcast client requests an episode.
 ///
-/// Flat extraction keeps feed creation fast: it downloads neither video nor
-/// audio. The active LAN server supervises each later `yt-dlp` resolver and
-/// proxies the resulting stream so required request headers never leave Youta.
+/// Metadata extraction downloads neither video nor audio. Each episode must
+/// include its original publication date. The active LAN server supervises
+/// each later `yt-dlp` resolver and proxies the resulting stream so required
+/// request headers never leave Youta.
 ///
 /// The input must use the unified newest-first upload order returned by
 /// [`crate::playback::ytdlp::YtDlp::youtube_channel_collection`]. Episodes are
@@ -342,7 +357,8 @@ fn retain_podcast_files_from(
 ///
 /// When `skip_shorts` is set, entries with canonical `/shorts/` provider URLs
 /// are omitted. Returns an error when the collection is empty, exceeds the
-/// feed bound, or contains no valid `YouTube` video identifiers.
+/// feed bound, contains no valid `YouTube` video identifiers, or a retained
+/// episode has no valid publication date.
 pub fn prepare_youtube_podcast_share(
     collection: ExtractedCollection,
     config: YouTubePrewarmConfig,
@@ -385,6 +401,8 @@ pub fn prepare_youtube_podcast_share_from(
 
 /// Returns retained input indices in oldest-first episode order.
 ///
+/// Metadata lookups and manifest construction share this exact selection so
+/// ignored older uploads and filtered Shorts need no publication-date lookup.
 /// The selected Short remains an inclusive boundary even when Shorts are skipped.
 /// The input is the unified newest-first uploads catalogue.
 ///
@@ -476,6 +494,15 @@ fn prepare_youtube_podcast_share_with_boundary(
         if !retained_indices.contains(&entry_index) {
             continue;
         }
+        let published_at = entry
+            .published_at
+            .and_then(rss_publication_date)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("YouTube episode {} has no valid publication date", entry.id),
+                )
+            })?;
         let source_url = Url::parse(&format!("https://www.youtube.com/watch?v={}", entry.id))
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         let index = files.len();
@@ -492,6 +519,7 @@ fn prepare_youtube_podcast_share_with_boundary(
         files.push(SharedFile {
             guid: format!("urn:youta:youtube:{}", entry.id),
             label,
+            published_at: Some(published_at),
             length: 0,
             mime: YOUTUBE_PODCAST_MIME,
             source: SharedFileSource::YouTube {
@@ -588,10 +616,37 @@ fn is_playable(path: &Path) -> bool {
     classify_local_file(path).is_some_and(LocalEntryKind::is_playable)
 }
 
+/// Converts real filesystem modification times without fabricating a fallback date.
+fn local_podcast_date(modified: SystemTime) -> io::Result<DateTime<Utc>> {
+    let seconds = match modified.duration_since(UNIX_EPOCH) {
+        Ok(duration) => i64::try_from(duration.as_secs()).ok(),
+        Err(error) => {
+            let duration = error.duration();
+            i64::try_from(duration.as_secs())
+                .ok()
+                .and_then(i64::checked_neg)
+                .and_then(|seconds| seconds.checked_sub(i64::from(duration.subsec_nanos() != 0)))
+        }
+    };
+    seconds.and_then(rss_publication_date).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "local audio modification date cannot be represented as an RSS publication date",
+        )
+    })
+}
+
+/// Checks the RFC 2822 date domain before formatting can overflow or panic.
+fn rss_publication_date(seconds: i64) -> Option<DateTime<Utc>> {
+    DateTime::from_timestamp(seconds, 0).filter(|date| (1900..=9999).contains(&date.year()))
+}
+
 #[derive(Debug)]
 struct SharedFile {
     guid: String,
     label: String,
+    /// Required by podcast manifests; optional only for plain file sharing.
+    published_at: Option<DateTime<Utc>>,
     length: u64,
     mime: &'static str,
     source: SharedFileSource,
@@ -708,8 +763,13 @@ impl ServerState {
 						}),
 					),
 				};
+				// Podcast preparation validates dates: local modification time or
+				// the YouTube upload's original publication time, always in UTC.
+				let publication_date = file.published_at
+					.expect("podcast manifests contain a validated episode date")
+					.to_rfc2822();
 				format!(
-					"<item>\n<title>{}</title>\n<description>{}</description>\n<guid isPermaLink=\"false\">{}</guid>\n<enclosure url=\"{}{}\" length=\"{}\" type=\"{}\"/>{episode_artwork}{duration}\n</item>",
+					"<item>\n<title>{}</title>\n<description>{}</description>\n<pubDate>{publication_date}</pubDate>\n<guid isPermaLink=\"false\">{}</guid>\n<enclosure url=\"{}{}\" length=\"{}\" type=\"{}\"/>{episode_artwork}{duration}\n</item>",
 					escape_xml(&file.label),
 					escape_xml(&description),
 					file.guid,
@@ -1536,6 +1596,40 @@ mod tests {
     }
 
     #[test]
+    fn local_podcast_episodes_publish_their_own_modification_dates() {
+        let directory = canonical_tempdir("lan-podcast-dates");
+        for (name, seconds) in [("01.opus", 1_704_164_645), ("02.opus", 1_706_933_106)] {
+            let file = File::create(directory.path().join(name)).expect("create episode");
+            file.set_modified(UNIX_EPOCH + Duration::from_secs(seconds))
+                .expect("set episode modification time");
+        }
+        let prepared = prepare_podcast_share(directory.path(), &directory.path().join("cache"))
+            .expect("prepare dated feed");
+        let rss = ServerState::new(prepared, "http://192.0.2.10:8123".to_owned()).rss();
+        let dates = rss
+            .split("<pubDate>")
+            .skip(1)
+            .map(|item| item.split_once("</pubDate>").expect("closed date").0)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            dates,
+            [
+                "Tue, 2 Jan 2024 03:04:05 +0000",
+                "Sat, 3 Feb 2024 04:05:06 +0000"
+            ]
+        );
+        for (date, expected) in dates.into_iter().zip([1_704_164_645, 1_706_933_106]) {
+            assert_eq!(
+                chrono::DateTime::parse_from_rfc2822(date)
+                    .expect("RSS date")
+                    .timestamp(),
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn local_podcast_feed_publishes_item_artwork_as_the_channel_cover() {
         let directory = canonical_tempdir("lan-podcast-cover");
         fs::write(directory.path().join("episode.opus"), b"audio").expect("write audio");
@@ -1618,6 +1712,7 @@ mod tests {
                     title: "First & episode".to_owned(),
                     webpage_url: None,
                     duration_seconds: Some(42),
+                    published_at: Some(1_706_933_106),
                     thumbnail_url: Some(
                         Url::parse("https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg")
                             .expect("thumbnail"),
@@ -1628,6 +1723,7 @@ mod tests {
                     title: "Second episode".to_owned(),
                     webpage_url: None,
                     duration_seconds: None,
+                    published_at: Some(1_704_164_645),
                     thumbnail_url: None,
                 },
             ],
@@ -1681,6 +1777,7 @@ mod tests {
             title: title.to_owned(),
             webpage_url: None,
             duration_seconds: None,
+            published_at: Some(1_704_164_645),
             thumbnail_url: None,
         };
         let collection = ExtractedCollection {
@@ -1728,6 +1825,7 @@ mod tests {
                     .expect("YouTube fixture URL"),
             ),
             duration_seconds: None,
+            published_at: Some(1_704_164_645),
             thumbnail_url: None,
         };
         let collection = ExtractedCollection {
@@ -1768,6 +1866,7 @@ mod tests {
                 .expect("video URL"),
             ),
             duration_seconds: None,
+            published_at: Some(1_704_164_645),
             thumbnail_url: None,
         };
         let collection = ExtractedCollection {
@@ -1841,6 +1940,92 @@ mod tests {
         )
         .expect("selected Short remains a valid cutoff");
         assert_eq!(labels(filtered), ["Newer video"]);
+    }
+
+    /// Makes a newest-first upload catalogue with distinct dated episodes.
+    fn dated_youtube_collection() -> ExtractedCollection {
+        let entry = |id: &str, published_at, short: bool| crate::playback::ytdlp::CollectionEntry {
+            id: id.to_owned(),
+            title: id.to_owned(),
+            webpage_url: short.then(|| {
+                Url::parse(&format!("https://www.youtube.com/shorts/{id}")).expect("Short URL")
+            }),
+            duration_seconds: None,
+            published_at,
+            thumbnail_url: None,
+        };
+        ExtractedCollection {
+            id: "UCfixture".to_owned(),
+            title: "Dated uploads".to_owned(),
+            extractor: Some("YoutubeTab".to_owned()),
+            thumbnail_url: None,
+            entries: vec![
+                entry("aaaaaaaaaaa", Some(1_706_933_106), false),
+                entry("bbbbbbbbbbb", None, true),
+                entry("ccccccccccc", Some(1_704_164_645), false),
+                entry("ddddddddddd", None, false),
+            ],
+        }
+    }
+
+    #[test]
+    fn youtube_podcast_episodes_preserve_dates_after_cutoff_and_short_filter() {
+        let collection = dated_youtube_collection();
+        assert_eq!(
+            youtube_podcast_episode_indices(&collection, Some("ccccccccccc"), true)
+                .expect("retained episode indices"),
+            [2, 0],
+        );
+        assert_eq!(
+            youtube_podcast_episode_indices(&collection, Some("bbbbbbbbbbb"), true)
+                .expect("selected Short still defines the cutoff"),
+            [0],
+        );
+        let prepared = prepare_youtube_podcast_share_from(
+            collection,
+            YouTubePrewarmConfig::default(),
+            "ccccccccccc",
+            true,
+        )
+        .expect("prepare dated YouTube feed");
+        let rss = ServerState::new(prepared, "http://192.0.2.10:8123".to_owned()).rss();
+        let episodes = rss.split("<item>").skip(1).collect::<Vec<_>>();
+        assert_eq!(episodes.len(), 2);
+        for (episode, id, date) in [
+            (episodes[0], "ccccccccccc", "Tue, 2 Jan 2024 03:04:05 +0000"),
+            (episodes[1], "aaaaaaaaaaa", "Sat, 3 Feb 2024 04:05:06 +0000"),
+        ] {
+            assert!(episode.contains(&format!("<title>{id}</title>")));
+            assert!(episode.contains(&format!("<pubDate>{date}</pubDate>")));
+            assert!(chrono::DateTime::parse_from_rfc2822(date).is_ok());
+        }
+    }
+
+    #[test]
+    fn youtube_podcast_rejects_retained_episodes_without_valid_dates() {
+        for published_at in [None, Some(i64::MAX), Some(253_402_300_800)] {
+            let mut collection = dated_youtube_collection();
+            collection.entries[0].published_at = published_at;
+            let error = prepare_youtube_podcast_share_from(
+                collection,
+                YouTubePrewarmConfig::default(),
+                "aaaaaaaaaaa",
+                false,
+            )
+            .expect_err("retained episode must have an RSS date");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(error.to_string().contains("aaaaaaaaaaa"));
+            assert!(error.to_string().contains("publication date"));
+        }
+    }
+
+    #[test]
+    fn local_podcast_dates_accept_pre_epoch_times_and_reject_unrepresentable_dates() {
+        let date = local_podcast_date(UNIX_EPOCH - Duration::from_millis(1))
+            .expect("valid pre-epoch time");
+        assert_eq!(date.to_rfc2822(), "Wed, 31 Dec 1969 23:59:59 +0000");
+        let invalid = UNIX_EPOCH + Duration::from_secs(253_402_300_800);
+        assert!(local_podcast_date(invalid).is_err());
     }
 
     #[test]

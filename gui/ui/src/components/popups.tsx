@@ -1295,7 +1295,7 @@ export function PodcastFeedOptionsPopup({
 						) : null}
 					</div>
 				) : popup.phase === 'Preparing' ? (
-					<p className='m-0 text-ink-dim'>Enumerating channel with yt-dlp{activity}</p>
+					<p className='m-0 text-ink-dim'>Reading channel metadata and episode dates{activity}</p>
 				) : (
 					<p className='m-0 text-accent'>{popup.error ?? 'Podcast feed preparation failed'}</p>
 				)}

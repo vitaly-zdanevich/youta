@@ -4,12 +4,13 @@
 //! shell command from a media URL or title.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::io::BufReader;
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
 use std::time::Duration;
 
-use serde::Deserialize;
+use chrono::{DateTime, NaiveDate, Utc};
+use serde::{Deserialize, Serialize};
 use url::Url;
 
 use super::youtube_prewarm::{YouTubePrewarmCancellation, run_bounded_json_command};
@@ -84,6 +85,9 @@ pub struct CollectionEntry {
     pub duration_seconds: Option<u64>,
     /// Provider artwork retained without resolving the media stream.
     pub thumbnail_url: Option<Url>,
+    /// Provider publication time in Unix seconds; date-only values use UTC midnight.
+    /// Missing dates can be enriched without resolving or downloading the audio.
+    pub published_at: Option<i64>,
 }
 
 /// Bounded flat collection used for generic yt-dlp URL subscriptions.
@@ -440,6 +444,221 @@ impl YtDlp {
         })
     }
 
+    /// Populates missing episode publication dates without downloading media.
+    ///
+    /// Only the caller's retained entries are inspected. Exact cached dates are
+    /// reused; each uncached video uses one metadata-only yt-dlp helper with a
+    /// 30-second deadline. At most four helpers run together, and cancellation
+    /// kills and reaps their process groups. Date-only metadata uses UTC midnight.
+    /// Cache failures are nonfatal: a successfully fetched date remains usable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid video ID, missing or mismatched date
+    /// metadata, cancellation, timeout, or unsuccessful helper. No later batch
+    /// starts after a failure, and the caller's cancellation token is not changed.
+    pub fn populate_youtube_publication_dates(
+        &self,
+        entries: &mut [CollectionEntry],
+        cache_dir: &Path,
+        cancellation: &YouTubePrewarmCancellation,
+    ) -> Result<()> {
+        self.populate_youtube_publication_dates_with_lookup(
+            entries,
+            cache_dir,
+            cancellation,
+            |id| self.youtube_publication_date(id, cancellation),
+        )
+    }
+
+    /// Reuses existing dates, then requests only uncached IDs in batches of 50.
+    ///
+    /// A caller can supply the existing official API client, or an empty map
+    /// when it is not configured. A failed batch disables further batch calls
+    /// for this feed. Missing results use small anonymous metadata requests when
+    /// networking is built, falling back to the bounded yt-dlp helper. Three
+    /// consecutive anonymous failures disable that shortcut for this feed.
+    /// Neither path resolves media. Exact dates remain required for every item.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for cancellation, invalid IDs or batch metadata, or when
+    /// both per-video lookup paths fail. Cache write failures remain nonfatal.
+    pub fn populate_youtube_publication_dates_with_batch(
+        &self,
+        entries: &mut [CollectionEntry],
+        cache_dir: &Path,
+        cancellation: &YouTubePrewarmCancellation,
+        lookup_batch: impl FnMut(&[String]) -> Result<HashMap<String, i64>>,
+    ) -> Result<()> {
+        #[cfg(feature = "network")]
+        let fast_client = super::youtube_dates::YouTubeDateClient::new();
+        #[cfg(feature = "network")]
+        let failures = std::sync::atomic::AtomicUsize::new(0);
+        self.populate_youtube_publication_dates_with_batch_lookup(
+            entries,
+            cache_dir,
+            cancellation,
+            lookup_batch,
+            |id| {
+                #[cfg(feature = "network")]
+                {
+                    use std::sync::atomic::Ordering;
+                    if failures.load(Ordering::Relaxed) < 3 {
+                        match fast_client.publication_date(id) {
+                            Ok(date) => {
+                                failures.store(0, Ordering::Relaxed);
+                                return Ok(date);
+                            }
+                            Err(_) => {
+                                failures.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
+                ensure_publication_lookup_active(cancellation)?;
+                self.youtube_publication_date(id, cancellation)
+            },
+        )
+    }
+
+    /// Keeps cache and batch policy independently testable without live services.
+    fn populate_youtube_publication_dates_with_batch_lookup(
+        &self,
+        entries: &mut [CollectionEntry],
+        cache_dir: &Path,
+        cancellation: &YouTubePrewarmCancellation,
+        mut lookup_batch: impl FnMut(&[String]) -> Result<HashMap<String, i64>>,
+        lookup_one: impl Fn(&str) -> Result<i64> + Sync,
+    ) -> Result<()> {
+        ensure_publication_lookup_active(cancellation)?;
+        let mut missing = Vec::new();
+        let mut seen = HashSet::new();
+        for entry in entries.iter_mut() {
+            ensure_publication_lookup_active(cancellation)?;
+            validate_publication_video_id(&entry.id)?;
+            if let Some(date) = entry
+                .published_at
+                .filter(|date| valid_publication_timestamp(*date))
+            {
+                // Persist reused API metadata too, so a restart needs no new lookup.
+                if load_publication_date(cache_dir, &entry.id) != Some(date) {
+                    let _ = store_publication_date(cache_dir, &entry.id, date);
+                }
+            } else {
+                entry.published_at = load_publication_date(cache_dir, &entry.id);
+            }
+            if entry.published_at.is_none() && seen.insert(entry.id.clone()) {
+                missing.push(entry.id.clone());
+            }
+        }
+        let mut dates = HashMap::new();
+        for ids in missing.chunks(50) {
+            ensure_publication_lookup_active(cancellation)?;
+            let result = lookup_batch(ids);
+            ensure_publication_lookup_active(cancellation)?;
+            let Ok(batch) = result else {
+                break;
+            };
+            if batch
+                .iter()
+                .any(|(id, date)| !ids.contains(id) || !valid_publication_timestamp(*date))
+            {
+                return Err(PlaybackError::Protocol(
+                    "YouTube date batch returned invalid publication metadata".to_owned(),
+                ));
+            }
+            for (id, date) in batch {
+                let _ = store_publication_date(cache_dir, &id, date);
+                dates.insert(id, date);
+            }
+        }
+        for entry in entries.iter_mut() {
+            if entry.published_at.is_none() {
+                entry.published_at = dates.get(&entry.id).copied();
+            }
+        }
+        self.populate_youtube_publication_dates_with_lookup(
+            entries,
+            cache_dir,
+            cancellation,
+            lookup_one,
+        )
+    }
+
+    /// Runs bounded per-video fallback work while retaining exact cache results.
+    fn populate_youtube_publication_dates_with_lookup(
+        &self,
+        entries: &mut [CollectionEntry],
+        cache_dir: &Path,
+        cancellation: &YouTubePrewarmCancellation,
+        lookup: impl Fn(&str) -> Result<i64> + Sync,
+    ) -> Result<()> {
+        ensure_publication_lookup_active(cancellation)?;
+        let mut missing = entries
+            .iter_mut()
+            .filter(|entry| !entry.published_at.is_some_and(valid_publication_timestamp))
+            .collect::<Vec<_>>();
+        for batch in missing.chunks_mut(4) {
+            let lookup = &lookup;
+            std::thread::scope(|scope| -> Result<()> {
+                let workers = batch
+                    .iter_mut()
+                    .map(|entry| {
+                        scope.spawn(move || -> Result<()> {
+                            ensure_publication_lookup_active(cancellation)?;
+                            if entry.published_at.is_some_and(valid_publication_timestamp) {
+                                return Ok(());
+                            }
+                            validate_publication_video_id(&entry.id)?;
+                            let published_at = match load_publication_date(cache_dir, &entry.id) {
+                                Some(date) => date,
+                                None => {
+                                    let date = lookup(&entry.id)?;
+                                    if !valid_publication_timestamp(date) {
+                                        return Err(PlaybackError::Protocol(
+                                            "YouTube returned an invalid publication date"
+                                                .to_owned(),
+                                        ));
+                                    }
+                                    let _ = store_publication_date(cache_dir, &entry.id, date);
+                                    date
+                                }
+                            };
+                            ensure_publication_lookup_active(cancellation)?;
+                            entry.published_at = Some(published_at);
+                            Ok(())
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                for worker in workers {
+                    worker.join().map_err(|_| {
+                        PlaybackError::Protocol("YouTube episode date worker failed".to_owned())
+                    })??;
+                }
+                Ok(())
+            })?;
+        }
+        ensure_publication_lookup_active(cancellation)
+    }
+
+    /// Last-resort exact date extraction using the existing supervised helper.
+    fn youtube_publication_date(
+        &self,
+        video_id: &str,
+        cancellation: &YouTubePrewarmCancellation,
+    ) -> Result<i64> {
+        let mut command = build_publication_date_command(&self.config, video_id);
+        let output =
+            run_bounded_json_command(&mut command, Duration::from_secs(30), 4096, cancellation)
+                .map_err(|error| {
+                    PlaybackError::Protocol(format!(
+                        "YouTube episode date lookup failed for {video_id}: {error}"
+                    ))
+                })?;
+        parse_youtube_publication_date(&output, video_id)
+    }
+
     /// Starts an audio download and returns a supervised child process.
     ///
     /// # Errors
@@ -656,6 +875,8 @@ struct ExtractedCollectionEntryJson {
     thumbnail: Option<String>,
     #[serde(default)]
     thumbnails: Vec<ExtractedThumbnailJson>,
+    #[serde(flatten)]
+    publication: PublicationDateJson,
     // Channel roots contain Videos, Live, and Shorts playlist wrappers.
     #[serde(default)]
     entries: Vec<ExtractedCollectionEntryJson>,
@@ -670,6 +891,190 @@ struct ExtractedThumbnailJson {
     width: Option<u32>,
     #[serde(default)]
     height: Option<u32>,
+}
+
+/// Actual extractor timestamps, deliberately excluding relative playlist dates.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct PublicationDateJson {
+    release_timestamp: Option<i64>,
+    timestamp: Option<i64>,
+    upload_date: Option<String>,
+}
+
+impl PublicationDateJson {
+    /// Prefers a premiere/stream release time, then upload time, then its date.
+    fn published_at(&self) -> Option<i64> {
+        self.release_timestamp
+            .filter(|value| valid_publication_timestamp(*value))
+            .or_else(|| {
+                self.timestamp
+                    .filter(|value| valid_publication_timestamp(*value))
+            })
+            .or_else(|| {
+                let raw = self.upload_date.as_deref()?;
+                if raw.len() != 8 || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return None;
+                }
+                let date = NaiveDate::parse_from_str(raw, "%Y%m%d").ok()?;
+                let timestamp = date.and_hms_opt(0, 0, 0)?.and_utc().timestamp();
+                valid_publication_timestamp(timestamp).then_some(timestamp)
+            })
+    }
+}
+
+/// Limits RSS dates to representable four-digit calendar years after the epoch.
+fn valid_publication_timestamp(timestamp: i64) -> bool {
+    (0..=253_402_300_799).contains(&timestamp)
+        && DateTime::<Utc>::from_timestamp(timestamp, 0).is_some()
+}
+
+/// Accepts only canonical video IDs before they become either URLs or filenames.
+fn validate_publication_video_id(video_id: &str) -> Result<()> {
+    if video_id.len() == 11
+        && video_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        Ok(())
+    } else {
+        Err(PlaybackError::InvalidValue(
+            "YouTube episode date requires a valid video ID".to_owned(),
+        ))
+    }
+}
+
+/// Stops lookup before touching cache files or starting another helper batch.
+fn ensure_publication_lookup_active(cancellation: &YouTubePrewarmCancellation) -> Result<()> {
+    if cancellation.is_cancelled() {
+        Err(PlaybackError::Protocol(
+            "YouTube episode date lookup was cancelled".to_owned(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// Fetches the original webpage's microformat date while skipping media work.
+fn build_publication_date_command(config: &YtDlpConfig, video_id: &str) -> Command {
+    let mut command = build_base_command(config);
+    command
+        .args([
+            "--no-warnings",
+            "--no-playlist",
+            "--skip-download",
+            "--ignore-no-formats-error",
+            "--no-check-formats",
+            "--socket-timeout",
+            "10",
+            "--retries",
+            "0",
+            "--extractor-retries",
+            "0",
+            "--extractor-args",
+            "youtube:player_client=web;player_skip=configs,js;skip=hls,dash;webpage_skip=",
+            "--print",
+            "%(.{id,timestamp,release_timestamp,upload_date})j",
+            "--",
+        ])
+        .arg(format!("https://www.youtube.com/watch?v={video_id}"));
+    command
+}
+
+/// Rejects mismatched video metadata instead of assigning another episode's date.
+fn parse_youtube_publication_date(bytes: &[u8], video_id: &str) -> Result<i64> {
+    #[derive(Deserialize)]
+    struct Metadata {
+        id: String,
+        #[serde(flatten)]
+        publication: PublicationDateJson,
+    }
+    let metadata: Metadata = serde_json::from_slice(bytes).map_err(|_| {
+        PlaybackError::Protocol("YouTube episode date lookup returned invalid JSON".to_owned())
+    })?;
+    if metadata.id != video_id {
+        return Err(PlaybackError::Protocol(
+            "YouTube episode date lookup returned another video's metadata".to_owned(),
+        ));
+    }
+    metadata.publication.published_at().ok_or_else(|| {
+        PlaybackError::Protocol(format!(
+            "YouTube did not provide a publication date for episode {video_id}"
+        ))
+    })
+}
+
+/// Versioned cache stores only public immutable identity and publication metadata.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CachedPublicationDate {
+    version: u8,
+    id: String,
+    published_at: i64,
+}
+
+/// Reads a small ordinary cache file; stale, malformed and wrong-ID files miss.
+fn load_publication_date(cache_dir: &Path, video_id: &str) -> Option<i64> {
+    validate_publication_video_id(video_id).ok()?;
+    let path = cache_dir.join(format!("{video_id}.json"));
+    let metadata = std::fs::symlink_metadata(&path).ok()?;
+    if !metadata.is_file() || metadata.len() > 1024 {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(1025)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > 1024 {
+        return None;
+    }
+    let cached: CachedPublicationDate = serde_json::from_slice(&bytes).ok()?;
+    (cached.version == 1
+        && cached.id == video_id
+        && valid_publication_timestamp(cached.published_at))
+    .then_some(cached.published_at)
+}
+
+/// Publishes a private atomic cache entry; callers may ignore disposable-cache I/O.
+fn store_publication_date(
+    cache_dir: &Path,
+    video_id: &str,
+    published_at: i64,
+) -> std::io::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
+    if validate_publication_video_id(video_id).is_err()
+        || !valid_publication_timestamp(published_at)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid publication date cache entry",
+        ));
+    }
+    crate::private_files::create_private_directory(cache_dir)?;
+    let cached = CachedPublicationDate {
+        version: 1,
+        id: video_id.to_owned(),
+        published_at,
+    };
+    let bytes = serde_json::to_vec(&cached).map_err(std::io::Error::other)?;
+    let sequence = NEXT_TEMPORARY.fetch_add(1, Ordering::Relaxed);
+    let temporary = cache_dir.join(format!(".{video_id}.{}.{sequence}.tmp", std::process::id()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    let mut file = crate::private_files::open_privately(&mut options).open(&temporary)?;
+    let result = (|| {
+        file.write_all(&bytes)?;
+        file.flush()?;
+        drop(file);
+        std::fs::rename(&temporary, cache_dir.join(format!("{video_id}.json")))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
 }
 
 impl TryFrom<ExtractedCollectionJson> for ExtractedCollection {
@@ -713,6 +1118,7 @@ impl TryFrom<ExtractedCollectionJson> for ExtractedCollection {
                     webpage_url,
                     duration_seconds,
                     thumbnail_url,
+                    published_at: entry.publication.published_at(),
                 });
             }
         }
@@ -956,6 +1362,452 @@ fn parse_extractor_list(output: &[u8]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn publication_date_batches_replace_per_episode_helpers_and_reuse_cache() {
+        let directory = tempfile::tempdir().expect("date cache");
+        let client = YtDlp::new(YtDlpConfig {
+            executable: directory.path().join("must-not-start-yt-dlp"),
+            ..YtDlpConfig::default()
+        });
+        let mut entries = (0..121)
+            .map(|index| CollectionEntry {
+                id: format!("{index:011}"),
+                title: "Episode".to_owned(),
+                webpage_url: None,
+                duration_seconds: None,
+                thumbnail_url: None,
+                published_at: None,
+            })
+            .collect::<Vec<_>>();
+        entries[0].published_at = Some(1_709_164_800);
+        store_publication_date(directory.path(), &entries[1].id, 1_709_164_801)
+            .expect("cached date");
+        let mut batches = Vec::new();
+        client
+            .populate_youtube_publication_dates_with_batch(
+                &mut entries,
+                directory.path(),
+                &YouTubePrewarmCancellation::new(),
+                |ids| {
+                    batches.push(ids.to_vec());
+                    Ok(ids.iter().map(|id| (id.clone(), 1_709_164_802)).collect())
+                },
+            )
+            .expect("batched dates without helpers");
+        assert_eq!(
+            batches.iter().map(Vec::len).collect::<Vec<_>>(),
+            [50, 50, 19]
+        );
+        assert_eq!(entries[0].published_at, Some(1_709_164_800));
+        assert_eq!(entries[1].published_at, Some(1_709_164_801));
+        assert!(
+            entries[2..]
+                .iter()
+                .all(|entry| entry.published_at == Some(1_709_164_802))
+        );
+        for entry in &mut entries {
+            entry.published_at = None;
+        }
+        client
+            .populate_youtube_publication_dates_with_batch(
+                &mut entries,
+                directory.path(),
+                &YouTubePrewarmCancellation::new(),
+                |_| panic!("cached feed must not make API requests"),
+            )
+            .expect("repeat feed uses only cache");
+    }
+
+    #[test]
+    fn publication_date_batch_fallback_and_failure_policy() {
+        use std::sync::Mutex;
+        let directory = tempfile::tempdir().expect("cache");
+        let client = YtDlp::new(YtDlpConfig::default());
+        let mut entries = (0..151)
+            .map(|index| CollectionEntry {
+                id: format!("{index:011}"),
+                title: "Episode".to_owned(),
+                webpage_url: None,
+                duration_seconds: None,
+                thumbnail_url: None,
+                published_at: None,
+            })
+            .collect::<Vec<_>>();
+        let mut requests = 0;
+        let fallbacks = Mutex::new(Vec::new());
+        client
+            .populate_youtube_publication_dates_with_batch_lookup(
+                &mut entries,
+                directory.path(),
+                &YouTubePrewarmCancellation::new(),
+                |ids| {
+                    requests += 1;
+                    if requests == 1 {
+                        Ok(ids[1..]
+                            .iter()
+                            .map(|id| (id.clone(), 1_709_164_800))
+                            .collect())
+                    } else {
+                        Err(PlaybackError::Protocol("API quota fixture".to_owned()))
+                    }
+                },
+                |id| {
+                    fallbacks.lock().unwrap().push(id.to_owned());
+                    Ok(1_709_164_801)
+                },
+            )
+            .expect("all episodes dated");
+        assert_eq!(requests, 2, "stop API calls after one failure");
+        let mut actual = fallbacks.into_inner().unwrap();
+        actual.sort();
+        let expected = entries
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i == 0 || *i >= 50)
+            .map(|(_, entry)| entry.id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected, "never refetch successful batch results");
+        assert!(entries.iter().all(|entry| entry.published_at.is_some()));
+    }
+
+    #[test]
+    fn publication_date_sparse_fallbacks_keep_four_requests_in_flight() {
+        use std::sync::{Condvar, Mutex};
+
+        let directory = tempfile::tempdir().expect("date cache");
+        let client = YtDlp::new(YtDlpConfig::default());
+        let mut entries = (0..13)
+            .map(|index| CollectionEntry {
+                id: format!("{index:011}"),
+                title: "Episode".to_owned(),
+                webpage_url: None,
+                duration_seconds: None,
+                thumbnail_url: None,
+                published_at: (index % 4 != 0).then_some(1_709_164_800),
+            })
+            .collect::<Vec<_>>();
+        // Arrival count, active callbacks, and peak concurrent callbacks. A
+        // timed condition variable makes the old serial behavior fail rather
+        // than hanging forever while waiting for the remaining three workers.
+        let counts = Mutex::new((0_usize, 0_usize, 0_usize));
+        let arrivals = Condvar::new();
+        client
+            .populate_youtube_publication_dates_with_batch_lookup(
+                &mut entries,
+                directory.path(),
+                &YouTubePrewarmCancellation::new(),
+                |_| Ok(HashMap::new()),
+                |id| {
+                    assert_eq!(id.parse::<usize>().expect("fixture ID") % 4, 0);
+                    let mut state = counts.lock().expect("callback counts");
+                    state.0 += 1;
+                    state.1 += 1;
+                    state.2 = state.2.max(state.1);
+                    arrivals.notify_all();
+                    let (mut state, timeout) = arrivals
+                        .wait_timeout_while(state, Duration::from_secs(5), |state| state.0 < 4)
+                        .expect("bounded callback wait");
+                    state.1 -= 1;
+                    if timeout.timed_out() && state.0 < 4 {
+                        return Err(PlaybackError::Protocol(
+                            "sparse date requests did not run concurrently".to_owned(),
+                        ));
+                    }
+                    Ok(1_709_164_801)
+                },
+            )
+            .expect("four sparse misses should be looked up together without HTTP");
+
+        let (started, active, peak) = counts.into_inner().expect("callback counts");
+        assert_eq!(started, 4, "already dated entries must not be requested");
+        assert_eq!(active, 0);
+        assert_eq!(peak, 4, "sparse cache misses must use all four workers");
+        for (index, entry) in entries.iter().enumerate() {
+            assert_eq!(
+                entry.published_at,
+                Some(if index % 4 == 0 {
+                    1_709_164_801
+                } else {
+                    1_709_164_800
+                }),
+            );
+        }
+    }
+
+    #[test]
+    fn publication_date_batches_require_valid_dates_and_honor_cancellation() {
+        let client = YtDlp::new(YtDlpConfig::default());
+        let entry = CollectionEntry {
+            id: "jNQXAC9IVRw".to_owned(),
+            title: "Episode".to_owned(),
+            webpage_url: None,
+            duration_seconds: None,
+            thumbnail_url: None,
+            published_at: None,
+        };
+        for scenario in 0..5 {
+            let directory = tempfile::tempdir().expect("cache");
+            let cancellation = YouTubePrewarmCancellation::new();
+            let mut entries = [entry.clone()];
+            let result = client.populate_youtube_publication_dates_with_batch_lookup(
+                &mut entries,
+                directory.path(),
+                &cancellation,
+                |_| match scenario {
+                    0 => Ok(HashMap::from([("wrongvideo1".to_owned(), 1_709_164_800)])),
+                    1 => Ok(HashMap::from([(entry.id.clone(), -1)])),
+                    2 => {
+                        cancellation.cancel();
+                        Ok(HashMap::from([(entry.id.clone(), 1_709_164_800)]))
+                    }
+                    _ => Ok(HashMap::new()),
+                },
+                |_| match scenario {
+                    3 => Err(PlaybackError::Protocol("no date fixture".to_owned())),
+                    4 => Ok(-1),
+                    _ => panic!("invalid or cancelled batch must not fall back"),
+                },
+            );
+            assert!(result.is_err(), "scenario {scenario}");
+            assert_eq!(entries[0].published_at, None);
+            assert_eq!(load_publication_date(directory.path(), &entry.id), None);
+            cancellation.cancel();
+            assert!(
+                client
+                    .populate_youtube_publication_dates_with_batch_lookup(
+                        &mut entries,
+                        directory.path(),
+                        &cancellation,
+                        |_| panic!("no batch after cancellation"),
+                        |_| panic!("no fallback after cancellation"),
+                    )
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn publication_dates_survive_flat_collection_conversion() {
+        let raw: ExtractedCollectionJson = serde_json::from_str(r#"{"id":"playlist","entries":[{"id":"video1","timestamp":1709164800},{"id":"video2","upload_date":"20240229"},{"id":"video3","upload_date":"20230229"}]}"#).expect("flat metadata");
+        let collection = ExtractedCollection::try_from(raw).expect("collection");
+        assert_eq!(
+            collection
+                .entries
+                .iter()
+                .map(|entry| entry.published_at)
+                .collect::<Vec<_>>(),
+            [Some(1_709_164_800), Some(1_709_164_800), None]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publication_date_lookup_refetches_bad_cache_and_keeps_private_result() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().expect("date fixture");
+        let cache_dir = directory.path().join("cache");
+        std::fs::create_dir(&cache_dir).expect("cache directory");
+        std::fs::write(cache_dir.join("jNQXAC9IVRw.json"), "broken cache")
+            .expect("broken cache fixture");
+        let executable = directory.path().join("metadata-helper");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nprintf '%s\\n' '{\"id\":\"jNQXAC9IVRw\",\"timestamp\":1114313512}'\n",
+        )
+        .expect("helper fixture");
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
+            .expect("executable fixture");
+        let client = YtDlp::new(YtDlpConfig {
+            executable: executable.clone(),
+            ..YtDlpConfig::default()
+        });
+        let mut entries = [CollectionEntry {
+            id: "jNQXAC9IVRw".to_owned(),
+            title: "Test".to_owned(),
+            webpage_url: None,
+            duration_seconds: None,
+            thumbnail_url: None,
+            published_at: None,
+        }];
+        let cancellation = YouTubePrewarmCancellation::new();
+        client
+            .populate_youtube_publication_dates(&mut entries, &cache_dir, &cancellation)
+            .expect("fresh date");
+        assert_eq!(entries[0].published_at, Some(1_114_313_512));
+        assert_eq!(
+            load_publication_date(&cache_dir, "jNQXAC9IVRw"),
+            Some(1_114_313_512)
+        );
+        assert_eq!(
+            std::fs::metadata(cache_dir.join("jNQXAC9IVRw.json"))
+                .expect("cache file")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(&cache_dir)
+                .expect("cache directory")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        std::fs::remove_file(executable).expect("remove fixture helper");
+        entries[0].published_at = None;
+        client
+            .populate_youtube_publication_dates(&mut entries, &cache_dir, &cancellation)
+            .expect("cached date without helper");
+        assert!(!cancellation.is_cancelled());
+    }
+
+    #[test]
+    fn publication_dates_keep_real_metadata_and_validate_calendar_dates() {
+        let date = |json: &str| {
+            serde_json::from_str::<PublicationDateJson>(json)
+                .expect("date JSON")
+                .published_at()
+        };
+        assert_eq!(
+            date(r#"{"release_timestamp":1709164801,"timestamp":1709164800}"#),
+            Some(1_709_164_801)
+        );
+        assert_eq!(
+            date(r#"{"timestamp":1709164800,"upload_date":"20240228"}"#),
+            Some(1_709_164_800)
+        );
+        assert_eq!(date(r#"{"upload_date":"20240229"}"#), Some(1_709_164_800));
+        for json in [
+            r#"{}"#,
+            r#"{"upload_date":"20230229"}"#,
+            r#"{"upload_date":"20241301"}"#,
+            r#"{"upload_date":"2024022"}"#,
+            r#"{"timestamp":-1}"#,
+            r#"{"timestamp":9223372036854775807}"#,
+        ] {
+            assert_eq!(date(json), None, "{json}");
+        }
+    }
+
+    #[test]
+    fn publication_date_output_requires_matching_id_and_actual_date() {
+        assert_eq!(
+            parse_youtube_publication_date(
+                br#"{"id":"jNQXAC9IVRw","upload_date":"20050424"}"#,
+                "jNQXAC9IVRw"
+            )
+            .expect("matching metadata"),
+            1_114_300_800,
+        );
+        assert!(
+            parse_youtube_publication_date(
+                br#"{"id":"wrong","timestamp":1114313512}"#,
+                "jNQXAC9IVRw"
+            )
+            .is_err()
+        );
+        assert!(parse_youtube_publication_date(br#"{"id":"jNQXAC9IVRw"}"#, "jNQXAC9IVRw").is_err());
+    }
+
+    #[test]
+    fn publication_date_command_skips_media_and_uses_bounded_metadata_fields() {
+        let command = build_publication_date_command(&YtDlpConfig::default(), "jNQXAC9IVRw");
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        for required in [
+            "--ignore-config",
+            "--no-plugin-dirs",
+            "--skip-download",
+            "--ignore-no-formats-error",
+            "--no-check-formats",
+            "--no-playlist",
+        ] {
+            assert!(args.iter().any(|arg| arg == required), "{required}");
+        }
+        assert!(args.windows(2).any(|pair| pair
+            == [
+                "--extractor-args",
+                "youtube:player_client=web;player_skip=configs,js;skip=hls,dash;webpage_skip="
+            ]));
+        assert!(args.windows(2).any(|pair| pair
+            == [
+                "--print",
+                "%(.{id,timestamp,release_timestamp,upload_date})j"
+            ]));
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("https://www.youtube.com/watch?v=jNQXAC9IVRw")
+        );
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg.contains("approximate_date") || arg.contains("cookies"))
+        );
+    }
+
+    #[test]
+    fn publication_date_cache_hit_avoids_unavailable_helper() {
+        let directory = tempfile::tempdir().expect("date cache");
+        store_publication_date(directory.path(), "jNQXAC9IVRw", 1_114_313_512)
+            .expect("cached date");
+        let client = YtDlp::new(YtDlpConfig {
+            executable: directory.path().join("missing-yt-dlp"),
+            ..YtDlpConfig::default()
+        });
+        let mut entries = [CollectionEntry {
+            id: "jNQXAC9IVRw".to_owned(),
+            title: "Test".to_owned(),
+            webpage_url: None,
+            duration_seconds: None,
+            thumbnail_url: None,
+            published_at: None,
+        }];
+        client
+            .populate_youtube_publication_dates(
+                &mut entries,
+                directory.path(),
+                &YouTubePrewarmCancellation::new(),
+            )
+            .expect("cached lookup");
+        assert_eq!(entries[0].published_at, Some(1_114_313_512));
+    }
+
+    #[test]
+    fn publication_date_cache_rejects_wrong_id_and_invalid_dates() {
+        let directory = tempfile::tempdir().expect("date cache");
+        for contents in [
+            r#"{"version":1,"id":"another-id","published_at":1114313512}"#,
+            r#"{"version":9,"id":"jNQXAC9IVRw","published_at":1114313512}"#,
+            r#"{"version":1,"id":"jNQXAC9IVRw","published_at":-1}"#,
+            "broken JSON",
+        ] {
+            std::fs::write(directory.path().join("jNQXAC9IVRw.json"), contents)
+                .expect("bad cache fixture");
+            assert_eq!(load_publication_date(directory.path(), "jNQXAC9IVRw"), None);
+        }
+    }
+
+    #[test]
+    fn publication_date_lookup_honors_cancellation_before_cache_or_spawn() {
+        let directory = tempfile::tempdir().expect("date cache");
+        let cancellation = YouTubePrewarmCancellation::new();
+        cancellation.cancel();
+        let client = YtDlp::new(YtDlpConfig {
+            executable: directory.path().join("missing-yt-dlp"),
+            ..YtDlpConfig::default()
+        });
+        assert!(
+            client
+                .populate_youtube_publication_dates(&mut [], directory.path(), &cancellation)
+                .expect_err("cancelled")
+                .to_string()
+                .contains("cancelled")
+        );
+    }
 
     #[test]
     fn base_command_disables_config_and_plugins_by_default() {

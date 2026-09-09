@@ -2784,6 +2784,9 @@ impl YouTubeMusicSearchProvider for YouTubeMusicSearch {
 }
 
 enum ProviderResponse {
+    /// Precise dates from the actual official provider used by a completed request.
+    #[cfg(feature = "lan-sharing")]
+    YouTubePublicationDates(Vec<YouTubePublicationDate>),
     Search {
         generation: u64,
         request: SearchRequest,
@@ -3169,6 +3172,148 @@ struct YouTubePodcastFeedResponse {
     generation: u64,
     channel_id: String,
     result: Result<ExtractedCollection, String>,
+}
+
+/// Maximum provenance-verified publication dates retained across navigation.
+#[cfg(feature = "lan-sharing")]
+const MAX_CACHED_YOUTUBE_PUBLICATION_DATES: usize = 4096;
+
+/// A publication timestamp read from an identified official provider response.
+#[cfg(feature = "lan-sharing")]
+struct YouTubePublicationDate {
+    video_id: String,
+    channel_id: String,
+    published_at: i64,
+}
+
+/// Bounded session cache whose entries never come from unlabelled saved metadata.
+#[cfg(feature = "lan-sharing")]
+#[derive(Default)]
+struct YouTubePublicationDateCache {
+    dates: HashMap<(String, String), i64>,
+    insertion_order: VecDeque<(String, String)>,
+}
+
+#[cfg(feature = "lan-sharing")]
+impl YouTubePublicationDateCache {
+    /// Retains exact channel/video pairs, evicting the oldest inserted pair first.
+    fn remember(&mut self, dates: Vec<YouTubePublicationDate>) {
+        for date in dates {
+            let key = (date.channel_id, date.video_id);
+            if !self.dates.contains_key(&key) {
+                if self.dates.len() >= MAX_CACHED_YOUTUBE_PUBLICATION_DATES
+                    && let Some(oldest) = self.insertion_order.pop_front()
+                {
+                    self.dates.remove(&oldest);
+                }
+                self.insertion_order.push_back(key.clone());
+            }
+            self.dates.insert(key, date.published_at);
+        }
+    }
+
+    /// Takes only dates proved to belong to the channel requested for this feed.
+    fn for_channel(&self, channel_id: &str) -> HashMap<String, i64> {
+        self.dates
+            .iter()
+            .filter_map(|((channel, video), date)| {
+                (channel == channel_id).then(|| (video.clone(), *date))
+            })
+            .collect()
+    }
+}
+
+/// Attaches precise provenance before ordinary provider metadata loses its source.
+///
+/// Configuration is insufficient evidence: cached/restored results may have
+/// come from a previous Invidious provider, whose timestamps can be approximate.
+#[cfg(feature = "lan-sharing")]
+fn official_youtube_publication_date(
+    provider_id: &str,
+    video_id: &str,
+    channel_id: &str,
+    published_at: Option<i64>,
+) -> Option<YouTubePublicationDate> {
+    if provider_id != "youtube-official"
+        || validate_youtube_video_id(video_id).is_err()
+        || canonical_youtube_uploads_url(channel_id).is_none()
+    {
+        return None;
+    }
+    let published_at =
+        published_at.filter(|date| *date > 0 && DateTime::from_timestamp(*date, 0).is_some())?;
+    Some(YouTubePublicationDate {
+        video_id: video_id.to_owned(),
+        channel_id: channel_id.to_owned(),
+        published_at,
+    })
+}
+
+/// Extracts precise timestamps already returned by a search or channel request.
+#[cfg(feature = "lan-sharing")]
+fn official_youtube_page_dates(
+    provider_id: &str,
+    page: &SearchPage,
+) -> Vec<YouTubePublicationDate> {
+    page.items
+        .iter()
+        .filter_map(|item| match item {
+            SearchItem::Video(video) => official_youtube_publication_date(
+                provider_id,
+                &video.video_id,
+                &video.channel_id,
+                video.published_at,
+            ),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Reuses one completed official page without issuing additional API requests.
+#[cfg(feature = "lan-sharing")]
+fn send_official_youtube_page_dates(
+    provider: Option<&dyn Provider>,
+    result: &Result<SearchPage, String>,
+    responses: &Sender<ProviderResponse>,
+) {
+    if let Some(provider) = provider
+        && let Ok(page) = result
+    {
+        let dates = official_youtube_page_dates(provider.id(), page);
+        if !dates.is_empty() {
+            let _ = responses.send(ProviderResponse::YouTubePublicationDates(dates));
+        }
+    }
+}
+
+/// Reuses precise cached dates and resolves only retained episodes, preserving
+/// the complete catalogue for an inclusive boundary on a filtered Short.
+#[cfg(feature = "lan-sharing")]
+fn populate_youtube_podcast_dates(
+    mut collection: ExtractedCollection,
+    first_video_id: Option<&str>,
+    skip_shorts: bool,
+    known_dates: &HashMap<String, i64>,
+    populate: impl FnOnce(&mut [crate::playback::ytdlp::CollectionEntry]) -> Result<(), String>,
+) -> Result<ExtractedCollection, String> {
+    let indices =
+        crate::lan_share::youtube_podcast_episode_indices(&collection, first_video_id, skip_shorts)
+            .map_err(|error| error.to_string())?;
+    let mut episodes = indices
+        .iter()
+        .map(|&index| {
+            let mut episode = collection.entries[index].clone();
+            if let Some(published_at) = known_dates.get(&episode.id) {
+                episode.published_at = Some(*published_at);
+            }
+            episode
+        })
+        .collect::<Vec<_>>();
+    populate(&mut episodes)?;
+    for (index, episode) in indices.into_iter().zip(episodes) {
+        collection.entries[index].published_at = episode.published_at;
+    }
+    Ok(collection)
 }
 
 #[cfg(feature = "evernote")]
@@ -5043,6 +5188,9 @@ pub struct AppController {
     channel_details_cache_order: VecDeque<String>,
     /// Full video details retained so revisits restore likes and chapters at once.
     youtube_video_details_cache: HashMap<String, VideoDetails>,
+    /// Precise dates separately retain official provenance across provider changes.
+    #[cfg(feature = "lan-sharing")]
+    youtube_publication_date_cache: YouTubePublicationDateCache,
     /// Least-recently-used order for full YouTube video details.
     youtube_video_details_cache_order: VecDeque<String>,
     /// Conservative owned-heap estimate for full YouTube video details.
@@ -6338,6 +6486,8 @@ impl AppController {
             channel_details_fresh_until: HashMap::new(),
             channel_details_cache_order: VecDeque::new(),
             youtube_video_details_cache: HashMap::new(),
+            #[cfg(feature = "lan-sharing")]
+            youtube_publication_date_cache: YouTubePublicationDateCache::default(),
             youtube_video_details_cache_order: VecDeque::new(),
             youtube_video_details_cache_bytes: 0,
             #[cfg(feature = "dearrow")]
@@ -10949,6 +11099,9 @@ impl AppController {
     }
 
     /// Enumerates one whole channel off the UI thread before publishing its feed.
+    /// Already fetched official dates are reused first; an existing API key can
+    /// fill missing dates in bounded batches before keyless/yt-dlp fallback.
+    /// Feed boundaries and Shorts filtering precede all date requests.
     #[cfg(feature = "lan-sharing")]
     fn start_youtube_channel_podcast(
         &mut self,
@@ -10973,6 +11126,23 @@ impl AppController {
             return Err("The selected YouTube channel ID is invalid".to_owned());
         }
         let executable = self.config.providers.yt_dlp_executable.clone();
+        let date_cache = self.config.cache_dir().join("youtube-publication-dates");
+        let known_dates = self.youtube_publication_date_cache.for_channel(&channel_id);
+        #[cfg(feature = "youtube-official")]
+        let official_dates = self
+            .config
+            .providers
+            .youtube_api_key
+            .as_ref()
+            .and_then(|key| {
+                crate::providers::youtube_official::YouTubeOfficialProvider::with_options(
+                    key.clone(),
+                    Duration::from_secs(8),
+                    256 * 1024,
+                )
+                .ok()
+            });
+        let date_boundary = first_video_id.clone();
         let cancellation = YouTubePrewarmCancellation::new();
         let worker_cancellation = cancellation.clone();
         let sender = self.youtube_podcast_feed_response_sender.clone();
@@ -10991,7 +11161,36 @@ impl AppController {
                         skip_shorts,
                         &worker_cancellation,
                     )
-                    .map_err(|error| error.to_string());
+                    .map_err(|error| error.to_string())
+                    .and_then(|collection| {
+                        populate_youtube_podcast_dates(
+                            collection,
+                            date_boundary.as_deref(),
+                            skip_shorts,
+                            &known_dates,
+                            |episodes| {
+                                client
+                                    .populate_youtube_publication_dates_with_batch(
+                                        episodes,
+                                        &date_cache,
+                                        &worker_cancellation,
+                                        |ids| {
+                                            #[cfg(feature = "youtube-official")]
+                                            if let Some(provider) = official_dates.as_ref() {
+                                                return provider.publication_dates(ids).map_err(|_| {
+                                                    PlaybackError::Protocol(
+                                                        "YouTube publication-date API request failed".to_owned(),
+                                                    )
+                                                });
+                                            }
+                                            let _ = ids;
+                                            Ok(HashMap::new())
+                                        },
+                                    )
+                                    .map_err(|error| error.to_string())
+                            },
+                        )
+                    });
                 let _ = sender.send(YouTubePodcastFeedResponse {
                     generation,
                     channel_id: response_channel_id,
@@ -11078,7 +11277,7 @@ impl AppController {
             }
             Err(error) => {
                 self.show_youtube_podcast_feed_failure(format!(
-                    "Cannot enumerate YouTube channel: {error}"
+                    "Cannot prepare YouTube podcast metadata: {error}"
                 ));
             }
         }
@@ -11669,6 +11868,10 @@ impl AppController {
 
     fn handle_provider_response(&mut self, response: ProviderResponse) {
         match response {
+            #[cfg(feature = "lan-sharing")]
+            ProviderResponse::YouTubePublicationDates(dates) => {
+                self.youtube_publication_date_cache.remember(dates);
+            }
             ProviderResponse::Search {
                 generation,
                 request,
@@ -37053,6 +37256,12 @@ fn youtube_pagination_worker(
                 Err("YouTube pagination worker panicked while loading the channel page".to_owned())
             }
         };
+        #[cfg(feature = "lan-sharing")]
+        send_official_youtube_page_dates(
+            work.youtube_provider.provider.as_deref(),
+            &result,
+            &responses,
+        );
         if responses
             .send(ProviderResponse::ChannelVideos {
                 generation: work.generation,
@@ -37561,6 +37770,12 @@ fn general_provider_worker(
                     || Err("YouTube provider is not configured".to_owned()),
                     |provider| provider.search(&request).map_err(|error| error.to_string()),
                 );
+                #[cfg(feature = "lan-sharing")]
+                send_official_youtube_page_dates(
+                    routed_youtube_provider.as_deref(),
+                    &result,
+                    &responses,
+                );
                 if responses
                     .send(ProviderResponse::Search {
                         generation,
@@ -37925,6 +38140,12 @@ fn general_provider_worker(
                             .map_err(|error| error.to_string())
                     },
                 );
+                #[cfg(feature = "lan-sharing")]
+                send_official_youtube_page_dates(
+                    routed_youtube_provider.as_deref(),
+                    &result,
+                    &responses,
+                );
                 if responses
                     .send(ProviderResponse::ChannelVideos {
                         generation,
@@ -37948,6 +38169,18 @@ fn general_provider_worker(
                             .map_err(|error| error.to_string())
                     },
                 );
+                #[cfg(feature = "lan-sharing")]
+                if let Some(provider) = routed_youtube_provider.as_deref()
+                    && let Ok(details) = &result
+                    && let Some(date) = official_youtube_publication_date(
+                        provider.id(),
+                        &details.video_id,
+                        &details.channel_id,
+                        details.published_at,
+                    )
+                {
+                    let _ = responses.send(ProviderResponse::YouTubePublicationDates(vec![date]));
+                }
                 if responses
                     .send(ProviderResponse::Details { generation, result })
                     .is_err()
@@ -52194,6 +52427,249 @@ mod tests {
 
     #[cfg(feature = "lan-sharing")]
     #[test]
+    fn podcast_date_reuse_requires_official_provenance_and_exact_channel_identity() {
+        let mut video = subscription_video_summary();
+        video.video_id = "aaaaaaaaaaa".to_owned();
+        let page = SearchPage {
+            page: 1,
+            items: vec![SearchItem::Video(video.clone())],
+            next_page: None,
+        };
+        assert!(official_youtube_page_dates("invidious", &page).is_empty());
+        assert!(official_youtube_page_dates("yt-dlp", &page).is_empty());
+        assert!(official_youtube_page_dates("unknown", &page).is_empty());
+        let mut cache = YouTubePublicationDateCache::default();
+        cache.remember(official_youtube_page_dates("youtube-official", &page));
+        let mut other_channel = video.clone();
+        other_channel.channel_id = "UCother".to_owned();
+        other_channel.published_at = Some(1_704_164_650);
+        let mut foreign_video = other_channel.clone();
+        foreign_video.video_id = "bbbbbbbbbbb".to_owned();
+        cache.remember(official_youtube_page_dates(
+            "youtube-official",
+            &SearchPage {
+                page: 1,
+                items: vec![
+                    SearchItem::Video(other_channel),
+                    SearchItem::Video(foreign_video),
+                ],
+                next_page: None,
+            },
+        ));
+        let mut details = subscription_video_details("Precise details");
+        details.video_id = "ccccccccccc".to_owned();
+        cache.remember(
+            official_youtube_publication_date(
+                "youtube-official",
+                &details.video_id,
+                &details.channel_id,
+                details.published_at,
+            )
+            .into_iter()
+            .collect(),
+        );
+        let dates = cache.for_channel("UCfixture");
+        assert_eq!(dates.len(), 2);
+        assert_eq!(dates.get("aaaaaaaaaaa"), video.published_at.as_ref());
+        assert_eq!(dates.get("ccccccccccc"), details.published_at.as_ref());
+        assert!(!dates.contains_key("bbbbbbbbbbb"));
+        assert!(cache.for_channel("UCunrelated").is_empty());
+        assert!(
+            official_youtube_publication_date(
+                "youtube-official",
+                "not a valid ID",
+                "UCfixture",
+                Some(1_704_164_645),
+            )
+            .is_none()
+        );
+        assert!(
+            official_youtube_publication_date(
+                "youtube-official",
+                "aaaaaaaaaaa",
+                "UCfixture",
+                Some(i64::MAX),
+            )
+            .is_none()
+        );
+    }
+
+    #[cfg(feature = "lan-sharing")]
+    #[test]
+    fn podcast_date_reuse_keeps_unknown_ids_for_the_missing_date_lookup() {
+        let entry = |id: &str| crate::playback::ytdlp::CollectionEntry {
+            id: id.to_owned(),
+            title: id.to_owned(),
+            webpage_url: None,
+            duration_seconds: None,
+            thumbnail_url: None,
+            published_at: None,
+        };
+        let collection = ExtractedCollection {
+            id: "UCfixture".to_owned(),
+            title: "Fixture".to_owned(),
+            extractor: None,
+            thumbnail_url: None,
+            entries: vec![
+                entry("aaaaaaaaaaa"),
+                entry("bbbbbbbbbbb"),
+                entry("ccccccccccc"),
+            ],
+        };
+        let known_dates = HashMap::from([
+            ("aaaaaaaaaaa".to_owned(), 1_704_164_645),
+            ("not-in-feed".to_owned(), 1_704_164_650),
+        ]);
+        let dated = populate_youtube_podcast_dates(
+            collection,
+            Some("bbbbbbbbbbb"),
+            false,
+            &known_dates,
+            |episodes| {
+                assert_eq!(episodes.len(), 2, "older items stay outside date requests");
+                let missing = episodes
+                    .iter()
+                    .filter(|entry| entry.published_at.is_none())
+                    .map(|entry| entry.id.as_str())
+                    .collect::<Vec<_>>();
+                assert_eq!(missing, ["bbbbbbbbbbb"]);
+                assert_eq!(
+                    episodes
+                        .iter()
+                        .find(|entry| entry.id == "aaaaaaaaaaa")
+                        .and_then(|entry| entry.published_at),
+                    Some(1_704_164_645)
+                );
+                for episode in episodes
+                    .iter_mut()
+                    .filter(|entry| entry.published_at.is_none())
+                {
+                    episode.published_at = Some(1_704_164_646);
+                }
+                Ok(())
+            },
+        )
+        .expect("precise date reuse");
+        assert_eq!(dated.entries[0].published_at, Some(1_704_164_645));
+        assert_eq!(dated.entries[1].published_at, Some(1_704_164_646));
+        assert_eq!(dated.entries[2].published_at, None);
+    }
+
+    #[cfg(feature = "lan-sharing")]
+    #[test]
+    fn podcast_precise_date_cache_is_bounded_and_controller_owned() {
+        let temporary = crate::test_support::canonical_tempdir("precise date cache");
+        let store = StateStore::open_in_memory().expect("store");
+        let mut controller =
+            AppController::new(Config::for_dir(temporary.path()), store, None, None);
+        let dates = (0..=MAX_CACHED_YOUTUBE_PUBLICATION_DATES)
+            .map(|index| {
+                official_youtube_publication_date(
+                    "youtube-official",
+                    &format!("{index:011}"),
+                    "UCfixture",
+                    Some(1_704_164_645),
+                )
+                .expect("precise date")
+            })
+            .collect();
+        controller.handle_provider_response(ProviderResponse::YouTubePublicationDates(dates));
+        let cached = controller
+            .youtube_publication_date_cache
+            .for_channel("UCfixture");
+        assert_eq!(cached.len(), MAX_CACHED_YOUTUBE_PUBLICATION_DATES);
+        assert!(
+            !cached.contains_key("00000000000"),
+            "oldest precise date is evicted"
+        );
+        assert!(cached.contains_key(&format!("{:011}", MAX_CACHED_YOUTUBE_PUBLICATION_DATES)));
+        controller.shutdown();
+    }
+
+    #[cfg(feature = "lan-sharing")]
+    #[test]
+    fn podcast_date_lookup_only_enriches_retained_episodes() {
+        let entry = |id: &str, short: bool| crate::playback::ytdlp::CollectionEntry {
+            id: id.to_owned(),
+            title: id.to_owned(),
+            webpage_url: Some(
+                url::Url::parse(&format!(
+                    "https://www.youtube.com/{}{}",
+                    if short { "shorts/" } else { "watch?v=" },
+                    id,
+                ))
+                .expect("source URL"),
+            ),
+            duration_seconds: None,
+            thumbnail_url: None,
+            published_at: None,
+        };
+        let collection = ExtractedCollection {
+            id: "UCfixture".to_owned(),
+            title: "Fixture".to_owned(),
+            extractor: None,
+            thumbnail_url: None,
+            entries: vec![
+                entry("aaaaaaaaaaa", false),
+                entry("bbbbbbbbbbb", true),
+                entry("ccccccccccc", true),
+                entry("ddddddddddd", false),
+            ],
+        };
+        let dated = populate_youtube_podcast_dates(
+            collection,
+            Some("ccccccccccc"),
+            true,
+            &HashMap::new(),
+            |entries| {
+                assert_eq!(
+                    entries.len(),
+                    1,
+                    "skip older episodes and Shorts before date requests"
+                );
+                assert_eq!(entries[0].id, "aaaaaaaaaaa");
+                entries[0].published_at = Some(1_704_164_645);
+                Ok(())
+            },
+        )
+        .expect("episode dates");
+        assert_eq!(
+            dated.entries.len(),
+            4,
+            "preserve the selected Short for final cutoff validation"
+        );
+        assert_eq!(dated.entries[0].published_at, Some(1_704_164_645));
+        assert!(
+            dated.entries[1..]
+                .iter()
+                .all(|entry| entry.published_at.is_none())
+        );
+        let feed = crate::lan_share::prepare_youtube_podcast_share_from(
+            dated,
+            YouTubePrewarmConfig::default(),
+            "ccccccccccc",
+            true,
+        )
+        .expect("dated feed");
+        assert_eq!(feed.item_count(), 1);
+    }
+
+    #[cfg(feature = "lan-sharing")]
+    #[test]
+    fn shutdown_cancels_podcast_publication_date_work() {
+        let temporary = crate::test_support::canonical_tempdir("podcast cancellation");
+        let config = Config::for_dir(temporary.path().join("config"));
+        let store = StateStore::open_in_memory().expect("in-memory store");
+        let mut controller = AppController::new(config, store, None, None);
+        let cancellation = YouTubePrewarmCancellation::new();
+        controller.youtube_podcast_feed_cancellation = Some(cancellation.clone());
+        controller.shutdown();
+        assert!(cancellation.is_cancelled());
+        assert!(controller.youtube_podcast_feed_cancellation.is_none());
+    }
+
+    #[cfg(feature = "lan-sharing")]
+    #[test]
     fn selected_youtube_video_opens_inclusive_channel_feed_boundary_review() {
         let temporary = crate::test_support::canonical_tempdir("youtube-podcast-options");
         let mut config = Config::for_dir(temporary.path().join("config"));
@@ -52346,6 +52822,7 @@ mod tests {
                     webpage_url: None,
                     duration_seconds: Some(42),
                     thumbnail_url: None,
+                    published_at: Some(1_704_164_645),
                 }],
             }),
         });

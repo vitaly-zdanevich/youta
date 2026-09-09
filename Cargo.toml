@@ -142,6 +142,7 @@ qr = ["dep:qrcode"]
 # Youta; QR encoding, networking, and embedded-artwork extraction remain
 # removable together.
 lan-sharing = [
+	"dep:chrono",
 	"local-artwork",
 	"network",
 	"qr",
@@ -265,7 +266,7 @@ vimeo = ["yt-dlp"]
 rutube = ["yt-dlp"]
 youtube-official = ["network"]
 youtube-music = ["yt-dlp"]
-yt-dlp = ["dep:fs2", "dep:rustix"]
+yt-dlp = ["dep:chrono", "dep:fs2", "dep:rustix"]
 sponsorblock = ["network"]
 dearrow = ["network"]
 wikidata = ["network"]

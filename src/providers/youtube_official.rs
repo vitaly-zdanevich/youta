@@ -372,6 +372,82 @@ impl YouTubeOfficialProvider {
         }
     }
 
+    /// Fetches exact publication timestamps for up to 50 distinct video IDs.
+    ///
+    /// Uses one `videos.list` request containing only `snippet.publishedAt` and
+    /// each resource ID. Returned timestamps are Unix seconds keyed by ID, so
+    /// callers need not rely on response ordering. Missing resources are omitted
+    /// to permit another metadata source to fill them; no dates are invented.
+    /// Empty input returns immediately without making a request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderError::InvalidRequest`] for invalid, duplicate, or more
+    /// than 50 identifiers. Returns [`ProviderError::InvalidResponse`] for
+    /// unexpected or duplicate returned IDs, or missing/invalid publication
+    /// dates. HTTP failures and response limits use the provider's usual bounded,
+    /// API-key-redacted error handling.
+    pub fn publication_dates(
+        &self,
+        video_ids: &[String],
+    ) -> Result<HashMap<String, i64>, ProviderError> {
+        if video_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        if video_ids.len() > MAX_VIDEO_RESOURCE_IDS {
+            return Err(ProviderError::InvalidRequest(format!(
+                "YouTube publication dates accept at most {MAX_VIDEO_RESOURCE_IDS} identifiers"
+            )));
+        }
+        for (index, video_id) in video_ids.iter().enumerate() {
+            validate_youtube_video_id(video_id)?;
+            if video_ids[..index].contains(video_id) {
+                return Err(ProviderError::InvalidRequest(
+                    "YouTube publication dates require distinct video identifiers".to_owned(),
+                ));
+            }
+        }
+
+        let mut url = self.endpoint("videos")?;
+        {
+            let mut query = url.query_pairs_mut();
+            query.append_pair("part", "snippet");
+            query.append_pair("id", &video_ids.join(","));
+            query.append_pair("fields", "items(id,snippet/publishedAt)");
+        }
+        let response: RawVideoListResponse = self.request_json(&url)?;
+        if response.items.len() > video_ids.len() {
+            return Err(ProviderError::InvalidResponse(
+                "YouTube returned more publication dates than requested".to_owned(),
+            ));
+        }
+        let mut dates = HashMap::with_capacity(response.items.len());
+        for item in response.items {
+            validate_response_video_id(&item.id)?;
+            if !video_ids.contains(&item.id) {
+                return Err(ProviderError::InvalidResponse(
+                    "YouTube publication dates contain an unexpected video ID".to_owned(),
+                ));
+            }
+            let published_at = item
+                .snippet
+                .published_at
+                .as_deref()
+                .and_then(parse_rfc3339_epoch)
+                .ok_or_else(|| {
+                    ProviderError::InvalidResponse(
+                        "YouTube publication date is missing or invalid".to_owned(),
+                    )
+                })?;
+            if dates.insert(item.id, published_at).is_some() {
+                return Err(ProviderError::InvalidResponse(
+                    "YouTube publication dates contain a duplicate video ID".to_owned(),
+                ));
+            }
+        }
+        Ok(dates)
+    }
+
     /// Enriches at most one official 50-ID batch with a partial response.
     ///
     /// # Errors
@@ -3051,6 +3127,141 @@ mod tests {
             Some("old_page_2"),
             "an incomplete refresh must not replace the last committed token chain"
         );
+    }
+
+    #[test]
+    fn publication_dates_batch_uses_only_date_fields_and_matches_shuffled_ids() {
+        let body = r#"{"items":[
+            {"id":"aaaaaaaaaaa","snippet":{"publishedAt":"1970-01-02T00:00:00Z"}},
+            {"id":"dQw4w9WgXcQ","snippet":{"publishedAt":"1970-01-01T00:00:01Z"}}
+        ]}"#;
+        let (provider, server) = provider_with_server(vec![json_response("200 OK", body)]);
+        let ids = [
+            VIDEO_ID.to_owned(),
+            "aaaaaaaaaaa".to_owned(),
+            "bbbbbbbbbbb".to_owned(),
+        ];
+        let dates = provider
+            .publication_dates(&ids)
+            .expect("dates should parse");
+        let requests = server.finish();
+
+        assert_eq!(dates.len(), 2);
+        assert_eq!(dates.get(VIDEO_ID), Some(&1));
+        assert_eq!(dates.get("aaaaaaaaaaa"), Some(&86_400));
+        assert!(!dates.contains_key("bbbbbbbbbbb"));
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("/videos?"));
+        let pairs = query_pairs(&requests[0]);
+        assert_eq!(
+            pairs.len(),
+            4,
+            "only dates, identifiers, and authentication are required"
+        );
+        assert_eq!(pairs.get("part").map(String::as_str), Some("snippet"));
+        assert_eq!(
+            pairs.get("fields").map(String::as_str),
+            Some("items(id,snippet/publishedAt)")
+        );
+        assert_eq!(pairs.get("id"), Some(&ids.join(",")));
+        assert_eq!(pairs.get("key").map(String::as_str), Some(TEST_KEY));
+    }
+
+    #[test]
+    fn publication_dates_accepts_fifty_identifiers_in_one_request() {
+        let (provider, server) =
+            provider_with_server(vec![json_response("200 OK", r#"{"items":[]}"#)]);
+        let ids = (0..50)
+            .map(|index| format!("v{index:010}"))
+            .collect::<Vec<_>>();
+        assert!(
+            provider
+                .publication_dates(&ids)
+                .expect("a full batch is valid")
+                .is_empty()
+        );
+        let requests = server.finish();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(query_pairs(&requests[0]).get("id"), Some(&ids.join(",")));
+    }
+
+    #[test]
+    fn publication_dates_empty_input_does_not_request_network() {
+        let (provider, server) = provider_with_server(Vec::new());
+        assert!(
+            provider
+                .publication_dates(&[])
+                .expect("empty input is valid")
+                .is_empty()
+        );
+        assert!(server.finish().is_empty());
+    }
+
+    #[test]
+    fn publication_dates_rejects_invalid_and_oversized_inputs_before_network() {
+        let invalid_batches = [
+            vec!["short".to_owned()],
+            vec!["bad,value!!".to_owned()],
+            vec![VIDEO_ID.to_owned(), VIDEO_ID.to_owned()],
+            (0..51).map(|index| format!("v{index:010}")).collect(),
+        ];
+        for ids in invalid_batches {
+            let (provider, server) = provider_with_server(Vec::new());
+            assert!(matches!(
+                provider.publication_dates(&ids),
+                Err(ProviderError::InvalidRequest(_))
+            ));
+            assert!(server.finish().is_empty());
+        }
+    }
+
+    #[test]
+    fn publication_dates_rejects_unexpected_duplicate_and_malformed_response_ids() {
+        for body in [
+            r#"{"items":[{"id":"ccccccccccc","snippet":{"publishedAt":"2024-01-01T00:00:00Z"}}]}"#,
+            r#"{"items":[{"id":"short","snippet":{"publishedAt":"2024-01-01T00:00:00Z"}}]}"#,
+            r#"{"items":[{"id":"dQw4w9WgXcQ","snippet":{"publishedAt":"2024-01-01T00:00:00Z"}},{"id":"dQw4w9WgXcQ","snippet":{"publishedAt":"2024-01-02T00:00:00Z"}}]}"#,
+        ] {
+            let (provider, server) = provider_with_server(vec![json_response("200 OK", body)]);
+            let ids = [VIDEO_ID.to_owned(), "aaaaaaaaaaa".to_owned()];
+            assert!(matches!(
+                provider.publication_dates(&ids),
+                Err(ProviderError::InvalidResponse(_))
+            ));
+            assert_eq!(server.finish().len(), 1);
+        }
+    }
+
+    #[test]
+    fn publication_dates_rejects_missing_and_invalid_dates_without_fabrication() {
+        for snippet in [
+            r#"{}"#,
+            r#"{"publishedAt":null}"#,
+            r#"{"publishedAt":"2024-02-30T00:00:00Z"}"#,
+            r#"{"publishedAt":"not a date"}"#,
+        ] {
+            let body = format!(r#"{{"items":[{{"id":"{VIDEO_ID}","snippet":{snippet}}}]}}"#);
+            let (provider, server) = provider_with_server(vec![json_response("200 OK", &body)]);
+            assert!(matches!(
+                provider.publication_dates(&[VIDEO_ID.to_owned()]),
+                Err(ProviderError::InvalidResponse(_))
+            ));
+            assert_eq!(server.finish().len(), 1);
+        }
+    }
+
+    #[test]
+    fn publication_dates_service_errors_do_not_expose_the_api_key() {
+        let body = format!(
+            r#"{{"error":{{"message":"invalid key {TEST_KEY}","errors":[{{"reason":"keyInvalid","message":"invalid key {TEST_KEY}"}}]}}}}"#
+        );
+        let (provider, server) = provider_with_server(vec![json_response("403 Forbidden", &body)]);
+        let error = provider
+            .publication_dates(&[VIDEO_ID.to_owned()])
+            .expect_err("service failure must be returned");
+        assert!(matches!(error, ProviderError::Service { status: 403, .. }));
+        assert!(!error.to_string().contains(TEST_KEY));
+        assert_eq!(server.finish().len(), 1);
     }
 
     #[test]

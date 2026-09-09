@@ -8163,8 +8163,10 @@ fn render_podcast_feed_options_popup(
             let frames = ["·  ", "·· ", "···", " ··", "  ·", "   "];
             let animation = frames[(popup.animation_frame / 4) % frames.len()];
             frame.render_widget(
-                Paragraph::new(format!("{animation} Enumerating channel with yt-dlp…"))
-                    .style(theme.muted),
+                Paragraph::new(format!(
+                    "{animation} Reading channel metadata and episode dates…"
+                ))
+                .style(theme.muted),
                 sections[1],
             );
             vec![("[Esc] Hide", UiAction::DismissPodcastFeed)]
@@ -28936,7 +28938,7 @@ prose 07:25 remains clickable but is not a chapter";
         assert!(rendered.contains("Preparing podcast feed…"));
         assert!(!rendered.contains("Source:"));
         assert!(!rendered.contains("Selected item:"));
-        assert!(rendered.contains("Enumerating channel with yt-dlp…"));
+        assert!(rendered.contains("Reading channel metadata and episode dates…"));
         assert!(rendered.contains("[Esc] Hide"));
         assert!(!rendered.contains("[Enter] Create feed"));
 

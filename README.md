@@ -1819,12 +1819,32 @@ review, including a channel selected without a video, also offers a default-off
 **Skip Shorts** checkbox. It omits entries whose provider URL belongs to the
 Shorts tab while retaining regular videos and live uploads.
 After confirmation, YouTube feeds keep a slow preparation animation visible
-while `yt-dlp` enumerates the channel; `[Esc] Hide` returns to browsing without
-stopping that worker, and preparation failures remain visible in the popup.
+while Youta reads the channel and episode dates; `[Esc] Hide` returns to
+browsing without stopping that worker, and preparation failures remain visible
+in the popup.
+
+Every episode includes an RSS [`pubDate`](https://www.rssboard.org/rss-specification#ltpubdategtSubelementOfLtitemgt).
+YouTube dates come from publication/release metadata. When only a calendar date
+is available, it is represented at midnight UTC. Youta first reuses exact dates
+already obtained from official search/channel/video responses and its video-ID
+cache under `cache/youtube-publication-dates`. With an existing YouTube API key,
+remaining dates are fetched in batches of 50 using a minimal
+[`videos.list`](https://developers.google.com/youtube/v3/docs/videos/list) request.
+Without a key, or for missing API results, small anonymous metadata requests
+share an HTTP connection pool, with up to four requests at once; the bounded
+`yt-dlp` helper is the fallback if this shortcut is unavailable. Neither path
+downloads audio or requires browser/login cookies. An API failure disables further batch attempts
+for that feed, and repeated anonymous-request failures disable that shortcut.
+Large uncached channels still need more work, but repeat feeds reuse cached
+dates. Youta never substitutes
+relative labels such as “years ago” or the current time for a YouTube publication
+date; if a retained episode has no usable date, preparation reports the error.
+Local episodes use each file's modification time. Dates are serialized in UTC
+and do not change the selected cutoff, item order, or episode identifiers.
 
 `[F12] Podcast feed` is also available on a YouTube channel in Search and in
-YouTube Subscriptions. Feed creation uses flat channel metadata, downloads no
-media, gives every episode a stable Youta URL and artwork route, and uses the
+YouTube Subscriptions. Feed creation uses channel and publication metadata,
+downloads no media, gives every episode a stable Youta URL and artwork route, and uses the
 channel's square avatar as the podcast cover. The first retained episode image
 is the cover fallback when flat metadata has no channel artwork. When a podcast
 client requests an enclosure, Youta asks `yt-dlp` for a fresh
@@ -1834,8 +1854,8 @@ signed URL in the XML. If an upstream body ends before its advertised length,
 Youta resumes from the first missing byte. Ambient `yt-dlp` configuration,
 plugins, and browser cookies remain disabled. Videos whose owners prohibit
 embedded playback may therefore remain unavailable. This keeps feed creation
-fast, but it is deliberately session scoped: the HTTP server and every feed URL
-stop when Youta exits. Use the full-channel download first and share the
+independent of audio downloads. It is session scoped: the HTTP server and every
+feed URL stop when Youta exits. Use the full-channel download first and share the
 resulting Local folder when the feed must remain usable without Youta or without
 Internet access.
 
@@ -2228,6 +2248,25 @@ scripts/test-live-youtube.sh
 Pass `--audible` to hear the test through the default output. The default
 fixture is the Blender Foundation's Creative Commons-licensed *Big Buck Bunny*
 upload. `YOUTA_LIVE_YOUTUBE_URL` can select another public YouTube URL.
+
+The large-channel podcast integration test exercises real enumeration, exact
+episode dates, generated RSS over HTTP, ordering, selected-item/Shorts filters,
+and an offline warm-cache repeat:
+
+```sh
+scripts/test-live-youtube-podcast.sh CHANNEL_ID
+```
+
+Replace `CHANNEL_ID` with a canonical `UC…` YouTube channel ID containing at
+least 500 public episodes. `YOUTA_LIVE_PODCAST_MIN_EPISODES` raises that minimum.
+The test reports catalogue, cold-date, and warm-cache timings and has a
+ten-minute watchdog. It uses a temporary cache and never downloads audio.
+Without `YOUTA_LIVE_PODCAST_API_KEY` it checks the anonymous metadata path; set
+that variable explicitly to check official API batches. It does not read
+Youta's saved credentials, and never prints the key. Ordinary `cargo test`
+compiles but skips this network-dependent test. CI can invoke the same script
+in a separate live-service job with a chosen channel; cold-cache runs are
+intentional so cached dates cannot mask a performance regression.
 
 ## License
 
