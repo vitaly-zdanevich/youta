@@ -178,6 +178,8 @@ export interface DetailView {
   webpage_url: string | null;
   channel_webpage_url: string | null;
   channel_subscribed: boolean;
+	/** Whether this channel downloads new uploads automatically. */
+	channel_auto_download: boolean;
   channel_subscriber_count: number | null;
   channel_video_count: number | null;
   channel_total_view_count: number | null;
@@ -416,6 +418,12 @@ export interface PreferencesPopupView {
   nyan_cat_seekbar: boolean;
   nyan_cat_supported: boolean;
   youtube_prewarm: boolean;
+	/** Draft startup and hourly check preference. */
+	download_new_episodes_every_hour: boolean;
+	/** Whether this build can download new channel uploads. */
+	auto_download_supported: boolean;
+	/** Immediate manual-check feedback without discarding preference edits. */
+	auto_download_status: string | null;
   youtube_thumbnail_size: string;
   show_local_folder_sizes: boolean;
   show_images_in_tty: boolean;

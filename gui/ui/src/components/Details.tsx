@@ -315,6 +315,21 @@ export function Details({ view, kind }: { view: ViewModel; kind: InformationPane
 		details.channel_id !== '' ? (
 			<Action onClick={() => void dispatch("OpenChannelDownload")}>Download full channel</Action>
 		) : null}
+		{/* Channel entities have no media ID; videos also carry channel metadata.
+		    Search channels can use the Video layout, so layout kind is insufficient. */}
+		{view.channel_download_supported &&
+		details.media_id === null &&
+		details.channel_id !== '' ? (
+			<label className='flex items-center gap-[6px] rounded-[5px] border border-line-strong px-[8px] py-[3px] text-[11px] text-ink-dim'>
+				<input
+					type='checkbox'
+					checked={details.channel_auto_download}
+					onChange={() => void dispatch('ToggleChannelAutoDownload')}
+					className='accent-accent'
+				/>
+				Auto-download
+			</label>
+		) : null}
         {details.channel_id !== "" ? (
           <Action
             active={details.channel_subscribed}

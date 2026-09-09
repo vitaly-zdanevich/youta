@@ -10,7 +10,7 @@
 //! avoids an asynchronous runtime and its additional idle bookkeeping.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-#[cfg(any(feature = "commons-upload", feature = "evernote"))]
+#[cfg(any(feature = "commons-upload", feature = "evernote", feature = "yt-dlp"))]
 use std::fs;
 #[cfg(feature = "yt-dlp")]
 use std::io::BufRead;
@@ -60,10 +60,10 @@ use crate::config::WikimediaCommonsAuthMethod;
 use crate::config::{
     BANDCAMP_AUDIO_FORMAT_ENV, BandcampAudioFormat, Config, LOCAL_FOLDER_SIZES_ENV,
     NYAN_CAT_SEEKBAR_ENV, PersistenceBackend, SAVE_PLAYBACK_HISTORY_ENV,
-    SKIP_ADVERTISEMENT_CHAPTERS_ENV, SPONSORBLOCK_ENABLED_ENV, SUBSCRIPTIONS_LAYOUT_ENV,
-    SubscriptionsLayout, TTY_IMAGES_ENV, VIDEO_SUMMARY_BACKEND_ENV, VideoSummaryBackend,
-    YOUTUBE_PREWARM_ENV, YOUTUBE_THUMBNAIL_SIZE_ENV, YouTubeBackend, YouTubeProviderSetting,
-    YouTubeThumbnailSize, tui_preference_environment_variable_is_relevant,
+    SKIP_ADVERTISEMENT_CHAPTERS_ENV, SPONSORBLOCK_ENABLED_ENV, SUBSCRIPTIONS_AUTO_DOWNLOAD_ENV,
+    SUBSCRIPTIONS_LAYOUT_ENV, SubscriptionsLayout, TTY_IMAGES_ENV, VIDEO_SUMMARY_BACKEND_ENV,
+    VideoSummaryBackend, YOUTUBE_PREWARM_ENV, YOUTUBE_THUMBNAIL_SIZE_ENV, YouTubeBackend,
+    YouTubeProviderSetting, YouTubeThumbnailSize, tui_preference_environment_variable_is_relevant,
 };
 #[cfg(feature = "yt-dlp")]
 use crate::diagnostics::ExternalHelperProbeStatus;
@@ -3117,6 +3117,26 @@ struct ChannelDownloadSelection {
     playlist_start: u64,
 }
 
+/// One opted-in YouTube channel awaiting its automatic archive check.
+#[cfg(feature = "yt-dlp")]
+#[derive(Clone, Debug)]
+struct AutomaticDownloadJob {
+    channel_id: String,
+    channel_name: String,
+    source_url: url::Url,
+}
+
+/// Purpose retained until one supervised yt-dlp child completes.
+#[cfg(feature = "yt-dlp")]
+enum ActiveDownloadOwner {
+    Manual,
+    AutomaticBaseline {
+        archive_path: PathBuf,
+        ready_marker: PathBuf,
+    },
+    AutomaticCheck,
+}
+
 /// Exact local or YouTube boundary retained outside the serialized popup.
 #[cfg(feature = "lan-sharing")]
 enum PodcastFeedSelection {
@@ -3221,6 +3241,9 @@ const DOWNLOAD_COMPLETED_PATHS: usize = 4;
 /// How long a successful download path remains visible after completion.
 #[cfg(feature = "yt-dlp")]
 const DOWNLOAD_COMPLETION_NOTICE_DURATION: Duration = Duration::from_secs(30);
+/// Interval between background checks while Youta remains open.
+#[cfg(feature = "yt-dlp")]
+const AUTO_DOWNLOAD_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 #[cfg(feature = "yt-dlp")]
 #[derive(Clone, Debug)]
@@ -3380,6 +3403,7 @@ struct ActiveDownload {
     destination: PathBuf,
     collection: bool,
     estimated_total_files: Option<u64>,
+    owner: ActiveDownloadOwner,
     process: Box<dyn RunningDownload>,
     output: Arc<Mutex<DownloadOutputBuffer>>,
     reader_threads: Vec<JoinHandle<()>>,
@@ -3392,6 +3416,24 @@ impl ActiveDownload {
         destination: PathBuf,
         collection: bool,
         estimated_total_files: Option<u64>,
+        process: Box<dyn RunningDownload>,
+    ) -> Result<Self, String> {
+        Self::start_with_owner(
+            title,
+            destination,
+            collection,
+            estimated_total_files,
+            ActiveDownloadOwner::Manual,
+            process,
+        )
+    }
+
+    fn start_with_owner(
+        title: String,
+        destination: PathBuf,
+        collection: bool,
+        estimated_total_files: Option<u64>,
+        owner: ActiveDownloadOwner,
         mut process: Box<dyn RunningDownload>,
     ) -> Result<Self, String> {
         let progress_reader = process
@@ -3428,10 +3470,15 @@ impl ActiveDownload {
             destination,
             collection,
             estimated_total_files,
+            owner,
             process,
             output,
             reader_threads: vec![progress_thread, error_thread],
         })
+    }
+
+    fn is_automatic(&self) -> bool {
+        !matches!(&self.owner, ActiveDownloadOwner::Manual)
     }
 
     fn join_readers(&mut self) {
@@ -5125,6 +5172,12 @@ pub struct AppController {
     download_launcher: Box<dyn DownloadLauncher>,
     #[cfg(feature = "yt-dlp")]
     active_download: Option<ActiveDownload>,
+    /// Opted-in channels waiting behind the sole supervised download child.
+    #[cfg(feature = "yt-dlp")]
+    automatic_download_queue: VecDeque<AutomaticDownloadJob>,
+    /// Startup/opt-in check, then an optional hourly recurrence.
+    #[cfg(feature = "yt-dlp")]
+    next_auto_download_check_at: Option<Instant>,
     /// Exact channel source retained while its destructive-size transfer awaits confirmation.
     #[cfg(feature = "yt-dlp")]
     channel_download_selection: Option<ChannelDownloadSelection>,
@@ -5287,6 +5340,8 @@ impl AppController {
             Ok(tree) => (tree, None),
             Err(error) => (SubscriptionTree::default(), Some(error)),
         };
+        #[cfg(feature = "yt-dlp")]
+        let next_auto_download_check_at = Some(Instant::now());
         let (response_sender, provider_responses) = unbounded();
         let (request_sender, request_receiver) = unbounded();
         #[cfg(feature = "sponsorblock")]
@@ -6365,6 +6420,10 @@ impl AppController {
             download_launcher,
             #[cfg(feature = "yt-dlp")]
             active_download: None,
+            #[cfg(feature = "yt-dlp")]
+            automatic_download_queue: VecDeque::new(),
+            #[cfg(feature = "yt-dlp")]
+            next_auto_download_check_at,
             #[cfg(feature = "yt-dlp")]
             channel_download_selection: None,
             #[cfg(feature = "yt-dlp")]
@@ -19150,6 +19209,7 @@ impl AppController {
             scope: DownloadScope::Collection,
             playlist_start,
             write_thumbnail: self.config.subscriptions.download_thumbnails,
+            archive_path: None,
         };
         let process = match self.download_launcher.start(&request) {
             Ok(process) => process,
@@ -19209,8 +19269,192 @@ impl AppController {
         self.view.status_line = "Full-channel download cancelled before starting".to_owned();
     }
 
+    /// Queues one newest-first check for every opted-in YouTube channel.
+    #[cfg(feature = "yt-dlp")]
+    fn queue_automatic_download_check(&mut self, manual: bool, now: Instant) {
+        let automatic_active = self
+            .active_download
+            .as_ref()
+            .is_some_and(ActiveDownload::is_automatic);
+        if automatic_active || !self.automatic_download_queue.is_empty() {
+            if manual {
+                self.view.status_line = "An automatic episode check is already running".to_owned();
+            }
+            return;
+        }
+        // Set the next attempt before fallible I/O so a malformed OPML file
+        // cannot reopen the same error popup on every controller tick.
+        self.next_auto_download_check_at = self
+            .config
+            .subscriptions
+            .auto_download
+            .then_some(now + AUTO_DOWNLOAD_INTERVAL);
+        let tree = match subscriptions::load(&self.config) {
+            Ok(tree) => tree,
+            Err(error) => {
+                self.view.status_line = "Cannot read automatic-download subscriptions".to_owned();
+                self.show_error("Cannot read automatic-download subscriptions", &error);
+                return;
+            }
+        };
+        let jobs = tree
+            .flattened_subscriptions()
+            .into_iter()
+            .filter_map(|entry| {
+                let subscription = entry.subscription;
+                if !subscription.auto_download {
+                    return None;
+                }
+                let channel_id = subscription.youtube_channel_id()?;
+                let source_url = canonical_youtube_uploads_url(&channel_id)?;
+                Some(AutomaticDownloadJob {
+                    channel_id,
+                    channel_name: subscription.title,
+                    source_url,
+                })
+            })
+            .collect::<VecDeque<_>>();
+        self.subscription_tree = tree;
+        self.automatic_download_queue = jobs;
+        if manual {
+            self.view.status_line = if self.automatic_download_queue.is_empty() {
+                "No YouTube channels have Auto-download enabled".to_owned()
+            } else {
+                format!(
+                    "Checking {} opted-in YouTube channel(s)",
+                    self.automatic_download_queue.len()
+                )
+            };
+        }
+    }
+
+    /// Enqueues startup, opt-in, or hourly work at its monotonic deadline.
+    #[cfg(feature = "yt-dlp")]
+    fn queue_due_automatic_download_check(&mut self, now: Instant) {
+        if self
+            .next_auto_download_check_at
+            .is_some_and(|deadline| now >= deadline)
+        {
+            self.queue_automatic_download_check(false, now);
+        }
+    }
+
+    /// Starts the next queued channel without competing with a manual download.
+    #[cfg(feature = "yt-dlp")]
+    fn start_next_automatic_download(&mut self) {
+        if self.active_download.is_some() {
+            return;
+        }
+        #[cfg(feature = "yandex-music")]
+        if self.yandex_music_download_thread.is_some() {
+            return;
+        }
+        let Some(job) = self.automatic_download_queue.front().cloned() else {
+            return;
+        };
+        if job.channel_id.len() > 128
+            || !job
+                .channel_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            self.automatic_download_queue.clear();
+            self.show_error_message(
+                "Automatic episode check could not start",
+                "The subscribed YouTube channel ID is unsafe for local archive storage",
+            );
+            return;
+        }
+        let destination = match prepare_download_destination(&self.config) {
+            Ok(destination) => destination,
+            Err(error) => {
+                self.automatic_download_queue.clear();
+                self.show_error_message("Automatic download destination is unavailable", error);
+                return;
+            }
+        };
+        let archive_directory = destination.join(".youta-auto-download");
+        if let Err(error) = crate::private_files::create_private_directory(&archive_directory) {
+            self.automatic_download_queue.clear();
+            self.show_error_message("Automatic download state is unavailable", error.to_string());
+            return;
+        }
+        let archive_path = archive_directory.join(format!("{}.archive", job.channel_id));
+        let ready_marker = archive_directory.join(format!("{}.ready", job.channel_id));
+        let baseline = !automatic_download_archive_is_ready(&archive_path, &ready_marker);
+        let format = match configured_download_format(&self.config.subscriptions.audio_format) {
+            Ok(format) => format,
+            Err(error) => {
+                self.automatic_download_queue.clear();
+                self.show_error_message("Automatic download format is invalid", error);
+                return;
+            }
+        };
+        let request = DownloadRequest {
+            source_url: job.source_url,
+            destination: destination.clone(),
+            format,
+            scope: if baseline {
+                DownloadScope::CollectionArchiveOnly
+            } else {
+                DownloadScope::Collection
+            },
+            playlist_start: None,
+            write_thumbnail: !baseline && self.config.subscriptions.download_thumbnails,
+            archive_path: Some(archive_path.clone()),
+        };
+        let process = match self.download_launcher.start(&request) {
+            Ok(process) => process,
+            Err(error) => {
+                self.automatic_download_queue.clear();
+                self.show_error_message("Automatic episode check could not start", error);
+                return;
+            }
+        };
+        let owner = if baseline {
+            ActiveDownloadOwner::AutomaticBaseline {
+                archive_path,
+                ready_marker,
+            }
+        } else {
+            ActiveDownloadOwner::AutomaticCheck
+        };
+        let active = match ActiveDownload::start_with_owner(
+            job.channel_name.clone(),
+            destination,
+            true,
+            None,
+            owner,
+            process,
+        ) {
+            Ok(active) => active,
+            Err(error) => {
+                self.automatic_download_queue.clear();
+                self.show_error_message("Automatic episode check could not be supervised", error);
+                return;
+            }
+        };
+        self.automatic_download_queue.pop_front();
+        self.view.download = Some(DownloadView {
+            title: job.channel_name.clone(),
+            collection: true,
+            active: true,
+            ..DownloadView::default()
+        });
+        self.view.status_line = if baseline {
+            format!(
+                "Establishing the current episode baseline for {}",
+                job.channel_name
+            )
+        } else {
+            format!("Checking {} for new episodes", job.channel_name)
+        };
+        self.active_download = Some(active);
+    }
+
     #[cfg(feature = "yt-dlp")]
     fn cancel_active_download(&mut self) {
+        self.automatic_download_queue.clear();
         let Some(mut active) = self.active_download.take() else {
             self.view.status_line = "No download is running".to_owned();
             return;
@@ -19288,6 +19532,7 @@ impl AppController {
             scope: DownloadScope::SingleItem,
             playlist_start: None,
             write_thumbnail: self.config.subscriptions.download_thumbnails,
+            archive_path: None,
         };
         let process = match self.download_launcher.start(&request) {
             Ok(process) => process,
@@ -19426,6 +19671,8 @@ impl AppController {
             return;
         }
         if !exit.success {
+            // A private or unavailable channel must not prevent the remaining
+            // opted-in channels from being checked on the following tick.
             mark_download_inactive(&mut self.view);
             self.show_error_message(
                 "Download failed",
@@ -19433,6 +19680,34 @@ impl AppController {
                     format!("yt-dlp exited with {}", exit.description),
                     &diagnostics,
                 ),
+            );
+            return;
+        }
+        if let ActiveDownloadOwner::AutomaticBaseline {
+            archive_path,
+            ready_marker,
+        } = &active.owner
+        {
+            let marker_result = save_automatic_download_baseline(archive_path, ready_marker);
+            if let Err(error) = marker_result {
+                self.automatic_download_queue.clear();
+                mark_download_inactive(&mut self.view);
+                self.show_error_message(
+                    "Automatic download baseline could not be saved",
+                    error.to_string(),
+                );
+                return;
+            }
+            self.view.download = Some(DownloadView {
+                title: active.title.clone(),
+                eta_seconds: Some(0),
+                collection: true,
+                active: false,
+                ..DownloadView::default()
+            });
+            self.view.status_line = format!(
+                "Automatic downloads are ready for {}; future uploads will be downloaded",
+                active.title
             );
             return;
         }
@@ -20644,6 +20919,9 @@ impl AppController {
             channel_id: channel_id.clone(),
             channel_webpage_url,
             channel_subscribed: self.subscription_tree.contains_youtube_channel(&channel_id),
+            channel_auto_download: self
+                .subscription_tree
+                .youtube_channel_auto_download(&channel_id),
             description: if description.is_empty() {
                 format!("YouTube channel ID: {channel_id}")
             } else {
@@ -20721,6 +20999,9 @@ impl AppController {
 
         self.subscription_tree = candidate;
         if !now_subscribed {
+            #[cfg(feature = "yt-dlp")]
+            self.automatic_download_queue
+                .retain(|job| job.channel_id != channel_id);
             self.subscription_generation = self.subscription_generation.wrapping_add(1);
             self.pending_subscription_refresh = None;
             self.subscription_video_cache.remove(&channel_id);
@@ -20737,11 +21018,13 @@ impl AppController {
             && details.channel_id == channel_id
         {
             details.channel_subscribed = now_subscribed;
+            details.channel_auto_download &= now_subscribed;
         }
         if let Some(details) = self.previous_detail.as_mut()
             && details.channel_id == channel_id
         {
             details.channel_subscribed = now_subscribed;
+            details.channel_auto_download &= now_subscribed;
         }
         if self.view.screen == Screen::Subscriptions {
             self.populate_subscriptions();
@@ -20756,6 +21039,78 @@ impl AppController {
                 "Unsubscribed from"
             }
         );
+    }
+
+    /// Persists the displayed channel's automatic-download opt-in.
+    ///
+    /// Opting in also creates the portable local subscription needed to retain
+    /// the channel identity. Opting out leaves that subscription intact.
+    fn toggle_channel_auto_download(&mut self) {
+        if !self.view.youtube_channel_auto_download_available() {
+            self.view.status_line = "No YouTube channel is selected".to_owned();
+            return;
+        }
+        let Some(details) = self.view.details.as_ref() else {
+            return;
+        };
+        let channel_id = details.channel_id.clone();
+        let channel_name = if details.channel_name.is_empty() {
+            details.title.clone()
+        } else {
+            details.channel_name.clone()
+        };
+        let channel_webpage_url = details.channel_webpage_url.clone();
+        let enabled = !details.channel_auto_download;
+        let mut candidate = match subscriptions::load(&self.config) {
+            Ok(tree) => tree,
+            Err(error) => {
+                self.show_error("Cannot change automatic downloads", &error);
+                return;
+            }
+        };
+        if enabled && !candidate.contains_youtube_channel(&channel_id) {
+            candidate.subscribe_youtube_channel_with_website(
+                channel_name.clone(),
+                &channel_id,
+                channel_webpage_url.as_ref(),
+            );
+        }
+        if !candidate.set_youtube_channel_auto_download(&channel_id, enabled) {
+            self.show_error_message(
+                "Cannot change automatic downloads",
+                "The selected channel could not be represented in OPML",
+            );
+            return;
+        }
+        if let Err(error) = subscriptions::save(&self.config, &candidate) {
+            self.show_error("Cannot save automatic downloads", &error);
+            return;
+        }
+        self.subscription_tree = candidate;
+        for detail in [self.view.details.as_mut(), self.previous_detail.as_mut()]
+            .into_iter()
+            .flatten()
+            .filter(|detail| detail.channel_id == channel_id)
+        {
+            detail.channel_subscribed = true;
+            detail.channel_auto_download = enabled;
+        }
+        if self.view.screen == Screen::Subscriptions {
+            self.populate_subscriptions();
+        } else {
+            self.refresh_youtube_rows();
+        }
+        self.view.status_line = format!(
+            "Automatic downloads for {channel_name}: {}",
+            if enabled { "on" } else { "off" }
+        );
+        #[cfg(feature = "yt-dlp")]
+        if enabled {
+            self.next_auto_download_check_at = Some(Instant::now());
+        } else {
+            self.automatic_download_queue
+                .retain(|job| job.channel_id != channel_id);
+        }
     }
 
     /// Opens the focused RSS/Atom feed editor.
@@ -27390,6 +27745,7 @@ impl AppController {
             channel_id: channel_id.clone(),
             channel_webpage_url,
             channel_subscribed: true,
+            channel_auto_download: subscription.auto_download,
             channel_subscriber_count: cached_subscribers,
             description,
             #[cfg(feature = "rss")]
@@ -31226,6 +31582,7 @@ impl AppController {
             TTY_IMAGES_ENV,
             BANDCAMP_AUDIO_FORMAT_ENV,
             SAVE_PLAYBACK_HISTORY_ENV,
+            SUBSCRIPTIONS_AUTO_DOWNLOAD_ENV,
             VIDEO_SUMMARY_BACKEND_ENV,
         ]
         .into_iter()
@@ -31241,6 +31598,9 @@ impl AppController {
             nyan_cat_seekbar: cfg!(feature = "nyan-cat") && self.config.ui.nyan_cat_seekbar,
             nyan_cat_supported: cfg!(feature = "nyan-cat"),
             youtube_prewarm: self.config.playback.youtube_prewarm,
+            download_new_episodes_every_hour: self.config.subscriptions.auto_download,
+            auto_download_supported: cfg!(feature = "yt-dlp"),
+            auto_download_status: None,
             youtube_thumbnail_size: self.config.ui.youtube_thumbnail_size,
             show_local_folder_sizes: self.config.ui.show_local_folder_sizes,
             show_images_in_tty: self.config.ui.show_images_in_tty,
@@ -31431,6 +31791,25 @@ impl AppController {
             return;
         }
         preferences.youtube_prewarm = !preferences.youtube_prewarm;
+        preferences.validation_error = None;
+    }
+
+    /// Toggles the hourly policy in the draft without changing a running batch.
+    fn toggle_draft_hourly_auto_download(&mut self) {
+        let Some(preferences) = self.view.preferences_popup.as_mut() else {
+            return;
+        };
+        if !preferences.auto_download_supported {
+            preferences.validation_error = Some("This build omits the `yt-dlp` feature".to_owned());
+            return;
+        }
+        if preferences.environment_override.is_some() {
+            preferences.validation_error =
+                Some("an environment variable controls this preference".to_owned());
+            return;
+        }
+        preferences.download_new_episodes_every_hour =
+            !preferences.download_new_episodes_every_hour;
         preferences.validation_error = None;
     }
 
@@ -32395,6 +32774,7 @@ impl AppController {
         let show_images_in_tty = self.config.ui.show_images_in_tty;
         let bandcamp_audio_format = preferences.bandcamp_audio_format;
         let save_playback_history = preferences.save_playback_history;
+        let download_new_episodes_every_hour = preferences.download_new_episodes_every_hour;
         let video_summary_backend = preferences.video_summary_backend;
         let video_summary_backend_changed =
             self.config.video_summary.backend != video_summary_backend;
@@ -32418,6 +32798,7 @@ impl AppController {
             show_images_in_tty,
             youtube_thumbnail_size,
             save_playback_history,
+            download_new_episodes_every_hour,
             video_summary_backend,
         ) {
             if let Some(preferences) = self.view.preferences_popup.as_mut() {
@@ -32425,6 +32806,10 @@ impl AppController {
             }
             self.show_error("Could not save Youta preferences", &error);
             return;
+        }
+        #[cfg(feature = "yt-dlp")]
+        {
+            self.next_auto_download_check_at = download_new_episodes_every_hour.then(Instant::now);
         }
         self.view.playback_history_enabled = save_playback_history;
         if !save_playback_history && self.view.screen == Screen::History {
@@ -33422,6 +33807,10 @@ impl UiController for AppController {
                 self.view.details_focused = true;
                 self.toggle_local_subscription();
             }
+            UiAction::ToggleChannelAutoDownload => {
+                self.view.details_focused = true;
+                self.toggle_channel_auto_download();
+            }
             UiAction::ActivateTimecode { media_id, seconds } => {
                 self.activate_timecode(media_id, seconds);
             }
@@ -34136,6 +34525,18 @@ impl UiController for AppController {
             }
             UiAction::ToggleNyanCatSeekbar => self.toggle_draft_nyan_cat_seekbar(),
             UiAction::ToggleYouTubePrewarm => self.toggle_draft_youtube_prewarm(),
+            UiAction::ToggleHourlyAutoDownload => self.toggle_draft_hourly_auto_download(),
+            UiAction::CheckAndDownloadNewEpisodes => {
+                #[cfg(feature = "yt-dlp")]
+                self.queue_automatic_download_check(true, Instant::now());
+                #[cfg(not(feature = "yt-dlp"))]
+                {
+                    self.view.status_line = "This build omits the `yt-dlp` feature".to_owned();
+                }
+                if let Some(preferences) = self.view.preferences_popup.as_mut() {
+                    preferences.auto_download_status = Some(self.view.status_line.clone());
+                }
+            }
             UiAction::TogglePlaybackHistorySaving => {
                 self.toggle_draft_playback_history_saving();
             }
@@ -34435,9 +34836,10 @@ impl UiController for AppController {
         {
             self.drain_youtube_prewarm_responses();
             self.request_due_youtube_prewarm(now);
+            self.queue_due_automatic_download_check(now);
+            self.start_next_automatic_download();
+            self.poll_download_at(now);
         }
-        #[cfg(feature = "yt-dlp")]
-        self.poll_download_at(Instant::now());
         self.update_player();
         #[cfg(feature = "ascii-visualizer")]
         self.refresh_ascii_visualizer();
@@ -40081,6 +40483,8 @@ fn preliminary_detail_with_thumbnail_size(
                     subscriptions.youtube_channel_website_url(&video.channel_id),
                 ),
                 channel_subscribed: subscriptions.contains_youtube_channel(&video.channel_id),
+                channel_auto_download: subscriptions
+                    .youtube_channel_auto_download(&video.channel_id),
                 length: video
                     .duration_seconds
                     .map_or_else(|| "unknown".to_owned(), format_seconds),
@@ -40752,6 +41156,7 @@ fn detail_from_channel(channel: &ChannelSummary, subscriptions: &SubscriptionTre
             channel.webpage_url.clone(),
         ),
         channel_subscribed: subscriptions.contains_youtube_channel(&channel.channel_id),
+        channel_auto_download: subscriptions.youtube_channel_auto_download(&channel.channel_id),
         channel_subscriber_count: channel.subscriber_count,
         description: channel.description.clone(),
         license: "not applicable".to_owned(),
@@ -40784,6 +41189,7 @@ fn detail_from_video_with_thumbnail_size(
             subscriptions.youtube_channel_website_url(&video.channel_id),
         ),
         channel_subscribed: subscriptions.contains_youtube_channel(&video.channel_id),
+        channel_auto_download: subscriptions.youtube_channel_auto_download(&video.channel_id),
         channel_subscriber_count: None,
         length: video
             .duration_seconds
@@ -41005,6 +41411,112 @@ fn canonical_youtube_channel_url(channel_id: &str) -> Option<url::Url> {
         .pop_if_empty()
         .push(channel_id);
     Some(url)
+}
+
+/// Uses YouTube's newest-first uploads playlist across videos, Shorts and streams.
+///
+/// The channel root produces separate tab playlists, so it cannot provide one
+/// combined upload order for automatic catalogue checks.
+#[cfg(feature = "yt-dlp")]
+fn canonical_youtube_uploads_url(channel_id: &str) -> Option<url::Url> {
+    canonical_youtube_channel_url(channel_id)?;
+    let suffix = channel_id
+        .strip_prefix("UC")
+        .filter(|suffix| !suffix.is_empty())?;
+    let mut url = url::Url::parse("https://www.youtube.com/playlist").ok()?;
+    url.query_pairs_mut()
+        .append_pair("list", &format!("UU{suffix}"));
+    Some(url)
+}
+
+/// Checks whether an archive represents a completed channel snapshot.
+///
+/// Empty archives are accepted only with an explicit marker written after a
+/// successful empty snapshot; a lost nonempty archive must be rebuilt instead.
+#[cfg(feature = "yt-dlp")]
+fn automatic_download_archive_is_ready(
+    archive_path: &std::path::Path,
+    marker: &std::path::Path,
+) -> bool {
+    if !marker.is_file() {
+        return false;
+    }
+    if automatic_download_archive_has_episode(archive_path) {
+        return true;
+    }
+    if !fs::metadata(archive_path).is_ok_and(|metadata| metadata.is_file() && metadata.len() == 0) {
+        return false;
+    }
+    let Ok(mut file) = fs::File::open(marker) else {
+        return false;
+    };
+    let mut contents = [0_u8; 6];
+    file.metadata().is_ok_and(|metadata| metadata.len() == 6)
+        && file.read_exact(&mut contents).is_ok()
+        && contents == *b"empty\n"
+}
+
+/// Records successful baseline completion without losing an empty channel's first upload.
+///
+/// yt-dlp need not create an archive when no entries exist. Create that empty
+/// file privately and label its marker explicitly; never truncate malformed data.
+#[cfg(feature = "yt-dlp")]
+fn save_automatic_download_baseline(
+    archive_path: &std::path::Path,
+    marker: &std::path::Path,
+) -> std::io::Result<()> {
+    let contents = if automatic_download_archive_has_episode(archive_path) {
+        b"ready\n"
+    } else {
+        match fs::metadata(archive_path) {
+            Ok(metadata) if metadata.is_file() && metadata.len() == 0 => {}
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "yt-dlp completed but its automatic-download archive is malformed",
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let mut options = fs::OpenOptions::new();
+                options.write(true).create_new(true);
+                crate::private_files::open_privately(&mut options).open(archive_path)?;
+            }
+            Err(error) => return Err(error),
+        }
+        b"empty\n"
+    };
+    crate::private_files::set_private_file_permissions(archive_path)?;
+    fs::write(marker, contents)?;
+    crate::private_files::set_private_file_permissions(marker)
+}
+
+/// Checks the first archive record for a valid YouTube episode.
+///
+/// A marker without an archive must never turn a new-only check into an
+/// unrestricted channel download. Read only a bounded first record because
+/// yt-dlp's append-only archives grow with each downloaded upload.
+#[cfg(feature = "yt-dlp")]
+fn automatic_download_archive_has_episode(archive_path: &std::path::Path) -> bool {
+    let Ok(file) = fs::File::open(archive_path) else {
+        return false;
+    };
+    let mut line = String::new();
+    if std::io::BufReader::new(file)
+        .take(128)
+        .read_line(&mut line)
+        .is_err()
+    {
+        return false;
+    }
+    let mut fields = line.split_whitespace();
+    fields.next() == Some("youtube")
+        && fields.next().is_some_and(|id| {
+            id.len() == 11
+                && id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        })
+        && fields.next().is_none()
 }
 
 /// Accepts a provider channel page from a strict YouTube allowlist.
@@ -52870,6 +53382,111 @@ mod tests {
                 .expect("read deleted snapshot after restart"),
             None
         );
+    }
+
+    #[cfg(feature = "yt-dlp")]
+    #[test]
+    fn channel_auto_download_ignores_actions_from_video_details() {
+        let temporary = crate::test_support::canonical_tempdir("video auto-download guard");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config.clone(), store, None, None);
+        controller.view.details = Some(preliminary_detail(
+            &SearchItem::Video(subscription_video_summary()),
+            &controller.subscription_tree,
+        ));
+        controller.dispatch(UiAction::ToggleChannelAutoDownload);
+        assert!(
+            !controller
+                .view
+                .details
+                .as_ref()
+                .unwrap()
+                .channel_auto_download
+        );
+        assert!(
+            !controller
+                .subscription_tree
+                .contains_youtube_channel("UCfixture")
+        );
+        assert!(
+            !subscriptions::load(&config)
+                .expect("unchanged subscriptions")
+                .contains_youtube_channel("UCfixture")
+        );
+        assert_eq!(
+            controller.view.status_line,
+            "No YouTube channel is selected"
+        );
+    }
+
+    #[cfg(feature = "yt-dlp")]
+    #[test]
+    fn channel_auto_download_subscribes_and_persists_the_channel_setting() {
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config.clone(), store, None, None);
+        let video = subscription_video_summary();
+        controller.view.details = Some(detail_from_channel(
+            &ChannelSummary {
+                channel_id: video.channel_id,
+                name: video.channel_name,
+                description: String::new(),
+                subscriber_count: None,
+                video_count: None,
+                created_at: None,
+                auto_generated: false,
+                thumbnails: Vec::new(),
+                webpage_url: None,
+            },
+            &controller.subscription_tree,
+        ));
+
+        controller.dispatch(UiAction::ToggleChannelAutoDownload);
+
+        let details = controller.view.details.as_ref().expect("channel details");
+        assert!(details.channel_subscribed);
+        assert!(details.channel_auto_download);
+        let persisted = subscriptions::load(&config).expect("persisted subscriptions");
+        assert!(persisted.contains_youtube_channel("UCfixture"));
+        assert!(persisted.youtube_channel_auto_download("UCfixture"));
+
+        controller.dispatch(UiAction::ToggleChannelAutoDownload);
+        let details = controller.view.details.as_ref().expect("channel details");
+        assert!(
+            details.channel_subscribed,
+            "disabling must retain the subscription"
+        );
+        assert!(!details.channel_auto_download);
+        let persisted = subscriptions::load(&config).expect("updated subscriptions");
+        assert!(persisted.contains_youtube_channel("UCfixture"));
+        assert!(!persisted.youtube_channel_auto_download("UCfixture"));
+    }
+
+    #[cfg(feature = "yt-dlp")]
+    #[test]
+    fn hourly_auto_download_preference_is_enabled_by_default_and_persists() {
+        let temporary = crate::test_support::canonical_tempdir("temporary directory");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config.clone(), store, None, None);
+
+        controller.dispatch(UiAction::OpenPreferences);
+        assert!(
+            controller
+                .view
+                .preferences_popup
+                .as_ref()
+                .expect("preferences")
+                .download_new_episodes_every_hour
+        );
+        controller.dispatch(UiAction::ToggleHourlyAutoDownload);
+        controller.dispatch(UiAction::SubmitPreferences);
+
+        assert!(!controller.config.subscriptions.auto_download);
+        let reloaded = Config::load_from_dir(config.config_dir()).expect("saved config");
+        assert!(!reloaded.subscriptions.auto_download);
     }
 
     fn save_fixture_subscriptions(config: &Config, channel_ids: &[&str]) {
@@ -70422,6 +71039,359 @@ mod tests {
             controller.view.status_line, "Could not copy the link: no clipboard helper",
             "a failed copy must say so rather than look like a success"
         );
+    }
+
+    #[cfg(feature = "yt-dlp")]
+    #[test]
+    fn startup_auto_download_snapshots_existing_uploads_without_media() {
+        let temporary = crate::test_support::canonical_tempdir("auto-download startup");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let mut tree = SubscriptionTree::default();
+        assert!(tree.subscribe_youtube_channel("Fixture channel", "UCfixture"));
+        assert!(tree.set_youtube_channel_auto_download("UCfixture", true));
+        subscriptions::save(&config, &tree).expect("save opted-in channel");
+        let process = MockRunningDownload {
+            progress: Some(Cursor::new(Vec::new())),
+            errors: Some(Cursor::new(Vec::new())),
+            exits: VecDeque::from([Ok(None)]),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+        let (mut controller, requests, _) = controller_with_mock_download(config.clone(), process);
+
+        controller.tick();
+
+        let requests = requests.lock().expect("download requests");
+        let request = requests.first().expect("startup baseline request");
+        assert_eq!(request.scope, DownloadScope::CollectionArchiveOnly);
+        assert_eq!(
+            request.source_url.as_str(),
+            "https://www.youtube.com/playlist?list=UUfixture"
+        );
+        assert!(
+            request
+                .archive_path
+                .as_ref()
+                .is_some_and(|path| { path.ends_with(".youta-auto-download/UCfixture.archive") })
+        );
+        drop(requests);
+        controller.shutdown();
+    }
+
+    #[cfg(feature = "yt-dlp")]
+    #[test]
+    fn manual_auto_download_check_uses_ready_archive_without_skipping_failed_gaps() {
+        let temporary = crate::test_support::canonical_tempdir("manual auto-download");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let mut tree = SubscriptionTree::default();
+        assert!(tree.subscribe_youtube_channel("Fixture channel", "UCfixture"));
+        assert!(tree.set_youtube_channel_auto_download("UCfixture", true));
+        subscriptions::save(&config, &tree).expect("save opted-in channel");
+        let archive_directory = config.downloads_dir().join(".youta-auto-download");
+        std::fs::create_dir_all(&archive_directory).expect("archive directory");
+        std::fs::write(archive_directory.join("UCfixture.ready"), b"ready\n")
+            .expect("ready marker");
+        std::fs::write(
+            archive_directory.join("UCfixture.archive"),
+            b"youtube dQw4w9WgXcQ\n",
+        )
+        .expect("known episode archive");
+        let process = MockRunningDownload {
+            progress: Some(Cursor::new(Vec::new())),
+            errors: Some(Cursor::new(Vec::new())),
+            exits: VecDeque::from([Ok(None)]),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+        let (mut controller, requests, _) = controller_with_mock_download(config, process);
+        controller.config.subscriptions.auto_download = false;
+        controller.next_auto_download_check_at = None;
+
+        controller.dispatch(UiAction::OpenPreferences);
+        controller.dispatch(UiAction::ToggleHourlyAutoDownload);
+        controller.dispatch(UiAction::CheckAndDownloadNewEpisodes);
+        let preferences = controller
+            .view
+            .preferences_popup
+            .as_ref()
+            .expect("preferences stay open");
+        assert_eq!(
+            preferences.auto_download_status.as_deref(),
+            Some("Checking 1 opted-in YouTube channel(s)")
+        );
+        assert!(
+            preferences.download_new_episodes_every_hour,
+            "manual checks preserve the unsaved draft"
+        );
+        assert!(
+            !controller.config.subscriptions.auto_download,
+            "manual checks do not save the draft"
+        );
+        controller.tick();
+
+        let requests = requests.lock().expect("download requests");
+        let request = requests.first().expect("manual automatic-download request");
+        assert_eq!(request.scope, DownloadScope::Collection);
+        assert!(
+            request
+                .archive_path
+                .as_ref()
+                .is_some_and(|path| { path.ends_with(".youta-auto-download/UCfixture.archive") })
+        );
+        drop(requests);
+        controller.shutdown();
+    }
+
+    #[cfg(feature = "yt-dlp")]
+    #[test]
+    fn startup_auto_download_runs_once_when_hourly_checks_are_disabled() {
+        let temporary = crate::test_support::canonical_tempdir("startup without hourly");
+        let mut config = Config::for_dir(temporary.path().join("youta"));
+        config.subscriptions.auto_download = false;
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        assert!(controller.next_auto_download_check_at.is_some());
+        controller.queue_due_automatic_download_check(Instant::now());
+        assert!(controller.next_auto_download_check_at.is_none());
+        controller.shutdown();
+    }
+
+    #[cfg(feature = "yt-dlp")]
+    #[test]
+    fn auto_download_opml_failure_waits_until_the_next_check() {
+        let temporary = crate::test_support::canonical_tempdir("automatic OPML failure");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config.clone(), store, None, None);
+        std::fs::create_dir_all(config.subscriptions_file().parent().expect("parent"))
+            .expect("config directory");
+        std::fs::write(config.subscriptions_file(), b"<broken>").expect("malformed OPML");
+        let now = Instant::now();
+        controller.queue_due_automatic_download_check(now);
+        assert_eq!(
+            controller.next_auto_download_check_at,
+            Some(now + AUTO_DOWNLOAD_INTERVAL)
+        );
+        controller.view.error_popup = None;
+        controller.queue_due_automatic_download_check(now + Duration::from_secs(1));
+        assert!(
+            controller.view.error_popup.is_none(),
+            "do not reopen an error on every tick"
+        );
+        controller.shutdown();
+    }
+
+    #[cfg(feature = "yt-dlp")]
+    #[test]
+    fn auto_download_rebuilds_missing_empty_or_invalid_archives() {
+        for (marker, contents) in [
+            (b"ready\n".as_slice(), None),
+            (b"ready\n".as_slice(), Some("")),
+            (b"ready\n".as_slice(), Some("not an archive\n")),
+            (b"empty\n".as_slice(), None),
+            (b"empty\n".as_slice(), Some("not an archive\n")),
+        ] {
+            let temporary = crate::test_support::canonical_tempdir("automatic archive recovery");
+            let config = Config::for_dir(temporary.path().join("youta"));
+            let archive_directory = config.downloads_dir().join(".youta-auto-download");
+            std::fs::create_dir_all(&archive_directory).expect("archive directory");
+            std::fs::write(archive_directory.join("UCfixture.ready"), marker)
+                .expect("stale marker");
+            if let Some(contents) = contents {
+                std::fs::write(archive_directory.join("UCfixture.archive"), contents)
+                    .expect("unusable archive");
+            }
+            let process = MockRunningDownload {
+                progress: Some(Cursor::new(Vec::new())),
+                errors: Some(Cursor::new(Vec::new())),
+                exits: VecDeque::from([Ok(None)]),
+                cancelled: Arc::new(AtomicBool::new(false)),
+            };
+            let (mut controller, requests, _) = controller_with_mock_download(config, process);
+            controller
+                .automatic_download_queue
+                .push_back(AutomaticDownloadJob {
+                    channel_id: "UCfixture".to_owned(),
+                    channel_name: "Fixture".to_owned(),
+                    source_url: url::Url::parse("https://www.youtube.com/playlist?list=UUfixture")
+                        .expect("uploads URL"),
+                });
+            controller.start_next_automatic_download();
+            assert_eq!(
+                requests.lock().expect("requests")[0].scope,
+                DownloadScope::CollectionArchiveOnly
+            );
+            controller.shutdown();
+        }
+    }
+
+    #[cfg(feature = "yt-dlp")]
+    #[test]
+    fn auto_download_baseline_records_verified_empty_channels_and_downloads_future_uploads() {
+        for has_episode in [false, true] {
+            let temporary = crate::test_support::canonical_tempdir("automatic baseline completion");
+            let config = Config::for_dir(temporary.path().join("youta"));
+            let process = MockRunningDownload {
+                progress: Some(Cursor::new(Vec::new())),
+                errors: Some(Cursor::new(Vec::new())),
+                exits: VecDeque::from([Ok(Some(DownloadExit {
+                    success: true,
+                    description: "exit status: 0".to_owned(),
+                }))]),
+                cancelled: Arc::new(AtomicBool::new(false)),
+            };
+            let (mut controller, requests, _) =
+                controller_with_mock_download(config.clone(), process);
+            controller
+                .automatic_download_queue
+                .push_back(AutomaticDownloadJob {
+                    channel_id: "UCfixture".to_owned(),
+                    channel_name: "Fixture".to_owned(),
+                    source_url: url::Url::parse("https://www.youtube.com/playlist?list=UUfixture")
+                        .expect("uploads URL"),
+                });
+            controller.start_next_automatic_download();
+            let archive_directory = config.downloads_dir().join(".youta-auto-download");
+            if has_episode {
+                // The fake successful child must reproduce yt-dlp's archive write.
+                std::fs::write(
+                    archive_directory.join("UCfixture.archive"),
+                    b"youtube dQw4w9WgXcQ\n",
+                )
+                .expect("baseline episode");
+            }
+            controller.poll_download_at(Instant::now());
+            assert_eq!(
+                std::fs::read(archive_directory.join("UCfixture.ready")).expect("ready marker"),
+                if has_episode { b"ready\n" } else { b"empty\n" }
+            );
+            assert!(archive_directory.join("UCfixture.archive").is_file());
+            assert!(controller.view.error_popup.is_none());
+            controller.download_launcher = Box::new(MockDownloadLauncher {
+                requests: Arc::clone(&requests),
+                process: Some(Box::new(MockRunningDownload {
+                    progress: Some(Cursor::new(Vec::new())),
+                    errors: Some(Cursor::new(Vec::new())),
+                    exits: VecDeque::from([Ok(None)]),
+                    cancelled: Arc::new(AtomicBool::new(false)),
+                })),
+            });
+            controller
+                .automatic_download_queue
+                .push_back(AutomaticDownloadJob {
+                    channel_id: "UCfixture".to_owned(),
+                    channel_name: "Fixture".to_owned(),
+                    source_url: url::Url::parse("https://www.youtube.com/playlist?list=UUfixture")
+                        .expect("uploads URL"),
+                });
+            controller.start_next_automatic_download();
+            assert_eq!(
+                requests.lock().expect("requests")[1].scope,
+                DownloadScope::Collection,
+                "the first future upload must be downloaded even if the original channel was empty"
+            );
+            controller.shutdown();
+        }
+    }
+
+    #[cfg(feature = "yt-dlp")]
+    #[test]
+    fn auto_download_rejects_malformed_successful_baseline_output() {
+        let temporary = crate::test_support::canonical_tempdir("malformed automatic baseline");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let process = MockRunningDownload {
+            progress: Some(Cursor::new(Vec::new())),
+            errors: Some(Cursor::new(Vec::new())),
+            exits: VecDeque::from([Ok(Some(DownloadExit {
+                success: true,
+                description: "exit status: 0".to_owned(),
+            }))]),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+        let (mut controller, _, _) = controller_with_mock_download(config.clone(), process);
+        controller
+            .automatic_download_queue
+            .push_back(AutomaticDownloadJob {
+                channel_id: "UCfixture".to_owned(),
+                channel_name: "Fixture".to_owned(),
+                source_url: url::Url::parse("https://www.youtube.com/playlist?list=UUfixture")
+                    .expect("uploads URL"),
+            });
+        controller.start_next_automatic_download();
+        let archive_directory = config.downloads_dir().join(".youta-auto-download");
+        std::fs::write(archive_directory.join("UCfixture.archive"), b"malformed\n")
+            .expect("malformed successful child output");
+        controller.poll_download_at(Instant::now());
+        assert!(!archive_directory.join("UCfixture.ready").is_file());
+        assert!(controller.view.error_popup.is_some());
+        assert_eq!(
+            std::fs::read(archive_directory.join("UCfixture.archive")).expect("archive"),
+            b"malformed\n"
+        );
+        controller.shutdown();
+    }
+
+    #[cfg(feature = "yt-dlp")]
+    #[test]
+    fn unsubscribing_removes_queued_auto_downloads() {
+        let temporary = crate::test_support::canonical_tempdir("unsubscribe automatic queue");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let mut tree = SubscriptionTree::default();
+        assert!(tree.subscribe_youtube_channel("Fixture", "UCfixture"));
+        assert!(tree.set_youtube_channel_auto_download("UCfixture", true));
+        subscriptions::save(&config, &tree).expect("save subscription");
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.queue_automatic_download_check(false, Instant::now());
+        assert_eq!(controller.automatic_download_queue.len(), 1);
+        controller.view.details = Some(DetailView {
+            channel_id: "UCfixture".to_owned(),
+            channel_name: "Fixture".to_owned(),
+            channel_subscribed: true,
+            channel_auto_download: true,
+            ..DetailView::default()
+        });
+        controller.toggle_local_subscription();
+        assert!(controller.automatic_download_queue.is_empty());
+        controller.shutdown();
+    }
+
+    #[cfg(feature = "yt-dlp")]
+    #[test]
+    fn auto_download_channel_failure_preserves_the_remaining_queue() {
+        let temporary = crate::test_support::canonical_tempdir("automatic failed channel");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let process = MockRunningDownload {
+            progress: Some(Cursor::new(Vec::new())),
+            errors: Some(Cursor::new(b"private channel\n".to_vec())),
+            exits: VecDeque::from([Ok(Some(DownloadExit {
+                success: false,
+                description: "exit status: 1".to_owned(),
+            }))]),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+        let (mut controller, _, _) = controller_with_mock_download(config, process);
+        for channel_id in ["UCfailed", "UChealthy"] {
+            controller
+                .automatic_download_queue
+                .push_back(AutomaticDownloadJob {
+                    channel_id: channel_id.to_owned(),
+                    channel_name: channel_id.to_owned(),
+                    source_url: url::Url::parse(&format!(
+                        "https://www.youtube.com/playlist?list=UU{}",
+                        &channel_id[2..]
+                    ))
+                    .expect("uploads URL"),
+                });
+        }
+        controller.start_next_automatic_download();
+        controller.poll_download_at(Instant::now());
+        assert!(controller.active_download.is_none());
+        assert!(controller.view.error_popup.is_some());
+        assert_eq!(controller.automatic_download_queue.len(), 1);
+        assert_eq!(
+            controller.automatic_download_queue[0].channel_id,
+            "UChealthy"
+        );
+        controller.shutdown();
     }
 
     #[cfg(feature = "yt-dlp")]

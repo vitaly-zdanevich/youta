@@ -39,7 +39,7 @@ use crate::config::WikimediaCommonsAuthMethod;
 use crate::config::{
     BandcampAudioFormat, SubscriptionsLayout, VideoSummaryBackend, YouTubeThumbnailSize,
 };
-#[cfg(feature = "lan-sharing")]
+#[cfg(any(feature = "lan-sharing", test))]
 use crate::domain::SourceKind;
 use crate::domain::{Chapter, MediaId, MediaKind};
 #[cfg(feature = "evernote")]
@@ -685,6 +685,8 @@ pub struct DetailView {
     pub channel_webpage_url: Option<url::Url>,
     /// Whether the channel is present in Youta's local OPML subscriptions.
     pub channel_subscribed: bool,
+    /// Whether new uploads from this YouTube channel are downloaded automatically.
+    pub channel_auto_download: bool,
     /// Public channel subscriber count, when exposed by the provider.
     pub channel_subscriber_count: Option<u64>,
     /// Public channel video count, when exposed by the provider.
@@ -931,6 +933,12 @@ pub struct PreferencesPopupView {
     pub nyan_cat_supported: bool,
     /// Draft selected-video `YouTube` prewarming saved only on confirmation.
     pub youtube_prewarm: bool,
+    /// Draft hourly automatic-download policy saved only on confirmation.
+    pub download_new_episodes_every_hour: bool,
+    /// Whether this binary contains the yt-dlp download helper integration.
+    pub auto_download_supported: bool,
+    /// Immediate manual-check feedback retained alongside unsaved preferences.
+    pub auto_download_status: Option<String>,
     /// Draft exact `YouTube` thumbnail size saved only on confirmation.
     pub youtube_thumbnail_size: YouTubeThumbnailSize,
     /// Draft lazy Local-folder size behavior saved only on confirmation.
@@ -2383,6 +2391,19 @@ impl ViewModel {
             })
     }
 
+    /// Reports whether the selected entity owns a YouTube channel checkbox.
+    ///
+    /// Channel search results and channel panels have no media ID. An
+    /// individual video has one even when its parent channel ID is known.
+    #[must_use]
+    pub fn youtube_channel_auto_download_available(&self) -> bool {
+        self.channel_download_supported
+            && self
+                .details
+                .as_ref()
+                .is_some_and(|details| !details.channel_id.is_empty() && details.media_id.is_none())
+    }
+
     /// Reports whether expanded Details owns a renderable artwork source.
     ///
     /// Both front-ends need this to decide whether the expanded-artwork key is
@@ -2683,6 +2704,8 @@ pub enum UiAction {
     },
     /// Subscribe to or unsubscribe from the displayed channel in local OPML.
     ToggleSubscription,
+    /// Toggle automatic downloads for the displayed YouTube channel.
+    ToggleChannelAutoDownload,
     /// Toggle pause in the invisible playback backend.
     TogglePause,
     /// Seek by a signed number of seconds.
@@ -3130,6 +3153,10 @@ pub enum UiAction {
     ToggleNyanCatSeekbar,
     /// Toggle selected-video YouTube prewarming in the draft.
     ToggleYouTubePrewarm,
+    /// Toggle the default-hourly automatic subscription check in the draft.
+    ToggleHourlyAutoDownload,
+    /// Check every opted-in YouTube channel immediately.
+    CheckAndDownloadNewEpisodes,
     /// Cycle the exact YouTube thumbnail size in the draft.
     CycleYouTubeThumbnailSize,
     /// Toggle lazy recursive Local-folder size measurement in the draft.
@@ -3310,6 +3337,33 @@ pub trait UiController {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn youtube_auto_download_is_available_only_for_channel_entities() {
+        let mut view = ViewModel {
+            channel_download_supported: true,
+            details: Some(DetailView {
+                channel_id: "UCfixture".to_owned(),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        for mode in [RightPanelMode::Details, RightPanelMode::Channel] {
+            view.right_panel_mode = mode;
+            assert!(view.youtube_channel_auto_download_available());
+            view.details.as_mut().unwrap().media_id =
+                Some(MediaId::new(SourceKind::YouTube, "fixture-video"));
+            assert!(!view.youtube_channel_auto_download_available());
+            view.details.as_mut().unwrap().media_id = None;
+        }
+        view.channel_download_supported = false;
+        assert!(!view.youtube_channel_auto_download_available());
+        view.channel_download_supported = true;
+        view.details.as_mut().unwrap().channel_id.clear();
+        assert!(!view.youtube_channel_auto_download_available());
+        view.details = None;
+        assert!(!view.youtube_channel_auto_download_available());
+    }
 
     #[test]
     fn subscription_shorts_are_visible_by_default() {

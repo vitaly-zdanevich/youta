@@ -1678,7 +1678,8 @@ Drill-down or Split, choose whether exact `Реклама` chapters are hidden a
 skipped, choose whether SponsorBlock segments are skipped, choose whether
 the rainbow Nyan Cat seek bar is used, choose whether selected YouTube audio is prepared, choose whether Local folder sizes are
 measured, choose the exact YouTube video-thumbnail size, choose whether new
-playback History entries are saved, choose the explicit summary backend, and
+playback History entries are saved, choose whether new channel episodes are
+downloaded every hour, choose the explicit summary backend, and
 press `Enter` to save. These preferences can be configured directly:
 
 ```toml
@@ -1687,6 +1688,9 @@ autoplay = false
 youtube_prewarm = true
 skip_advertisement_chapters = true
 sponsorblock_enabled = true
+
+[subscriptions]
+auto_download = true
 
 [ui]
 subscriptions_layout = 'drill-down' # drill-down or split
@@ -1709,6 +1713,7 @@ codex_executable = 'codex'
 `YOUTA_PLAYBACK__YOUTUBE_PREWARM=false` and
 `YOUTA_PLAYBACK__SKIP_ADVERTISEMENT_CHAPTERS=false` and
 `YOUTA_PLAYBACK__SPONSORBLOCK_ENABLED=false` and
+`YOUTA_SUBSCRIPTIONS__AUTO_DOWNLOAD=false` and
 `YOUTA_UI__NYAN_CAT_SEEKBAR=true` override the corresponding TOML values.
 `YOUTA_UI__SHOW_LOCAL_FOLDER_SIZES=false` disables recursive size
 work, hides cached folder sizes, and removes the Local size-sort control.
@@ -1761,6 +1766,24 @@ page. The detailed disk bounds are documented in
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#subscription-navigation-and-channel-videos).
 
 ### Full-channel downloads and session LAN feeds
+
+Every YouTube channel offers an **Auto-download** checkbox (`X` in the terminal).
+The checkbox and shortcut are available when a channel is selected, including
+channel search results and Subscriptions, not on individual video details.
+Enabling it also adds that channel to local Subscriptions. Youta checks opted-in
+channels on startup and, by default, every hour while it remains open. The first
+check records all existing upload IDs without downloading audio; later checks download
+new uploads as audio, including Shorts and streams, using the configured download
+format and thumbnail policy. Existing channel history remains available through
+**Download full channel**. Checks run one channel at a time and show the normal
+download progress and cancellation controls.
+
+In Preferences, **Download new episodes every hour** (`e`) controls hourly
+checks. **Check and download new episodes** (`C`) starts a check immediately,
+including when hourly checks are disabled. Per-channel choices travel with
+`subscriptions.opml`; local download archives remain in the downloads directory.
+This uses yt-dlp's [download archive options](https://github.com/yt-dlp/yt-dlp#download-options)
+and is available in builds containing the `yt-dlp` feature.
 
 On a subscribed YouTube channel, `[D] Download full channel` opens a review
 popup before starting anything. It shows the provider's estimated video count

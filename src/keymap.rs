@@ -1407,6 +1407,12 @@ fn unfiltered_key_action(
                 Some(UiAction::ToggleNyanCatSeekbar)
             }
             Key::Char('y') => Some(UiAction::ToggleYouTubePrewarm),
+            Key::Char('e') if preferences.auto_download_supported => {
+                Some(UiAction::ToggleHourlyAutoDownload)
+            }
+            Key::Char('C') if preferences.auto_download_supported => {
+                Some(UiAction::CheckAndDownloadNewEpisodes)
+            }
             Key::Char('t') if cfg!(feature = "images") => Some(UiAction::CycleYouTubeThumbnailSize),
             Key::Char('f') => Some(UiAction::ToggleLocalFolderSizes),
             Key::Char('i') if cfg!(feature = "images") => Some(UiAction::ToggleTtyImages),
@@ -1643,6 +1649,9 @@ fn unfiltered_key_action(
             if view.screen == Screen::YandexMusic && view.yandex_music_actions.track_selected =>
         {
             Some(UiAction::ToggleYandexMusicDislike)
+        }
+        Key::Char('X') if view.youtube_channel_auto_download_available() => {
+            Some(UiAction::ToggleChannelAutoDownload)
         }
         Key::Char('g')
             if view.screen == Screen::YandexMusic && view.yandex_music_actions.artist_available =>

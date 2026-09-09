@@ -121,6 +121,8 @@ pub enum DownloadScope {
     SingleItem,
     /// Download every public entry exposed by a channel or playlist URL.
     Collection,
+    /// Record all current collection entries without downloading media.
+    CollectionArchiveOnly,
 }
 
 /// One machine-readable event emitted by a supervised `yt-dlp` download.
@@ -160,6 +162,8 @@ pub struct DownloadRequest {
     pub playlist_start: Option<u64>,
     /// Download the provider thumbnail alongside the audio.
     pub write_thumbnail: bool,
+    /// Explicit archive used instead of the shared manual collection archive.
+    pub archive_path: Option<PathBuf>,
 }
 
 /// Child process for a running download.
@@ -621,7 +625,11 @@ fn build_download_command(config: &YtDlpConfig, request: &DownloadRequest) -> Co
     let mut command = build_base_command(config);
     command
 		.arg("--no-overwrites")
-        .arg("--no-simulate")
+        .arg(if request.scope == DownloadScope::CollectionArchiveOnly {
+            "--simulate"
+        } else {
+            "--no-simulate"
+        })
         .arg("--newline")
         .arg("--progress")
         .arg("--progress-template")
@@ -635,7 +643,7 @@ fn build_download_command(config: &YtDlpConfig, request: &DownloadRequest) -> Co
         .arg("--output")
 		.arg(match request.scope {
 			DownloadScope::SingleItem => "%(title).180B [%(id)s].%(ext)s",
-			DownloadScope::Collection => {
+			DownloadScope::Collection | DownloadScope::CollectionArchiveOnly => {
 				"%(channel).100B [%(channel_id)s]/%(title).180B [%(id)s].%(ext)s"
 			}
 		});
@@ -644,11 +652,16 @@ fn build_download_command(config: &YtDlpConfig, request: &DownloadRequest) -> Co
         DownloadScope::SingleItem => {
             command.arg("--no-playlist");
         }
-        DownloadScope::Collection => {
+        DownloadScope::Collection | DownloadScope::CollectionArchiveOnly => {
+            let default_archive = request.destination.join(".youta-download-archive");
             command
                 .arg("--yes-playlist")
                 .arg("--download-archive")
-                .arg(request.destination.join(".youta-download-archive"));
+                .arg(request.archive_path.as_ref().unwrap_or(&default_archive));
+            if request.scope == DownloadScope::CollectionArchiveOnly {
+                command.arg("--flat-playlist").arg("--force-write-archive");
+                return command;
+            }
             if let Some(playlist_start) = request.playlist_start {
                 command
                     .arg("--playlist-start")
@@ -842,6 +855,7 @@ mod tests {
             scope: DownloadScope::SingleItem,
             playlist_start: None,
             write_thumbnail: true,
+            archive_path: None,
         };
         let command = build_download_command(&config, &request);
         let arguments = command
@@ -945,6 +959,7 @@ mod tests {
             scope: DownloadScope::Collection,
             playlist_start: Some(17),
             write_thumbnail: true,
+            archive_path: None,
         };
         let command = build_download_command(&config, &request);
         let arguments = command
@@ -970,6 +985,71 @@ mod tests {
         assert!(arguments.windows(2).any(|pair| {
             pair[0] == "--output" && pair[1].starts_with("%(channel).100B [%(channel_id)s]/")
         }));
+    }
+
+    #[test]
+    fn automatic_collection_check_skips_archived_items_without_stopping_at_them() {
+        let config = YtDlpConfig::default();
+        let request = DownloadRequest {
+            source_url: Url::parse("https://www.youtube.com/channel/UCfixture")
+                .expect("channel URL"),
+            destination: PathBuf::from("/tmp/youta-fixture-downloads"),
+            format: DownloadFormat::OpusWithoutTranscoding,
+            scope: DownloadScope::Collection,
+            playlist_start: None,
+            write_thumbnail: true,
+            archive_path: Some(PathBuf::from(
+                "/tmp/youta-fixture-downloads/.youta-auto-download/UCfixture.archive",
+            )),
+        };
+        let arguments = build_download_command(&config, &request)
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert!(arguments.windows(2).any(|pair| {
+            pair[0] == "--download-archive"
+                && pair[1].ends_with(".youta-auto-download/UCfixture.archive")
+        }));
+        assert!(
+            !arguments
+                .iter()
+                .any(|argument| argument == "--break-on-existing"),
+            "archived newer uploads must not hide an older failed download on retry"
+        );
+    }
+
+    #[test]
+    fn automatic_collection_baseline_records_all_existing_items_without_media() {
+        let config = YtDlpConfig::default();
+        let request = DownloadRequest {
+            source_url: Url::parse("https://www.youtube.com/channel/UCfixture")
+                .expect("channel URL"),
+            destination: PathBuf::from("/tmp/youta-fixture-downloads"),
+            format: DownloadFormat::OpusWithoutTranscoding,
+            scope: DownloadScope::CollectionArchiveOnly,
+            playlist_start: None,
+            write_thumbnail: false,
+            archive_path: Some(PathBuf::from("/tmp/UCfixture.archive")),
+        };
+        let arguments = build_download_command(&config, &request)
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert!(arguments.iter().any(|argument| argument == "--simulate"));
+        assert!(
+            arguments
+                .iter()
+                .any(|argument| argument == "--force-write-archive")
+        );
+        assert!(
+            !arguments
+                .iter()
+                .any(|argument| argument == "--playlist-end"),
+            "baseline must also remember older uploads when the newest disappears"
+        );
+        assert!(!arguments.iter().any(|argument| argument == "--remux-video"));
     }
 
     #[test]

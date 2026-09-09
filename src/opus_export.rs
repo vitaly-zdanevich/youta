@@ -159,6 +159,7 @@ fn prepare_public_page_opus(
             scope: DownloadScope::SingleItem,
             playlist_start: None,
             write_thumbnail: false,
+            archive_path: None,
         })
         .map_err(|error| format!("Could not start yt-dlp audio preparation: {error}"))?;
     let stderr = process.take_error_reader();

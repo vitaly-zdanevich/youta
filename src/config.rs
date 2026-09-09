@@ -35,6 +35,9 @@ pub const CONFIG_DIR_ENV: &str = "YOUTA_CONFIG_DIR";
 /// Environment variable that overrides the Subscriptions screen layout.
 pub const SUBSCRIPTIONS_LAYOUT_ENV: &str = "YOUTA_UI__SUBSCRIPTIONS_LAYOUT";
 
+/// Environment variable that overrides hourly subscription downloads.
+pub const SUBSCRIPTIONS_AUTO_DOWNLOAD_ENV: &str = "YOUTA_SUBSCRIPTIONS__AUTO_DOWNLOAD";
+
 /// Environment variable that overrides `YouTube` Shorts visibility.
 pub const SHOW_YOUTUBE_SHORTS_ENV: &str = "YOUTA_UI__SHOW_YOUTUBE_SHORTS";
 
@@ -79,6 +82,7 @@ pub(crate) fn tui_preference_environment_variable_is_relevant(variable: &str) ->
         && (cfg!(feature = "summary") || variable != VIDEO_SUMMARY_BACKEND_ENV)
         && (cfg!(feature = "sponsorblock") || variable != SPONSORBLOCK_ENABLED_ENV)
         && (cfg!(feature = "nyan-cat") || variable != NYAN_CAT_SEEKBAR_ENV)
+        && (cfg!(feature = "yt-dlp") || variable != SUBSCRIPTIONS_AUTO_DOWNLOAD_ENV)
 }
 
 /// Environment variable that overrides the preferred Bandcamp audio format.
@@ -723,8 +727,8 @@ impl Config {
     /// [`LOCAL_FOLDER_SIZES_ENV`], [`TTY_IMAGES_ENV`], and
     /// [`YOUTUBE_THUMBNAIL_SIZE_ENV`] and [`SAVE_PLAYBACK_HISTORY_ENV`] retain
     /// precedence and therefore prevent this writer from storing a shadowed
-    /// draft. [`VIDEO_SUMMARY_BACKEND_ENV`] does the same when that capability
-    /// is compiled.
+    /// draft. [`VIDEO_SUMMARY_BACKEND_ENV`] and [`SUBSCRIPTIONS_AUTO_DOWNLOAD_ENV`]
+    /// do the same when their corresponding capabilities are compiled.
     ///
     /// The layout-only [`Self::save_subscriptions_layout`] method remains
     /// available for callers that do not edit the complete preference draft.
@@ -750,6 +754,7 @@ impl Config {
         show_images_in_tty: bool,
         youtube_thumbnail_size: YouTubeThumbnailSize,
         save_playback_history: bool,
+        download_new_episodes_every_hour: bool,
         video_summary_backend: VideoSummaryBackend,
     ) -> Result<(), ConfigError> {
         for variable in [
@@ -762,6 +767,7 @@ impl Config {
             TTY_IMAGES_ENV,
             YOUTUBE_THUMBNAIL_SIZE_ENV,
             SAVE_PLAYBACK_HISTORY_ENV,
+            SUBSCRIPTIONS_AUTO_DOWNLOAD_ENV,
             VIDEO_SUMMARY_BACKEND_ENV,
         ]
         .into_iter()
@@ -831,6 +837,21 @@ impl Config {
                 })?;
             persistence["save_playback_history"] = value(save_playback_history);
         }
+        #[cfg(feature = "yt-dlp")]
+        {
+            let subscriptions = document
+                .as_table_mut()
+                .entry("subscriptions")
+                .or_insert_with(|| Item::Table(Table::new()))
+                .as_table_mut()
+                .ok_or_else(|| {
+                    ConfigError::Invalid(
+                        "`subscriptions` must be a TOML table before Youta can update it"
+                            .to_owned(),
+                    )
+                })?;
+            subscriptions["auto_download"] = value(download_new_episodes_every_hour);
+        }
         #[cfg(feature = "summary")]
         {
             let video_summary = document
@@ -874,6 +895,12 @@ impl Config {
         let _ = sponsorblock_enabled;
         self.playback.youtube_prewarm = youtube_prewarm;
         self.persistence.save_playback_history = save_playback_history;
+        #[cfg(feature = "yt-dlp")]
+        {
+            self.subscriptions.auto_download = download_new_episodes_every_hour;
+        }
+        #[cfg(not(feature = "yt-dlp"))]
+        let _ = download_new_episodes_every_hour;
         #[cfg(feature = "summary")]
         {
             self.video_summary.backend = video_summary_backend;
@@ -1096,7 +1123,8 @@ pub struct AudiophileConfig {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default)]
 pub struct SubscriptionConfig {
-    /// Download new items while Youta is open.
+    /// Check opted-in YouTube channels hourly while Youta is open.
+    /// A startup check and the explicit manual action do not depend on this flag.
     pub auto_download: bool,
     /// Preferred downloaded audio container or codec.
     pub audio_format: String,
@@ -2163,6 +2191,10 @@ mod tests {
             tui_preference_environment_variable_is_relevant(NYAN_CAT_SEEKBAR_ENV),
             cfg!(feature = "nyan-cat")
         );
+        assert_eq!(
+            tui_preference_environment_variable_is_relevant(SUBSCRIPTIONS_AUTO_DOWNLOAD_ENV),
+            cfg!(feature = "yt-dlp")
+        );
         assert!(tui_preference_environment_variable_is_relevant(
             SAVE_PLAYBACK_HISTORY_ENV
         ));
@@ -2543,6 +2575,7 @@ youtube_api_key = "keep-this-existing-secret"
                 false,
                 YouTubeThumbnailSize::Maxres,
                 false,
+                true,
                 VideoSummaryBackend::Codex,
             )
             .expect("save TUI preferences");
@@ -2657,6 +2690,7 @@ youtube_api_key = "keep-this-existing-secret"
                 false,
                 YouTubeThumbnailSize::High,
                 false,
+                true,
                 VideoSummaryBackend::Off,
             )
             .expect("save supported preferences");
@@ -2692,6 +2726,7 @@ youtube_api_key = "keep-this-existing-secret"
                 false,
                 YouTubeThumbnailSize::High,
                 false,
+                true,
                 VideoSummaryBackend::Off,
             )
             .expect("save supported preferences");
@@ -2906,6 +2941,7 @@ youtube_api_key = "keep-this-existing-secret"
                     true,
                     YouTubeThumbnailSize::Standard,
                     true,
+                    true,
                     VideoSummaryBackend::Codex,
                 )
                 .expect_err("an environment override must lock the atomic writer");
@@ -2928,6 +2964,7 @@ youtube_api_key = "keep-this-existing-secret"
             (TTY_IMAGES_ENV, "false"),
             (YOUTUBE_THUMBNAIL_SIZE_ENV, "high"),
             (SAVE_PLAYBACK_HISTORY_ENV, "false"),
+            (SUBSCRIPTIONS_AUTO_DOWNLOAD_ENV, "false"),
             (VIDEO_SUMMARY_BACKEND_ENV, "codex"),
         ];
         for (override_name, override_value) in overrides

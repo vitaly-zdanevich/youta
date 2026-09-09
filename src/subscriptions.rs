@@ -16,6 +16,8 @@ use url::Url;
 use crate::config::{Config, ConfigError};
 use crate::domain::decode_url_path_segment_once;
 
+const AUTO_DOWNLOAD_CATEGORY: &str = "youta:auto-download";
+
 /// A complete portable subscription document.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SubscriptionTree {
@@ -112,6 +114,30 @@ impl SubscriptionTree {
                 .items
                 .iter()
                 .any(|node| node_contains_youtube_channel(node, channel_id))
+    }
+
+    /// Returns whether automatic downloads are enabled for one YouTube channel.
+    #[must_use]
+    pub fn youtube_channel_auto_download(&self, channel_id: &str) -> bool {
+        !channel_id.is_empty()
+            && self
+                .items
+                .iter()
+                .find_map(|node| node_youtube_channel_auto_download(node, channel_id))
+                .unwrap_or(false)
+    }
+
+    /// Changes automatic downloads for one subscribed YouTube channel.
+    ///
+    /// Returns `true` when a matching channel exists. Callers that expose this
+    /// setting on an unsubscribed channel should subscribe it first.
+    pub fn set_youtube_channel_auto_download(&mut self, channel_id: &str, enabled: bool) -> bool {
+        if channel_id.is_empty() {
+            return false;
+        }
+        self.items
+            .iter_mut()
+            .any(|node| set_node_youtube_channel_auto_download(node, channel_id, enabled))
     }
 
     /// Returns the validated public website stored for a `YouTube` channel.
@@ -230,6 +256,7 @@ impl SubscriptionTree {
                 website_url: None,
                 description: None,
                 kind: SubscriptionKind::Rss,
+                auto_download: false,
             }));
         Ok(true)
     }
@@ -308,6 +335,41 @@ fn node_youtube_channel_website_url<'a>(
                 .filter(|url| safe_youtube_channel_website_url(url, channel_id))
         }
         SubscriptionNode::Subscription(_) => None,
+    }
+}
+
+fn node_youtube_channel_auto_download(node: &SubscriptionNode, channel_id: &str) -> Option<bool> {
+    match node {
+        SubscriptionNode::Folder(folder) => folder
+            .children
+            .iter()
+            .find_map(|child| node_youtube_channel_auto_download(child, channel_id)),
+        SubscriptionNode::Subscription(subscription)
+            if subscription_matches_youtube_channel(subscription, channel_id) =>
+        {
+            Some(subscription.auto_download)
+        }
+        SubscriptionNode::Subscription(_) => None,
+    }
+}
+
+fn set_node_youtube_channel_auto_download(
+    node: &mut SubscriptionNode,
+    channel_id: &str,
+    enabled: bool,
+) -> bool {
+    match node {
+        SubscriptionNode::Folder(folder) => folder
+            .children
+            .iter_mut()
+            .any(|child| set_node_youtube_channel_auto_download(child, channel_id, enabled)),
+        SubscriptionNode::Subscription(subscription)
+            if subscription_matches_youtube_channel(subscription, channel_id) =>
+        {
+            subscription.auto_download = enabled;
+            true
+        }
+        SubscriptionNode::Subscription(_) => false,
     }
 }
 
@@ -474,6 +536,9 @@ pub struct Subscription {
     pub description: Option<String>,
     /// Source classification inferred during import or selected on creation.
     pub kind: SubscriptionKind,
+    /// Whether Youta should download new YouTube uploads while it is running.
+    #[serde(default)]
+    pub auto_download: bool,
 }
 
 impl Subscription {
@@ -487,6 +552,7 @@ impl Subscription {
             website_url: None,
             description: None,
             kind,
+            auto_download: false,
         }
     }
 
@@ -658,6 +724,12 @@ fn node_from_outline(outline: Outline) -> Result<SubscriptionNode, SubscriptionE
         website_url,
         description: outline.description,
         kind,
+        auto_download: outline.category.as_deref().is_some_and(|categories| {
+            categories
+                .split(',')
+                .map(str::trim)
+                .any(|category| category == AUTO_DOWNLOAD_CATEGORY)
+        }),
     }))
 }
 
@@ -693,6 +765,9 @@ fn outline_from_node(node: &SubscriptionNode) -> Outline {
                     .map(|url| url.as_str().to_owned()),
                 url,
                 description: subscription.description.clone(),
+                category: subscription
+                    .auto_download
+                    .then(|| AUTO_DOWNLOAD_CATEGORY.to_owned()),
                 ..Outline::default()
             }
         }
@@ -776,6 +851,7 @@ mod tests {
                         website_url: Some(parse("https://www.youtube.com/@medical")),
                         description: Some("Evidence-based videos".to_owned()),
                         kind: SubscriptionKind::YouTube,
+                        auto_download: false,
                     }),
                     SubscriptionNode::Folder(SubscriptionFolder {
                         title: "Podcasts".to_owned(),
@@ -785,6 +861,7 @@ mod tests {
                             website_url: Some(parse("https://example.org/podcast")),
                             description: None,
                             kind: SubscriptionKind::Rss,
+                            auto_download: false,
                         })],
                     }),
                 ],
@@ -893,6 +970,22 @@ mod tests {
     }
 
     #[test]
+    fn youtube_auto_download_is_explicit_and_survives_opml_round_trip() {
+        let mut tree = SubscriptionTree::default();
+        assert!(tree.subscribe_youtube_channel("Fixture channel", "UCfixture"));
+        assert!(!tree.youtube_channel_auto_download("UCfixture"));
+
+        assert!(tree.set_youtube_channel_auto_download("UCfixture", true));
+        assert!(tree.youtube_channel_auto_download("UCfixture"));
+        let xml = tree.to_opml().expect("serialize auto-download marker");
+        assert!(xml.contains("category=\"youta:auto-download\""));
+
+        let restored = SubscriptionTree::from_opml(&xml).expect("restore auto-download marker");
+        assert!(restored.youtube_channel_auto_download("UCfixture"));
+        assert!(!restored.youtube_channel_auto_download("UCother"));
+    }
+
+    #[test]
     fn youtube_subscription_preserves_safe_preferred_channel_website() {
         for handle in [
             parse("https://www.youtube.com/@fixture"),
@@ -970,6 +1063,7 @@ mod tests {
                     website_url: Some(handle.clone()),
                     description: None,
                     kind: SubscriptionKind::YouTube,
+                    auto_download: false,
                 })],
             })],
         };
@@ -1014,6 +1108,7 @@ mod tests {
                     website_url: Some(parse("https://www.youtube.com/channel/UCnestedfixture")),
                     description: None,
                     kind: SubscriptionKind::YouTube,
+                    auto_download: false,
                 })],
             })],
         };

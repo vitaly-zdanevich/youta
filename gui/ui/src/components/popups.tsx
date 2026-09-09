@@ -1322,7 +1322,7 @@ export function LanSharePopup({ popup }: { popup: LanSharePopupView }) {
 	);
 }
 
-/** The runtime preferences editor. Every value is a draft until Save. */
+/** Preference values are drafts until Save; a manual download check runs immediately. */
 export function PreferencesPopup({ popup }: { popup: PreferencesPopupView }) {
   const toggles: Array<[string, boolean, string]> = [
     ["Skip advertisement chapters", popup.skip_advertisement_chapters, "ToggleSkipAdvertisementChapters"],
@@ -1369,6 +1369,34 @@ export function PreferencesPopup({ popup }: { popup: PreferencesPopupView }) {
               {popup.save_playback_history ? "on" : "off"}
             </PopupButton>
           </label>
+					{popup.auto_download_supported ? (
+						<section className='grid gap-[7px] border-y border-line py-[7px]'>
+							<label className='flex items-center justify-between gap-4'>
+								<span className='text-ink-dim'>Download new episodes every hour</span>
+								<input
+									type='checkbox'
+									checked={popup.download_new_episodes_every_hour}
+									onChange={() => void dispatch('ToggleHourlyAutoDownload')}
+									className='accent-accent'
+								/>
+							</label>
+							<PopupButton onClick={() => void dispatch('CheckAndDownloadNewEpisodes')}>
+								Check and download new episodes
+							</PopupButton>
+							{popup.auto_download_status ? (
+								<p role='status' className='m-0 text-[11px] leading-[16px] text-accent'>
+									{popup.auto_download_status}
+								</p>
+							) : null}
+							<p className='m-0 text-[11px] leading-[16px] text-ink-faint'>
+								Checks channels with Auto-download enabled while Youta is open.
+							</p>
+						</section>
+					) : (
+						<p className='m-0 text-[11px] text-ink-faint'>
+							Automatic downloads are not included in this build.
+						</p>
+					)}
           {popup.video_summary_supported ? (
             <section className="grid gap-[4px] border-y border-line py-[7px]">
               <div className="flex items-center justify-between gap-4">

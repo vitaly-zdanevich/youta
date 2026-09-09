@@ -59,7 +59,9 @@ avoid_resampling = false
 # output_sample_rate_hz = 96000
 
 [subscriptions]
-# Automatic work runs only while Youta is open.
+# Check opted-in YouTube channels every hour while Youta is open.
+# Youta also checks once on startup. Enable Auto-download for each channel first.
+# YOUTA_SUBSCRIPTIONS__AUTO_DOWNLOAD overrides this hourly preference.
 auto_download = true
 audio_format = 'opus'
 download_thumbnails = true

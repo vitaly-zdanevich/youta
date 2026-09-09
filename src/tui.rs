@@ -2330,7 +2330,7 @@ fn render_frame(
     }
     hit_map.preferences_buttons.clear();
     if let Some(preferences) = view.preferences_popup.as_ref() {
-        render_preferences_popup(frame, preferences, &theme, hit_map);
+        render_preferences_popup(frame, preferences, settings.show_hotkeys, &theme, hit_map);
     }
     hit_map.local_file_buttons.clear();
     hit_map.local_move_rows = Rect::default();
@@ -4615,6 +4615,29 @@ fn render_information_panel(
             UiAction::OpenChannelDownload,
         )
     });
+    let auto_download_button = view.youtube_channel_auto_download_available().then(|| {
+        push_left_detail_button(
+            &mut lines,
+            &right_buttons,
+            &mut next_left_row,
+            inner.width,
+            button(
+                "X",
+                if details.channel_auto_download {
+                    "[x] Auto-download"
+                } else {
+                    "[ ] Auto-download"
+                },
+                show_hotkeys,
+            ),
+            if details.channel_auto_download {
+                theme.selected
+            } else {
+                theme.accent
+            },
+            UiAction::ToggleChannelAutoDownload,
+        )
+    });
     let subscription_button = (!details.channel_id.is_empty()).then(|| {
         let label = button(
             "s",
@@ -4764,6 +4787,7 @@ fn render_information_panel(
     .collect::<Vec<_>>();
     #[cfg(feature = "yt-dlp")]
     detail_buttons.extend(channel_download_button);
+    detail_buttons.extend(auto_download_button);
     detail_buttons.extend(subscription_button);
     detail_buttons.extend(rename_button);
     // Preserve the compact layout's established left-actions-first hit-map
@@ -6646,6 +6670,16 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
     let subscription_help = "  Subscriptions: PageUp/Down page R refresh h Shorts on/off i info D full channel C cancel";
     #[cfg(not(feature = "yt-dlp"))]
     let subscription_help = "  Subscriptions: PageUp/Down page     R refresh videos     h Shorts on/off     i description";
+    let preferences_help = if view.channel_download_supported {
+        "  F4 playlists  F5 stats  p preferences (e hourly downloads, C check now)"
+    } else {
+        "  F4 playlists     F5 stats     p preferences"
+    };
+    let channel_actions_help = if view.channel_download_supported {
+        "  y copy link  c channel info  s (un)subscribe  X channel auto-download"
+    } else {
+        "  y copy link     c channel info     s local subscribe/unsubscribe"
+    };
     let mut video_actions_help = "  o video page".to_owned();
     #[cfg(feature = "youtube-captions")]
     if view.youtube_captions_supported {
@@ -6670,7 +6704,7 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
         "  / search     Tab next tab     Shift+Tab previous tab     S subscriptions",
         "  Ctrl+Tab/Ctrl+Shift+Tab are aliases when the terminal distinguishes them.",
         history_navigation_help,
-        "  F4 playlists     F5 stats     p preferences",
+        preferences_help,
         project_history_help,
         search_kind_help(view),
         "  j/k select     Enter open/play",
@@ -6694,7 +6728,7 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
         video_actions_help.as_str(),
         playlist_actions_help.as_str(),
         "  O channel page     i subscription description     p preferences",
-        "  y copy link     c channel info     s local subscribe/unsubscribe",
+        channel_actions_help,
         private_note_help,
         "  Alt+j/k select external link     Alt+Enter open selected link",
         "",
@@ -10277,6 +10311,7 @@ fn render_private_note_popup(
 fn render_preferences_popup(
     frame: &mut Frame<'_>,
     preferences: &PreferencesPopupView,
+    show_hotkeys: bool,
     theme: &Theme,
     hit_map: &mut HitMap,
 ) {
@@ -10516,6 +10551,70 @@ fn render_preferences_popup(
         ));
     }
 
+    let auto_download_label = if preferences.auto_download_supported {
+        button(
+            "e",
+            &format!(
+                "Download new episodes every hour: {}",
+                if preferences.download_new_episodes_every_hour {
+                    "on"
+                } else {
+                    "off"
+                },
+            ),
+            show_hotkeys,
+        )
+    } else {
+        "Automatic downloads: unavailable in this build".to_owned()
+    };
+    for (row, label, action, selected) in [
+        (
+            0,
+            auto_download_label,
+            UiAction::ToggleHourlyAutoDownload,
+            preferences.download_new_episodes_every_hour,
+        ),
+        (
+            1,
+            button("C", "Check and download new episodes", show_hotkeys),
+            UiAction::CheckAndDownloadNewEpisodes,
+            false,
+        ),
+    ] {
+        if row == 1 && !preferences.auto_download_supported {
+            continue;
+        }
+        let control_area = Rect::new(
+            sections[5].x,
+            sections[5].y.saturating_add(row),
+            sections[5].width,
+            1,
+        );
+        frame.render_widget(
+            Paragraph::new(label.clone())
+                .style(if !preferences.auto_download_supported {
+                    theme.muted
+                } else if selected {
+                    theme.selected
+                } else {
+                    theme.base
+                })
+                .alignment(Alignment::Center),
+            control_area,
+        );
+        if preferences.auto_download_supported {
+            hit_map.preferences_buttons.push((
+                action,
+                Rect::new(
+                    centered_line_x(control_area, terminal_text_width(&label)),
+                    control_area.y,
+                    terminal_text_width(&label).min(control_area.width),
+                    1,
+                ),
+            ));
+        }
+    }
+
     let youtube_thumbnail_label = if cfg!(feature = "images") {
         format!(
             "[t] YouTube thumbnails: {}",
@@ -10532,15 +10631,15 @@ fn render_preferences_popup(
                 theme.muted
             })
             .alignment(Alignment::Center),
-        sections[5],
+        sections[6],
     );
     if cfg!(feature = "images") {
         hit_map.preferences_buttons.push((
             UiAction::CycleYouTubeThumbnailSize,
             Rect::new(
-                centered_line_x(sections[5], terminal_text_width(&youtube_thumbnail_label)),
-                sections[5].y,
-                terminal_text_width(&youtube_thumbnail_label).min(sections[5].width),
+                centered_line_x(sections[6], terminal_text_width(&youtube_thumbnail_label)),
+                sections[6].y,
+                terminal_text_width(&youtube_thumbnail_label).min(sections[6].width),
                 1,
             ),
         ));
@@ -10554,6 +10653,12 @@ fn render_preferences_popup(
             "off"
         }
     );
+    let folder_size_area = Rect::new(
+        sections[6].x,
+        sections[6].y.saturating_add(1),
+        sections[6].width,
+        1,
+    );
     frame.render_widget(
         Paragraph::new(folder_size_label.clone())
             .style(if preferences.show_local_folder_sizes {
@@ -10562,14 +10667,14 @@ fn render_preferences_popup(
                 theme.base
             })
             .alignment(Alignment::Center),
-        sections[6],
+        folder_size_area,
     );
     hit_map.preferences_buttons.push((
         UiAction::ToggleLocalFolderSizes,
         Rect::new(
-            centered_line_x(sections[6], terminal_text_width(&folder_size_label)),
-            sections[6].y,
-            terminal_text_width(&folder_size_label).min(sections[6].width),
+            centered_line_x(folder_size_area, terminal_text_width(&folder_size_label)),
+            folder_size_area.y,
+            terminal_text_width(&folder_size_label).min(folder_size_area.width),
             1,
         ),
     ));
@@ -10678,6 +10783,11 @@ fn render_preferences_popup(
         "Will save UI, playback, persistence, and summary preferences in:\n{}\n\nCodex receives bounded captions only after Summarize; Youta does not read Codex credentials or save summaries.\nDrill-down is the low-width default. YouTube preparation is short-lived; folder sizes are measured lazily.\nThumbnail and terminal-image behavior follows build support. Bandcamp resolves audio only after playback.",
         preferences.config_path
     );
+    if let Some(status) = preferences.auto_download_status.as_deref() {
+        // Put action feedback first so it stays visible even when explanatory
+        // notes are clipped by a short terminal.
+        notes.insert_str(0, &format!("{status}\n"));
+    }
     if let Some(variable) = preferences.environment_override.as_deref() {
         notes.push_str(&format!(
             "\n\nLocked by environment: {variable}\nChange or remove it before saving."
@@ -18782,6 +18892,9 @@ mod tests {
                 nyan_cat_seekbar: true,
                 nyan_cat_supported: true,
                 youtube_prewarm: true,
+                download_new_episodes_every_hour: true,
+                auto_download_supported: true,
+                auto_download_status: Some("Checking 2 opted-in YouTube channel(s)".to_owned()),
                 youtube_thumbnail_size: YouTubeThumbnailSize::Standard,
                 show_images_in_tty: true,
                 show_local_folder_sizes: true,
@@ -18806,6 +18919,9 @@ mod tests {
         assert!(!rendered.contains("[h] Save playback history"));
         assert!(rendered.contains("[S] SponsorBlock sponsored segments: on"));
         assert!(rendered.contains("[y] Prepare selected YouTube audio: on"));
+        assert!(rendered.contains("[e] Download new episodes every hour: on"));
+        assert!(rendered.contains("[C] Check and download new episodes"));
+        assert!(rendered.contains("Checking 2 opted-in YouTube channel(s)"));
         assert!(rendered.contains("[N] Rainbow Nyan Cat seek bar: on"));
         #[cfg(feature = "images")]
         assert!(rendered.contains("[t] YouTube thumbnails: 640×480 (standard)"));
@@ -18832,6 +18948,17 @@ mod tests {
         assert_eq!(
             key_action(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE), &view),
             Some(UiAction::ToggleYouTubePrewarm)
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE), &view),
+            Some(UiAction::ToggleHourlyAutoDownload)
+        );
+        assert_eq!(
+            key_action(
+                KeyEvent::new(KeyCode::Char('C'), KeyModifiers::SHIFT),
+                &view
+            ),
+            Some(UiAction::CheckAndDownloadNewEpisodes)
         );
         assert_eq!(
             key_action(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::NONE), &view),
@@ -19092,6 +19219,14 @@ mod tests {
             Some(UiAction::CycleVideoSummaryBackend)
         );
         for (action, label) in [
+            (
+                UiAction::ToggleHourlyAutoDownload,
+                "[e] Download new episodes every hour: on",
+            ),
+            (
+                UiAction::CheckAndDownloadNewEpisodes,
+                "[C] Check and download new episodes",
+            ),
             (UiAction::SubmitPreferences, "[Enter] Save"),
             (UiAction::DismissPreferences, "[Esc] Cancel"),
         ] {
@@ -19125,6 +19260,42 @@ mod tests {
                 Some(action)
             );
         }
+        let settings = UiSettings {
+            show_hotkeys: false,
+            ..UiSettings::default()
+        };
+        terminal
+            .draw(|frame| render(frame, &view, &settings, &mut hit_map))
+            .expect("draw automatic downloads with hidden hotkeys");
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("Download new episodes every hour: on"));
+        assert!(!rendered.contains("[e] Download new episodes every hour: on"));
+        assert!(rendered.contains("Check and download new episodes"));
+        assert!(!rendered.contains("[C] Check and download new episodes"));
+
+        let mut view = view;
+        view.preferences_popup
+            .as_mut()
+            .expect("preferences")
+            .auto_download_supported = false;
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw preferences without automatic-download build support");
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("Automatic downloads: unavailable in this build"));
+        assert!(!rendered.contains("Check and download new episodes"));
+        for key in ['e', 'C'] {
+            assert_eq!(
+                key_action(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE), &view),
+                None
+            );
+        }
+        assert!(hit_map.preferences_buttons.iter().all(|(action, _)| {
+            !matches!(
+                action,
+                UiAction::ToggleHourlyAutoDownload | UiAction::CheckAndDownloadNewEpisodes
+            )
+        }));
     }
 
     #[test]
@@ -19141,6 +19312,9 @@ mod tests {
                 nyan_cat_seekbar: true,
                 nyan_cat_supported: true,
                 youtube_prewarm: true,
+                download_new_episodes_every_hour: true,
+                auto_download_supported: true,
+                auto_download_status: None,
                 youtube_thumbnail_size: YouTubeThumbnailSize::Standard,
                 show_images_in_tty: true,
                 show_local_folder_sizes: true,
@@ -19185,6 +19359,9 @@ mod tests {
                 nyan_cat_seekbar: true,
                 nyan_cat_supported: true,
                 youtube_prewarm: true,
+                download_new_episodes_every_hour: true,
+                auto_download_supported: true,
+                auto_download_status: None,
                 youtube_thumbnail_size: YouTubeThumbnailSize::Standard,
                 show_images_in_tty: true,
                 show_local_folder_sizes: true,
@@ -19990,6 +20167,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).expect("terminal");
         let mut view = ViewModel {
             details: Some(DetailView {
+                media_id: Some(MediaId::new(SourceKind::YouTube, "fixture-video")),
                 title: "Mock video".to_owned(),
                 source: "YouTube".to_owned(),
                 webpage_url: Some(
@@ -20036,6 +20214,7 @@ mod tests {
         assert!(rendered.contains("[O] open channel https://www.youtube.com/@fixture"));
         assert!(!rendered.contains("xdg-open channel"));
         assert!(!rendered.contains("xdg-open video"));
+        assert!(!rendered.contains("Auto-download"));
         let (_, subscribe_area) = hit_map
             .detail_buttons
             .iter()
@@ -20082,8 +20261,10 @@ mod tests {
         );
         assert_eq!(
             subscribe_area.y,
-            open_area.y.saturating_add(1),
-            "the subscription action should follow the grouped channel and video openers"
+            open_area
+                .y
+                .saturating_add(1 + u16::from(cfg!(feature = "lan-sharing"))),
+            "Subscribe should follow the grouped openers and optional podcast-feed action"
         );
         let expected_right = hit_map
             .details_panel
@@ -20149,18 +20330,63 @@ mod tests {
 
     #[cfg(feature = "yt-dlp")]
     #[test]
-    fn subscribed_youtube_details_put_full_channel_download_before_unsubscribe() {
+    fn youtube_video_details_hide_channel_auto_download_and_shortcut() {
+        for screen in [Screen::Search, Screen::Subscriptions] {
+            let mut terminal = Terminal::new(TestBackend::new(180, 32)).expect("terminal");
+            let view = ViewModel {
+                screen,
+                channel_download_supported: true,
+                details: Some(DetailView {
+                    title: "Fixture video".to_owned(),
+                    media_id: Some(MediaId::new(SourceKind::YouTube, "fixture-video")),
+                    channel_id: "UCfixture".to_owned(),
+                    channel_name: "Fixture channel".to_owned(),
+                    channel_subscribed: true,
+                    ..DetailView::default()
+                }),
+                ..ViewModel::default()
+            };
+            let mut hit_map = HitMap::default();
+            terminal
+                .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+                .expect("draw video details");
+            assert!(!rendered_text(&terminal).contains("Auto-download"));
+            if screen == Screen::Subscriptions {
+                assert!(rendered_text(&terminal).contains("[D] Download full channel"));
+            }
+            assert!(
+                !hit_map
+                    .detail_buttons
+                    .iter()
+                    .any(|(action, _)| *action == UiAction::ToggleChannelAutoDownload)
+            );
+            assert_eq!(
+                key_action(
+                    KeyEvent::new(KeyCode::Char('X'), KeyModifiers::SHIFT),
+                    &view
+                ),
+                None
+            );
+        }
+    }
+
+    #[cfg(feature = "yt-dlp")]
+    #[test]
+    fn subscribed_youtube_channel_puts_auto_download_before_unsubscribe() {
         let backend = TestBackend::new(180, 32);
         let mut terminal = Terminal::new(backend).expect("terminal");
         let view = ViewModel {
             screen: Screen::Subscriptions,
+            right_panel_mode: RightPanelMode::Channel,
             details: Some(DetailView {
-                title: "Fixture upload".to_owned(),
+                title: "Fixture channel".to_owned(),
                 channel_name: "Fixture channel".to_owned(),
                 channel_id: "UCfixture".to_owned(),
                 channel_subscribed: true,
+                channel_auto_download: true,
                 ..DetailView::default()
             }),
+            channel_download_supported: true,
             ..ViewModel::default()
         };
         let mut hit_map = HitMap::default();
@@ -20171,6 +20397,7 @@ mod tests {
 
         let rendered = rendered_text(&terminal);
         assert!(rendered.contains("[D] Download full channel"));
+        assert!(rendered.contains("[X] [x] Auto-download"));
         assert!(rendered.contains("[s] Unsubscribe (locally)"));
         let download_row = hit_map
             .detail_buttons
@@ -20185,6 +20412,34 @@ mod tests {
         assert!(
             download_row < unsubscribe_row,
             "the channel download must precede Unsubscribe"
+        );
+        let auto_download_area = hit_map
+            .detail_buttons
+            .iter()
+            .find_map(|(action, area)| {
+                (action == &UiAction::ToggleChannelAutoDownload).then_some(*area)
+            })
+            .expect("auto-download checkbox target");
+        assert!(download_row < auto_download_area.y && auto_download_area.y < unsubscribe_row);
+        assert_eq!(
+            key_action(
+                KeyEvent::new(KeyCode::Char('X'), KeyModifiers::SHIFT),
+                &view
+            ),
+            Some(UiAction::ToggleChannelAutoDownload)
+        );
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: auto_download_area.x,
+                    row: auto_download_area.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            Some(UiAction::ToggleChannelAutoDownload)
         );
         assert_eq!(
             key_action(
@@ -20435,6 +20690,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing channel action {action:?}"))
         };
         let podcast_area = area_for(&UiAction::ShareYouTubeChannelPodcast);
+        let auto_download_area = area_for(&UiAction::ToggleChannelAutoDownload);
         let subscribe_area = area_for(&UiAction::ToggleSubscription);
         let open_area = area_for(&UiAction::OpenChannelInBrowser);
         let thumbnail_area = hit_map
@@ -20442,7 +20698,8 @@ mod tests {
             .expect("ready channel artwork hitbox");
         assert_eq!(podcast_area.y, thumbnail_area.y);
         assert_eq!(open_area.y, podcast_area.y.saturating_add(2));
-        assert_eq!(subscribe_area.y, open_area.y.saturating_add(2));
+        assert_eq!(auto_download_area.y, open_area.y.saturating_add(2));
+        assert_eq!(subscribe_area.y, auto_download_area.y.saturating_add(2));
         assert!(
             thumbnail_area.right().saturating_add(2) <= podcast_area.x
                 && thumbnail_area.right().saturating_add(2) <= open_area.x
@@ -21810,8 +22067,10 @@ mod tests {
         let backend = TestBackend::new(120, 28);
         let mut terminal = Terminal::new(backend).expect("terminal");
         let view = ViewModel {
+            channel_download_supported: true,
             details: Some(DetailView {
                 title: "Mock video".to_owned(),
+                media_id: Some(MediaId::new(SourceKind::YouTube, "fixture-video")),
                 channel_name: "Fixture channel".to_owned(),
                 channel_id: "UCfixture".to_owned(),
                 ..DetailView::default()
@@ -21836,11 +22095,15 @@ mod tests {
             .collect::<String>();
         assert!(rendered.contains("Subscribe (locally)"));
         assert!(!rendered.contains("[s] Subscribe (locally)"));
+        assert!(!rendered.contains("Auto-download"));
         assert!(!rendered.contains("Select mode"));
         assert!(rendered.contains("open video"));
         assert!(!rendered.contains("[o] open video"));
         assert!(!rendered.contains("[O] open channel"));
-        assert_eq!(hit_map.detail_buttons.len(), 2);
+        assert_eq!(
+            hit_map.detail_buttons.len(),
+            2 + usize::from(cfg!(feature = "lan-sharing"))
+        );
         assert!(
             hit_map
                 .detail_buttons

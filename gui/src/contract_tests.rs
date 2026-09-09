@@ -305,6 +305,9 @@ fn preferences() -> PreferencesPopupView {
         nyan_cat_seekbar: true,
         nyan_cat_supported: true,
         youtube_prewarm: false,
+        download_new_episodes_every_hour: true,
+        auto_download_supported: true,
+        auto_download_status: None,
         youtube_thumbnail_size: youta::config::YouTubeThumbnailSize::default(),
         show_local_folder_sizes: false,
         show_images_in_tty: false,
@@ -677,6 +680,65 @@ fn the_window_reviews_and_can_cancel_a_full_channel_download() {
     }
     assert!(download.contains("dispatch(\"CancelDownload\")"));
     assert!(app.contains("<ChannelDownloadPopup"));
+}
+
+#[test]
+fn the_window_exposes_channel_and_hourly_auto_download_controls() {
+    let details = window_source("components/Details.tsx");
+    let popups = window_source("components/popups.tsx");
+
+    for required in [
+        "details.channel_auto_download",
+        "ToggleChannelAutoDownload",
+        "Auto-download",
+    ] {
+        assert!(
+            details.contains(required),
+            "Details no longer contains {required}"
+        );
+    }
+    for required in [
+        "popup.auto_download_supported",
+        "popup.auto_download_status",
+        "popup.download_new_episodes_every_hour",
+        "ToggleHourlyAutoDownload",
+        "CheckAndDownloadNewEpisodes",
+        "Download new episodes every hour",
+        "Check and download new episodes",
+    ] {
+        assert!(
+            popups.contains(required),
+            "Preferences no longer contains {required}"
+        );
+    }
+}
+
+/// A video's channel metadata must not turn its Details into a channel checkbox.
+#[test]
+fn the_window_limits_auto_download_to_channel_entities() {
+    let details = window_source("components/Details.tsx");
+    let before_checkbox = details
+        .split_once("checked={details.channel_auto_download}")
+        .expect("channel auto-download checkbox")
+        .0;
+    let guard = before_checkbox
+        .rsplit_once("{view.channel_download_supported &&")
+        .expect("build-capability guard on the channel checkbox")
+        .1;
+
+    assert!(
+        guard.contains("details.media_id === null"),
+        "only a selected channel entity may show Auto-download; video Details also have channel IDs"
+    );
+    assert!(guard.contains("details.channel_id !== ''"));
+    assert!(
+        !guard.contains("|| isYouTube"),
+        "a YouTube video must not bypass channel-only availability"
+    );
+    assert!(
+        !guard.contains("kind === 'Channel'"),
+        "search channel entities must not depend on the subscription-only Channel layout"
+    );
 }
 
 #[test]
