@@ -3882,10 +3882,40 @@ fn detail_action_rail(
         .preferred_height(details, artwork_width, panel_width)
         .min(available_height);
     (artwork_height >= MIN_THUMBNAIL_HEIGHT && height <= artwork_height).then(|| {
-        let mut buttons = buttons.to_vec();
-        buttons.sort_by_key(|button| (button.line_index, button.column));
+        let mut rail_buttons = buttons.to_vec();
+        rail_buttons.sort_by_key(|button| (button.line_index, button.column));
+        // Compact columns can share preservation/navigation rows. Restore the
+        // rail's grouped reading order using virtual rows, without introducing
+        // those holes into the compact layout. A fitted rail guarantees every
+        // right control has column > 0: a full-width label leaves no artwork.
+        let mut next_left_row = 0;
+        let mut next_appended_row = buttons
+            .iter()
+            .filter(|button| button.column > 0)
+            .map(|button| button.line_index.saturating_add(1))
+            .max()
+            .unwrap_or_default();
+        for left in rail_buttons.iter_mut().filter(|button| button.column == 0) {
+            left.line_index = buttons
+                .iter()
+                .find(|right| {
+                    left.action != UiAction::ToggleSubscription
+                        && right.column > 0
+                        && right.line_index >= next_left_row
+                        && !right_detail_button_reserves_full_row(&right.action, buttons)
+                        && right.column >= terminal_text_width(&left.label).saturating_add(2)
+                })
+                .map(|right| right.line_index)
+                .unwrap_or_else(|| {
+                    let row = next_appended_row;
+                    next_appended_row = next_appended_row.saturating_add(1);
+                    row
+                });
+            next_left_row = left.line_index.saturating_add(1);
+        }
+        rail_buttons.sort_by_key(|button| (button.line_index, button.column));
         DetailActionRail {
-            buttons,
+            buttons: rail_buttons,
             width,
             height,
             artwork_width,
@@ -3968,8 +3998,8 @@ fn push_right_detail_button<'a>(
 /// Pairing the two columns keeps actions near the top without overlapping on
 /// narrow panes. The monotonic row cursor preserves action order; once no
 /// remaining right-control row has enough room, the action and its successors
-/// receive appended rows. Related right-side action groups stay unpaired so
-/// Commons/Evernote and channel/video remain consecutive in reading order.
+/// receive appended rows. Right-side groups remain consecutive in their own
+/// column; only Subscribe requires a separate final row below both columns.
 fn push_left_detail_button<'a>(
     lines: &mut Vec<Line<'a>>,
     right_buttons: &[DetailButtonPlacement],
@@ -3981,8 +4011,8 @@ fn push_left_detail_button<'a>(
 ) -> DetailButtonPlacement {
     let label_width = terminal_text_width(&label).min(panel_width);
     let shared_row = right_buttons.iter().find(|button| {
-        button.line_index >= *next_left_row
-            && !right_detail_button_reserves_full_row(&button.action, right_buttons)
+        action != UiAction::ToggleSubscription
+            && button.line_index >= *next_left_row
             && button.column >= label_width.saturating_add(2)
     });
     let line_index = if let Some(button) = shared_row {
@@ -4008,7 +4038,7 @@ fn push_left_detail_button<'a>(
     }
 }
 
-/// Keeps related preservation and external-navigation actions visually adjacent.
+/// Keeps preservation and navigation pairs adjacent in the single-column rail.
 fn right_detail_button_reserves_full_row(
     action: &UiAction,
     right_buttons: &[DetailButtonPlacement],
@@ -20783,7 +20813,7 @@ for encoded, expected in json.load(sys.stdin):
 
     #[cfg(feature = "lan-sharing")]
     #[test]
-    fn left_detail_actions_preserve_grouped_navigation_rows() {
+    fn left_detail_actions_preserve_independently_grouped_columns() {
         let media_id = MediaId::new(SourceKind::YouTube, "fixture-video");
         let view = ViewModel {
             video_comments_available: true,
@@ -20834,8 +20864,7 @@ for encoded, expected in json.load(sys.stdin):
         );
 
         let ordered_actions = [
-            UiAction::OpenChannelInBrowser,
-            UiAction::OpenInBrowser,
+            UiAction::ToggleTodoPlaylist,
             UiAction::OpenPlaylistPopup,
             UiAction::EditPrivateNote,
             UiAction::ToggleSubscription,
@@ -20845,8 +20874,126 @@ for encoded, expected in json.load(sys.stdin):
             ordered_areas
                 .windows(2)
                 .all(|pair| pair[1].y == pair[0].y.saturating_add(1)),
-            "channel and video must stay grouped while Subscribe remains last"
+            "the left column must remain compact while Subscribe remains last"
         );
+        assert_eq!(
+            area_for(&UiAction::OpenInBrowser).y,
+            area_for(&UiAction::OpenChannelInBrowser).bottom(),
+            "channel and video must stay grouped in the right column"
+        );
+    }
+
+    #[test]
+    fn compact_detail_actions_do_not_leave_a_hole_before_private_note() {
+        let media_id = MediaId::new(SourceKind::YouTube, "fixture-video");
+        let view = ViewModel {
+            video_comments_available: true,
+            video_summary_available: true,
+            #[cfg(feature = "commons-upload")]
+            commons_upload_available: true,
+            #[cfg(feature = "evernote")]
+            evernote_available: true,
+            private_note_available: true,
+            playlist_item: Some(PlaylistItemView {
+                media_id: media_id.clone(),
+                title: "Fixture video".to_owned(),
+                in_todo: false,
+            }),
+            details: Some(DetailView {
+                media_id: Some(media_id),
+                title: "Fixture video".to_owned(),
+                source: "YouTube".to_owned(),
+                channel_id: "UCfixture".to_owned(),
+                channel_webpage_url: Some(
+                    url::Url::parse("https://www.youtube.com/@fixture").expect("channel URL"),
+                ),
+                webpage_url: Some(
+                    url::Url::parse("https://www.youtube.com/watch?v=fixture-video")
+                        .expect("video URL"),
+                ),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(120, 32)).expect("terminal");
+        let mut hit_map = HitMap::default();
+        terminal
+            .draw(|frame| {
+                render_details(
+                    frame,
+                    frame.area(),
+                    &view,
+                    true,
+                    0,
+                    &Theme::new(false),
+                    &mut hit_map,
+                    None,
+                )
+            })
+            .expect("draw compact actions");
+        let area_for = |action: &UiAction| {
+            hit_map
+                .detail_buttons
+                .iter()
+                .find_map(|(candidate, area)| (candidate == action).then_some(*area))
+                .unwrap_or_else(|| panic!("missing action {action:?}"))
+        };
+        let left = [
+            UiAction::ToggleTodoPlaylist,
+            UiAction::OpenPlaylistPopup,
+            UiAction::EditPrivateNote,
+        ];
+        let areas = left.each_ref().map(area_for);
+        assert!(
+            areas.windows(2).all(|pair| pair[1].y == pair[0].bottom()),
+            "left actions must use consecutive rows: {areas:?}"
+        );
+        let channel = area_for(&UiAction::OpenChannelInBrowser);
+        let video = area_for(&UiAction::OpenInBrowser);
+        assert_eq!(
+            video.y,
+            channel.bottom(),
+            "browser buttons must stay grouped"
+        );
+        #[cfg(all(feature = "commons-upload", feature = "evernote"))]
+        assert_eq!(
+            area_for(&UiAction::OpenEvernoteNote).y,
+            area_for(&UiAction::OpenCommonsUpload).bottom(),
+            "preservation buttons must stay grouped"
+        );
+        let subscribe = area_for(&UiAction::ToggleSubscription);
+        assert!(
+            hit_map
+                .detail_buttons
+                .iter()
+                .all(|(action, area)| *action == UiAction::ToggleSubscription
+                    || area.bottom() <= subscribe.y),
+            "Subscribe must remain last"
+        );
+        for (action, area) in &hit_map.detail_buttons {
+            assert_eq!(
+                mouse_action(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: area.x,
+                        row: area.y,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    &hit_map,
+                    &view
+                ),
+                Some(action.clone()),
+                "compaction must retain exact hit targets"
+            );
+            assert!(
+                hit_map
+                    .detail_buttons
+                    .iter()
+                    .all(|(other, other_area)| action == other
+                        || area.intersection(*other_area).is_empty()),
+                "buttons must not overlap"
+            );
+        }
     }
 
     #[test]
