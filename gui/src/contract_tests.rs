@@ -752,6 +752,29 @@ fn the_window_limits_auto_download_to_channel_entities() {
     );
 }
 
+/// Both subscription labels belong to channel entities, never episode details.
+#[test]
+fn the_window_limits_subscription_actions_to_channel_entities() {
+    let details = window_source("components/Details.tsx");
+    let before_action = details
+        .split_once("active={details.channel_subscribed}")
+        .expect("channel subscription action")
+        .0;
+    let guard = before_action
+        .rsplit_once("{details.")
+        .expect("channel entity guard")
+        .1;
+
+    assert!(
+        guard.starts_with("media_id === null && details.channel_id !== '' ? ("),
+        "Subscribe and Unsubscribe must require a channel entity with no media ID"
+    );
+    assert!(
+        !guard.contains("kind ==="),
+        "search channels may use the Video layout"
+    );
+}
+
 #[test]
 fn yt_dlp_lookup_variants_keep_the_window_contract_shape() {
     assert_eq!(

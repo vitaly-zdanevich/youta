@@ -21342,6 +21342,9 @@ impl AppController {
         self.schedule_visible_channel_details(Instant::now());
     }
 
+    /// Mutates the selected channel's local subscription after reloading OPML.
+    /// Episode details retain channel metadata, but stale frontend actions must
+    /// not use that metadata to subscribe or unsubscribe the parent channel.
     fn toggle_local_subscription(&mut self) {
         let Some(details) = self.view.details.as_ref() else {
             self.view.status_line = "No channel is selected".to_owned();
@@ -21350,6 +21353,11 @@ impl AppController {
         if details.channel_id.is_empty() {
             self.view.status_line =
                 "The provider has not returned a subscribable channel ID".to_owned();
+            return;
+        }
+        if !self.view.youtube_channel_subscription_available() {
+            self.view.status_line =
+                "Select a channel to subscribe or unsubscribe locally".to_owned();
             return;
         }
         let channel_id = details.channel_id.clone();
@@ -54026,6 +54034,60 @@ mod tests {
         );
     }
 
+    /// A stale frontend action on episode details must not change channel OPML.
+    #[test]
+    fn video_subscription_dispatch_preserves_existing_opml_and_view() {
+        for subscribed in [false, true] {
+            let temporary = crate::test_support::canonical_tempdir("video subscription guard");
+            let config = Config::for_dir(temporary.path().join("youta"));
+            let mut tree = SubscriptionTree::default();
+            assert!(tree.subscribe_youtube_channel("Unrelated channel", "UCother"));
+            if subscribed {
+                assert!(tree.subscribe_youtube_channel("Fixture channel", "UCfixture"));
+            }
+            subscriptions::save(&config, &tree).expect("existing OPML");
+            let before = std::fs::read(config.subscriptions_file()).expect("OPML before dispatch");
+            let store = StateStore::open_in_memory().expect("in-memory state");
+            let mut controller = AppController::new(config.clone(), store, None, None);
+            let video = subscription_video_summary();
+            controller.youtube_results = vec![SearchItem::Video(video.clone())];
+            controller.view.details = Some(preliminary_detail(
+                &SearchItem::Video(video),
+                &controller.subscription_tree,
+            ));
+            controller.refresh_youtube_rows();
+
+            controller.dispatch(UiAction::ToggleSubscription);
+
+            assert_eq!(
+                std::fs::read(config.subscriptions_file()).expect("OPML after dispatch"),
+                before,
+                "video details must not mutate the channel subscription"
+            );
+            assert_eq!(
+                controller
+                    .subscription_tree
+                    .contains_youtube_channel("UCfixture"),
+                subscribed
+            );
+            assert_eq!(
+                controller
+                    .view
+                    .details
+                    .as_ref()
+                    .expect("video details")
+                    .channel_subscribed,
+                subscribed
+            );
+            assert_eq!(controller.view.rows[0].subscribed, subscribed);
+            assert!(
+                controller
+                    .subscription_tree
+                    .contains_youtube_channel("UCother")
+            );
+        }
+    }
+
     #[test]
     fn local_channel_subscription_persists_and_updates_details_and_rows() {
         let temporary = crate::test_support::canonical_tempdir("temporary directory");
@@ -54038,14 +54100,15 @@ mod tests {
             &SearchItem::Video(video),
             &controller.subscription_tree,
         ));
+        controller.refresh_youtube_rows();
+        controller.dispatch(UiAction::ShowChannel);
         controller
             .view
             .details
             .as_mut()
-            .expect("video details")
+            .expect("channel details")
             .channel_webpage_url =
             Some(url::Url::parse("https://www.youtube.com/@fixture").expect("fixture handle"));
-        controller.refresh_youtube_rows();
 
         controller.dispatch(UiAction::ToggleSubscription);
 
@@ -59668,6 +59731,7 @@ mod tests {
             &controller.subscription_tree,
         ));
         controller.refresh_youtube_rows();
+        controller.dispatch(UiAction::ShowChannel);
         assert!(
             !controller
                 .view
@@ -67638,6 +67702,7 @@ mod tests {
             &controller.subscription_tree,
         ));
         controller.refresh_youtube_rows();
+        controller.dispatch(UiAction::ShowChannel);
 
         controller.dispatch(UiAction::ToggleSubscription);
 
@@ -67698,6 +67763,7 @@ mod tests {
             &controller.subscription_tree,
         ));
         controller.refresh_youtube_rows();
+        controller.dispatch(UiAction::ShowChannel);
 
         controller.dispatch(UiAction::ToggleSubscription);
 

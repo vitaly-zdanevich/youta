@@ -4673,7 +4673,7 @@ fn render_information_panel(
             UiAction::ToggleChannelAutoDownload,
         )
     });
-    let subscription_button = (!details.channel_id.is_empty()).then(|| {
+    let subscription_button = view.youtube_channel_subscription_available().then(|| {
         let label = button(
             "s",
             if details.channel_subscribed {
@@ -20426,12 +20426,12 @@ for encoded, expected in json.load(sys.stdin):
     }
 
     #[test]
-    fn details_render_clickable_local_subscription_without_duplicate_channel_name() {
+    fn channel_details_render_clickable_local_subscription_without_duplicate_name() {
         let backend = TestBackend::new(240, 32);
         let mut terminal = Terminal::new(backend).expect("terminal");
         let mut view = ViewModel {
             details: Some(DetailView {
-                media_id: Some(MediaId::new(SourceKind::YouTube, "fixture-video")),
+                media_id: None,
                 title: "Mock video".to_owned(),
                 source: "YouTube".to_owned(),
                 webpage_url: Some(
@@ -20478,7 +20478,10 @@ for encoded, expected in json.load(sys.stdin):
         assert!(rendered.contains("[O] open channel https://www.youtube.com/@fixture"));
         assert!(!rendered.contains("xdg-open channel"));
         assert!(!rendered.contains("xdg-open video"));
-        assert!(!rendered.contains("Auto-download"));
+        assert_eq!(
+            rendered.contains("Auto-download"),
+            view.channel_download_supported
+        );
         let (_, subscribe_area) = hit_map
             .detail_buttons
             .iter()
@@ -20588,6 +20591,85 @@ for encoded, expected in json.load(sys.stdin):
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
         assert!(rendered.contains("[s] Unsubscribe (locally)"));
+    }
+
+    #[test]
+    fn youtube_subscription_controls_require_channel_items() {
+        for screen in [Screen::Search, Screen::Subscriptions] {
+            for subscribed in [false, true] {
+                let mut view = ViewModel {
+                    screen,
+                    details: Some(DetailView {
+                        media_id: Some(MediaId::new(SourceKind::YouTube, "fixture-video")),
+                        title: "Fixture video".to_owned(),
+                        source: "YouTube".to_owned(),
+                        channel_id: "UCfixture".to_owned(),
+                        channel_subscribed: subscribed,
+                        ..DetailView::default()
+                    }),
+                    ..ViewModel::default()
+                };
+                let mut terminal = Terminal::new(TestBackend::new(180, 32)).expect("terminal");
+                let mut hit_map = HitMap::default();
+                terminal
+                    .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+                    .expect("render video");
+                assert!(
+                    hit_map
+                        .detail_buttons
+                        .iter()
+                        .all(|(action, _)| *action != UiAction::ToggleSubscription),
+                    "video items must not expose subscription controls: {screen:?}, subscribed={subscribed}"
+                );
+                assert!(!rendered_text(&terminal).contains("Subscribe (locally)"));
+                assert!(!rendered_text(&terminal).contains("Unsubscribe (locally)"));
+                assert_eq!(
+                    key_action(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE), &view),
+                    None,
+                    "a hidden subscription action must not remain keyboard-active"
+                );
+
+                view.details.as_mut().expect("details").media_id = None;
+                terminal
+                    .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+                    .expect("render channel");
+                let area = hit_map
+                    .detail_buttons
+                    .iter()
+                    .find_map(|(action, area)| {
+                        (*action == UiAction::ToggleSubscription).then_some(*area)
+                    })
+                    .expect("channel subscription control");
+                assert!(rendered_text(&terminal).contains(if subscribed {
+                    "Unsubscribe (locally)"
+                } else {
+                    "Subscribe (locally)"
+                }));
+                assert_eq!(
+                    key_action(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE), &view),
+                    Some(UiAction::ToggleSubscription)
+                );
+                assert_eq!(
+                    mouse_action(
+                        MouseEvent {
+                            kind: MouseEventKind::Down(MouseButton::Left),
+                            column: area.x,
+                            row: area.y,
+                            modifiers: KeyModifiers::NONE,
+                        },
+                        &hit_map,
+                        &view
+                    ),
+                    Some(UiAction::ToggleSubscription)
+                );
+
+                view.details.as_mut().expect("details").channel_id.clear();
+                assert_eq!(
+                    key_action(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE), &view),
+                    None
+                );
+            }
+        }
     }
 
     #[cfg(feature = "yt-dlp")]
@@ -20867,14 +20949,13 @@ for encoded, expected in json.load(sys.stdin):
             UiAction::ToggleTodoPlaylist,
             UiAction::OpenPlaylistPopup,
             UiAction::EditPrivateNote,
-            UiAction::ToggleSubscription,
         ];
         let ordered_areas = ordered_actions.each_ref().map(area_for);
         assert!(
             ordered_areas
                 .windows(2)
                 .all(|pair| pair[1].y == pair[0].y.saturating_add(1)),
-            "the left column must remain compact while Subscribe remains last"
+            "the left column must remain compact"
         );
         assert_eq!(
             area_for(&UiAction::OpenInBrowser).y,
@@ -20961,14 +21042,12 @@ for encoded, expected in json.load(sys.stdin):
             area_for(&UiAction::OpenCommonsUpload).bottom(),
             "preservation buttons must stay grouped"
         );
-        let subscribe = area_for(&UiAction::ToggleSubscription);
         assert!(
             hit_map
                 .detail_buttons
                 .iter()
-                .all(|(action, area)| *action == UiAction::ToggleSubscription
-                    || area.bottom() <= subscribe.y),
-            "Subscribe must remain last"
+                .all(|(action, _)| *action != UiAction::ToggleSubscription),
+            "video items must not reserve a subscription row"
         );
         for (action, area) in &hit_map.detail_buttons {
             assert_eq!(
@@ -21198,7 +21277,6 @@ for encoded, expected in json.load(sys.stdin):
             UiAction::OpenInBrowser,
             UiAction::OpenPlaylistPopup,
             UiAction::EditPrivateNote,
-            UiAction::ToggleSubscription,
         ];
         let mut action_areas = expected_actions
             .iter()
@@ -21246,7 +21324,6 @@ for encoded, expected in json.load(sys.stdin):
             "[o] open video".to_owned(),
             "[P] Playlist…".to_owned(),
             "[n] Add private note".to_owned(),
-            "[s] Subscribe (locally)".to_owned(),
         ];
         for ((expected, expected_label), area) in expected_actions
             .iter()
@@ -21374,7 +21451,6 @@ for encoded, expected in json.load(sys.stdin):
             UiAction::ToggleTodoPlaylist,
             UiAction::OpenPlaylistPopup,
             UiAction::EditPrivateNote,
-            UiAction::ToggleSubscription,
         ];
         let placements = actions.each_ref().map(|expected| {
             let (_, area) = hit_map
@@ -21403,12 +21479,7 @@ for encoded, expected in json.load(sys.stdin):
             "left-side actions must retain their logical order on narrow panes"
         );
         let rendered = rendered_text(&terminal);
-        for label in [
-            "[l] Add to todo",
-            "[P] Playlist…",
-            "[n] Add private note",
-            "[s] Subscribe (locally)",
-        ] {
+        for label in ["[l] Add to todo", "[P] Playlist…", "[n] Add private note"] {
             assert!(rendered.contains(label), "missing rendered label {label:?}");
         }
     }
@@ -21481,7 +21552,6 @@ for encoded, expected in json.load(sys.stdin):
             UiAction::ToggleTodoPlaylist,
             UiAction::OpenPlaylistPopup,
             UiAction::EditPrivateNote,
-            UiAction::ToggleSubscription,
         ] {
             let (_, area) = hit_map
                 .detail_buttons
@@ -22458,10 +22528,10 @@ for encoded, expected in json.load(sys.stdin):
         let backend = TestBackend::new(120, 28);
         let mut terminal = Terminal::new(backend).expect("terminal");
         let view = ViewModel {
-            channel_download_supported: true,
+            channel_download_supported: false,
             details: Some(DetailView {
-                title: "Mock video".to_owned(),
-                media_id: Some(MediaId::new(SourceKind::YouTube, "fixture-video")),
+                title: "Mock channel".to_owned(),
+                media_id: None,
                 channel_name: "Fixture channel".to_owned(),
                 channel_id: "UCfixture".to_owned(),
                 ..DetailView::default()

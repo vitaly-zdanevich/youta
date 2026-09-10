@@ -1916,7 +1916,9 @@ fn unfiltered_key_action(
         Key::Char('r') => Some(UiAction::ToggleRepeat),
         Key::Char('w') if !key.modified() => Some(UiAction::ToggleWaveform),
         Key::Char('c') => Some(UiAction::ShowChannel),
-        Key::Char('s') => Some(UiAction::ToggleSubscription),
+        Key::Char('s') if view.youtube_channel_subscription_available() => {
+            Some(UiAction::ToggleSubscription)
+        }
         Key::Backspace => Some(UiAction::GoBack),
         Key::Char('n') if !key.modified() => Some(UiAction::EditPrivateNote),
         Key::Char('a') => Some(UiAction::AddToQueue),

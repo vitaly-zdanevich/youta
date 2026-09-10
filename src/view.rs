@@ -2404,6 +2404,17 @@ pub struct ViewModel {
 }
 
 impl ViewModel {
+    /// Allows local subscription changes only for channel entities.
+    ///
+    /// Videos carry their parent's channel ID too, but their media ID
+    /// distinguishes them from channel results and channel panels.
+    #[must_use]
+    pub fn youtube_channel_subscription_available(&self) -> bool {
+        self.details
+            .as_ref()
+            .is_some_and(|details| !details.channel_id.is_empty() && details.media_id.is_none())
+    }
+
     /// Reports whether the current details or channel panel can create a `YouTube` feed.
     ///
     /// A selected video already owns its channel ID, so users inside a channel

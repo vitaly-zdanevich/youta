@@ -1593,8 +1593,11 @@ are shown when the feed supplies them. Enclosure URLs are treated as transient
 playback data and are not written to the restart snapshot.
 
 YouTube subscriptions are currently local-only channel subscriptions. Choosing
-`Subscribe (locally)` while a video is selected adds its channel to Youta's
-OPML-backed source list; it does not subscribe the signed-in YouTube account.
+`Subscribe (locally)` on a selected channel adds it to Youta's OPML-backed
+source list; it does not subscribe the signed-in YouTube account. Subscribe,
+Unsubscribe, and their `s` shortcut are available only on channel items, not
+individual videos. From a video, press `c` to show its channel before changing
+the subscription.
 OAuth-based synchronization remains roadmap work. In Details, uppercase
 `[O] open channel` opens the selected YouTube channel's webpage, while lowercase
 `[o] open video` opens the selected video's webpage. Each control shows its full

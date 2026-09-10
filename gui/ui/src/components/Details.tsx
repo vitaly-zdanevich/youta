@@ -332,14 +332,16 @@ export function Details({ view, kind }: { view: ViewModel; kind: InformationPane
 				Auto-download
 			</label>
 		) : null}
-        {details.channel_id !== "" ? (
-          <Action
-            active={details.channel_subscribed}
-            onClick={() => void dispatch("ToggleSubscription")}
-          >
-            {details.channel_subscribed ? "Unsubscribe" : "Subscribe"}
-          </Action>
-        ) : null}
+		{/* Episode metadata also has a channel ID; subscription actions belong
+		    only to channel entities, including search channels in the Video layout. */}
+		{details.media_id === null && details.channel_id !== '' ? (
+			<Action
+				active={details.channel_subscribed}
+				onClick={() => void dispatch('ToggleSubscription')}
+			>
+				{details.channel_subscribed ? 'Unsubscribe' : 'Subscribe'}
+			</Action>
+		) : null}
         {view.playlist_item !== null ? (
           <>
             <Action
