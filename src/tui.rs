@@ -15,8 +15,8 @@ use crossterm::event::{
 use crossterm::execute;
 use crossterm::style::{Attribute, Colored, ResetColor, SetAttribute};
 use crossterm::terminal::{
-    Clear as ClearTerminal, ClearType, EnterAlternateScreen, LeaveAlternateScreen, SetTitle,
-    disable_raw_mode, enable_raw_mode,
+    Clear as ClearTerminal, ClearType, DisableLineWrap, EnableLineWrap, EnterAlternateScreen,
+    LeaveAlternateScreen, SetTitle, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::Frame;
 use ratatui::backend::CrosstermBackend;
@@ -1582,11 +1582,9 @@ impl TerminalSession {
         execute!(
             self.terminal.backend_mut(),
             SetAttribute(Attribute::Reset),
-            ResetColor,
-            Show,
-            DisableMouseCapture,
-            LeaveAlternateScreen
+            ResetColor
         )?;
+        write_terminal_exit(self.terminal.backend_mut())?;
         self.terminal.show_cursor()
     }
 
@@ -1642,17 +1640,31 @@ fn execute_text_file_open_plan(
 /// Clearing after requesting the alternate screen preserves a terminal
 /// emulator's primary buffer while also giving Linux virtual consoles, which
 /// may ignore the alternate-screen request, a clean full-screen canvas.
+/// Explicitly positioned rows must not wrap when the terminal and application
+/// disagree about a glyph's width. This is a session setting, not per-frame work.
 fn write_terminal_startup(writer: &mut impl io::Write) -> io::Result<()> {
     execute!(
         writer,
         SetTitle("Youta"),
         EnterAlternateScreen,
+        DisableLineWrap,
         SetAttribute(Attribute::Reset),
         ResetColor,
         ClearTerminal(ClearType::All),
         MoveTo(0, 0),
         EnableMouseCapture,
         Hide
+    )
+}
+
+/// Restores shell/editor wrapping on exit, suspension, or failed terminal setup.
+fn write_terminal_exit(writer: &mut impl io::Write) -> io::Result<()> {
+    execute!(
+        writer,
+        EnableLineWrap,
+        Show,
+        DisableMouseCapture,
+        LeaveAlternateScreen
     )
 }
 
@@ -1666,24 +1678,14 @@ impl Drop for TerminalSetupGuard {
             return;
         }
         let _ = disable_raw_mode();
-        let _ = execute!(
-            io::stdout(),
-            Show,
-            DisableMouseCapture,
-            LeaveAlternateScreen
-        );
+        let _ = write_terminal_exit(&mut io::stdout());
     }
 }
 
 impl Drop for TerminalSession {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(
-            self.terminal.backend_mut(),
-            Show,
-            DisableMouseCapture,
-            LeaveAlternateScreen
-        );
+        let _ = write_terminal_exit(self.terminal.backend_mut());
         let _ = self.terminal.show_cursor();
     }
 }
@@ -13499,6 +13501,126 @@ mod tests {
                 .windows(b"\x1b[?1006l".len())
                 .all(|window| window != b"\x1b[?1006l"),
             "Details selection must keep SGR mouse reporting enabled: {output:?}"
+        );
+    }
+
+    #[test]
+    fn terminal_startup_disables_autowrap_before_drawing() {
+        let mut output = Vec::new();
+        write_terminal_startup(&mut output).expect("terminal startup");
+        let position = |sequence: &[u8]| {
+            output
+                .windows(sequence.len())
+                .position(|window| window == sequence)
+                .expect("required terminal command")
+        };
+        assert!(position(b"\x1b[?1049h") < position(b"\x1b[?7l"));
+        assert!(position(b"\x1b[?7l") < position(b"\x1b[2J"));
+    }
+
+    #[test]
+    fn terminal_exit_restores_wrapping_and_resume_disables_it_again() {
+        let mut output = Vec::new();
+        write_terminal_exit(&mut output).expect("terminal exit");
+        assert!(output.starts_with(b"\x1b[?7h"));
+        assert!(output.ends_with(b"\x1b[?1049l"));
+
+        output.clear();
+        write_terminal_startup(&mut output).expect("terminal resume");
+        assert_eq!(
+            output
+                .windows(5)
+                .filter(|window| *window == b"\x1b[?7l")
+                .count(),
+            1,
+            "wrapping changes once per entry, not per frame"
+        );
+    }
+
+    /// Exercises actual Crossterm bytes in Kitty's native headless screen parser.
+    /// An underestimated emoji models a width disagreement at the scrollbar.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires Kitty and its native headless screen parser"]
+    fn kitty_right_edge_overflow_never_overwrites_the_next_row() {
+        use ratatui::backend::Backend;
+        use ratatui::buffer::Cell;
+        use std::process::{Command, Stdio};
+
+        fn draw_overflow(output: &mut Vec<u8>, row: u16) {
+            let mut date = Cell::default();
+            date.set_symbol("2020 December 2");
+            let mut emoji = Cell::default();
+            emoji.set_symbol("🪷");
+            let mut scrollbar = Cell::default();
+            scrollbar.set_symbol("█");
+            CrosstermBackend::new(output)
+                .draw([(0, 1, &date), (22, row, &emoji), (23, row, &scrollbar)].into_iter())
+                .expect("draw overflowing row");
+        }
+
+        let mut protected = Vec::new();
+        write_terminal_startup(&mut protected).expect("startup");
+        draw_overflow(&mut protected, 0);
+        let unprotected = String::from_utf8(protected.clone())
+            .expect("ANSI output")
+            .replace("\x1b[?7l", "")
+            .into_bytes();
+        let mut suspended = Vec::new();
+        write_terminal_startup(&mut suspended).expect("startup");
+        write_terminal_exit(&mut suspended).expect("suspend");
+        draw_overflow(&mut suspended, 0);
+        let mut resumed = Vec::new();
+        write_terminal_startup(&mut resumed).expect("startup");
+        write_terminal_exit(&mut resumed).expect("suspend");
+        write_terminal_startup(&mut resumed).expect("resume");
+        draw_overflow(&mut resumed, 0);
+        let mut bottom_row = Vec::new();
+        write_terminal_startup(&mut bottom_row).expect("startup");
+        draw_overflow(&mut bottom_row, 2);
+        let cases = [
+            (protected, "2020 December 2"),
+            (unprotected, "█020 December 2"),
+            (suspended, "█020 December 2"),
+            (resumed, "2020 December 2"),
+            (bottom_row, "2020 December 2"),
+        ];
+        let script = r#"
+import json
+import sys
+from kitty.fast_data_types import Screen
+
+for encoded, expected in json.load(sys.stdin):
+	screen = Screen(None, 3, 24)
+	buffer = screen.test_create_write_buffer()
+	data = bytes(encoded)
+	buffer[:len(data)] = data
+	committed = screen.test_commit_write_buffer(buffer, data)
+	if committed != len(data):
+		raise RuntimeError('Incomplete parser write')
+	screen.test_parse_written_data()
+	actual = str(screen.line(1))
+	if actual != expected:
+		raise RuntimeError(f'Expected {expected!r}, got {actual!r}')
+"#;
+        let mut child = Command::new("kitty")
+            .args(["+runpy", script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start Kitty's headless parser");
+        child
+            .stdin
+            .take()
+            .expect("parser input")
+            .write_all(&serde_json::to_vec(&cases).expect("encode cases"))
+            .expect("write cases");
+        let output = child.wait_with_output().expect("wait for Kitty parser");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 
