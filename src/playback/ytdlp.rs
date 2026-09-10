@@ -845,8 +845,9 @@ fn merge_youtube_channel_collections(
 #[derive(Debug, Deserialize)]
 struct ExtractedCollectionJson {
     id: String,
+    /// Flat extractors can omit a title or explicitly report JSON null.
     #[serde(default)]
-    title: String,
+    title: Option<String>,
     #[serde(default)]
     extractor: Option<String>,
     // yt-dlp emits both extractor fields for channel and playlist documents.
@@ -863,8 +864,9 @@ struct ExtractedCollectionJson {
 #[derive(Debug, Deserialize)]
 struct ExtractedCollectionEntryJson {
     id: String,
+    /// Missing and null titles share the existing empty-title display fallback.
     #[serde(default)]
-    title: String,
+    title: Option<String>,
     #[serde(default)]
     webpage_url: Option<String>,
     #[serde(default)]
@@ -1114,7 +1116,7 @@ impl TryFrom<ExtractedCollectionJson> for ExtractedCollection {
                     });
                 entries.push(CollectionEntry {
                     id: entry.id,
-                    title: entry.title,
+                    title: entry.title.unwrap_or_default(),
                     webpage_url,
                     duration_seconds,
                     thumbnail_url,
@@ -1125,7 +1127,7 @@ impl TryFrom<ExtractedCollectionJson> for ExtractedCollection {
 
         Ok(Self {
             id: value.id,
-            title: value.title,
+            title: value.title.unwrap_or_default(),
             extractor: value.extractor_key.or(value.extractor),
             thumbnail_url,
             entries,
@@ -2166,6 +2168,87 @@ mod tests {
                 .map(Url::as_str),
             Some("https://images.example/one.jpg")
         );
+    }
+
+    #[test]
+    fn parses_collection_with_null_titles_without_losing_episode_metadata() {
+        let fixture = r#"{
+            "id": "UCfixture", "title": null,
+            "thumbnail": "https://images.example/avatar.jpg",
+            "entries": [{
+                "id": "videos", "title": null,
+                "entries": [
+                    {
+                        "id": "aaaaaaaaaaa", "title": null,
+                        "url": "https://www.youtube.com/watch?v=aaaaaaaaaaa",
+                        "duration": 90,
+                        "thumbnails": [{"url": "https://images.example/episode.jpg"}],
+                        "timestamp": 1709164800
+                    },
+                    {"id": "bbbbbbbbbbb", "timestamp": null, "upload_date": null},
+                    {"id": "ccccccccccc", "title": "", "upload_date": "20240229"},
+                    {"id": "ddddddddddd", "title": "Named episode", "release_timestamp": 1709164801}
+                ]
+            }]
+        }"#;
+        let extracted: ExtractedCollectionJson =
+            serde_json::from_str(fixture).expect("nullable flat-playlist titles");
+        let collection = ExtractedCollection::try_from(extracted).expect("collection");
+
+        assert_eq!(collection.id, "UCfixture");
+        assert!(collection.title.is_empty());
+        assert_eq!(
+            collection.thumbnail_url.as_ref().map(Url::as_str),
+            Some("https://images.example/avatar.jpg")
+        );
+        assert_eq!(
+            collection
+                .entries
+                .iter()
+                .map(|entry| (entry.id.as_str(), entry.title.as_str(), entry.published_at))
+                .collect::<Vec<_>>(),
+            [
+                ("aaaaaaaaaaa", "", Some(1_709_164_800)),
+                ("bbbbbbbbbbb", "", None),
+                ("ccccccccccc", "", Some(1_709_164_800)),
+                ("ddddddddddd", "Named episode", Some(1_709_164_801)),
+            ]
+        );
+        let first = &collection.entries[0];
+        assert_eq!(first.duration_seconds, Some(90));
+        assert_eq!(
+            first.webpage_url.as_ref().map(Url::as_str),
+            Some("https://www.youtube.com/watch?v=aaaaaaaaaaa")
+        );
+        assert_eq!(
+            first.thumbnail_url.as_ref().map(Url::as_str),
+            Some("https://images.example/episode.jpg")
+        );
+    }
+
+    #[test]
+    fn collection_nullable_titles_do_not_relax_other_metadata_types() {
+        for fixture in [
+            r#"{"id":null}"#,
+            r#"{"title":"Missing collection ID"}"#,
+            r#"{"id":"channel","entries":[{"id":null}]}"#,
+            r#"{"id":"channel","entries":[{"title":"Missing episode ID"}]}"#,
+            r#"{"id":"channel","entries":[{"id":null,"entries":[{"id":"aaaaaaaaaaa"}]}]}"#,
+            r#"{"id":"channel","entries":[{"entries":[{"id":"aaaaaaaaaaa"}]}]}"#,
+            r#"{"id":"channel","title":1}"#,
+            r#"{"id":"channel","title":{}}"#,
+            r#"{"id":"channel","entries":[{"id":"aaaaaaaaaaa","title":false}]}"#,
+            r#"{"id":"channel","entries":[{"id":"aaaaaaaaaaa","title":[]}]}"#,
+            r#"{"id":"channel","entries":[{"id":"videos","title":{},"entries":[{"id":"aaaaaaaaaaa"}]}]}"#,
+            r#"{"id":"channel","entries":[{"id":"aaaaaaaaaaa","timestamp":"1709164800"}]}"#,
+            r#"{"id":"channel","entries":[{"id":"aaaaaaaaaaa","upload_date":20240229}]}"#,
+            r#"{"id":"channel","thumbnails":[{"url":null}]}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<ExtractedCollectionJson>(fixture).is_err(),
+                "invalid metadata must remain rejected: {fixture}"
+            );
+        }
     }
 
     #[test]
