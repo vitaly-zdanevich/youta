@@ -13551,6 +13551,10 @@ mod tests {
     #[test]
     fn terminal_exit_restores_wrapping_and_resume_disables_it_again() {
         let mut output = Vec::new();
+        // Windows mouse capture saves console modes during startup; teardown
+        // must follow that lifecycle even when ANSI output goes to a buffer.
+        write_terminal_startup(&mut output).expect("initial terminal startup");
+        output.clear();
         write_terminal_exit(&mut output).expect("terminal exit");
         assert!(output.starts_with(b"\x1b[?7h"));
         assert!(output.ends_with(b"\x1b[?1049l"));
