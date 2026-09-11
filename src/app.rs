@@ -9,6 +9,9 @@
 //! terminal event loop never waits for these responses, while the process
 //! avoids an asynchronous runtime and its additional idle bookkeeping.
 
+#[cfg(feature = "web-browser")]
+mod web;
+
 use std::collections::{HashMap, HashSet, VecDeque};
 #[cfg(any(feature = "commons-upload", feature = "evernote", feature = "yt-dlp"))]
 use std::fs;
@@ -752,6 +755,8 @@ pub enum SearchRoute {
     ApplePodcasts,
     /// The audiobook tab queries LibriVox's public-domain catalogue.
     LibriVox,
+    /// The Web tab opens an explicitly supplied HTTP folder or direct media URL.
+    Web,
     /// The dedicated tracker screen queries only module archives.
     TrackerArchives,
     /// The screen does not perform remote search.
@@ -2345,6 +2350,7 @@ pub const fn search_route(screen: Screen) -> SearchRoute {
         Screen::Bandcamp => SearchRoute::Bandcamp,
         Screen::ApplePodcasts => SearchRoute::ApplePodcasts,
         Screen::LibriVox => SearchRoute::LibriVox,
+        Screen::Web => SearchRoute::Web,
         Screen::TrackerMusic => SearchRoute::TrackerArchives,
         Screen::Radio
         | Screen::Subscriptions
@@ -3754,6 +3760,12 @@ enum AutoplayOrigin {
         items: Arc<[QueueItem]>,
         index: usize,
     },
+    #[cfg(feature = "web-browser")]
+    Web {
+        /// Ephemeral direct links captured independently of later navigation.
+        items: Arc<[QueueItem]>,
+        index: usize,
+    },
     Subscription {
         channel_id: String,
         index: usize,
@@ -4807,6 +4819,9 @@ pub struct AppController {
     pending_playlist_replay: Option<PendingPlaylistReplay>,
     /// Current bounded, non-recursive directory snapshot for the Local tab.
     local_listing: Option<crate::local_browser::LocalDirectoryListing>,
+    /// Session-only URLs and isolated bounded HTTP folder work.
+    #[cfg(feature = "web-browser")]
+    web: web::WebState,
     /// Sole session-scoped LAN server; replacing or dropping it closes the old listener.
     #[cfg(feature = "lan-sharing")]
     lan_share_server: Option<crate::lan_share::LanShareServer>,
@@ -5833,6 +5848,7 @@ impl AppController {
                 StoredScreen::Bandcamp => saved.bandcamp_search_text.clone(),
                 StoredScreen::ApplePodcasts => saved.apple_podcasts_search_text.clone(),
                 StoredScreen::LibriVox => saved.librivox_search_text.clone(),
+                StoredScreen::Web => String::new(),
                 #[cfg(feature = "radio")]
                 StoredScreen::Radio => saved.radio_filter_text.clone(),
                 _ => saved.search_text.clone(),
@@ -6214,6 +6230,8 @@ impl AppController {
             apple_podcast_episode_selected: 0,
             librivox_search_query,
             librivox_selected,
+            #[cfg(feature = "web-browser")]
+            web: web::WebState::default(),
             #[cfg(feature = "librivox")]
             restore_librivox_selection: saved.librivox_selected_row.is_some()
                 || saved.screen == StoredScreen::LibriVox,
@@ -7177,7 +7195,7 @@ impl AppController {
         }
     }
 
-    /// Starts editing the active search or local Radio filter.
+    /// Starts editing the active search, Web address, or local Radio filter.
     fn begin_search_input(&mut self) {
         #[cfg(feature = "radio")]
         if self.view.screen == Screen::Radio {
@@ -7197,6 +7215,9 @@ impl AppController {
 
     /// Inserts one character and applies a Radio filter without waiting for Enter.
     fn append_search_input(&mut self, character: char) {
+        if self.view.screen == Screen::Web && self.view.search_query.len() >= 16 * 1024 {
+            return;
+        }
         if character.is_control() {
             return;
         }
@@ -7257,9 +7278,14 @@ impl AppController {
         self.populate_radio();
     }
 
-    /// Cancels editing, restoring Radio's previously accepted query and station.
+    /// Cancels editing, restoring the accepted Web address or Radio filter and station.
     fn cancel_search_input(&mut self) {
         self.view.search_editing = false;
+        #[cfg(feature = "web-browser")]
+        if self.view.screen == Screen::Web {
+            self.view.search_query.clone_from(&self.web.query);
+            self.view.search_cursor_byte = self.view.search_query.len();
+        }
         #[cfg(feature = "radio")]
         if self.view.screen == Screen::Radio
             && let Some(snapshot) = self.radio_filter_edit_snapshot.take()
@@ -7291,13 +7317,26 @@ impl AppController {
     fn submit_search(&mut self) {
         let query = self.view.search_query.trim().to_owned();
         if query.is_empty() {
-            self.view.status_line = "Enter a search query".to_owned();
+            self.view.status_line = if self.view.screen == Screen::Web {
+                self.view.search_editing = true;
+                "Enter a complete http:// or https:// URL".to_owned()
+            } else {
+                "Enter a search query".to_owned()
+            };
             return;
         }
         self.view.details_focused = false;
         self.view.details_scroll = 0;
 
         match search_route(self.view.screen) {
+            SearchRoute::Web => {
+                #[cfg(feature = "web-browser")]
+                self.submit_web_url();
+                #[cfg(not(feature = "web-browser"))]
+                {
+                    self.view.status_line = "This build omits the `web-browser` feature".to_owned();
+                }
+            }
             SearchRoute::YouTube => match parse_local_path_input(&query) {
                 Ok(Some(local)) => self.open_local_input(local),
                 Ok(None) => match parse_direct_youtube_input(&query) {
@@ -15060,6 +15099,7 @@ impl AppController {
             | Screen::Bandcamp
             | Screen::ApplePodcasts
             | Screen::LibriVox
+            | Screen::Web
             | Screen::Radio
             | Screen::Subscriptions
             | Screen::TrackerMusic
@@ -15112,6 +15152,7 @@ impl AppController {
                         | Screen::Bandcamp
                         | Screen::ApplePodcasts
                         | Screen::LibriVox
+                        | Screen::Web
                         | Screen::Radio
                         | Screen::Subscriptions
                         | Screen::TrackerMusic
@@ -15148,6 +15189,7 @@ impl AppController {
                 | Screen::Bandcamp
                 | Screen::ApplePodcasts
                 | Screen::LibriVox
+                | Screen::Web
                 | Screen::Radio
                 | Screen::Subscriptions
                 | Screen::TrackerMusic
@@ -16357,6 +16399,15 @@ impl AppController {
 
     fn update_non_youtube_detail(&mut self) {
         match self.view.screen {
+            Screen::Web => {
+                #[cfg(feature = "web-browser")]
+                self.update_web_detail();
+                #[cfg(not(feature = "web-browser"))]
+                {
+                    self.view.details = None;
+                }
+                return;
+            }
             Screen::Local => {
                 self.update_local_browser_detail();
                 return;
@@ -16588,6 +16639,9 @@ impl AppController {
         } else if self.view.screen == Screen::LibriVox {
             self.librivox_selected = self.view.selected;
             self.update_librivox_detail();
+        } else if self.view.screen == Screen::Web {
+            #[cfg(feature = "web-browser")]
+            self.update_web_detail();
         } else if self.view.screen == Screen::Radio {
             self.update_radio_detail();
         } else if self.view.screen == Screen::Playlists {
@@ -16647,6 +16701,9 @@ impl AppController {
         } else if self.view.screen == Screen::LibriVox {
             self.librivox_selected = self.view.selected;
             self.update_librivox_detail();
+        } else if self.view.screen == Screen::Web {
+            #[cfg(feature = "web-browser")]
+            self.update_web_detail();
         } else if self.view.screen == Screen::Radio {
             self.update_radio_detail();
         } else if self.view.screen == Screen::Playlists {
@@ -16690,6 +16747,13 @@ impl AppController {
     }
 
     fn selected_queue_item(&self) -> Result<QueueItem, String> {
+        #[cfg(feature = "web-browser")]
+        if self.view.screen == Screen::Web {
+            return self
+                .selected_web_entry()
+                .and_then(web::queue_item_from_web)
+                .ok_or_else(|| "Select a Web audio or video file".to_owned());
+        }
         if self.view.screen == Screen::Downloaded {
             return queue_item_from_local(&local_media_item(
                 self.selected_downloaded_path()?,
@@ -17411,7 +17475,7 @@ impl AppController {
                     None
                 }
             }
-            Screen::LibriVox => {
+            Screen::LibriVox | Screen::Web => {
                 let details = self.view.details.as_ref()?;
                 let media_id = details.media_id.clone()?;
                 Some(PrivateNoteSelection {
@@ -20159,6 +20223,11 @@ impl AppController {
     }
 
     fn activate_selection(&mut self) {
+        #[cfg(feature = "web-browser")]
+        if self.view.screen == Screen::Web {
+            self.activate_web_selection();
+            return;
+        }
         if self.view.screen == Screen::YandexMusic {
             self.activate_yandex_music_selection();
             return;
@@ -21803,6 +21872,11 @@ impl AppController {
     }
 
     fn go_back(&mut self) {
+        #[cfg(feature = "web-browser")]
+        if self.view.screen == Screen::Web {
+            self.open_web_parent();
+            return;
+        }
         #[cfg(feature = "librivox")]
         if self.view.screen == Screen::LibriVox && self.close_librivox_child() {
             return;
@@ -24729,6 +24803,10 @@ impl AppController {
                 });
             }
         }
+        #[cfg(feature = "web-browser")]
+        if media_id.source == SourceKind::RemoteFiles {
+            return self.web_autoplay_origin(media_id);
+        }
         if media_id.source == SourceKind::Local {
             if let Some(index) = self
                 .local_results
@@ -24883,6 +24961,18 @@ impl AppController {
                     Some(AutoplayStep::Play {
                         item: Box::new(item.clone()),
                         origin: AutoplayOrigin::Librivox {
+                            items: Arc::clone(items),
+                            index,
+                        },
+                    })
+                })
+            }
+            #[cfg(feature = "web-browser")]
+            AutoplayOrigin::Web { items, index } => {
+                neighbour_list_step(items, *index, direction, |index, item| {
+                    Some(AutoplayStep::Play {
+                        item: Box::new(item.clone()),
+                        origin: AutoplayOrigin::Web {
                             items: Arc::clone(items),
                             index,
                         },
@@ -25173,6 +25263,12 @@ impl AppController {
             })
         };
         let mut canonical_input = PlaybackInput::new(item.playback_location.clone());
+        // Web rows are already direct media, including saved queryless replays.
+        if media_id.source == SourceKind::RemoteFiles
+            && media_id.external_id.starts_with("web:sha256:")
+        {
+            canonical_input.bypass_ytdl = true;
+        }
         canonical_input.start_at = Duration::from_secs(start_at);
         canonical_input.title = Some(item.media.title.clone());
         #[cfg(feature = "waveform")]
@@ -26205,6 +26301,11 @@ impl AppController {
                     ApplePodcastsRoute::Direct => {}
                 }
             }
+            #[cfg(feature = "web-browser")]
+            Screen::Web => {
+                self.web.selected = self.view.selected;
+                self.finish_search_activity(SearchActivity::Web);
+            }
             Screen::LibriVox => {
                 self.librivox_search_query
                     .clone_from(&self.view.search_query);
@@ -26283,6 +26384,11 @@ impl AppController {
                     ApplePodcastsRoute::Episodes => self.apple_podcast_episode_selected,
                     ApplePodcastsRoute::Direct => 0,
                 };
+            }
+            #[cfg(feature = "web-browser")]
+            Screen::Web => {
+                self.view.search_query.clone_from(&self.web.query);
+                self.view.selected = self.web.selected;
             }
             Screen::LibriVox => {
                 self.view
@@ -26519,6 +26625,15 @@ impl AppController {
                 ApplePodcastsRoute::Direct => self.refresh_apple_direct_view(),
             },
             Screen::LibriVox => self.populate_librivox(),
+            Screen::Web => {
+                #[cfg(feature = "web-browser")]
+                self.populate_web();
+                #[cfg(not(feature = "web-browser"))]
+                {
+                    self.view.rows.clear();
+                    self.view.status_line = "This build omits the `web-browser` feature".to_owned();
+                }
+            }
             Screen::Radio => self.populate_radio(),
             Screen::TrackerMusic => {
                 self.refresh_tracker_rows();
@@ -29633,6 +29748,10 @@ impl AppController {
         }
         if self.view.screen == Screen::LibriVox {
             return self.current_librivox_url();
+        }
+        #[cfg(feature = "web-browser")]
+        if self.view.screen == Screen::Web {
+            return self.selected_web_entry().map(|entry| entry.url.to_string());
         }
         if self.view.screen == Screen::Radio {
             #[cfg(feature = "radio")]
@@ -33926,6 +34045,14 @@ impl UiController for AppController {
             }
             UiAction::ShowScreen(screen) => self.show_screen(screen),
             UiAction::BeginSearch => self.begin_search_input(),
+            UiAction::RefreshWeb => {
+                #[cfg(feature = "web-browser")]
+                self.refresh_web();
+                #[cfg(not(feature = "web-browser"))]
+                {
+                    self.view.status_line = "This build omits the `web-browser` feature".to_owned();
+                }
+            }
             UiAction::CancelSearch => self.cancel_search_input(),
             UiAction::AppendSearch(character) => self.append_search_input(character),
             UiAction::MoveSearchCursor(direction) => self.move_search_input_cursor(direction),
@@ -35229,6 +35356,8 @@ impl UiController for AppController {
         #[cfg(feature = "sponsorblock")]
         self.drain_sponsorblock_responses();
         self.drain_local_browse_responses(true);
+        #[cfg(feature = "web-browser")]
+        self.poll_web_worker();
         loop {
             match self.provider_responses.try_recv() {
                 Ok(response) => self.handle_provider_response(response),
@@ -42128,6 +42257,8 @@ fn stored_screen_from_tui(screen: Screen) -> StoredScreen {
         #[cfg(not(feature = "radio"))]
         Screen::Radio => StoredScreen::Search,
         Screen::Local => StoredScreen::Local,
+        Screen::Web if cfg!(feature = "web-browser") => StoredScreen::Web,
+        Screen::Web => StoredScreen::Search,
         Screen::Subscriptions => StoredScreen::Subscriptions,
         Screen::Downloaded => StoredScreen::Downloaded,
         Screen::History => StoredScreen::History,
@@ -42196,6 +42327,8 @@ fn tui_screen_from_stored(screen: &StoredScreen) -> Screen {
         #[cfg(not(feature = "radio"))]
         StoredScreen::Radio => Screen::Search,
         StoredScreen::Local => Screen::Local,
+        StoredScreen::Web if cfg!(feature = "web-browser") => Screen::Web,
+        StoredScreen::Web => Screen::Search,
         StoredScreen::Subscriptions => Screen::Subscriptions,
         StoredScreen::Downloaded => Screen::Downloaded,
         StoredScreen::History => Screen::History,
@@ -45052,6 +45185,13 @@ pub fn is_confined_path(root: &Path, candidate: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "web-browser")]
+    #[path = "web.rs"]
+    mod web_tests;
+    #[cfg(feature = "web-browser")]
+    #[path = "web_worker.rs"]
+    mod web_worker_tests;
+
     use std::collections::VecDeque;
     #[cfg(feature = "lan-sharing")]
     use std::fs;
@@ -80166,15 +80306,16 @@ mod tests {
     /// something.
     ///
     /// Both front-ends label their editor from `Screen::search_verb`, while the
-    /// submit path dispatches on `search_route`. Radio is the one deliberate
-    /// difference: it filters the compiled catalogue in place instead of asking
-    /// a provider, so it carries a verb without a route.
+    /// submit path dispatches on `search_route`. Web opens a supplied URL, while
+    /// Radio filters the compiled catalogue in place instead of asking a provider,
+    /// so Radio alone carries a verb without a route.
     #[test]
     fn every_screen_with_a_search_verb_submits_somewhere() {
         for screen in Screen::ALL {
             let verb = screen.search_verb();
             let expected = match screen {
                 Screen::Radio => Some("Filter"),
+                Screen::Web => Some("Open URL"),
                 _ if search_route(screen) == SearchRoute::None => None,
                 _ => Some("Search"),
             };

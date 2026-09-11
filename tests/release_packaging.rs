@@ -13,6 +13,19 @@ fn repository_path(relative: impl AsRef<Path>) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(relative)
 }
 
+/// Removing Web also removes its HTML parser without changing other sources.
+#[test]
+fn web_browser_is_default_but_independently_removable() {
+    let manifest = manifest();
+    assert!(feature_entries(&manifest, "default").contains(&"web-browser"));
+    assert!(feature_closure(&manifest, "web-browser").contains("dep:html5gum"));
+    assert!(!feature_closure(&manifest, "app").contains("dep:html5gum"));
+    assert!(!feature_closure(&manifest, "web-browser").contains("yt-dlp"));
+    let gui: toml::Value = toml::from_str(&read_repository_file("gui/Cargo.toml")).unwrap();
+    assert!(feature_entries(&gui, "default").contains(&"web-browser"));
+    assert_eq!(feature_entries(&gui, "web-browser"), ["youta/web-browser"]);
+}
+
 fn read_repository_file(relative: impl AsRef<Path>) -> String {
     let path = repository_path(relative);
     fs::read_to_string(&path)
@@ -650,14 +663,14 @@ fn release_script_builds_gpm_and_linux_no_gpm_non_sqlite_executables() {
 
     assert!(!script.contains("--features bundled-sqlite"));
     for feature_set in [
-        "cargo_features=app,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,youtube-captions",
-        "cargo_features=app,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,youtube-captions",
-        "cargo_features=app,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,images,local-archives,nyan-cat,sponsorblock,summary,youtube-captions",
-        "cargo_features=app,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,local-archives,nyan-cat,sponsorblock,summary,youtube-captions",
-        "cargo_features=app,ascii-visualizer,audio-quality,commons-upload,evernote,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,youtube-captions",
-        "cargo_features=app,ascii-visualizer,audio-quality,commons-upload,evernote,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,youtube-captions",
-        "cargo_features=app,ascii-visualizer,audio-quality,commons-upload,evernote,images,local-archives,nyan-cat,sponsorblock,summary,youtube-captions",
-        "cargo_features=app,ascii-visualizer,audio-quality,commons-upload,evernote,local-archives,nyan-cat,sponsorblock,summary,youtube-captions",
+        "cargo_features=app,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,web-browser,youtube-captions",
+        "cargo_features=app,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,web-browser,youtube-captions",
+        "cargo_features=app,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,images,local-archives,nyan-cat,sponsorblock,summary,web-browser,youtube-captions",
+        "cargo_features=app,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,local-archives,nyan-cat,sponsorblock,summary,web-browser,youtube-captions",
+        "cargo_features=app,ascii-visualizer,audio-quality,commons-upload,evernote,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,web-browser,youtube-captions",
+        "cargo_features=app,ascii-visualizer,audio-quality,commons-upload,evernote,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,web-browser,youtube-captions",
+        "cargo_features=app,ascii-visualizer,audio-quality,commons-upload,evernote,images,local-archives,nyan-cat,sponsorblock,summary,web-browser,youtube-captions",
+        "cargo_features=app,ascii-visualizer,audio-quality,commons-upload,evernote,local-archives,nyan-cat,sponsorblock,summary,web-browser,youtube-captions",
     ] {
         assert!(
             script

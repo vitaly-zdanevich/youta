@@ -724,6 +724,8 @@ export interface ViewModel {
   screen: string;
   playback_history_enabled: boolean;
   search_editing: boolean;
+	/** Active provider/directory request, including the session-only Web browser. */
+	search_activity: string | null;
   search_query: string;
   search_cursor_byte: number;
   rows: RowView[];

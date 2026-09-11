@@ -45,6 +45,7 @@ default = [
     "qr",
     "sponsorblock",
     "summary",
+    "web-browser",
     "youtube-captions",
 ]
 
@@ -66,10 +67,11 @@ app = [
 # Linux virtual-console mouse integration.
 app-core = ["tui", "sources"]
 
-# Every source adapter and playback helper, without any user interface.
+# Catalogue source adapters and playback helpers, without any user interface.
 #
 # `app-core` is this set plus the terminal front-end. A different front-end
-# combines `sources` with `controller` and links no renderer at all.
+# combines `sources` with `controller` and links no renderer at all. Web folder
+# browsing stays independently removable through the default `web-browser` feature.
 sources = [
     "acoustid",
     "local",
@@ -240,6 +242,8 @@ local = [
 ]
 # Read-only directory browsing and local-media playback.
 local-browser = []
+# Bounded HTTP directory listings with direct audio-only playback.
+web-browser = ["network", "local-browser", "dep:html5gum", "dep:percent-encoding", "dep:sha2"]
 # Tag, codec, and technical metadata extraction.
 local-metadata = ["local-browser", "dep:encoding_rs", "dep:lofty"]
 # Restart-safe no-overwrite local-file renaming.
@@ -340,6 +344,7 @@ directories = "6.0.0"
 evernote = { version = "0.1.2", optional = true }
 figment = { version = "0.10.19", features = ["env", "toml"] }
 hmac = { version = "0.12.1", optional = true }
+html5gum = { version = "0.8.4", default-features = false, optional = true }
 opml = { version = "1.1.6", optional = true }
 percent-encoding = { version = "2.3.2", optional = true }
 qrcode = { version = "0.14.1", default-features = false, optional = true }

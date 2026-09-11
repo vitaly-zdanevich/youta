@@ -2726,6 +2726,7 @@ fn search_panel_title(view: &ViewModel) -> String {
         query.insert(cursor, '▏');
         match view.screen {
             Screen::Radio => format!(" Filter: {query} "),
+            Screen::Web => format!(" Open URL: {query} "),
             Screen::YandexMusic => format!(
                 " {} search: {query} ",
                 view.yandex_music_search_kind.title_label()
@@ -2750,6 +2751,7 @@ fn search_panel_title(view: &ViewModel) -> String {
         }
     } else if view.search_query.is_empty() {
         match view.screen {
+            Screen::Web => " Open URL ".to_owned(),
             Screen::Search => format!(
                 " {} search ",
                 match view.search_kind {
@@ -2915,10 +2917,22 @@ fn render_body(
         .split(area);
 
     let search_title = search_panel_title(view);
+    let mut list_area = panes[0];
+    if view.screen == Screen::Web {
+        let controls_height = list_area.height.min(2);
+        list_area.height = list_area.height.saturating_sub(controls_height);
+        let controls = Rect::new(
+            list_area.x,
+            list_area.bottom(),
+            list_area.width,
+            controls_height,
+        );
+        render_web_controls(frame, controls, show_hotkeys, view.autoplay, theme, hit_map);
+    }
     hit_map.rows_row_height = row_list_height(&view.rows);
     (hit_map.rows, hit_map.rows_first_index) = render_row_list(
         frame,
-        panes[0],
+        list_area,
         search_title.trim(),
         &view.rows,
         true,
@@ -2958,6 +2972,51 @@ fn render_body(
                 thumbnail_renderer,
             );
         }
+    }
+}
+
+/// Keeps URL navigation separate from Local's filesystem controls.
+fn render_web_controls(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    show_hotkeys: bool,
+    autoplay: bool,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+) {
+    if area.is_empty() {
+        return;
+    }
+    let mut x = area.x;
+    for (key, label, action) in [
+        ("/", "Open URL", UiAction::BeginSearch),
+        ("R", "Refresh", UiAction::RefreshWeb),
+        (
+            "A",
+            if autoplay {
+                "Autoplay: on"
+            } else {
+                "Autoplay: off"
+            },
+            UiAction::ToggleAutoplay,
+        ),
+        ("Esc", "Back", UiAction::GoBack),
+    ] {
+        let label = button(key, label, show_hotkeys);
+        let width = terminal_text_width(&label).min(area.right().saturating_sub(x));
+        if width == 0 {
+            break;
+        }
+        let target = Rect::new(x, area.y, width, 1);
+        frame.render_widget(Paragraph::new(label).style(theme.accent), target);
+        hit_map.detail_buttons.push((action, target));
+        x = x.saturating_add(width).saturating_add(2);
+    }
+    if area.height > 1 {
+        frame.render_widget(
+            Paragraph::new("Audio only").style(theme.muted),
+            Rect::new(area.x, area.y + 1, area.width, 1),
+        );
     }
 }
 
@@ -3667,7 +3726,13 @@ fn render_details_with_terminal_window(
     hit_map: &mut HitMap,
     thumbnail_renderer: Option<&mut dyn ThumbnailRenderer>,
 ) {
-    let empty_message = if completed_search_has_no_rows(view) {
+    let empty_message = if view.screen == Screen::Web {
+        if completed_search_has_no_rows(view) {
+            "Audio only. No folders or supported audio found."
+        } else {
+            "Open an HTTP or HTTPS directory URL to browse folders and audio."
+        }
+    } else if completed_search_has_no_rows(view) {
         "Nothing found"
     } else {
         "Select an item to load details lazily."
@@ -3704,6 +3769,7 @@ fn completed_search_has_no_rows(view: &ViewModel) -> bool {
         | Screen::Bandcamp
         | Screen::ApplePodcasts
         | Screen::LibriVox
+        | Screen::Web
         | Screen::TrackerMusic
         | Screen::Radio => true,
         Screen::Subscriptions
@@ -6645,6 +6711,8 @@ fn centered_line_x(area: Rect, line_width: u16) -> u16 {
 fn search_kind_help(view: &ViewModel) -> &'static str {
     if view.screen == Screen::YandexMusic {
         "  v all/music/podcasts/audiobooks search"
+    } else if view.screen == Screen::Web {
+        "  Web: / open URL     R refresh     Esc back     Enter open/play audio"
     } else {
         "  v video/channel search     N relevance/newest     C CC-only videos"
     }
@@ -13911,6 +13979,165 @@ for encoded, expected in json.load(sys.stdin):
         view.screen = Screen::LibriVox;
         view.search_activity = Some(SearchActivity::LibriVox);
         assert_eq!(search_panel_title(&view), " | ambient ");
+    }
+
+    #[test]
+    fn web_url_editor_and_navigation_do_not_offer_filesystem_actions() {
+        let mut view = ViewModel {
+            screen: Screen::Web,
+            ..ViewModel::default()
+        };
+        assert_eq!(search_panel_title(&view), " Open URL ");
+        for (key, expected) in [
+            (KeyCode::Char('/'), UiAction::BeginSearch),
+            (KeyCode::Char('R'), UiAction::RefreshWeb),
+            (KeyCode::Enter, UiAction::ActivateSelection),
+            (KeyCode::Esc, UiAction::GoBack),
+            (KeyCode::Backspace, UiAction::GoBack),
+            (KeyCode::Char('j'), UiAction::MoveSelection(1)),
+            (KeyCode::Char('k'), UiAction::MoveSelection(-1)),
+        ] {
+            assert_eq!(
+                key_action(KeyEvent::new(key, KeyModifiers::NONE), &view),
+                Some(expected)
+            );
+        }
+        for (key, rows) in [(KeyCode::PageUp, -6), (KeyCode::PageDown, 6)] {
+            assert_eq!(
+                key_action_with_page_rows(
+                    KeyEvent::new(key, KeyModifiers::NONE),
+                    &view,
+                    Some(6),
+                    None
+                ),
+                Some(UiAction::MoveSelection(rows))
+            );
+        }
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE), &view),
+            Some(UiAction::ToggleRepeat)
+        );
+        for key in [
+            KeyCode::Delete,
+            KeyCode::Char('m'),
+            KeyCode::Char('H'),
+            KeyCode::Char('Z'),
+            KeyCode::F(11),
+            KeyCode::F(12),
+        ] {
+            assert_eq!(
+                key_action(KeyEvent::new(key, KeyModifiers::NONE), &view),
+                None,
+                "Web must not offer local action {key:?}"
+            );
+        }
+        view.search_editing = true;
+        view.search_query = "https://example.test/audio/".to_owned();
+        view.search_cursor_byte = view.search_query.len();
+        assert_eq!(
+            search_panel_title(&view),
+            " Open URL: https://example.test/audio/▏ "
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &view),
+            Some(UiAction::SubmitSearch)
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &view),
+            Some(UiAction::CancelSearch)
+        );
+        view.search_editing = false;
+        view.search_activity = Some(SearchActivity::Web);
+        assert_eq!(search_panel_title(&view), " | https://example.test/audio/ ");
+    }
+
+    #[test]
+    fn web_rows_are_compact_and_url_controls_remain_clickable() {
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        let mut view = ViewModel {
+            screen: Screen::Web,
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+        terminal
+            .draw(|frame| render_frame(frame, &view, &UiSettings::default(), &mut hit_map, None))
+            .unwrap();
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("Audio only"));
+        assert!(rendered.contains("Open an HTTP or HTTPS directory URL"));
+        assert!(rendered.contains("[/] Open URL"));
+        assert!(rendered.contains("[R] Refresh"));
+        assert!(rendered.contains("[A] Autoplay: off"));
+        for expected in [
+            UiAction::BeginSearch,
+            UiAction::RefreshWeb,
+            UiAction::ToggleAutoplay,
+        ] {
+            let (_, target) = hit_map
+                .detail_buttons
+                .iter()
+                .find(|(action, _)| action == &expected)
+                .unwrap();
+            assert_eq!(
+                mouse_action(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: target.x,
+                        row: target.y,
+                        modifiers: KeyModifiers::NONE
+                    },
+                    &hit_map,
+                    &view
+                ),
+                Some(expected)
+            );
+        }
+        view.rows = ["..", "Album/", "Episode.opus"]
+            .into_iter()
+            .map(|title| RowView {
+                title: title.to_owned(),
+                compact: true,
+                hide_watched_marker: true,
+                ..RowView::default()
+            })
+            .collect();
+        terminal
+            .draw(|frame| render_frame(frame, &view, &UiSettings::default(), &mut hit_map, None))
+            .unwrap();
+        assert_eq!(hit_map.rows_row_height, 1);
+        assert!(rendered_text(&terminal).contains("Episode.opus"));
+        view.autoplay = true;
+        terminal
+            .draw(|frame| render_frame(frame, &view, &UiSettings::default(), &mut hit_map, None))
+            .unwrap();
+        assert!(rendered_text(&terminal).contains("[A] Autoplay: on"));
+        assert!(rendered_text(&terminal).contains("Audio only"));
+    }
+
+    #[test]
+    fn web_help_reuses_its_context_row_without_hiding_shared_actions() {
+        let view = ViewModel {
+            screen: Screen::Web,
+            ..ViewModel::default()
+        };
+        assert_eq!(
+            search_kind_help(&view),
+            "  Web: / open URL     R refresh     Esc back     Enter open/play audio"
+        );
+        for (width, height) in [(100, 40), (140, 32)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| render_help(frame, &view, &Theme::new(false)))
+                .unwrap();
+            let rendered = rendered_text(&terminal);
+            assert!(rendered.contains("Web: / open URL"));
+            #[cfg(feature = "evernote")]
+            assert!(rendered.contains("E Evernote audio"));
+            if height >= 40 {
+                #[cfg(feature = "qr")]
+                assert!(rendered.contains("Q selected YouTube video QR code"));
+            }
+        }
     }
 
     #[test]
@@ -31013,6 +31240,8 @@ prose 07:25 remains clickable but is not a chapter";
                 Screen::TrackerMusic,
                 Screen::Subscriptions,
                 Screen::Local,
+                #[cfg(feature = "web-browser")]
+                Screen::Web,
                 Screen::Playlists,
                 Screen::Downloaded,
                 Screen::History,

@@ -54,7 +54,9 @@ export function SearchBar({
   label: string;
 }) {
   const [before, after] = splitAtByte(view.search_query, view.search_cursor_byte);
-  const placeholder = `${verb} ${label}`;
+	const web = view.screen === 'Web';
+	// Web opens an address; appending the tab label would read "Open URL Web".
+	const placeholder = web ? verb : `${verb} ${label}`;
 
   return (
     <div
@@ -95,6 +97,25 @@ export function SearchBar({
           view.search_query
         )}
       </div>
+      {web ? (
+		<>
+			<span className='shrink-0 text-[11px] text-ink-faint'>Audio only</span>
+			{view.search_activity === 'Web' ? (
+				<span role='status' aria-label='Loading directory' className='animate-spin text-accent'>◌</span>
+			) : null}
+			<button
+				type='button'
+				disabled={view.search_editing}
+				onClick={() => void dispatch('RefreshWeb')}
+				className='shrink-0 text-[11px] text-accent disabled:opacity-50'
+			>
+				[R] Refresh
+			</button>
+			<button type='button' disabled={view.search_editing} onClick={() => void dispatch('GoBack')} className='shrink-0 text-[11px] text-accent disabled:opacity-50'>
+				[Esc] Back
+			</button>
+		</>
+      ) : null}
       <span className="shrink-0 text-[11px] whitespace-nowrap text-ink-faint">
         {view.search_editing
           ? `Enter to ${verb.toLowerCase()} · Esc to cancel`

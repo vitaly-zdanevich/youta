@@ -540,6 +540,7 @@ pub fn enabled_compile_features() -> Vec<&'static str> {
         "vimeo",
         "vk",
         "waveform",
+        "web-browser",
         "webdav",
         "wikidata",
         "wikimedia",

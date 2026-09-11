@@ -103,6 +103,27 @@ bar, queue, volume, pause state, actions, and persistent controller state.
   A conservative display-only fallback repairs strong Windows-1251 text that
   legacy MP3 tags incorrectly declare as Latin-1; Unicode tags and media files
   are never rewritten.
+- The Web tab, immediately after Local, browses HTTP/HTTPS directory listings
+  and direct media links. It opens the URL editor on first entry; `/` edits the
+  address, `Enter` opens a folder or plays its selected media, `Esc` or
+  `Backspace` goes back, and `R` refreshes. `j`/`k` and `PageUp`/`PageDown`
+  navigate the compact list. `[A] Autoplay` uses the existing preference
+  (off by default) to continue through that directory's media in sequence.
+  Playback is audio only, including linked video containers.
+  Browsing fetches only the requested page in a bounded background
+  worker: it does not recursively crawl directories, probe every file, or need
+  `yt-dlp`. The Web browsing location and query-bearing links remain
+  session-only; safe public links can still be saved in playlists and history.
+  Reopening Youta asks for an address again. Local Rename, Move, and Trash
+  actions are not offered for Web entries. To try a directory locally, use
+  [Python's `http.server`](https://docs.python.org/3/library/http.server.html):
+
+  ```sh
+  python -m http.server 8000 --bind 127.0.0.1 --directory '/path/to/music'
+  ```
+
+  Then enter `http://127.0.0.1:8000/` in Web. This example serves only on the
+  same computer; Python's test server is not intended for public production use.
 - Optional providers are isolated behind Cargo features, so a local/RSS-only
   build does not need YouTube or cloud integrations.
 - A plain Linux TTY is a primary target. A confirmed local `/dev/ttyN` can use
@@ -569,7 +590,7 @@ dependencies, or the optional Linux virtual-console mouse client with:
 
 ```sh
 cargo build --release --locked --no-default-features \
-	--features app,ascii-visualizer,audio-quality,commons-upload,evernote,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,youtube-captions
+	--features app,ascii-visualizer,audio-quality,commons-upload,evernote,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,web-browser,youtube-captions
 ```
 
 The `app` profile includes the experimental YandexMusic adapter but does not
@@ -580,7 +601,7 @@ with:
 
 ```sh
 cargo build --release --locked --no-default-features \
-	--features app-core,ascii-visualizer,audio-quality,commons-upload,evernote,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,youtube-captions
+	--features app-core,ascii-visualizer,audio-quality,commons-upload,evernote,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,web-browser,youtube-captions
 ```
 
 Omit `images` from that command for the Yandex-free text-only variant. Omit
@@ -600,11 +621,12 @@ renderer,
 `lan-sharing` is the independently removable session HTTP server and feed
 builder,
 `local-archives` is the independently removable ZIP/RAR Local-folder support,
+`web-browser` is the independently removable HTTP directory and direct-media browser,
 and `gpm` is the positive opt-in for virtual-console mouse input. The ordinary
 default feature set still enables audio-quality analysis, SponsorBlock, the
 ASCII spectrum visualizer, Nyan Cat renderer, YouTube captions, video summaries,
-Commons and Evernote transfer, LAN sharing, ZIP/RAR folders, Yandex Music, and
-GPM. Add `local-archives` to either
+Commons and Evernote transfer, LAN sharing, ZIP/RAR folders, Yandex Music,
+Web browsing, and GPM. Add `local-archives` to either
 custom command above to retain archive folders; leaving it out removes the
 archive folder code. Leave `sponsorblock` out to remove all of its UI, network,
 cache, and playback code. The shared ZIP decoder also disappears only when no
@@ -612,6 +634,8 @@ other selected feature, such as tracker archive support, enables `archive-zip`.
 Leave `nyan-cat` out to remove the terminal and desktop rainbow renderer.
 Leave `ascii-visualizer` out to remove CAVA capture and both fullscreen
 renderers.
+Leave `web-browser` out of a `--no-default-features` build to omit the Web tab
+and its HTML directory parser; no other source requires that parser.
 
 Both configurations use human-readable TOML persistence. SQLite is included
 only when `sqlite-state` or `bundled-sqlite` is requested explicitly.

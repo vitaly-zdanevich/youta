@@ -1593,6 +1593,7 @@ fn unfiltered_key_action(
             Some(UiAction::ShareYouTubeChannelPodcast)
         }
         Key::Char('/') => Some(UiAction::BeginSearch),
+        Key::Char('R') if view.screen == Screen::Web => Some(UiAction::RefreshWeb),
         Key::Char('p') | Key::F(7) => Some(UiAction::OpenPreferences),
         Key::Tab if reverse_tab(key) => Some(UiAction::ShowScreen(
             view.screen
@@ -1802,7 +1803,7 @@ fn unfiltered_key_action(
             Some(UiAction::GoBack)
         }
         Key::Esc if view.playlist_back_available => Some(UiAction::GoBack),
-        Key::Esc if view.screen == Screen::LibriVox => Some(UiAction::GoBack),
+        Key::Esc if matches!(view.screen, Screen::LibriVox | Screen::Web) => Some(UiAction::GoBack),
         Key::Esc if view.screen == Screen::Local => Some(UiAction::OpenLocalParent),
         Key::Up if alt && details_line_scroll_available => {
             Some(UiAction::ScrollDetails(DetailsScroll::Lines(-1)))
@@ -1827,7 +1828,11 @@ fn unfiltered_key_action(
         Key::PageUp
             if matches!(
                 view.screen,
-                Screen::LibriVox | Screen::Local | Screen::Radio | Screen::Subscriptions
+                Screen::LibriVox
+                    | Screen::Local
+                    | Screen::Web
+                    | Screen::Radio
+                    | Screen::Subscriptions
             ) =>
         {
             page_rows
@@ -1837,7 +1842,11 @@ fn unfiltered_key_action(
         Key::PageDown
             if matches!(
                 view.screen,
-                Screen::LibriVox | Screen::Local | Screen::Radio | Screen::Subscriptions
+                Screen::LibriVox
+                    | Screen::Local
+                    | Screen::Web
+                    | Screen::Radio
+                    | Screen::Subscriptions
             ) =>
         {
             page_rows

@@ -231,7 +231,13 @@ export function Details({ view, kind }: { view: ViewModel; kind: InformationPane
   if (details === null) {
     return (
       <aside className="overflow-y-auto border-l border-line px-[18px] py-[14px]">
-        <p className="text-xs text-ink-faint">Select an item to load details lazily.</p>
+		<p className='text-xs text-ink-faint'>
+			{view.screen === 'Web'
+				? view.search_query.trim() === '' || view.search_editing || view.search_activity === 'Web'
+					? 'Audio only. Open an HTTP or HTTPS directory URL to browse folders and audio.'
+					: 'Audio only. Select a folder or audio file to open it.'
+				: 'Select an item to load details lazily.'}
+		</p>
       </aside>
     );
   }

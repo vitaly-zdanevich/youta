@@ -111,6 +111,8 @@ pub enum Screen {
     Subscriptions,
     /// Local folders and supported media files.
     Local,
+    /// Session-only navigation through HTTP directories and audio links.
+    Web,
     /// Media available without a network connection.
     Downloaded,
     /// Played and partially played media.
@@ -122,7 +124,7 @@ pub enum Screen {
 }
 
 impl Screen {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::Search,
         Self::YouTubeMusic,
         Self::YandexMusic,
@@ -133,6 +135,7 @@ impl Screen {
         Self::TrackerMusic,
         Self::Subscriptions,
         Self::Local,
+        Self::Web,
         Self::Playlists,
         Self::Downloaded,
         Self::History,
@@ -148,6 +151,7 @@ impl Screen {
             Self::ApplePodcasts => cfg!(feature = "apple-podcasts"),
             Self::LibriVox => cfg!(feature = "librivox"),
             Self::Radio => cfg!(feature = "radio"),
+            Self::Web => cfg!(feature = "web-browser"),
             _ => true,
         }
     }
@@ -175,7 +179,9 @@ impl Screen {
             Self::LibriVox => InformationPanelKind::Audiobook,
             Self::Radio => InformationPanelKind::Radio,
             Self::YandexMusic => InformationPanelKind::YandexMusic,
-            Self::Bandcamp | Self::Playlists | Self::History => InformationPanelKind::Generic,
+            Self::Bandcamp | Self::Web | Self::Playlists | Self::History => {
+                InformationPanelKind::Generic
+            }
             _ => InformationPanelKind::Video,
         }
     }
@@ -199,6 +205,7 @@ impl Screen {
             | Self::LibriVox
             | Self::TrackerMusic => Some("Search"),
             Self::Radio => Some("Filter"),
+            Self::Web => Some("Open URL"),
             Self::Subscriptions
             | Self::Local
             | Self::Downloaded
@@ -219,6 +226,7 @@ impl Screen {
             Self::Radio => "Radio",
             Self::TrackerMusic => "MOD/tracker",
             Self::Local => "Local",
+            Self::Web => "Web",
             Self::Subscriptions => "Subscriptions",
             Self::Playlists => "Playlists",
             Self::Downloaded => "Downloaded",
@@ -240,6 +248,7 @@ impl Screen {
             Self::Radio => "Radio",
             Self::TrackerMusic => "MOD",
             Self::Local => "Local",
+            Self::Web => "Web",
             Self::Subscriptions => "Subs",
             Self::Playlists => "Lists",
             Self::Downloaded => "Offline",
@@ -517,6 +526,8 @@ pub enum SearchActivity {
     LibriVox,
     /// An aggregate search through the enabled MOD/tracker archives.
     TrackerArchives,
+    /// A bounded HTTP directory request for the Web browser.
+    Web,
 }
 
 impl SearchActivity {
@@ -531,6 +542,7 @@ impl SearchActivity {
             Self::ApplePodcasts => Screen::ApplePodcasts,
             Self::LibriVox => Screen::LibriVox,
             Self::TrackerArchives => Screen::TrackerMusic,
+            Self::Web => Screen::Web,
         }
     }
 }
@@ -2682,6 +2694,8 @@ pub enum UiAction {
     ShowScreen(Screen),
     /// Enter search-query editing mode.
     BeginSearch,
+    /// Reload the active session-only Web directory without changing its URL.
+    RefreshWeb,
     /// Cancel search-query editing.
     CancelSearch,
     /// Insert one character at the query cursor.
@@ -3498,6 +3512,29 @@ mod tests {
                 ["loading_more"],
             serde_json::Value::Bool(false)
         );
+    }
+
+    #[test]
+    fn web_tab_follows_local_and_is_an_optional_url_browser() {
+        let local = Screen::ALL
+            .iter()
+            .position(|screen| *screen == Screen::Local)
+            .unwrap();
+        assert_eq!(Screen::ALL.len(), 15);
+        assert_eq!(Screen::ALL[local + 1], Screen::Web);
+        assert_eq!(Screen::ALL[local + 2], Screen::Playlists);
+        assert_eq!(Screen::Web.label(), "Web");
+        assert_eq!(Screen::Web.compact_label(), "Web");
+        assert_eq!(Screen::Web.enabled(), cfg!(feature = "web-browser"));
+        assert_eq!(Screen::Web.search_verb(), Some("Open URL"));
+        assert_eq!(Screen::Web.details_kind(), InformationPanelKind::Generic);
+        assert_eq!(SearchActivity::Web.screen(), Screen::Web);
+        let next = if cfg!(feature = "web-browser") {
+            Screen::Web
+        } else {
+            Screen::Playlists
+        };
+        assert_eq!(Screen::Local.next_available(true), next);
     }
 
     #[test]

@@ -1351,6 +1351,8 @@ pub enum Screen {
     Radio,
     /// Local folders and supported media files.
     Local,
+    /// Web browser tab identity; its directory URL is never stored in session state.
+    Web,
     /// Local subscription tree.
     Subscriptions,
     /// Offline media.
@@ -1822,6 +1824,16 @@ mod tests {
 
         assert!(encoded.contains("apple-podcasts"));
         assert_eq!(restored, Screen::ApplePodcasts);
+    }
+
+    #[test]
+    fn web_screen_has_a_stable_restart_name_without_a_persisted_url() {
+        let encoded = serde_json::to_string(&Screen::Web).expect("encode Web screen");
+        assert_eq!(encoded, r#"{"screen":"web"}"#);
+        assert_eq!(
+            serde_json::from_str::<Screen>(&encoded).unwrap(),
+            Screen::Web
+        );
     }
 
     #[test]

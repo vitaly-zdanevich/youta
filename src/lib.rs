@@ -51,6 +51,8 @@ pub(crate) mod terminal_environment;
 #[cfg(feature = "local-browser")]
 pub mod text_file_open;
 pub mod waveform;
+#[cfg(feature = "web-browser")]
+pub mod web_browser;
 
 #[cfg(feature = "audio-quality")]
 pub mod audio_quality;
