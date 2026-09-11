@@ -6,6 +6,9 @@
 //! owns its listener thread and stops it on drop, so sharing never survives a
 //! Youta process that the user has closed.
 
+mod socket_io;
+use socket_io::HttpStream;
+
 use chrono::{DateTime, Datelike, Utc};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
@@ -1018,17 +1021,6 @@ fn reap_finished_connections(connections: &mut Vec<JoinHandle<()>>) {
     }
 }
 
-/// Uses blocking worker I/O with short polls independently of listener mode.
-///
-/// Winsock can preserve the listener's nonblocking mode on accepted sockets.
-/// Socket timeouts alone do not clear that mode, so reads would otherwise spin
-/// on `WouldBlock` instead of waiting for data or the next cancellation poll.
-fn configure_http_stream(stream: &TcpStream) -> io::Result<()> {
-    stream.set_nonblocking(false)?;
-    stream.set_read_timeout(Some(IO_POLL))?;
-    stream.set_write_timeout(Some(IO_POLL))
-}
-
 /// Keeps podcast feeds available while rejecting excess audio downloads.
 ///
 /// Reading the headers avoids closing over unread GET/HEAD request bytes, which
@@ -1037,11 +1029,11 @@ fn configure_http_stream(stream: &TcpStream) -> io::Result<()> {
 /// Only the immutable podcast feed uses these reserved workers for content,
 /// with its own normal response deadline after the short header-drain deadline.
 fn handle_overloaded_connection(
-    mut stream: TcpStream,
+    stream: TcpStream,
     state: &ServerState,
     stop: &AtomicBool,
 ) -> io::Result<()> {
-    configure_http_stream(&stream)?;
+    let mut stream = HttpStream::new(stream)?;
     let deadline = Instant::now() + OVERLOAD_RESPONSE_TIMEOUT;
     let mut reader = BufReader::new(stream.try_clone()?);
     let request_line = read_request_line(&mut reader, MAX_REQUEST_LINE_BYTES + 1, deadline, stop)?;
@@ -1090,7 +1082,7 @@ fn handle_overloaded_connection(
 }
 
 /// Frames a bounded retry response only before any successful response begins.
-fn write_busy_response(stream: &mut TcpStream, head: bool, stop: &AtomicBool) -> io::Result<()> {
+fn write_busy_response(stream: &mut HttpStream, head: bool, stop: &AtomicBool) -> io::Result<()> {
     let deadline = Instant::now() + OVERLOAD_RESPONSE_TIMEOUT;
     let body = "Youta is busy; retry shortly";
     let headers = format!(
@@ -1133,9 +1125,7 @@ fn read_request_line(
             Err(error)
                 if matches!(
                     error.kind(),
-                    io::ErrorKind::WouldBlock
-                        | io::ErrorKind::TimedOut
-                        | io::ErrorKind::Interrupted
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
                 ) =>
             {
                 continue;
@@ -1163,12 +1153,12 @@ fn handle_connection(stream: TcpStream, state: &ServerState, stop: &AtomicBool) 
 
 /// Parses bounded headers before acquiring the matching transfer-class permit.
 fn handle_connection_with_admission(
-    mut stream: TcpStream,
+    stream: TcpStream,
     state: &ServerState,
     stop: &AtomicBool,
     admission: Option<&RequestAdmission>,
 ) -> io::Result<()> {
-    configure_http_stream(&stream)?;
+    let mut stream = HttpStream::new(stream)?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let deadline = Instant::now() + REQUEST_HEADER_TIMEOUT;
     let request_line = read_request_line(&mut reader, MAX_REQUEST_LINE_BYTES + 1, deadline, stop)?;
@@ -1334,7 +1324,7 @@ fn route_index(path: &str, prefix: &str) -> Option<usize> {
 }
 
 fn proxy_youtube_audio(
-    stream: &mut TcpStream,
+    stream: &mut HttpStream,
     state: &ServerState,
     index: usize,
     source_url: &Url,
@@ -1421,7 +1411,7 @@ fn proxy_youtube_audio(
 }
 
 fn proxy_youtube_artwork(
-    stream: &mut TcpStream,
+    stream: &mut HttpStream,
     state: &ServerState,
     _media_index: usize,
     initial_url: Option<&Url>,
@@ -1518,7 +1508,7 @@ impl CachedYouTubeResolution {
 }
 
 fn proxy_remote_response(
-    stream: &mut TcpStream,
+    stream: &mut HttpStream,
     state: &ServerState,
     url: &Url,
     headers: &[(&str, &str)],
@@ -1551,7 +1541,7 @@ fn proxy_remote_response(
 /// Writes only an accepted upstream response, after any setup retries complete.
 #[allow(clippy::too_many_arguments)]
 fn write_remote_response(
-    stream: &mut TcpStream,
+    stream: &mut HttpStream,
     remote: &RemoteRuntime,
     url: &Url,
     headers: &[(&str, &str)],
@@ -1655,7 +1645,7 @@ impl YouTubeChunkPlan {
 /// Reassembles bounded upstream ranges into a full download or client suffix.
 #[allow(clippy::too_many_arguments)]
 fn write_chunked_youtube_response(
-    stream: &mut TcpStream,
+    stream: &mut HttpStream,
     remote: &RemoteRuntime,
     url: &Url,
     headers: &[(&str, &str)],
@@ -1989,7 +1979,7 @@ fn request_remote_response_with_setup_policy(
 /// missing byte before the advertised downstream length can be truncated.
 #[allow(clippy::too_many_arguments)]
 fn proxy_remote_body(
-    stream: &mut TcpStream,
+    stream: &mut HttpStream,
     remote: &RemoteRuntime,
     url: &Url,
     headers: &[(&str, &str)],
@@ -2162,7 +2152,7 @@ fn unix_seconds() -> u64 {
 /// advances the remaining slice before retrying, preserving Content-Length even
 /// when a podcast app pauses its reads for longer than the socket poll interval.
 fn write_content_response(
-    stream: &mut TcpStream,
+    stream: &mut HttpStream,
     content_type: &str,
     body: &[u8],
     head: bool,
@@ -2217,9 +2207,7 @@ fn write_response_bytes(
             Err(error)
                 if matches!(
                     error.kind(),
-                    io::ErrorKind::WouldBlock
-                        | io::ErrorKind::TimedOut
-                        | io::ErrorKind::Interrupted
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
                 ) => {}
             Err(error) => return Err(error),
         }
@@ -2228,7 +2216,7 @@ fn write_response_bytes(
 }
 
 fn write_text_response(
-    stream: &mut TcpStream,
+    stream: &mut HttpStream,
     status: u16,
     reason: &str,
     body: &str,
@@ -2246,7 +2234,7 @@ fn write_text_response(
 }
 
 fn write_file_response(
-    stream: &mut TcpStream,
+    stream: &mut HttpStream,
     content_type: &str,
     path: &Path,
     length: u64,
@@ -2310,10 +2298,11 @@ const MEDIA_WRITE_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// truncated download.
 ///
 /// Accepted sockets retain short write polls so shutdown remains responsive.
-/// Transient timeouts and interruptions retry the exact unsent suffix, but a
+/// Nonblocking polls and interruptions retry the exact unsent suffix, but a
 /// client that makes no write progress for 60 seconds releases its worker.
 /// Successful writes restart the idle timer; total media duration is unlimited.
-fn write_media_bytes(stream: &mut TcpStream, bytes: &[u8], stop: &AtomicBool) -> io::Result<()> {
+/// Transport timeouts are terminal because Winsock cannot guarantee their byte count.
+fn write_media_bytes(stream: &mut HttpStream, bytes: &[u8], stop: &AtomicBool) -> io::Result<()> {
     write_media_bytes_with_policy(stream, bytes, stop, MEDIA_WRITE_IDLE_TIMEOUT, Instant::now)
 }
 
@@ -2354,9 +2343,7 @@ fn write_media_bytes_with_policy(
             Err(error)
                 if matches!(
                     error.kind(),
-                    io::ErrorKind::WouldBlock
-                        | io::ErrorKind::TimedOut
-                        | io::ErrorKind::Interrupted
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
                 ) => {}
             Err(error) => return Err(error),
         }
@@ -2967,6 +2954,61 @@ mod tests {
         }
     }
 
+    /// Models Winsock's indeterminate progress after a blocking send timeout.
+    /// The first send accepts a prefix but reports only the timeout error.
+    #[derive(Default)]
+    struct IndeterminateTimeoutWriter {
+        calls: usize,
+        output: Vec<u8>,
+    }
+
+    impl Write for IndeterminateTimeoutWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.calls += 1;
+            if self.calls == 1 {
+                self.output.extend_from_slice(&bytes[..bytes.len().min(2)]);
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            self.output.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn http_response_does_not_retry_indeterminate_timeouts() {
+        let mut writer = IndeterminateTimeoutWriter::default();
+        let error = write_response_bytes(
+            &mut writer,
+            b"abcdef",
+            &AtomicBool::new(false),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .expect_err("a transport timeout must not replay bytes already sent");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(writer.calls, 1);
+        assert_eq!(writer.output, b"ab");
+    }
+
+    #[test]
+    fn media_response_does_not_retry_indeterminate_timeouts() {
+        let mut writer = IndeterminateTimeoutWriter::default();
+        let error = write_media_bytes_with_policy(
+            &mut writer,
+            b"abcdef",
+            &AtomicBool::new(false),
+            Duration::from_secs(5),
+            Instant::now,
+        )
+        .expect_err("a transport timeout must not replay bytes already sent");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(writer.calls, 1);
+        assert_eq!(writer.output, b"ab");
+    }
+
     /// Advances a fake clock for each bounded write and records only accepted bytes.
     struct ScriptedMediaWriter<'a> {
         clock: &'a std::cell::Cell<Instant>,
@@ -3013,11 +3055,7 @@ mod tests {
 
     #[test]
     fn media_write_stalls_timeout_without_resetting_on_transient_errors() {
-        for kind in [
-            io::ErrorKind::WouldBlock,
-            io::ErrorKind::TimedOut,
-            io::ErrorKind::Interrupted,
-        ] {
+        for kind in [io::ErrorKind::WouldBlock, io::ErrorKind::Interrupted] {
             let clock = std::cell::Cell::new(Instant::now());
             let mut writer = scripted_media_writer(
                 &clock,
@@ -3045,7 +3083,10 @@ mod tests {
             &clock,
             [
                 (Duration::from_secs(4), Ok(2)),
-                (Duration::from_secs(2), Err(io::ErrorKind::TimedOut.into())),
+                (
+                    Duration::from_secs(2),
+                    Err(io::ErrorKind::WouldBlock.into()),
+                ),
                 (
                     Duration::from_secs(2),
                     Err(io::ErrorKind::WouldBlock.into()),
@@ -3100,6 +3141,7 @@ mod tests {
         }
         for (result, expected_kind) in [
             (Ok(0), io::ErrorKind::WriteZero),
+            (Err(io::ErrorKind::TimedOut.into()), io::ErrorKind::TimedOut),
             (
                 Err(io::ErrorKind::BrokenPipe.into()),
                 io::ErrorKind::BrokenPipe,
@@ -3143,7 +3185,7 @@ mod tests {
                 self.calls += 1;
                 let written = match self.calls {
                     1 => bytes.len().min(2),
-                    2 => return Err(io::Error::from(io::ErrorKind::TimedOut)),
+                    2 => return Err(io::Error::from(io::ErrorKind::WouldBlock)),
                     3 => return Err(io::Error::from(io::ErrorKind::WouldBlock)),
                     4 => return Err(io::Error::from(io::ErrorKind::Interrupted)),
                     _ => bytes.len(),
@@ -3200,10 +3242,9 @@ mod tests {
         }
     }
 
-    /// Reproduces inherited Winsock nonblocking mode on Unix and inspects it
-    /// directly, without relying on scheduling delays or timeout measurements.
+    /// Inspects normalized mode on Unix without scheduling or timing assumptions.
     #[cfg(unix)]
-    fn assert_http_handler_restores_blocking_mode(overloaded: bool) {
+    fn assert_http_handler_normalizes_socket(overloaded: bool, initially_nonblocking: bool) {
         use rustix::fs::{OFlags, fcntl_getfl};
 
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -3216,13 +3257,7 @@ mod tests {
             .set_write_timeout(Some(Duration::from_secs(2)))
             .unwrap();
         let (stream, _) = listener.accept().unwrap();
-        stream.set_nonblocking(true).unwrap();
-        // Kernels may round timeout values to their timer resolution. Capture
-        // that normalization, then ensure the handler replaces longer polls.
-        stream.set_read_timeout(Some(IO_POLL)).unwrap();
-        stream.set_write_timeout(Some(IO_POLL)).unwrap();
-        let expected_read_timeout = stream.read_timeout().unwrap();
-        let expected_write_timeout = stream.write_timeout().unwrap();
+        stream.set_nonblocking(initially_nonblocking).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
@@ -3230,7 +3265,10 @@ mod tests {
             .set_write_timeout(Some(Duration::from_secs(2)))
             .unwrap();
         let observer = stream.try_clone().unwrap();
-        assert!(fcntl_getfl(&observer).unwrap().contains(OFlags::NONBLOCK));
+        assert_eq!(
+            fcntl_getfl(&observer).unwrap().contains(OFlags::NONBLOCK),
+            initially_nonblocking
+        );
         client
             .write_all(b"GET /feed.xml HTTP/1.1\r\nHost: fixture\r\n\r\n")
             .unwrap();
@@ -3242,11 +3280,11 @@ mod tests {
             handle_connection_with_admission(stream, &state, &stop, None).unwrap();
         }
         assert!(
-            !fcntl_getfl(&observer).unwrap().contains(OFlags::NONBLOCK),
-            "HTTP workers must use blocking I/O with short socket timeouts"
+            fcntl_getfl(&observer).unwrap().contains(OFlags::NONBLOCK),
+            "HTTP workers must use nonblocking I/O without ambiguous socket timeouts"
         );
-        assert_eq!(observer.read_timeout().unwrap(), expected_read_timeout);
-        assert_eq!(observer.write_timeout().unwrap(), expected_write_timeout);
+        assert_eq!(observer.read_timeout().unwrap(), None);
+        assert_eq!(observer.write_timeout().unwrap(), None);
         drop(observer);
 
         let mut response = String::new();
@@ -3258,14 +3296,18 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn server_admission_normal_handler_restores_blocking_mode() {
-        assert_http_handler_restores_blocking_mode(false);
+    fn server_admission_normal_handler_normalizes_socket_mode() {
+        for initially_nonblocking in [false, true] {
+            assert_http_handler_normalizes_socket(false, initially_nonblocking);
+        }
     }
 
     #[cfg(unix)]
     #[test]
-    fn server_admission_overload_handler_restores_blocking_mode() {
-        assert_http_handler_restores_blocking_mode(true);
+    fn server_admission_overload_handler_normalizes_socket_mode() {
+        for initially_nonblocking in [false, true] {
+            assert_http_handler_normalizes_socket(true, initially_nonblocking);
+        }
     }
 
     /// Waits for an observed queue transition instead of guessing thread timing.
@@ -3588,7 +3630,12 @@ mod tests {
         }
         server.stop();
         for (method, response, read) in outcomes {
-            read.expect("busy listener must accept and answer instead of leaving the request in its backlog");
+            assert!(
+                read.is_ok(),
+                "busy listener must answer {method}: {read:?}; status {:?}; received {} bytes",
+                response.lines().next(),
+                response.len(),
+            );
             let (headers, body) = response.split_once("\r\n\r\n").unwrap();
             assert!(
                 headers.starts_with("HTTP/1.1 503 Service Unavailable"),
@@ -3893,10 +3940,8 @@ mod tests {
         let expected_length = body.len();
         let (ready, accepted) = std::sync::mpsc::channel();
         let worker = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept feed client");
-            stream
-                .set_write_timeout(Some(IO_POLL))
-                .expect("short cancellation poll");
+            let (stream, _) = listener.accept().expect("accept feed client");
+            let mut stream = HttpStream::new(stream).expect("configure HTTP socket");
             ready.send(()).expect("signal response start");
             write_content_response(
                 &mut stream,
@@ -3939,10 +3984,11 @@ mod tests {
     fn server_does_not_truncate_media_when_client_temporarily_stops_reading() {
         let directory = canonical_tempdir("lan-slow-client");
         let audio = directory.path().join("episode.opus");
-        let audio_length = 16 * 1024 * 1024;
-        File::create(&audio)
-            .and_then(|file| file.set_len(audio_length))
-            .expect("create large sparse audio fixture");
+        // Distinct 64-KiB chunks expose replay or skipped data as well as truncation.
+        let expected: Vec<u8> = (0..=u8::MAX)
+            .flat_map(|chunk| std::iter::repeat_n(chunk, 64 * 1024))
+            .collect();
+        fs::write(&audio, &expected).expect("create patterned audio fixture");
         let mut server = LanShareServer::start(prepare_file_share(&audio).expect("prepare file"))
             .expect("start server");
         let address = server
@@ -3972,11 +4018,13 @@ mod tests {
             .map(|index| index + 4)
             .expect("HTTP response headers");
 
-        assert_eq!(
-            response.len() - header_end,
-            usize::try_from(audio_length).expect("fixture length fits usize")
-        );
         server.stop();
+        let received = &response[header_end..];
+        assert_eq!(received.len(), expected.len());
+        assert!(
+            received == expected,
+            "backpressure must not duplicate, omit, or reorder audio bytes"
+        );
     }
 
     #[test]
@@ -4287,7 +4335,8 @@ printf '{"url":"https://cdn.example.test/%s.webm","acodec":"opus","vcodec":"none
         let downstream = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let address = downstream.local_addr().unwrap();
         let proxy = thread::spawn(move || {
-            let (mut stream, _) = downstream.accept().unwrap();
+            let (stream, _) = downstream.accept().unwrap();
+            let mut stream = HttpStream::new(stream).unwrap();
             if let Some((chunk_size, head)) = chunked {
                 let remote = state.remote.as_ref().unwrap();
                 let plan = resume_from.map_or(YouTubeChunkPlan::Full, YouTubeChunkPlan::From);
@@ -5030,7 +5079,8 @@ printf '{"url":"https://cdn.example.test/%s.webm","acodec":"opus","vcodec":"none
             }),
         };
         let proxy_thread = thread::spawn(move || {
-            let (mut stream, _) = downstream.accept().expect("accept proxy client");
+            let (stream, _) = downstream.accept().expect("accept proxy client");
+            let mut stream = HttpStream::new(stream).expect("configure HTTP socket");
             proxy_remote_response(
                 &mut stream,
                 &state,
