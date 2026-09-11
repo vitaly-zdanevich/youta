@@ -32,6 +32,17 @@ fn read_repository_file(relative: impl AsRef<Path>) -> String {
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
 }
 
+/// Reads a feature or USE-flag table row without fixing its surrounding prose.
+fn documented_table_description<'a>(readme: &'a str, key: &str) -> &'a str {
+    let prefix = format!("| `{key}` |");
+    readme
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(&prefix))
+        .and_then(|description| description.trim().strip_suffix('|'))
+        .map(str::trim)
+        .unwrap_or_else(|| panic!("README must document table entry `{key}`"))
+}
+
 fn manifest() -> toml::Value {
     toml::from_str(&read_repository_file("Cargo.toml")).expect("Cargo.toml must remain valid TOML")
 }
@@ -223,7 +234,10 @@ fn lan_sharing_is_default_but_removable_from_both_front_ends() {
 
     let readme = read_repository_file("README.md");
     assert!(readme.contains("The default-on `lan-sharing` feature"));
-    assert!(readme.contains("`USE=\"-lan-sharing\"` removes the session HTTP server"));
+    assert!(
+        documented_table_description(&readme, "USE=\"-lan-sharing\"")
+            .contains("Session HTTP server")
+    );
 
     let ci = read_repository_file(".github/workflows/ci.yml");
     assert!(ci.contains("cargo check --locked --no-default-features --features lan-sharing --lib"));
@@ -263,11 +277,12 @@ fn sponsorblock_is_default_but_removable_from_both_front_ends() {
     );
 
     let readme = read_repository_file("README.md");
-    assert!(readme.contains(
-        "`sponsorblock` is the independently removable SponsorBlock client and playback"
-    ));
+    assert!(documented_table_description(&readme, "sponsorblock").contains("SponsorBlock"));
     assert!(readme.contains("`YOUTA_PLAYBACK__SPONSORBLOCK_ENABLED=false`"));
-    assert!(readme.contains("`USE=\"-sponsorblock\"` removes its API client"));
+    assert!(
+        documented_table_description(&readme, "USE=\"-sponsorblock\"")
+            .contains("SponsorBlock API client")
+    );
 
     let ci = read_repository_file(".github/workflows/ci.yml");
     assert!(
@@ -309,9 +324,11 @@ fn nyan_cat_seekbar_is_default_but_removable_from_both_front_ends() {
     );
 
     let readme = read_repository_file("README.md");
-    assert!(readme.contains("`nyan-cat` is the independently removable rainbow seek-bar renderer"));
+    assert!(documented_table_description(&readme, "nyan-cat").contains("rainbow seek bars"));
     assert!(readme.contains("`YOUTA_UI__NYAN_CAT_SEEKBAR=true`"));
-    assert!(readme.contains("`USE=\"-nyan-cat\"` removes the rainbow seek-bar"));
+    assert!(
+        documented_table_description(&readme, "USE=\"-nyan-cat\"").contains("Rainbow seek-bar")
+    );
 
     let ci = read_repository_file(".github/workflows/ci.yml");
     assert!(ci.contains("cargo check --locked --no-default-features --features tui,nyan-cat"));
@@ -353,12 +370,10 @@ fn ascii_visualizer_is_default_but_removable_from_both_front_ends() {
     );
 
     let readme = read_repository_file("README.md");
+    assert!(documented_table_description(&readme, "ascii-visualizer").contains("CAVA"));
     assert!(
-        readme.contains("`ascii-visualizer` is the independently removable CAVA-backed fullscreen")
-    );
-    assert!(
-        readme
-            .contains("`USE=\"-ascii-visualizer\"` removes CAVA integration, fullscreen rendering")
+        documented_table_description(&readme, "USE=\"-ascii-visualizer\"")
+            .contains("CAVA integration, fullscreen rendering")
     );
     assert!(readme.contains("[CAVA](https://github.com/karlstav/cava)"));
     assert!(readme.contains("directs CAVA to that sink's monitor"));
@@ -397,7 +412,13 @@ fn audio_quality_is_default_but_remains_a_removable_local_capability() {
 
     let readme = read_repository_file("README.md");
     assert!(readme.contains("[V] Analyze quality"));
-    assert!(readme.contains("measured cutoff"));
+    assert!(
+        readme
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .contains("high-frequency cutoff")
+    );
     assert!(readme.contains("cannot recover an exact original bitrate"));
     assert!(readme.contains("https://docs.rs/rustfft/"));
     let architecture = read_repository_file("docs/ARCHITECTURE.md");
@@ -459,8 +480,11 @@ fn video_summary_is_default_but_remains_a_removable_renderer_free_capability() {
     );
 
     let readme = read_repository_file("README.md");
-    assert!(readme.contains("`summary` is the independently removable Codex summary"));
-    assert!(readme.contains("`USE=\"-summary\"` removes the Codex summary UI and backend"));
+    assert!(documented_table_description(&readme, "summary").contains("Codex"));
+    assert!(
+        documented_table_description(&readme, "USE=\"-summary\"")
+            .contains("Codex summary UI and backend")
+    );
 
     let ci = read_repository_file(".github/workflows/ci.yml");
     assert!(ci.contains("cargo check --locked --no-default-features --features summary --lib"));
@@ -503,9 +527,10 @@ fn youtube_captions_are_default_but_remain_a_removable_renderer_free_capability(
     );
 
     let readme = read_repository_file("README.md");
-    assert!(readme.contains("`youtube-captions` is the independently removable caption browser"));
+    assert!(documented_table_description(&readme, "youtube-captions").contains("captions"));
     assert!(
-        readme.contains("`USE=\"-youtube-captions\"` removes caption loading, search, and seeking")
+        documented_table_description(&readme, "USE=\"-youtube-captions\"")
+            .contains("Caption loading, search, and seeking")
     );
 }
 
@@ -550,7 +575,9 @@ fn evernote_is_default_but_remains_a_removable_export_capability() {
 
     let readme = read_repository_file("README.md");
     assert!(readme.contains("The default-on `evernote` feature"));
-    assert!(readme.contains("`USE=\"-evernote\"` removes the Evernote EDAM client"));
+    assert!(
+        documented_table_description(&readme, "USE=\"-evernote\"").contains("Evernote EDAM client")
+    );
 
     let ci = read_repository_file(".github/workflows/ci.yml");
     assert!(ci.contains("cargo check --locked --no-default-features --features evernote --lib"));

@@ -3,6 +3,10 @@
 [![CI](https://github.com/vitaly-zdanevich/youta/actions/workflows/ci.yml/badge.svg)](https://github.com/vitaly-zdanevich/youta/actions/workflows/ci.yml)
 [![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_youta&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_youta)
 [![Coverage](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_youta&metric=coverage)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_youta)
+
+<details>
+<summary>More quality metrics</summary>
+
 [![Bugs](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_youta&metric=bugs)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_youta)
 [![Vulnerabilities](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_youta&metric=vulnerabilities)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_youta)
 [![Code Smells](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_youta&metric=code_smells)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_youta)
@@ -12,6 +16,8 @@
 [![Security](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_youta&metric=security_rating)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_youta)
 [![Lines of Code](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_youta&metric=ncloc)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_youta)
 [![Technical Debt](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_youta&metric=sqale_index)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_youta)
+
+</details>
 
 ![Youta logo](gui/icons/icon.png)
 
@@ -25,6 +31,50 @@ for playback, communicates with it over JSON IPC, and uses `yt-dlp` for
 supported media resolution and downloads. Both front-ends share the same seek
 bar, queue, volume, pause state, actions, and persistent controller state.
 
+## Quick start
+
+Install `mpv` 0.38 or newer and `yt-dlp`, then build and open the terminal player
+with Rust 1.95 or newer:
+
+```sh
+cargo run --release --locked
+```
+
+Press `?` for contextual Help. Use `Tab` / `Shift+Tab` to switch sources,
+`j` / `k` to select an item, `Enter` to open or play it, and `Space` to pause.
+`/` searches the current source or edits the Web address; `p` or `F7` opens
+Preferences. The first YouTube search offers API-key or Invidious setup.
+YouTube Music search needs neither; Local, Web, and Radio need no account.
+
+For installation alternatives, optional helpers, credentials, and smaller
+builds, see [Build and run](#build-and-run). For the desktop front-end, see
+[The desktop window](#the-desktop-window).
+
+## Contents
+
+- [Design](#why-this-design), [playback and queue](#the-mpv-backend-and-the-tui),
+  and [supported sources](#current-foundation)
+- [Local files and archives](#local-files-and-archives) and [Web directories](#web-directories)
+- [Build and run](#build-and-run) and [desktop window](#the-desktop-window)
+- [State and OPML](#human-readable-state-opml-and-optional-sqlite),
+  [private notes](#private-notes), and [playlists](#local-playlists-and-todo)
+- [Online discovery](#online-discovery-and-yt-dlp),
+  [captions](#youtube-captions), and [summaries](#codex-video-summaries)
+- [SponsorBlock](#sponsorblock), [DeArrow titles](#dearrow-titles),
+  [rainbow seek bar](#rainbow-nyan-cat-seek-bar), and
+  [audio visualization](#fullscreen-audio-visualization)
+- [Thumbnails](#thumbnails-and-real-ttys) and
+  [virtual-console mouse input](#mouse-input-on-a-linux-virtual-console)
+- [Subscriptions and preferences](#subscriptions-and-local-data),
+  [channel downloads and LAN podcast feeds](#full-channel-downloads-and-session-lan-feeds)
+- [Commons uploads](#wikimedia-commons-transfer) and [Evernote notes](#evernote-audio-notes)
+- [Diagnostics](#diagnostics-and-issue-review), [audio quality](#audiophiles),
+  and [packaging and tests](#packaging-and-quality)
+- [Roadmap](#service-roadmap), [license](#license),
+  [related Wikimedia projects](#my-other-wikimedia-related-projects), and
+  [similar terminal players](#similar-terminal-youtube-projects)
+- [Talks and articles](#talks-and-articles)
+
 ## Why this design
 
 - The UI stays responsive while network, metadata, and playback work happen
@@ -32,98 +82,6 @@ bar, queue, volume, pause state, actions, and persistent controller state.
 - Persistent state is local-first and restartable. Youta stores navigation,
   queue, playlists, history, notes, bookmarks, and playback positions beneath
   `~/.config/youta/`.
-- The Local tab browses supported media and images in place. Youta never
-  reorganizes folders automatically; only explicit Rename, Move to Trash, and
-  Move actions change selected entries. A durable move journal lets startup
-  finish or reconcile interrupted moves without guessing which copy is
-  authoritative. Recursive folder sizes are enabled by default, calculated
-  asynchronously one folder at a time, and never follow symbolic links. `[Z]`
-  cycles size sorting off, ascending, and descending; unknown folders remain
-  after known sizes. `Enter` opens a folder, `Esc` returns to its parent while
-  reselecting the folder just left, and `PageUp`/`PageDown` move by the visible
-  Local page. Selecting media shows filename metadata immediately while
-  tags and bounded `ffprobe` codec/container details load off the TUI thread;
-  completed records remain in a fixed-size RAM cache for fast revisits. When
-  terminal images are enabled, selecting a finite local video lazily extracts
-  its midpoint frame through a bounded `ffmpeg` worker and reuses the persistent
-  thumbnail cache on later visits.
-  The default-on `local-archives` feature presents ZIP and RAR files as
-  read-only folders. `Enter` opens an archive or a nested archive, and `Esc`
-  returns to the containing folder while reselecting it. ZIP decoding is
-  in-process; RAR requires the external `unrar` program. Youta validates member
-  paths and types first, streams regular files through per-member and total byte
-  limits into a private regenerable cache beneath `~/.config/youta/cache/`, and
-  never asks `unrar` to choose output paths. Rename, Move, and Trash remain
-  disabled inside archive folders. Reopening an unchanged archive reuses its
-  extraction; replacing the source atomically replaces the one cache entry for
-  that source instead of retaining stale copies.
-  `[w]` lazily generates a waveform for a local audio or video file with the
-  existing `ffmpeg` helper and replaces the normal seek bar without hiding
-  Details. Peak extraction is cancellable, runs outside the UI thread, aligns
-  delayed or shorter audio with the whole media timeline, skips mathematically
-  inevitable intermediate compactions for long files, and retains only a
-  bounded min/max envelope in RAM; clicking any waveform row starts or seeks
-  the exact selected file at that position.
-  `[V] Analyze quality` explicitly checks a selected local audio file, every
-  marked file or folder, or the selected folder for a stable high-frequency
-  cutoff. Folder traversal is deterministic, never follows symbolic links,
-  and analyzes at most 256 discovered audio files sequentially. A progress
-  popup retains a bounded report that can be copied while work continues or
-  after it finishes. The default-on `audio-quality` feature streams bounded PCM
-  from the existing `ffmpeg` helper and uses
-  [RustFFT](https://docs.rs/rustfft/) locally; no filename, audio, or result is
-  uploaded. Details keeps the factual current codec, sample rate, channel
-  count, and encoded bitrate separate from the qualitative assessment. It
-  reports the measured cutoff, evidence strength, and agreement across active
-  FFT windows from up to the leading 30 seconds. It does not convert bandwidth
-  into a codec-neutral source bitrate: Opus, AAC, MP3, and other encoders use
-  different low-pass behaviour. If the current sample rate or channel count is
-  unavailable, or a stream has more than two channels and `ffmpeg` must
-  normalize it to stereo, the cutoff remains visible but source-history
-  inference is suppressed.
-  Analysis cannot recover an exact original bitrate: a naturally
-  band-limited master can resemble a lossy encode, while an encoder that keeps
-  full bandwidth can leave no detectable cutoff. Youta therefore reports
-  evidence and uncertainty, never “genuine lossless,” a recovered source
-  bitrate, or a proven codec history.
-  For an audio file, `[f] Fingerprint` explicitly runs Chromaprint's official
-  `fpcalc` helper off the UI thread and submits only its encoded fingerprint
-  and duration to [AcoustID](https://acoustid.org/). Ranked
-  [MusicBrainz](https://musicbrainz.org/) recording links are cached in bounded
-  RAM by file identity; the best match is also offered to Wikidata enrichment
-  through [MusicBrainz recording ID (P4404)](https://www.wikidata.org/wiki/Property:P4404)
-  when that feature is enabled. Once the recording's Wikidata link is visible,
-  the optional `lastfm` adapter follows its performer to
-  [Last.fm ID (P3192)](https://www.wikidata.org/wiki/Property:P3192) and requests
-  the artist's full public `/+wiki` biography as a separate best-effort step.
-  Biography text and its attribution link remain in the same identity-bound
-  RAM cache; Last.fm errors do not delay or remove the Wikidata result.
-  Changing the selection cancels obsolete fingerprint work, and Youta never
-  scans or uploads local media automatically.
-  A conservative display-only fallback repairs strong Windows-1251 text that
-  legacy MP3 tags incorrectly declare as Latin-1; Unicode tags and media files
-  are never rewritten.
-- The Web tab, immediately after Local, browses HTTP/HTTPS directory listings
-  and direct media links. It opens the URL editor on first entry; `/` edits the
-  address, `Enter` opens a folder or plays its selected media, `Esc` or
-  `Backspace` goes back, and `R` refreshes. `j`/`k` and `PageUp`/`PageDown`
-  navigate the compact list. `[A] Autoplay` uses the existing preference
-  (off by default) to continue through that directory's media in sequence.
-  Playback is audio only, including linked video containers.
-  Browsing fetches only the requested page in a bounded background
-  worker: it does not recursively crawl directories, probe every file, or need
-  `yt-dlp`. The Web browsing location and query-bearing links remain
-  session-only; safe public links can still be saved in playlists and history.
-  Reopening Youta asks for an address again. Local Rename, Move, and Trash
-  actions are not offered for Web entries. To try a directory locally, use
-  [Python's `http.server`](https://docs.python.org/3/library/http.server.html):
-
-  ```sh
-  python -m http.server 8000 --bind 127.0.0.1 --directory '/path/to/music'
-  ```
-
-  Then enter `http://127.0.0.1:8000/` in Web. This example serves only on the
-  same computer; Python's test server is not intended for public production use.
 - Optional providers are isolated behind Cargo features, so a local/RSS-only
   build does not need YouTube or cloud integrations.
 - A plain Linux TTY is a primary target. A confirmed local `/dev/ttyN` can use
@@ -132,6 +90,113 @@ bar, queue, volume, pause state, actions, and persistent controller state.
 
 See [Architecture](docs/ARCHITECTURE.md), [feasibility and service
 tiers](docs/FEASIBILITY.md), and [audiophile guidance](docs/AUDIOPHILE.md).
+
+### Local files and archives
+
+The Local tab browses supported media and images in place. `Enter` opens a
+folder; `Esc` returns to its parent and reselects the folder just left.
+`PageUp` / `PageDown` move by the visible Local page. Recursive folder sizes
+are enabled by default and calculated asynchronously, one folder at a time,
+without following symbolic links. `[Z]` cycles size sorting off, ascending,
+and descending; unknown sizes remain after known ones.
+
+Youta never reorganizes folders automatically. Only explicit Rename, Move to
+Trash, and Move actions change selected entries. A durable move journal lets
+startup finish or reconcile interrupted moves without guessing which copy is
+authoritative.
+
+Selecting media shows filename metadata immediately while tags and bounded
+`ffprobe` codec/container details load off the TUI thread. A fixed-size RAM
+cache makes revisits fast. With terminal images enabled, selecting a finite
+local video lazily extracts its midpoint frame through a bounded `ffmpeg`
+worker and reuses the persistent thumbnail cache on later visits. A
+display-only fallback repairs strong Windows-1251 text that legacy MP3 tags
+incorrectly declare as Latin-1; Unicode tags and media files are never rewritten.
+
+The default-on `local-archives` feature presents ZIP and RAR files as read-only
+folders. `Enter` opens an archive or nested archive; `Esc` returns to its
+containing folder and reselects it. ZIP decoding is in-process; RAR requires
+`unrar`. Youta validates member paths and types, then streams regular files
+through per-member and total byte limits into a private regenerable cache
+beneath `~/.config/youta/cache/`. It never asks `unrar` to choose output paths.
+Rename, Move, and Trash are disabled inside archives. Unchanged archives reuse
+their extraction; replacing a source atomically replaces its single cache
+entry rather than retaining stale copies.
+
+#### Waveforms and quality analysis
+
+`[w]` generates a waveform for a local audio or video file with `ffmpeg` and
+replaces the seek bar without hiding Details. Clicking any waveform row starts
+or seeks the exact selected file at that position. Extraction is cancellable,
+runs outside the UI thread, aligns delayed or shorter audio with the whole
+media timeline, and retains only a bounded min/max envelope in RAM. Long files
+skip mathematically inevitable intermediate compactions.
+
+`[V] Analyze quality` checks a selected local audio file, every marked file or
+folder, or the selected folder for a stable high-frequency cutoff. Traversal
+is deterministic, never follows symbolic links, and analyzes at most 256
+discovered audio files sequentially. Its bounded progress report can be copied
+while work continues or after completion. The default-on `audio-quality`
+feature streams bounded PCM from `ffmpeg` and uses
+[RustFFT](https://docs.rs/rustfft/) locally; no filename, audio, or result is
+uploaded.
+
+Details separates the factual codec, sample rate, channel count, and encoded
+bitrate from the qualitative assessment. It reports the cutoff, evidence
+strength, and agreement across active FFT windows from up to the leading 30
+seconds. Opus, AAC, MP3, and other encoders use different low-pass behaviour, so
+bandwidth is not converted into a codec-neutral source bitrate. When sample
+rate or channel count is unavailable, or `ffmpeg` must normalize more than two
+channels to stereo, the cutoff remains visible but source-history inference
+is suppressed.
+
+Analysis cannot recover an exact original bitrate: a naturally band-limited
+master can resemble a lossy encode, while an encoder retaining full bandwidth
+can leave no detectable cutoff. Youta reports evidence and uncertainty, never
+“genuine lossless,” a recovered source bitrate, or a proven codec history.
+
+#### Audio identification
+
+`[f] Fingerprint` runs Chromaprint's `fpcalc` off the UI thread and submits only
+the encoded fingerprint and duration to [AcoustID](https://acoustid.org/).
+Ranked [MusicBrainz](https://musicbrainz.org/) recording links are cached in
+bounded RAM by file identity. When Wikidata is enabled, the best match is also
+offered for enrichment through
+[MusicBrainz recording ID (P4404)](https://www.wikidata.org/wiki/Property:P4404).
+
+Once that Wikidata link is visible, the optional `lastfm` adapter follows the
+performer to [Last.fm ID (P3192)](https://www.wikidata.org/wiki/Property:P3192)
+and requests the full public `/+wiki` biography separately. The biography and
+attribution link share the identity-bound RAM cache; Last.fm errors neither
+delay nor remove Wikidata results. Selection changes cancel obsolete
+fingerprinting. Youta never fingerprints or uploads local media automatically.
+
+### Web directories
+
+The Web tab, immediately after Local, browses HTTP/HTTPS directory listings
+and direct media links. It opens the URL editor on first entry; `/` edits the
+address, `Enter` opens a folder or plays selected media, `Esc` or `Backspace`
+goes back, and `R` refreshes. `j` / `k` and `PageUp` / `PageDown` navigate the
+compact list. `[A] Autoplay` uses the existing preference (off by default) to
+continue through the directory's media in sequence. Playback is audio only,
+including linked video containers.
+
+Browsing fetches only the requested page in a bounded background worker. It
+does not recursively crawl directories, probe every file, or require `yt-dlp`.
+The browsing location and query-bearing links remain session-only; safe public
+links can still be saved in playlists and history. Reopening Youta asks for an
+address again. Local Rename, Move, and Trash actions are not offered for Web
+entries.
+
+To try a directory locally, use
+[Python's `http.server`](https://docs.python.org/3/library/http.server.html):
+
+```sh
+python -m http.server 8000 --bind 127.0.0.1 --directory '/path/to/music'
+```
+
+Then enter `http://127.0.0.1:8000/` in Web. This example serves only on the same
+computer; Python's test server is not intended for public production use.
 
 ## The `mpv` backend and the TUI
 
@@ -172,6 +237,22 @@ continuation, the way scheduled YouTube rows are: continuation only starts
 what it can start directly. The same-source position is tracked even while
 autoplay is off, so a manual skip can use it; the toggle decides only whether
 end-of-file continues on its own.
+
+`[r] Repeat: off/on` follows Autoplay in both Subscriptions layouts, including
+RSS episode lists. It repeats the **currently playing item** from the beginning
+each time it ends, taking precedence over queued items and Autoplay until
+disabled. Repeat is session-only and starts off each time Youta opens. Manual
+next/previous or stopping playback still works; playback errors are reported,
+not retried indefinitely. Live radio cannot repeat.
+
+For example, a YouTube channel's item footer is:
+
+```text
+[R] Refresh  [h] Shorts: off  [A] Autoplay: off  [r] Repeat: off
+```
+
+The shared `r` shortcut toggles Repeat outside contexts that assign it another
+action: in Radio it records, and in Local it opens Rename.
 
 `u` opens that queue. It lists the entries in play order, marks the one
 playback is on, and starts the selected entry from where it sits, drops a
@@ -254,6 +335,8 @@ implement the same playback interface without changing screens or history.
   author navigation, chapter playback, genres, and public-page keywords;
 - an account-free Radio tab backed by a static, zero-startup-network catalogue
   of direct public streams;
+- Local browsing with read-only ZIP/RAR folders, plus a separate Web tab for
+  HTTP/HTTPS directories and direct media links;
 - lazy Wikidata enrichment for exact YouTube, SoundCloud, Bilibili, LibriVox
   author, and fingerprint-derived MusicBrainz external identifiers;
 - supervised, argument-safe `mpv` JSON IPC and `yt-dlp` metadata/download
@@ -312,7 +395,8 @@ resolver:
   it exposes a feed or direct enclosure only when the public response includes
   one. The generic direct-URL fallback remains available, but the installed
   extractor may report the site as unsupported.
-- **LitRes podcasts** are an opt-in `litres` feature. Catalog search, item
+- **LitRes podcasts** are included in default builds through the removable
+  `litres` feature, but require explicit credential setup. Catalog search, item
   details, and episode pagination use the documented
   [CataLit 2.0 API](https://docs.litres.ru/public/6424300.html), a user-provided
   LitRes application ID/secret, and only the documented anonymous session.
@@ -373,6 +457,13 @@ Repeat remains disabled. Live streams remain marker-free as
 `Radio · live` entries in
 History, `todo`, and other playlists. Listening time still contributes to the
 Radio total on the Stats screen.
+
+`[f]` toggles a station as a favorite. Favorites survive restarts and appear
+first, while preserving the chosen ordering within favorites and other
+stations. `[r] Record` starts capture only when the selected station is already
+playing; press `r` again to stop recording. Youta asks `mpv` to copy the encoded
+stream packets rather than re-encoding the audio. The recording indicator marks
+the playing station. Here `r` controls recording, not Repeat.
 
 `[/] Search` is a zero-network live filter on this tab: every typed character
 immediately narrows the catalogue. Whitespace-separated terms match station
@@ -510,10 +601,8 @@ a time and every answer is remembered for the session, including "this station
 has no image", so moving through the catalogue costs at most one lookup per
 station rather than one per selection.
 
-Wikidata knows only the broadcasters notable enough to have an item, which is
-about a tenth of Youta's catalogue: a hobby FLAC stream has no item to link to
-and never will. The rest ask the station's own homepage, which already
-advertises its logo to browsers and messaging apps. Youta reads one bounded page
+The verified Wikidata mapping covers only part of the catalogue. Other stations
+use their own homepage as the artwork fallback. Youta reads one bounded page
 and takes the first of `apple-touch-icon`, `og:image`, and a `rel="icon"` that
 is a PNG, JPEG, or WebP — an ICO or SVG favicon is skipped because the artwork
 pipeline cannot render one. The address requested is the compile-time homepage
@@ -585,6 +674,8 @@ Install `fpcalc` from your operating system's
 - Fedora: `dnf install chromaprint-tools`
 - macOS with Homebrew: `brew install chromaprint`
 
+### Smaller and custom builds
+
 Build the complete application without image decoding, terminal-image
 dependencies, or the optional Linux virtual-console mouse client with:
 
@@ -606,39 +697,41 @@ cargo build --release --locked --no-default-features \
 
 Omit `images` from that command for the Yandex-free text-only variant. Omit
 both `qr` and `lan-sharing` to remove QR encoding, LAN sharing, and their
-shortcuts from a custom build. Cargo
-features are additive: `app-core` is the complete profile without
-`yandex-music`, `audio-quality` is the independently removable local analyzer,
-`commons-upload` and `evernote` are independently removable preservation
-clients,
-`summary` is the independently removable Codex summary integration,
-`youtube-captions` is the independently removable caption browser,
-`sponsorblock` is the independently removable SponsorBlock client and playback
-skip integration,
-`nyan-cat` is the independently removable rainbow seek-bar renderer,
-`ascii-visualizer` is the independently removable CAVA-backed fullscreen
-renderer,
-`lan-sharing` is the independently removable session HTTP server and feed
-builder,
-`local-archives` is the independently removable ZIP/RAR Local-folder support,
-`web-browser` is the independently removable HTTP directory and direct-media browser,
-and `gpm` is the positive opt-in for virtual-console mouse input. The ordinary
-default feature set still enables audio-quality analysis, SponsorBlock, the
-ASCII spectrum visualizer, Nyan Cat renderer, YouTube captions, video summaries,
-Commons and Evernote transfer, LAN sharing, ZIP/RAR folders, Yandex Music,
-Web browsing, and GPM. Add `local-archives` to either
-custom command above to retain archive folders; leaving it out removes the
-archive folder code. Leave `sponsorblock` out to remove all of its UI, network,
-cache, and playback code. The shared ZIP decoder also disappears only when no
-other selected feature, such as tracker archive support, enables `archive-zip`.
-Leave `nyan-cat` out to remove the terminal and desktop rainbow renderer.
-Leave `ascii-visualizer` out to remove CAVA capture and both fullscreen
-renderers.
-Leave `web-browser` out of a `--no-default-features` build to omit the Web tab
-and its HTML directory parser; no other source requires that parser.
+shortcuts from a custom build. Cargo features are additive: `app-core` selects
+the shared sources and TUI without Yandex Music; `app` also includes
+`yandex-music`. Neither profile forces the independent features below.
+
+All of these are compiled in by the ordinary default build. To remove one,
+leave it out of an explicit `--no-default-features` feature list:
+
+| Feature | What it adds |
+| --- | --- |
+| `ascii-visualizer` | CAVA capture and fullscreen terminal/desktop spectrum renderers. |
+| `audio-quality` | Local spectral analysis and RustFFT. |
+| `commons-upload` | Commons authentication, upload client, and review UI. |
+| `evernote` | Evernote client and audio-note UI. |
+| `gpm` | Linux virtual-console mouse input; opt in explicitly in either custom example. |
+| `images` | Image decoding and terminal graphics protocols. |
+| `lan-sharing` | Session HTTP server, audio proxy, and local/channel podcast feed builder. |
+| `local-archives` | Read-only ZIP/RAR folders in Local. |
+| `nyan-cat` | Terminal and desktop rainbow seek bars. |
+| `qr` | Offline QR encoding. |
+| `sponsorblock` | SponsorBlock UI, networking, cache, and playback skipping. |
+| `summary` | Explicit Codex video summaries. |
+| `web-browser` | Web tab and its HTML directory parser, unused by other sources. |
+| `youtube-captions` | Searchable captions and the current-cue line. |
+
+Both custom examples retain `local-archives`; remove it if archive folders are
+unwanted. The shared ZIP decoder disappears only when no remaining feature,
+such as tracker archive support, enables `archive-zip`. `lan-sharing` selects
+`qr`, so removing `qr` alone does not remove QR code when sharing is enabled.
+Build defaults and runtime defaults are separate: Nyan Cat and summaries start
+off even when compiled in.
 
 Both configurations use human-readable TOML persistence. SQLite is included
 only when `sqlite-state` or `bundled-sqlite` is requested explicitly.
+
+### Commands and credentials
 
 After installation, the current commands are:
 
@@ -652,8 +745,8 @@ youta config                  # print non-secret effective paths and settings
 youta extractors              # list extractors reported by installed yt-dlp
 ```
 
-The TUI starts without a network request. On the first YouTube search without a
-configured metadata provider, it opens a setup popup where the user can enter
+On the first YouTube search without a configured metadata provider, Youta opens
+a setup popup where the user can enter
 either a YouTube Data API key or an Invidious instance URL. The popup shows the
 exact destination before saving: API keys go to
 `~/.config/youta/secrets/credentials.toml`, while an Invidious instance URL
@@ -723,10 +816,11 @@ wanted.
 
 ### The desktop window
 
-Youta also has a desktop window, in the `youta-gui` workspace crate. It is a
-second front-end to the same reducer the terminal drives: the same state, the
-same keyboard map, the same providers and playback engine. Neither front-end
-replaces the other.
+The `youta-gui` workspace crate provides a desktop front-end with the same
+state, keyboard map, providers, and playback engine as the terminal. Neither
+front-end replaces the other.
+
+#### Building the desktop window
 
 Its page is built with Vite, so it needs Node once before the Rust build:
 
@@ -744,11 +838,13 @@ Nvidia and older Mesa configurations render the window as a blank or torn
 surface until WebKitGTK's DMA-BUF path is turned off:
 
 ```sh
-WEBKIT_DISABLE_DMABUF_RENDERER=1 youta-desktop
+WEBKIT_DISABLE_DMABUF_RENDERER=1 youta-gui
 ```
 
 That is a WebKitGTK workaround rather than a Youta setting, and it is worth
 trying first whenever the window appears but shows nothing.
+
+#### Desktop packages and installation
 
 Native desktop artifacts are built by `scripts/package-desktop.sh`. It
 produces a standalone GUI executable and whatever the host platform's bundler
@@ -764,162 +860,119 @@ but does not claim that a cross-built installer is native. The resulting raw
 executable remains dynamically linked; distribution packages must supply its
 32-bit GUI libraries, as the Gentoo x86 ebuild does.
 
-The installers are **not signed**, on any platform. macOS will refuse a
-downloaded `.dmg` until it is opened through the right-click "Open" menu, and
-Windows SmartScreen will warn about an unrecognised publisher. Signing is wired
-into the release workflow and turns itself on the moment the maintainer adds
-the certificate secrets; until then, unsigned is the honest state and this is
-where it is written down. For the same reason the window carries **no automatic
-updater**: an updater needs a signing key pair whose private half only the
-maintainer can hold, and an endpoint to publish manifests to. Neither exists,
-and shipping an update channel that nobody can sign for would be worse than
-shipping none. Deep links — opening a `youta://` address from a browser — are
-not registered either; they need the bundle that now exists plus a decision
-about handing a URL to an already-running copy, which is its own change.
+The installers are **not signed**. macOS may require opening a downloaded
+`.dmg` through the right-click "Open" menu; Windows SmartScreen warns about an
+unrecognised publisher. Release signing is prepared but requires maintainer
+certificate secrets. There is **no automatic updater**: its signing key pair
+and manifest endpoint have not been configured. Browser deep links such as
+`youta://…` are not registered; routing them to an already-running instance is
+separate work.
 
 The page is embedded into the binary when the Rust crate compiles, so editing
 the front-end means running both commands again: `npm --prefix gui/ui run build`
 followed by `cargo build -p youta-gui`. Rebuilding only the page leaves the
 running binary serving the assets it was compiled with.
 
+#### Desktop controls and limitations
+
+The window supports native Details selection/copying, a menu bar, tray
+controls, media keys, and file/folder drops into Local. Track-change
+notifications appear only while the window is unfocused. Closing the window
+ends Youta and playback; the tray does not keep it running. The Subscriptions
+layout preference is shared with the terminal, with room to show sources,
+items, and Details together.
+
+Four editors remain terminal-only: the YouTube API key, Yandex Music OAuth
+token, RSS feed URL, and private notes. Their contents never leave the player
+process. The desktop shows a notice with a dismissal action while one is open,
+including automatic YouTube setup on a first search without credentials. Use
+the terminal front-end or configuration files for those values.
+
+<details>
+<summary>Desktop implementation and security boundaries</summary>
+
 The rest of the repository needs no JavaScript toolchain. `youta-gui` is not a
-default workspace member, so `cargo build`, `cargo test`, and the lint gates
-never touch it, and a Rust-only build of the window falls back to a placeholder
-page that says what to run.
+default workspace member: ordinary `cargo build`, `cargo test`, and core lint
+commands exclude it. Building the GUI without its generated page provides a
+placeholder explaining the missing build step. The window selects `controller`
+and `sources`, not `tui`; `cargo tree -p youta-gui -i ratatui` must match no
+package.
 
-The window links no terminal code at all. It selects `controller` and `sources`
-rather than `tui`, which is checked by `cargo tree -p youta-gui -i ratatui`
-matching no package.
+Subscriptions supports both saved navigation layouts. Its information panel
+shows the channel/feed while choosing a source, then the selected item after
+entering it. Details selection and copying are native: Ctrl-C stays with the
+web view whenever text is selected. Scrolling is native too, but the reducer
+owns focus and offset so Home, End, PageDown, and Alt-u/d stay synchronized.
 
-Subscriptions keeps both navigation models the terminal offers, because which
-one is active is a saved preference the two front-ends share. Where the window
-differs is width: it shows the source list, the item list, and the information
-panel at once, which four terminal rows cannot. The panel follows the reducer —
-a channel or a feed while a source is being chosen, the selected item once one
-has been entered.
+UI snapshots use JSON, except for waveform and artwork bytes:
 
-Details text selects and copies natively, so Ctrl-C is left to the web view
-whenever something is selected rather than being claimed by Youta. Scrolling is
-native too, but the reducer still owns the offset, because Home, End, PageDown
-and Alt-u/d move it and only the reducer knows whether the panel has focus.
+- Waveforms contain sixteen-bit peaks, requested as four bytes per column once
+  per file or resize, not once per frame. This avoids JSON's roughly tenfold
+  expansion. Rust reduces them to the canvas's device-pixel width with the same
+  code used for the terminal's four waveform rows. Requests carry a generation;
+  stale generations receive no data, preventing an old selection's response
+  from drawing or seeking the wrong file.
+- Artwork uses `<img src>` with `youta://artwork/`. Rust supplies the bytes
+  through Youta's guarded agent: public addresses only, no redirects, and size
+  limits. The web view never fetches provider artwork directly.
+- Local covers use the same endpoint, but only URLs the reducer published in
+  a snapshot are served. Several recent selections remain allowed so a delayed
+  image request still resolves. This is an explicit allowlist, not a guessed
+  path pattern; a provider-supplied `file:` URL is refused.
 
-Everything the window renders arrives as JSON except the waveform. A
-window-wide envelope is a few thousand sixteen-bit peaks, which JSON inflates by
-roughly an order of magnitude, and it changes once per file rather than once per
-frame — so the window asks for it as bytes, four per column, once per file and
-once per resize. Rust reduces it to exactly the number of device pixels the
-canvas will draw, using the same code the terminal draws its four rows with. The
-request names a generation, and a generation the reducer no longer holds is
-answered with nothing rather than with the current file's peaks: otherwise a
-reply that outlived the selection would paint one file's envelope where another
-belongs, and a click on those pixels would seek the wrong media.
+Clipboard transport and local text-file opening belong to each front-end. The
+window uses the platform clipboard and a detached system opener. The terminal
+uses a native helper or OSC 52 through its own tty, and can suspend itself for
+a terminal editor. The controller supplies content and intent, not transport.
 
-Artwork is the other exception, and it never enters a snapshot either: the
-window asks for it with an ordinary `<img src>` pointing at `youta://artwork/`,
-and Rust answers with the bytes. That keeps the network in the player process,
-so a provider sees Youta's guarded agent — public addresses only, no redirects,
-size-capped — rather than a request from a web view.
+Menu and tray item IDs serialize `UiAction` directly, avoiding a second command
+mapping. They have no keyboard accelerators that could bypass the shared modal
+keymap: typing Space in an editor must not pause playback. The predefined Edit
+menu retains native cut, copy, paste, and select-all. The tray menu opens on an
+ordinary click on each platform; its Previous/Next actions target the playing
+queue, not the list selection. Closing the window also releases the durable-state
+lock rather than leaving an invisible process holding it.
 
-Local covers reach the same endpoint but are trusted differently, because they
-are real files: the cover extracted out of a download, or the image `yt-dlp`
-left beside it. No path pattern separates the user's own `cover.jpg` from the
-rest of their filesystem, so the endpoint does not try to invent one. It serves
-a file only when the reducer itself published that URL in a snapshot the window
-was given, remembering the last several selections so an image request that
-outlives its selection still resolves. A `file:` URL arriving from a provider is
-refused, because no snapshot ever named it.
+Drops open Local at the dropped folder, or at the first file's parent with that
+file selected. Only the first path is inspected; remaining paths are counted.
+Several files from one folder therefore appear in the same listing. Drops do
+not expose anything beyond the normal Local browser.
 
-Two things the reducer decides but cannot do itself are done here rather than
-in it: copying to the clipboard, and opening a local text file. The window
-reaches the platform clipboard directly and starts the system opener detached;
-the terminal reaches a native helper or writes an OSC 52 escape to its own tty,
-and can suspend itself so a terminal editor may take the console. The
-controller supplies the text and the command, never the transport.
+Window titles, tray tooltips, and track-change notifications use the queue's
+`now_playing` field, not the selected row or a title parsed by the playback
+engine. Notifications require an unfocused window and a new track; the first
+snapshot after startup does not notify about a merely restored queue. Text
+passed to the operating system is bounded like other provider text.
 
-The window carries a menu bar, a tray icon, and a drop target — the three ways
-of reaching Youta from outside its page. Every entry in the menu and the tray is
-a semantic action: a menu item's identity *is* its serialized `UiAction`, so an
-entry cannot name a command that does not exist and there is no second table to
-drift. None of them carries a keyboard accelerator, because an accelerator is
-resolved by the operating system before the page sees the key, while the shared
-keyboard map resolves the same key against live modal state — `Space` as an
-accelerator would pause playback while a space was typed into the search field.
-The Edit submenu is the exception and is not decoration: its predefined items
-are what give the web view working cut, copy, paste, and select-all, which is
-how the natively selected Details text is actually copied.
+Media keys use MPRIS on Linux, System Media Transport Controls on Windows, and
+Now Playing on macOS. Play/Pause are idempotent requests checked against live
+reducer state. Previous/Next traverse the queue, continuing into its source
+list at either edge. The media-session Stop action holds the current item in
+place. Seeking with an unknown duration is refused rather than approximated,
+and session-bus URIs are ignored rather than bypassing provider resolution.
 
-The tray does not keep Youta alive. Closing the window still ends the process,
-stops the player, and releases the durable-state lock; a tray that outlived its
-window would be a second, invisible way to hold that lock. Its menu opens on an
-ordinary click on every platform, because it exists to carry controls — and
-every entry on it has to mean something with no list in sight, which is why it
-carries the queue's neighbours rather than "queue the selected item next".
+Media sessions receive no cover URLs: platform image loaders would bypass the
+guarded artwork agent. On Linux, MPRIS allows other processes on the user's
+session bus to request pause or quit, within the existing same-user boundary.
+The build requires `libdbus-1-dev` alongside the GUI development libraries.
 
-Dropping files or folders on the window shows them in Local: the folder itself
-when a folder was dropped, otherwise the folder the first file lives in with
-that file selected. Several files out of one folder therefore land on all of
-them at once. Nothing is read per path — only the first is inspected and the
-rest are counted — and the folder it opens is one the arrow keys could already
-reach, so a drop opens no door Local does not already open.
+Position updates are bounded. macOS and Windows extrapolate from position and
+rate and receive updates when playback jumps. MPRIS does not extrapolate, so
+it also receives one update per second. This avoids per-tick allocations;
+the measured souvlaki macOS backend rebuilds the now-playing dictionary without
+an autorelease pool, retaining about 0.9 KiB per call.
 
-The window title, the tray tooltip, and a track-change notification all read one
-field, `now_playing`, which is the queue entry playback is on rather than
-whatever the engine parsed out of the stream. Deriving it from the visible rows
-would follow the cursor instead of the sound, since the playing item leaves the
-list as soon as the user browses elsewhere. A notification is raised only when
-the track changes while the window is *not* focused, and never for the first
-snapshot after startup: a queue restored from durable state is not a track that
-started. Titles reaching an operating system are bounded like every other piece
-of provider text Youta shows.
+Only screens accepted by `Screen::search_verb` display a query field. Clicking
+it opens the reducer's editor, just like `/` in the terminal; typing, Enter,
+and Esc use the shared keymap. Query text, insertion position, and modal
+precedence remain in `src/app.rs`, not a second desktop editor.
 
-The keyboard's media keys work too, through whatever the desktop uses for them:
-MPRIS on Linux, the System Media Transport Controls on Windows, Now Playing on
-macOS. Play and Pause name a destination rather than a change, so both are
-answered against the reducer's live state instead of the last snapshot — a Play
-arriving at something already playing does nothing rather than pausing it. Next
-and Previous step through the *queue*, continuing into the playing source list
-at its edges, which is also what those entries mean in the tray, where there is
-no cursor for "queue the selected item" to refer to.
-Youta has no stop, so the Stop button holds the item where it is; a dragged
-position is refused rather than approximated while the running time is unknown;
-and a URI arriving from the session bus is ignored, because Youta plays what its
-providers resolved.
+For terminal-only editors, the snapshot exposes only whether a modal is open;
+the shared keyboard map retains modal precedence without exposing its contents.
 
-No cover art is published there. Every one of the three hands the URL to the
-platform's own image loader, which would fetch a provider's thumbnail without
-the guarded agent that the `youta://artwork/` endpoint exists to keep in front
-of it. On Linux the media surface is MPRIS, which is to say any process on the
-user's session bus can then ask Youta to pause or quit — the bargain every MPRIS
-player makes, and no reach that running as the same user did not already grant.
+</details>
 
-The position is not pushed on every tick. macOS and Windows extrapolate elapsed
-time from the last value and the rate, so they are told again only when playback
-*jumps*; MPRIS answers `Position` with exactly what it was last told, so there
-it is refreshed every second as well. Getting this wrong is measurable rather
-than theoretical: souvlaki's macOS backend rebuilds and re-copies the whole
-now-playing dictionary per call from a thread with no autorelease pool, and a
-call costs 0.9 KiB that is never returned.
-
-On Linux this needs `libdbus-1-dev` at build time, next to the WebKitGTK
-development packages the window already requires.
-
-A search field appears on every screen that collects a query and nowhere else;
-both front-ends ask `Screen::search_verb` which those are, so a screen whose
-Enter would answer "search is not available" is never given a field. It is not
-a text input: clicking it asks the reducer to open its editor, and the typing,
-Enter, and Escape that follow travel through the shared keyboard map, exactly
-as `/` does in the terminal. The query, the insertion point, and the modal
-precedence stay in `src/app.rs`, so the window displays an editor it does not
-own.
-
-Four editors are terminal-only: the YouTube API key, the Yandex Music OAuth
-token, the RSS feed URL, and private notes. Their contents never leave the
-player process, so the window cannot draw them; it receives one bit saying an
-editor is open and shows a notice with a way out. Without that bit the window
-would look like an ordinary screen that had stopped responding, because those
-editors are modal and the keyboard map routes every key into them — and the
-YouTube one opens by itself the first time a search runs without credentials.
-Set those values in the terminal front-end or in the configuration files.
+### Local and remote artwork
 
 `images` is terminal artwork: it adds decoding and the graphics protocols on
 top of `remote-artwork`, which is the fetching and private on-disk cache alone.
@@ -949,6 +1002,8 @@ list comes from one directory, so one extra pass over it covers every row
 instead of one lookup per row. Embedded pictures stay lazy and per selection,
 since reading them means parsing each media file's tags.
 
+### Minimal source combinations
+
 For a small TUI build containing only the curated Radio catalogue and `mpv`
 playback:
 
@@ -963,6 +1018,8 @@ For metadata through the official YouTube Data API instead of Invidious:
 cargo build --release --no-default-features \
 	--features tui,images,local,rss,youtube-official,backend-mpv
 ```
+
+### Configuration overrides
 
 Copy [config.example.toml](config.example.toml) to
 `~/.config/youta/config.toml`. Environment variables override file values;
@@ -1043,6 +1100,20 @@ may coexist. `persistence.backend` alone selects which state is active, so
 switching back to `sqlite` reopens the database rather than migrating or
 deleting it.
 
+### OPML and listening-progress interchange
+
+OPML remains the subscription interchange format. It carries feed URLs and
+outline folders, but has no standard listening-progress fields. Youta stores
+source-neutral current position, total duration, update time, and played
+override for podcasts, YouTube, Bandcamp, MOD/tracker, and local media.
+
+A future `gpodder` adapter can map these values to `position`, `total`, and
+`timestamp`, and capture the per-play start offset required for `started`.
+Importing, exporting, or synchronizing episode-action JSON does not require
+making that service protocol Youta's canonical format. See the
+[gPodder episode-actions API](https://gpoddernet.readthedocs.io/en/latest/api/reference/events.html)
+and [gPodder synchronization manual](https://gpodder.github.io/docs/user-manual.html).
+
 ## Private notes
 
 Press `n`, or activate the **Add private note** / **Edit private note** row in
@@ -1074,18 +1145,6 @@ Notes survive restarts in `state/notes.toml` with the default files backend, or
 in `state.sqlite3` when the optional SQLite backend is selected. The editor
 shows the active destination. Empty notes are rejected; use the explicit
 delete action to remove one.
-
-OPML deliberately remains the subscription interchange format. It carries
-feed URLs and outline folders, but it has no standard listening-progress
-fields. Youta stores source-neutral current position, total duration, update
-time, and played override so the model also covers YouTube, Bandcamp,
-MOD/tracker, and local media. For podcasts, a future `gpodder` adapter maps
-those values to `position`, `total`, and `timestamp`, and captures the
-per-play start offset required for `started`. It can import, export, or
-synchronize episode-action JSON without making that service protocol Youta's
-canonical file format. See the
-[gPodder episode-actions API](https://gpoddernet.readthedocs.io/en/latest/api/reference/events.html)
-and [gPodder synchronization manual](https://gpodder.github.io/docs/user-manual.html).
 
 ## Online discovery and `yt-dlp`
 
@@ -1321,6 +1380,8 @@ Windows descendant termination is best-effort through `taskkill /T`, matching
 Youta's existing helper-process boundary. Youta does not retry a failed summary
 automatically.
 
+### Playback resolution and format preferences
+
 Bandcamp audio defaults to **Best available** (`best-available`). The `[b]`
 control in the `[p]` Preferences popup cycles the same closed set accepted by
 `providers.bandcamp_audio_format` and
@@ -1350,6 +1411,8 @@ rather than manually maintained tokens. Follow its current
 [PO Token guide](https://github.com/yt-dlp/yt-dlp/wiki/PO-Token-Guide) when the
 checked-format retry also fails.
 
+### SponsorBlock
+
 The default-on `sponsorblock` build feature requests the `sponsor` category
 from the read-only [SponsorBlock API](https://wiki.sponsor.ajay.app/w/API_Docs)
 for an exact YouTube video ID. Youta caches the bounded result in RAM and seeks
@@ -1367,6 +1430,8 @@ SponsorBlock service; Youta does not submit segments or votes. SponsorBlock data
 is supplied by its community; see its
 [database/API licence and attribution terms](https://github.com/ajayyy/SponsorBlock/wiki/Database-and-API-License).
 
+### Rainbow Nyan Cat seek bar
+
 The default build includes the `nyan-cat` renderer, but its runtime preference
 starts off. Enable **Rainbow Nyan Cat seek bar** in Preferences to replace the
 played fill with the six-color terminal palette and place `=^.^=` at the exact
@@ -1374,6 +1439,8 @@ playhead. The desktop window uses the same shared preference. Set
 `ui.nyan_cat_seekbar = true` or `YOUTA_UI__NYAN_CAT_SEEKBAR=true` for the same
 behavior without the popup. Builds made with `--no-default-features` can omit
 `nyan-cat` to remove both renderers and their preference control.
+
+### Fullscreen audio visualization
 
 The default-on `ascii-visualizer` feature adds a fullscreen, audio-reactive
 ASCII frequency spectrum. While audio is playing, press `F10` to open the
@@ -1399,6 +1466,8 @@ include its version and startup failures point to that setting. See CAVA's
 and [configuration reference](https://github.com/karlstav/cava/blob/master/example_files/config).
 Builds made with `--no-default-features` can omit `ascii-visualizer` to remove
 CAVA integration, the renderer, its actions, and the Help entry.
+
+### DeArrow titles
 
 When the `dearrow` build feature is enabled, Youta shows a crowdsourced title
 as `DeArrow title: …` immediately before the original video description. The
@@ -1515,9 +1584,9 @@ artwork for local subscriptions is warmed independently, so moving between
 known channels can reuse the persistent cache without a foreground network
 request. Unsupported terminals perform no thumbnail network work regardless of
 this preference. To exclude the renderer and its image
-dependencies while retaining the other defaults, build with
-`--no-default-features --features app,ascii-visualizer,audio-quality,qr,summary`. For a
-smaller custom build, omit `images`; include it explicitly to restore rendering.
+dependencies, use the complete text-only command under
+[Smaller and custom builds](#smaller-and-custom-builds). Include `images`
+explicitly in a custom build to restore rendering.
 The rendering integration uses
 [`ratatui-image`](https://docs.rs/ratatui-image/11.0.6/ratatui_image/).
 
@@ -1661,7 +1730,8 @@ subscription-source root. Youta provides two layouts:
   For YouTube, `[h] Shorts: on/off` follows the refresh action and controls
   whether provider-confirmed vertical videos remain in the list. Shorts are
   shown by default and retain their existing distinct title color. The
-  `[A] Autoplay: on/off` control follows the Shorts control.
+  `[A] Autoplay: on/off` control follows Shorts, then `[r] Repeat: off/on`.
+  RSS episode footers also offer Autoplay followed by Repeat.
 - `split` keeps sources on the left and the selected source's videos or
   episodes on the right. Moving across sources uses only cached rows and makes
   no provider request; press `Enter` to activate the source, loading it
@@ -1701,13 +1771,16 @@ when it is still in the refreshed result; a refresh failure also leaves the
 existing rows intact.
 
 Open the current in-app preferences with `[p] Preferences` or `F7`, choose
-Drill-down or Split, choose whether exact `Реклама` chapters are hidden and
-skipped, choose whether SponsorBlock segments are skipped, choose whether
-the rainbow Nyan Cat seek bar is used, choose whether selected YouTube audio is prepared, choose whether Local folder sizes are
-measured, choose the exact YouTube video-thumbnail size, choose whether new
-playback History entries are saved, choose whether new channel episodes are
-downloaded every hour, choose the explicit summary backend, and
-press `Enter` to save. These preferences can be configured directly:
+the desired options, then press `Enter` to save. It includes:
+
+- Drill-down or Split subscription layout;
+- exact `Реклама` chapter skipping and independent SponsorBlock skipping;
+- Nyan Cat seek bar and selected YouTube audio preparation;
+- Local folder-size measurement and YouTube video-thumbnail size;
+- playback History recording and hourly channel-download checks;
+- the explicit video-summary backend.
+
+These preferences can also be configured directly:
 
 ```toml
 [playback]
@@ -1794,6 +1867,8 @@ page. The detailed disk bounds are documented in
 
 ### Full-channel downloads and session LAN feeds
 
+#### Automatic downloads
+
 Every YouTube channel offers an **Auto-download** checkbox (`X` in the terminal).
 The checkbox and shortcut are available when a channel is selected, including
 channel search results and Subscriptions, not on individual video details.
@@ -1812,21 +1887,26 @@ including when hourly checks are disabled. Per-channel choices travel with
 This uses yt-dlp's [download archive options](https://github.com/yt-dlp/yt-dlp#download-options)
 and is available in builds containing the `yt-dlp` feature.
 
+#### Reviewed full-channel downloads
+
 On a subscribed YouTube channel, `[D] Download full channel` opens a review
 popup before starting anything. The button and shortcut are available only on
 channel items, not individual videos. It shows the provider's estimated video count
 when available, marks a loaded-row count as a lower bound when necessary,
 shows the exact destination and currently available disk space, and uses the
 configured audio download format. Its default-off **Ignore items before this
-item** checkbox starts with the currently selected video, using the complete
-provider order even when Shorts are hidden. The separate default-off **Skip
-Shorts** checkbox excludes entries from YouTube's Shorts tab while retaining
+item** checkbox starts at the subscription's retained video position,
+inclusively, using the complete provider order even when Shorts are hidden.
+The separate default-off **Skip Shorts** checkbox excludes entries from
+YouTube's Shorts tab while retaining
 regular videos and live uploads. Confirmation starts one supervised `yt-dlp`
 collection download with per-file and aggregate progress, speed, ETA, completed
 file count, and cancellation. It downloads public uploads as audio and can
 write each provider thumbnail beside its audio file.
 After cancellation with `[C]`, the stopped-download line disappears after
 10 seconds. A new download replaces that notice without waiting for its expiry.
+
+#### Sharing local files and folders
 
 The default-on `lan-sharing` feature adds two Local actions. `[F11] Share over
 LAN` serves the selected regular file or a bounded, recursive folder index.
@@ -1836,6 +1916,8 @@ screen. A local podcast episode uses embedded artwork when available and then
 Youta's normal sidecar-artwork fallback. The feed itself uses the first retained
 episode that has artwork as its podcast cover. The popup shows a local-IP URL
 and QR code; `[x] Stop sharing` closes the server explicitly.
+
+#### Podcast review options and episode dates
 
 When the current row is a playable local file or a YouTube video, podcast-feed
 creation first opens a review popup. Its default-off **Ignore items before this
@@ -1872,6 +1954,8 @@ date; if a retained episode has no usable date, preparation reports the error.
 Local episodes use each file's modification time. Dates are serialized in UTC
 and do not change the selected cutoff, item order, or episode identifiers.
 
+#### YouTube channel feeds and audio delivery
+
 `[F12] Podcast feed` is also available on a YouTube channel in Search and in
 YouTube Subscriptions. Its button is shown only for channel selections; the
 F12 shortcut also works on a selected episode to open the inclusive-boundary
@@ -1901,9 +1985,13 @@ time out. Ambient `yt-dlp` configuration,
 plugins, and browser cookies remain disabled. Videos whose owners prohibit
 embedded playback may therefore remain unavailable. This keeps feed creation
 independent of audio downloads. It is session scoped: the HTTP server and every
-feed URL stop when Youta exits. Use the full-channel download first and share the
-resulting Local folder when the feed must remain usable without Youta or without
-Internet access.
+feed URL stop when Youta exits. For offline source audio, download the channel
+first and share the resulting Local folder; that server still requires Youta
+to remain open, but no longer needs Internet access. Episodes fully downloaded
+to the podcast app remain usable after Youta exits. A feed that must remain
+reachable independently needs a separate persistent server.
+
+#### LAN server limits and security
 
 The server exposes only an immutable manifest prepared for that explicit
 action, ignores symbolic links during folder scans, supports `HEAD` and one
@@ -1965,14 +2053,14 @@ The roadmap is intentionally tiered:
    bidirectional local/YouTube subscription sync, Last.fm scrobbling, Discord,
    ListenBrainz, Google Drive, WebDAV, SSH, and optional one-way backups.
 4. **Experimental adapters:** Odysee, Rumble, Bilibili, Telegram, Yandex Disk,
-   VK, cloud.mail.ru, 4duk, knizhnyvoz, archive files, and
-   torrent-backed sources.
+   VK, cloud.mail.ru, 4duk, knizhnyvoz, additional archive formats, and
+   torrent-backed sources. Read-only ZIP/RAR Local folders are already implemented.
 
 Additional proprietary or scraper-dependent providers are not promised until
 an adapter has tests, documented authentication, rate limiting, and a
 maintenance owner. The implemented Bandcamp public-page adapter remains
 best-effort and makes no stability or authenticated-access claim.
-RuTracker/torrent support is a separate build feature and must remain stopped
+Any future RuTracker/torrent support must be a separate build feature and stop
 when Youta exits. Youta will not bypass access controls or digital-rights
 management.
 
@@ -2065,11 +2153,14 @@ remove the generated EDAM bindings, hashing, network client, and UI by leaving
 
 ## Diagnostics and issue review
 
-Recoverable operational errors open a scrollable report containing the Youta
+Unexpected operational errors open a scrollable report containing the Youta
 version, operating-system identity, enabled build features, exact Rust
 dependency versions, configured helper paths, the error chain, and a forced
 backtrace. Tokens, URL credentials and query strings, authorization headers,
 environment contents, and home-directory paths are redacted or omitted.
+Actionable runtime-state save conflicts instead show their concise error text,
+without a dependency list or backtrace.
+
 Helper-version processes are never launched at startup. Recoverable TUI
 reports lazily probe the configured `mpv` and `yt-dlp` concurrently; fatal CLI
 and TUI reports also probe `ffmpeg` and `ffprobe`. Every probe uses fixed
@@ -2108,12 +2199,16 @@ guidance is in [docs/AUDIOPHILE.md](docs/AUDIOPHILE.md).
 
 ## Packaging and quality
 
-Gentoo ebuild: https://github.com/vitaly-zdanevich/gentoo-overlay/tree/main/media-sound
+[Gentoo source and binary ebuilds](https://github.com/vitaly-zdanevich/gentoo-overlay/tree/main/media-sound)
+are available in the maintainer's overlay. See [Gentoo packages](#gentoo-packages)
+for USE flags and binary-size/debug settings.
+
+### Continuous integration
 
 Every pushed revision and pull request runs formatting, Clippy, Rustdoc,
 deterministic tests with default, no-default, and all features, an explicit
 terminal end-to-end target, and a 70% minimum line-coverage gate. It also runs
-required live Apple Podcasts, keyless YouTube Music, Wikidata, and public Radio
+required live Apple Podcasts, keyless YouTube Music, LibriVox, Wikidata, and public Radio
 jobs; a newer push does not cancel the older revision's suite. Clippy blocks
 compiler hygiene plus its correctness, suspicious-code, and performance groups; style,
 complexity, and pedantic findings remain visible as advisory output while that
@@ -2122,7 +2217,11 @@ Apple metadata through its RSS enclosure and silent audio decode. YouTube Music
 is checked through yt-dlp's public songs search with a 15-second process bound
 and no Google API key. Wikidata is checked through a live exact P1651 lookup.
 Each enabled live job retries once for a transient network failure; a second
-failure fails CI. Tagged releases build for Linux on amd64, i686, and arm64,
+failure fails CI.
+
+### Release artifacts
+
+Tagged releases build for Linux on amd64, i686, and arm64,
 and natively for macOS on amd64 and arm64. Linux i686 requires a Pentium 4/SSE2
 or newer processor. Each operating-system/architecture pair publishes directly
 downloadable executables for all four combinations of the default-on `images`
@@ -2153,6 +2252,8 @@ list before publication, so a missing architecture or bundle fails the release
 instead of shrinking it. Checksum sidecars are not attached because GitHub's
 Digest column already displays each published file's SHA-256 value.
 
+### Desktop and platform checks
+
 The window has its own CI lane on Linux, macOS, and Windows, which compiles it,
 runs its tests, lints it, type-checks its page, and proves by `cargo tree` that
 it links no terminal renderer. It is deliberately left out of the coverage gate:
@@ -2165,14 +2266,16 @@ durability and private-file access ask the platform instead of assuming POSIX,
 helper trees are ended with `taskkill /T`, helper processes get no console
 window of their own, and a file's identity is read from the volume serial
 number and file index rather than given up. The desktop window ships a Windows
-installer. What is still missing before a Windows *terminal* binary is
-advertised is evidence: no part of the test suite has ever been executed on
-Windows. The `windows-test` job runs it and reports without gating, precisely so
-that evidence exists to work through.
+installer. A Windows *terminal* release remains unadvertised pending validated
+test and playback coverage. The `windows-test` job runs deterministic tests in
+reporting-only mode (`continue-on-error`); Windows compile checks remain
+separate gates.
 
 FreeBSD x86_64 receives a cross-target compile check of the portable
 TUI/local-browser boundary. It is not advertised as a release target until a
 native or validated cross-build can also run playback tests.
+
+### Live-service checks
 
 Live YouTube playback is temporarily excluded from automatic hosted CI because
 YouTube returns `LOGIN_REQUIRED` for GitHub-hosted runner addresses even with
@@ -2234,42 +2337,67 @@ YOUTA_RUN_LIVE_RADIO_TEST=1 cargo test --locked --test live_services --no-defaul
 YOUTA_RUN_LIVE_BBC_RADIO_TEST=1 cargo test --locked --test live_services --no-default-features --features bbc-radio,backend-mpv -- --ignored --exact bbc_sounds_resolution_and_audio_are_usable --nocapture
 ```
 
+### Gentoo packages
+
 The Gentoo ebuild is maintained as
 [`media-sound/youta`](https://github.com/vitaly-zdanevich/gentoo-overlay/tree/main/media-sound/youta)
 in the
 [`vitaly-zdanevich-overlay`](https://github.com/vitaly-zdanevich/gentoo-overlay).
 It maps provider choices to USE flags and consumes the release vendor archive.
 Both the source and binary packages expose an opt-in `gui` USE flag; enabling
-it installs `youta` and `youta-gui` together. The GUI is available on amd64 and
-arm64, while x86 retains the TUI. The positive `images` and `qr` USE flags are
-enabled by default. Gentoo users can independently disable them with
+it installs `youta` and `youta-gui` together on amd64, arm64, and x86. The x86
+package requires SSE2 and the corresponding 32-bit GUI libraries.
+The positive `images` and `qr` USE flags are enabled by default. Gentoo users
+can independently disable them with
 conventional `USE="-images"` and `USE="-qr"` overrides.
+
 The source package maps the default-enabled `ascii-visualizer`, `audio-quality`,
 `commons-upload`, `evernote`, `lan-sharing`, `local-archives`, `nyan-cat`,
 `sponsorblock`, `summary`, and `youtube-captions` flags to their Cargo features.
-With `USE="ascii-visualizer"`, the source ebuild installs CAVA for FFT capture.
-`USE="-ascii-visualizer"` removes CAVA integration, fullscreen rendering, and
-its Help entry.
-`USE="-audio-quality"` removes the analyzer and RustFFT dependency.
-`USE="-commons-upload"` removes the Commons client and review UI.
-`USE="-evernote"` removes the Evernote EDAM client and note UI.
-`USE="-lan-sharing"` removes the session HTTP server, LAN-share/feed actions,
-and their QR workflow.
-`USE="-local-archives"` removes ZIP/RAR Local-folder browsing and the RAR helper
-dependency; add `-archive-zip` when the shared tracker ZIP decoder is also
-unnecessary. The enabled source package depends on `app-arch/unrar` for RAR
-extraction. `USE="-sponsorblock"` removes its API client, preference, cache, and
-playback skip logic. `USE="-summary"` removes the Codex summary UI and backend.
-`USE="-youtube-captions"` removes caption loading, search, and seeking while
-leaving the independent `summary` and `evernote` integrations available.
-`USE="-nyan-cat"` removes the rainbow seek-bar renderers and preference.
+
+| Source package override | What it removes |
+| --- | --- |
+| `USE="-ascii-visualizer"` | CAVA integration, fullscreen rendering, and its Help entry. |
+| `USE="-audio-quality"` | Local analyzer and RustFFT dependency. |
+| `USE="-commons-upload"` | Commons client and review UI. |
+| `USE="-evernote"` | Evernote EDAM client and note UI. |
+| `USE="-lan-sharing"` | Session HTTP server, LAN-share/feed actions, and their QR workflow. |
+| `USE="-local-archives"` | ZIP/RAR Local folders and the RAR helper dependency. |
+| `USE="-sponsorblock"` | SponsorBlock API client, preference, cache, and playback skipping. |
+| `USE="-summary"` | Codex summary UI and backend. |
+| `USE="-youtube-captions"` | Caption loading, search, and seeking; `summary` and `evernote` remain independent. |
+| `USE="-nyan-cat"` | Rainbow seek-bar renderers and preference. |
+
+`USE="ascii-visualizer"` installs CAVA for FFT capture; enabled archive-folder
+support depends on `app-arch/unrar`. Add `-archive-zip` when the shared tracker
+ZIP decoder is also unnecessary.
+
 Prebuilt executables contain a fixed upstream feature set: QR-capable variants
 keep these capabilities enabled, while `-no-qr` variants also omit LAN sharing.
 Offering more binary USE switches would require another copy of every Linux
 release variant rather than changing installed code.
+
 GPM mouse-daemon integration is opt-in with `USE="gpm"` in both packages. The
 binary ebuild selects an unsuffixed GPM-enabled executable only when that flag
 is enabled; otherwise it uses the corresponding `-no-gpm` release executable.
+
+Starting with `youta-bin-0.53.3-r1`, the binary package allows normal Portage
+stripping instead of unconditionally preserving upstream debug information:
+
+| Portage setting | Installed result |
+| --- | --- |
+| Normal stripping | Smaller executable, without debug information. |
+| `FEATURES="splitdebug"` | Smaller executable with separate debugging information. |
+| `FEATURES="nostrip"` | Original executable with its debug information retained. |
+
+There is no separate `debug` USE flag. In the measured Linux amd64 0.53.3
+artifact, stripping reduced the executable from 104.7 MB to 22.1 MB. This
+changes installed size, not the downloaded upstream artifact or its published
+checksum. Panic unwinding remains enabled; stripping is not the same as the
+`release-small` profile's abort-on-panic tradeoff.
+
+### Building release artifacts
+
 GitHub Actions use Node 24-based action majors and set the maximum requested job
 timeout to 360 minutes.
 
@@ -2296,6 +2424,8 @@ npm --prefix gui/ui ci
 npm --prefix gui/ui run build
 scripts/package-vendor.sh
 ```
+
+### Playback and podcast integration tests
 
 Before each commit, run the live YouTube playback check locally without sending
 audio to a device:
@@ -2447,6 +2577,8 @@ Youta is licensed under the [MIT License](LICENSE).
   search, watch, and download frontend with thumbnails, subscriptions, and
   history; its upstream repository says it is no longer actively maintained.
 
-My lecture/meetup about youta, in Batumi, August 2026, in Russian language https://www.youtube.com/watch?v=swzZX4Y30Ak
+## Talks and articles
 
-Article about youta https://habr.com/en/posts/1081424/
+- [Youta talk and meetup in Batumi](https://www.youtube.com/watch?v=swzZX4Y30Ak)
+  — August 2026, in Russian.
+- [Article about Youta on Habr](https://habr.com/en/posts/1081424/).
