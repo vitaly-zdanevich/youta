@@ -3587,9 +3587,9 @@ fn render_subscription_item_buttons(
     }
     let refresh_label = if loading && !loading_more {
         let frame = ASCII_ACTIVITY_FRAMES[animation_frame % ASCII_ACTIVITY_FRAMES.len()];
-        format!("Refresh {} {frame}", subscription_item_noun(source_kind))
+        format!("{} {frame}", subscription_refresh_label(source_kind))
     } else {
-        format!("Refresh {}", subscription_item_noun(source_kind))
+        subscription_refresh_label(source_kind).to_owned()
     };
     let refresh = (
         button("R", &refresh_label, show_hotkeys),
@@ -3675,11 +3675,12 @@ fn render_subscription_item_buttons(
     }
 }
 
-/// Returns the plural item noun used by one subscription source.
-const fn subscription_item_noun(source_kind: SubscriptionKind) -> &'static str {
+/// Returns the compact refresh label for one subscription source.
+const fn subscription_refresh_label(source_kind: SubscriptionKind) -> &'static str {
     match source_kind {
-        SubscriptionKind::Rss => "episodes",
-        _ => "videos",
+        SubscriptionKind::YouTube => "Refresh",
+        SubscriptionKind::Rss => "Refresh episodes",
+        SubscriptionKind::Other => "Refresh videos",
     }
 }
 
@@ -18846,7 +18847,7 @@ for encoded, expected in json.load(sys.stdin):
             "playing subscription videos keep only the active-playback marker"
         );
         assert!(rendered.contains("Expanded fixture description"));
-        assert!(rendered.contains("[R] Refresh videos  [h] Shorts: on  [A] Autoplay: off"));
+        assert!(rendered.contains("[R] Refresh  [h] Shorts: on  [A] Autoplay: off"));
         let refresh_target = hit_map
             .detail_buttons
             .iter()
@@ -18917,18 +18918,14 @@ for encoded, expected in json.load(sys.stdin):
         terminal
             .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
             .expect("draw enabled Autoplay beside subscription refresh");
-        assert!(
-            rendered_text(&terminal)
-                .contains("[R] Refresh videos  [h] Shorts: on  [A] Autoplay: on")
-        );
+        assert!(rendered_text(&terminal).contains("[R] Refresh  [h] Shorts: on  [A] Autoplay: on"));
         view.autoplay = false;
         view.subscriptions.show_youtube_shorts = false;
         terminal
             .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
             .expect("draw disabled Shorts beside subscription refresh");
         assert!(
-            rendered_text(&terminal)
-                .contains("[R] Refresh videos  [h] Shorts: off  [A] Autoplay: off")
+            rendered_text(&terminal).contains("[R] Refresh  [h] Shorts: off  [A] Autoplay: off")
         );
         view.subscriptions.show_youtube_shorts = true;
 
@@ -18937,14 +18934,14 @@ for encoded, expected in json.load(sys.stdin):
         terminal
             .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
             .expect("draw animated subscription refresh");
-        assert!(rendered_text(&terminal).contains("[R] Refresh videos -"));
+        assert!(rendered_text(&terminal).contains("[R] Refresh -"));
         view.subscriptions.loading_more = true;
         terminal
             .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
             .expect("draw static subscription continuation");
         let rendered = rendered_text(&terminal);
-        assert!(rendered.contains("[R] Refresh videos"));
-        assert!(!rendered.contains("[R] Refresh videos -"));
+        assert!(rendered.contains("[R] Refresh"));
+        assert!(!rendered.contains("[R] Refresh -"));
         assert!(rendered.contains("Loading more…"));
         view.subscriptions.loading_more = false;
         view.subscriptions.loading = false;
@@ -18969,7 +18966,7 @@ for encoded, expected in json.load(sys.stdin):
             rendered.contains("▶ Fixture video"),
             "split subscription rows keep only the active-playback marker"
         );
-        assert!(rendered.contains("[R] Refresh videos"));
+        assert!(rendered.contains("[R] Refresh"));
         assert!(rendered.contains("[i] Details"));
         assert_eq!(
             key_action(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE), &view),
@@ -19024,7 +19021,7 @@ for encoded, expected in json.load(sys.stdin):
             .expect("draw split description");
         let rendered = rendered_text(&terminal);
         assert!(rendered.contains("Expanded fixture description"));
-        assert!(rendered.contains("[R] Refresh videos"));
+        assert!(rendered.contains("[R] Refresh"));
 
         view.subscriptions.description_expanded = false;
         view.subscriptions.source_subscriber_count = None;
@@ -19333,7 +19330,7 @@ for encoded, expected in json.load(sys.stdin):
             .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
             .expect("draw narrow YouTube subscription footer");
         let rendered = rendered_text(&terminal);
-        assert!(rendered.contains("[R] Refresh videos  [h] Shorts: on"));
+        assert!(rendered.contains("[R] Refresh  [h] Shorts: on"));
         assert!(!rendered.contains("Autoplay"));
         let refresh = hit_map
             .detail_buttons

@@ -1656,7 +1656,7 @@ subscription-source root. Youta provides two layouts:
   left with channel or podcast information on the right. Press `Enter` to
   activate the selected source, render any restart snapshot, and refresh its
   videos or episodes in the usual list-and-Details view; `Backspace` or `Esc`
-  returns to the source list. `[R] Refresh videos` requests a YouTube channel's
+  returns to the source list. `[R] Refresh` requests a YouTube channel's
   first page again, while `[R] Refresh episodes` reloads an RSS or Atom feed.
   For YouTube, `[h] Shorts: on/off` follows the refresh action and controls
   whether provider-confirmed vertical videos remain in the list. Shorts are
