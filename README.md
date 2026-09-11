@@ -2083,6 +2083,8 @@ guidance is in [docs/AUDIOPHILE.md](docs/AUDIOPHILE.md).
 
 ## Packaging and quality
 
+Gentoo ebuild: https://github.com/vitaly-zdanevich/gentoo-overlay/tree/main/media-sound
+
 Every pushed revision and pull request runs formatting, Clippy, Rustdoc,
 deterministic tests with default, no-default, and all features, an explicit
 terminal end-to-end target, and a 70% minimum line-coverage gate. It also runs
