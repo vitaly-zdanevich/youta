@@ -50,6 +50,22 @@ test('explicit refresh claims Items only after its page-one command', () => {
 	assert.doesNotMatch(source, /data-pane-footer-control/);
 });
 
+/** Episode metadata must not expose the channel-only download action. */
+test('full-channel download requires a subscribed YouTube channel entity', async () => {
+	const details = await readFile(
+		new URL('./components/Details.tsx', import.meta.url),
+		'utf8',
+	);
+	const beforeButton = details.split('dispatch("OpenChannelDownload")')[0];
+	const guard = beforeButton.slice(beforeButton.lastIndexOf('{view.channel_download_supported &&'));
+	assert.match(guard, /details\.media_id === null/);
+	assert.match(guard, /view\.screen === 'Subscriptions'/);
+	assert.match(guard, /view\.subscriptions\.source_kind === YOUTUBE/);
+	assert.match(guard, /details\.channel_subscribed/);
+	assert.match(guard, /details\.channel_id !== ''/);
+	assert.doesNotMatch(guard, /\|\||view\.screen === 'Search'|\bkind ===/);
+});
+
 /** Channel metadata on an episode must not expose the channel podcast button. */
 test('YouTube podcast buttons are limited to channel entities, including search channels', async () => {
 	const details = await readFile(

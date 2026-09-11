@@ -1789,7 +1789,8 @@ This uses yt-dlp's [download archive options](https://github.com/yt-dlp/yt-dlp#d
 and is available in builds containing the `yt-dlp` feature.
 
 On a subscribed YouTube channel, `[D] Download full channel` opens a review
-popup before starting anything. It shows the provider's estimated video count
+popup before starting anything. The button and shortcut are available only on
+channel items, not individual videos. It shows the provider's estimated video count
 when available, marks a loaded-row count as a lower bound when necessary,
 shows the exact destination and currently available disk space, and uses the
 configured audio download format. Its default-off **Ignore items before this

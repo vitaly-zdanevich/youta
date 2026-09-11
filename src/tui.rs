@@ -4635,11 +4635,7 @@ fn render_information_panel(
             )
         });
     #[cfg(feature = "yt-dlp")]
-    let channel_download_button = (view.screen == Screen::Subscriptions
-        && view.subscriptions.source_kind == SubscriptionKind::YouTube
-        && details.channel_subscribed
-        && !details.channel_id.is_empty())
-    .then(|| {
+    let channel_download_button = view.youtube_full_channel_download_available().then(|| {
         push_left_detail_button(
             &mut lines,
             &right_buttons,
@@ -20879,7 +20875,7 @@ for encoded, expected in json.load(sys.stdin):
 
     #[cfg(feature = "yt-dlp")]
     #[test]
-    fn youtube_video_details_hide_channel_auto_download_and_shortcut() {
+    fn youtube_video_details_hide_channel_download_buttons_and_shortcuts() {
         for screen in [Screen::Search, Screen::Subscriptions] {
             let mut terminal = Terminal::new(TestBackend::new(180, 32)).expect("terminal");
             let view = ViewModel {
@@ -20900,9 +20896,20 @@ for encoded, expected in json.load(sys.stdin):
                 .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
                 .expect("draw video details");
             assert!(!rendered_text(&terminal).contains("Auto-download"));
-            if screen == Screen::Subscriptions {
-                assert!(rendered_text(&terminal).contains("[D] Download full channel"));
-            }
+            assert!(!rendered_text(&terminal).contains("Download full channel"));
+            assert!(
+                !hit_map
+                    .detail_buttons
+                    .iter()
+                    .any(|(action, _)| *action == UiAction::OpenChannelDownload)
+            );
+            assert_eq!(
+                key_action(
+                    KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT),
+                    &view
+                ),
+                None
+            );
             assert!(
                 !hit_map
                     .detail_buttons

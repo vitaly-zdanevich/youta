@@ -311,6 +311,8 @@ export function Details({ view, kind }: { view: ViewModel; kind: InformationPane
 			<Action onClick={() => void dispatch('ShareYouTubeChannelPodcast')}>Podcast feed</Action>
 		) : null}
 		{view.channel_download_supported &&
+		// Videos carry channel metadata too; only channel entities have no media ID.
+		details.media_id === null &&
 		view.screen === 'Subscriptions' &&
 		view.subscriptions.source_kind === YOUTUBE &&
 		details.channel_subscribed &&

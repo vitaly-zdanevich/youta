@@ -1681,14 +1681,7 @@ fn unfiltered_key_action(
             Some(UiAction::DownloadYandexMusicAlbum)
         }
         #[cfg(feature = "yt-dlp")]
-        Key::Char('D')
-            if view.screen == Screen::Subscriptions
-                && view.subscriptions.source_kind
-                    == crate::subscriptions::SubscriptionKind::YouTube
-                && view.details.as_ref().is_some_and(|details| {
-                    details.channel_subscribed && !details.channel_id.is_empty()
-                }) =>
-        {
+        Key::Char('D') if view.youtube_full_channel_download_available() => {
             Some(UiAction::OpenChannelDownload)
         }
         Key::Char('R')

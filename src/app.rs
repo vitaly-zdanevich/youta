@@ -19396,11 +19396,9 @@ impl AppController {
                 "One download is already running; wait for it to finish or cancel it".to_owned();
             return;
         }
-        if self.view.screen != Screen::Subscriptions
-            || self.view.subscriptions.source_kind != SubscriptionKind::YouTube
-        {
+        if !self.view.youtube_full_channel_download_available() {
             self.view.status_line =
-                "Full-channel download is available for YouTube subscriptions".to_owned();
+                "Select a subscribed YouTube channel to download its audio".to_owned();
             return;
         }
         let Some(details) = self.view.details.as_ref() else {
@@ -72366,6 +72364,17 @@ mod tests {
             ..DetailView::default()
         });
 
+        controller.view.details.as_mut().expect("details").media_id =
+            Some(MediaId::new(SourceKind::YouTube, "fixture-video"));
+        controller.dispatch(UiAction::OpenChannelDownload);
+        assert!(
+            controller.view.channel_download_popup.is_none(),
+            "video details must not open a full-channel download"
+        );
+        assert!(controller.channel_download_selection.is_none());
+        assert!(requests.lock().expect("download requests").is_empty());
+
+        controller.view.details.as_mut().expect("details").media_id = None;
         controller.dispatch(UiAction::OpenChannelDownload);
 
         let popup = controller

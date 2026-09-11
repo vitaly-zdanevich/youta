@@ -2450,6 +2450,22 @@ impl ViewModel {
                 .is_some_and(|details| !details.channel_id.is_empty() && details.media_id.is_none())
     }
 
+    /// Reports whether a subscribed `YouTube` channel can open download review.
+    ///
+    /// Channel metadata on a video does not make it a channel item. Share this
+    /// rule between button visibility, keyboard input, and action dispatch.
+    #[must_use]
+    pub fn youtube_full_channel_download_available(&self) -> bool {
+        self.channel_download_supported
+            && self.screen == Screen::Subscriptions
+            && self.subscriptions.source_kind == SubscriptionKind::YouTube
+            && self.details.as_ref().is_some_and(|details| {
+                details.channel_subscribed
+                    && !details.channel_id.is_empty()
+                    && details.media_id.is_none()
+            })
+    }
+
     /// Reports whether expanded Details owns a renderable artwork source.
     ///
     /// Both front-ends need this to decide whether the expanded-artwork key is
@@ -3427,6 +3443,44 @@ mod tests {
         assert!(!view.youtube_channel_auto_download_available());
         view.details = None;
         assert!(!view.youtube_channel_auto_download_available());
+    }
+
+    #[test]
+    fn full_channel_download_is_available_only_for_subscribed_channel_entities() {
+        let mut view = ViewModel {
+            screen: Screen::Subscriptions,
+            channel_download_supported: true,
+            details: Some(DetailView {
+                channel_id: "UCfixture".to_owned(),
+                channel_subscribed: true,
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        for mode in [RightPanelMode::Details, RightPanelMode::Channel] {
+            view.right_panel_mode = mode;
+            assert!(view.youtube_full_channel_download_available());
+            view.details.as_mut().unwrap().media_id =
+                Some(MediaId::new(SourceKind::YouTube, "fixture-video"));
+            assert!(!view.youtube_full_channel_download_available());
+            view.details.as_mut().unwrap().media_id = None;
+        }
+        view.screen = Screen::Search;
+        assert!(!view.youtube_full_channel_download_available());
+        view.screen = Screen::Subscriptions;
+        view.subscriptions.source_kind = SubscriptionKind::Rss;
+        assert!(!view.youtube_full_channel_download_available());
+        view.subscriptions.source_kind = SubscriptionKind::YouTube;
+        view.details.as_mut().unwrap().channel_subscribed = false;
+        assert!(!view.youtube_full_channel_download_available());
+        view.details.as_mut().unwrap().channel_subscribed = true;
+        view.channel_download_supported = false;
+        assert!(!view.youtube_full_channel_download_available());
+        view.channel_download_supported = true;
+        view.details.as_mut().unwrap().channel_id.clear();
+        assert!(!view.youtube_full_channel_download_available());
+        view.details = None;
+        assert!(!view.youtube_full_channel_download_available());
     }
 
     #[test]
