@@ -624,7 +624,7 @@ where
     let mut inspected_entries = 0_usize;
     let mut pending_directories = Vec::new();
     let mut root_identities = BTreeMap::new();
-    let mut traversed_directory_identities = BTreeMap::new();
+    let mut traversed_directory_snapshots = BTreeMap::new();
     let mut audio_files = BTreeMap::new();
 
     for root in unique_roots {
@@ -660,7 +660,6 @@ where
             continue;
         }
         let before = required_directory_identity(&directory)?;
-        traversed_directory_identities.insert(directory.clone(), before.clone());
         let entries = fs::read_dir(&directory).map_err(|source| {
             AudioQualityTargetCollectionError::Inspect {
                 path: directory.clone(),
@@ -668,6 +667,7 @@ where
             }
         })?;
         let mut child_directories = Vec::new();
+        let mut child_names = BTreeSet::new();
         for result in entries {
             check_target_collection_cancellation(cancellation)?;
             inspect_one_target(&mut inspected_entries, limits.maximum_inspected_entries)?;
@@ -675,6 +675,11 @@ where
                 path: directory.clone(),
                 source,
             })?;
+            if !child_names.insert(entry.file_name()) {
+                return Err(AudioQualityTargetCollectionError::TargetChanged(
+                    directory.clone(),
+                ));
+            }
             let path = entry.path();
             let Some(identity) = inspect_collectable_target(&path)? else {
                 continue;
@@ -703,6 +708,7 @@ where
             }
         }
 
+        traversed_directory_snapshots.insert(directory.clone(), (before.clone(), child_names));
         after_directory(&directory);
         check_target_collection_cancellation(cancellation)?;
         ensure_collected_target_unchanged(&directory, &before)?;
@@ -714,8 +720,10 @@ where
         check_target_collection_cancellation(cancellation)?;
         ensure_collected_target_unchanged(root, identity)?;
     }
-    for (directory, identity) in &traversed_directory_identities {
+    for (directory, (identity, child_names)) in &traversed_directory_snapshots {
         check_target_collection_cancellation(cancellation)?;
+        ensure_collected_target_unchanged(directory, identity)?;
+        ensure_directory_entries_unchanged(directory, child_names, cancellation)?;
         ensure_collected_target_unchanged(directory, identity)?;
     }
     for (path, identity) in &audio_files {
@@ -723,6 +731,48 @@ where
         ensure_collected_target_unchanged(path, identity)?;
     }
     Ok(audio_files.into_keys().collect())
+}
+
+/// Revalidates raw child names independently of directory timestamp precision.
+///
+/// Windows may expose unchanged directory metadata after a child appears. Keep
+/// the original identity checks, but also compare all names observed during the
+/// bounded traversal, including skipped non-audio entries and symbolic links.
+/// Removing each expected name detects duplicates and stops on the first new
+/// name, bounding this second scan to the snapshot length plus one. Existing
+/// names do not consume the unique-entry limit a second time.
+fn ensure_directory_entries_unchanged(
+    directory: &Path,
+    expected: &BTreeSet<OsString>,
+    cancellation: &AudioQualityCancellation,
+) -> Result<(), AudioQualityTargetCollectionError> {
+    check_target_collection_cancellation(cancellation)?;
+    let entries =
+        fs::read_dir(directory).map_err(|source| AudioQualityTargetCollectionError::Inspect {
+            path: directory.to_owned(),
+            source,
+        })?;
+    let mut remaining = expected.clone();
+    for result in entries {
+        check_target_collection_cancellation(cancellation)?;
+        let entry = result.map_err(|source| AudioQualityTargetCollectionError::Inspect {
+            path: directory.to_owned(),
+            source,
+        })?;
+        if !remaining.remove(&entry.file_name()) {
+            return Err(AudioQualityTargetCollectionError::TargetChanged(
+                directory.to_owned(),
+            ));
+        }
+    }
+    check_target_collection_cancellation(cancellation)?;
+    if remaining.is_empty() {
+        Ok(())
+    } else {
+        Err(AudioQualityTargetCollectionError::TargetChanged(
+            directory.to_owned(),
+        ))
+    }
 }
 
 fn validate_target_limits(
@@ -2784,6 +2834,97 @@ mod tests {
             error,
             AudioQualityTargetCollectionError::TargetChanged(path) if path == earlier
         ));
+    }
+
+    #[test]
+    fn directory_membership_revalidation_detects_changes_without_metadata_comparison() {
+        for change in ["added", "removed", "renamed"] {
+            let directory = tempfile::tempdir().expect("temporary directory");
+            let audio = directory.path().join("known.mp3");
+            let note = directory.path().join("notes.txt");
+            fs::write(&audio, b"known audio").expect("known audio");
+            fs::write(&note, b"notes").expect("non-audio entry");
+            let expected =
+                BTreeSet::from([OsString::from("known.mp3"), OsString::from("notes.txt")]);
+            match change {
+                "added" => fs::write(directory.path().join("cover.jpg"), b"artwork")
+                    .expect("add non-audio entry"),
+                "removed" => fs::remove_file(&note).expect("remove non-audio entry"),
+                "renamed" => fs::rename(&note, directory.path().join("renamed.txt"))
+                    .expect("rename non-audio entry"),
+                _ => unreachable!(),
+            }
+
+            // Membership must detect the change independently of directory
+            // timestamps or inode-change metadata that Windows may not expose.
+            let error = ensure_directory_entries_unchanged(
+                directory.path(),
+                &expected,
+                &AudioQualityCancellation::new(),
+            )
+            .expect_err("changed directory membership must reject partial targets");
+            assert!(
+                matches!(
+                    error,
+                    AudioQualityTargetCollectionError::TargetChanged(path)
+                        if path == directory.path()
+                ),
+                "{change}",
+            );
+        }
+    }
+
+    #[test]
+    fn directory_membership_revalidation_accepts_unchanged_and_empty_directories() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let cancellation = AudioQualityCancellation::new();
+        ensure_directory_entries_unchanged(directory.path(), &BTreeSet::new(), &cancellation)
+            .expect("unchanged empty directory");
+        // Creation order need not match the native filename ordering.
+        for name in ["z-notes.txt", "a-track.mp3"] {
+            fs::write(directory.path().join(name), b"fixture").expect("directory entry");
+        }
+        let expected =
+            BTreeSet::from([OsString::from("a-track.mp3"), OsString::from("z-notes.txt")]);
+        ensure_directory_entries_unchanged(directory.path(), &expected, &cancellation)
+            .expect("unchanged directory membership");
+    }
+
+    #[test]
+    fn directory_membership_revalidation_checks_cancellation_before_inspection() {
+        let cancellation = AudioQualityCancellation::new();
+        cancellation.cancel();
+        let missing = Path::new("missing-cancelled-directory-snapshot");
+        assert!(matches!(
+            ensure_directory_entries_unchanged(missing, &BTreeSet::new(), &cancellation),
+            Err(AudioQualityTargetCollectionError::Cancelled)
+        ));
+        assert!(matches!(
+            ensure_directory_entries_unchanged(
+                missing,
+                &BTreeSet::new(),
+                &AudioQualityCancellation::new(),
+            ),
+            Err(AudioQualityTargetCollectionError::Inspect { path, .. }) if path == missing
+        ));
+    }
+
+    #[test]
+    fn target_collection_membership_revalidation_preserves_the_unique_entry_limit() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let audio = directory.path().join("known.mp3");
+        fs::write(&audio, b"known audio").expect("known audio");
+        fs::write(directory.path().join("notes.txt"), b"notes").expect("non-audio entry");
+        let targets = collect_audio_quality_targets(
+            &[directory.path().to_path_buf()],
+            AudioQualityTargetLimits {
+                maximum_inspected_entries: 3,
+                ..AudioQualityTargetLimits::default()
+            },
+            &AudioQualityCancellation::new(),
+        )
+        .expect("revalidation must not count the same directory entries twice");
+        assert_eq!(targets, [audio]);
     }
 
     #[test]
