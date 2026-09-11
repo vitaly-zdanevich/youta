@@ -1,7 +1,7 @@
 //! Bounded HTTP socket polls without ambiguous blocking timeout progress.
 
 use std::io::{self, Read, Write};
-use std::net::TcpStream;
+use std::net::{Shutdown, TcpStream};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -31,6 +31,16 @@ impl HttpStream {
         socket.set_read_timeout(None)?;
         socket.set_write_timeout(None)?;
         Ok(Self { socket })
+    }
+
+    /// Signals a completed response without relying on final socket-handle drop.
+    ///
+    /// Winsock recommends an explicit send-side shutdown before closing. This
+    /// queues EOF after accepted response bytes even while a reader clone is
+    /// alive, without disabling receives or waiting for the peer to close.
+    /// See <https://learn.microsoft.com/en-us/windows/win32/winsock/graceful-shutdown-linger-options-and-socket-closure-2>.
+    pub(super) fn finish_response(&self) -> io::Result<()> {
+        self.socket.shutdown(Shutdown::Write)
     }
 
     /// Clones the already-configured socket without changing its shared options.

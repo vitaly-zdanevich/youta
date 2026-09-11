@@ -1093,7 +1093,7 @@ fn write_busy_response(stream: &mut HttpStream, head: bool, stop: &AtomicBool) -
     if !head {
         write_response_bytes(stream, body.as_bytes(), stop, deadline)?;
     }
-    Ok(())
+    stream.finish_response()
 }
 
 /// Reads one bounded HTTP line without losing fragments across socket timeouts.
@@ -3239,6 +3239,41 @@ mod tests {
             files: Vec::new(),
             artwork: Vec::new(),
             remote: None,
+        }
+    }
+
+    #[test]
+    fn busy_response_signals_eof_before_connection_handles_are_dropped() {
+        for head in [false, true] {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let mut client =
+                TcpStream::connect_timeout(&listener.local_addr().unwrap(), Duration::from_secs(2))
+                    .unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let (socket, _) = listener.accept().unwrap();
+            let mut stream = HttpStream::new(socket).unwrap();
+            // A handler's request reader can retain a second socket handle.
+            // The completed response must still explicitly signal EOF.
+            let reader = stream.try_clone().unwrap();
+            write_busy_response(&mut stream, head, &AtomicBool::new(false)).unwrap();
+            let mut response = String::new();
+            let read = client.read_to_string(&mut response);
+            drop(reader);
+            drop(stream);
+            read.expect("a complete retry response must end gracefully before final close");
+            let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+            assert!(headers.starts_with("HTTP/1.1 503 Service Unavailable"));
+            assert!(headers.contains("Content-Length: 28\r\n"));
+            assert_eq!(
+                body,
+                if head {
+                    ""
+                } else {
+                    "Youta is busy; retry shortly"
+                }
+            );
         }
     }
 
