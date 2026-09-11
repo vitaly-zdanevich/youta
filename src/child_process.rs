@@ -36,7 +36,8 @@
 #[cfg(any(
     feature = "ascii-visualizer",
     feature = "audio-quality",
-    feature = "yt-dlp"
+    feature = "yt-dlp",
+    all(feature = "web-browser", feature = "local-metadata")
 ))]
 use std::process::Child;
 use std::process::Command;
@@ -69,7 +70,8 @@ pub fn quiet(command: &mut Command) -> &mut Command {
 #[cfg(any(
     feature = "ascii-visualizer",
     feature = "audio-quality",
-    feature = "yt-dlp"
+    feature = "yt-dlp",
+    all(feature = "web-browser", feature = "local-metadata")
 ))]
 pub fn supervised(command: &mut Command) -> &mut Command {
     #[cfg(unix)]
@@ -88,7 +90,8 @@ pub fn supervised(command: &mut Command) -> &mut Command {
 #[cfg(any(
     feature = "ascii-visualizer",
     feature = "audio-quality",
-    feature = "yt-dlp"
+    feature = "yt-dlp",
+    all(feature = "web-browser", feature = "local-metadata")
 ))]
 pub fn kill_descendants(pid: u32) {
     #[cfg(windows)]
@@ -117,7 +120,8 @@ pub fn kill_descendants(pid: u32) {
 #[cfg(any(
     feature = "ascii-visualizer",
     feature = "audio-quality",
-    feature = "yt-dlp"
+    feature = "yt-dlp",
+    all(feature = "web-browser", feature = "local-metadata")
 ))]
 pub fn terminate_tree(child: &mut Child) {
     #[cfg(unix)]
@@ -157,7 +161,8 @@ pub fn terminate_tree(child: &mut Child) {
         any(
             feature = "ascii-visualizer",
             feature = "audio-quality",
-            feature = "yt-dlp"
+            feature = "yt-dlp",
+            all(feature = "web-browser", feature = "local-metadata")
         )
     ),
     test

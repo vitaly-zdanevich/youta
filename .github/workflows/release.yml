@@ -106,6 +106,9 @@ jobs:
           cargo test --locked --all-targets --no-default-features --features tui,lan-sharing
           cargo test --locked --all-targets --no-default-features --features qr
           cargo test --locked --all-targets --no-default-features --features tui,local
+          cargo test --locked --lib --no-default-features --features controller,web-browser web_
+          cargo test --locked --lib --no-default-features --features controller,web-browser,local-metadata web_
+          cargo test --locked --lib --no-default-features --features controller,web-browser,local-artwork web_
           cargo test --locked --all-targets --no-default-features --features tui,local-archives
           cargo test --locked --all-targets --no-default-features --features tui,acoustid,wikidata
           cargo test --locked --all-targets --no-default-features --features tui,apple-podcasts

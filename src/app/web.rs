@@ -15,6 +15,8 @@ pub(super) struct WebState {
     pub(super) generation: u64,
     pub(super) pending: bool,
     pub(super) worker: Option<WebWorker>,
+    #[cfg(feature = "local-metadata")]
+    pub(super) metadata: super::web_metadata::WebMetadataState,
     request: Option<(u64, url::Url)>,
     back: VecDeque<(url::Url, usize)>,
     restore_row: usize,
@@ -118,6 +120,8 @@ impl AppController {
             self.handle_web_response(worker.generation, result);
         }
         self.start_web_worker();
+        #[cfg(feature = "local-metadata")]
+        self.poll_web_metadata();
     }
 
     /// Accepts only the latest navigation owner, caching hidden-tab results without drawing them.
@@ -240,6 +244,8 @@ impl AppController {
             } else { "Audio only. With Autoplay enabled, playback continues through this folder in the displayed order.".to_owned() },
             ..DetailView::default()
         });
+        #[cfg(feature = "local-metadata")]
+        self.apply_web_metadata_detail();
     }
 
     /// Opens a directory or captures the playable list before starting direct media.
@@ -290,6 +296,8 @@ impl AppController {
         if self.view.screen != Screen::Web {
             return;
         }
+        #[cfg(feature = "local-metadata")]
+        self.invalidate_web_metadata();
         if let Ok(url) = url::Url::parse(&self.web.query) {
             self.browse_web_url(url, self.view.selected);
         } else {

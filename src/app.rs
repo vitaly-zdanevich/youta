@@ -11,6 +11,10 @@
 
 #[cfg(feature = "web-browser")]
 mod web;
+#[cfg(all(feature = "web-browser", feature = "local-metadata"))]
+mod web_metadata;
+#[cfg(all(feature = "web-browser", feature = "local-metadata"))]
+mod web_probe;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 #[cfg(any(feature = "commons-upload", feature = "evernote", feature = "yt-dlp"))]
@@ -45191,6 +45195,9 @@ pub fn is_confined_path(root: &Path, candidate: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(feature = "web-browser", feature = "local-metadata"))]
+    #[path = "web_metadata.rs"]
+    mod web_metadata_tests;
     #[cfg(feature = "web-browser")]
     #[path = "web.rs"]
     mod web_tests;

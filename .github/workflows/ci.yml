@@ -200,6 +200,9 @@ jobs:
           cargo check --locked --no-default-features --features tui,lan-sharing
           cargo check --locked --no-default-features --features tui,local-browser
           cargo check --locked --no-default-features --features tui,local-metadata
+          cargo check --locked --no-default-features --features tui,web-browser
+          cargo check --locked --no-default-features --features tui,web-browser,local-metadata
+          cargo check --locked --no-default-features --features tui,web-browser,local-artwork
           cargo check --locked --no-default-features --features tui,local-rename
           cargo check --locked --no-default-features --features tui,local-trash
           cargo check --locked --no-default-features --features tui,local-move

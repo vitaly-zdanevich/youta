@@ -182,6 +182,19 @@ links can still be saved in playlists and history. Reopening Youta asks for an
 address again. Local Rename, Move, and Trash actions are not offered for Web
 entries.
 
+With `local-metadata` enabled (the default), pausing on a media file loads its
+title, artist, album, genre, comment, duration, size, codec, bitrate, sample rate,
+and channel count when available. Filenames and their ordering stay unchanged
+in the list. Embedded covers use `local-artwork` and the existing image cache.
+Loading is background-only, delayed by 200 ms while navigating, and cached for
+five minutes (up to 128 files). `R` also retries unavailable metadata.
+
+Metadata inspection uses bounded HTTP ranges: at most 8 MiB, 32 requests, and
+five seconds per selection. A server without range support supplies at most a
+1 MiB prefix; unavailable trailing tags or duration stay omitted. Unsupported
+video headers may additionally use the configured `ffprobe`, with a five-second
+limit and only already-fetched bytes through a pipe, never the remote URL.
+
 To try a directory locally, use
 [Python's `http.server`](https://docs.python.org/3/library/http.server.html):
 
@@ -712,7 +725,7 @@ leave it out of an explicit `--no-default-features` feature list:
 | `qr` | Offline QR encoding. |
 | `sponsorblock` | SponsorBlock UI, networking, cache, and playback skipping. |
 | `summary` | Explicit Codex video summaries. |
-| `web-browser` | Web tab and its HTML directory parser, unused by other sources. |
+| `web-browser` | Web tab and its HTML directory parser; selected-file metadata uses `local-metadata`, covers use `local-artwork`. |
 | `youtube-captions` | Searchable captions and the current-cue line. |
 
 Both custom examples retain `local-archives`; remove it if archive folders are

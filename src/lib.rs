@@ -53,6 +53,8 @@ pub mod text_file_open;
 pub mod waveform;
 #[cfg(feature = "web-browser")]
 pub mod web_browser;
+#[cfg(all(feature = "web-browser", feature = "local-metadata"))]
+pub(crate) mod web_metadata;
 
 #[cfg(feature = "audio-quality")]
 pub mod audio_quality;

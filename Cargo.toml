@@ -244,8 +244,9 @@ local = [
 local-browser = []
 # Bounded HTTP directory listings with direct audio-only playback.
 web-browser = ["network", "local-browser", "dep:html5gum", "dep:percent-encoding", "dep:sha2"]
-# Tag, codec, and technical metadata extraction.
-local-metadata = ["local-browser", "dep:encoding_rs", "dep:lofty"]
+# Tag, codec, and technical metadata extraction for Local and selected Web files.
+# Process supervision keeps the bounded Web header probe cancellable.
+local-metadata = ["local-browser", "dep:encoding_rs", "dep:lofty", "dep:rustix"]
 # Restart-safe no-overwrite local-file renaming.
 local-rename = ["local-browser", "dep:rustix"]
 # Recoverable platform Trash integration.
