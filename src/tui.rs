@@ -11801,22 +11801,44 @@ fn key_action(key: KeyEvent, view: &ViewModel) -> Option<UiAction> {
     key_action_with_page_rows(key, view, None, None)
 }
 
-/// Maps one key using the current rendered main-list page capacity.
+/// Maps one key using rendered list capacity and Details scroll bounds.
 ///
 /// The mapping itself lives in [`crate::keymap`] so the window applies the
-/// same modal precedence. Only the translation from Crossterm is local.
+/// same modal precedence. Terminal Details movements then use the visible
+/// offset, like mouse scrolling, so excess requests or a resized pane cannot
+/// accumulate invisible scroll steps. This reuses the last frame's geometry
+/// without rewrapping text or requesting another redraw.
 fn key_action_with_page_rows(
     key: KeyEvent,
     view: &ViewModel,
     page_rows: Option<usize>,
     hit_map: Option<&HitMap>,
 ) -> Option<UiAction> {
-    crate::keymap::key_action(
+    let action = crate::keymap::key_action(
         key_press(key)?,
         view,
         page_rows,
         hit_map.map(popup_geometry),
-    )
+    )?;
+    let (UiAction::ScrollDetails(movement), Some(hit_map)) = (&action, hit_map) else {
+        return Some(action);
+    };
+    let maximum = hit_map.details_scroll_maximum;
+    let offset = hit_map.details_scroll_offset.min(maximum);
+    let requested = match *movement {
+        DetailsScroll::Lines(lines) => {
+            offset.saturating_add_signed(isize::try_from(lines).unwrap_or_default())
+        }
+        // Preserve the controller's existing twenty-line keyboard page step.
+        DetailsScroll::Pages(pages) => offset.saturating_add_signed(
+            isize::try_from(pages)
+                .unwrap_or_default()
+                .saturating_mul(20),
+        ),
+        DetailsScroll::Home => 0,
+        DetailsScroll::End => maximum,
+    };
+    Some(UiAction::SetDetailsScroll(requested.min(maximum)))
 }
 
 fn mouse_action(mouse: MouseEvent, hit_map: &HitMap, view: &ViewModel) -> Option<UiAction> {
@@ -20141,6 +20163,185 @@ for encoded, expected in json.load(sys.stdin):
             rendered_after_wheel, rendered_at_end,
             "one upward wheel notch must visibly change the wrapped text window"
         );
+    }
+
+    /// Every keyboard movement starts at the visible offset, including when a
+    /// persisted End request or a resized pane left a larger requested offset.
+    #[test]
+    fn details_keyboard_scroll_uses_rendered_bounds_for_all_movements() {
+        let view = ViewModel {
+            details: Some(DetailView::default()),
+            details_focused: true,
+            details_scroll: usize::MAX,
+            ..ViewModel::default()
+        };
+        for (offset, maximum) in [(31_usize, 50_usize), (50, 50), (0, 50), (0, 0)] {
+            let hit_map = HitMap {
+                details_scroll_offset: offset,
+                details_scroll_maximum: maximum,
+                ..HitMap::default()
+            };
+            for (code, modifiers, expected) in [
+                (
+                    KeyCode::Char('d'),
+                    KeyModifiers::ALT,
+                    offset.saturating_add(1).min(maximum),
+                ),
+                (
+                    KeyCode::Down,
+                    KeyModifiers::ALT,
+                    offset.saturating_add(1).min(maximum),
+                ),
+                (
+                    KeyCode::Char('u'),
+                    KeyModifiers::ALT,
+                    offset.saturating_sub(1),
+                ),
+                (KeyCode::Up, KeyModifiers::ALT, offset.saturating_sub(1)),
+                (
+                    KeyCode::PageDown,
+                    KeyModifiers::NONE,
+                    offset.saturating_add(20).min(maximum),
+                ),
+                (
+                    KeyCode::PageUp,
+                    KeyModifiers::NONE,
+                    offset.saturating_sub(20),
+                ),
+                (KeyCode::Home, KeyModifiers::NONE, 0),
+                (KeyCode::End, KeyModifiers::NONE, maximum),
+            ] {
+                assert_eq!(
+                    key_action_with_page_rows(
+                        KeyEvent::new(code, modifiers),
+                        &view,
+                        None,
+                        Some(&hit_map),
+                    ),
+                    Some(UiAction::SetDetailsScroll(expected)),
+                    "{code:?} at visible offset {offset}/{maximum} must ignore the unbounded request"
+                );
+            }
+        }
+    }
+
+    /// Pressing Alt-D beyond the last page must never create invisible scroll
+    /// debt: the first Alt-U must immediately move the rendered text upward.
+    #[test]
+    fn details_keyboard_scroll_stops_at_bottom_and_reverses_immediately() {
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("terminal");
+        let mut view = ViewModel {
+            details: Some(DetailView {
+                title: "Keyboard scroll fixture".to_owned(),
+                description: (0..=60)
+                    .map(|line| format!("KEYBOARD_SCROLL_LINE_{line:02}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw initial description");
+        let maximum = hit_map.details_scroll_maximum;
+        assert!(maximum > 0);
+        for _ in 0..maximum + 20 {
+            let action = key_action_with_page_rows(
+                KeyEvent::new(KeyCode::Char('d'), KeyModifiers::ALT),
+                &view,
+                None,
+                Some(&hit_map),
+            );
+            let expected = view.details_scroll.saturating_add(1).min(maximum);
+            assert_eq!(action, Some(UiAction::SetDetailsScroll(expected)));
+            view.details_scroll = expected;
+            view.details_focused = true;
+            terminal
+                .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+                .expect("draw keyboard scroll step");
+            assert_eq!(hit_map.details_scroll_offset, view.details_scroll);
+        }
+        let bottom = rendered_text(&terminal);
+        assert!(bottom.contains("KEYBOARD_SCROLL_LINE_60"));
+        assert_eq!(view.details_scroll, maximum);
+        assert_eq!(
+            key_action_with_page_rows(
+                KeyEvent::new(KeyCode::Char('u'), KeyModifiers::ALT),
+                &view,
+                None,
+                Some(&hit_map),
+            ),
+            Some(UiAction::SetDetailsScroll(maximum - 1)),
+        );
+        view.details_scroll = maximum - 1;
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw first upward keyboard step");
+        assert_ne!(rendered_text(&terminal), bottom);
+    }
+
+    /// A larger viewport or shorter replacement text changes the bounds, not
+    /// the number of upward keypresses needed to reach visible content.
+    #[test]
+    fn details_keyboard_scroll_recovers_after_resize_and_shorter_content() {
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("terminal");
+        let mut view = ViewModel {
+            details: Some(DetailView {
+                description: (0..=60)
+                    .map(|line| format!("RESIZE_SCROLL_LINE_{line:02}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                ..DetailView::default()
+            }),
+            details_focused: true,
+            details_scroll: usize::MAX,
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw initial end position");
+        let old_maximum = hit_map.details_scroll_maximum;
+        view.details_scroll = old_maximum;
+
+        terminal.backend_mut().resize(120, 45);
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw resized description");
+        let maximum = hit_map.details_scroll_maximum;
+        assert!(maximum > 0 && maximum < old_maximum);
+        assert_eq!(hit_map.details_scroll_offset, maximum);
+        assert_eq!(
+            key_action_with_page_rows(
+                KeyEvent::new(KeyCode::Char('u'), KeyModifiers::ALT),
+                &view,
+                None,
+                Some(&hit_map),
+            ),
+            Some(UiAction::SetDetailsScroll(maximum - 1)),
+        );
+
+        for description in ["Short description", ""] {
+            view.details.as_mut().expect("details").description = description.to_owned();
+            terminal
+                .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+                .expect("draw shorter description");
+            assert_eq!(hit_map.details_scroll_maximum, 0);
+            assert_eq!(hit_map.details_scroll_offset, 0);
+            for letter in ['u', 'd'] {
+                assert_eq!(
+                    key_action_with_page_rows(
+                        KeyEvent::new(KeyCode::Char(letter), KeyModifiers::ALT),
+                        &view,
+                        None,
+                        Some(&hit_map),
+                    ),
+                    Some(UiAction::SetDetailsScroll(0)),
+                );
+            }
+        }
     }
 
     #[test]
