@@ -2423,3 +2423,5 @@ Youta is licensed under the [MIT License](LICENSE).
   history; its upstream repository says it is no longer actively maintained.
 
 My lecture/meetup about youta, in Batumi, August 2026, in Russian language https://www.youtube.com/watch?v=swzZX4Y30Ak
+
+Article about youta https://habr.com/en/posts/1081424/
