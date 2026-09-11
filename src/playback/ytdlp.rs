@@ -1988,9 +1988,11 @@ mod tests {
                 .any(|argument| argument == "--yes-playlist")
         );
         assert!(!arguments.iter().any(|argument| argument == "--no-playlist"));
+        // Joining uses native separators even when the fixture root has '/'.
+        // Keep validating the entire archive path on Unix and Windows.
         assert!(arguments.windows(2).any(|pair| {
             pair[0] == "--download-archive"
-                && pair[1] == "/tmp/youta-fixture-downloads/.youta-download-archive"
+                && Path::new(&pair[1]) == request.destination.join(".youta-download-archive")
         }));
         assert!(
             arguments

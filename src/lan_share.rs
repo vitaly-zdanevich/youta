@@ -1018,6 +1018,17 @@ fn reap_finished_connections(connections: &mut Vec<JoinHandle<()>>) {
     }
 }
 
+/// Uses blocking worker I/O with short polls independently of listener mode.
+///
+/// Winsock can preserve the listener's nonblocking mode on accepted sockets.
+/// Socket timeouts alone do not clear that mode, so reads would otherwise spin
+/// on `WouldBlock` instead of waiting for data or the next cancellation poll.
+fn configure_http_stream(stream: &TcpStream) -> io::Result<()> {
+    stream.set_nonblocking(false)?;
+    stream.set_read_timeout(Some(IO_POLL))?;
+    stream.set_write_timeout(Some(IO_POLL))
+}
+
 /// Keeps podcast feeds available while rejecting excess audio downloads.
 ///
 /// Reading the headers avoids closing over unread GET/HEAD request bytes, which
@@ -1030,8 +1041,7 @@ fn handle_overloaded_connection(
     state: &ServerState,
     stop: &AtomicBool,
 ) -> io::Result<()> {
-    stream.set_read_timeout(Some(IO_POLL))?;
-    stream.set_write_timeout(Some(IO_POLL))?;
+    configure_http_stream(&stream)?;
     let deadline = Instant::now() + OVERLOAD_RESPONSE_TIMEOUT;
     let mut reader = BufReader::new(stream.try_clone()?);
     let request_line = read_request_line(&mut reader, MAX_REQUEST_LINE_BYTES + 1, deadline, stop)?;
@@ -1158,8 +1168,7 @@ fn handle_connection_with_admission(
     stop: &AtomicBool,
     admission: Option<&RequestAdmission>,
 ) -> io::Result<()> {
-    stream.set_read_timeout(Some(IO_POLL))?;
-    stream.set_write_timeout(Some(IO_POLL))?;
+    configure_http_stream(&stream)?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let deadline = Instant::now() + REQUEST_HEADER_TIMEOUT;
     let request_line = read_request_line(&mut reader, MAX_REQUEST_LINE_BYTES + 1, deadline, stop)?;
@@ -3191,6 +3200,74 @@ mod tests {
         }
     }
 
+    /// Reproduces inherited Winsock nonblocking mode on Unix and inspects it
+    /// directly, without relying on scheduling delays or timeout measurements.
+    #[cfg(unix)]
+    fn assert_http_handler_restores_blocking_mode(overloaded: bool) {
+        use rustix::fs::{OFlags, fcntl_getfl};
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect_timeout(&address, Duration::from_secs(2)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        client
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        stream.set_nonblocking(true).unwrap();
+        // Kernels may round timeout values to their timer resolution. Capture
+        // that normalization, then ensure the handler replaces longer polls.
+        stream.set_read_timeout(Some(IO_POLL)).unwrap();
+        stream.set_write_timeout(Some(IO_POLL)).unwrap();
+        let expected_read_timeout = stream.read_timeout().unwrap();
+        let expected_write_timeout = stream.write_timeout().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let observer = stream.try_clone().unwrap();
+        assert!(fcntl_getfl(&observer).unwrap().contains(OFlags::NONBLOCK));
+        client
+            .write_all(b"GET /feed.xml HTTP/1.1\r\nHost: fixture\r\n\r\n")
+            .unwrap();
+        let state = admission_test_state(LanShareKind::Podcast);
+        let stop = AtomicBool::new(false);
+        if overloaded {
+            handle_overloaded_connection(stream, &state, &stop).unwrap();
+        } else {
+            handle_connection_with_admission(stream, &state, &stop, None).unwrap();
+        }
+        assert!(
+            !fcntl_getfl(&observer).unwrap().contains(OFlags::NONBLOCK),
+            "HTTP workers must use blocking I/O with short socket timeouts"
+        );
+        assert_eq!(observer.read_timeout().unwrap(), expected_read_timeout);
+        assert_eq!(observer.write_timeout().unwrap(), expected_write_timeout);
+        drop(observer);
+
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+        assert!(headers.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert_eq!(body, state.rss());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn server_admission_normal_handler_restores_blocking_mode() {
+        assert_http_handler_restores_blocking_mode(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn server_admission_overload_handler_restores_blocking_mode() {
+        assert_http_handler_restores_blocking_mode(true);
+    }
+
     /// Waits for an observed queue transition instead of guessing thread timing.
     fn wait_for_admission_queue(pool: &AdmissionPool, expected: usize) {
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -4163,6 +4240,8 @@ printf '{"url":"https://cdn.example.test/%s.webm","acodec":"opus","vcodec":"none
                     thread::sleep(Duration::from_millis(5));
                     continue;
                 };
+                // Accepted Winsock streams retain the listener's mode.
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .unwrap();
@@ -4760,6 +4839,8 @@ printf '{"url":"https://cdn.example.test/%s.webm","acodec":"opus","vcodec":"none
                 );
                 thread::sleep(Duration::from_millis(5));
             };
+            // Accepted Winsock streams retain the listener's mode.
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(1)))
                 .unwrap();
@@ -4799,6 +4880,8 @@ printf '{"url":"https://cdn.example.test/%s.webm","acodec":"opus","vcodec":"none
                     thread::sleep(Duration::from_millis(5));
                     continue;
                 };
+                // Accepted Winsock streams retain the listener's mode.
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .unwrap();
@@ -4895,6 +4978,16 @@ printf '{"url":"https://cdn.example.test/%s.webm","acodec":"opus","vcodec":"none
                     thread::sleep(Duration::from_millis(10));
                     continue;
                 };
+                // Keep inherited nonblocking mode out of this bounded fixture.
+                stream
+                    .set_nonblocking(false)
+                    .expect("make mock request blocking");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .expect("bound mock request reads");
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(2)))
+                    .expect("bound mock response writes");
                 let mut request = [0_u8; 2_048];
                 let read = stream.read(&mut request).expect("read proxy request");
                 let request = String::from_utf8_lossy(&request[..read]);
