@@ -25861,7 +25861,13 @@ impl AppController {
                     self.local_waveform_follow_from = local_waveform_follow_from;
                 }
                 match self.playback_queue.advance().cloned() {
-                    Some(next) => {
+                    Some(mut next) => {
+                        if self.playback_queue.repeat_one {
+                            // An EOF replay starts the whole item, regardless
+                            // of its original timestamp or saved resume point.
+                            // Override only this load, not the queued link.
+                            next.start_at_seconds = Some(0);
+                        }
                         // Parked even with autoplay off: a manual queue-edge
                         // step may consume this position after the explicit
                         // entries finish.
@@ -76360,6 +76366,262 @@ mod tests {
                 .map(|item| item.media.title.as_str()),
             Some("first")
         );
+    }
+
+    /// Repeat ignores both a link timestamp and persisted resume progress.
+    #[test]
+    fn repeat_one_restarts_at_zero_across_eof_cycles() {
+        for duration_seconds in [None, Some(120)] {
+            for start_at_seconds in [None, Some(45)] {
+                let active = PlaybackStatus {
+                    idle: false,
+                    position: Duration::from_secs(120),
+                    duration: duration_seconds.map(Duration::from_secs),
+                    paused: false,
+                    ..PlaybackStatus::default()
+                };
+                let (mut controller, state, statuses, events) =
+                    controller_with_mock_lifecycle([], []);
+                assert!(!controller.view.repeating);
+                assert!(!controller.playback_queue.repeat_one);
+                controller.config.playback.autoplay = true;
+                controller.view.autoplay = true;
+                controller.dispatch(UiAction::ToggleRepeat);
+                let mut item = fixture_direct_item("first");
+                item.media.duration_seconds = duration_seconds;
+                item.start_at_seconds = start_at_seconds;
+                let mut progress =
+                    PlaybackProgress::new(item.media.id.clone(), duration_seconds, 1);
+                progress.record_position(90, 1);
+                controller
+                    .store
+                    .upsert_progress(&progress)
+                    .expect("resume progress");
+                controller.play_queue_item(item, false);
+                controller
+                    .playback_queue
+                    .push(fixture_direct_item("second"));
+
+                let initial_position = start_at_seconds.unwrap_or(
+                    90_u64.saturating_sub(controller.config.playback.resume_rewind_seconds),
+                );
+                assert_eq!(
+                    state.lock().expect("mock state").played[0].start_at,
+                    Duration::from_secs(initial_position),
+                    "the initial play must still honor a timestamp or resume point"
+                );
+                for cycle in 1..=3 {
+                    statuses
+                        .lock()
+                        .expect("mock statuses")
+                        .push_back(active.clone());
+                    events
+                        .lock()
+                        .expect("mock events")
+                        .extend([PlaybackEvent::MediaLoaded, PlaybackEvent::PlaybackStarted]);
+                    controller.update_player();
+                    events
+                        .lock()
+                        .expect("mock events")
+                        .push_back(PlaybackEvent::Ended(PlaybackEnd {
+                            reason: PlaybackEndReason::Eof,
+                            error: None,
+                            file_error: None,
+                            diagnostic: None,
+                        }));
+                    controller.update_player();
+
+                    let state = state.lock().expect("mock state");
+                    assert_eq!(state.played.len(), cycle + 1);
+                    assert_eq!(state.played[cycle].title.as_deref(), Some("first"));
+                    assert_eq!(
+                        state.played[cycle].start_at,
+                        Duration::ZERO,
+                        "repeat cycle {cycle} must start from zero, not {start_at_seconds:?} or saved progress; duration={duration_seconds:?}"
+                    );
+                    assert_eq!(controller.playback_queue.current_index, Some(0));
+                    assert_eq!(
+                        controller
+                            .playback_queue
+                            .current()
+                            .expect("current item")
+                            .start_at_seconds,
+                        start_at_seconds,
+                        "repeating must not rewrite the queue's original link timestamp"
+                    );
+                }
+
+                statuses.lock().expect("mock statuses").push_back(active);
+                events
+                    .lock()
+                    .expect("mock events")
+                    .extend([PlaybackEvent::MediaLoaded, PlaybackEvent::PlaybackStarted]);
+                controller.update_player();
+                controller.dispatch(UiAction::ToggleRepeat);
+                events
+                    .lock()
+                    .expect("mock events")
+                    .push_back(PlaybackEvent::Ended(PlaybackEnd {
+                        reason: PlaybackEndReason::Eof,
+                        error: None,
+                        file_error: None,
+                        diagnostic: None,
+                    }));
+                controller.update_player();
+                assert!(!controller.view.repeating);
+                assert!(!controller.playback_queue.repeat_one);
+                assert_eq!(controller.playback_queue.current_index, Some(1));
+                assert_eq!(
+                    state
+                        .lock()
+                        .expect("mock state")
+                        .played
+                        .last()
+                        .expect("next input")
+                        .title
+                        .as_deref(),
+                    Some("second")
+                );
+            }
+        }
+    }
+
+    /// Repeating parks, rather than consumes, the same-source continuation.
+    #[test]
+    fn repeat_one_takes_priority_until_disabled_then_resumes_autoplay() {
+        let active = PlaybackStatus {
+            idle: false,
+            position: Duration::from_secs(42),
+            duration: Some(Duration::from_secs(42)),
+            paused: false,
+            ..PlaybackStatus::default()
+        };
+        let (mut controller, state, statuses, events) = controller_with_mock_lifecycle([], []);
+        controller.config.playback.autoplay = true;
+        controller.view.autoplay = true;
+        controller.view.screen = Screen::Search;
+        let first = subscription_video_summary();
+        let mut second = first.clone();
+        second.video_id = "aqz-KE-bpKQ".to_owned();
+        second.title = "Second playable video".to_owned();
+        controller.youtube_results =
+            vec![SearchItem::Video(first.clone()), SearchItem::Video(second)];
+        controller.play_queue_item(queue_item_from_video(&first, None), false);
+        controller.dispatch(UiAction::ToggleRepeat);
+
+        for repeating in [true, true, true, false] {
+            statuses
+                .lock()
+                .expect("mock statuses")
+                .push_back(active.clone());
+            events
+                .lock()
+                .expect("mock events")
+                .extend([PlaybackEvent::MediaLoaded, PlaybackEvent::PlaybackStarted]);
+            controller.update_player();
+            if !repeating {
+                controller.dispatch(UiAction::ToggleRepeat);
+            }
+            events
+                .lock()
+                .expect("mock events")
+                .push_back(PlaybackEvent::Ended(PlaybackEnd {
+                    reason: PlaybackEndReason::Eof,
+                    error: None,
+                    file_error: None,
+                    diagnostic: None,
+                }));
+            controller.update_player();
+            if repeating {
+                assert_eq!(
+                    controller
+                        .playback_queue
+                        .current()
+                        .expect("repeat item")
+                        .media
+                        .id
+                        .external_id,
+                    first.video_id
+                );
+            }
+        }
+
+        assert_eq!(
+            state
+                .lock()
+                .expect("mock state")
+                .played
+                .iter()
+                .filter_map(|input| input.title.as_deref())
+                .collect::<Vec<_>>(),
+            [
+                "Fixture video",
+                "Fixture video",
+                "Fixture video",
+                "Fixture video",
+                "Second playable video"
+            ]
+        );
+        assert_eq!(
+            controller.current_autoplay_origin,
+            Some(AutoplayOrigin::YouTube {
+                generation: controller.search_generation,
+                index: 1,
+            })
+        );
+        assert!(!controller.playback_queue.repeat_one);
+        assert!(controller.config.playback.autoplay);
+    }
+
+    /// Repeat never retries a stop, decoder failure, or EOF before playback.
+    #[test]
+    fn repeat_one_does_not_restart_stops_errors_or_unstarted_items() {
+        for (started, reason, expected_error) in [
+            (true, PlaybackEndReason::Stop, None),
+            (true, PlaybackEndReason::Error, Some("Playback failed")),
+            (
+                false,
+                PlaybackEndReason::Eof,
+                Some("Playback did not start"),
+            ),
+        ] {
+            let (mut controller, state, _, events) = controller_with_mock_lifecycle([], []);
+            controller.diagnostic_helpers_cache = Some(Vec::new());
+            controller.config.playback.autoplay = true;
+            controller.view.autoplay = true;
+            controller.dispatch(UiAction::ToggleRepeat);
+            controller.play_queue_item(fixture_direct_item("first"), false);
+            controller
+                .playback_queue
+                .push(fixture_direct_item("second"));
+            {
+                let mut events = events.lock().expect("mock events");
+                events.push_back(PlaybackEvent::MediaLoaded);
+                if started {
+                    events.push_back(PlaybackEvent::PlaybackStarted);
+                }
+                events.push_back(PlaybackEvent::Ended(PlaybackEnd {
+                    reason,
+                    error: None,
+                    file_error: None,
+                    diagnostic: None,
+                }));
+            }
+
+            controller.update_player();
+
+            assert_eq!(state.lock().expect("mock state").played.len(), 1);
+            assert_eq!(controller.playback_queue.current_index, Some(0));
+            assert_eq!(controller.playback_phase, PlaybackPhase::Idle);
+            assert_eq!(
+                controller
+                    .view
+                    .error_popup
+                    .as_ref()
+                    .map(|popup| popup.title.as_str()),
+                expected_error
+            );
+        }
     }
 
     #[test]

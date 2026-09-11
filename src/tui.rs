@@ -3330,6 +3330,7 @@ fn render_subscriptions_body(
                 subscriptions.source_kind,
                 subscriptions.show_youtube_shorts,
                 view.autoplay,
+                view.repeating,
                 show_hotkeys,
                 theme,
                 hit_map,
@@ -3433,6 +3434,7 @@ fn render_subscriptions_body(
                     subscriptions.source_kind,
                     subscriptions.show_youtube_shorts,
                     view.autoplay,
+                    view.repeating,
                     show_hotkeys,
                     theme,
                     hit_map,
@@ -3485,6 +3487,7 @@ fn render_subscriptions_body(
                     subscriptions.source_kind,
                     subscriptions.show_youtube_shorts,
                     view.autoplay,
+                    view.repeating,
                     show_hotkeys,
                     theme,
                     hit_map,
@@ -3578,6 +3581,7 @@ fn render_subscription_item_buttons(
     source_kind: SubscriptionKind,
     show_youtube_shorts: bool,
     autoplay: bool,
+    repeating: bool,
     show_hotkeys: bool,
     theme: &Theme,
     hit_map: &mut HitMap,
@@ -3606,6 +3610,18 @@ fn render_subscription_item_buttons(
             show_hotkeys,
         ),
         UiAction::ToggleAutoplay,
+    );
+    let repeat = (
+        button(
+            "r",
+            if repeating {
+                "Repeat: on"
+            } else {
+                "Repeat: off"
+            },
+            show_hotkeys,
+        ),
+        UiAction::ToggleRepeat,
     );
     let shorts = (source_kind == SubscriptionKind::YouTube).then(|| {
         (
@@ -3638,7 +3654,7 @@ fn render_subscription_item_buttons(
             UiAction::ToggleSubscriptionDescription,
         )
     });
-    let mut buttons = Vec::with_capacity(4);
+    let mut buttons = Vec::with_capacity(5);
     if description_expanded && let Some(description) = description.clone() {
         buttons.push(description);
     }
@@ -3647,6 +3663,7 @@ fn render_subscription_item_buttons(
         buttons.push(shorts);
     }
     buttons.push(autoplay);
+    buttons.push(repeat);
     if !description_expanded && let Some(description) = description {
         buttons.push(description);
     }
@@ -18750,7 +18767,7 @@ for encoded, expected in json.load(sys.stdin):
 
     #[test]
     fn subscriptions_render_both_drill_down_and_split_navigation_models() {
-        let backend = TestBackend::new(160, 34);
+        let backend = TestBackend::new(180, 34);
         let mut terminal = Terminal::new(backend).expect("terminal");
         let details = DetailView {
             media_id: Some(MediaId::new(SourceKind::YouTube, "dQw4w9WgXcQ")),
@@ -19076,6 +19093,7 @@ for encoded, expected in json.load(sys.stdin):
         assert!(rendered.contains("Fixture RSS show · RSS/Atom"));
         assert!(rendered.contains("Fixture RSS episode"));
         assert!(rendered.contains("[R] Refresh episodes"));
+        assert!(rendered.contains("[A] Autoplay: off  [r] Repeat: off"));
         assert!(!rendered.contains("Shorts"));
         assert!(
             hit_map
@@ -19308,6 +19326,85 @@ for encoded, expected in json.load(sys.stdin):
             ),
             Some(UiAction::RefreshSubscriptionVideos)
         );
+    }
+
+    /// Repeat stays beside Autoplay in both layouts, with working mouse and TTY controls.
+    #[test]
+    fn subscription_repeat_toggle_follows_autoplay_and_respects_hidden_hotkeys() {
+        assert!(!ViewModel::default().repeating);
+        for (layout, expanded) in [
+            (SubscriptionsLayout::DrillDown, false),
+            (SubscriptionsLayout::Split, false),
+            (SubscriptionsLayout::Split, true),
+        ] {
+            for show_hotkeys in [true, false] {
+                for repeating in [false, true] {
+                    let mut terminal = Terminal::new(TestBackend::new(240, 30)).expect("terminal");
+                    let view = ViewModel {
+                        screen: Screen::Subscriptions,
+                        repeating,
+                        subscriptions: SubscriptionsView {
+                            layout,
+                            route: SubscriptionRoute::Items,
+                            focus: SubscriptionPane::Items,
+                            description_expanded: expanded,
+                            items: vec![subscription_row("Video", true)],
+                            ..SubscriptionsView::default()
+                        },
+                        ..ViewModel::default()
+                    };
+                    let settings = UiSettings {
+                        show_hotkeys,
+                        ..UiSettings::default()
+                    };
+                    let mut hit_map = HitMap::default();
+                    terminal
+                        .draw(|frame| render(frame, &view, &settings, &mut hit_map))
+                        .expect("draw Repeat toggle");
+                    let rendered = rendered_text(&terminal);
+                    let state = if repeating { "on" } else { "off" };
+                    let label = button("r", &format!("Repeat: {state}"), show_hotkeys);
+                    let autoplay = button("A", "Autoplay: off", show_hotkeys);
+                    assert!(rendered.contains(&format!("{autoplay}  {label}")));
+                    if !show_hotkeys {
+                        assert!(!rendered.contains("[r] Repeat"));
+                    }
+                    let target = hit_map
+                        .detail_buttons
+                        .iter()
+                        .find_map(|(action, target)| {
+                            (action == &UiAction::ToggleRepeat).then_some(*target)
+                        })
+                        .expect("Repeat target");
+                    let autoplay_target = hit_map
+                        .detail_buttons
+                        .iter()
+                        .find_map(|(action, target)| {
+                            (action == &UiAction::ToggleAutoplay).then_some(*target)
+                        })
+                        .expect("Autoplay target");
+                    assert_eq!(target.x, autoplay_target.right() + 2);
+                    assert_eq!(target.width, terminal_text_width(&label));
+                    assert_eq!(
+                        mouse_action(
+                            MouseEvent {
+                                kind: MouseEventKind::Down(MouseButton::Left),
+                                column: target.x,
+                                row: target.y,
+                                modifiers: KeyModifiers::NONE,
+                            },
+                            &hit_map,
+                            &view,
+                        ),
+                        Some(UiAction::ToggleRepeat)
+                    );
+                    assert_eq!(
+                        key_action(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE), &view),
+                        Some(UiAction::ToggleRepeat)
+                    );
+                }
+            }
+        }
     }
 
     #[test]
