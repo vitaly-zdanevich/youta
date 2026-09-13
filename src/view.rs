@@ -215,6 +215,7 @@ impl Screen {
         }
     }
 
+    /// Returns the tab label shared by terminal, GUI, and desktop menus.
     pub const fn label(self) -> &'static str {
         match self {
             Self::Search => "YT",
@@ -224,7 +225,7 @@ impl Screen {
             Self::ApplePodcasts => "Apple Podcasts",
             Self::LibriVox => "LibriVox",
             Self::Radio => "Radio",
-            Self::TrackerMusic => "MOD/tracker",
+            Self::TrackerMusic => "MOD",
             Self::Local => "Local",
             Self::Web => "Web",
             Self::Subscriptions => "Subscriptions",

@@ -1199,7 +1199,7 @@ These are distinct integration modes:
   require a YouTube Data API key. Youta recursively resolves music browse
   containers but retains only playable track-level video IDs, with strict
   process, output, timeout, and result limits. Its query, results, and selected
-  row are saved independently from the normal YouTube and MOD/tracker tabs.
+  row are saved independently from the normal YouTube and MOD tabs.
   Search runs on a capacity-one latest-only worker, so a slow `yt-dlp` search
   cannot delay general YouTube provider requests.
   When an official or Invidious metadata provider is configured, it may enrich

@@ -31396,7 +31396,17 @@ prose 07:25 remains clickable but is not a chapter";
             }
         }
 
-        let backend = TestBackend::new(80, 1);
+        // Feature-minimal builds can fit every full label in 80 columns.
+        // Stay below the rendered full width so this fixture exercises compact tabs.
+        let compact_width = hit_map
+            .tabs
+            .last()
+            .expect("last full-width tab")
+            .1
+            .right()
+            .saturating_sub(1)
+            .min(80);
+        let backend = TestBackend::new(compact_width, 1);
         let mut terminal = Terminal::new(backend).expect("compact terminal");
         let mut compact_hit_map = HitMap::default();
         terminal
@@ -31417,7 +31427,12 @@ prose 07:25 remains clickable but is not a chapter";
             .filter(|screen| screen.available(view.playback_history_enabled))
             .collect::<Vec<_>>();
         let compact_divider_width = terminal_text_width("│");
-        let visible = active_tab_window(&compact_screens, view.screen, 80, compact_divider_width);
+        let visible = active_tab_window(
+            &compact_screens,
+            view.screen,
+            compact_width,
+            compact_divider_width,
+        );
         assert_eq!(
             compact_hit_map
                 .tabs
@@ -31535,6 +31550,8 @@ prose 07:25 remains clickable but is not a chapter";
         assert_eq!(Screen::YouTubeMusic.compact_label(), "YT Music");
         assert_eq!(Screen::LibriVox.label(), "LibriVox");
         assert_eq!(Screen::LibriVox.compact_label(), "LibriVox");
+        assert_eq!(Screen::TrackerMusic.label(), "MOD");
+        assert_eq!(Screen::TrackerMusic.compact_label(), "MOD");
         let librivox_index = Screen::ALL
             .iter()
             .position(|screen| *screen == Screen::LibriVox)
@@ -31549,6 +31566,7 @@ prose 07:25 remains clickable but is not a chapter";
         let active_screens = [
             #[cfg(feature = "apple-podcasts")]
             Screen::ApplePodcasts,
+            Screen::TrackerMusic,
             Screen::Statistics,
         ];
         for active in active_screens {
