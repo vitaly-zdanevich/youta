@@ -540,6 +540,10 @@ jobs:
             ~/.cargo/git
           key: windows-test-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
 
+      # Keep these assertions visible even if the broad suite aborts its process.
+      - name: Test Archive upload fixtures in isolation
+        run: cargo test --locked --lib --no-default-features --features archive-upload archive_upload::tests:: -- --test-threads=1
+
       - name: Run the deterministic suite
         run: cargo test --locked --all-targets --no-fail-fast
 

@@ -13,6 +13,29 @@ fn repository_path(relative: impl AsRef<Path>) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(relative)
 }
 
+/// Isolates Archive upload failures before a broad Windows process can abort.
+#[test]
+fn windows_archive_upload_fixtures_run_before_the_broad_suite() {
+    let workflow = read_repository_file(".github/workflows/ci.yml");
+    let windows = workflow
+        .split_once("\n  windows-test:\n")
+        .expect("Windows reporting job")
+        .1
+        .split_once("\n  freebsd-compile:\n")
+        .expect("next job")
+        .0;
+    let focused = windows
+        .find("cargo test --locked --lib --no-default-features --features archive-upload archive_upload::tests:: -- --test-threads=1")
+        .expect("isolated, native Windows Archive upload fixtures");
+    let broad = windows
+        .find("cargo test --locked --all-targets --no-fail-fast")
+        .expect("retain the broad deterministic suite");
+    assert!(
+        focused < broad,
+        "report the focused assertions before a broad abort"
+    );
+}
+
 /// Archive browsing is present by default without being forced by broad profiles.
 #[test]
 fn archive_org_is_default_but_independently_removable_in_both_frontends() {

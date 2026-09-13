@@ -902,6 +902,41 @@ mod tests {
         thread: Option<std::thread::JoinHandle<()>>,
     }
 
+    /// Windows inherits the listener's nonblocking mode; parsing needs blocking reads.
+    fn configure_fixture_stream(stream: &std::net::TcpStream) {
+        stream
+            .set_nonblocking(false)
+            .expect("blocking fixture stream");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .expect("fixture timeout");
+    }
+
+    /// Reproduces inherited Windows socket mode without timing-dependent reads.
+    #[cfg(unix)]
+    #[test]
+    fn fixture_stream_configuration_clears_inherited_nonblocking_mode() {
+        use rustix::fs::{OFlags, fcntl_getfl};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback listener");
+        let _client = std::net::TcpStream::connect_timeout(
+            &listener.local_addr().expect("fixture address"),
+            std::time::Duration::from_secs(2),
+        )
+        .expect("fixture client");
+        let (stream, _) = listener.accept().expect("accepted fixture stream");
+        stream.set_nonblocking(true).expect("inherited socket mode");
+        assert!(fcntl_getfl(&stream).unwrap().contains(OFlags::NONBLOCK));
+
+        configure_fixture_stream(&stream);
+
+        assert!(
+            !fcntl_getfl(&stream).unwrap().contains(OFlags::NONBLOCK),
+            "fixture request parsing requires a blocking stream on every platform"
+        );
+        assert!(stream.read_timeout().unwrap().is_some());
+    }
+
     impl Server {
         fn new(responses: Vec<(u16, Option<String>)>) -> Self {
             use std::io::{Read, Write};
@@ -929,9 +964,7 @@ mod tests {
                         }
                         Err(error) => panic!("fixture listener failed: {error}"),
                     };
-                    stream
-                        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
-                        .expect("fixture timeout");
+                    configure_fixture_stream(&stream);
                     let mut request = Vec::new();
                     let mut byte = [0];
                     while !request.ends_with(b"\r\n\r\n") && request.len() < 256 * 1024 {
@@ -1190,36 +1223,37 @@ mod tests {
 
     #[test]
     fn credential_discovery_uses_documented_precedence_without_reading_real_configs() {
+        // A slash-rooted Unix spelling lacks the drive prefix that Windows
+        // requires for `is_absolute`; construct every fixture from a native root.
+        let directory = tempfile::tempdir().expect("fake configs");
+        let config_dir = directory.path().join("youta");
+        let explicit = directory.path().join("override.ini");
+        let xdg = directory.path().join("xdg");
+        let home = directory.path().join("home");
+        assert!(xdg.is_absolute(), "fixture XDG path must be absolute");
         let paths = credential_paths(
-            Path::new("/fixture/youta"),
-            Some(PathBuf::from("/fixture/override.ini")),
-            Some(PathBuf::from("/fixture/xdg")),
-            Some(Path::new("/fixture/home")),
+            &config_dir,
+            Some(explicit.clone()),
+            Some(xdg.clone()),
+            Some(&home),
         );
         assert_eq!(
             paths,
             vec![
-                (
-                    PathBuf::from("/fixture/youta/secrets/archive-org.toml"),
-                    true
-                ),
-                (PathBuf::from("/fixture/override.ini"), false),
-                (PathBuf::from("/fixture/xdg/internetarchive/ia.ini"), false),
-                (PathBuf::from("/fixture/home/.config/ia.ini"), false),
-                (PathBuf::from("/fixture/home/.ia"), false)
+                (config_dir.join("secrets/archive-org.toml"), true),
+                (explicit, false),
+                (xdg.join("internetarchive/ia.ini"), false),
+                (home.join(".config/ia.ini"), false),
+                (home.join(".ia"), false)
             ]
         );
         let fallback = credential_paths(
-            Path::new("/fixture/youta"),
+            &config_dir,
             None,
             Some(PathBuf::from("relative-xdg")),
-            Some(Path::new("/fixture/home")),
+            Some(&home),
         );
-        assert_eq!(
-            fallback[1].0,
-            PathBuf::from("/fixture/home/.config/internetarchive/ia.ini")
-        );
-        let directory = tempfile::tempdir().expect("fake configs");
+        assert_eq!(fallback[1].0, home.join(".config/internetarchive/ia.ini"));
         let first = directory.path().join("first.toml");
         let second = directory.path().join("second.ini");
         fs::write(&first, "access_key='FAKE_FIRST'\nsecret_key='FAKE_SECRET'").expect("fake TOML");
