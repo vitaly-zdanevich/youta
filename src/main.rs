@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 
 use youta::config::Config;
 use youta::diagnostics::{ExternalHelper, ExternalHelperKind};
@@ -23,7 +23,8 @@ use youta::video_summary::CodexVideoSummarizer;
     author,
     version,
     about = "Low-resource terminal YouTube audio player using yt-dlp",
-    long_about = None
+    long_about = None,
+    subcommand_precedence_over_arg = true
 )]
 struct Cli {
     /// Print the complete MIT license notice and exit.
@@ -33,6 +34,10 @@ struct Cli {
     /// Use this directory instead of the platform Youta configuration folder.
     #[arg(long, global = true, value_name = "PATH")]
     config_dir: Option<PathBuf>,
+
+    /// Open this HTTP(S) page in the Web tab without starting playback.
+    #[arg(value_name = "URL", value_parser = parse_startup_url)]
+    startup_url: Option<url::Url>,
 
     /// Operation to run. With no command, Youta opens the terminal UI.
     #[command(subcommand)]
@@ -60,6 +65,57 @@ enum CliCommand {
     Extractors,
 }
 
+/// Keeps positional URL conflicts separate from globally reusable options.
+fn parse_cli_from<I, T>(arguments: I) -> std::result::Result<Cli, clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    let cli = Cli::try_parse_from(arguments)?;
+    if cli.startup_url.is_some() && cli.command.is_some() {
+        return Err(Cli::command().error(
+            clap::error::ErrorKind::ArgumentConflict,
+            "a startup URL cannot be combined with a subcommand",
+        ));
+    }
+    Ok(cli)
+}
+
+/// Parses one explicit HTTP(S) page without accepting browser credentials.
+fn parse_startup_url(value: &str) -> std::result::Result<url::Url, String> {
+    let invalid = || "enter a complete credential-free http:// or https:// URL".to_owned();
+    let url = url::Url::parse(value).map_err(|_| invalid())?;
+    #[cfg(feature = "web-browser")]
+    youta::web_browser::validate_web_url(&url).map_err(|_| invalid())?;
+    #[cfg(not(feature = "web-browser"))]
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.as_str().len() > 16 * 1024
+        || url.as_str().chars().any(char::is_control)
+    {
+        return Err(invalid());
+    }
+    Ok(url)
+}
+
+/// Rejects unavailable URL startup before configuration or terminal side effects.
+fn ensure_startup_url_supported(startup_url: Option<&url::Url>) -> Result<()> {
+    if startup_url.is_some() {
+        if !cfg!(feature = "web-browser") {
+            bail!(
+                "opening a startup URL requires the `web-browser` feature; this build does not include Web browsing"
+            );
+        }
+        if !cfg!(feature = "tui") {
+            bail!(
+                "opening a startup URL requires the `tui` feature; this build does not include the terminal UI"
+            );
+        }
+    }
+    Ok(())
+}
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -144,11 +200,12 @@ fn probe_diagnostic_helpers(
 }
 
 fn run() -> Result<()> {
-    let cli = Cli::parse();
+    let cli = parse_cli_from(std::env::args_os()).unwrap_or_else(|error| error.exit());
     if cli.license {
         print!("{}", youta::LICENSE_TEXT);
         return Ok(());
     }
+    ensure_startup_url_supported(cli.startup_url.as_ref())?;
     let config = if let Some(directory) = cli.config_dir {
         Config::load_from_dir(directory)
     } else {
@@ -157,7 +214,7 @@ fn run() -> Result<()> {
     .context("cannot load Youta configuration")?;
 
     match cli.command.unwrap_or(CliCommand::Tui) {
-        CliCommand::Tui => run_tui(config),
+        CliCommand::Tui => run_tui(config, cli.startup_url),
         CliCommand::Search { query, channels } => run_search(&config, &query, channels),
         CliCommand::Doctor => run_doctor(&config),
         CliCommand::Config => {
@@ -169,7 +226,7 @@ fn run() -> Result<()> {
 }
 
 #[cfg(feature = "tui")]
-fn run_tui(config: Config) -> Result<()> {
+fn run_tui(config: Config, startup_url: Option<url::Url>) -> Result<()> {
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::{Arc, Mutex};
 
@@ -203,6 +260,14 @@ fn run_tui(config: Config) -> Result<()> {
         .git_commit_on_change
         .then(|| config.config_dir().to_path_buf());
     let mut controller = AppController::new(config, store, provider, playback_factory);
+    #[cfg(feature = "web-browser")]
+    if let Some(url) = startup_url {
+        controller
+            .open_web_url(url)
+            .context("cannot open the startup Web URL")?;
+    }
+    #[cfg(not(feature = "web-browser"))]
+    let _ = startup_url;
     if let Some(error) = provider_startup_error {
         let report = DiagnosticReport::capture_error(
             &error,
@@ -327,7 +392,7 @@ fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
 }
 
 #[cfg(not(feature = "tui"))]
-fn run_tui(_config: Config) -> Result<()> {
+fn run_tui(_config: Config, _startup_url: Option<url::Url>) -> Result<()> {
     bail!("this build does not include the `tui` feature")
 }
 
@@ -739,6 +804,67 @@ mod tests {
     use super::helper_install_guidance;
     use super::{doctor_helper_checks, video_summary_config_lines};
 
+    /// One URL is an alternative to a subcommand, not an implicit search query.
+    #[test]
+    fn startup_url_cli_accepts_public_and_explicit_local_web_addresses() {
+        for address in [
+            "https://example.com/",
+            "http://127.0.0.1:8000/music/",
+            "http://192.168.1.20:8000/",
+            "http://[::1]:8000/",
+        ] {
+            assert!(
+                super::parse_cli_from(["youta", address]).is_ok(),
+                "{address}"
+            );
+            assert!(
+                super::parse_cli_from(["youta", "--config-dir", "/tmp/fixture", address]).is_ok()
+            );
+            assert!(super::parse_cli_from(["youta", address, "--license"]).is_ok());
+        }
+    }
+
+    /// Existing commands and global options retain their parse behavior.
+    #[test]
+    fn startup_url_cli_preserves_existing_commands_and_global_options() {
+        for arguments in [
+            vec!["youta"],
+            vec!["youta", "tui"],
+            vec!["youta", "doctor"],
+            vec!["youta", "config"],
+            vec!["youta", "extractors"],
+            vec!["youta", "search", "ambient music", "--channels"],
+            vec!["youta", "--config-dir", "/tmp/fixture", "config"],
+            vec!["youta", "doctor", "--config-dir", "/tmp/fixture"],
+            vec!["youta", "--license"],
+            vec!["youta", "tui", "--license"],
+        ] {
+            assert!(
+                super::parse_cli_from(arguments.clone()).is_ok(),
+                "{arguments:?}"
+            );
+        }
+    }
+
+    /// A startup address cannot consume subcommands or trailing positional data.
+    #[test]
+    fn startup_url_cli_rejects_ambiguous_and_unsafe_arguments() {
+        for arguments in [
+            vec!["youta", "https://example.com/", "tui"],
+            vec!["youta", "tui", "https://example.com/"],
+            vec!["youta", "https://example.com/", "https://second.example/"],
+            vec!["youta", "https://example.com/", "search", "music"],
+            vec!["youta", "file:///etc/passwd"],
+            vec!["youta", "ftp://example.com/music/"],
+            vec!["youta", "https://user:password@example.com/"],
+            vec!["youta", "not-a-url"],
+        ] {
+            assert!(
+                super::parse_cli_from(arguments.clone()).is_err(),
+                "{arguments:?}"
+            );
+        }
+    }
     #[test]
     fn doctor_checks_only_helpers_required_by_compiled_features() {
         let temporary = tempdir().expect("temporary directory");

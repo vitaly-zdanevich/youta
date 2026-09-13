@@ -175,6 +175,17 @@ compact list. `[A] Autoplay` uses the existing preference (off by default) to
 continue through the directory's media in sequence. Playback is audio only,
 including linked video containers.
 
+You can also open a page directly from the command line:
+
+```sh
+youta 'https://example.com/'
+youta 'http://192.168.1.2:8000/'
+```
+
+This starts in Web and loads the page without starting playback. It uses the
+same URL validation and browsing limits as the URL editor, and requires the
+`tui` and `web-browser` build features. Quote URLs containing shell characters.
+
 Browsing fetches only the requested page in a bounded background worker. It
 does not recursively crawl directories, probe every file, or require `yt-dlp`.
 The browsing location and query-bearing links remain session-only; safe public

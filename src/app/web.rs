@@ -31,6 +31,25 @@ pub(super) struct WebWorker {
 }
 
 impl AppController {
+    /// Opens an explicitly supplied startup URL through the normal Web worker.
+    ///
+    /// Navigation is session-only and never activates a media row or playback.
+    /// Local and private HTTP servers follow the same policy as the URL editor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for credentials, unsupported schemes, or an invalid URL.
+    pub fn open_web_url(
+        &mut self,
+        url: url::Url,
+    ) -> Result<(), crate::web_browser::WebBrowserError> {
+        validate_web_url(&url)?;
+        self.show_screen(Screen::Web);
+        self.web.back.clear();
+        self.browse_web_url(url, 0);
+        Ok(())
+    }
+
     /// Validates an explicit address before scheduling any network work.
     pub(super) fn submit_web_url(&mut self) {
         let result = url::Url::parse(self.view.search_query.trim())
@@ -354,4 +373,114 @@ pub(super) fn queue_item_from_web(entry: &WebEntry) -> Option<QueueItem> {
         start_at_seconds: None,
         added_at: unix_time(),
     })
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+
+    /// Owns an isolated controller without provider or playback network work.
+    fn controller() -> (tempfile::TempDir, AppController) {
+        let directory = tempfile::tempdir().expect("startup state directory");
+        let config = Config::for_dir(directory.path());
+        let store = StateStore::open(&config).expect("startup state");
+        (directory, AppController::new(config, store, None, None))
+    }
+
+    /// Startup queues the exact latest page through the existing worker, never playback.
+    #[test]
+    fn startup_web_url_schedules_latest_page_without_playing() {
+        let (_directory, mut controller) = controller();
+        controller.view.search_query = "saved YouTube search".into();
+        controller.config.playback.autoplay = true;
+        controller.view.autoplay = true;
+        let (release, held) = bounded::<()>(1);
+        let (_reply, response) = bounded(1);
+        controller.web.worker = Some(WebWorker {
+            generation: 0,
+            response,
+            thread: thread::spawn(move || {
+                let _ = held.recv_timeout(Duration::from_secs(2));
+            }),
+        });
+        let first = url::Url::parse("http://127.0.0.1:8000/first/#track").expect("local URL");
+        controller.open_web_url(first).expect("open first page");
+        let latest =
+            url::Url::parse("http://192.168.1.20:8000/music/?view=all#track").expect("LAN URL");
+        controller
+            .open_web_url(latest.clone())
+            .expect("replace startup page");
+        let mut requested = latest;
+        requested.set_fragment(None);
+        assert_eq!(controller.view.screen, Screen::Web);
+        assert_eq!(controller.youtube_search_query, "saved YouTube search");
+        assert_eq!(controller.view.search_query, requested.as_str());
+        assert!(!controller.view.search_editing);
+        assert!(controller.web.pending);
+        assert!(controller.web.back.is_empty());
+        assert_eq!(
+            controller
+                .web
+                .worker
+                .as_ref()
+                .expect("sole held worker")
+                .generation,
+            0
+        );
+        let (generation, url) = controller
+            .web
+            .request
+            .take()
+            .expect("latest pending request");
+        assert_eq!(generation, 2);
+        assert_eq!(url, requested);
+        controller.handle_web_response(
+            generation,
+            Ok(WebDirectoryListing {
+                parent: None,
+                entries: vec![WebEntry {
+                    url: requested.join("song.opus").expect("media URL"),
+                    name: "song.opus".into(),
+                    kind: WebEntryKind::Audio,
+                }],
+                url: requested,
+                truncated: false,
+            }),
+        );
+        assert_eq!(controller.view.rows.len(), 1);
+        assert_eq!(controller.view.rows[0].title, "song.opus");
+        assert!(!controller.web.pending);
+        assert!(controller.player.is_none());
+        assert!(controller.current_media.is_none());
+        assert!(controller.current_autoplay_origin.is_none());
+        drop(release);
+        controller
+            .web
+            .worker
+            .take()
+            .expect("held worker")
+            .thread
+            .join()
+            .expect("mock worker");
+    }
+
+    /// Validation precedes any tab mutation, worker creation, or network request.
+    #[test]
+    fn startup_web_url_rejects_credentials_and_non_http_before_navigation() {
+        let (_directory, mut controller) = controller();
+        let screen = controller.view.screen;
+        let query = controller.view.search_query.clone();
+        for raw in [
+            "file:///etc/passwd",
+            "ftp://example.com/",
+            "https://user:secret@example.com/",
+        ] {
+            let url = url::Url::parse(raw).expect("invalid-source fixture");
+            assert!(controller.open_web_url(url).is_err());
+            assert_eq!(controller.view.screen, screen);
+            assert_eq!(controller.view.search_query, query);
+            assert!(controller.web.worker.is_none());
+            assert!(controller.web.request.is_none());
+        }
+    }
 }
