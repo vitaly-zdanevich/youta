@@ -27,7 +27,7 @@ use std::time::{Duration, SystemTime};
 
 use sha2::{Digest, Sha256};
 #[cfg(feature = "remote-artwork")]
-use ureq::ResponseExt;
+use std::time::Instant;
 #[cfg(feature = "remote-artwork")]
 use ureq::unversioned::resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver};
 #[cfg(feature = "remote-artwork")]
@@ -42,6 +42,12 @@ pub(crate) const MAX_DOWNLOAD_BYTES: usize = 4 * 1024 * 1024;
 /// Bounded wait for one artwork request.
 #[cfg(feature = "remote-artwork")]
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// Maximum explicitly validated CDN redirects for one Archive.org image.
+#[cfg(feature = "remote-artwork")]
+const MAX_ARCHIVE_ARTWORK_REDIRECTS: usize = 3;
+/// Bound for a redirect target before parsing or following its Location value.
+#[cfg(feature = "remote-artwork")]
+const MAX_ARTWORK_REDIRECT_URL_BYTES: usize = 4 * 1024;
 /// Age after which a cached entry is discarded.
 const CACHE_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 /// Byte budget for the whole cache directory.
@@ -108,8 +114,9 @@ pub(crate) trait ThumbnailTransport: Send + 'static {
 
 /// Builds the agent every artwork request uses.
 ///
-/// Redirects are refused outright rather than followed, because a redirect can
-/// cross from a public host to a private one after the first check passed.
+/// Automatic redirects stay disabled. Archive.org CDN redirects are checked
+/// explicitly by the fetcher, and every new connection still uses the public
+/// address resolver so a redirect cannot reach a private destination.
 #[cfg(feature = "remote-artwork")]
 pub(crate) fn thumbnail_agent() -> ureq::Agent {
     let config = ureq::Agent::config_builder()
@@ -551,19 +558,52 @@ pub(crate) fn fetch_thumbnail_with_policy(
     if !is_safe_remote_thumbnail_source(source, allow_non_public_test_source) {
         return Err(ThumbnailFailure::InvalidSource);
     }
-    let mut response = agent
-        .get(source.as_str())
-        .header("Accept", "image/jpeg, image/png, image/webp")
-        .call()
-        .map_err(|_| ThumbnailFailure::DownloadFailed)?;
-    if !(200..300).contains(&response.status().as_u16()) {
-        return Err(ThumbnailFailure::DownloadFailed);
-    }
-    let final_url =
-        Url::parse(&response.get_uri().to_string()).map_err(|_| ThumbnailFailure::InvalidSource)?;
-    if !is_safe_remote_thumbnail_source(&final_url, allow_non_public_test_source) {
-        return Err(ThumbnailFailure::InvalidSource);
-    }
+    let deadline = Instant::now() + REQUEST_TIMEOUT;
+    let mut redirects = 0;
+    let mut current = source.clone();
+    let mut response = loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or(ThumbnailFailure::DownloadFailed)?;
+        // Disabling redirects per request guarantees the URL validated before
+        // I/O is the one requested, even if a caller supplies a different agent.
+        let response = agent
+            .get(current.as_str())
+            .header("Accept", "image/jpeg, image/png, image/webp")
+            .config()
+            .max_redirects(0)
+            .timeout_global(Some(remaining))
+            .build()
+            .call()
+            .map_err(|_| ThumbnailFailure::DownloadFailed)?;
+        let status = response.status().as_u16();
+        if (200..300).contains(&status) {
+            break response;
+        }
+        if !matches!(status, 301 | 302 | 303 | 307 | 308)
+            || redirects == MAX_ARCHIVE_ARTWORK_REDIRECTS
+            || !is_archive_artwork_redirect_url(&current)
+        {
+            return Err(ThumbnailFailure::DownloadFailed);
+        }
+        let location = response
+            .headers()
+            .get("Location")
+            .and_then(|value| value.to_str().ok())
+            .ok_or(ThumbnailFailure::DownloadFailed)?;
+        if location.len() > MAX_ARTWORK_REDIRECT_URL_BYTES {
+            return Err(ThumbnailFailure::InvalidSource);
+        }
+        let target = current
+            .join(location)
+            .map_err(|_| ThumbnailFailure::InvalidSource)?;
+        if !is_archive_artwork_redirect_url(&target) {
+            return Err(ThumbnailFailure::InvalidSource);
+        }
+        current = target;
+        redirects += 1;
+    };
     if response
         .body()
         .content_length()
@@ -580,11 +620,32 @@ pub(crate) fn fetch_thumbnail_with_policy(
             ureq::Error::BodyExceedsLimit(_) => ThumbnailFailure::ResponseTooLarge,
             _ => ThumbnailFailure::DownloadFailed,
         })?;
-    if bytes.len() > MAX_DOWNLOAD_BYTES {
+    if Instant::now() >= deadline {
+        Err(ThumbnailFailure::DownloadFailed)
+    } else if bytes.len() > MAX_DOWNLOAD_BYTES {
         Err(ThumbnailFailure::ResponseTooLarge)
     } else {
         Ok(bytes)
     }
+}
+
+/// Admits only credential-free HTTPS URLs on Internet Archive's own domains.
+///
+/// Covers commonly redirect from archive.org/download to a geographic CDN
+/// subdomain. Dot-delimited suffix matching rejects lookalike hosts; query,
+/// fragment, and non-default-port targets are deliberately not followed.
+/// The agent independently resolves and pins each connection to public IPs.
+#[cfg(feature = "remote-artwork")]
+fn is_archive_artwork_redirect_url(source: &Url) -> bool {
+    source.as_str().len() <= MAX_ARTWORK_REDIRECT_URL_BYTES
+        && source.scheme() == "https"
+        && source.port().is_none()
+        && source.query().is_none()
+        && source.fragment().is_none()
+        && is_safe_remote_thumbnail_source(source, false)
+        && source
+            .host_str()
+            .is_some_and(|host| host == "archive.org" || host.ends_with(".archive.org"))
 }
 
 #[cfg(feature = "images")]
@@ -659,9 +720,9 @@ pub struct Artwork {
 ///
 /// This is the whole surface an out-of-process front-end needs, and it is
 /// deliberately narrow. Every protection stays on this side of the boundary:
-/// only public `http`/`https` origins are accepted, redirects are refused
-/// rather than followed, the response is size-capped, the bytes must actually
-/// be an image, and the result lands in the confined private cache. A window
+/// only public `http`/`https` origins are accepted, redirects are refused except
+/// for bounded Archive.org CDN hops, responses are size-capped, and the bytes
+/// must be an image stored in the confined private cache. A window
 /// that fetched artwork itself would keep none of that, and would additionally
 /// hand a provider a request from the user's browser stack.
 ///
@@ -811,6 +872,185 @@ mod public_surface_tests {
 
     use std::path::Path;
     use url::Url;
+
+    /// Replays exact HTTPS requests in memory without relaxing production DNS rules.
+    fn scripted_thumbnail_agent(
+        responses: Vec<(&str, u16, Option<&str>, Vec<u8>)>,
+    ) -> (ureq::Agent, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::collections::VecDeque;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        let responses = Mutex::new(
+            responses
+                .into_iter()
+                .map(|(url, status, location, body)| {
+                    (url.to_owned(), status, location.map(str::to_owned), body)
+                })
+                .collect::<VecDeque<_>>(),
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let agent = ureq::Agent::config_builder()
+            .max_redirects(0)
+            .http_status_as_error(false)
+            .middleware(
+                move |request: ureq::http::Request<ureq::SendBody>,
+                      _next: ureq::middleware::MiddlewareNext| {
+                    observed.fetch_add(1, Ordering::Relaxed);
+                    let (url, status, location, body) = responses
+                        .lock()
+                        .expect("response fixture")
+                        .pop_front()
+                        .expect("unexpected request");
+                    assert_eq!(request.uri().to_string(), url);
+                    let mut response = ureq::http::Response::builder().status(status);
+                    if let Some(location) = location {
+                        response = response.header("Location", location);
+                    }
+                    Ok(response
+                        .body(ureq::Body::builder().data(body))
+                        .expect("mock response"))
+                },
+            )
+            .build()
+            .into();
+        (agent, calls)
+    }
+
+    /// LibriVox's stable cover URL redirects to the Archive.org image CDN.
+    #[test]
+    fn archive_thumbnail_redirects_fetch_the_cover_for_standard_redirect_statuses() {
+        let source =
+            Url::parse("https://archive.org/download/Covers/book_thumb.jpg").expect("cover URL");
+        let target = "https://dn710703.ca.archive.org/0/items/Covers/book_thumb.jpg";
+        let image = b"\xFF\xD8\xFF\xE0cover";
+        for status in [301, 302, 303, 307, 308] {
+            let (agent, calls) = scripted_thumbnail_agent(vec![
+                (source.as_str(), status, Some(target), Vec::new()),
+                (target, 200, None, image.to_vec()),
+            ]);
+            assert_eq!(
+                super::fetch_thumbnail(&agent, &source).expect("redirected cover"),
+                image
+            );
+            assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+        }
+    }
+
+    /// A legitimate initial URL cannot authorize credentials or another origin.
+    #[test]
+    fn archive_thumbnail_redirects_refuse_unsafe_targets_before_requesting_them() {
+        let source = Url::parse("https://archive.org/download/Covers/book.jpg").expect("cover URL");
+        for target in [
+            "http://cdn.archive.org/book.jpg",
+            "https://archive.org.evil.test/book.jpg",
+            "https://notarchive.org/book.jpg",
+            "https://example.org/book.jpg",
+            "https://127.0.0.1/book.jpg",
+            "https://[::1]/book.jpg",
+            "https://169.254.169.254/book.jpg",
+            "https://localhost/book.jpg",
+            "https://user:password@cdn.archive.org/book.jpg",
+            "https://cdn.archive.org:8443/book.jpg",
+            "file:///tmp/book.jpg",
+            "https://cdn.archive.org/book.jpg?token=secret",
+            "https://cdn.archive.org/book.jpg#part",
+        ] {
+            let (agent, calls) =
+                scripted_thumbnail_agent(vec![(source.as_str(), 302, Some(target), Vec::new())]);
+            assert_eq!(
+                super::fetch_thumbnail(&agent, &source),
+                Err(ThumbnailFailure::InvalidSource),
+                "{target}"
+            );
+            assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        }
+    }
+
+    /// The allow-list applies to every hop, not just the first Location header.
+    #[test]
+    fn archive_thumbnail_redirects_recheck_intermediate_servers() {
+        let source = Url::parse("https://archive.org/services/img/public_book").expect("image URL");
+        let target = "https://cdn.archive.org/public_book.jpg";
+        let (agent, calls) = scripted_thumbnail_agent(vec![
+            (source.as_str(), 302, Some(target), Vec::new()),
+            (
+                target,
+                302,
+                Some("https://example.org/private.jpg"),
+                Vec::new(),
+            ),
+        ]);
+        assert_eq!(
+            super::fetch_thumbnail(&agent, &source),
+            Err(ThumbnailFailure::InvalidSource)
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
+    /// An endless redirect chain remains bounded without changing other origins.
+    #[test]
+    fn archive_thumbnail_redirects_are_bounded_and_other_origins_remain_refused() {
+        let source = Url::parse("https://archive.org/services/img/public_book").expect("image URL");
+        let (agent, calls) = scripted_thumbnail_agent(vec![
+            (
+                source.as_str(),
+                302,
+                Some(source.as_str()),
+                Vec::new()
+            );
+            4
+        ]);
+        assert_eq!(
+            super::fetch_thumbnail(&agent, &source),
+            Err(ThumbnailFailure::DownloadFailed)
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 4);
+
+        let source = Url::parse("https://example.org/book.jpg").expect("other origin");
+        let (agent, calls) = scripted_thumbnail_agent(vec![(
+            source.as_str(),
+            302,
+            Some("https://archive.org/services/img/public_book"),
+            Vec::new(),
+        )]);
+        assert_eq!(
+            super::fetch_thumbnail(&agent, &source),
+            Err(ThumbnailFailure::DownloadFailed)
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    /// Redirected image bytes keep the same 4 MiB budget as direct responses.
+    #[test]
+    fn archive_thumbnail_redirects_preserve_the_download_size_limit() {
+        let source = Url::parse("https://archive.org/download/Covers/book.jpg").expect("cover URL");
+        let target = "https://cdn.archive.org/book.jpg";
+        let (agent, calls) = scripted_thumbnail_agent(vec![
+            (source.as_str(), 302, Some(target), Vec::new()),
+            (target, 200, None, vec![0; super::MAX_DOWNLOAD_BYTES + 1]),
+        ]);
+        assert_eq!(
+            super::fetch_thumbnail(&agent, &source),
+            Err(ThumbnailFailure::ResponseTooLarge)
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
+    /// Live coverage of the canonical LibriVox cover URL and its CDN redirect.
+    #[test]
+    #[ignore = "requires live Internet Archive artwork and public network access"]
+    fn librivox_cover_artwork_live_redirect_smoke() {
+        let source = Url::parse(
+            "https://archive.org/download/LibrivoxCdCoverArt27/withturkspalestine_1301_thumb.jpg",
+        )
+        .expect("public LibriVox cover URL");
+        let directory = tempfile::tempdir().expect("private artwork fixture cache");
+        let artwork = remote_artwork(directory.path(), &source).expect("live LibriVox cover");
+        assert_eq!(artwork.format, ArtworkFormat::Jpeg);
+        assert!(!artwork.bytes.is_empty());
+    }
 
     /// This entry point is reachable from a web view, so it must never become a
     /// way to read the filesystem — even though the terminal pipeline accepts

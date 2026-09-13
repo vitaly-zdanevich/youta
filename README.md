@@ -611,7 +611,7 @@ to [image (P18)](https://www.wikidata.org/wiki/Property:P18) — a broadcaster's
 logotype identifies the station, while its representative image is as likely to
 be a transmitter mast. That takes two bounded requests rather than one, because
 Commons' stable file address is a redirect and Youta's artwork agent refuses
-redirects on purpose; the second asks Commons for the raster URL itself at a
+Commons redirects; the second asks Commons for the raster URL itself at a
 bounded width, which also rasterizes an SVG logotype to PNG. One lookup runs at
 a time and every answer is remembered for the session, including "this station
 has no image", so moving through the catalogue costs at most one lookup per
@@ -929,8 +929,9 @@ UI snapshots use JSON, except for waveform and artwork bytes:
   stale generations receive no data, preventing an old selection's response
   from drawing or seeking the wrong file.
 - Artwork uses `<img src>` with `youta://artwork/`. Rust supplies the bytes
-  through Youta's guarded agent: public addresses only, no redirects, and size
-  limits. The web view never fetches provider artwork directly.
+  through Youta's guarded agent: public addresses only, size limits, and only
+  bounded Archive.org-to-Archive.org image redirects. The web view never
+  fetches provider artwork directly.
 - Local covers use the same endpoint, but only URLs the reducer published in
   a snapshot are served. Several recent selections remain allowed so a delayed
   image request still resolves. This is an explicit allowlist, not a guessed
