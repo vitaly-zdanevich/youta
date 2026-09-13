@@ -84,6 +84,12 @@ fn youtube_audio_playback_advances_and_shuts_down() {
                     last_error = Some(format!("media ended before advancing: {end:?}"));
                     break;
                 }
+                Ok(Some(PlaybackEvent::EndOfFileHeld)) => {
+                    // This smoke load does not opt into retaining EOF.
+                    last_error =
+                        Some("media unexpectedly paused at end before advancing".to_owned());
+                    break;
+                }
                 Ok(Some(PlaybackEvent::ProcessExited { diagnostic })) => {
                     last_error = Some(format!(
                         "mpv exited before advancing: {}",

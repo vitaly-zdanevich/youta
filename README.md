@@ -252,6 +252,15 @@ disabled. Repeat is session-only and starts off each time Youta opens. Manual
 next/previous or stopping playback still works; playback errors are reported,
 not retried indefinitely. Live radio cannot repeat.
 
+When a finite YouTube item finishes with Autoplay and Repeat off and no next
+queued item, it stays loaded and paused at the end. Left/right arrows and the
+seek bar remain usable without pressing Enter or resolving the audio again.
+Seeking backward from this end pause resumes audio automatically, without
+pressing Space. Seeking during an ordinary manual pause keeps it paused.
+This uses mpv's [native keep-open mode](https://mpv.io/manual/stable/#options-keep-open),
+with no additional playback polling. Autoplay, Repeat, and explicit queues
+retain their existing continuation behavior.
+
 For example, a YouTube channel's item footer is:
 
 ```text

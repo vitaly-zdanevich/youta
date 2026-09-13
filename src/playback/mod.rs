@@ -123,6 +123,13 @@ pub struct PlaybackInput {
     pub http_headers: PlaybackHttpHeaders,
     /// Skip mpv's yt-dlp hook because [`Self::location`] is already resolved.
     pub bypass_ytdl: bool,
+    /// Keep the media loaded and paused when its natural end is reached.
+    ///
+    /// Opt-in controllers receive [`PlaybackEvent::EndOfFileHeld`] instead of
+    /// an unloaded timeline. Seeking backward resumes this automatic pause
+    /// without reloading the item. [`PlayerCommand::ReleaseEndOfFile`]
+    /// alternatively restores normal completion so the controller can continue its queue.
+    pub keep_open: bool,
 }
 
 impl fmt::Debug for PlaybackInput {
@@ -142,6 +149,7 @@ impl fmt::Debug for PlaybackInput {
             .field("verify_remote_format", &self.verify_remote_format)
             .field("http_headers", &self.http_headers)
             .field("bypass_ytdl", &self.bypass_ytdl)
+            .field("keep_open", &self.keep_open)
             .finish()
     }
 }
@@ -157,6 +165,7 @@ impl PlaybackInput {
             verify_remote_format: false,
             http_headers: PlaybackHttpHeaders::default(),
             bypass_ytdl: false,
+            keep_open: false,
         }
     }
 }
@@ -230,6 +239,9 @@ pub struct AudiophilePlaybackOptions {
 }
 
 /// Commands understood by a playback backend.
+///
+/// Timeline seeks resume media held at natural EOF, but preserve manual pauses
+/// away from EOF. Seeking to or beyond a held end is a no-op.
 #[derive(Clone, Debug, PartialEq)]
 pub enum PlayerCommand {
     /// Toggle between paused and playing.
@@ -250,6 +262,12 @@ pub enum PlayerCommand {
     ChangeChapter(i32),
     /// Repeat the current item indefinitely.
     SetRepeat(bool),
+    /// Release media paused at its natural end so ordinary EOF processing runs.
+    ///
+    /// This does not stop or replace the item: backends emit their normal
+    /// [`PlaybackEvent::Ended`] notification with [`PlaybackEndReason::Eof`].
+    /// It has no effect when the active item is not held at its end.
+    ReleaseEndOfFile,
     /// Start recording a stream to this path, or stop and finalize recording.
     ///
     /// A [`Some`] path starts or redirects recording. [`None`] stops the
@@ -363,6 +381,12 @@ pub enum PlaybackEvent {
     MediaLoaded,
     /// Decoding and output started or resumed after buffering.
     PlaybackStarted,
+    /// Natural EOF was reached, but the media remains loaded and paused.
+    ///
+    /// The timeline is still seekable. Controllers can retain this state or
+    /// issue [`PlayerCommand::ReleaseEndOfFile`] to obtain ordinary EOF
+    /// completion and continue their existing queue policy.
+    EndOfFileHeld,
     /// The current media ended or failed after its load request was accepted.
     Ended(PlaybackEnd),
     /// The playback process exited without a later event being available.

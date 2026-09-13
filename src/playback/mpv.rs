@@ -33,6 +33,8 @@ mod backend {
     const MAX_RESOLVED_HTTP_HEADER_BYTES: usize = 16 * 1024;
     const ICY_TITLE_OBSERVER_ID: u64 = 1;
     const ICY_TITLE_PROPERTY: &str = "metadata/by-key/icy-title";
+    const EOF_OBSERVER_ID: u64 = 2;
+    const EOF_PROPERTY: &str = "eof-reached";
     /// Audio-only selector used by every ordinary extractor-backed load.
     #[cfg(feature = "yt-dlp")]
     const YTDL_AUDIO_FORMAT: &str = "bestaudio[acodec^=opus]/bestaudio";
@@ -46,6 +48,16 @@ mod backend {
         events: VecDeque<PlaybackEvent>,
         warnings: VecDeque<String>,
         stream_title: Option<String>,
+        /// EOF holding requested for the current mpv playlist entry.
+        keep_open: bool,
+        /// Replacement policy is installed by its ordered `start-file` event.
+        pending_keep_open: Option<bool>,
+        /// Ignore observer values while loading, redirecting, or idle.
+        media_loaded: bool,
+        /// One held-EOF event per timeline traversal; cleared by a backward seek.
+        eof_held: bool,
+        /// Detects an EOF edge interleaved with a command's IPC response.
+        held_eof_generation: u64,
     }
 
     /// Headless mpv playback backend.
@@ -135,6 +147,33 @@ mod backend {
             Ok(())
         }
 
+        /// Seeks in place and resumes only a timeline leaving automatic EOF pause.
+        ///
+        /// Ordinary manual pause is untouched. Relative rewinds and percentages
+        /// below 100 are known departures even when the EOF notification arrives
+        /// inside the request; absolute targets require the earlier exact-bound
+        /// check and therefore an already observed hold.
+        fn seek_and_resume_held(
+            &mut self,
+            command: &[Value],
+            resume_on_new_eof: bool,
+        ) -> Result<()> {
+            let was_held = self.ipc.eof_held;
+            let generation = self.ipc.held_eof_generation;
+            self.send(command)?;
+            if self.ipc.keep_open
+                && self.ipc.media_loaded
+                && self.ipc.pending_keep_open.is_none()
+                && (was_held || (resume_on_new_eof && self.ipc.held_eof_generation != generation))
+            {
+                // A seek clears eof-reached, but mpv preserves pause. Clear
+                // only that automatic pause; the media has not been reloaded.
+                self.set_property("pause", json!(false))?;
+                self.ipc.eof_held = false;
+            }
+            Ok(())
+        }
+
         fn ensure_processing_allowed(&self, operation: &'static str) -> Result<()> {
             if self.profile == PlaybackProfile::Direct {
                 return Err(PlaybackError::DirectProfileRestriction(operation));
@@ -151,6 +190,11 @@ mod backend {
                 events: VecDeque::new(),
                 warnings: VecDeque::new(),
                 stream_title: None,
+                keep_open: false,
+                pending_keep_open: None,
+                media_loaded: false,
+                eof_held: false,
+                held_eof_generation: 0,
             }
         }
 
@@ -195,10 +239,20 @@ mod backend {
                     // mpv may retain the previous file's metadata until the
                     // replacement stream publishes its first property event.
                     self.stream_title = None;
+                    if let Some(keep_open) = self.pending_keep_open.take() {
+                        self.keep_open = keep_open;
+                    }
+                    self.media_loaded = false;
+                    self.eof_held = false;
                 }
-                Some("file-loaded") => self.push_event(PlaybackEvent::MediaLoaded),
+                Some("file-loaded") => {
+                    self.media_loaded = true;
+                    self.push_event(PlaybackEvent::MediaLoaded);
+                }
                 Some("playback-restart") => self.push_event(PlaybackEvent::PlaybackStarted),
                 Some("end-file") => {
+                    self.media_loaded = false;
+                    self.eof_held = false;
                     let reason_text = message
                         .get("reason")
                         .and_then(Value::as_str)
@@ -212,6 +266,7 @@ mod backend {
                         self.stream_title = None;
                         return;
                     }
+                    self.keep_open = false;
                     let reason = match reason_text {
                         "eof" => PlaybackEndReason::Eof,
                         "stop" | "quit" => PlaybackEndReason::Stop,
@@ -230,6 +285,28 @@ mod backend {
                         file_error,
                         diagnostic,
                     }));
+                }
+                Some("property-change")
+                    if message.get("id").and_then(Value::as_u64) == Some(EOF_OBSERVER_ID)
+                        && message.get("name").and_then(Value::as_str) == Some(EOF_PROPERTY) =>
+                {
+                    let reached = message.get("data").and_then(Value::as_bool) == Some(true);
+                    if !reached {
+                        // mpv clears this property when a backward seek leaves
+                        // EOF, allowing the same loaded item to finish again.
+                        self.eof_held = false;
+                    } else if self.keep_open
+                        && self.media_loaded
+                        && self.pending_keep_open.is_none()
+                        && !self.eof_held
+                    {
+                        // `keep-open` deliberately suppresses `end-file`.
+                        // Keep this distinct so explicit release can still
+                        // deliver the ordinary EOF event exactly once later.
+                        self.eof_held = true;
+                        self.held_eof_generation = self.held_eof_generation.wrapping_add(1);
+                        self.push_event(PlaybackEvent::EndOfFileHeld);
+                    }
                 }
                 Some("property-change")
                     if message.get("id").and_then(Value::as_u64) == Some(ICY_TITLE_OBSERVER_ID)
@@ -304,7 +381,7 @@ mod backend {
     }
 
     /// Returns the deterministic subscriptions installed on every mpv process.
-    fn ipc_configuration_commands() -> [Vec<Value>; 2] {
+    fn ipc_configuration_commands() -> [Vec<Value>; 3] {
         // mpv's JSON IPC log stream contains the authoritative extractor,
         // decoder, and audio-output failure text that otherwise occurs after
         // `loadfile` has already been acknowledged.
@@ -317,6 +394,13 @@ mod backend {
                 json!("observe_property"),
                 json!(ICY_TITLE_OBSERVER_ID),
                 json!(ICY_TITLE_PROPERTY),
+            ],
+            // Natural EOF stays observable while `keep-open` retains a
+            // seekable timeline. Reuse IPC notifications, not another poll.
+            vec![
+                json!("observe_property"),
+                json!(EOF_OBSERVER_ID),
+                json!(EOF_PROPERTY),
             ],
         ]
     }
@@ -519,6 +603,13 @@ mod backend {
         // application-owned selection start atomically even when the previous
         // item was paused.
         options.insert("pause".to_owned(), Value::String("no".to_owned()));
+        // Per-file options also reset the policy when a held YouTube item is
+        // replaced by ordinary media. No separate command can race the load.
+        options.insert(
+            "keep-open".to_owned(),
+            json!(if input.keep_open { "yes" } else { "no" }),
+        );
+        options.insert("keep-open-pause".to_owned(), json!("yes"));
         if !input.start_at.is_zero() {
             // `loadfile` is asynchronous: a following `seek` can run before
             // mpv has loaded a seekable stream. The per-file `start` option
@@ -741,7 +832,14 @@ mod backend {
             // Do not show metadata retained from the previous stream while
             // mpv is loading a replacement.
             self.ipc.stream_title = None;
-            self.send(&loadfile_command(input)?)?;
+            let command = loadfile_command(input)?;
+            // Replacement emits the previous file's terminal event first.
+            // Install its new policy only once `start-file` identifies it.
+            self.ipc.pending_keep_open = Some(input.keep_open);
+            if let Err(error) = self.send(&command) {
+                self.ipc.pending_keep_open = None;
+                return Err(error);
+            }
             Ok(())
         }
 
@@ -752,14 +850,37 @@ mod backend {
                 }
                 PlayerCommand::SetPaused(paused) => self.set_property("pause", json!(paused))?,
                 PlayerCommand::SeekRelative(seconds) => {
-                    self.send(&[json!("seek"), json!(seconds), json!("relative")])?;
+                    if self.ipc.eof_held && seconds >= 0 {
+                        // Seeking past a paused mpv EOF clears eof-reached
+                        // without another true edge. A forward arrow at the
+                        // end is a no-op, preserving its releasable timeline.
+                        return Ok(());
+                    }
+                    self.seek_and_resume_held(
+                        &[json!("seek"), json!(seconds), json!("relative")],
+                        seconds < 0,
+                    )?;
                 }
                 PlayerCommand::SeekAbsolute(position) => {
-                    self.send(&[
-                        json!("seek"),
-                        json!(position.as_secs_f64()),
-                        json!("absolute"),
-                    ])?;
+                    if self.ipc.eof_held
+                        && self
+                            .property("time-pos")?
+                            .and_then(|value| value.as_f64())
+                            .filter(|value| value.is_finite() && *value >= 0.0)
+                            .is_some_and(|end| position.as_secs_f64() >= end)
+                    {
+                        // Only an explicit absolute seek at held EOF needs
+                        // this bounded lookup; periodic status stays unchanged.
+                        return Ok(());
+                    }
+                    self.seek_and_resume_held(
+                        &[
+                            json!("seek"),
+                            json!(position.as_secs_f64()),
+                            json!("absolute"),
+                        ],
+                        false,
+                    )?;
                 }
                 PlayerCommand::SeekPercent(percent) => {
                     if !(0.0..=100.0).contains(&percent) {
@@ -767,7 +888,13 @@ mod backend {
                             "seek percentage {percent} is outside 0..=100"
                         )));
                     }
-                    self.send(&[json!("seek"), json!(percent), json!("absolute-percent")])?;
+                    if self.ipc.eof_held && percent >= 100.0 {
+                        return Ok(());
+                    }
+                    self.seek_and_resume_held(
+                        &[json!("seek"), json!(percent), json!("absolute-percent")],
+                        percent < 100.0,
+                    )?;
                 }
                 PlayerCommand::SetVolume(volume) => {
                     self.ensure_processing_allowed("software volume")?;
@@ -791,7 +918,33 @@ mod backend {
                     self.send(&[json!("add"), json!("chapter"), json!(delta)])?;
                 }
                 PlayerCommand::SetRepeat(enabled) => {
+                    let was_held = self.ipc.eof_held;
+                    let generation = self.ipc.held_eof_generation;
                     self.set_property("loop-file", json!(if enabled { "inf" } else { "no" }))?;
+                    let resume_held = enabled
+                        && self.ipc.keep_open
+                        && self.ipc.media_loaded
+                        && self.ipc.pending_keep_open.is_none()
+                        && (was_held || self.ipc.held_eof_generation != generation);
+                    if resume_held {
+                        // Enabling mpv's native loop at EOF seeks to zero but
+                        // preserves pause. Resume that loaded timeline while
+                        // keeping its hold policy for when Repeat is disabled.
+                        // The generation also catches EOF observed during the
+                        // property request, before loop-file clears the edge.
+                        self.set_property("pause", json!(false))?;
+                        self.ipc.eof_held = false;
+                    }
+                }
+                PlayerCommand::ReleaseEndOfFile => {
+                    if self.ipc.eof_held && self.ipc.pending_keep_open.is_none() {
+                        // mpv releases even a paused EOF as soon as keep-open
+                        // is disabled. Do not issue stop or suppress its real
+                        // end-file event: existing queue handling owns it.
+                        self.set_property("keep-open", json!("no"))?;
+                        self.ipc.keep_open = false;
+                        self.ipc.eof_held = false;
+                    }
                 }
                 PlayerCommand::SetStreamRecording(path) => {
                     self.set_property("stream-record", stream_recording_property_value(path)?)?;
@@ -1090,6 +1243,11 @@ mod backend {
                         json!(ICY_TITLE_OBSERVER_ID),
                         json!(ICY_TITLE_PROPERTY),
                     ],
+                    vec![
+                        json!("observe_property"),
+                        json!(EOF_OBSERVER_ID),
+                        json!(EOF_PROPERTY),
+                    ],
                 ]
             );
         }
@@ -1180,6 +1338,18 @@ mod backend {
             mpsc::Receiver<Vec<Value>>,
             thread::JoinHandle<()>,
         ) {
+            backend_with_command_recorder_script(Vec::new(), None)
+        }
+
+        /// Injects first-command events and an optional exact EOF position.
+        fn backend_with_command_recorder_script(
+            mut first_events: Vec<Value>,
+            end_position: Option<f64>,
+        ) -> (
+            MpvBackend,
+            mpsc::Receiver<Vec<Value>>,
+            thread::JoinHandle<()>,
+        ) {
             let (client, server) = UnixStream::pair().expect("mock IPC pair");
             let (command_sender, command_receiver) = mpsc::channel();
             let server_thread = thread::spawn(move || {
@@ -1206,9 +1376,18 @@ mod backend {
                         .expect("command array");
                     let should_quit = command.first().and_then(Value::as_str) == Some("quit");
                     command_sender.send(command).expect("record mock command");
+                    for event in first_events.drain(..) {
+                        serde_json::to_writer(reader.get_mut(), &event)
+                            .expect("write interleaved event");
+                        reader.get_mut().write_all(b"\n").expect("event newline");
+                    }
                     serde_json::to_writer(
                         reader.get_mut(),
-                        &json!({"request_id": request_id, "error": "success"}),
+                        &json!({
+                            "request_id": request_id,
+                            "error": "success",
+                            "data": end_position,
+                        }),
                     )
                     .expect("write mock command response");
                     reader
@@ -1245,6 +1424,353 @@ mod backend {
         }
 
         #[test]
+        fn opted_in_loadfile_atomically_enables_paused_eof_holding() {
+            let mut input = PlaybackInput::new("https://cdn.example/audio.webm");
+            input.keep_open = true;
+            let command = loadfile_command(&input).expect("held EOF loadfile command");
+            let options = command[4].as_object().expect("per-file options");
+
+            assert_eq!(options.get("keep-open"), Some(&json!("yes")));
+            assert_eq!(options.get("keep-open-pause"), Some(&json!("yes")));
+            assert_eq!(options.get("pause"), Some(&json!("no")));
+            assert!(format!("{input:?}").contains("keep_open: true"));
+        }
+
+        /// Constructs a loaded, opted-in IPC state without a real media process.
+        fn ipc_with_eof_holding() -> MpvIpc {
+            let mut ipc = ipc_after_script(Vec::new());
+            ipc.pending_keep_open = Some(true);
+            ipc.handle_event(&json!({"event": "start-file"}));
+            ipc.handle_event(&json!({"event": "file-loaded"}));
+            ipc.events.clear();
+            ipc
+        }
+
+        /// Uses the exact observer shape sent by mpv for the loaded timeline.
+        fn eof_notification(reached: bool) -> Value {
+            json!({
+                "event": "property-change",
+                "id": EOF_OBSERVER_ID,
+                "name": EOF_PROPERTY,
+                "data": reached,
+            })
+        }
+
+        #[test]
+        fn held_eof_is_edge_triggered_and_backward_seeking_rearms_it() {
+            let mut ipc = ipc_with_eof_holding();
+            ipc.handle_event(&eof_notification(true));
+            ipc.handle_event(&eof_notification(true));
+            assert_eq!(ipc.events.pop_front(), Some(PlaybackEvent::EndOfFileHeld));
+            assert!(ipc.events.is_empty());
+
+            ipc.handle_event(&eof_notification(false));
+            ipc.handle_event(&json!({"event": "playback-restart"}));
+            ipc.handle_event(&eof_notification(true));
+            assert_eq!(ipc.events.pop_front(), Some(PlaybackEvent::PlaybackStarted));
+            assert_eq!(ipc.events.pop_front(), Some(PlaybackEvent::EndOfFileHeld));
+            assert!(ipc.events.is_empty());
+        }
+
+        #[test]
+        fn held_eof_requires_opt_in_loaded_media_and_the_exact_observer() {
+            let mut ordinary = ipc_after_script(vec![json!({"event": "file-loaded"})]);
+            ordinary.events.clear();
+            ordinary.handle_event(&eof_notification(true));
+            assert!(ordinary.events.is_empty());
+
+            let mut ipc = ipc_with_eof_holding();
+            for message in [
+                json!({"event": "property-change", "id": ICY_TITLE_OBSERVER_ID, "name": EOF_PROPERTY, "data": true}),
+                json!({"event": "property-change", "id": EOF_OBSERVER_ID, "name": "pause", "data": true}),
+                json!({"event": "property-change", "id": EOF_OBSERVER_ID, "name": EOF_PROPERTY, "data": "yes"}),
+            ] {
+                ipc.handle_event(&message);
+            }
+            assert!(ipc.events.is_empty());
+            ipc.handle_event(&json!({"event": "start-file"}));
+            ipc.handle_event(&eof_notification(true));
+            assert!(ipc.events.is_empty());
+        }
+
+        #[test]
+        fn replacement_suppresses_old_eof_and_installs_the_new_load_policy() {
+            let mut ipc = ipc_with_eof_holding();
+            ipc.pending_keep_open = Some(false);
+            ipc.handle_event(&eof_notification(true));
+            assert!(
+                ipc.events.is_empty(),
+                "a queued replacement owns the next EOF"
+            );
+            ipc.handle_event(&json!({"event": "end-file", "reason": "stop"}));
+            ipc.handle_event(&json!({"event": "start-file"}));
+            ipc.handle_event(&json!({"event": "file-loaded"}));
+            ipc.events.clear();
+            ipc.handle_event(&eof_notification(true));
+            assert!(
+                ipc.events.is_empty(),
+                "ordinary replacement does not opt in"
+            );
+
+            ipc.pending_keep_open = Some(true);
+            ipc.handle_event(&json!({"event": "end-file", "reason": "stop"}));
+            ipc.handle_event(&json!({"event": "start-file"}));
+            ipc.handle_event(&json!({"event": "file-loaded"}));
+            ipc.events.clear();
+            ipc.handle_event(&eof_notification(true));
+            assert_eq!(ipc.events.pop_front(), Some(PlaybackEvent::EndOfFileHeld));
+        }
+
+        #[test]
+        fn redirect_keeps_eof_policy_without_reporting_intermediate_completion() {
+            let mut ipc = ipc_with_eof_holding();
+            ipc.handle_event(&json!({"event": "end-file", "reason": "redirect"}));
+            ipc.handle_event(&eof_notification(true));
+            assert!(ipc.events.is_empty());
+            ipc.handle_event(&json!({"event": "start-file"}));
+            ipc.handle_event(&json!({"event": "file-loaded"}));
+            ipc.events.clear();
+            ipc.handle_event(&eof_notification(true));
+            assert_eq!(ipc.events.pop_front(), Some(PlaybackEvent::EndOfFileHeld));
+        }
+
+        #[test]
+        fn held_eof_does_not_swallow_release_stop_or_error_events() {
+            for (reason, expected) in [
+                ("eof", PlaybackEndReason::Eof),
+                ("stop", PlaybackEndReason::Stop),
+                ("error", PlaybackEndReason::Error),
+            ] {
+                let mut ipc = ipc_with_eof_holding();
+                ipc.handle_event(&eof_notification(true));
+                assert_eq!(ipc.events.pop_front(), Some(PlaybackEvent::EndOfFileHeld));
+                ipc.handle_event(&json!({"event": "end-file", "reason": reason}));
+                let Some(PlaybackEvent::Ended(ended)) = ipc.events.pop_front() else {
+                    panic!("terminal event must remain visible");
+                };
+                assert_eq!(ended.reason, expected);
+                ipc.handle_event(&eof_notification(true));
+                assert!(ipc.events.is_empty(), "idle media cannot hold EOF");
+            }
+        }
+
+        #[test]
+        fn repeat_enabling_observes_held_eof_reached_during_its_ipc_request() {
+            let (mut backend, commands, server) = backend_with_command_recorder_script(
+                vec![
+                    eof_notification(true),
+                    eof_notification(false),
+                    json!({"event": "playback-restart"}),
+                ],
+                None,
+            );
+            backend.ipc.keep_open = true;
+            backend.ipc.media_loaded = true;
+            backend
+                .command(PlayerCommand::SetRepeat(true))
+                .expect("racing repeat enable");
+            backend.shutdown().expect("shutdown mock backend");
+            server.join().expect("mock command server");
+            assert_eq!(
+                commands.into_iter().collect::<Vec<_>>(),
+                [
+                    vec![json!("set_property"), json!("loop-file"), json!("inf")],
+                    vec![json!("set_property"), json!("pause"), json!(false)],
+                    vec![json!("quit")],
+                ],
+            );
+        }
+
+        #[test]
+        fn seeking_backward_from_held_eof_resumes_the_loaded_media() {
+            for command in [
+                PlayerCommand::SeekRelative(-5),
+                PlayerCommand::SeekAbsolute(Duration::from_secs(7)),
+                PlayerCommand::SeekPercent(25.0),
+            ] {
+                let (mut backend, commands, server) =
+                    backend_with_command_recorder_script(Vec::new(), Some(42.0));
+                backend.ipc.keep_open = true;
+                backend.ipc.media_loaded = true;
+                backend.ipc.eof_held = true;
+                backend
+                    .command(command.clone())
+                    .expect("seek away from held EOF");
+                assert!(
+                    !backend.ipc.eof_held,
+                    "{command:?}: successful rewind leaves EOF"
+                );
+                backend.shutdown().expect("shutdown mock backend");
+                server.join().expect("mock command server");
+                let commands = commands.into_iter().collect::<Vec<_>>();
+                assert_eq!(
+                    commands[commands.len() - 2],
+                    vec![json!("set_property"), json!("pause"), json!(false)],
+                    "{command:?}: rewind must resume without a second keypress",
+                );
+                assert!(commands.iter().any(|command| command[0] == json!("seek")));
+                assert!(
+                    !commands
+                        .iter()
+                        .any(|command| command[0] == json!("loadfile"))
+                );
+            }
+        }
+
+        #[test]
+        fn ordinary_manual_pause_is_preserved_when_seeking() {
+            let (mut backend, commands, server) = backend_with_command_recorder();
+            backend.ipc.keep_open = true;
+            backend.ipc.media_loaded = true;
+            backend
+                .command(PlayerCommand::SetPaused(true))
+                .expect("manual pause");
+            for command in [
+                PlayerCommand::SeekRelative(-5),
+                PlayerCommand::SeekAbsolute(Duration::from_secs(7)),
+                PlayerCommand::SeekPercent(25.0),
+            ] {
+                backend
+                    .command(command)
+                    .expect("seek within ordinary pause");
+            }
+            backend.shutdown().expect("shutdown mock backend");
+            server.join().expect("mock command server");
+            assert_eq!(
+                commands.into_iter().collect::<Vec<_>>(),
+                [
+                    vec![json!("set_property"), json!("pause"), json!(true)],
+                    vec![json!("seek"), json!(-5), json!("relative")],
+                    vec![json!("seek"), json!(7.0), json!("absolute")],
+                    vec![json!("seek"), json!(25.0), json!("absolute-percent")],
+                    vec![json!("quit")],
+                ],
+            );
+        }
+
+        #[test]
+        fn backward_seek_resumes_eof_observed_during_its_ipc_request() {
+            let (mut backend, commands, server) = backend_with_command_recorder_script(
+                vec![
+                    eof_notification(true),
+                    eof_notification(false),
+                    json!({"event": "playback-restart"}),
+                ],
+                None,
+            );
+            backend.ipc.keep_open = true;
+            backend.ipc.media_loaded = true;
+            backend
+                .command(PlayerCommand::SeekRelative(-5))
+                .expect("racing backward seek");
+            backend.shutdown().expect("shutdown mock backend");
+            server.join().expect("mock command server");
+            assert_eq!(
+                commands.into_iter().collect::<Vec<_>>(),
+                [
+                    vec![json!("seek"), json!(-5), json!("relative")],
+                    vec![json!("set_property"), json!("pause"), json!(false)],
+                    vec![json!("quit")],
+                ],
+            );
+        }
+
+        #[test]
+        fn forward_and_end_target_seeks_preserve_held_eof_until_release() {
+            let (mut backend, commands, server) =
+                backend_with_command_recorder_script(Vec::new(), Some(42.0));
+            backend.ipc.keep_open = true;
+            backend.ipc.media_loaded = true;
+            backend.ipc.eof_held = true;
+            for command in [
+                PlayerCommand::SeekRelative(5),
+                PlayerCommand::SeekRelative(0),
+                PlayerCommand::SeekPercent(100.0),
+                PlayerCommand::SeekAbsolute(Duration::from_secs(42)),
+                PlayerCommand::SeekAbsolute(Duration::from_secs(99)),
+            ] {
+                backend.command(command).expect("no-op seek at held EOF");
+            }
+            let invalid = backend.command(PlayerCommand::SeekPercent(101.0));
+            assert!(matches!(invalid, Err(PlaybackError::InvalidValue(_))));
+            backend
+                .command(PlayerCommand::ReleaseEndOfFile)
+                .expect("release remains available");
+            backend.shutdown().expect("shutdown mock backend");
+            server.join().expect("mock command server");
+            assert_eq!(
+                commands.into_iter().collect::<Vec<_>>(),
+                [
+                    vec![json!("get_property"), json!("time-pos")],
+                    vec![json!("get_property"), json!("time-pos")],
+                    vec![json!("set_property"), json!("keep-open"), json!("no")],
+                    vec![json!("quit")],
+                ],
+            );
+        }
+
+        #[test]
+        fn enabling_repeat_at_held_eof_resumes_native_loop_without_reloading() {
+            let (mut backend, commands, server) = backend_with_command_recorder();
+            backend.ipc.keep_open = true;
+            backend.ipc.media_loaded = true;
+            backend.ipc.eof_held = true;
+            backend
+                .command(PlayerCommand::SetRepeat(true))
+                .expect("enable repeat at EOF");
+            backend
+                .command(PlayerCommand::ReleaseEndOfFile)
+                .expect("obsolete held state");
+            assert!(
+                backend.ipc.keep_open,
+                "disabling repeat later must still hold EOF"
+            );
+            backend.shutdown().expect("shutdown mock backend");
+            server.join().expect("mock command server");
+            assert_eq!(
+                commands.into_iter().collect::<Vec<_>>(),
+                [
+                    vec![json!("set_property"), json!("loop-file"), json!("inf")],
+                    vec![json!("set_property"), json!("pause"), json!(false)],
+                    vec![json!("quit")],
+                ],
+            );
+        }
+
+        #[test]
+        fn releasing_held_eof_restores_native_completion_without_stop() {
+            let (mut backend, commands, server) = backend_with_command_recorder();
+            backend.ipc.keep_open = true;
+            backend.ipc.media_loaded = true;
+            backend.ipc.eof_held = true;
+            backend
+                .command(PlayerCommand::ReleaseEndOfFile)
+                .expect("release EOF");
+            backend
+                .command(PlayerCommand::ReleaseEndOfFile)
+                .expect("duplicate release");
+            backend.shutdown().expect("shutdown mock backend");
+            server.join().expect("mock command server");
+            assert_eq!(
+                commands.into_iter().collect::<Vec<_>>(),
+                [
+                    vec![json!("set_property"), json!("keep-open"), json!("no")],
+                    vec![json!("quit")],
+                ],
+            );
+        }
+
+        #[test]
+        fn ordinary_loadfile_explicitly_disables_eof_hold() {
+            let input = PlaybackInput::new("/tmp/audio.opus");
+            let command = loadfile_command(&input).expect("ordinary loadfile command");
+            let options = command[4].as_object().expect("per-file options");
+
+            assert_eq!(options.get("keep-open"), Some(&json!("no")));
+            assert_eq!(options.get("keep-open-pause"), Some(&json!("yes")));
+        }
+
+        #[test]
         fn normal_loadfile_command_atomically_clears_global_pause() {
             let input = PlaybackInput::new("https://www.youtube.com/watch?v=fixture");
 
@@ -1255,7 +1781,7 @@ mod backend {
                     json!("https://www.youtube.com/watch?v=fixture"),
                     json!("replace"),
                     json!(-1),
-                    json!({"pause": "no"}),
+                    json!({"pause": "no", "keep-open": "no", "keep-open-pause": "yes"}),
                 ]
             );
         }
@@ -1330,6 +1856,8 @@ mod backend {
                     json!(-1),
                     json!({
                         "pause": "no",
+                        "keep-open": "no",
+                        "keep-open-pause": "yes",
                         "ytdl-raw-options": "check-formats=",
                         "ytdl-format": YTDL_CHECKED_YOUTUBE_FORMAT,
                     }),
@@ -1400,6 +1928,8 @@ mod backend {
                     json!(-1),
                     json!({
                         "pause": "no",
+                        "keep-open": "no",
+                        "keep-open-pause": "yes",
                         "start": "30",
                     }),
                 ]
@@ -1421,6 +1951,8 @@ mod backend {
                     json!(-1),
                     json!({
                         "pause": "no",
+                        "keep-open": "no",
+                        "keep-open-pause": "yes",
                         "start": "30.5",
                         "ytdl-raw-options": "check-formats=",
                         "ytdl-format": YTDL_CHECKED_YOUTUBE_FORMAT,
@@ -1454,6 +1986,8 @@ mod backend {
                         "force-media-title": "Human-readable video name",
                         "http-header-fields": r"Accept: audio/webm\,audio/ogg,X-Path: one\\two",
                         "pause": "no",
+                        "keep-open": "no",
+                        "keep-open-pause": "yes",
                         "ytdl": "no",
                     }),
                 ]
@@ -1556,6 +2090,8 @@ mod backend {
                         json!(-1),
                         json!({
                             "pause": "no",
+                            "keep-open": "no",
+                            "keep-open-pause": "yes",
                             "start": "30",
                         }),
                     ],

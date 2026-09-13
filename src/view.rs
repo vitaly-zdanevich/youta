@@ -2188,6 +2188,12 @@ pub struct ViewModel {
     pub search_animation_frame: usize,
     /// Whether accepted media is waiting for authoritative playback start.
     pub playback_starting: bool,
+    /// A retained EOF is awaiting its authoritative completion event.
+    ///
+    /// Keeps terminal response polling at the playing cadence during queue
+    /// continuation only; it does not unpause media or count time as listening.
+    #[serde(skip)]
+    pub playback_end_releasing: bool,
     /// Monotonic frame counter for the ASCII playback-start animation.
     pub playback_start_animation_frame: usize,
     /// Media whose backend emitted `PlaybackStarted`, including while paused.
@@ -2527,6 +2533,7 @@ impl Default for ViewModel {
             local_fingerprint_animation_frame: 0,
             search_animation_frame: 0,
             playback_starting: false,
+            playback_end_releasing: false,
             playback_start_animation_frame: 0,
             playing_media_id: None,
             now_playing: None,

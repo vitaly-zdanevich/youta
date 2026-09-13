@@ -1503,6 +1503,7 @@ fn event_wait(view: &ViewModel, settings: &UiSettings) -> Duration {
         || view.subscriptions.loading
         || view.subscriptions.metadata_pending
         || view.playback_starting
+        || view.playback_end_releasing
     {
         playback_wait.min(settings.playing_tick)
     } else {
@@ -13813,6 +13814,29 @@ for encoded, expected in json.load(sys.stdin):
             event_wait(&ViewModel::default(), &zero_settings),
             Duration::from_millis(1)
         );
+    }
+
+    #[test]
+    fn releasing_a_held_end_uses_playing_cadence_without_faster_paused_polling() {
+        let settings = UiSettings {
+            idle_tick: Duration::from_secs(2),
+            playing_tick: Duration::from_millis(250),
+            ..UiSettings::default()
+        };
+        let mut view = ViewModel::default();
+        assert!(view.playback.paused);
+        assert_eq!(event_wait(&view, &settings), settings.idle_tick);
+
+        view.playback_end_releasing = true;
+        assert_eq!(
+            event_wait(&view, &settings),
+            settings.playing_tick,
+            "Autoplay must not wait for an idle tick after releasing held EOF"
+        );
+        assert!(view.playback.paused, "waiting is not listening time");
+
+        view.playback_end_releasing = false;
+        assert_eq!(event_wait(&view, &settings), settings.idle_tick);
     }
 
     #[test]

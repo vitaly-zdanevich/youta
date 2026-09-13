@@ -9,6 +9,7 @@
 //! terminal event loop never waits for these responses, while the process
 //! avoids an asynchronous runtime and its additional idle bookkeeping.
 
+mod end_pause;
 #[cfg(feature = "web-browser")]
 mod web;
 #[cfg(all(feature = "web-browser", feature = "local-metadata"))]
@@ -5442,6 +5443,8 @@ pub struct AppController {
     url_open_pending: usize,
     playback_queue: PlaybackQueue,
     playback_phase: PlaybackPhase,
+    /// The backend still owns the finite `YouTube` timeline after natural EOF.
+    playback_held_at_end: bool,
     playback_load_kind: PlaybackLoadKind,
     pending_history: Option<HistoryEntry>,
     ignore_replaced_stop: bool,
@@ -6666,6 +6669,7 @@ impl AppController {
             url_open_pending: 0,
             playback_queue: PlaybackQueue::default(),
             playback_phase: PlaybackPhase::Idle,
+            playback_held_at_end: false,
             playback_load_kind: PlaybackLoadKind::Regular,
             pending_history: None,
             ignore_replaced_stop: false,
@@ -25275,6 +25279,7 @@ impl AppController {
         }
         canonical_input.start_at = Duration::from_secs(start_at);
         canonical_input.title = Some(item.media.title.clone());
+        canonical_input.keep_open = media_id.source == SourceKind::YouTube && !live_stream;
         #[cfg(feature = "waveform")]
         let local_playback_candidate = (media_id.source == SourceKind::Local)
             .then(|| local_playback_path(&canonical_input.location))
@@ -25285,6 +25290,7 @@ impl AppController {
         let mut input = resolved_input.unwrap_or_else(|| canonical_input.clone());
         input.start_at = Duration::from_secs(start_at);
         input.title = Some(item.media.title.clone());
+        input.keep_open = canonical_input.keep_open;
         let mut load_kind = if media_id.source == SourceKind::YouTube {
             PlaybackLoadKind::YouTubeCanonical
         } else {
@@ -25370,6 +25376,8 @@ impl AppController {
                 });
                 self.current_autoplay_origin = origin;
                 self.playback_phase = PlaybackPhase::Loading;
+                self.playback_held_at_end = false;
+                self.view.playback_end_releasing = false;
                 self.playback_load_kind = load_kind;
                 self.begin_playback_start_activity();
                 self.ignore_replaced_stop = had_active_media;
@@ -25501,6 +25509,10 @@ impl AppController {
     /// input-before-tick race without applying a stale seek to an autoplay
     /// successor or replacing the authoritative end event with a command
     /// error popup.
+    ///
+    /// A meaningful seek from automatic EOF pause also resumes the backend.
+    /// Ordinary manual pauses are preserved; absolute seeks await a native
+    /// restart before discarding EOF because displayed duration can be rounded.
     fn seek_player_command(&mut self, command: PlayerCommand) -> bool {
         if self.playback_phase == PlaybackPhase::Idle || self.current_media.is_none() {
             return false;
@@ -25509,6 +25521,8 @@ impl AppController {
         if self.drain_player_events(elapsed)
             || self.playback_phase == PlaybackPhase::Idle
             || self.current_media.is_none()
+            || self.view.playback_end_releasing
+            || self.is_held_end_no_op_seek(&command)
         {
             return false;
         }
@@ -25516,8 +25530,17 @@ impl AppController {
             self.view.status_line = "Nothing is playing".to_owned();
             return false;
         };
+        // Displayed duration can differ from native EOF. For absolute seeks,
+        // only a backend restart confirms this was not a clamped end seek.
+        let clear_held = !matches!(&command, PlayerCommand::SeekAbsolute(_));
         match player.command(command) {
-            Ok(()) => true,
+            Ok(()) => {
+                if clear_held && std::mem::take(&mut self.playback_held_at_end) {
+                    self.view.playback.paused = false;
+                    self.view.status_line = format!("Playing {}", self.current_playback_title());
+                }
+                true
+            }
             Err(error) => {
                 if self.drain_player_events(elapsed) {
                     return false;
@@ -25577,6 +25600,9 @@ impl AppController {
         if self.drain_player_events(elapsed) {
             return;
         }
+        if self.continue_from_held_end(elapsed) {
+            return;
+        }
         let Some(status_result) = self.player.as_mut().map(|player| player.status()) else {
             return;
         };
@@ -25599,6 +25625,16 @@ impl AppController {
                 if self.playback_phase != PlaybackPhase::Playing {
                     status.paused = true;
                     status.buffering = true;
+                }
+                if self.playback_held_at_end {
+                    // The threaded snapshot may precede the EOF event. Keep
+                    // the authoritative end pause until a seek/restart clears it.
+                    status.paused = true;
+                    status.buffering = false;
+                    if let Some(duration) = status.duration.or(self.view.playback.duration) {
+                        status.duration = Some(duration);
+                        status.position = duration;
+                    }
                 }
                 // Backends may derive a title from a resolved CDN URL. Youta
                 // already owns the stable user-facing title and must not
@@ -25747,6 +25783,12 @@ impl AppController {
                     }
                 }
                 Ok(Some(PlaybackEvent::PlaybackStarted)) => {
+                    self.view.playback_end_releasing = false;
+                    if std::mem::take(&mut self.playback_held_at_end) {
+                        self.view.playback.paused = false;
+                        self.view.status_line =
+                            format!("Playing {}", self.current_playback_title());
+                    }
                     if self.playback_phase != PlaybackPhase::Playing {
                         self.playback_phase = PlaybackPhase::Playing;
                         self.playback_load_kind = PlaybackLoadKind::Regular;
@@ -25769,6 +25811,11 @@ impl AppController {
                         self.follow_yandex_music_playback_selection();
                         #[cfg(feature = "waveform")]
                         self.follow_local_waveform_playback_transition();
+                    }
+                }
+                Ok(Some(PlaybackEvent::EndOfFileHeld)) => {
+                    if self.handle_held_playback_end(elapsed) {
+                        return true;
                     }
                 }
                 Ok(Some(PlaybackEvent::Ended(end))) => {
@@ -26013,6 +26060,7 @@ impl AppController {
         let mut input = PlaybackInput::new(item.playback_location);
         input.start_at = Duration::from_secs(start_at);
         input.title = Some(title.clone());
+        input.keep_open = item.media.kind != MediaKind::LiveStream;
         input.verify_remote_format = next_kind == PlaybackLoadKind::YouTubeChecked;
         let result = self
             .player
@@ -26073,6 +26121,8 @@ impl AppController {
         #[cfg(feature = "ascii-visualizer")]
         self.dismiss_ascii_visualizer();
         self.playback_phase = PlaybackPhase::Idle;
+        self.playback_held_at_end = false;
+        self.view.playback_end_releasing = false;
         self.playback_load_kind = PlaybackLoadKind::Regular;
         self.clear_playback_start_activity();
         self.view.playing_media_id = None;
@@ -45195,6 +45245,8 @@ pub fn is_confined_path(root: &Path, candidate: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[path = "end_pause.rs"]
+    mod end_pause_tests;
     #[cfg(all(feature = "web-browser", feature = "local-metadata"))]
     #[path = "web_metadata.rs"]
     mod web_metadata_tests;
