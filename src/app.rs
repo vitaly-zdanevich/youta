@@ -11,6 +11,8 @@
 
 #[cfg(feature = "archive-org")]
 mod archive_org;
+#[cfg(feature = "yt-dlp")]
+mod download_choice;
 mod end_pause;
 #[cfg(feature = "web-browser")]
 mod web;
@@ -5366,6 +5368,12 @@ pub struct AppController {
     download_launcher: Box<dyn DownloadLauncher>,
     #[cfg(feature = "yt-dlp")]
     active_download: Option<ActiveDownload>,
+    /// Captured manual source and choices; independent of foreground navigation.
+    #[cfg(feature = "yt-dlp")]
+    pending_download_choice: Option<download_choice::PendingDownloadChoice>,
+    /// Distinguishes clicks queued for a preceding step of a two-stage chooser.
+    #[cfg(feature = "yt-dlp")]
+    download_choice_generation: u64,
     /// Opted-in channels waiting behind the sole supervised download child.
     #[cfg(feature = "yt-dlp")]
     automatic_download_queue: VecDeque<AutomaticDownloadJob>,
@@ -6644,6 +6652,10 @@ impl AppController {
             download_launcher,
             #[cfg(feature = "yt-dlp")]
             active_download: None,
+            #[cfg(feature = "yt-dlp")]
+            pending_download_choice: None,
+            #[cfg(feature = "yt-dlp")]
+            download_choice_generation: 0,
             #[cfg(feature = "yt-dlp")]
             automatic_download_queue: VecDeque::new(),
             #[cfg(feature = "yt-dlp")]
@@ -19928,7 +19940,7 @@ impl AppController {
     /// Starts the next queued channel without competing with a manual download.
     #[cfg(feature = "yt-dlp")]
     fn start_next_automatic_download(&mut self) {
-        if self.active_download.is_some() {
+        if self.active_download.is_some() || self.pending_download_choice.is_some() {
             return;
         }
         #[cfg(feature = "yandex-music")]
@@ -20068,6 +20080,9 @@ impl AppController {
 
     #[cfg(feature = "yt-dlp")]
     fn start_selected_download(&mut self) {
+        if self.pending_download_choice.is_some() {
+            return;
+        }
         #[cfg(feature = "yandex-music")]
         if self.view.screen == Screen::YandexMusic {
             self.download_selected_yandex_music_track();
@@ -20098,7 +20113,29 @@ impl AppController {
                 return;
             }
         };
-        let source_url = item.media.webpage_url.clone();
+        self.choose_manual_download(item);
+    }
+
+    /// Starts one captured source after confirmation, rechecking concurrent transfers.
+    #[cfg(feature = "yt-dlp")]
+    fn launch_manual_download(
+        &mut self,
+        item: QueueItem,
+        source_url: url::Url,
+        format: DownloadFormat,
+    ) {
+        if self.active_download.is_some() {
+            self.view.status_line =
+                "One download is already running; wait for it to finish".to_owned();
+            return;
+        }
+        #[cfg(feature = "yandex-music")]
+        if self.yandex_music_download_thread.is_some() {
+            self.view.status_line =
+                "A Yandex Music download batch is already running; wait for it to finish"
+                    .to_owned();
+            return;
+        }
         if !matches!(source_url.scheme(), "http" | "https")
             || source_url.host_str().is_none()
             || !source_url.username().is_empty()
@@ -20113,19 +20150,6 @@ impl AppController {
             Err(error) => {
                 self.show_error_message("Download destination is unavailable", error);
                 return;
-            }
-        };
-        // Archive rows already identify one existing file. Never apply an Opus
-        // source filter, extraction or conversion to that exact selected audio.
-        let format = if item.media.id.source == SourceKind::ArchiveOrg {
-            DownloadFormat::ExactFile
-        } else {
-            match configured_download_format(&self.config.subscriptions.audio_format) {
-                Ok(format) => format,
-                Err(error) => {
-                    self.show_error_message("Download format is invalid", error);
-                    return;
-                }
             }
         };
         let request = DownloadRequest {
@@ -32356,6 +32380,8 @@ impl AppController {
             SAVE_PLAYBACK_HISTORY_ENV,
             SUBSCRIPTIONS_AUTO_DOWNLOAD_ENV,
             VIDEO_SUMMARY_BACKEND_ENV,
+            crate::config::DOWNLOAD_MODE_ENV,
+            crate::config::ARCHIVE_DOWNLOAD_FORMAT_ENV,
         ]
         .into_iter()
         .filter(|variable| tui_preference_environment_variable_is_relevant(variable))
@@ -32379,6 +32405,8 @@ impl AppController {
             bandcamp_audio_format: self.config.providers.bandcamp_audio_format,
             save_playback_history: self.config.persistence.save_playback_history,
             video_summary_backend: self.config.video_summary.backend,
+            download_mode: self.config.downloads.mode,
+            archive_download_preference: self.config.downloads.archive_format,
             video_summary_supported: cfg!(feature = "summary"),
             config_path: self.config.config_file().display().to_string(),
             environment_override: (!environment_override.is_empty())
@@ -33548,6 +33576,8 @@ impl AppController {
         let save_playback_history = preferences.save_playback_history;
         let download_new_episodes_every_hour = preferences.download_new_episodes_every_hour;
         let video_summary_backend = preferences.video_summary_backend;
+        let download_mode = preferences.download_mode;
+        let archive_download_preference = preferences.archive_download_preference;
         let video_summary_backend_changed =
             self.config.video_summary.backend != video_summary_backend;
         #[cfg(feature = "sponsorblock")]
@@ -33572,6 +33602,8 @@ impl AppController {
             save_playback_history,
             download_new_episodes_every_hour,
             video_summary_backend,
+            download_mode,
+            archive_download_preference,
         ) {
             if let Some(preferences) = self.view.preferences_popup.as_mut() {
                 preferences.validation_error = Some(error.to_string());
@@ -35335,6 +35367,41 @@ impl UiController for AppController {
                 self.view.status_line = "RSS subscription canceled".to_owned();
             }
             UiAction::OpenPreferences => self.open_preferences(),
+            #[cfg(feature = "yt-dlp")]
+            UiAction::MoveDownloadChoice(direction) => self.move_download_choice(direction),
+            #[cfg(feature = "yt-dlp")]
+            UiAction::ConfirmDownloadChoice(generation) => {
+                self.confirm_download_choice(generation, None)
+            }
+            #[cfg(feature = "yt-dlp")]
+            UiAction::DismissDownloadChoice => self.dismiss_download_choice(),
+            #[cfg(feature = "yt-dlp")]
+            UiAction::SelectDownloadChoice { generation, index } => {
+                self.confirm_download_choice(generation, Some(index))
+            }
+            #[cfg(not(feature = "yt-dlp"))]
+            UiAction::MoveDownloadChoice(_)
+            | UiAction::ConfirmDownloadChoice(_)
+            | UiAction::DismissDownloadChoice
+            | UiAction::SelectDownloadChoice { .. } => {}
+            UiAction::CycleDownloadModePreference => {
+                if let Some(popup) = self.view.preferences_popup.as_mut()
+                    && popup.environment_override.is_none()
+                    && cfg!(feature = "yt-dlp")
+                {
+                    popup.download_mode = popup.download_mode.next();
+                    popup.validation_error = None;
+                }
+            }
+            UiAction::CycleArchiveDownloadPreference => {
+                if let Some(popup) = self.view.preferences_popup.as_mut()
+                    && popup.environment_override.is_none()
+                    && cfg!(all(feature = "archive-org", feature = "yt-dlp"))
+                {
+                    popup.archive_download_preference = popup.archive_download_preference.next();
+                    popup.validation_error = None;
+                }
+            }
             UiAction::SetSubscriptionsLayout(layout) => {
                 self.set_draft_subscriptions_layout(layout);
             }
@@ -35662,6 +35729,7 @@ impl UiController for AppController {
             self.drain_youtube_prewarm_responses();
             self.request_due_youtube_prewarm(now);
             self.queue_due_automatic_download_check(now);
+            self.poll_manual_download_choice();
             self.start_next_automatic_download();
             self.poll_download_at(now);
         }
@@ -45381,6 +45449,9 @@ pub fn is_confined_path(root: &Path, candidate: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "yt-dlp")]
+    #[path = "download_choice.rs"]
+    mod download_choice_tests;
     #[path = "end_pause.rs"]
     mod end_pause_tests;
     #[cfg(all(feature = "web-browser", feature = "local-metadata"))]
@@ -70930,7 +71001,7 @@ mod tests {
 
     #[cfg(feature = "yt-dlp")]
     fn controller_with_mock_download(
-        config: Config,
+        mut config: Config,
         process: MockRunningDownload,
     ) -> (
         AppController,
@@ -70938,6 +71009,9 @@ mod tests {
         Arc<AtomicBool>,
     ) {
         let cancelled = Arc::clone(&process.cancelled);
+        // Existing supervision fixtures explicitly bypass the new manual chooser;
+        // chooser regressions restore AskEachTime after creating this controller.
+        config.downloads.mode = crate::config::DownloadMode::AudioOnly;
         let requests = Arc::new(Mutex::new(Vec::new()));
         let store = StateStore::open_in_memory().expect("in-memory state");
         let mut controller = AppController::new(config, store, None, None);
@@ -72673,7 +72747,7 @@ mod tests {
             request.source_url.as_str(),
             "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
         );
-        assert_eq!(request.format, DownloadFormat::OpusWithoutTranscoding);
+        assert_eq!(request.format, DownloadFormat::AudioOnlyWithoutReencoding);
         assert_eq!(request.scope, DownloadScope::SingleItem);
         assert!(!request.write_thumbnail);
         assert_eq!(

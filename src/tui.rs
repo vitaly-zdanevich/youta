@@ -1830,6 +1830,8 @@ struct HitMap {
     private_note_scroll_maximum: usize,
 
     local_file_buttons: Vec<(UiAction, Rect)>,
+    /// Exact modal choices and confirmation controls for one download request.
+    download_choice_buttons: Vec<(UiAction, Rect)>,
     #[cfg(feature = "yt-dlp")]
     channel_download_buttons: Vec<(UiAction, Rect)>,
     /// Visible destination rows inside the Local Move popup.
@@ -2177,6 +2179,7 @@ fn render_frame(
         || view.playlist_popup.is_some()
         || view.private_note_popup.is_some()
         || view.local_file_popup.is_some()
+        || view.download_choice_popup.is_some()
         || view.video_comments_popup.is_some()
         || view.error_popup.is_some();
     #[cfg(feature = "yt-dlp")]
@@ -2350,6 +2353,10 @@ fn render_frame(
         if let Some(popup) = view.channel_download_popup.as_ref() {
             render_channel_download_popup(frame, popup, &theme, hit_map);
         }
+    }
+    hit_map.download_choice_buttons.clear();
+    if let Some(popup) = view.download_choice_popup.as_ref() {
+        render_download_choice_popup(frame, popup, settings.show_hotkeys, &theme, hit_map);
     }
     hit_map.playlist_popup_rows = Rect::default();
     hit_map.playlist_popup_first_index = 0;
@@ -10624,10 +10631,11 @@ fn render_preferences_popup(
             Constraint::Length(1),
             Constraint::Length(2),
             Constraint::Length(2),
+            // Reuse the two formerly blank rows below TTY/Bandcamp preferences.
+            Constraint::Length(4),
             Constraint::Length(2),
-            Constraint::Length(2),
-            Constraint::Length(2),
-            Constraint::Length(2),
+            Constraint::Length(1),
+            Constraint::Length(1),
             Constraint::Length(2),
             Constraint::Min(4),
             Constraint::Length(1),
@@ -10894,6 +10902,57 @@ fn render_preferences_popup(
             control_area,
         );
         if preferences.auto_download_supported {
+            hit_map.preferences_buttons.push((
+                action,
+                Rect::new(
+                    centered_line_x(control_area, terminal_text_width(&label)),
+                    control_area.y,
+                    terminal_text_width(&label).min(control_area.width),
+                    1,
+                ),
+            ));
+        }
+    }
+
+    for (row, key, label, supported, action) in [
+        (
+            2,
+            "m",
+            format!("Download mode: {}", preferences.download_mode.label()),
+            preferences.auto_download_supported,
+            UiAction::CycleDownloadModePreference,
+        ),
+        (
+            3,
+            "F",
+            format!(
+                "archive.org format: {}",
+                preferences.archive_download_preference.label()
+            ),
+            cfg!(feature = "archive-org") && preferences.auto_download_supported,
+            UiAction::CycleArchiveDownloadPreference,
+        ),
+    ] {
+        let label = if supported {
+            button(key, &label, show_hotkeys)
+        } else if row == 2 {
+            "Download mode: unavailable in this build".to_owned()
+        } else {
+            "archive.org format: unavailable in this build".to_owned()
+        };
+        let control_area = Rect::new(
+            sections[5].x,
+            sections[5].y.saturating_add(row),
+            sections[5].width,
+            1,
+        );
+        frame.render_widget(
+            Paragraph::new(label.clone())
+                .style(if supported { theme.base } else { theme.muted })
+                .alignment(Alignment::Center),
+            control_area,
+        );
+        if supported {
             hit_map.preferences_buttons.push((
                 action,
                 Rect::new(
@@ -11262,6 +11321,111 @@ fn render_local_file_popup(
             1,
         ),
     ));
+}
+
+/// Renders exact controller choices and keeps every action inside its modal area.
+fn render_download_choice_popup(
+    frame: &mut Frame<'_>,
+    popup: &DownloadChoicePopupView,
+    show_hotkeys: bool,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+) {
+    let width = frame.area().width.saturating_sub(4).clamp(1, 90);
+    let message = format!("{}\n{}", popup.title, popup.explanation);
+    let wrapped = wrap_text_lines(&message, width.saturating_sub(4).max(1));
+    let height = u16::try_from(
+        wrapped
+            .len()
+            .saturating_add(popup.options.len())
+            .saturating_add(4),
+    )
+    .unwrap_or(u16::MAX)
+    .min(frame.area().height.saturating_sub(2).max(1));
+    let area = centered_sized_rect(width, height, frame.area());
+    frame.render_widget(Clear, area);
+    frame.render_widget(panel_block(" Download format ", theme), area);
+    let inner = area.inner(ratatui::layout::Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+    if inner.is_empty() {
+        return;
+    }
+    let footer = Rect::new(inner.x, inner.bottom() - 1, inner.width, 1);
+    let message_height = u16::try_from(wrapped.len())
+        .unwrap_or(u16::MAX)
+        .min(inner.height.saturating_sub(2));
+    frame.render_widget(
+        Paragraph::new(wrapped.join("\n")).style(theme.base),
+        Rect::new(inner.x, inner.y, inner.width, message_height),
+    );
+    let rows = Rect::new(
+        inner.x,
+        inner.y.saturating_add(message_height),
+        inner.width,
+        inner
+            .height
+            .saturating_sub(message_height)
+            .saturating_sub(1),
+    );
+    let selected = popup.selected.min(popup.options.len().saturating_sub(1));
+    let first = selected.saturating_sub(usize::from(rows.height).saturating_sub(1));
+    for (index, label) in popup
+        .options
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(usize::from(rows.height))
+    {
+        let label = format!("{} {label}", if index == selected { "▶" } else { " " });
+        let target = Rect::new(
+            rows.x,
+            rows.y
+                .saturating_add(u16::try_from(index - first).unwrap_or(u16::MAX)),
+            terminal_text_width(&label).min(rows.width),
+            1,
+        );
+        frame.render_widget(
+            Paragraph::new(label).style(if index == selected {
+                theme.selected
+            } else {
+                theme.base
+            }),
+            target,
+        );
+        hit_map.download_choice_buttons.push((
+            UiAction::SelectDownloadChoice {
+                generation: popup.generation,
+                index,
+            },
+            target,
+        ));
+    }
+    let mut x = footer.x;
+    for (key, label, action) in [
+        (
+            "Enter",
+            "Download",
+            UiAction::ConfirmDownloadChoice(popup.generation),
+        ),
+        ("Esc", "Cancel", UiAction::DismissDownloadChoice),
+    ] {
+        if matches!(action, UiAction::ConfirmDownloadChoice(_))
+            && popup.selected >= popup.options.len()
+        {
+            continue;
+        }
+        let label = button(key, label, show_hotkeys);
+        let width = terminal_text_width(&label).min(footer.right().saturating_sub(x));
+        if width == 0 {
+            break;
+        }
+        let target = Rect::new(x, footer.y, width, 1);
+        frame.render_widget(Paragraph::new(label).style(theme.accent), target);
+        hit_map.download_choice_buttons.push((action, target));
+        x = x.saturating_add(width).saturating_add(2);
+    }
 }
 
 /// Renders the review gate for a potentially large full-channel transfer.
@@ -12391,6 +12555,18 @@ fn mouse_action_unfiltered(
             MouseEventKind::ScrollUp if popup.mode == PlaylistPopupMode::Choose => {
                 Some(UiAction::MovePlaylistPopupSelection(-1))
             }
+            _ => None,
+        };
+    }
+    if view.download_choice_popup.is_some() {
+        return match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => hit_map
+                .download_choice_buttons
+                .iter()
+                .find(|(_, area)| contains(*area, mouse.column, mouse.row))
+                .map(|(action, _)| action.clone()),
+            MouseEventKind::ScrollDown => Some(UiAction::MoveDownloadChoice(1)),
+            MouseEventKind::ScrollUp => Some(UiAction::MoveDownloadChoice(-1)),
             _ => None,
         };
     }
@@ -19628,6 +19804,175 @@ for encoded, expected in json.load(sys.stdin):
         );
     }
 
+    /// The chooser owns navigation and explicit confirmation, never background playback keys.
+    #[test]
+    fn download_choice_popup_is_modal_and_confirms_exact_clicked_options() {
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        let view = ViewModel {
+            download_choice_popup: Some(DownloadChoicePopupView {
+                generation: 42,
+                title: "Selected audio fixture".to_owned(),
+                explanation: "Choose an existing file; nothing has downloaded yet.".to_owned(),
+                options: vec!["Original file (FLAC)".to_owned(), "Archive MP3".to_owned()],
+                selected: 1,
+            }),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .unwrap();
+        let rendered = rendered_text(&terminal);
+        for label in [
+            "Selected audio fixture",
+            "nothing has downloaded yet",
+            "Original file (FLAC)",
+            "Archive MP3",
+            "[Enter] Download",
+            "[Esc] Cancel",
+        ] {
+            assert!(rendered.contains(label), "{label}");
+        }
+        for (key, expected) in [
+            (KeyCode::Up, Some(UiAction::MoveDownloadChoice(-1))),
+            (KeyCode::Down, Some(UiAction::MoveDownloadChoice(1))),
+            (KeyCode::Enter, Some(UiAction::ConfirmDownloadChoice(42))),
+            (KeyCode::Esc, Some(UiAction::DismissDownloadChoice)),
+            (KeyCode::Char('q'), None),
+            (KeyCode::Char('d'), None),
+            (KeyCode::Char('A'), None),
+            (KeyCode::Left, None),
+            (KeyCode::Char(' '), None),
+        ] {
+            assert_eq!(
+                key_action(KeyEvent::new(key, KeyModifiers::NONE), &view),
+                expected
+            );
+        }
+        for index in 0..2 {
+            let target = hit_map
+                .download_choice_buttons
+                .iter()
+                .find_map(|(action, area)| {
+                    (action
+                        == &UiAction::SelectDownloadChoice {
+                            generation: 42,
+                            index,
+                        })
+                        .then_some(*area)
+                })
+                .expect("rendered download option");
+            for column in [target.x, target.right() - 1] {
+                assert_eq!(
+                    mouse_action(
+                        MouseEvent {
+                            kind: MouseEventKind::Down(MouseButton::Left),
+                            column,
+                            row: target.y,
+                            modifiers: KeyModifiers::NONE,
+                        },
+                        &hit_map,
+                        &view
+                    ),
+                    Some(UiAction::SelectDownloadChoice {
+                        generation: 42,
+                        index
+                    })
+                );
+            }
+        }
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: 0,
+                    row: 0,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view
+            ),
+            None
+        );
+    }
+
+    /// Both mouse confirmation routes carry the exact rendered stage, even after it changes.
+    #[test]
+    fn download_choice_footer_and_rows_echo_the_rendered_generation() {
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        let mut view = ViewModel::default();
+        let mut hit_map = HitMap::default();
+        for generation in [7, 42] {
+            view.download_choice_popup = Some(DownloadChoicePopupView {
+                generation,
+                title: "Selected file".to_owned(),
+                explanation: "Choose the exact current stage".to_owned(),
+                options: vec!["Original file".to_owned()],
+                selected: 0,
+            });
+            terminal
+                .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+                .unwrap();
+            for expected in [
+                UiAction::ConfirmDownloadChoice(generation),
+                UiAction::SelectDownloadChoice {
+                    generation,
+                    index: 0,
+                },
+            ] {
+                let target = hit_map
+                    .download_choice_buttons
+                    .iter()
+                    .find_map(|(action, target)| (action == &expected).then_some(*target))
+                    .unwrap();
+                assert_eq!(
+                    mouse_action(
+                        MouseEvent {
+                            kind: MouseEventKind::Down(MouseButton::Left),
+                            column: target.x,
+                            row: target.y,
+                            modifiers: KeyModifiers::NONE,
+                        },
+                        &hit_map,
+                        &view
+                    ),
+                    Some(expected)
+                );
+            }
+        }
+    }
+
+    /// A closed chooser cannot leave hitboxes active over the ordinary screen.
+    #[test]
+    fn download_choice_popup_clears_stale_targets_and_clips_small_layouts() {
+        for (width, height) in [(100, 24), (40, 10), (12, 5)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let mut view = ViewModel {
+                download_choice_popup: Some(DownloadChoicePopupView {
+                    generation: 7,
+                    title: "A long selected file title".to_owned(),
+                    explanation: "Original upload or an available Archive derivative.".to_owned(),
+                    options: vec!["Original file".to_owned(), "Archive MP3".to_owned()],
+                    selected: 1,
+                }),
+                ..ViewModel::default()
+            };
+            let mut hit_map = HitMap::default();
+            terminal
+                .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+                .unwrap();
+            for (_, target) in &hit_map.download_choice_buttons {
+                assert!(target.right() <= width && target.bottom() <= height);
+                assert!(target.width > 0 && target.height == 1);
+            }
+            view.download_choice_popup = None;
+            terminal
+                .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+                .unwrap();
+            assert!(hit_map.download_choice_buttons.is_empty());
+        }
+    }
+
     #[test]
     fn preferences_popup_is_modal_selectable_and_clickable() {
         let backend = TestBackend::new(120, 32);
@@ -19643,6 +19988,8 @@ for encoded, expected in json.load(sys.stdin):
                 nyan_cat_supported: true,
                 youtube_prewarm: true,
                 download_new_episodes_every_hour: true,
+                download_mode: crate::config::DownloadMode::AskEachTime,
+                archive_download_preference: crate::config::ArchiveDownloadPreference::AskEachTime,
                 auto_download_supported: true,
                 auto_download_status: Some("Checking 2 opted-in YouTube channel(s)".to_owned()),
                 youtube_thumbnail_size: YouTubeThumbnailSize::Standard,
@@ -19671,6 +20018,18 @@ for encoded, expected in json.load(sys.stdin):
         assert!(rendered.contains("[y] Prepare selected YouTube audio: on"));
         assert!(rendered.contains("[e] Download new episodes every hour: on"));
         assert!(rendered.contains("[C] Check and download new episodes"));
+        assert!(rendered.contains("[m] Download mode: Ask each time"));
+        #[cfg(feature = "archive-org")]
+        assert!(rendered.contains("[F] archive.org format: Ask each time"));
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE), &view),
+            Some(UiAction::CycleDownloadModePreference)
+        );
+        #[cfg(feature = "archive-org")]
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('F'), KeyModifiers::NONE), &view),
+            Some(UiAction::CycleArchiveDownloadPreference)
+        );
         assert!(rendered.contains("Checking 2 opted-in YouTube channel(s)"));
         assert!(rendered.contains("[N] Rainbow Nyan Cat seek bar: on"));
         #[cfg(feature = "images")]
@@ -19977,6 +20336,15 @@ for encoded, expected in json.load(sys.stdin):
                 UiAction::CheckAndDownloadNewEpisodes,
                 "[C] Check and download new episodes",
             ),
+            (
+                UiAction::CycleDownloadModePreference,
+                "[m] Download mode: Ask each time",
+            ),
+            #[cfg(feature = "archive-org")]
+            (
+                UiAction::CycleArchiveDownloadPreference,
+                "[F] archive.org format: Ask each time",
+            ),
             (UiAction::SubmitPreferences, "[Enter] Save"),
             (UiAction::DismissPreferences, "[Esc] Cancel"),
         ] {
@@ -20022,6 +20390,10 @@ for encoded, expected in json.load(sys.stdin):
         assert!(!rendered.contains("[e] Download new episodes every hour: on"));
         assert!(rendered.contains("Check and download new episodes"));
         assert!(!rendered.contains("[C] Check and download new episodes"));
+        assert!(rendered.contains("Download mode: Ask each time"));
+        assert!(!rendered.contains("[m] Download mode"));
+        #[cfg(feature = "archive-org")]
+        assert!(!rendered.contains("[F] archive.org format"));
 
         let mut view = view;
         view.preferences_popup
@@ -20034,7 +20406,7 @@ for encoded, expected in json.load(sys.stdin):
         let rendered = rendered_text(&terminal);
         assert!(rendered.contains("Automatic downloads: unavailable in this build"));
         assert!(!rendered.contains("Check and download new episodes"));
-        for key in ['e', 'C'] {
+        for key in ['e', 'C', 'm', 'F'] {
             assert_eq!(
                 key_action(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE), &view),
                 None
@@ -20043,7 +20415,9 @@ for encoded, expected in json.load(sys.stdin):
         assert!(hit_map.preferences_buttons.iter().all(|(action, _)| {
             !matches!(
                 action,
-                UiAction::ToggleHourlyAutoDownload | UiAction::CheckAndDownloadNewEpisodes
+                UiAction::ToggleHourlyAutoDownload
+                    | UiAction::CheckAndDownloadNewEpisodes
+                    | UiAction::CycleDownloadModePreference
             )
         }));
     }
@@ -20063,6 +20437,8 @@ for encoded, expected in json.load(sys.stdin):
                 nyan_cat_supported: true,
                 youtube_prewarm: true,
                 download_new_episodes_every_hour: true,
+                download_mode: crate::config::DownloadMode::AskEachTime,
+                archive_download_preference: crate::config::ArchiveDownloadPreference::AskEachTime,
                 auto_download_supported: true,
                 auto_download_status: None,
                 youtube_thumbnail_size: YouTubeThumbnailSize::Standard,
@@ -20110,6 +20486,8 @@ for encoded, expected in json.load(sys.stdin):
                 nyan_cat_supported: true,
                 youtube_prewarm: true,
                 download_new_episodes_every_hour: true,
+                download_mode: crate::config::DownloadMode::AskEachTime,
+                archive_download_preference: crate::config::ArchiveDownloadPreference::AskEachTime,
                 auto_download_supported: true,
                 auto_download_status: None,
                 youtube_thumbnail_size: YouTubeThumbnailSize::Standard,

@@ -68,6 +68,12 @@ pub const YOUTUBE_THUMBNAIL_SIZE_ENV: &str = "YOUTA_UI__YOUTUBE_THUMBNAIL_SIZE";
 /// Environment variable that overrides whether new playback History rows are saved.
 pub const SAVE_PLAYBACK_HISTORY_ENV: &str = "YOUTA_PERSISTENCE__SAVE_PLAYBACK_HISTORY";
 
+/// Environment variable that overrides the video/audio-only download choice.
+pub const DOWNLOAD_MODE_ENV: &str = "YOUTA_DOWNLOADS__MODE";
+
+/// Environment variable that overrides the Archive original/MP3 choice.
+pub const ARCHIVE_DOWNLOAD_FORMAT_ENV: &str = "YOUTA_DOWNLOADS__ARCHIVE_FORMAT";
+
 /// Environment variable that overrides the selected video-summary backend.
 pub const VIDEO_SUMMARY_BACKEND_ENV: &str = "YOUTA_VIDEO_SUMMARY__BACKEND";
 
@@ -83,6 +89,9 @@ pub(crate) fn tui_preference_environment_variable_is_relevant(variable: &str) ->
         && (cfg!(feature = "sponsorblock") || variable != SPONSORBLOCK_ENABLED_ENV)
         && (cfg!(feature = "nyan-cat") || variable != NYAN_CAT_SEEKBAR_ENV)
         && (cfg!(feature = "yt-dlp") || variable != SUBSCRIPTIONS_AUTO_DOWNLOAD_ENV)
+        && (cfg!(feature = "yt-dlp") || variable != DOWNLOAD_MODE_ENV)
+        && (cfg!(all(feature = "archive-org", feature = "yt-dlp"))
+            || variable != ARCHIVE_DOWNLOAD_FORMAT_ENV)
 }
 
 /// Environment variable that overrides the preferred Bandcamp audio format.
@@ -168,6 +177,9 @@ pub struct Config {
     pub playback: PlaybackConfig,
     /// Local subscription behavior.
     pub subscriptions: SubscriptionConfig,
+    /// Explicit download format preferences; old configurations ask first.
+    #[serde(default)]
+    pub downloads: DownloadConfig,
     /// Terminal presentation preferences.
     pub ui: UiConfig,
     /// State persistence behavior.
@@ -198,6 +210,7 @@ impl Config {
         Self {
             playback: PlaybackConfig::default(),
             subscriptions: SubscriptionConfig::default(),
+            downloads: DownloadConfig::default(),
             ui: UiConfig::default(),
             persistence: PersistenceConfig::default(),
             video_summary: VideoSummaryConfig::default(),
@@ -728,7 +741,8 @@ impl Config {
     /// [`YOUTUBE_THUMBNAIL_SIZE_ENV`] and [`SAVE_PLAYBACK_HISTORY_ENV`] retain
     /// precedence and therefore prevent this writer from storing a shadowed
     /// draft. [`VIDEO_SUMMARY_BACKEND_ENV`] and [`SUBSCRIPTIONS_AUTO_DOWNLOAD_ENV`]
-    /// do the same when their corresponding capabilities are compiled.
+    /// do the same when their corresponding capabilities are compiled, as do
+    /// [`DOWNLOAD_MODE_ENV`] and [`ARCHIVE_DOWNLOAD_FORMAT_ENV`] for download choices.
     ///
     /// The layout-only [`Self::save_subscriptions_layout`] method remains
     /// available for callers that do not edit the complete preference draft.
@@ -756,6 +770,8 @@ impl Config {
         save_playback_history: bool,
         download_new_episodes_every_hour: bool,
         video_summary_backend: VideoSummaryBackend,
+        download_mode: DownloadMode,
+        archive_download_preference: ArchiveDownloadPreference,
     ) -> Result<(), ConfigError> {
         for variable in [
             SUBSCRIPTIONS_LAYOUT_ENV,
@@ -769,6 +785,8 @@ impl Config {
             SAVE_PLAYBACK_HISTORY_ENV,
             SUBSCRIPTIONS_AUTO_DOWNLOAD_ENV,
             VIDEO_SUMMARY_BACKEND_ENV,
+            DOWNLOAD_MODE_ENV,
+            ARCHIVE_DOWNLOAD_FORMAT_ENV,
         ]
         .into_iter()
         .filter(|variable| tui_preference_environment_variable_is_relevant(variable))
@@ -869,8 +887,41 @@ impl Config {
         }
         #[cfg(not(feature = "summary"))]
         let _ = video_summary_backend;
+        #[cfg(feature = "yt-dlp")]
+        {
+            let downloads = document
+                .as_table_mut()
+                .entry("downloads")
+                .or_insert_with(|| Item::Table(Table::new()))
+                .as_table_mut()
+                .ok_or_else(|| {
+                    ConfigError::Invalid(
+                        "`downloads` must be a TOML table before Youta can update it".to_owned(),
+                    )
+                })?;
+            #[cfg(feature = "yt-dlp")]
+            {
+                downloads["mode"] = value(download_mode.as_config_value());
+            }
+            #[cfg(all(feature = "archive-org", feature = "yt-dlp"))]
+            {
+                downloads["archive_format"] = value(archive_download_preference.as_config_value());
+            }
+        }
         write_private_config(&path, document.to_string().as_bytes())?;
 
+        #[cfg(feature = "yt-dlp")]
+        {
+            self.downloads.mode = download_mode;
+        }
+        #[cfg(not(feature = "yt-dlp"))]
+        let _ = download_mode;
+        #[cfg(all(feature = "archive-org", feature = "yt-dlp"))]
+        {
+            self.downloads.archive_format = archive_download_preference;
+        }
+        #[cfg(not(all(feature = "archive-org", feature = "yt-dlp")))]
+        let _ = archive_download_preference;
         self.ui.subscriptions_layout = layout;
         self.ui.show_local_folder_sizes = show_local_folder_sizes;
         #[cfg(feature = "nyan-cat")]
@@ -1024,6 +1075,118 @@ impl Config {
         write_private_config(&path, document.to_string().as_bytes())?;
         self.providers.bandcamp_audio_format = format;
         Ok(())
+    }
+}
+
+/// Explicit download choices, kept separate from subscription automation.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+pub struct DownloadConfig {
+    /// Whether a video download asks for video or audio-only output.
+    pub mode: DownloadMode,
+    /// Whether Archive files keep the original encoding or use an available MP3.
+    pub archive_format: ArchiveDownloadPreference,
+}
+
+/// Closed set of interactive video download preferences.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DownloadMode {
+    /// Ask before each eligible explicit download.
+    #[default]
+    AskEachTime,
+    /// Keep both video and audio when the source provides video.
+    Video,
+    /// Download only the audio from an eligible video.
+    AudioOnly,
+}
+
+impl DownloadMode {
+    /// Stable value written to TOML and environment overrides.
+    #[must_use]
+    pub const fn as_config_value(self) -> &'static str {
+        match self {
+            Self::AskEachTime => "ask-each-time",
+            Self::Video => "video",
+            Self::AudioOnly => "audio-only",
+        }
+    }
+
+    /// Human-readable preference value.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::AskEachTime => "Ask each time",
+            Self::Video => "Video",
+            Self::AudioOnly => "Audio only",
+        }
+    }
+
+    /// Advances the closed preference selector in its stable display order.
+    #[must_use]
+    pub const fn next(self) -> Self {
+        match self {
+            Self::AskEachTime => Self::Video,
+            Self::Video => Self::AudioOnly,
+            Self::AudioOnly => Self::AskEachTime,
+        }
+    }
+}
+
+impl fmt::Display for DownloadMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_config_value())
+    }
+}
+
+/// Closed set of Archive download preferences; unavailable derivatives are never invented.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ArchiveDownloadPreference {
+    /// Ask when the selected Archive track offers a format choice.
+    #[default]
+    AskEachTime,
+    /// Keep the original uploaded file.
+    OriginalFile,
+    /// Use an existing Archive-provided MP3 derivative.
+    ArchiveMp3,
+}
+
+impl ArchiveDownloadPreference {
+    /// Stable value written to TOML and environment overrides.
+    #[must_use]
+    pub const fn as_config_value(self) -> &'static str {
+        match self {
+            Self::AskEachTime => "ask-each-time",
+            Self::OriginalFile => "original-file",
+            Self::ArchiveMp3 => "archive-mp3",
+        }
+    }
+
+    /// Human-readable preference value.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::AskEachTime => "Ask each time",
+            Self::OriginalFile => "Original file",
+            Self::ArchiveMp3 => "Archive MP3",
+        }
+    }
+
+    /// Advances the closed preference selector in its stable display order.
+    #[must_use]
+    pub const fn next(self) -> Self {
+        match self {
+            Self::AskEachTime => Self::OriginalFile,
+            Self::OriginalFile => Self::ArchiveMp3,
+            Self::ArchiveMp3 => Self::AskEachTime,
+        }
+    }
+}
+
+impl fmt::Display for ArchiveDownloadPreference {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_config_value())
     }
 }
 
@@ -2200,6 +2363,178 @@ mod tests {
         ));
     }
 
+    /// Old configurations must acquire explicit ask-first download defaults.
+    #[test]
+    fn download_preferences_default_to_asking_without_changing_existing_settings() {
+        let directory = tempdir().expect("temporary directory");
+        fs::write(
+            directory.path().join("config.toml"),
+            "[playback]\nvolume_percent = 35\n",
+        )
+        .expect("old configuration");
+        let config = Config::load_from_dir_with_environment(directory.path().to_owned(), false)
+            .expect("load old configuration");
+        let value = serde_json::to_value(&config).expect("configuration snapshot");
+        assert_eq!(
+            value["downloads"],
+            serde_json::json!({
+                "mode": "ask-each-time",
+                "archive_format": "ask-each-time"
+            })
+        );
+        assert_eq!(config.playback.volume_percent, 35);
+    }
+
+    /// Saves only the download draft while retaining other preference values.
+    #[cfg(feature = "controller")]
+    fn save_download_draft(config: &mut Config) -> Result<(), ConfigError> {
+        config.save_tui_preferences(
+            config.ui.subscriptions_layout,
+            config.playback.skip_advertisement_chapters,
+            config.playback.sponsorblock_enabled,
+            config.ui.nyan_cat_seekbar,
+            config.playback.youtube_prewarm,
+            config.ui.show_local_folder_sizes,
+            config.ui.show_images_in_tty,
+            config.ui.youtube_thumbnail_size,
+            config.persistence.save_playback_history,
+            config.subscriptions.auto_download,
+            config.video_summary.backend,
+            DownloadMode::AudioOnly,
+            ArchiveDownloadPreference::ArchiveMp3,
+        )
+    }
+
+    /// An unavailable downloader's environment values must not lock unrelated settings.
+    #[cfg(all(feature = "controller", not(feature = "yt-dlp")))]
+    #[test]
+    fn download_environment_overrides_do_not_lock_a_build_without_download_support() {
+        const CHILD_MARKER: &str = "YOUTA_INACTIVE_DOWNLOAD_PREFERENCES_TEST_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let mut config = Config::load().unwrap();
+            let before = config.downloads.clone();
+            assert_eq!(before.mode, DownloadMode::Video);
+            assert_eq!(
+                before.archive_format,
+                ArchiveDownloadPreference::OriginalFile
+            );
+            save_download_draft(&mut config)
+                .expect("inactive download overrides must not lock saving");
+            assert_eq!(config.downloads, before);
+            assert!(
+                !fs::read_to_string(config.config_file())
+                    .unwrap()
+                    .contains("[downloads]")
+            );
+            return;
+        }
+        let directory = tempdir().unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "config::tests::download_environment_overrides_do_not_lock_a_build_without_download_support", "--nocapture"])
+            .env(CHILD_MARKER, "1")
+            .env(CONFIG_DIR_ENV, directory.path())
+            .env(DOWNLOAD_MODE_ENV, "video")
+            .env(ARCHIVE_DOWNLOAD_FORMAT_ENV, "original-file")
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(feature = "controller")]
+    #[test]
+    fn download_preferences_preserve_disabled_capabilities_and_round_trip_enabled_values() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(&path, "# keep download notes\n[downloads]\nmode = 'video'\narchive_format = 'original-file'\n").unwrap();
+        let mut config =
+            Config::load_from_dir_with_environment(directory.path().to_owned(), false).unwrap();
+        save_download_draft(&mut config).unwrap();
+        let reloaded =
+            Config::load_from_dir_with_environment(directory.path().to_owned(), false).unwrap();
+        assert_eq!(reloaded.downloads, config.downloads);
+        assert_eq!(
+            reloaded.downloads.mode,
+            if cfg!(feature = "yt-dlp") {
+                DownloadMode::AudioOnly
+            } else {
+                DownloadMode::Video
+            }
+        );
+        assert_eq!(
+            reloaded.downloads.archive_format,
+            if cfg!(all(feature = "archive-org", feature = "yt-dlp")) {
+                ArchiveDownloadPreference::ArchiveMp3
+            } else {
+                ArchiveDownloadPreference::OriginalFile
+            }
+        );
+        assert!(
+            fs::read_to_string(path)
+                .unwrap()
+                .contains("# keep download notes")
+        );
+    }
+
+    #[cfg(all(feature = "controller", feature = "yt-dlp"))]
+    #[test]
+    fn malformed_download_table_prevents_partial_preferences_file_or_memory_changes() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let original = "# preserve this file\ndownloads = 'not a table'\n[ui]\ntheme = 'dark'\n";
+        fs::write(&path, original).unwrap();
+        let mut config = Config::for_dir(directory.path());
+        let before = config.clone();
+        let error = save_download_draft(&mut config).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("`downloads` must be a TOML table")
+        );
+        assert_eq!(fs::read_to_string(path).unwrap(), original);
+        assert_eq!(config, before);
+    }
+
+    #[test]
+    fn download_preferences_have_closed_stable_serde_values_and_cycles() {
+        for mode in [
+            DownloadMode::AskEachTime,
+            DownloadMode::Video,
+            DownloadMode::AudioOnly,
+        ] {
+            let json = serde_json::to_string(&mode).unwrap();
+            assert_eq!(json, format!("{:?}", mode.as_config_value()));
+            assert_eq!(serde_json::from_str::<DownloadMode>(&json).unwrap(), mode);
+            assert_eq!(mode.next().next().next(), mode);
+            assert!(!mode.label().is_empty());
+        }
+        for format in [
+            ArchiveDownloadPreference::AskEachTime,
+            ArchiveDownloadPreference::OriginalFile,
+            ArchiveDownloadPreference::ArchiveMp3,
+        ] {
+            let json = serde_json::to_string(&format).unwrap();
+            assert_eq!(json, format!("{:?}", format.as_config_value()));
+            assert_eq!(
+                serde_json::from_str::<ArchiveDownloadPreference>(&json).unwrap(),
+                format
+            );
+            assert_eq!(format.next().next().next(), format);
+            assert!(!format.label().is_empty());
+        }
+        assert!(serde_json::from_str::<DownloadMode>("\"best[height>1080]\"").is_err());
+        assert!(serde_json::from_str::<ArchiveDownloadPreference>("\"transcode\"").is_err());
+        let partial: DownloadConfig =
+            serde_json::from_value(serde_json::json!({"mode": "video"})).unwrap();
+        assert_eq!(partial.mode, DownloadMode::Video);
+        assert_eq!(
+            partial.archive_format,
+            ArchiveDownloadPreference::AskEachTime
+        );
+    }
+
     #[test]
     fn defaults_are_low_resource_and_paths_are_confined() {
         let root = PathBuf::from("/tmp/youta-config-test");
@@ -2577,6 +2912,8 @@ youtube_api_key = "keep-this-existing-secret"
                 false,
                 true,
                 VideoSummaryBackend::Codex,
+                DownloadMode::AudioOnly,
+                ArchiveDownloadPreference::ArchiveMp3,
             )
             .expect("save TUI preferences");
 
@@ -2600,6 +2937,26 @@ youtube_api_key = "keep-this-existing-secret"
         assert!(contents.contains("save_playback_history = false"));
         assert!(contents.contains("show_local_folder_sizes = false"));
         assert!(contents.contains("youtube_thumbnail_size = \"maxres\""));
+        #[cfg(feature = "yt-dlp")]
+        assert!(contents.contains("mode = \"audio-only\""));
+        #[cfg(all(feature = "archive-org", feature = "yt-dlp"))]
+        assert!(contents.contains("archive_format = \"archive-mp3\""));
+        assert_eq!(
+            config.downloads.mode,
+            if cfg!(feature = "yt-dlp") {
+                DownloadMode::AudioOnly
+            } else {
+                DownloadMode::AskEachTime
+            }
+        );
+        assert_eq!(
+            config.downloads.archive_format,
+            if cfg!(all(feature = "archive-org", feature = "yt-dlp")) {
+                ArchiveDownloadPreference::ArchiveMp3
+            } else {
+                ArchiveDownloadPreference::AskEachTime
+            }
+        );
         #[cfg(feature = "summary")]
         {
             assert!(contents.contains("[video_summary]"));
@@ -2639,6 +2996,7 @@ youtube_api_key = "keep-this-existing-secret"
 
         let reloaded = Config::load_from_dir_with_environment(directory.path().to_owned(), false)
             .expect("reload configuration");
+        assert_eq!(reloaded.downloads, config.downloads);
         assert_eq!(reloaded.ui.subscriptions_layout, SubscriptionsLayout::Split);
         assert!(!reloaded.ui.show_local_folder_sizes);
         #[cfg(feature = "images")]
@@ -2692,6 +3050,8 @@ youtube_api_key = "keep-this-existing-secret"
                 false,
                 true,
                 VideoSummaryBackend::Off,
+                DownloadMode::AudioOnly,
+                ArchiveDownloadPreference::ArchiveMp3,
             )
             .expect("save supported preferences");
 
@@ -2728,6 +3088,8 @@ youtube_api_key = "keep-this-existing-secret"
                 false,
                 true,
                 VideoSummaryBackend::Off,
+                DownloadMode::AudioOnly,
+                ArchiveDownloadPreference::ArchiveMp3,
             )
             .expect("save supported preferences");
 
@@ -2927,6 +3289,7 @@ youtube_api_key = "keep-this-existing-secret"
             let mut config =
                 Config::load_from_dir(directory.clone()).expect("load overridden configuration");
             let original_thumbnail_size = config.ui.youtube_thumbnail_size;
+            let original_downloads = config.downloads.clone();
             if override_name == SAVE_PLAYBACK_HISTORY_ENV {
                 assert!(!config.persistence.save_playback_history);
             }
@@ -2943,11 +3306,14 @@ youtube_api_key = "keep-this-existing-secret"
                     true,
                     true,
                     VideoSummaryBackend::Codex,
+                    DownloadMode::AudioOnly,
+                    ArchiveDownloadPreference::ArchiveMp3,
                 )
                 .expect_err("an environment override must lock the atomic writer");
             assert!(error.to_string().contains(&override_name));
             assert!(!directory.join("config.toml").exists());
             assert_eq!(config.ui.youtube_thumbnail_size, original_thumbnail_size);
+            assert_eq!(config.downloads, original_downloads);
             if override_name == SAVE_PLAYBACK_HISTORY_ENV {
                 assert!(!config.persistence.save_playback_history);
             }
@@ -2963,6 +3329,8 @@ youtube_api_key = "keep-this-existing-secret"
             (LOCAL_FOLDER_SIZES_ENV, "false"),
             (TTY_IMAGES_ENV, "false"),
             (YOUTUBE_THUMBNAIL_SIZE_ENV, "high"),
+            (DOWNLOAD_MODE_ENV, "video"),
+            (ARCHIVE_DOWNLOAD_FORMAT_ENV, "original-file"),
             (SAVE_PLAYBACK_HISTORY_ENV, "false"),
             (SUBSCRIPTIONS_AUTO_DOWNLOAD_ENV, "false"),
             (VIDEO_SUMMARY_BACKEND_ENV, "codex"),

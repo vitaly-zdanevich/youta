@@ -5,6 +5,8 @@
 mod worker_tests;
 
 use super::*;
+#[cfg(any(feature = "yt-dlp", test))]
+use crate::providers::archive_org::ArchiveOrgDownloadVariant;
 use crate::providers::archive_org::{
     ArchiveOrgClient, ArchiveOrgItem, ArchiveOrgItemDetails, ArchiveOrgSearchPage,
     ArchiveOrgSearchRequest, ArchiveOrgTrack,
@@ -24,8 +26,17 @@ pub(super) struct ArchiveOrgState {
     request: Option<ArchiveJob>,
     worker: Option<ArchiveWorker>,
     initialized: bool,
+    download_lookup: Option<ArchiveDownloadLookup>,
     search_selected: usize,
     message: String,
+}
+
+/// Manual download ownership is independent of the selected tab, item or row.
+struct ArchiveDownloadLookup {
+    #[cfg(any(feature = "yt-dlp", test))]
+    source: url::Url,
+    identifier: String,
+    generation: u64,
 }
 
 /// A replaceable request retains both result ownership and explicit-open intent.
@@ -57,6 +68,127 @@ enum ArchiveResponse {
 }
 
 impl AppController {
+    /// Resolves exact existing files for a manual download without changing navigation.
+    ///
+    /// None means the existing bounded metadata worker is still loading this
+    /// source. Active/cache hits avoid HTTP. Legacy empty inventories refresh
+    /// once, while errors stay terminal until explicit cancellation or a new
+    /// source; polling cannot trigger a retry loop or silently select a file.
+    #[cfg(any(feature = "yt-dlp", test))]
+    pub(super) fn archive_download_variants(
+        &mut self,
+        source: &url::Url,
+    ) -> Result<Option<Vec<ArchiveOrgDownloadVariant>>, String> {
+        let identifier = archive_download_identifier(source)
+            .ok_or_else(|| "Expected a canonical public archive.org file URL".to_owned())?;
+        if self
+            .archive_org
+            .download_lookup
+            .as_ref()
+            .is_some_and(|lookup| lookup.source != *source)
+        {
+            self.cancel_archive_download_lookup();
+        }
+        let cached = self.cached_archive_details(&identifier);
+        let active = self
+            .archive_org
+            .active
+            .as_ref()
+            .filter(|details| details.item.identifier == identifier);
+        for details in cached
+            .as_ref()
+            .and_then(|result| result.as_ref().ok())
+            .into_iter()
+            .chain(active)
+        {
+            if let Some(track) = details.tracks.iter().find(|track| {
+                track.download_url == *source
+                    || track
+                        .download_variants
+                        .iter()
+                        .any(|variant| variant.download_url == *source)
+            }) && !track.download_variants.is_empty()
+            {
+                return Ok(Some(track.download_variants.clone()));
+            }
+        }
+        if self.archive_org.download_lookup.is_some() {
+            if let Some(result) = cached {
+                return match result {
+                    Err(error) => Err(error),
+                    Ok(_) => Err(
+                        "The selected archive.org file has no available download variants"
+                            .to_owned(),
+                    ),
+                };
+            }
+            return if self.archive_download_lookup_pending() {
+                Ok(None)
+            } else {
+                Err("Archive.org download metadata lookup was canceled".to_owned())
+            };
+        }
+        // A new user action may refresh a failed/legacy cache once. The pinned
+        // generation keeps subsequent polls from clearing this attempt's result.
+        self.archive_org.cache.retain(|(id, _)| id != &identifier);
+        let existing = self.archive_org.pending.as_mut().filter(|job| {
+            matches!(&job.kind, ArchiveRequest::Details { identifier: pending, .. } if *pending == identifier)
+        });
+        let generation = if let Some(job) = existing {
+            if let ArchiveRequest::Details { open, .. } = &mut job.kind {
+                *open = false;
+            }
+            if let Some(request) = &mut self.archive_org.request
+                && request.generation == job.generation
+                && let ArchiveRequest::Details { open, .. } = &mut request.kind
+            {
+                *open = false;
+            }
+            job.generation
+        } else {
+            self.archive_org.generation.wrapping_add(1)
+        };
+        self.finish_search_activity(SearchActivity::ArchiveOrg);
+        self.archive_org.download_lookup = Some(ArchiveDownloadLookup {
+            source: source.clone(),
+            identifier: identifier.clone(),
+            generation,
+        });
+        self.queue_archive_request(
+            ArchiveRequest::Details {
+                identifier,
+                open: false,
+            },
+            false,
+        );
+        Ok(None)
+    }
+
+    /// Identifies only the still-pending manual owner, not a completed popup result.
+    fn archive_download_lookup_pending(&self) -> bool {
+        self.archive_org
+            .download_lookup
+            .as_ref()
+            .is_some_and(|lookup| {
+                self.archive_org
+                    .pending
+                    .as_ref()
+                    .is_some_and(|job| job.generation == lookup.generation)
+            })
+    }
+
+    /// Revokes a manual lookup without canceling another navigation owner's request.
+    /// An in-flight HTTP request can finish into the bounded cache but never opens an item.
+    #[cfg(any(feature = "yt-dlp", test))]
+    pub(super) fn cancel_archive_download_lookup(&mut self) {
+        if self.archive_download_lookup_pending() {
+            self.archive_org.generation = self.archive_org.generation.wrapping_add(1);
+            self.archive_org.pending = None;
+            self.archive_org.request = None;
+        }
+        self.archive_org.download_lookup = None;
+    }
+
     /// Starts a new search without reusing another tab's query or results.
     pub(super) fn submit_archive_org_search(&mut self, query: String) {
         self.archive_org_search_query = query.trim().to_owned();
@@ -216,6 +348,14 @@ impl AppController {
             .pending
             .take()
             .expect("current Archive.org owner");
+        if self.archive_org.download_lookup.as_ref().is_some_and(|lookup| {
+            lookup.generation == owner.generation
+                && matches!(&owner.kind, ArchiveRequest::Details { identifier, .. } if *identifier == lookup.identifier)
+        }) {
+            // The download popup polls the cache using its pinned file URL.
+            // Do not open an item or rewrite another tab's rows/status/details.
+            return;
+        }
         match result {
             Ok(ArchiveResponse::Search(page)) => {
                 let mut seen: HashSet<String> = self
@@ -412,10 +552,12 @@ impl AppController {
     pub(super) fn update_archive_org_detail(&mut self) {
         self.archive_org_selected = self.view.selected;
         let selected = self.selected_archive_item();
-        if self.archive_org.pending.as_ref().is_some_and(|job| {
-            matches!(&job.kind, ArchiveRequest::Details { identifier, .. }
+        if !self.archive_download_lookup_pending()
+            && self.archive_org.pending.as_ref().is_some_and(|job| {
+                matches!(&job.kind, ArchiveRequest::Details { identifier, .. }
                 if selected.as_ref().is_none_or(|item| item.identifier != *identifier))
-        }) {
+            })
+        {
             // Moving away revokes an explicit open even if the new row is cached.
             self.archive_org.generation = self.archive_org.generation.wrapping_add(1);
             self.archive_org.pending = None;
@@ -463,7 +605,8 @@ impl AppController {
             self.view.details_scroll = 0;
             self.view.selected_detail_link = None;
         }
-        if self.archive_org.active.is_none()
+        if !self.archive_download_lookup_pending()
+            && self.archive_org.active.is_none()
             && self.cached_archive_details(&item.identifier).is_none()
         {
             self.queue_archive_request(
@@ -666,6 +809,74 @@ impl AppController {
     }
 }
 
+/// Validates canonical route spelling before requesting bounded item metadata.
+///
+/// Decode each filename segment exactly once, reject separators/control bytes,
+/// and rebuild with the same URL builder as the provider. This supports Unicode
+/// and literal percent signs without accepting encoded traversal or credentials.
+#[cfg(any(feature = "yt-dlp", test))]
+fn archive_download_identifier(source: &url::Url) -> Option<String> {
+    // The provider filename is at most 2048 UTF-8 bytes, escaped at most 3x.
+    if source.as_str().len() > 3 * 2048 + 200 || !is_direct_audio_url(source) {
+        return None;
+    }
+    let mut segments = source.path_segments()?;
+    if segments.next()? != "download" {
+        return None;
+    }
+    let identifier = segments.next()?;
+    if identifier.is_empty()
+        || identifier.len() > 100
+        || !(identifier.as_bytes()[0].is_ascii_alphanumeric() || identifier.starts_with('@'))
+        || !identifier
+            .bytes()
+            .skip(1)
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+    {
+        return None;
+    }
+    let mut filenames = Vec::new();
+    let mut filename_bytes = 0_usize;
+    for segment in segments {
+        let mut decoded = Vec::with_capacity(segment.len());
+        let mut bytes = segment.as_bytes().iter().copied();
+        while let Some(byte) = bytes.next() {
+            decoded.push(if byte == b'%' {
+                let first = char::from(bytes.next()?).to_digit(16)?;
+                let second = char::from(bytes.next()?).to_digit(16)?;
+                u8::try_from(first * 16 + second).ok()?
+            } else {
+                byte
+            });
+        }
+        let filename = String::from_utf8(decoded).ok()?;
+        if matches!(filename.as_str(), "" | "." | "..")
+            || filename
+                .chars()
+                .any(|character| character.is_control() || matches!(character, '/' | '\\'))
+        {
+            return None;
+        }
+        filename_bytes =
+            filename_bytes.checked_add(filename.len() + usize::from(!filenames.is_empty()))?;
+        filenames.push(filename);
+        if filenames.len() > 32 || filename_bytes > 2048 {
+            return None;
+        }
+    }
+    if filenames.is_empty() {
+        return None;
+    }
+    let mut canonical = url::Url::parse("https://archive.org/").ok()?;
+    canonical
+        .path_segments_mut()
+        .ok()?
+        .clear()
+        .extend(["download", identifier])
+        .extend(&filenames);
+    (canonical == *source).then(|| identifier.to_owned())
+}
+
 /// Exact file identities keep multiple tracks from collapsing into one history entry.
 fn track_id(track: &ArchiveOrgTrack) -> MediaId {
     MediaId::new(SourceKind::ArchiveOrg, track.download_url.as_str())
@@ -821,6 +1032,7 @@ mod tests {
     fn track() -> ArchiveOrgTrack {
         ArchiveOrgTrack {
             waveform_url: None,
+            download_variants: Vec::new(),
             filename: "01 chapter.opus".into(),
             title: "First chapter".into(),
             download_url: url::Url::parse("https://archive.org/download/fixture/01%20chapter.opus")
@@ -830,49 +1042,457 @@ mod tests {
         }
     }
 
-    /// Downloading a selected Archive file preserves its URL and existing encoding.
+    /// A standalone controller keeps lookup tests offline and independent of selected rows.
+    fn lookup_controller() -> (tempfile::TempDir, AppController) {
+        let directory = crate::test_support::canonical_tempdir("archive download lookup");
+        let config = Config::for_dir(directory.path().join("config"));
+        let store = StateStore::open_in_memory().unwrap();
+        let mut controller = AppController::new(config, store, None, None);
+        controller.view.screen = Screen::History;
+        controller.archive_org.initialized = true;
+        (directory, controller)
+    }
+
+    fn lookup_details(identifier: &str) -> Arc<ArchiveOrgItemDetails> {
+        let mut value = item();
+        value.identifier = identifier.to_owned();
+        value.webpage_url =
+            url::Url::parse(&format!("https://archive.org/details/{identifier}")).unwrap();
+        let mut audio = track();
+        audio.download_url = url::Url::parse(&format!(
+            "https://archive.org/download/{identifier}/01%20chapter.opus"
+        ))
+        .unwrap();
+        audio.download_variants = serde_json::from_value(serde_json::json!([
+            {"filename": "original.flac", "download_url": format!("https://archive.org/download/{identifier}/original.flac"),
+             "format": "Flac", "size_bytes": 9000, "provenance": "original", "is_video": false},
+            {"filename": "01 chapter.opus", "download_url": audio.download_url,
+             "format": "Ogg Opus", "size_bytes": 1000, "provenance": "derivative", "is_video": false}
+        ])).unwrap();
+        Arc::new(ArchiveOrgItemDetails {
+            item: value,
+            tracks: vec![audio],
+            comments: Vec::new(),
+        })
+    }
+
+    /// A gated metadata transport proves asynchronous ownership without accessing a real item.
+    struct LookupTransport {
+        entered: Sender<url::Url>,
+        release: Receiver<Result<Vec<u8>, crate::providers::ProviderError>>,
+        count: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl crate::providers::archive_org::ArchiveOrgTransport for LookupTransport {
+        fn fetch(
+            &self,
+            url: &url::Url,
+            _: usize,
+        ) -> Result<Vec<u8>, crate::providers::ProviderError> {
+            if !url.path().starts_with("/metadata/") {
+                return Err(crate::providers::ProviderError::HttpStatus(404));
+            }
+            self.count.fetch_add(1, AtomicOrdering::SeqCst);
+            self.entered
+                .send(url.clone())
+                .expect("test still receiving");
+            self.release
+                .recv_timeout(Duration::from_secs(5))
+                .expect("test releases its bounded metadata worker")
+        }
+    }
+
+    fn lookup_transport(
+        controller: &mut AppController,
+    ) -> (
+        Receiver<url::Url>,
+        Sender<Result<Vec<u8>, crate::providers::ProviderError>>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let (entered, requests) = bounded(1);
+        let (release, responses) = bounded(1);
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        controller.archive_org.client =
+            ArchiveOrgClient::with_transport(Arc::new(LookupTransport {
+                entered,
+                release: responses,
+                count: Arc::clone(&count),
+            }));
+        (requests, release, count)
+    }
+
+    fn lookup_metadata(identifier: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "metadata": {"identifier": identifier, "title": "Download inventory", "mediatype": "audio"},
+            "files": [
+                {"name": "original.flac", "source": "original", "format": "Flac"},
+                {"name": "01 chapter.opus", "source": "derivative", "original": "original.flac", "format": "Ogg Opus"}
+            ]
+        })).unwrap()
+    }
+
+    fn finish_lookup_worker(controller: &mut AppController) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while controller.archive_org.worker.is_some() {
+            assert!(
+                Instant::now() < deadline,
+                "bounded metadata worker completed"
+            );
+            controller.poll_archive_org_worker();
+            thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn download_lookup_uses_active_or_cached_exact_family_without_navigation() {
+        for active in [true, false] {
+            let (_directory, mut controller) = lookup_controller();
+            let details = lookup_details("fixture");
+            let source = details.tracks[0].download_variants[0].download_url.clone();
+            if active {
+                controller.archive_org.active = Some(Arc::clone(&details));
+            } else {
+                controller
+                    .archive_org
+                    .cache
+                    .push_back(("fixture".into(), Ok(Arc::clone(&details))));
+            }
+            controller.view.selected = 7;
+            controller.view.status_line = "Keep history".to_owned();
+            let variants = controller
+                .archive_download_variants(&source)
+                .unwrap()
+                .expect("cached inventory");
+            assert_eq!(variants, details.tracks[0].download_variants);
+            assert_eq!(controller.view.screen, Screen::History);
+            assert_eq!(controller.view.selected, 7);
+            assert_eq!(controller.view.status_line, "Keep history");
+            assert!(controller.archive_org.worker.is_none());
+        }
+    }
+
+    #[test]
+    fn download_lookup_rejects_untrusted_or_noncanonical_sources_without_requests() {
+        let (_directory, mut controller) = lookup_controller();
+        for source in [
+            "https://example.org/download/fixture/audio.mp3",
+            "http://archive.org/download/fixture/audio.mp3",
+            "https://user:secret@archive.org/download/fixture/audio.mp3",
+            "https://archive.org:8443/download/fixture/audio.mp3",
+            "https://archive.org/details/fixture",
+            "https://archive.org/download/fixture/audio.mp3?token=secret",
+            "https://archive.org/download/fixture/audio.mp3#part",
+            "https://archive.org/download/bad%20id/audio.mp3",
+            "https://archive.org/download/fixture/%2Fescape.mp3",
+            "https://archive.org/download/fixture/%5Cescape.mp3",
+            "https://archive.org/download/fixture/%00audio.mp3",
+            "https://archive.org/download/fixture/%FFaudio.mp3",
+            "https://archive.org/download/fixture/bad%escape.mp3",
+            "https://archive.org/download/fixture/empty//audio.mp3",
+        ] {
+            let source = url::Url::parse(source).unwrap();
+            assert!(
+                controller.archive_download_variants(&source).is_err(),
+                "{source}"
+            );
+            assert!(controller.archive_org.pending.is_none());
+            assert!(controller.archive_org.worker.is_none());
+        }
+    }
+
+    #[test]
+    fn download_lookup_refreshes_old_inventory_and_survives_passive_other_selection() {
+        let (_directory, mut controller) = lookup_controller();
+        let mut old = (*lookup_details("fixture")).clone();
+        let source = old.tracks[0].download_url.clone();
+        old.tracks[0].download_variants.clear();
+        controller
+            .archive_org
+            .cache
+            .push_back(("fixture".into(), Ok(Arc::new(old))));
+        let other = lookup_details("other");
+        controller.archive_org.items.push(other.item.clone());
+        controller
+            .archive_org
+            .cache
+            .push_back(("other".into(), Ok(other)));
+        let (requests, release, count) = lookup_transport(&mut controller);
+        assert!(
+            controller
+                .archive_download_variants(&source)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            requests
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .path(),
+            "/metadata/fixture"
+        );
+        let generation = controller.archive_org.pending.as_ref().unwrap().generation;
+        controller.view.screen = Screen::ArchiveOrg;
+        controller.update_archive_org_detail();
+        assert_eq!(
+            controller.archive_org.pending.as_ref().unwrap().generation,
+            generation
+        );
+        assert!(
+            controller
+                .archive_download_variants(&source)
+                .unwrap()
+                .is_none()
+        );
+        release.send(Ok(lookup_metadata("fixture"))).unwrap();
+        finish_lookup_worker(&mut controller);
+        let variants = controller
+            .archive_download_variants(&source)
+            .unwrap()
+            .expect("complete inventory");
+        assert_eq!(variants.len(), 2);
+        assert_eq!(count.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(controller.view.screen, Screen::ArchiveOrg);
+        assert!(controller.archive_org.active.is_none());
+        assert_eq!(
+            controller.view.details.as_ref().unwrap().title,
+            "An audio collection"
+        );
+    }
+
+    #[test]
+    fn download_lookup_cancellation_keeps_late_results_passive() {
+        let (_directory, mut controller) = lookup_controller();
+        let source = lookup_details("fixture").tracks[0].download_url.clone();
+        let (requests, release, _) = lookup_transport(&mut controller);
+        assert!(
+            controller
+                .archive_download_variants(&source)
+                .unwrap()
+                .is_none()
+        );
+        requests.recv_timeout(Duration::from_secs(5)).unwrap();
+        controller.cancel_archive_download_lookup();
+        assert!(controller.archive_org.pending.is_none());
+        release.send(Ok(lookup_metadata("fixture"))).unwrap();
+        finish_lookup_worker(&mut controller);
+        assert!(controller.cached_archive_details("fixture").is_some());
+        assert!(controller.archive_org.active.is_none());
+        assert_eq!(controller.view.screen, Screen::History);
+        assert!(controller.archive_org.pending.is_none());
+    }
+
+    #[test]
+    fn download_lookup_errors_are_terminal_until_explicit_cancellation() {
+        let (_directory, mut controller) = lookup_controller();
+        let source = lookup_details("fixture").tracks[0].download_url.clone();
+        let (requests, release, count) = lookup_transport(&mut controller);
+        assert!(
+            controller
+                .archive_download_variants(&source)
+                .unwrap()
+                .is_none()
+        );
+        requests.recv_timeout(Duration::from_secs(5)).unwrap();
+        release
+            .send(Err(crate::providers::ProviderError::HttpStatus(503)))
+            .unwrap();
+        finish_lookup_worker(&mut controller);
+        for _ in 0..3 {
+            assert!(controller.archive_download_variants(&source).is_err());
+        }
+        assert_eq!(count.load(AtomicOrdering::SeqCst), 1);
+        assert!(controller.archive_org.worker.is_none());
+        assert_eq!(controller.view.screen, Screen::History);
+    }
+
+    #[test]
+    fn download_lookup_reuses_pending_details_without_leaving_open_activity() {
+        let (_directory, mut controller) = lookup_controller();
+        controller.view.screen = Screen::ArchiveOrg;
+        let source = lookup_details("fixture").tracks[0].download_url.clone();
+        let (requests, release, count) = lookup_transport(&mut controller);
+        let job = ArchiveJob {
+            generation: 7,
+            kind: ArchiveRequest::Details {
+                identifier: "fixture".into(),
+                open: true,
+            },
+            due: Instant::now() + Duration::from_secs(60),
+        };
+        controller.archive_org.generation = 7;
+        controller.archive_org.pending = Some(job.clone());
+        controller.archive_org.request = Some(job);
+        controller.begin_search_activity(SearchActivity::ArchiveOrg);
+        assert!(
+            controller
+                .archive_download_variants(&source)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            controller.archive_org.pending.as_ref().unwrap().generation,
+            7
+        );
+        assert_eq!(controller.view.search_activity, None);
+        controller.poll_archive_org_worker();
+        requests.recv_timeout(Duration::from_secs(5)).unwrap();
+        release.send(Ok(lookup_metadata("fixture"))).unwrap();
+        finish_lookup_worker(&mut controller);
+        assert!(
+            controller
+                .archive_download_variants(&source)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(count.load(AtomicOrdering::SeqCst), 1);
+        assert!(controller.archive_org.active.is_none());
+    }
+
+    #[test]
+    fn download_lookup_cancel_does_not_revoke_a_newer_navigation_owner() {
+        let (_directory, mut controller) = lookup_controller();
+        let source = lookup_details("fixture").tracks[0].download_url.clone();
+        let (requests, release, _) = lookup_transport(&mut controller);
+        assert!(
+            controller
+                .archive_download_variants(&source)
+                .unwrap()
+                .is_none()
+        );
+        requests.recv_timeout(Duration::from_secs(5)).unwrap();
+        let next = ArchiveJob {
+            generation: controller.archive_org.generation + 1,
+            kind: ArchiveRequest::Details {
+                identifier: "other".into(),
+                open: true,
+            },
+            due: Instant::now() + Duration::from_secs(60),
+        };
+        controller.archive_org.generation = next.generation;
+        controller.archive_org.pending = Some(next.clone());
+        controller.archive_org.request = Some(next.clone());
+        controller.cancel_archive_download_lookup();
+        assert_eq!(
+            controller.archive_org.pending.as_ref().unwrap().generation,
+            next.generation
+        );
+        release.send(Ok(lookup_metadata("fixture"))).unwrap();
+        finish_lookup_worker(&mut controller);
+        assert_eq!(
+            controller.archive_org.pending.as_ref().unwrap().generation,
+            next.generation
+        );
+        assert!(controller.archive_org.active.is_none());
+    }
+
+    #[test]
+    fn download_lookup_missing_exact_file_is_terminal_without_a_substitute() {
+        let (_directory, mut controller) = lookup_controller();
+        let source = url::Url::parse("https://archive.org/download/fixture/missing.mp3").unwrap();
+        let (requests, release, count) = lookup_transport(&mut controller);
+        assert!(
+            controller
+                .archive_download_variants(&source)
+                .unwrap()
+                .is_none()
+        );
+        requests.recv_timeout(Duration::from_secs(5)).unwrap();
+        release.send(Ok(lookup_metadata("fixture"))).unwrap();
+        finish_lookup_worker(&mut controller);
+        for _ in 0..3 {
+            assert!(
+                controller
+                    .archive_download_variants(&source)
+                    .unwrap_err()
+                    .contains("no available download variants")
+            );
+        }
+        assert_eq!(count.load(AtomicOrdering::SeqCst), 1);
+        assert!(controller.archive_org.worker.is_none());
+    }
+
+    #[test]
+    fn download_lookup_canonical_source_supports_unicode_literal_percent_and_nested_files() {
+        let mut source = url::Url::parse("https://archive.org/").unwrap();
+        source.path_segments_mut().unwrap().extend([
+            "download",
+            "fixture",
+            "Звук",
+            "01 ?#%+ chapter.opus",
+        ]);
+        assert_eq!(
+            archive_download_identifier(&source).as_deref(),
+            Some("fixture")
+        );
+        let too_long = url::Url::parse(&format!(
+            "https://archive.org/download/fixture/{}.mp3",
+            "a".repeat(2049)
+        ))
+        .unwrap();
+        assert_eq!(archive_download_identifier(&too_long), None);
+    }
+
+    /// A real selected Archive track enters the chooser without starting a helper.
     #[cfg(feature = "yt-dlp")]
     #[test]
-    fn selected_archive_audio_download_uses_exact_file_without_conversion() {
-        struct Capture(Arc<Mutex<Vec<DownloadRequest>>>);
-        impl DownloadLauncher for Capture {
-            fn start(
-                &mut self,
-                request: &DownloadRequest,
-            ) -> Result<Box<dyn RunningDownload>, String> {
-                self.0.lock().unwrap().push(request.clone());
-                Err("fixture captures requests without starting a child".to_owned())
+    fn selected_archive_download_keeps_snapshot_and_dismisses_without_a_child() {
+        struct NeverStart;
+        impl DownloadLauncher for NeverStart {
+            fn start(&mut self, _: &DownloadRequest) -> Result<Box<dyn RunningDownload>, String> {
+                panic!("showing/dismissing download choices must not launch a process");
             }
         }
-        for extension in ["mp3", "flac"] {
-            let directory = crate::test_support::canonical_tempdir("exact Archive download");
-            let config = Config::for_dir(directory.path().join("config"));
-            let store = StateStore::open_in_memory().unwrap();
-            let mut controller = AppController::new(config, store, None, None);
-            let requests = Arc::new(Mutex::new(Vec::new()));
-            controller.download_launcher = Box::new(Capture(Arc::clone(&requests)));
-            let mut selected = track();
-            selected.filename = format!("chapter.{extension}");
-            selected.download_url = url::Url::parse(&format!(
-                "https://archive.org/download/fixture/chapter.{extension}"
-            ))
-            .unwrap();
-            let expected = selected.download_url.clone();
-            controller.archive_org.active = Some(Arc::new(ArchiveOrgItemDetails {
-                item: item(),
-                tracks: vec![selected],
-                comments: Vec::new(),
-            }));
-            controller.view.screen = Screen::ArchiveOrg;
-            controller.view.selected = 0;
-            controller.start_selected_download();
-            let requests = requests.lock().unwrap();
-            assert_eq!(requests.len(), 1);
-            assert_eq!(requests[0].source_url, expected);
-            assert_eq!(requests[0].format, DownloadFormat::ExactFile);
-            assert_eq!(requests[0].scope, DownloadScope::SingleItem);
-            assert!(controller.active_download.is_none());
-        }
+        let (_directory, mut controller) = lookup_controller();
+        controller.download_launcher = Box::new(NeverStart);
+        controller.config.downloads.archive_format =
+            crate::config::ArchiveDownloadPreference::AskEachTime;
+        let mut details = (*lookup_details("fixture")).clone();
+        let selected = &mut details.tracks[0];
+        selected.filename = "generated.mp3".into();
+        selected.download_url =
+            url::Url::parse("https://archive.org/download/fixture/generated.mp3").unwrap();
+        selected.download_variants[1].filename = selected.filename.clone();
+        selected.download_variants[1].format = "VBR MP3".into();
+        selected.download_variants[1].download_url = selected.download_url.clone();
+        let mut other = selected.clone();
+        other.title = "Other selected row".into();
+        other.filename = "other.mp3".into();
+        other.download_url =
+            url::Url::parse("https://archive.org/download/fixture/other.mp3").unwrap();
+        other.download_variants.clear();
+        details.tracks.push(other);
+        controller.archive_org.active = Some(Arc::new(details));
+        controller.view.screen = Screen::ArchiveOrg;
+        controller.view.selected = 0;
+        controller.start_selected_download();
+        let popup = controller
+            .view
+            .download_choice_popup
+            .as_ref()
+            .expect("format chooser");
+        assert_eq!(popup.options.len(), 2);
+        assert!(popup.options[0].contains("Original: Flac"));
+        assert!(popup.options[0].contains("original.flac"));
+        assert!(popup.options[1].contains("Archive-generated: VBR MP3"));
+        assert!(popup.options[1].contains("generated.mp3"));
+        let options = popup.options.clone();
+        controller.view.selected = 1;
+        controller.poll_manual_download_choice();
+        assert_eq!(
+            controller
+                .view
+                .download_choice_popup
+                .as_ref()
+                .unwrap()
+                .options,
+            options
+        );
+        assert!(controller.active_download.is_none());
+        controller.dismiss_download_choice();
+        assert!(controller.view.download_choice_popup.is_none());
+        assert!(controller.pending_download_choice.is_none());
+        assert!(controller.active_download.is_none());
+        assert!(controller.archive_org.worker.is_none());
     }
 
     #[test]

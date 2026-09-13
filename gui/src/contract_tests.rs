@@ -36,11 +36,12 @@ use youta::view::CommonsUploadPopupView;
 use youta::view::EvernoteNotePopupView;
 use youta::view::{
     AudioQualityPopupView, DetailLinkView, DetailTimecodeView, DetailVideoLinkView, DetailView,
-    DetailWikidataEntityView, DownloadView, ErrorPopupView, GitHubIssueSubmissionView,
-    LocalMoveDestinationView, NowPlayingView, PlaylistChoiceView, PlaylistPopupView,
-    PreferencesPopupView, ProjectCommitView, ProjectHistoryPopupView, QueuePopupView, QueueRowView,
-    RowView, SubscriptionsView, VideoCommentView, VideoCommentsPopupView, VideoSummaryPopupView,
-    ViewModel, WaveformView, YtDlpForbiddenView, YtDlpGentooVersionView, YtDlpVersionLookupView,
+    DetailWikidataEntityView, DownloadChoicePopupView, DownloadView, ErrorPopupView,
+    GitHubIssueSubmissionView, LocalMoveDestinationView, NowPlayingView, PlaylistChoiceView,
+    PlaylistPopupView, PreferencesPopupView, ProjectCommitView, ProjectHistoryPopupView,
+    QueuePopupView, QueueRowView, RowView, SubscriptionsView, VideoCommentView,
+    VideoCommentsPopupView, VideoSummaryPopupView, ViewModel, WaveformView, YtDlpForbiddenView,
+    YtDlpGentooVersionView, YtDlpVersionLookupView,
 };
 use youta::view::{ChannelDownloadOption, ChannelDownloadPopupView};
 #[cfg(feature = "lan-sharing")]
@@ -308,6 +309,8 @@ fn preferences() -> PreferencesPopupView {
         nyan_cat_supported: true,
         youtube_prewarm: false,
         download_new_episodes_every_hour: true,
+        download_mode: youta::config::DownloadMode::AskEachTime,
+        archive_download_preference: youta::config::ArchiveDownloadPreference::AskEachTime,
         auto_download_supported: true,
         auto_download_status: None,
         youtube_thumbnail_size: youta::config::YouTubeThumbnailSize::default(),
@@ -447,6 +450,16 @@ fn the_typescript_contract_names_only_fields_the_reducer_emits() {
         emitted_keys(&ProjectCommitView::default()),
     );
     emitted.insert("PreferencesPopupView", emitted_keys(&preferences()));
+    emitted.insert(
+        "DownloadChoicePopupView",
+        emitted_keys(&DownloadChoicePopupView {
+            generation: 7,
+            title: "Exact selected file".to_owned(),
+            explanation: "Choose an existing format".to_owned(),
+            options: vec!["Original file".to_owned(), "Archive MP3".to_owned()],
+            selected: 0,
+        }),
+    );
     emitted.insert(
         "PlaylistPopupView",
         emitted_keys(&PlaylistPopupView::default()),
@@ -618,6 +631,7 @@ fn every_checked_interface_is_actually_declared() {
         "ProjectHistoryPopupView",
         "ProjectCommitView",
         "PreferencesPopupView",
+        "DownloadChoicePopupView",
         "PlaylistPopupView",
         "PlaylistChoiceView",
         "LocalMoveDestinationView",

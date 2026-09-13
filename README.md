@@ -1851,6 +1851,7 @@ the desired options, then press `Enter` to save. It includes:
 - Nyan Cat seek bar and selected YouTube audio preparation;
 - Local folder-size measurement and YouTube video-thumbnail size;
 - playback History recording and hourly channel-download checks;
+- manual video/audio download mode and archive.org original/MP3 selection;
 - the explicit video-summary backend.
 
 These preferences can also be configured directly:
@@ -1864,6 +1865,10 @@ sponsorblock_enabled = true
 
 [subscriptions]
 auto_download = true
+
+[downloads]
+mode = 'ask-each-time' # ask-each-time, video, or audio-only
+archive_format = 'ask-each-time' # ask-each-time, original-file, or archive-mp3
 
 [ui]
 subscriptions_layout = 'drill-down' # drill-down or split
@@ -1937,6 +1942,32 @@ or refresh. Short-lived or signed direct stream URLs are never persisted in
 this snapshot, so playback resolves a fresh stream from the canonical video
 page. The detailed disk bounds are documented in
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#subscription-navigation-and-channel-videos).
+
+### Manual download choices
+
+Manual YouTube downloads ask whether to keep video and audio or save audio
+only. YouTube's available streams are already encoded by YouTube; these are
+not the uploader's original source file. No additional re-encoding is used.
+
+For archive.org, choose among the selected track's original files and available
+Archive-generated encodings, with filenames and sizes. For example, an original
+FLAC and Archive-generated MP3 remain separate choices. Audio files download
+unchanged. Selecting a video file asks whether to keep the selected file or
+extract audio without re-encoding. An unsupported extraction fails instead of
+silently converting to another codec.
+
+Use Up/Down and Enter in the chooser, click a choice, or press Esc to cancel.
+In Preferences (`F7`), **Download mode** (`m`) remembers video or audio-only;
+**archive.org format** (`F`) remembers original files or Archive MP3. Both
+default to **Ask each time**. A saved choice skips the corresponding prompt
+only when it identifies an available choice; missing or ambiguous Archive
+formats still ask. An Archive track with just one file needs no format prompt.
+The overrides are `YOUTA_DOWNLOADS__MODE` and
+`YOUTA_DOWNLOADS__ARCHIVE_FORMAT`, using the TOML values above.
+
+These choices do not change unattended or full-channel audio-download settings.
+Downloads reuse [yt-dlp format selection](https://github.com/yt-dlp/yt-dlp#format-selection)
+and [FFmpeg stream copying](https://ffmpeg.org/ffmpeg.html#Streamcopy).
 
 ### Full-channel downloads and session LAN feeds
 

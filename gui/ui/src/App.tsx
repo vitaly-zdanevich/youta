@@ -13,6 +13,7 @@ import { AsciiVisualizer } from './components/AsciiVisualizer';
 import {
   AudioQualityPopup,
   ChannelDownloadPopup,
+	DownloadChoicePopup,
   CommonsCredentialsPopup,
   CommonsUploadPopup,
   CredentialEditorNotice,
@@ -219,11 +220,12 @@ export function App() {
 			<EvernoteCredentialsPopup editor={view.evernote_credentials_editor} />
 		) : null}
       {view.rss_subscription_open ? <CredentialEditorNotice editor="rss_subscription" /> : null}
-      {view.preferences_popup ? <PreferencesPopup popup={view.preferences_popup} /> : null}
+      {view.preferences_popup ? <PreferencesPopup popup={view.preferences_popup} archiveSupported={sources.some((source) => source.id === 'ArchiveOrg')} /> : null}
       {view.local_file_popup ? <LocalFilePopup popup={view.local_file_popup} /> : null}
 		{view.channel_download_popup ? (
 			<ChannelDownloadPopup popup={view.channel_download_popup} />
 		) : null}
+		{view.download_choice_popup ? <DownloadChoicePopup popup={view.download_choice_popup} /> : null}
       {view.playlist_popup ? <PlaylistPopup popup={view.playlist_popup} /> : null}
       {view.queue_popup ? <QueuePopup popup={view.queue_popup} /> : null}
       {view.private_note_open ? <CredentialEditorNotice editor="private_note" /> : null}

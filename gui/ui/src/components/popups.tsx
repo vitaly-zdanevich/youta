@@ -15,6 +15,9 @@ import { useEffect, useRef } from 'react';
 import type {
   AudioQualityPopupView,
   ChannelDownloadPopupView,
+	DownloadChoicePopupView,
+	DownloadMode,
+	ArchiveDownloadPreference,
   CommonsCredentialsEditorView,
   CommonsUploadField,
   CommonsUploadPopupView,
@@ -51,6 +54,7 @@ export const LAYER = {
   preferences: 4,
   localFile: 5,
   channelDownload: 6,
+	downloadChoice: 6.5,
   playlist: 7,
   queue: 8,
   videoComments: 9,
@@ -221,6 +225,45 @@ export function HelpPopup({
   );
 }
 
+/** Present controller-owned format choices without interpreting labels or fetching files. */
+export function DownloadChoicePopup({ popup }: { popup: DownloadChoicePopupView }) {
+	return (
+		<Popup
+			title='Download format'
+			subtitle={popup.title}
+			layer={LAYER.downloadChoice}
+			onDismiss={() => void dispatch('DismissDownloadChoice')}
+			dismissLabel='Cancel'
+			footer={
+				<>
+					<PopupButton
+						emphasis
+						disabled={popup.options.length === 0 || popup.selected >= popup.options.length}
+						onClick={() => void dispatch({ ConfirmDownloadChoice: popup.generation })}
+					>
+						Download
+					</PopupButton>
+					<PopupButton onClick={() => void dispatch('DismissDownloadChoice')}>Cancel</PopupButton>
+				</>
+			}
+		>
+			<Body>
+				<p className='mb-3 whitespace-pre-wrap text-ink-dim'>{popup.explanation}</p>
+				<div className='grid gap-2'>
+					{popup.options.map((label, index) => (
+						<PopupButton
+							key={index}
+							emphasis={index === popup.selected}
+							onClick={() => void dispatch({ SelectDownloadChoice: { generation: popup.generation, index } })}
+						>
+							{label}
+						</PopupButton>
+					))}
+				</div>
+			</Body>
+		</Popup>
+	);
+}
 
 /** Review gate for a full-channel audio transfer. */
 export function ChannelDownloadPopup({ popup }: { popup: ChannelDownloadPopupView }) {
@@ -1348,9 +1391,19 @@ export function LanSharePopup({ popup }: { popup: LanSharePopupView }) {
 	);
 }
 
+/** Display labels do not determine the controller's format policy. */
+const DOWNLOAD_MODE_LABELS: Record<DownloadMode, string> = {
+	'ask-each-time': 'Ask each time', video: 'Video', 'audio-only': 'Audio only',
+};
+const ARCHIVE_DOWNLOAD_LABELS: Record<ArchiveDownloadPreference, string> = {
+	'ask-each-time': 'Ask each time', 'original-file': 'Original file', 'archive-mp3': 'Archive MP3',
+};
 
 /** Preference values are drafts until Save; a manual download check runs immediately. */
-export function PreferencesPopup({ popup }: { popup: PreferencesPopupView }) {
+export function PreferencesPopup({ popup, archiveSupported }: {
+	popup: PreferencesPopupView;
+	archiveSupported: boolean;
+}) {
   const toggles: Array<[string, boolean, string]> = [
     ["Skip advertisement chapters", popup.skip_advertisement_chapters, "ToggleSkipAdvertisementChapters"],
     ["Prewarm the selected YouTube video", popup.youtube_prewarm, "ToggleYouTubePrewarm"],
@@ -1362,6 +1415,12 @@ export function PreferencesPopup({ popup }: { popup: PreferencesPopupView }) {
     ["YouTube thumbnail size", popup.youtube_thumbnail_size, "CycleYouTubeThumbnailSize"],
     ["Bandcamp audio format", popup.bandcamp_audio_format, "CycleBandcampAudioFormat"],
   ];
+	if (popup.auto_download_supported) {
+		cycles.push(['Download mode', DOWNLOAD_MODE_LABELS[popup.download_mode], 'CycleDownloadModePreference']);
+	}
+	if (archiveSupported && popup.auto_download_supported) {
+		cycles.push(['archive.org format', ARCHIVE_DOWNLOAD_LABELS[popup.archive_download_preference], 'CycleArchiveDownloadPreference']);
+	}
   return (
     <Popup
       title="Preferences"

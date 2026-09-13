@@ -411,6 +411,19 @@ export interface ProjectHistoryPopupView {
   scroll_offset: number;
 }
 
+/** Closed, persisted choices shared with the controller configuration. */
+export type DownloadMode = 'ask-each-time' | 'video' | 'audio-only';
+export type ArchiveDownloadPreference = 'ask-each-time' | 'original-file' | 'archive-mp3';
+
+/** Display-only options for one exact download target retained in the reducer. */
+export interface DownloadChoicePopupView {
+	/** Opaque stage token echoed with every confirmation; never computed by the UI. */
+	generation: number;
+	title: string;
+	explanation: string;
+	options: string[];
+	selected: number;
+}
 
 /** The runtime preferences editor. Values are drafts until it is submitted. */
 export interface PreferencesPopupView {
@@ -426,6 +439,9 @@ export interface PreferencesPopupView {
   youtube_prewarm: boolean;
 	/** Draft startup and hourly check preference. */
 	download_new_episodes_every_hour: boolean;
+	/** Draft choices saved only by the existing Preferences confirmation. */
+	download_mode: DownloadMode;
+	archive_download_preference: ArchiveDownloadPreference;
 	/** Whether this build can download new channel uploads. */
 	auto_download_supported: boolean;
 	/** Immediate manual-check feedback without discarding preference edits. */
@@ -765,6 +781,7 @@ export interface ViewModel {
   channel_download_supported: boolean;
   channel_download_popup: ChannelDownloadPopupView | null;
   download: DownloadView | null;
+	download_choice_popup: DownloadChoicePopupView | null;
   help_open: boolean;
   project_history_popup: ProjectHistoryPopupView | null;
   error_popup: ErrorPopupView | null;

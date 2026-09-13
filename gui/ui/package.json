@@ -1,12 +1,12 @@
 {
   "name": "youta-ui",
   "private": true,
-  "version": "0.60.0",
+  "version": "0.61.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "npm run test && tsc --noEmit && vite build",
-    "test": "node --experimental-strip-types --test src/subscriptionPageRows.test.mjs src/subscriptionsBehavior.test.mjs src/webBrowserBehavior.test.mjs src/archiveOrgBehavior.test.mjs",
+    "test": "node --experimental-strip-types --test src/subscriptionPageRows.test.mjs src/subscriptionsBehavior.test.mjs src/webBrowserBehavior.test.mjs src/archiveOrgBehavior.test.mjs src/downloadChoices.test.mjs",
 	"test:browser": "node --test tests/browser.test.mjs",
     "typecheck": "tsc --noEmit"
   },

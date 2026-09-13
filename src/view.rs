@@ -37,7 +37,8 @@ use crate::commons_upload::{CommonsCategorySuggestion, CommonsUploadDraft};
 #[cfg(feature = "commons-upload")]
 use crate::config::WikimediaCommonsAuthMethod;
 use crate::config::{
-    BandcampAudioFormat, SubscriptionsLayout, VideoSummaryBackend, YouTubeThumbnailSize,
+    ArchiveDownloadPreference, BandcampAudioFormat, DownloadMode, SubscriptionsLayout,
+    VideoSummaryBackend, YouTubeThumbnailSize,
 };
 use crate::domain::{Chapter, MediaId, MediaKind, SourceKind};
 #[cfg(feature = "evernote")]
@@ -932,6 +933,22 @@ impl std::fmt::Debug for RssSubscriptionPopupView {
     }
 }
 
+/// Display-only choices for one controller-owned, exact download target.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct DownloadChoicePopupView {
+    /// Opaque controller epoch binding confirmations to this exact chooser stage.
+    #[serde(default)]
+    pub generation: u64,
+    /// Human-readable item title; the download target stays in the controller.
+    pub title: String,
+    /// Explanation of the choice being requested.
+    pub explanation: String,
+    /// Labels in the same stable order as the controller's typed choices.
+    pub options: Vec<String>,
+    /// Currently highlighted choice; confirmation is always explicit.
+    pub selected: usize,
+}
+
 /// Focused in-app editor for preferences that are implemented at runtime.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct PreferencesPopupView {
@@ -957,6 +974,10 @@ pub struct PreferencesPopupView {
     pub youtube_prewarm: bool,
     /// Draft hourly automatic-download policy saved only on confirmation.
     pub download_new_episodes_every_hour: bool,
+    /// Draft video/audio-only choice saved only on confirmation.
+    pub download_mode: DownloadMode,
+    /// Draft original/Archive-MP3 choice saved only on confirmation.
+    pub archive_download_preference: ArchiveDownloadPreference,
     /// Whether this binary contains the yt-dlp download helper integration.
     pub auto_download_supported: bool,
     /// Immediate manual-check feedback retained alongside unsaved preferences.
@@ -2429,6 +2450,8 @@ pub struct ViewModel {
     /// Review-first confirmation for downloading every public channel upload.
     #[cfg(feature = "yt-dlp")]
     pub channel_download_popup: Option<ChannelDownloadPopupView>,
+    /// Modal format choice for one explicit download request.
+    pub download_choice_popup: Option<DownloadChoicePopupView>,
     /// Active or most recently completed supervised download.
     pub download: Option<DownloadView>,
     /// Whether the controller has requested application shutdown.
@@ -2660,6 +2683,7 @@ impl Default for ViewModel {
             channel_download_supported: cfg!(feature = "yt-dlp"),
             #[cfg(feature = "yt-dlp")]
             channel_download_popup: None,
+            download_choice_popup: None,
             download: None,
             quitting: false,
         }
@@ -2933,6 +2957,19 @@ pub enum UiAction {
     DismissPlaylistPopup,
     /// Download the selected item.
     Download,
+    /// Move the highlighted download format without starting a download.
+    MoveDownloadChoice(i32),
+    /// Confirm the highlighted controller-owned download choice.
+    ConfirmDownloadChoice(u64),
+    /// Close the format chooser without downloading.
+    DismissDownloadChoice,
+    /// Immediately confirm one exact clicked download choice.
+    SelectDownloadChoice {
+        /// Exact chooser stage that rendered the clicked choice.
+        generation: u64,
+        /// Index in that stage's controller-owned option list.
+        index: usize,
+    },
     /// Review a full-channel audio download before starting yt-dlp.
     #[cfg(feature = "yt-dlp")]
     OpenChannelDownload,
@@ -3287,6 +3324,10 @@ pub enum UiAction {
     ToggleYouTubePrewarm,
     /// Toggle the default-hourly automatic subscription check in the draft.
     ToggleHourlyAutoDownload,
+    /// Cycle the draft video/audio-only download preference.
+    CycleDownloadModePreference,
+    /// Cycle the draft original/Archive-MP3 download preference.
+    CycleArchiveDownloadPreference,
     /// Check every opted-in YouTube channel immediately.
     CheckAndDownloadNewEpisodes,
     /// Cycle the exact YouTube thumbnail size in the draft.

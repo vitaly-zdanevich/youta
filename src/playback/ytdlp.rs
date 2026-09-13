@@ -129,6 +129,10 @@ pub struct YouTubeEpisodeMetadata {
 pub enum DownloadFormat {
     /// Keep one directly selected provider file byte-for-byte, without fixups.
     ExactFile,
+    /// Merge the best video and audio streams into MKV using stream copy only.
+    BestVideo,
+    /// Extract audio without encoding; unsupported output containers fail explicitly.
+    AudioOnlyWithoutReencoding,
     /// Prefer an Opus source and remux it without lossy re-encoding.
     #[default]
     OpusWithoutTranscoding,
@@ -1735,6 +1739,32 @@ fn build_download_command(config: &YtDlpConfig, request: &DownloadRequest) -> Co
                 .arg("--fixup")
                 .arg("never");
         }
+        DownloadFormat::BestVideo => {
+            command
+                .arg("--format")
+                .arg("bestvideo+bestaudio/best")
+                .arg("--merge-output-format")
+                .arg("mkv")
+                .arg("--postprocessor-args")
+                .arg("Merger+ffmpeg_o:-c copy")
+                .arg("--fixup")
+                .arg("never");
+        }
+        DownloadFormat::AudioOnlyWithoutReencoding => {
+            // yt-dlp's "best" audio postprocessor can otherwise choose an
+            // encoder for an unknown codec. Output-position arguments are
+            // appended after that choice, so copy wins or FFmpeg fails.
+            command
+                .arg("--format")
+                .arg("bestaudio/best")
+                .arg("--extract-audio")
+                .arg("--audio-format")
+                .arg("best")
+                .arg("--postprocessor-args")
+                .arg("ExtractAudio+ffmpeg_o:-c:a copy")
+                .arg("--fixup")
+                .arg("never");
+        }
         DownloadFormat::OpusWithoutTranscoding => {
             command
                 .arg("--format")
@@ -2906,46 +2936,89 @@ mod tests {
         }
     }
 
-    /// A directly selected Archive audio file must not inherit the Opus-only filter.
+    /// User-selected modes never inherit an unattended Opus-only format filter.
     #[test]
-    fn exact_file_download_disables_all_extraction_conversion_and_fixups() {
-        let request = DownloadRequest {
-            source_url: Url::parse("https://archive.org/download/book/chapter.mp3").unwrap(),
-            destination: PathBuf::from("/tmp/youta-fixture-downloads"),
-            format: DownloadFormat::ExactFile,
-            scope: DownloadScope::SingleItem,
-            playlist_start: None,
-            skip_shorts: false,
-            write_thumbnail: false,
-            archive_path: None,
-        };
-        let command = build_download_command(&YtDlpConfig::default(), &request);
-        let arguments = command
-            .get_args()
-            .map(|value| value.to_string_lossy())
-            .collect::<Vec<_>>();
-        assert!(
-            arguments
-                .windows(2)
-                .any(|pair| pair == ["--format", "best"])
-        );
-        assert!(
-            arguments
-                .windows(2)
-                .any(|pair| pair == ["--fixup", "never"])
-        );
-        for forbidden in [
-            "--extract-audio",
-            "--audio-format",
-            "--recode-video",
-            "--remux-video",
-            "--postprocessor-args",
-            "--merge-output-format",
+    fn explicit_download_modes_require_exact_bytes_or_explicit_stream_copy() {
+        let config = YtDlpConfig::default();
+        for (format, selector, postprocessor) in [
+            (DownloadFormat::ExactFile, "best", None),
+            (
+                DownloadFormat::BestVideo,
+                "bestvideo+bestaudio/best",
+                Some("Merger+ffmpeg_o:-c copy"),
+            ),
+            (
+                DownloadFormat::AudioOnlyWithoutReencoding,
+                "bestaudio/best",
+                Some("ExtractAudio+ffmpeg_o:-c:a copy"),
+            ),
         ] {
+            let request = DownloadRequest {
+                source_url: Url::parse("https://archive.org/download/book/file.mp4")
+                    .expect("direct source"),
+                destination: PathBuf::from("/tmp/youta-fixture-downloads"),
+                format,
+                scope: DownloadScope::SingleItem,
+                playlist_start: None,
+                skip_shorts: false,
+                write_thumbnail: false,
+                archive_path: None,
+            };
+            let command = build_download_command(&config, &request);
+            let arguments: Vec<_> = command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
             assert!(
-                !arguments.iter().any(|argument| argument == forbidden),
-                "{forbidden}"
+                arguments
+                    .windows(2)
+                    .any(|pair| pair == ["--format", selector])
             );
+            assert!(
+                arguments
+                    .windows(2)
+                    .any(|pair| pair == ["--fixup", "never"])
+            );
+            assert!(
+                !arguments
+                    .iter()
+                    .any(|arg| matches!(arg.as_str(), "--recode-video" | "--remux-video"))
+            );
+            match format {
+                DownloadFormat::ExactFile => {
+                    assert!(!arguments.iter().any(|arg| matches!(
+                        arg.as_str(),
+                        "--extract-audio"
+                            | "--audio-format"
+                            | "--postprocessor-args"
+                            | "--merge-output-format"
+                    )));
+                }
+                DownloadFormat::BestVideo => {
+                    assert!(
+                        arguments
+                            .windows(2)
+                            .any(|pair| pair == ["--merge-output-format", "mkv"])
+                    );
+                    assert!(!arguments.iter().any(|arg| arg == "--extract-audio"));
+                }
+                DownloadFormat::AudioOnlyWithoutReencoding => {
+                    assert!(arguments.iter().any(|arg| arg == "--extract-audio"));
+                    assert!(
+                        arguments
+                            .windows(2)
+                            .any(|pair| pair == ["--audio-format", "best"])
+                    );
+                }
+                _ => unreachable!("explicit mode fixture"),
+            }
+            if let Some(postprocessor) = postprocessor {
+                assert!(
+                    arguments
+                        .windows(2)
+                        .any(|pair| pair == ["--postprocessor-args", postprocessor])
+                );
+            }
         }
     }
 
@@ -2997,47 +3070,171 @@ mod tests {
         }
     }
 
-    /// The file-only fixture proves byte identity for two non-Opus audio formats.
+    /// Runs only locally generated media, with the normal helper lifetime/output bounds.
     #[test]
-    #[ignore = "requires installed yt-dlp and ffmpeg; generated local audio only"]
-    fn exact_file_download_preserves_real_mp3_and_flac_bytes() {
-        let directory = tempfile::tempdir().expect("exact audio fixture");
-        for (extension, codec) in [("mp3", "libmp3lame"), ("flac", "flac")] {
-            let source = directory.path().join(format!("source.{extension}"));
+    #[ignore = "requires installed yt-dlp, ffmpeg, and ffprobe; creates synthetic local files only"]
+    fn explicit_download_modes_preserve_real_bitstreams_and_reject_unsupported_codecs() {
+        let directory = tempfile::tempdir().expect("local stream-copy fixture");
+        let source = directory.path().join("source.mkv");
+        let unknown = directory.path().join("unknown.mkv");
+        for (path, codec) in [(&source, "aac"), (&unknown, "pcm_s16le")] {
             local_media_fixture_output(
                 Command::new("ffmpeg")
                     .args([
                         "-v",
                         "error",
-                        "-nostdin",
-                        "-n",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        "color=c=black:s=16x16:r=10",
                         "-f",
                         "lavfi",
                         "-i",
                         "sine=frequency=440:sample_rate=48000",
                         "-t",
                         "0.2",
+                        "-c:v",
+                        "mpeg4",
                         "-c:a",
                         codec,
                     ])
-                    .arg(&source),
+                    .arg(path),
             );
-            let request = DownloadRequest {
-                source_url: Url::from_file_path(&source).expect("fixture URL"),
-                destination: directory.path().join(format!("download-{extension}")),
-                format: DownloadFormat::ExactFile,
-                scope: DownloadScope::SingleItem,
-                playlist_start: None,
-                skip_shorts: false,
-                write_thumbnail: false,
-                archive_path: None,
-            };
-            let downloaded = local_download_fixture(&request, None).expect("exact file");
-            assert_eq!(downloaded.extension().unwrap(), extension);
+        }
+        let source_audio = local_media_stream_hash(&source, "0:a:0");
+        let source_video = local_media_stream_hash(&source, "0:v:0");
+        let request = |name: &str, format, path: &Path| DownloadRequest {
+            source_url: Url::from_file_path(path).expect("fixture file URL"),
+            destination: directory.path().join(name),
+            format,
+            scope: DownloadScope::SingleItem,
+            playlist_start: None,
+            skip_shorts: false,
+            write_thumbnail: false,
+            archive_path: None,
+        };
+        let exact =
+            local_download_fixture(&request("exact", DownloadFormat::ExactFile, &source), None)
+                .expect("exact local download");
+        assert_eq!(
+            std::fs::read(&exact).expect("exact bytes"),
+            std::fs::read(&source).expect("source bytes")
+        );
+        let audio = local_download_fixture(
+            &request("audio", DownloadFormat::AudioOnlyWithoutReencoding, &source),
+            None,
+        )
+        .expect("strict audio extraction");
+        assert_eq!(local_media_stream_hash(&audio, "0:a:0"), source_audio);
+        assert_eq!(
+            local_media_codecs(&audio),
+            [("audio".to_owned(), "aac".to_owned())]
+        );
+
+        // Two separately advertised files exercise the actual yt-dlp merger,
+        // rather than only downloading an already multiplexed "best" fallback.
+        let video_input = directory.path().join("video.mp4");
+        let audio_input = directory.path().join("audio.m4a");
+        for (path, map) in [(&video_input, "0:v:0"), (&audio_input, "0:a:0")] {
+            local_media_fixture_output(
+                Command::new("ffmpeg")
+                    .args(["-v", "error", "-i"])
+                    .arg(&source)
+                    .args(["-map", map, "-c", "copy"])
+                    .arg(path),
+            );
+        }
+        let info = directory.path().join("formats.json");
+        std::fs::write(&info, serde_json::to_vec(&serde_json::json!({
+            "id": "local_merge",
+            "title": "Local merge fixture",
+            "extractor": "generic",
+            "webpage_url": "https://example.invalid/local-fixture",
+            "formats": [
+                {"format_id":"video","url":Url::from_file_path(&video_input).unwrap().as_str(),"ext":"mp4","vcodec":"mpeg4","acodec":"none","width":16,"height":16},
+                {"format_id":"audio","url":Url::from_file_path(&audio_input).unwrap().as_str(),"ext":"m4a","vcodec":"none","acodec":"aac","abr":128},
+            ],
+        })).expect("format metadata")).expect("write local metadata");
+        let merged = local_download_fixture(
+            &request("merged", DownloadFormat::BestVideo, &source),
+            Some(&info),
+        )
+        .expect("strict best-video merger");
+        assert_eq!(
+            merged.extension().and_then(|value| value.to_str()),
+            Some("mkv")
+        );
+        assert_eq!(local_media_stream_hash(&merged, "0:a:0"), source_audio);
+        assert_eq!(local_media_stream_hash(&merged, "0:v:0"), source_video);
+        let codecs = local_media_codecs(&merged);
+        assert!(codecs.contains(&("audio".to_owned(), "aac".to_owned())));
+        assert!(codecs.contains(&("video".to_owned(), "mpeg4".to_owned())));
+
+        let encoders =
+            local_media_fixture_output(Command::new("ffmpeg").args(["-v", "quiet", "-encoders"]));
+        if String::from_utf8_lossy(&encoders).contains("libmp3lame") {
+            // Prove this fixture reaches yt-dlp's implicit encoder fallback when
+            // the final copy override is absent; all input is synthetic local media.
+            let control = request(
+                "unsafe-control",
+                DownloadFormat::AudioOnlyWithoutReencoding,
+                &unknown,
+            );
+            std::fs::create_dir_all(&control.destination).expect("control output directory");
+            let configured = build_download_command(&YtDlpConfig::default(), &control);
+            let mut arguments: Vec<_> = configured
+                .get_args()
+                .map(std::ffi::OsStr::to_owned)
+                .collect();
+            let override_index = arguments
+                .iter()
+                .position(|arg| arg == "--postprocessor-args")
+                .expect("strict copy override");
+            arguments.drain(override_index..override_index + 2);
+            let mut unsafe_control = Command::new(configured.get_program());
+            unsafe_control
+                .args(arguments)
+                .arg("--enable-file-urls")
+                .arg("--")
+                .arg(control.source_url.as_str());
+            let output = local_media_fixture_output(&mut unsafe_control);
+            let control_path = String::from_utf8_lossy(&output)
+                .lines()
+                .filter_map(parse_download_event)
+                .find_map(|event| match event {
+                    DownloadEvent::CompletedFile(path) => Some(path),
+                    _ => None,
+                })
+                .expect("control encoded file");
             assert_eq!(
-                std::fs::read(&downloaded).unwrap(),
-                std::fs::read(&source).unwrap()
+                local_media_codecs(&control_path),
+                [("audio".to_owned(), "mp3".to_owned())]
             );
+        } else {
+            eprintln!(
+                "MP3 encoder unavailable: skipping unsafe encoding control; strict-copy checks remain required"
+            );
+        }
+
+        let unsupported = request(
+            "unsupported",
+            DownloadFormat::AudioOnlyWithoutReencoding,
+            &unknown,
+        );
+        assert!(
+            local_download_fixture(&unsupported, None).is_err(),
+            "an unfamiliar audio codec must fail instead of falling back to an encoder"
+        );
+        for entry in std::fs::read_dir(&unsupported.destination).expect("failed download directory")
+        {
+            let path = entry.expect("failed download entry").path();
+            if path.extension().and_then(|value| value.to_str()) == Some("mp3") {
+                assert_eq!(
+                    path.metadata().expect("failed MP3 metadata").len(),
+                    0,
+                    "the unsupported codec must not produce re-encoded MP3 audio"
+                );
+            }
         }
     }
 
@@ -3050,6 +3247,52 @@ mod tests {
             &YouTubePrewarmCancellation::default(),
         )
         .expect("bounded local multimedia helper")
+    }
+
+    /// Hashes compressed packets, not container headers or decoded sample approximations.
+    fn local_media_stream_hash(path: &Path, stream: &str) -> Vec<u8> {
+        local_media_fixture_output(
+            Command::new("ffmpeg")
+                .args(["-v", "error", "-i"])
+                .arg(path)
+                .args([
+                    "-map", stream, "-c", "copy", "-f", "hash", "-hash", "sha256", "-",
+                ]),
+        )
+    }
+
+    /// Reads only codec/type metadata from one synthetic test output.
+    fn local_media_codecs(path: &Path) -> Vec<(String, String)> {
+        let bytes = local_media_fixture_output(
+            Command::new("ffprobe")
+                .args([
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "stream=codec_name,codec_type",
+                    "-of",
+                    "json",
+                ])
+                .arg(path),
+        );
+        let value: serde_json::Value = serde_json::from_slice(&bytes).expect("codec metadata");
+        value["streams"]
+            .as_array()
+            .expect("streams")
+            .iter()
+            .map(|stream| {
+                (
+                    stream["codec_type"]
+                        .as_str()
+                        .expect("codec type")
+                        .to_owned(),
+                    stream["codec_name"]
+                        .as_str()
+                        .expect("codec name")
+                        .to_owned(),
+                )
+            })
+            .collect()
     }
 
     /// Enables file URLs only inside this fixture, never through the public downloader.

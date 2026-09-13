@@ -140,9 +140,11 @@ mod wire_tests {
     use crate::playback::PlaybackStatus;
     #[cfg(feature = "commons-upload")]
     use crate::view::{CommonsUploadField, CommonsUploadPhase, CommonsUploadPopupView};
+    use crate::view::{
+        DownloadChoicePopupView, UiAction, VideoSummaryPopupState, VideoSummaryPopupView, ViewModel,
+    };
     #[cfg(feature = "evernote")]
     use crate::view::{EvernoteNoteField, EvernoteNotePhase, EvernoteNotePopupView};
-    use crate::view::{UiAction, VideoSummaryPopupState, VideoSummaryPopupView, ViewModel};
 
     /// The window builds this JSON by hand in JavaScript, so the exact shape is
     /// part of the contract rather than an implementation detail of Serde.
@@ -216,6 +218,51 @@ mod wire_tests {
                 ..shifted
             }
             .chorded()
+        );
+    }
+
+    /// Format choices remain modal over a background query and reject empty confirmation.
+    #[test]
+    fn download_choice_keys_block_background_actions_and_empty_confirmation() {
+        let mut view = ViewModel {
+            search_editing: true,
+            download_choice_popup: Some(DownloadChoicePopupView {
+                generation: 7,
+                title: "Selected item".to_owned(),
+                explanation: "Choose a download format".to_owned(),
+                options: vec!["Original".to_owned(), "MP3".to_owned()],
+                selected: 0,
+            }),
+            ..ViewModel::default()
+        };
+        for (key, expected) in [
+            (Key::Up, Some(UiAction::MoveDownloadChoice(-1))),
+            (Key::Down, Some(UiAction::MoveDownloadChoice(1))),
+            (Key::Tab, Some(UiAction::MoveDownloadChoice(1))),
+            (Key::BackTab, Some(UiAction::MoveDownloadChoice(-1))),
+            (Key::Enter, Some(UiAction::ConfirmDownloadChoice(7))),
+            (Key::Esc, Some(UiAction::DismissDownloadChoice)),
+            (Key::Char('q'), None),
+            (Key::Char('d'), None),
+            (Key::Char(' '), None),
+            (Key::F(6), None),
+            (Key::Left, None),
+        ] {
+            assert_eq!(key_action(KeyPress::new(key), &view, None, None), expected);
+        }
+        view.download_choice_popup.as_mut().unwrap().generation = 42;
+        assert_eq!(
+            key_action(KeyPress::new(Key::Enter), &view, None, None),
+            Some(UiAction::ConfirmDownloadChoice(42))
+        );
+        view.download_choice_popup.as_mut().unwrap().options.clear();
+        assert_eq!(
+            key_action(KeyPress::new(Key::Enter), &view, None, None),
+            None
+        );
+        assert_eq!(
+            key_action(KeyPress::new(Key::Esc), &view, None, None),
+            Some(UiAction::DismissDownloadChoice)
         );
     }
 
@@ -1339,6 +1386,17 @@ fn unfiltered_key_action(
             _ => None,
         };
     }
+    if let Some(popup) = view.download_choice_popup.as_ref() {
+        return match key.key {
+            Key::Up | Key::Char('k') | Key::BackTab => Some(UiAction::MoveDownloadChoice(-1)),
+            Key::Down | Key::Char('j') | Key::Tab => Some(UiAction::MoveDownloadChoice(1)),
+            Key::Enter if popup.selected < popup.options.len() => {
+                Some(UiAction::ConfirmDownloadChoice(popup.generation))
+            }
+            Key::Esc => Some(UiAction::DismissDownloadChoice),
+            _ => None,
+        };
+    }
     #[cfg(feature = "yt-dlp")]
     if view.channel_download_popup.is_some() {
         return match key.key {
@@ -1421,6 +1479,14 @@ fn unfiltered_key_action(
             Key::Char('y') => Some(UiAction::ToggleYouTubePrewarm),
             Key::Char('e') if preferences.auto_download_supported => {
                 Some(UiAction::ToggleHourlyAutoDownload)
+            }
+            Key::Char('m') if preferences.auto_download_supported => {
+                Some(UiAction::CycleDownloadModePreference)
+            }
+            Key::Char('F')
+                if cfg!(feature = "archive-org") && preferences.auto_download_supported =>
+            {
+                Some(UiAction::CycleArchiveDownloadPreference)
             }
             Key::Char('C') if preferences.auto_download_supported => {
                 Some(UiAction::CheckAndDownloadNewEpisodes)
