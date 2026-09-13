@@ -1828,6 +1828,7 @@ struct HitMap {
     private_note_scroll_offset: usize,
     /// Largest wrapped-line offset that can change the private-note viewport.
     private_note_scroll_maximum: usize,
+
     local_file_buttons: Vec<(UiAction, Rect)>,
     #[cfg(feature = "yt-dlp")]
     channel_download_buttons: Vec<(UiAction, Rect)>,
@@ -2190,6 +2191,7 @@ fn render_frame(
     let thumbnail_is_obscured = thumbnail_is_obscured
         || view.evernote_popup.is_some()
         || view.evernote_credentials_popup.is_some();
+
     #[cfg(feature = "qr")]
     let thumbnail_is_obscured = thumbnail_is_obscured || view.video_qr_popup.is_some();
     #[cfg(feature = "lan-sharing")]
@@ -2326,6 +2328,7 @@ fn render_frame(
             );
         }
     }
+
     hit_map.rss_subscription_field = None;
     hit_map.rss_subscription_buttons.clear();
     if let Some(popup) = view.rss_subscription_popup.as_ref() {
@@ -2769,6 +2772,7 @@ fn search_panel_title(view: &ViewModel) -> String {
             Screen::YouTubeMusic
             | Screen::Bandcamp
             | Screen::ApplePodcasts
+            | Screen::ArchiveOrg
             | Screen::LibriVox
             | Screen::TrackerMusic => " Search ".to_owned(),
             Screen::YandexMusic => {
@@ -2935,6 +2939,16 @@ fn render_body(
             controls_height,
         );
         render_web_controls(frame, controls, show_hotkeys, view.autoplay, theme, hit_map);
+    } else if view.screen == Screen::ArchiveOrg {
+        let controls_height = list_area.height.min(1);
+        list_area.height = list_area.height.saturating_sub(controls_height);
+        let controls = Rect::new(
+            list_area.x,
+            list_area.bottom(),
+            list_area.width,
+            controls_height,
+        );
+        render_archive_org_controls(frame, controls, view, show_hotkeys, theme, hit_map);
     }
     hit_map.rows_row_height = row_list_height(&view.rows);
     (hit_map.rows, hit_map.rows_first_index) = render_row_list(
@@ -2979,6 +2993,51 @@ fn render_body(
                 thumbnail_renderer,
             );
         }
+    }
+}
+
+/// Exposes global playback toggles below Archive item and track lists.
+fn render_archive_org_controls(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    view: &ViewModel,
+    show_hotkeys: bool,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+) {
+    if area.is_empty() {
+        return;
+    }
+    let mut x = area.x;
+    for (key, label, action) in [
+        (
+            "A",
+            if view.autoplay {
+                "Autoplay: on"
+            } else {
+                "Autoplay: off"
+            },
+            UiAction::ToggleAutoplay,
+        ),
+        (
+            "r",
+            if view.repeating {
+                "Repeat: on"
+            } else {
+                "Repeat: off"
+            },
+            UiAction::ToggleRepeat,
+        ),
+    ] {
+        let label = button(key, label, show_hotkeys);
+        let width = terminal_text_width(&label).min(area.right().saturating_sub(x));
+        if width == 0 {
+            break;
+        }
+        let target = Rect::new(x, area.y, width, 1);
+        frame.render_widget(Paragraph::new(label).style(theme.accent), target);
+        hit_map.detail_buttons.push((action, target));
+        x = x.saturating_add(width).saturating_add(2);
     }
 }
 
@@ -3793,6 +3852,7 @@ fn completed_search_has_no_rows(view: &ViewModel) -> bool {
         | Screen::YouTubeMusic
         | Screen::Bandcamp
         | Screen::ApplePodcasts
+        | Screen::ArchiveOrg
         | Screen::LibriVox
         | Screen::Web
         | Screen::TrackerMusic
@@ -4146,6 +4206,7 @@ fn right_detail_button_reserves_full_row(
         UiAction::OpenCommonsUpload => true,
         #[cfg(feature = "evernote")]
         UiAction::OpenEvernoteNote => true,
+
         _ => false,
     }
 }
@@ -4229,6 +4290,10 @@ fn render_information_panel(
         return;
     };
 
+    let archive_org_details = details
+        .media_id
+        .as_ref()
+        .is_some_and(|media_id| media_id.source == SourceKind::ArchiveOrg);
     let title_already_visible = if view.screen == Screen::Subscriptions {
         view.subscriptions.source_title == details.title
     } else {
@@ -4242,19 +4307,20 @@ fn render_information_panel(
         Vec::new()
     };
     let mut right_buttons = Vec::with_capacity(5);
-    if show_text_selection
-        && kind == InformationPanelKind::Video
-        && view.video_comments_available
-        && details
-            .media_id
-            .as_ref()
-            .is_some_and(|media_id| media_id.source == SourceKind::YouTube)
-    {
+    if show_text_selection && view.public_comments_available() {
         push_right_detail_button(
             &mut lines,
             &mut right_buttons,
             inner.width,
-            button("F6", "Twenty comments", show_hotkeys),
+            button(
+                "F6",
+                if archive_org_details {
+                    "Comments"
+                } else {
+                    "Twenty comments"
+                },
+                show_hotkeys,
+            ),
             theme.accent,
             UiAction::OpenVideoComments,
         );
@@ -4291,6 +4357,7 @@ fn render_information_panel(
             UiAction::OpenEvernoteNote,
         );
     }
+
     if cfg!(feature = "local-trash") && view.screen == Screen::Downloaded {
         push_right_detail_button(
             &mut lines,
@@ -4325,14 +4392,15 @@ fn render_information_panel(
     }
     if view.external_opener_available
         && show_text_selection
-        && matches!(
-            kind,
-            InformationPanelKind::Video
-                | InformationPanelKind::Podcast
-                | InformationPanelKind::Audiobook
-                | InformationPanelKind::Radio
-                | InformationPanelKind::YandexMusic
-        )
+        && (archive_org_details
+            || matches!(
+                kind,
+                InformationPanelKind::Video
+                    | InformationPanelKind::Podcast
+                    | InformationPanelKind::Audiobook
+                    | InformationPanelKind::Radio
+                    | InformationPanelKind::YandexMusic
+            ))
     {
         let opener_name = system_url_opener_name();
         let mut action_text = match kind {
@@ -4343,6 +4411,7 @@ fn render_information_panel(
                 format!("{opener_name} track")
             }
             InformationPanelKind::YandexMusic => format!("{opener_name} item"),
+            InformationPanelKind::Generic if archive_org_details => "original page".to_owned(),
             _ => "open video".to_owned(),
         };
         if let Some(webpage_url) = details.webpage_url.as_ref() {
@@ -4859,7 +4928,26 @@ fn render_information_panel(
                 ]));
             }
         }
-        InformationPanelKind::Generic => {}
+        InformationPanelKind::Generic => {
+            if archive_org_details {
+                for (name, value) in [
+                    ("Length", details.length.as_str()),
+                    ("Favourites", details.likes.as_str()),
+                    ("Downloads", details.views.as_str()),
+                    ("Comments", details.comments.as_str()),
+                    ("Uploaded", details.published.as_str()),
+                ] {
+                    let value = value.trim();
+                    if value.is_empty() || value.eq_ignore_ascii_case("unknown") {
+                        continue;
+                    }
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("{name}: "), theme.muted),
+                        Span::raw(value.to_owned()),
+                    ]));
+                }
+            }
+        }
     }
     if show_text_selection && !details.playlist_names.is_empty() {
         let summary = format!("Playlists: {}", details.playlist_names.join(", "));
@@ -4869,8 +4957,10 @@ fn render_information_panel(
                 .map(Line::raw),
         );
     }
+    // Archive rights notices may be plain text and do not imply a standard licence.
     if is_creative_commons_license(&details.license)
         || is_librivox_public_domain_license(&details.source, &details.license)
+        || (archive_org_details && is_specified_archive_license(&details.license))
     {
         lines.push(Line::from(vec![
             Span::styled("License: ", theme.muted),
@@ -5832,6 +5922,15 @@ fn is_librivox_public_domain_license(source: &str, label: &str) -> bool {
             .eq_ignore_ascii_case("Public domain in the United States")
 }
 
+/// Keeps actual Archive rights notices without displaying missing-value placeholders.
+fn is_specified_archive_license(label: &str) -> bool {
+    let label = label.trim();
+    !label.is_empty()
+        && !["unknown", "not specified", "unspecified"]
+            .iter()
+            .any(|placeholder| label.eq_ignore_ascii_case(placeholder))
+}
+
 /// Formats one non-negative count with comma-separated thousands groups.
 fn format_count(count: u64) -> String {
     let digits = count.to_string();
@@ -6736,6 +6835,8 @@ fn centered_line_x(area: Rect, line_width: u16) -> u16 {
 fn search_kind_help(view: &ViewModel) -> &'static str {
     if view.screen == Screen::YandexMusic {
         "  v all/music/podcasts/audiobooks search"
+    } else if view.screen == Screen::ArchiveOrg {
+        "  archive.org: / search   Enter open/play   d download   F6 comments   Esc back"
     } else if view.screen == Screen::Web {
         "  Web: / open URL     R refresh     Esc back     Enter open/play audio"
     } else {
@@ -6823,6 +6924,8 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
         playlist_actions_help.push_str("E Evernote audio  ");
     }
     playlist_actions_help.push_str("  l toggle todo     P choose playlist");
+    let selection_help = "  j/k select     Enter open/play";
+
     let help = [
         "Navigation",
         "  / search     Tab next tab     Shift+Tab previous tab     S subscriptions",
@@ -6831,7 +6934,7 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
         preferences_help,
         project_history_help,
         search_kind_help(view),
-        "  j/k select     Enter open/play",
+        selection_help.as_ref(),
         "  ↪ internal video: click the marker after a YouTube URL",
         local_help.as_str(),
         "  Radio: B cycles name / high-bitrate / low-bitrate order",
@@ -7916,7 +8019,12 @@ fn render_video_comments_popup(
 ) {
     let area = centered_rect(84, 82, frame.area());
     frame.render_widget(Clear, area);
-    frame.render_widget(panel_block(" YouTube comments ", theme), area);
+    let title = if popup.source == SourceKind::ArchiveOrg {
+        " archive.org comments "
+    } else {
+        " YouTube comments "
+    };
+    frame.render_widget(panel_block(title, theme), area);
 
     let inner = area.inner(ratatui::layout::Margin {
         horizontal: 1,
@@ -7971,10 +8079,10 @@ fn render_video_comments_popup(
                 if index > 0 {
                     content.push(Line::raw(""));
                 }
-                let mut header = vec![
-                    Span::styled(comment.author_name.clone(), theme.heading),
-                    Span::styled(" · ", theme.muted),
-                    Span::raw(format!(
+                let mut header = vec![Span::styled(comment.author_name.clone(), theme.heading)];
+                if popup.source == SourceKind::YouTube {
+                    header.push(Span::styled(" · ", theme.muted));
+                    header.push(Span::raw(format!(
                         "{} {}",
                         format_count(comment.like_count),
                         if comment.like_count == 1 {
@@ -7982,8 +8090,8 @@ fn render_video_comments_popup(
                         } else {
                             "likes"
                         }
-                    )),
-                ];
+                    )));
+                }
                 if let Some(published) = comment.published.as_deref() {
                     header.push(Span::styled(" · ", theme.muted));
                     header.push(Span::raw(published.to_owned()));
@@ -11963,6 +12071,7 @@ fn mouse_action_unfiltered(
             _ => None,
         };
     }
+
     #[cfg(feature = "commons-upload")]
     if view.commons_credentials_popup.is_some() {
         return match mouse.kind {
@@ -14024,6 +14133,9 @@ for encoded, expected in json.load(sys.stdin):
         view.screen = Screen::ApplePodcasts;
         view.search_activity = Some(SearchActivity::ApplePodcasts);
         assert_eq!(search_panel_title(&view), " | ambient ");
+        view.screen = Screen::ArchiveOrg;
+        view.search_activity = Some(SearchActivity::ArchiveOrg);
+        assert_eq!(search_panel_title(&view), " | ambient ");
         view.screen = Screen::LibriVox;
         view.search_activity = Some(SearchActivity::LibriVox);
         assert_eq!(search_panel_title(&view), " | ambient ");
@@ -14199,6 +14311,7 @@ for encoded, expected in json.load(sys.stdin):
             Screen::YouTubeMusic,
             Screen::Bandcamp,
             Screen::ApplePodcasts,
+            Screen::ArchiveOrg,
             Screen::LibriVox,
             Screen::TrackerMusic,
         ] {
@@ -22749,6 +22862,471 @@ for encoded, expected in json.load(sys.stdin):
         assert!(!rendered.contains("Views:"));
     }
 
+    /// Archive playback toggles reuse the global keys and exact clickable labels.
+    #[test]
+    fn archive_org_footer_shows_autoplay_repeat_and_working_controls() {
+        for width in [160, 79] {
+            for show_hotkeys in [true, false] {
+                for autoplay in [false, true] {
+                    for repeating in [false, true] {
+                        let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+                        let view = ViewModel {
+                            screen: Screen::ArchiveOrg,
+                            autoplay,
+                            repeating,
+                            rows: vec![RowView {
+                                title: "Archive item or track".to_owned(),
+                                ..RowView::default()
+                            }],
+                            ..ViewModel::default()
+                        };
+                        let mut hit_map = HitMap::default();
+                        terminal
+                            .draw(|frame| {
+                                render_body(
+                                    frame,
+                                    frame.area(),
+                                    &view,
+                                    show_hotkeys,
+                                    DEFAULT_THUMBNAIL_HEIGHT,
+                                    &Theme::new(false),
+                                    &mut hit_map,
+                                    None,
+                                )
+                            })
+                            .unwrap();
+                        let autoplay_label = button(
+                            "A",
+                            if autoplay {
+                                "Autoplay: on"
+                            } else {
+                                "Autoplay: off"
+                            },
+                            show_hotkeys,
+                        );
+                        let repeat_label = button(
+                            "r",
+                            if repeating {
+                                "Repeat: on"
+                            } else {
+                                "Repeat: off"
+                            },
+                            show_hotkeys,
+                        );
+                        assert!(
+                            rendered_text(&terminal)
+                                .contains(&format!("{autoplay_label}  {repeat_label}"))
+                        );
+                        let mut previous: Option<Rect> = None;
+                        for (key, label, expected) in [
+                            ('A', autoplay_label, UiAction::ToggleAutoplay),
+                            ('r', repeat_label, UiAction::ToggleRepeat),
+                        ] {
+                            let targets = hit_map
+                                .detail_buttons
+                                .iter()
+                                .filter(|(action, _)| action == &expected)
+                                .collect::<Vec<_>>();
+                            assert_eq!(targets.len(), 1);
+                            let target = targets[0].1;
+                            assert_eq!(target.width, terminal_text_width(&label));
+                            assert!(hit_map.rows.intersection(target).is_empty());
+                            if let Some(previous) = previous {
+                                assert_eq!(target.x, previous.right() + 2);
+                                assert_eq!(target.y, previous.y);
+                            }
+                            for column in [target.x, target.right() - 1] {
+                                assert_eq!(
+                                    mouse_action(
+                                        MouseEvent {
+                                            kind: MouseEventKind::Down(MouseButton::Left),
+                                            column,
+                                            row: target.y,
+                                            modifiers: KeyModifiers::NONE,
+                                        },
+                                        &hit_map,
+                                        &view
+                                    ),
+                                    Some(expected.clone())
+                                );
+                            }
+                            assert_eq!(
+                                key_action(
+                                    KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE),
+                                    &view
+                                ),
+                                Some(expected)
+                            );
+                            previous = Some(target);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Clipped Archive controls never claim cells outside their one-row footer.
+    #[test]
+    fn archive_org_footer_stays_bounded_in_small_terminals() {
+        for (width, height) in [(1, 1), (12, 2), (30, 3), (80, 1), (80, 2)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let view = ViewModel {
+                screen: Screen::ArchiveOrg,
+                ..ViewModel::default()
+            };
+            let mut hit_map = HitMap::default();
+            terminal
+                .draw(|frame| {
+                    render_body(
+                        frame,
+                        frame.area(),
+                        &view,
+                        true,
+                        DEFAULT_THUMBNAIL_HEIGHT,
+                        &Theme::new(false),
+                        &mut hit_map,
+                        None,
+                    )
+                })
+                .unwrap();
+            let targets = hit_map
+                .detail_buttons
+                .iter()
+                .filter(|(action, _)| {
+                    matches!(action, UiAction::ToggleAutoplay | UiAction::ToggleRepeat)
+                })
+                .collect::<Vec<_>>();
+            if width >= 80 || height > 1 {
+                assert!(
+                    !targets.is_empty(),
+                    "{width}x{height}: visible Archive controls"
+                );
+            }
+            for (_, target) in targets {
+                assert!(target.right() <= width && target.bottom() <= height);
+                assert_eq!(target.height, 1);
+                assert!(hit_map.rows.intersection(*target).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn archive_org_details_hide_unspecified_licenses_and_keep_real_rights() {
+        let mut terminal = Terminal::new(TestBackend::new(180, 36)).unwrap();
+        let mut hit_map = HitMap::default();
+        for (license, visible) in [
+            ("Permission granted for noncommercial listening.", true),
+            ("", false),
+            (" \t", false),
+            ("Unknown", false),
+            (" unknown ", false),
+            ("Not specified", false),
+            (" NOT SPECIFIED ", false),
+            ("Unspecified", false),
+        ] {
+            let view = ViewModel {
+                screen: Screen::ArchiveOrg,
+                details: Some(DetailView {
+                    media_id: Some(MediaId::new(
+                        SourceKind::ArchiveOrg,
+                        "https://archive.org/download/fixture/audio.mp3",
+                    )),
+                    title: "Archive licence fixture".to_owned(),
+                    source: "archive.org".to_owned(),
+                    license: license.to_owned(),
+                    links: Vec::new(),
+                    ..DetailView::default()
+                }),
+                ..ViewModel::default()
+            };
+            terminal
+                .draw(|frame| {
+                    render(frame, &view, &UiSettings::default(), &mut hit_map);
+                })
+                .unwrap();
+            let rendered = rendered_text(&terminal);
+            assert_eq!(rendered.contains("License:"), visible, "{license:?}");
+            if visible {
+                assert!(
+                    rendered.contains(&format!("License: {license}")),
+                    "Actual Archive rights must stay visible without a licence URL: {license}"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "archive-org")]
+    #[test]
+    fn archive_org_details_render_favourites_upload_description_artwork_and_original_page() {
+        let media_id = MediaId::new(
+            SourceKind::ArchiveOrg,
+            "https://archive.org/download/fixture/audio.mp3",
+        );
+        let artwork = url::Url::parse("https://archive.org/services/img/fixture").unwrap();
+        let webpage = "https://archive.org/details/fixture";
+        let view = ViewModel {
+            screen: Screen::ArchiveOrg,
+            external_opener_available: true,
+            video_comments_available: true,
+            rows: vec![RowView {
+                media_id: Some(media_id.clone()),
+                title: "Archive fixture".to_owned(),
+                ..RowView::default()
+            }],
+            details: Some(DetailView {
+                media_id: Some(media_id),
+                title: "Archive fixture".to_owned(),
+                source: "archive.org".to_owned(),
+                description: "An archival recording with a detailed description.".to_owned(),
+                length: "6:03".to_owned(),
+                likes: "42".to_owned(),
+                views: "1,234".to_owned(),
+                comments: "3".to_owned(),
+                published: "2026 September 12".to_owned(),
+                webpage_url: Some(url::Url::parse(webpage).unwrap()),
+                thumbnail_url: Some(artwork.clone()),
+                thumbnail_dimensions: Some((1200, 1200)),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(180, 54)).unwrap();
+        let mut hit_map = HitMap::default();
+        let mut thumbnails = MockThumbnailRenderer {
+            enabled: true,
+            rendered_artwork: true,
+            prepared_artwork_size: Some(Size::new(18, 8)),
+            ..MockThumbnailRenderer::default()
+        };
+        terminal
+            .draw(|frame| {
+                render_frame(
+                    frame,
+                    &view,
+                    &UiSettings::default(),
+                    &mut hit_map,
+                    Some(&mut thumbnails),
+                );
+            })
+            .unwrap();
+        let rendered = rendered_text(&terminal);
+        for expected in [
+            "Favourites: 42",
+            "Downloads: 1,234",
+            "Uploaded: 2026 September 12",
+            "Comments: 3",
+            "An archival recording with a detailed description.",
+            "[F6] Comments",
+            "[o] original page",
+            webpage,
+            "THUMBNAIL IMAGE",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "Archive Details omitted {expected:?}"
+            );
+        }
+        assert!(!rendered.contains("Likes:"));
+        assert_eq!(thumbnails.synchronized[0].0.as_ref(), Some(&artwork));
+        assert!(hit_map.thumbnail_area.is_some());
+        for expected in [UiAction::OpenVideoComments, UiAction::OpenInBrowser] {
+            let target = hit_map
+                .detail_buttons
+                .iter()
+                .find_map(|(action, target)| (action == &expected).then_some(*target))
+                .expect("Archive action target");
+            assert_eq!(
+                mouse_action(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: target.x,
+                        row: target.y,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    &hit_map,
+                    &view
+                ),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn archive_org_collection_links_show_only_urls_with_exact_hitboxes() {
+        let collections = [
+            (
+                "Community Audio",
+                "https://archive.org/details/opensource_audio",
+            ),
+            ("Audio Library", "https://archive.org/details/audio"),
+        ];
+        let view = ViewModel {
+            screen: Screen::ArchiveOrg,
+            external_opener_available: true,
+            details: Some(DetailView {
+                media_id: Some(MediaId::new(SourceKind::ArchiveOrg, "fixture")),
+                title: "Archive fixture".to_owned(),
+                source: "archive.org".to_owned(),
+                links: collections
+                    .iter()
+                    .map(|(name, url)| DetailLinkView {
+                        prefix: "In collections: ".to_owned(),
+                        label: (*name).to_owned(),
+                        url: (*url).to_owned(),
+                        presentation: DetailLinkPresentation::UrlOnly,
+                        ..DetailLinkView::default()
+                    })
+                    .collect(),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(180, 30)).expect("terminal");
+        let mut hit_map = HitMap::default();
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw Archive collections");
+
+        let rendered = rendered_text(&terminal);
+        assert_eq!(hit_map.detail_links.len(), collections.len());
+        for (index, (name, url)) in collections.iter().enumerate() {
+            let (_, target) = hit_map.detail_links[index];
+            let row_start = target.x - terminal_text_width("In collections: ");
+            let row = (row_start..hit_map.details_panel.right().saturating_sub(1))
+                .map(|x| terminal.backend().buffer()[(x, target.y)].symbol())
+                .collect::<String>();
+            assert_eq!(row.trim_end(), format!("In collections: {url}"));
+            assert!(!rendered.contains(name));
+            assert_eq!(rendered.matches(url).count(), 1);
+            assert_eq!(target.width, terminal_text_width(url));
+            assert_eq!(target.height, 1);
+
+            for column in [target.x, target.right().saturating_sub(1)] {
+                assert_eq!(
+                    mouse_action(
+                        MouseEvent {
+                            kind: MouseEventKind::Down(MouseButton::Left),
+                            column,
+                            row: target.y,
+                            modifiers: KeyModifiers::NONE,
+                        },
+                        &hit_map,
+                        &view,
+                    ),
+                    Some(UiAction::ActivateDetailLink(index))
+                );
+            }
+            for column in [target.x.saturating_sub(1), target.right()] {
+                assert_eq!(
+                    mouse_action(
+                        MouseEvent {
+                            kind: MouseEventKind::Down(MouseButton::Left),
+                            column,
+                            row: target.y,
+                            modifiers: KeyModifiers::NONE,
+                        },
+                        &hit_map,
+                        &view,
+                    ),
+                    Some(UiAction::SetDetailsFocus(true)),
+                    "collection prefixes and trailing spaces must not activate the URL"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "archive-org")]
+    #[test]
+    fn archive_org_search_navigation_download_and_comments_keep_shared_controls() {
+        let mut view = ViewModel {
+            screen: Screen::ArchiveOrg,
+            video_comments_available: true,
+            details: Some(DetailView {
+                media_id: Some(MediaId::new(SourceKind::ArchiveOrg, "fixture")),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        for (key, expected) in [
+            (KeyCode::Char('/'), UiAction::BeginSearch),
+            (KeyCode::Char('j'), UiAction::MoveSelection(1)),
+            (KeyCode::Char('k'), UiAction::MoveSelection(-1)),
+            (KeyCode::Enter, UiAction::ActivateSelection),
+            (KeyCode::Char('d'), UiAction::Download),
+            (KeyCode::Char('o'), UiAction::OpenInBrowser),
+            (KeyCode::F(6), UiAction::OpenVideoComments),
+            (KeyCode::Esc, UiAction::GoBack),
+            (KeyCode::Backspace, UiAction::GoBack),
+        ] {
+            assert_eq!(
+                key_action(KeyEvent::new(key, KeyModifiers::NONE), &view),
+                Some(expected)
+            );
+        }
+        for (key, offset) in [(KeyCode::PageUp, -6), (KeyCode::PageDown, 6)] {
+            assert_eq!(
+                key_action_with_page_rows(
+                    KeyEvent::new(key, KeyModifiers::NONE),
+                    &view,
+                    Some(6),
+                    None,
+                ),
+                Some(UiAction::MoveSelection(offset))
+            );
+        }
+        let help = search_kind_help(&view);
+        for expected in [
+            "/ search",
+            "Enter open/play",
+            "d download",
+            "F6 comments",
+            "Esc back",
+        ] {
+            assert!(help.contains(expected));
+        }
+        view.search_editing = true;
+        view.search_query = "archival music".to_owned();
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &view),
+            Some(UiAction::SubmitSearch)
+        );
+    }
+
+    #[test]
+    fn archive_org_comments_popup_preserves_source_without_inventing_review_likes() {
+        let view = ViewModel {
+            video_comments_popup: Some(VideoCommentsPopupView {
+                source: SourceKind::ArchiveOrg,
+                video_id: "fixture".to_owned(),
+                video_title: "Archive fixture".to_owned(),
+                state: VideoCommentsPopupState::Ready,
+                comments: vec![VideoCommentView {
+                    author_name: "Archive reviewer".to_owned(),
+                    published: Some("2026 September 12".to_owned()),
+                    text: "A useful public review.".to_owned(),
+                    ..VideoCommentView::default()
+                }],
+                ..VideoCommentsPopupView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut HitMap::default()))
+            .unwrap();
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("archive.org comments"));
+        assert!(rendered.contains("Archive reviewer"));
+        assert!(rendered.contains("2026 September 12"));
+        assert!(rendered.contains("A useful public review."));
+        assert!(!rendered.contains("0 likes"));
+        assert!(!rendered.contains("YouTube comments"));
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE), &view),
+            Some(UiAction::DismissVideoComments)
+        );
+    }
+
     #[test]
     fn librivox_book_details_render_audiobook_metadata_links_and_cover() {
         let cover_url = url::Url::parse("https://archive.org/download/fixture/cover.jpg")
@@ -30092,6 +30670,7 @@ prose 07:25 remains clickable but is not a chapter";
             .collect();
         let view = ViewModel {
             video_comments_popup: Some(VideoCommentsPopupView {
+                source: SourceKind::YouTube,
                 video_id: "dQw4w9WgXcQ".to_owned(),
                 video_title: "Fixture video".to_owned(),
                 state: VideoCommentsPopupState::Ready,
@@ -31405,6 +31984,8 @@ prose 07:25 remains clickable but is not a chapter";
                 Screen::Bandcamp,
                 #[cfg(feature = "apple-podcasts")]
                 Screen::ApplePodcasts,
+                #[cfg(feature = "archive-org")]
+                Screen::ArchiveOrg,
                 #[cfg(feature = "librivox")]
                 Screen::LibriVox,
                 #[cfg(feature = "radio")]
@@ -31597,6 +32178,46 @@ prose 07:25 remains clickable but is not a chapter";
     }
 
     #[test]
+    fn archive_org_tab_is_feature_gated_before_librivox() {
+        let archive_index = Screen::ALL
+            .iter()
+            .position(|screen| screen.label() == "archive.org")
+            .expect("archive.org tab");
+        let archive = Screen::ALL[archive_index];
+        assert_eq!(Screen::ALL[archive_index + 1], Screen::LibriVox);
+        assert_eq!(archive.compact_label(), "archive.org");
+        assert_eq!(archive.enabled(), cfg!(feature = "archive-org"));
+        assert_eq!(archive.details_kind(), InformationPanelKind::Generic);
+        assert_eq!(archive.search_verb(), Some("Search"));
+    }
+
+    #[test]
+    fn archive_org_comments_reuse_f6_for_supported_media() {
+        let mut view = ViewModel {
+            screen: Screen::ArchiveOrg,
+            // Archive comments are independent of the configured YouTube backend.
+            video_comments_available: false,
+            details: Some(DetailView {
+                media_id: Some(MediaId::new(SourceKind::ArchiveOrg, "fixture-item")),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE), &view),
+            cfg!(feature = "archive-org").then_some(UiAction::OpenVideoComments)
+        );
+        for screen in [Screen::History, Screen::Playlists, Screen::Search] {
+            view.screen = screen;
+            assert_eq!(
+                key_action(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE), &view),
+                None,
+                "off-tab Archive state cannot supply this selection's comments"
+            );
+        }
+    }
+
+    #[test]
     fn source_tabs_use_space_saving_labels_and_keep_librivox_order() {
         assert_eq!(Screen::Search.label(), "YT");
         assert_eq!(Screen::Search.compact_label(), "YT");
@@ -31610,7 +32231,8 @@ prose 07:25 remains clickable but is not a chapter";
             .iter()
             .position(|screen| *screen == Screen::LibriVox)
             .expect("LibriVox tab");
-        assert_eq!(Screen::ALL[librivox_index - 1], Screen::ApplePodcasts);
+        assert_eq!(Screen::ALL[librivox_index - 1], Screen::ArchiveOrg);
+        assert_eq!(Screen::ALL[librivox_index - 2], Screen::ApplePodcasts);
         assert_eq!(Screen::ALL[librivox_index + 1], Screen::Radio);
         assert_eq!(SourceKind::YouTube.to_string(), "youtube");
     }

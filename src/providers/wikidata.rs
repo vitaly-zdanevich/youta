@@ -74,6 +74,9 @@ pub enum WikidataExternalKind {
     YandexMusicAlbum,
     /// LibriVox author ID, represented by Wikidata property P1899.
     LibriVoxAuthor,
+    /// Internet Archive item ID (P724), also matched through exact item URLs
+    /// in URL-valued direct statements, including described at URL (P973).
+    ArchiveOrg,
 }
 
 impl WikidataExternalKind {
@@ -91,6 +94,7 @@ impl WikidataExternalKind {
             Self::YandexMusicArtist => "P1553",
             Self::YandexMusicAlbum => "P2819",
             Self::LibriVoxAuthor => "P1899",
+            Self::ArchiveOrg => "P724",
         }
     }
 
@@ -112,6 +116,7 @@ impl WikidataExternalKind {
             Self::YandexMusicArtist => "Yandex Music artist ID",
             Self::YandexMusicAlbum => "Yandex Music release ID",
             Self::LibriVoxAuthor => "LibriVox author ID",
+            Self::ArchiveOrg => "Internet Archive ID",
         }
     }
 }
@@ -308,6 +313,10 @@ impl WikidataProvider {
 
     /// Looks up items whose exact external identifier matches the selected
     /// media or channel property.
+    ///
+    /// Internet Archive items additionally match their canonical details URL
+    /// in any URL-valued direct statement, without searching unrelated text,
+    /// references, or qualifiers.
     ///
     /// # Errors
     ///
@@ -576,6 +585,24 @@ fn validate_external_id(
                 ))
             }
         }
+        WikidataExternalKind::ArchiveOrg => {
+            // Match P724's bounded format without admitting URL delimiters or
+            // SPARQL syntax. An initial @ also permits Archive.org account IDs.
+            let valid = (1..=100).contains(&external_id.len())
+                && external_id.bytes().enumerate().all(|(index, byte)| {
+                    byte.is_ascii_alphanumeric()
+                        || (index == 0 && byte == b'@')
+                        || (index > 0 && matches!(byte, b'.' | b'_' | b'-'))
+                });
+            if valid {
+                Ok(())
+            } else {
+                Err(ProviderError::InvalidRequest(
+                    "Internet Archive ID must be 1–100 ASCII characters: an initial letter, digit, or @ followed by letters, digits, dots, underscores, or dashes"
+                        .to_owned(),
+                ))
+            }
+        }
     }
 }
 
@@ -675,8 +702,11 @@ fn build_query_url(kind: WikidataExternalKind, external_id: &str) -> Result<Url,
     } else {
         format!(r#""{external_id}""#)
     };
-    let query = format!(
-        r#"SELECT ?item ?itemLabel ?itemDescription WHERE {{
+    let query = if kind == WikidataExternalKind::ArchiveOrg {
+        build_archive_org_query(external_id)?
+    } else {
+        format!(
+            r#"SELECT ?item ?itemLabel ?itemDescription WHERE {{
   VALUES ?externalId {{ {identifiers} }}
   ?item wdt:{} ?externalId .
   SERVICE wikibase:label {{
@@ -684,14 +714,46 @@ fn build_query_url(kind: WikidataExternalKind, external_id: &str) -> Result<Url,
   }}
 }}
 LIMIT {MAX_RESULTS}"#,
-        kind.property_id()
-    );
+            kind.property_id()
+        )
+    };
     let mut url =
         Url::parse(ENDPOINT).map_err(|error| ProviderError::InvalidResponse(error.to_string()))?;
     url.query_pairs_mut()
         .append_pair("query", &query)
         .append_pair("format", "json");
     Ok(url)
+}
+
+/// Matches an exact Archive.org item through P724 or any direct URL property.
+///
+/// The constant URL object keeps the lookup selective; property metadata
+/// admits URL-valued direct statements such as P973 and P953, not references
+/// or qualifiers that may merely cite the item. DISTINCT avoids duplicate
+/// items consuming the result budget when several statements match.
+///
+/// See <https://www.wikidata.org/wiki/Property:P724> and
+/// <https://www.mediawiki.org/wiki/Wikibase/Indexing/RDF_Dump_Format#Properties>.
+fn build_archive_org_query(external_id: &str) -> Result<String, ProviderError> {
+    validate_external_id(WikidataExternalKind::ArchiveOrg, external_id)?;
+    Ok(format!(
+        r#"SELECT DISTINCT ?item ?itemLabel ?itemDescription WHERE {{
+  {{
+    VALUES ?externalId {{ "{external_id}" }}
+    ?item wdt:P724 ?externalId .
+  }}
+  UNION
+  {{
+    ?item ?urlProperty <https://archive.org/details/{external_id}> .
+    ?property wikibase:directClaim ?urlProperty ;
+              wikibase:propertyType wikibase:Url .
+  }}
+  SERVICE wikibase:label {{
+    bd:serviceParam wikibase:language "[AUTO_LANGUAGE],en" .
+  }}
+}}
+LIMIT {MAX_RESULTS}"#
+    ))
 }
 
 /// Builds one injection-safe query for a recording performer or direct artist.
@@ -3050,6 +3112,117 @@ mod tests {
             ));
             assert_eq!(server.finish().len(), 1);
         }
+    }
+
+    #[test]
+    fn archive_org_query_matches_exact_id_and_all_direct_url_properties() {
+        let kind: WikidataExternalKind =
+            serde_json::from_str(r#""archive-org""#).expect("Archive.org lookup kind");
+        assert_eq!(kind.property_id(), "P724");
+        assert_eq!(kind.property_label(), "Internet Archive ID");
+        assert_eq!(
+            serde_json::to_string(&kind).expect("serialized kind"),
+            r#""archive-org""#
+        );
+
+        let url = build_query_url(kind, "Public_Audio-1.0").expect("Archive.org query URL");
+        let query = url
+            .query_pairs()
+            .find(|(key, _)| key == "query")
+            .map(|(_, value)| value.into_owned())
+            .expect("SPARQL query");
+        assert!(query.contains("SELECT DISTINCT ?item ?itemLabel ?itemDescription"));
+        assert!(query.contains("VALUES ?externalId { \"Public_Audio-1.0\" }"));
+        assert!(query.contains("?item wdt:P724 ?externalId ."));
+        assert!(query.contains("UNION"));
+        assert!(
+            query.contains("?item ?urlProperty <https://archive.org/details/Public_Audio-1.0> .")
+        );
+        assert!(query.contains("?property wikibase:directClaim ?urlProperty"));
+        assert!(query.contains("wikibase:propertyType wikibase:Url"));
+        assert!(query.contains("LIMIT 20"));
+        assert!(
+            !query.contains("wdt:P973"),
+            "URL lookup must not be limited to P973"
+        );
+        assert!(!query.contains("CONTAINS("));
+        assert!(!query.contains("REGEX("));
+    }
+
+    #[test]
+    fn archive_org_identifiers_are_bounded_exact_and_injection_safe() {
+        let kind: WikidataExternalKind =
+            serde_json::from_str(r#""archive-org""#).expect("Archive.org lookup kind");
+        for valid in [
+            "a",
+            "0",
+            "Public_Audio-1.0",
+            "@public_account",
+            &"a".repeat(100),
+        ] {
+            assert!(
+                validate_external_id(kind, valid).is_ok(),
+                "rejected {valid:?}"
+            );
+        }
+        let provider = WikidataProvider::new();
+        for invalid in [
+            "",
+            ".",
+            "..",
+            "_audio",
+            "-audio",
+            " audio",
+            "audio ",
+            "audio/file",
+            "audio%2Ffile",
+            "audio?part=1",
+            "audio#part",
+            "audio@account",
+            "café",
+            "audio\n",
+            "audio\" } UNION { ?item ?p ?v } #",
+            "audio> . ?item ?p ?v . <x",
+            "https://archive.org/details/audio",
+            &"a".repeat(101),
+        ] {
+            assert!(
+                matches!(
+                    provider.lookup_external(kind, invalid),
+                    Err(ProviderError::InvalidRequest(_))
+                ),
+                "invalid Archive.org identifier must fail before network access: {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn archive_org_fixture_preserves_lookup_identity_and_deduplicates_items() {
+        let kind: WikidataExternalKind =
+            serde_json::from_str(r#""archive-org""#).expect("Archive.org lookup kind");
+        let binding = serde_json::json!({
+            "item": {"type": "uri", "value": "http://www.wikidata.org/entity/Q42"},
+            "itemLabel": {"type": "literal", "value": "Public recording"},
+            "itemDescription": {"type": "literal", "value": "An archived recording"}
+        });
+        let response = serde_json::from_value(serde_json::json!({
+            "results": {"bindings": [binding.clone(), binding]}
+        }))
+        .expect("Archive.org fixture");
+        let lookup = normalize_response(kind, "Public_Audio-1.0", response).expect("lookup");
+        assert_eq!(lookup.kind, kind);
+        assert_eq!(lookup.external_id, "Public_Audio-1.0");
+        assert_eq!(lookup.items.len(), 1);
+        assert_eq!(lookup.items[0].item_id, "Q42");
+        assert_eq!(lookup.items[0].label, "Public recording");
+        assert_eq!(
+            lookup.items[0].description.as_deref(),
+            Some("An archived recording")
+        );
+        assert_eq!(
+            lookup.items[0].url.as_str(),
+            "https://www.wikidata.org/wiki/Q42"
+        );
     }
 
     #[test]

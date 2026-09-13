@@ -13,6 +13,8 @@ use url::Url;
 
 #[cfg(feature = "apple-podcasts")]
 pub mod apple_podcasts;
+#[cfg(feature = "archive-org")]
+pub mod archive_org;
 #[cfg(feature = "bandcamp")]
 pub mod bandcamp;
 #[cfg(feature = "bbc-radio")]

@@ -39,9 +39,7 @@ use crate::config::WikimediaCommonsAuthMethod;
 use crate::config::{
     BandcampAudioFormat, SubscriptionsLayout, VideoSummaryBackend, YouTubeThumbnailSize,
 };
-#[cfg(any(feature = "lan-sharing", test))]
-use crate::domain::SourceKind;
-use crate::domain::{Chapter, MediaId, MediaKind};
+use crate::domain::{Chapter, MediaId, MediaKind, SourceKind};
 #[cfg(feature = "evernote")]
 use crate::evernote::EvernoteNoteDraft;
 use crate::playback::PlaybackStatus;
@@ -101,6 +99,8 @@ pub enum Screen {
     Bandcamp,
     /// Podcast-show discovery through Apple's public catalogue.
     ApplePodcasts,
+    /// Public audio discovery through archive.org.
+    ArchiveOrg,
     /// Public-domain audiobook discovery through `LibriVox`.
     LibriVox,
     /// Curated public live-radio stations.
@@ -124,12 +124,14 @@ pub enum Screen {
 }
 
 impl Screen {
-    pub const ALL: [Self; 15] = [
+    /// Stable ordering shared by the terminal, desktop tabs, and native menus.
+    pub const ALL: [Self; 16] = [
         Self::Search,
         Self::YouTubeMusic,
         Self::YandexMusic,
         Self::Bandcamp,
         Self::ApplePodcasts,
+        Self::ArchiveOrg,
         Self::LibriVox,
         Self::Radio,
         Self::TrackerMusic,
@@ -149,6 +151,7 @@ impl Screen {
             Self::YandexMusic => cfg!(feature = "yandex-music"),
             Self::Bandcamp => cfg!(feature = "bandcamp"),
             Self::ApplePodcasts => cfg!(feature = "apple-podcasts"),
+            Self::ArchiveOrg => cfg!(feature = "archive-org"),
             Self::LibriVox => cfg!(feature = "librivox"),
             Self::Radio => cfg!(feature = "radio"),
             Self::Web => cfg!(feature = "web-browser"),
@@ -179,7 +182,7 @@ impl Screen {
             Self::LibriVox => InformationPanelKind::Audiobook,
             Self::Radio => InformationPanelKind::Radio,
             Self::YandexMusic => InformationPanelKind::YandexMusic,
-            Self::Bandcamp | Self::Web | Self::Playlists | Self::History => {
+            Self::Bandcamp | Self::ArchiveOrg | Self::Web | Self::Playlists | Self::History => {
                 InformationPanelKind::Generic
             }
             _ => InformationPanelKind::Video,
@@ -202,6 +205,7 @@ impl Screen {
             | Self::YandexMusic
             | Self::Bandcamp
             | Self::ApplePodcasts
+            | Self::ArchiveOrg
             | Self::LibriVox
             | Self::TrackerMusic => Some("Search"),
             Self::Radio => Some("Filter"),
@@ -223,6 +227,7 @@ impl Screen {
             Self::YandexMusic => "YandexMusic",
             Self::Bandcamp => "Bandcamp",
             Self::ApplePodcasts => "Apple Podcasts",
+            Self::ArchiveOrg => "archive.org",
             Self::LibriVox => "LibriVox",
             Self::Radio => "Radio",
             Self::TrackerMusic => "MOD",
@@ -245,6 +250,7 @@ impl Screen {
             Self::YandexMusic => "Yandex",
             Self::Bandcamp => "Bandcamp",
             Self::ApplePodcasts => "Apple",
+            Self::ArchiveOrg => "archive.org",
             Self::LibriVox => "LibriVox",
             Self::Radio => "Radio",
             Self::TrackerMusic => "MOD",
@@ -523,6 +529,8 @@ pub enum SearchActivity {
     Bandcamp,
     /// A show search through Apple's public podcast catalogue.
     ApplePodcasts,
+    /// A public audio search through archive.org.
+    ArchiveOrg,
     /// A public-domain audiobook search through `LibriVox`.
     LibriVox,
     /// An aggregate search through the enabled MOD/tracker archives.
@@ -541,6 +549,7 @@ impl SearchActivity {
             Self::YandexMusic => Screen::YandexMusic,
             Self::Bandcamp => Screen::Bandcamp,
             Self::ApplePodcasts => Screen::ApplePodcasts,
+            Self::ArchiveOrg => Screen::ArchiveOrg,
             Self::LibriVox => Screen::LibriVox,
             Self::TrackerArchives => Screen::TrackerMusic,
             Self::Web => Screen::Web,
@@ -675,7 +684,7 @@ pub enum InformationPanelKind {
     YandexMusic,
     /// Local folder, media, or image metadata without remote statistics.
     Local,
-    /// Persisted or aggregate rows without source-specific remote statistics.
+    /// Source-neutral media details and aggregate rows.
     Generic,
 }
 
@@ -727,13 +736,13 @@ pub struct DetailView {
     pub timecodes: Vec<DetailTimecodeView>,
     /// Parsed `YouTube` video URLs that may replace Details internally.
     pub video_links: Vec<DetailVideoLinkView>,
-    /// Public like count, formatted by the provider.
+    /// Public like or archive.org favourite count, formatted by the provider.
     pub likes: String,
     /// Public view count, formatted by the provider.
     pub views: String,
     /// Public top-level comment count, formatted by the provider.
     pub comments: String,
-    /// Publication date.
+    /// Publication date, or upload date for archive.org items.
     pub published: String,
     /// Provider-reported license.
     pub license: String,
@@ -1674,12 +1683,14 @@ pub enum VideoCommentsPopupState {
     Error(String),
 }
 
-/// Scrollable public comments for one exact selected YouTube video.
+/// Scrollable public comments for one exact provider-qualified media item.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct VideoCommentsPopupView {
-    /// Stable provider video identifier that owns this popup.
+    /// Provider that owns the item and determines the comment metadata labels.
+    pub source: SourceKind,
+    /// Stable provider item identifier that owns this popup.
     pub video_id: String,
-    /// Human-readable selected video title.
+    /// Human-readable selected item title.
     pub video_title: String,
     /// Explicit request/result state.
     pub state: VideoCommentsPopupState,
@@ -2320,7 +2331,8 @@ pub struct ViewModel {
     /// Searchable transcript popup for one exact selected video.
     #[cfg(feature = "youtube-captions")]
     pub youtube_captions_popup: Option<YouTubeCaptionsPopupView>,
-    /// Whether the selected YouTube video supports loading public comments.
+    /// Whether the configured `YouTube` backend supports public comments.
+    /// Other public adapters are checked by `public_comments_available`.
     pub video_comments_available: bool,
     /// Scrollable bounded public-comments popup.
     pub video_comments_popup: Option<VideoCommentsPopupView>,
@@ -2383,6 +2395,7 @@ pub struct ViewModel {
         serialize_with = "serialize_evernote_credentials_editor"
     )]
     pub evernote_credentials_popup: Option<EvernoteCredentialsPopupView>,
+
     /// Focused RSS/Atom podcast-subscription editor.
     // Redacted: this editor holds a credential or private text, so only the one
     // bit saying it is open crosses. See the module header.
@@ -2423,6 +2436,21 @@ pub struct ViewModel {
 }
 
 impl ViewModel {
+    /// Whether the selection belongs to an implemented public-comments adapter.
+    #[must_use]
+    pub fn public_comments_available(&self) -> bool {
+        self.details
+            .as_ref()
+            .and_then(|details| details.media_id.as_ref())
+            .is_some_and(|media_id| match media_id.source {
+                SourceKind::YouTube => self.video_comments_available,
+                SourceKind::ArchiveOrg => {
+                    cfg!(feature = "archive-org") && self.screen == Screen::ArchiveOrg
+                }
+                _ => false,
+            })
+    }
+
     /// Allows local subscription changes only for channel entities.
     ///
     /// Videos carry their parent's channel ID too, but their media ID
@@ -2620,6 +2648,7 @@ impl Default for ViewModel {
             evernote_popup: None,
             #[cfg(feature = "evernote")]
             evernote_credentials_popup: None,
+
             rss_subscription_popup: None,
             preferences_popup: None,
             playlist_popup: None,
@@ -2928,6 +2957,7 @@ pub enum UiAction {
     /// Cancel the sole active supervised download.
     #[cfg(feature = "yt-dlp")]
     CancelDownload,
+
     /// Open the selected `YouTube`, Yandex Music, or Apple Podcasts Commons review.
     #[cfg(feature = "commons-upload")]
     OpenCommonsUpload,
@@ -3058,7 +3088,7 @@ pub enum UiAction {
     OpenYtDlpProject,
     /// Open Gentoo's yt-dlp package page from its specialized 403 popup.
     OpenGentooYtDlpPackage,
-    /// Open public top-level comments for the selected YouTube video.
+    /// Open bounded public comments for the selected provider item.
     OpenVideoComments,
     /// Set the exact wrapped-line offset in the public-comments popup.
     SetVideoCommentsScroll(usize),
@@ -3528,7 +3558,7 @@ mod tests {
             .iter()
             .position(|screen| *screen == Screen::Local)
             .unwrap();
-        assert_eq!(Screen::ALL.len(), 15);
+        assert_eq!(Screen::ALL.len(), 16);
         assert_eq!(Screen::ALL[local + 1], Screen::Web);
         assert_eq!(Screen::ALL[local + 2], Screen::Playlists);
         assert_eq!(Screen::Web.label(), "Web");

@@ -300,6 +300,7 @@ export type VideoCommentsPopupState = "Loading" | "Ready" | "Empty" | { Error: s
 
 /** Scrollable public comments for one selected video. */
 export interface VideoCommentsPopupView {
+	source: string;
   video_id: string;
   video_title: string;
   state: VideoCommentsPopupState;
@@ -409,6 +410,7 @@ export interface ProjectHistoryPopupView {
   remote_state: ProjectHistoryRemoteState;
   scroll_offset: number;
 }
+
 
 /** The runtime preferences editor. Values are drafts until it is submitted. */
 export interface PreferencesPopupView {
@@ -718,6 +720,7 @@ export interface EvernoteCredentialsEditorView {
 	token_length: number;
 	validation_failed: boolean;
 }
+
 
 /** The published snapshot. */
 export interface ViewModel {

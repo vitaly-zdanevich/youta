@@ -1,6 +1,6 @@
 [package]
 name = "youta-gui"
-version = "0.59.0"
+version = "0.60.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Desktop front-end for the Youta player, sharing its reducer with the terminal UI"
@@ -26,12 +26,13 @@ include = [
 unsafe_code = "forbid"
 
 [features]
-default = ["ascii-visualizer", "audio-quality", "commons-upload", "custom-protocol", "evernote", "lan-sharing", "local-archives", "nyan-cat", "sponsorblock", "summary", "web-browser", "youtube-captions"]
+default = ["archive-org", "ascii-visualizer", "audio-quality", "commons-upload", "custom-protocol", "evernote", "lan-sharing", "local-archives", "nyan-cat", "sponsorblock", "summary", "web-browser", "youtube-captions"]
 # `cargo install` does not run Tauri's CLI, which otherwise supplies this flag.
 custom-protocol = ["tauri/custom-protocol"]
 # Forward the source package's independently removable capabilities. Release
 # and ordinary GUI builds retain them through this crate's defaults;
 # distributors can disable both layers with `--no-default-features`.
+archive-org = ["youta/archive-org"]
 ascii-visualizer = ["youta/ascii-visualizer"]
 audio-quality = ["youta/audio-quality"]
 commons-upload = ["youta/commons-upload"]
@@ -50,7 +51,7 @@ youtube-captions = ["youta/youtube-captions"]
 # renderer, so Crossterm and Ratatui never enter this binary.
 # Keep the registry bound synchronized with this release: both front ends use
 # the same reducer/view contract, including across patch releases.
-youta = { version = "=0.59.0", path = "..", default-features = false, features = ["controller", "sources", "remote-artwork", "qr", "yandex-music"] }
+youta = { version = "=0.60.0", path = "..", default-features = false, features = ["controller", "sources", "remote-artwork", "qr", "yandex-music"] }
 
 percent-encoding = "2.3"
 serde = { version = "1.0", features = ["derive"] }

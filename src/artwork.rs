@@ -558,8 +558,57 @@ pub(crate) fn fetch_thumbnail_with_policy(
     if !is_safe_remote_thumbnail_source(source, allow_non_public_test_source) {
         return Err(ThumbnailFailure::InvalidSource);
     }
-    let deadline = Instant::now() + REQUEST_TIMEOUT;
+    fetch_remote_thumbnail_with_fallback(agent, source, Instant::now(), REQUEST_TIMEOUT)
+}
+
+/// Gives the full image four fifths of one deadline, reserving time for its tile.
+///
+/// Only the exact Archive waveform route enables fallback. Invalid redirect
+/// targets fail closed; transport, status, byte-limit, and format failures can
+/// use the canonical item tile without resetting the redirect or time budget.
+#[cfg(feature = "remote-artwork")]
+fn fetch_remote_thumbnail_with_fallback(
+    agent: &ureq::Agent,
+    source: &Url,
+    started: Instant,
+    timeout: Duration,
+) -> Result<Vec<u8>, ThumbnailFailure> {
+    let deadline = started
+        .checked_add(timeout)
+        .ok_or(ThumbnailFailure::DownloadFailed)?;
+    let fallback = archive_iiif_thumbnail_fallback(source);
+    let primary_deadline = if fallback.is_some() {
+        started + timeout.saturating_sub(timeout / 5)
+    } else {
+        deadline
+    };
     let mut redirects = 0;
+    let result = fetch_remote_thumbnail(agent, source, primary_deadline, &mut redirects);
+    let Some(fallback) = fallback else {
+        return result;
+    };
+    match result {
+        Ok(bytes) if ArtworkFormat::sniff(&bytes).is_some() => Ok(bytes),
+        Err(ThumbnailFailure::InvalidSource) => Err(ThumbnailFailure::InvalidSource),
+        _ => {
+            let bytes = fetch_remote_thumbnail(agent, &fallback, deadline, &mut redirects)?;
+            if ArtworkFormat::sniff(&bytes).is_some() {
+                Ok(bytes)
+            } else {
+                Err(ThumbnailFailure::UnsupportedFormat)
+            }
+        }
+    }
+}
+
+/// Fetches one remote image with an operation-wide deadline and redirect count.
+#[cfg(feature = "remote-artwork")]
+fn fetch_remote_thumbnail(
+    agent: &ureq::Agent,
+    source: &Url,
+    deadline: Instant,
+    redirects: &mut usize,
+) -> Result<Vec<u8>, ThumbnailFailure> {
     let mut current = source.clone();
     let mut response = loop {
         let remaining = deadline
@@ -582,7 +631,7 @@ pub(crate) fn fetch_thumbnail_with_policy(
             break response;
         }
         if !matches!(status, 301 | 302 | 303 | 307 | 308)
-            || redirects == MAX_ARCHIVE_ARTWORK_REDIRECTS
+            || *redirects == MAX_ARCHIVE_ARTWORK_REDIRECTS
             || !is_archive_artwork_redirect_url(&current)
         {
             return Err(ThumbnailFailure::DownloadFailed);
@@ -602,7 +651,7 @@ pub(crate) fn fetch_thumbnail_with_policy(
             return Err(ThumbnailFailure::InvalidSource);
         }
         current = target;
-        redirects += 1;
+        *redirects += 1;
     };
     if response
         .body()
@@ -629,6 +678,77 @@ pub(crate) fn fetch_thumbnail_with_policy(
     }
 }
 
+/// Derives a tile only from the canonical, single-encoded PNG waveform route.
+///
+/// The decoded identifier is bounded ASCII and never a remote URL. Filenames
+/// reject traversal, controls, ambiguous separators, and further percent
+/// escapes before the entire route is re-encoded and compared exactly.
+#[cfg(feature = "remote-artwork")]
+fn archive_iiif_thumbnail_fallback(source: &Url) -> Option<Url> {
+    if source.host_str() != Some("iiif.archive.org") || !is_archive_artwork_redirect_url(source) {
+        return None;
+    }
+    let encoded = source
+        .path()
+        .strip_prefix("/image/iiif/3/")?
+        .strip_suffix("/full/max/0/default.jpg")?;
+    if encoded.contains('/') {
+        return None;
+    }
+    let mut decoded = Vec::with_capacity(encoded.len());
+    let mut bytes = encoded.bytes();
+    while let Some(byte) = bytes.next() {
+        decoded.push(if byte == b'%' {
+            let high = char::from(bytes.next()?).to_digit(16)?;
+            let low = char::from(bytes.next()?).to_digit(16)?;
+            u8::try_from(high * 16 + low).ok()?
+        } else {
+            byte
+        });
+    }
+    let decoded = String::from_utf8(decoded).ok()?;
+    let (identifier, filename) = decoded.split_once('/')?;
+    if identifier.is_empty()
+        || identifier.len() > 100
+        || !(identifier.as_bytes()[0].is_ascii_alphanumeric() || identifier.as_bytes()[0] == b'@')
+        || !identifier
+            .bytes()
+            .skip(1)
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+        || filename.is_empty()
+        || filename.len() > 2048
+        || filename.contains(['\\', '%'])
+        || filename.chars().any(char::is_control)
+        || filename.split('/').count() > 32
+        || filename
+            .split('/')
+            .any(|part| matches!(part, "" | "." | ".."))
+        || !filename.rsplit_once('.')?.1.eq_ignore_ascii_case("png")
+    {
+        return None;
+    }
+    let mut canonical = Url::parse("https://iiif.archive.org/").ok()?;
+    canonical.path_segments_mut().ok()?.clear().extend([
+        "image",
+        "iiif",
+        "3",
+        &decoded,
+        "full",
+        "max",
+        "0",
+        "default.jpg",
+    ]);
+    if canonical != *source {
+        return None;
+    }
+    let mut fallback = Url::parse("https://archive.org/").ok()?;
+    fallback
+        .path_segments_mut()
+        .ok()?
+        .clear()
+        .extend(["services", "img", identifier]);
+    Some(fallback)
+}
 /// Admits only credential-free HTTPS URLs on Internet Archive's own domains.
 ///
 /// Covers commonly redirect from archive.org/download to a geographic CDN
@@ -918,6 +1038,296 @@ mod public_surface_tests {
         (agent, calls)
     }
 
+    /// A failed full-resolution waveform uses the same item's bounded image tile.
+    #[test]
+    fn archive_iiif_waveform_failures_fall_back_to_the_item_tile() {
+        let source = Url::parse("https://iiif.archive.org/image/iiif/3/public_book%2Fchapter.png/full/max/0/default.jpg").expect("waveform URL");
+        let fallback = "https://archive.org/services/img/public_book";
+        let image = b"\xFF\xD8\xFFtile";
+        for (status, body) in [
+            (404, Vec::new()),
+            (503, Vec::new()),
+            (200, b"<!doctype html>not an image".to_vec()),
+            (200, vec![0; super::MAX_DOWNLOAD_BYTES + 1]),
+        ] {
+            let (agent, calls) = scripted_thumbnail_agent(vec![
+                (source.as_str(), status, None, body),
+                (fallback, 200, None, image.to_vec()),
+            ]);
+            assert_eq!(super::fetch_thumbnail(&agent, &source), Ok(image.to_vec()));
+            assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+        }
+    }
+
+    /// Successful full-resolution images are not replaced or fetched twice.
+    #[test]
+    fn archive_iiif_waveform_success_does_not_request_a_fallback() {
+        let source = Url::parse("https://iiif.archive.org/image/iiif/3/public_book%2Fchapter.png/full/max/0/default.jpg").expect("waveform URL");
+        let image = b"\xFF\xD8\xFFwaveform";
+        let (agent, calls) =
+            scripted_thumbnail_agent(vec![(source.as_str(), 200, None, image.to_vec())]);
+        assert_eq!(super::fetch_thumbnail(&agent, &source), Ok(image.to_vec()));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    /// URL lookalikes, other IIIF modes, and ambiguous paths cannot enable fallback.
+    #[test]
+    fn archive_iiif_waveform_fallback_requires_the_exact_safe_route() {
+        for raw in [
+            "http://iiif.archive.org/image/iiif/3/book%2Fa.png/full/max/0/default.jpg",
+            "https://iiif.archive.org.evil.test/image/iiif/3/book%2Fa.png/full/max/0/default.jpg",
+            "https://archive.org/image/iiif/3/book%2Fa.png/full/max/0/default.jpg",
+            "https://iiif.archive.org:8443/image/iiif/3/book%2Fa.png/full/max/0/default.jpg",
+            "https://user:password@iiif.archive.org/image/iiif/3/book%2Fa.png/full/max/0/default.jpg",
+            "https://iiif.archive.org/image/iiif/3/book%2Fa.png/full/max/0/default.jpg?download=1",
+            "https://iiif.archive.org/image/iiif/3/book%2Fa.png/full/max/0/default.jpg#image",
+            "https://iiif.archive.org/image/iiif/2/book%2Fa.png/full/max/0/default.jpg",
+            "https://iiif.archive.org/image/iiif/3/book%2Fa.png/full/!1024,1024/0/default.jpg",
+            "https://iiif.archive.org/image/iiif/3/book/a.png/full/max/0/default.jpg",
+            "https://iiif.archive.org/image/iiif/3/book%2F..%2Fa.png/full/max/0/default.jpg",
+            "https://iiif.archive.org/image/iiif/3/book%2F.%2Fa.png/full/max/0/default.jpg",
+            "https://iiif.archive.org/image/iiif/3/book%2F%2Fa.png/full/max/0/default.jpg",
+            "https://iiif.archive.org/image/iiif/3/book%2Fa%5Cb.png/full/max/0/default.jpg",
+            "https://iiif.archive.org/image/iiif/3/book%252Fa.png/full/max/0/default.jpg",
+            "https://iiif.archive.org/image/iiif/3/book%2F%252e%252e%252Fa.png/full/max/0/default.jpg",
+            "https://iiif.archive.org/image/iiif/3/book%2Fa%00.png/full/max/0/default.jpg",
+            "https://iiif.archive.org/image/iiif/3/book%2Fa%FF.png/full/max/0/default.jpg",
+            "https://iiif.archive.org/image/iiif/3/book%2Fa%GG.png/full/max/0/default.jpg",
+            "https://iiif.archive.org/image/iiif/3/book%2Fa.jpg/full/max/0/default.jpg",
+            "https://iiif.archive.org/image/iiif/3/.book%2Fa.png/full/max/0/default.jpg",
+        ] {
+            let source = Url::parse(raw).expect("URL fixture");
+            let mut requested = source.clone();
+            requested.set_fragment(None);
+            let (agent, calls) =
+                scripted_thumbnail_agent(vec![(requested.as_str(), 404, None, Vec::new())]);
+            assert!(super::fetch_thumbnail(&agent, &source).is_err(), "{raw}");
+            assert!(
+                calls.load(std::sync::atomic::Ordering::Relaxed) <= 1,
+                "{raw}"
+            );
+        }
+    }
+
+    /// A failed IIIF redirect never grants permission to request a private host.
+    #[test]
+    fn archive_iiif_waveform_unsafe_redirect_remains_fail_closed() {
+        let source =
+            Url::parse("https://iiif.archive.org/image/iiif/3/book%2Fa.png/full/max/0/default.jpg")
+                .expect("waveform URL");
+        let (agent, calls) = scripted_thumbnail_agent(vec![(
+            source.as_str(),
+            302,
+            Some("https://127.0.0.1/private.png"),
+            Vec::new(),
+        )]);
+        assert_eq!(
+            super::fetch_thumbnail(&agent, &source),
+            Err(ThumbnailFailure::InvalidSource)
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    /// Fallback does not relax the image format or per-response download limit.
+    #[test]
+    fn archive_iiif_waveform_fallback_keeps_response_guards() {
+        let source =
+            Url::parse("https://iiif.archive.org/image/iiif/3/book%2Fa.png/full/max/0/default.jpg")
+                .expect("waveform URL");
+        let fallback = "https://archive.org/services/img/book";
+        for (body, expected) in [
+            (
+                vec![0; super::MAX_DOWNLOAD_BYTES + 1],
+                ThumbnailFailure::ResponseTooLarge,
+            ),
+            (
+                b"<html>missing</html>".to_vec(),
+                ThumbnailFailure::UnsupportedFormat,
+            ),
+        ] {
+            let (agent, calls) = scripted_thumbnail_agent(vec![
+                (source.as_str(), 404, None, Vec::new()),
+                (fallback, 200, None, body),
+            ]);
+            assert_eq!(super::fetch_thumbnail(&agent, &source), Err(expected));
+            assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+        }
+    }
+
+    /// Initial and fallback requests share one redirect allowance.
+    #[test]
+    fn archive_iiif_waveform_fallback_shares_the_redirect_limit() {
+        let source =
+            Url::parse("https://iiif.archive.org/image/iiif/3/book%2Fa.png/full/max/0/default.jpg")
+                .expect("waveform URL");
+        let fallback = "https://archive.org/services/img/book";
+        let (agent, calls) = scripted_thumbnail_agent(vec![
+            (
+                source.as_str(),
+                302,
+                Some("https://cdn.archive.org/full.jpg"),
+                Vec::new(),
+            ),
+            ("https://cdn.archive.org/full.jpg", 404, None, Vec::new()),
+            (
+                fallback,
+                302,
+                Some("https://cdn.archive.org/tile.jpg"),
+                Vec::new(),
+            ),
+            (
+                "https://cdn.archive.org/tile.jpg",
+                302,
+                Some("https://cdn.archive.org/tile2.jpg"),
+                Vec::new(),
+            ),
+            (
+                "https://cdn.archive.org/tile2.jpg",
+                302,
+                Some("https://cdn.archive.org/tile3.jpg"),
+                Vec::new(),
+            ),
+        ]);
+        assert_eq!(
+            super::fetch_thumbnail(&agent, &source),
+            Err(ThumbnailFailure::DownloadFailed)
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 5);
+    }
+
+    /// Canonical nested Unicode filenames keep only the validated item identity.
+    #[test]
+    fn archive_iiif_waveform_fallback_decodes_one_safe_path_segment() {
+        let mut source = Url::parse("https://iiif.archive.org/").expect("IIIF origin");
+        source
+            .path_segments_mut()
+            .expect("hierarchical URL")
+            .clear()
+            .extend([
+                "image",
+                "iiif",
+                "3",
+                "public_book/album/ქართული + waveform.PNG",
+                "full",
+                "max",
+                "0",
+                "default.jpg",
+            ]);
+        let fallback = "https://archive.org/services/img/public_book";
+        let image = b"\xFF\xD8\xFFtile";
+        let (agent, calls) = scripted_thumbnail_agent(vec![
+            (source.as_str(), 404, None, Vec::new()),
+            (fallback, 200, None, image.to_vec()),
+        ]);
+        assert_eq!(super::fetch_thumbnail(&agent, &source), Ok(image.to_vec()));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
+    /// An immediate transport timeout can spend the remaining budget on the tile.
+    #[test]
+    fn archive_iiif_waveform_timeout_uses_the_fallback() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let source =
+            Url::parse("https://iiif.archive.org/image/iiif/3/book%2Fa.png/full/max/0/default.jpg")
+                .expect("waveform URL");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let expected = source.to_string();
+        let image = b"\xFF\xD8\xFFtile";
+        let agent = ureq::Agent::config_builder()
+            .middleware(
+                move |request: ureq::http::Request<ureq::SendBody>,
+                      _next: ureq::middleware::MiddlewareNext| {
+                    match observed.fetch_add(1, Ordering::Relaxed) {
+                        0 => {
+                            assert_eq!(request.uri().to_string(), expected);
+                            Err(ureq::Error::Timeout(ureq::Timeout::Global))
+                        }
+                        1 => {
+                            assert_eq!(
+                                request.uri().to_string(),
+                                "https://archive.org/services/img/book"
+                            );
+                            Ok(ureq::http::Response::builder()
+                                .status(200)
+                                .body(ureq::Body::builder().data(image.to_vec()))
+                                .expect("tile response"))
+                        }
+                        _ => panic!("unexpected artwork request"),
+                    }
+                },
+            )
+            .build()
+            .into();
+        assert_eq!(super::fetch_thumbnail(&agent, &source), Ok(image.to_vec()));
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    /// Neither an initial response nor a fallback body can reset the total deadline.
+    #[test]
+    fn archive_iiif_waveform_fallback_keeps_one_overall_deadline() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+        let source =
+            Url::parse("https://iiif.archive.org/image/iiif/3/book%2Fa.png/full/max/0/default.jpg")
+                .expect("waveform URL");
+        for slow_fallback in [false, true] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&calls);
+            let expected = source.to_string();
+            let agent = ureq::Agent::config_builder()
+                .middleware(
+                    move |request: ureq::http::Request<ureq::SendBody>,
+                          _next: ureq::middleware::MiddlewareNext| {
+                        let index = observed.fetch_add(1, Ordering::Relaxed);
+                        if index == 0 {
+                            assert_eq!(request.uri().to_string(), expected);
+                        } else {
+                            assert_eq!(index, 1, "at most one fallback");
+                            assert_eq!(
+                                request.uri().to_string(),
+                                "https://archive.org/services/img/book"
+                            );
+                        }
+                        if (index == 1) == slow_fallback {
+                            std::thread::sleep(Duration::from_millis(100));
+                        }
+                        Ok(ureq::http::Response::builder()
+                            .status(if index == 0 { 404 } else { 200 })
+                            .body(ureq::Body::builder().data(b"\xFF\xD8\xFFtile".to_vec()))
+                            .expect("timed response"))
+                    },
+                )
+                .build()
+                .into();
+            assert_eq!(
+                super::fetch_remote_thumbnail_with_fallback(
+                    &agent,
+                    &source,
+                    Instant::now(),
+                    Duration::from_millis(50)
+                ),
+                Err(ThumbnailFailure::DownloadFailed),
+            );
+            assert_eq!(
+                calls.load(Ordering::Relaxed),
+                if slow_fallback { 2 } else { 1 }
+            );
+        }
+        let (agent, calls) = scripted_thumbnail_agent(Vec::new());
+        assert_eq!(
+            super::fetch_remote_thumbnail_with_fallback(
+                &agent,
+                &source,
+                Instant::now() - Duration::from_secs(1),
+                Duration::from_millis(50)
+            ),
+            Err(ThumbnailFailure::DownloadFailed),
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+    }
     /// LibriVox's stable cover URL redirects to the Archive.org image CDN.
     #[test]
     fn archive_thumbnail_redirects_fetch_the_cover_for_standard_redirect_statuses() {

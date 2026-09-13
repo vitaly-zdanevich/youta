@@ -245,7 +245,7 @@ Preferences, or `YOUTA_PLAYBACK__YOUTUBE_PREWARM=false`.
 
 `[A] Autoplay` is off by default and persists its state in
 `playback.autoplay`. When enabled, EOF advances through the same YouTube,
-YouTube Music, subscription-channel, Local, Downloaded, playlist, or
+YouTube Music, archive.org, subscription-channel, Local, Downloaded, playlist, or
 MOD/tracker list. Items added with **Play next** or **Add to queue** always run
 first; Youta then resumes the original source list. Replacing a live search
 stops that list's continuation instead of accidentally playing an unrelated
@@ -263,7 +263,7 @@ disabled. Repeat is session-only and starts off each time Youta opens. Manual
 next/previous or stopping playback still works; playback errors are reported,
 not retried indefinitely. Live radio cannot repeat.
 
-When a finite YouTube item finishes with Autoplay and Repeat off and no next
+When a finite YouTube or archive.org item finishes with Autoplay and Repeat off and no next
 queued item, it stays loaded and paused at the end. Left/right arrows and the
 seek bar remain usable without pressing Enter or resolving the audio again.
 Seeking backward from this end pause resumes audio automatically, without
@@ -277,6 +277,9 @@ For example, a YouTube channel's item footer is:
 ```text
 [R] Refresh  [h] Shorts: off  [A] Autoplay: off  [r] Repeat: off
 ```
+
+The archive.org footer also offers `[A] Autoplay: off` followed by
+`[r] Repeat: off`, using the same preferences and end-of-file behavior.
 
 The shared `r` shortcut toggles Repeat outside contexts that assign it another
 action: in Radio it records, and in Local it opens Rename.
@@ -358,6 +361,8 @@ implement the same playback interface without changing screens or history.
   resolves only the selected release for explicit playback through `yt-dlp`;
 - an independent Apple Podcasts tab that searches the public, unauthenticated
   Apple catalogue by storefront and lazily loads playable episode metadata;
+- an archive.org tab for public audio search, item and track browsing, downloads,
+  artwork, provenance, licenses, favourites, and public reviews on F6;
 - an independent LibriVox tab for public-domain audiobook discovery, book and
   author navigation, chapter playback, genres, and public-page keywords;
 - an account-free Radio tab backed by a static, zero-startup-network catalogue
@@ -432,6 +437,41 @@ resolver:
   but Youta never derives downloads from file IDs or framework state and never
   bypasses login, payment, DRM, or signed-link controls. This follows the
   [LitRes public offer](https://www.litres.ru/pages/litres_oferta/).
+- **archive.org**, immediately before LibriVox, searches Internet Archive's
+  public audio and live-music collections without an account. Press `/` to
+  search, Enter to open an item, Enter again to play a track, `d` to download
+  the selected track, and Esc to return to the search results. Autoplay follows
+  the item's track order. Large searches use explicit 50-item continuation
+  pages, with at most 1,000 results retained per search.
+
+  Details show artwork, description, uploader/profile, upload date, topics,
+  language, whole-item size, license, favourites, and links to the original
+  item and its collections when supplied by Archive.org. The content date is
+  kept separate from the upload date. F6 opens up to twenty public reviews;
+  review stars are not represented as likes. Metadata is fetched lazily on a
+  bounded worker; restricted items and private files are not exposed for playback.
+  Strong legacy Cyrillic encoding errors in track titles are repaired for display
+  using the same conservative handling as local tags. Ambiguous short titles
+  require a matching Cyrillic word in the item's description or title. Original
+  filenames, download addresses, and correctly encoded titles remain unchanged.
+  Missing rights information is omitted, not treated as permission
+  to redistribute. See the [Internet Archive search API](https://archive.org/advancedsearch.php)
+  and [metadata API](https://archive.org/developers/md-read.html).
+
+  Suitable original covers take priority. For items without a cover, Youta can
+  show the selected track's full-size waveform through Archive.org's
+  [official IIIF image service](https://github.com/internetarchive/iiif), rather
+  than enlarging the small item tile. Item previews use the first track's
+  waveform. Image download/decoding limits remain in place, and image-service
+  failures fall back to the small tile within a bounded request deadline.
+
+  The `archive-org` Cargo feature is enabled by default in the TUI and GUI,
+  independently of `app`, `app-core`, and `sources`. A custom
+  `--no-default-features` build can omit it. The
+  [next Gentoo source-release template](packaging/gentoo/README.md) uses
+  default-on `archive-org` USE. Optional Wikidata enrichment matches the exact
+  Internet Archive
+  ID and exact canonical item links, including “described at URL” statements.
 - **LibriVox** is a credential-free first-class source backed by the public
   [LibriVox API](https://librivox.org/api/info). The default tab shows one
   bounded catalogue page, while `/` searches books independently from
@@ -600,6 +640,7 @@ No Wikidata request is made at startup. The current mappings are:
 | Bilibili video | [Bilibili video ID (P6456)](https://www.wikidata.org/wiki/Property:P6456) |
 | Bilibili channel/user | [Bilibili user ID (P6455)](https://www.wikidata.org/wiki/Property:P6455) |
 | LibriVox author | [LibriVox author ID (P1899)](https://www.wikidata.org/wiki/Property:P1899) |
+| Internet Archive item | [Internet Archive ID (P724)](https://www.wikidata.org/wiki/Property:P724), or an exact item URL in a URL-valued property such as [described at URL (P973)](https://www.wikidata.org/wiki/Property:P973) |
 | Fingerprinted local recording | [MusicBrainz recording ID (P4404)](https://www.wikidata.org/wiki/Property:P4404) |
 
 Each response is limited to 512 KiB and 20 matches. Successful lookups are
@@ -708,7 +749,7 @@ dependencies, or the optional Linux virtual-console mouse client with:
 
 ```sh
 cargo build --release --locked --no-default-features \
-	--features app,ascii-visualizer,audio-quality,commons-upload,evernote,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,web-browser,youtube-captions
+	--features app,archive-org,ascii-visualizer,audio-quality,commons-upload,evernote,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,web-browser,youtube-captions
 ```
 
 The `app` profile includes the experimental YandexMusic adapter but does not
@@ -719,7 +760,7 @@ with:
 
 ```sh
 cargo build --release --locked --no-default-features \
-	--features app-core,ascii-visualizer,audio-quality,commons-upload,evernote,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,web-browser,youtube-captions
+	--features app-core,archive-org,ascii-visualizer,audio-quality,commons-upload,evernote,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,web-browser,youtube-captions
 ```
 
 Omit `images` from that command for the Yandex-free text-only variant. Omit
@@ -733,6 +774,7 @@ leave it out of an explicit `--no-default-features` feature list:
 
 | Feature | What it adds |
 | --- | --- |
+| `archive-org` | Internet Archive audio catalogue, metadata, reviews, and track browsing. |
 | `ascii-visualizer` | CAVA capture and fullscreen terminal/desktop spectrum renderers. |
 | `audio-quality` | Local spectral analysis and RustFFT. |
 | `commons-upload` | Commons authentication, upload client, and review UI. |
@@ -1534,7 +1576,10 @@ perform no thumbnail network work. Accepted remote images are limited to
 bounded JPEG, PNG, and WebP input before decoding, which prevents unbounded
 downloads and image allocations. Remote image fetches reject non-public literal
 and DNS-resolved addresses, `.local`, `.internal`, and single-label hosts;
-redirects are not followed. These gates avoid stray escape sequences and reduce
+redirects are rejected except for up to three HTTPS hops within archive.org
+and its storage subdomains, needed for LibriVox and Internet Archive covers.
+Each hop is revalidated and shares the original request deadline.
+These gates avoid stray escape sequences and reduce
 network traffic, decoding work, memory use, heat, and battery consumption.
 
 On that confirmed physical console, Youta also hides external-opener controls
@@ -2086,11 +2131,11 @@ The roadmap is intentionally tiered:
 1. **Core:** local audio/video, RSS and OPML, radio/BBC feeds, official
    YouTube metadata, Invidious, PeerTube, Funkwhale, direct
    Vimeo/RuTube/SoundCloud URLs, Apple Podcasts catalogue search, Bandcamp
-   public track/album discovery and playback, LibriVox public-domain audiobook
+   public track/album discovery and playback, Internet Archive audio, LibriVox public-domain audiobook
    discovery and chapter playback, tracker modules, generic
    `yt-dlp`, `mpv`, and search/history/queue/download state.
 2. **Open-data integrations:** broader DeArrow thumbnail support and Wikidata
-   discovery, Internet Archive, Podcast Index, and
+   discovery, Podcast Index, and
    gpodder.net. Read-only SponsorBlock skipping and labelled DeArrow titles are
    already implemented.
 3. **Authenticated integrations:** YouTube OAuth interactions, including
@@ -2364,6 +2409,24 @@ it links no terminal renderer. It is deliberately left out of the coverage gate:
 measuring it would mean installing the WebKitGTK toolchain on the coverage
 runner to instrument a thin shell over the reducer that gate already covers.
 
+The opt-in browser integration test requires Firefox on `PATH`; set
+`YOUTA_TEST_FIREFOX` to an executable path to select another Firefox installation.
+Build the frontend first, then run the browser check from the repository root:
+
+```sh
+npm --prefix gui/ui ci
+npm --prefix gui/ui run build
+npm --prefix gui/ui run test:browser
+```
+
+This uses a private headless Firefox profile and a loopback-only test server.
+The actual built page receives a mocked native bridge, so Archive search,
+track navigation and EOF/seek snapshots can be checked without
+using the active player, provider services, upload credentials, or real uploads.
+It is not native Tauri/WebKit validation and does not exercise Rust playback;
+those require separate validation. The check skips when Firefox is unavailable
+and is not part of the ordinary frontend test or build command.
+
 Windows amd64 and arm64 are compile-checked in CI. The platform work is done:
 `mpv` is driven over a named pipe rather than a Unix socket, directory
 durability and private-file access ask the platform instead of assuming POSIX,
@@ -2461,6 +2524,7 @@ The source package maps the default-enabled `ascii-visualizer`, `audio-quality`,
 
 | Source package override | What it removes |
 | --- | --- |
+| `USE="-archive-org"` (next release template) | Internet Archive catalogue, metadata, reviews, and track browsing in both frontends. |
 | `USE="-ascii-visualizer"` | CAVA integration, fullscreen rendering, and its Help entry. |
 | `USE="-audio-quality"` | Local analyzer and RustFFT dependency. |
 | `USE="-commons-upload"` | Commons client and review UI. |

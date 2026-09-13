@@ -1,9 +1,9 @@
-//! Keeps a completed `YouTube` item seekable without resolving or loading it again.
+//! Keeps a completed YouTube or Archive item seekable without resolving or loading it again.
 
 use super::{AppController, Duration, MediaKind, PlaybackPhase, PlayerCommand, SourceKind};
 
 impl AppController {
-    /// Retains only a started, finite `YouTube` item with no requested continuation.
+    /// Retains only started, finite YouTube or Archive media without requested continuation.
     ///
     /// Explicit queued entries keep their existing priority even with Autoplay
     /// disabled. A held EOF must not hide a decoder failure before audio starts.
@@ -12,7 +12,7 @@ impl AppController {
             && !self.config.playback.autoplay
             && !self.playback_queue.repeat_one
             && self.current_media.as_ref().is_some_and(|media| {
-                media.source == SourceKind::YouTube
+                matches!(media.source, SourceKind::YouTube | SourceKind::ArchiveOrg)
                     && self.playback_queue.current().is_some_and(|item| {
                         item.media.id == *media && item.media.kind != MediaKind::LiveStream
                     })

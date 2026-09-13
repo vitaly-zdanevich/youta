@@ -127,6 +127,8 @@ pub struct YouTubeEpisodeMetadata {
 /// Download behavior selected by the user.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DownloadFormat {
+    /// Keep one directly selected provider file byte-for-byte, without fixups.
+    ExactFile,
     /// Prefer an Opus source and remux it without lossy re-encoding.
     #[default]
     OpusWithoutTranscoding,
@@ -1669,6 +1671,8 @@ fn build_base_command(config: &YtDlpConfig) -> Command {
     command
 }
 
+/// Builds the shared fixed download policy without spawning it or appending the source URL.
+/// Private exporters can add their own supervised lifecycle and helper location.
 fn build_download_command(config: &YtDlpConfig, request: &DownloadRequest) -> Command {
     let mut command = build_base_command(config);
     command
@@ -1724,6 +1728,13 @@ fn build_download_command(config: &YtDlpConfig, request: &DownloadRequest) -> Co
     }
 
     match request.format {
+        DownloadFormat::ExactFile => {
+            command
+                .arg("--format")
+                .arg("best")
+                .arg("--fixup")
+                .arg("never");
+        }
         DownloadFormat::OpusWithoutTranscoding => {
             command
                 .arg("--format")
@@ -2895,6 +2906,181 @@ mod tests {
         }
     }
 
+    /// A directly selected Archive audio file must not inherit the Opus-only filter.
+    #[test]
+    fn exact_file_download_disables_all_extraction_conversion_and_fixups() {
+        let request = DownloadRequest {
+            source_url: Url::parse("https://archive.org/download/book/chapter.mp3").unwrap(),
+            destination: PathBuf::from("/tmp/youta-fixture-downloads"),
+            format: DownloadFormat::ExactFile,
+            scope: DownloadScope::SingleItem,
+            playlist_start: None,
+            skip_shorts: false,
+            write_thumbnail: false,
+            archive_path: None,
+        };
+        let command = build_download_command(&YtDlpConfig::default(), &request);
+        let arguments = command
+            .get_args()
+            .map(|value| value.to_string_lossy())
+            .collect::<Vec<_>>();
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["--format", "best"])
+        );
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["--fixup", "never"])
+        );
+        for forbidden in [
+            "--extract-audio",
+            "--audio-format",
+            "--recode-video",
+            "--remux-video",
+            "--postprocessor-args",
+            "--merge-output-format",
+        ] {
+            assert!(
+                !arguments.iter().any(|argument| argument == forbidden),
+                "{forbidden}"
+            );
+        }
+    }
+
+    /// Old collection/default modes remain opt-in-compatible and unchanged.
+    #[test]
+    fn explicit_download_modes_leave_existing_unattended_formats_unchanged() {
+        let config = YtDlpConfig::default();
+        for (format, selector, extra) in [
+            (
+                DownloadFormat::OpusWithoutTranscoding,
+                "bestaudio[acodec^=opus]",
+                Some(("--remux-video", "opus")),
+            ),
+            (DownloadFormat::OriginalBestAudio, "bestaudio", None),
+            (
+                DownloadFormat::TranscodeToOpus,
+                "bestaudio",
+                Some(("--audio-format", "opus")),
+            ),
+        ] {
+            let request = DownloadRequest {
+                source_url: Url::parse("https://example.test/watch").expect("source"),
+                destination: PathBuf::from("/tmp/youta-fixture-downloads"),
+                format,
+                scope: DownloadScope::SingleItem,
+                playlist_start: None,
+                skip_shorts: false,
+                write_thumbnail: false,
+                archive_path: None,
+            };
+            let command = build_download_command(&config, &request);
+            let arguments: Vec<_> = command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+            assert!(
+                arguments
+                    .windows(2)
+                    .any(|pair| pair == ["--format", selector])
+            );
+            assert!(
+                !arguments
+                    .iter()
+                    .any(|arg| matches!(arg.as_str(), "--fixup" | "--postprocessor-args"))
+            );
+            if let Some((option, value)) = extra {
+                assert!(arguments.windows(2).any(|pair| pair == [option, value]));
+            }
+        }
+    }
+
+    /// The file-only fixture proves byte identity for two non-Opus audio formats.
+    #[test]
+    #[ignore = "requires installed yt-dlp and ffmpeg; generated local audio only"]
+    fn exact_file_download_preserves_real_mp3_and_flac_bytes() {
+        let directory = tempfile::tempdir().expect("exact audio fixture");
+        for (extension, codec) in [("mp3", "libmp3lame"), ("flac", "flac")] {
+            let source = directory.path().join(format!("source.{extension}"));
+            local_media_fixture_output(
+                Command::new("ffmpeg")
+                    .args([
+                        "-v",
+                        "error",
+                        "-nostdin",
+                        "-n",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        "sine=frequency=440:sample_rate=48000",
+                        "-t",
+                        "0.2",
+                        "-c:a",
+                        codec,
+                    ])
+                    .arg(&source),
+            );
+            let request = DownloadRequest {
+                source_url: Url::from_file_path(&source).expect("fixture URL"),
+                destination: directory.path().join(format!("download-{extension}")),
+                format: DownloadFormat::ExactFile,
+                scope: DownloadScope::SingleItem,
+                playlist_start: None,
+                skip_shorts: false,
+                write_thumbnail: false,
+                archive_path: None,
+            };
+            let downloaded = local_download_fixture(&request, None).expect("exact file");
+            assert_eq!(downloaded.extension().unwrap(), extension);
+            assert_eq!(
+                std::fs::read(&downloaded).unwrap(),
+                std::fs::read(&source).unwrap()
+            );
+        }
+    }
+
+    /// Keeps fixture helpers bounded while reusing production process supervision.
+    fn local_media_fixture_output(command: &mut Command) -> Vec<u8> {
+        run_bounded_json_command(
+            command,
+            Duration::from_secs(30),
+            64 * 1024,
+            &YouTubePrewarmCancellation::default(),
+        )
+        .expect("bounded local multimedia helper")
+    }
+
+    /// Enables file URLs only inside this fixture, never through the public downloader.
+    fn local_download_fixture(
+        request: &DownloadRequest,
+        metadata: Option<&Path>,
+    ) -> std::result::Result<PathBuf, ()> {
+        std::fs::create_dir_all(&request.destination).expect("local download destination");
+        let mut command = build_download_command(&YtDlpConfig::default(), request);
+        command.arg("--enable-file-urls");
+        if let Some(metadata) = metadata {
+            command.arg("--load-info-json").arg(metadata);
+        } else {
+            command.arg("--").arg(request.source_url.as_str());
+        }
+        let bytes = run_bounded_json_command(
+            &mut command,
+            Duration::from_secs(30),
+            64 * 1024,
+            &YouTubePrewarmCancellation::default(),
+        )
+        .map_err(|_| ())?;
+        String::from_utf8_lossy(&bytes)
+            .lines()
+            .filter_map(parse_download_event)
+            .find_map(|event| match event {
+                DownloadEvent::CompletedFile(path) => Some(path),
+                _ => None,
+            })
+            .ok_or(())
+    }
     #[test]
     fn download_command_is_bounded_headless_and_machine_readable() {
         let config = YtDlpConfig::default();

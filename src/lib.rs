@@ -31,6 +31,11 @@ pub mod evernote;
 pub mod file_identity;
 #[cfg(feature = "lan-sharing")]
 pub mod lan_share;
+#[cfg(any(
+    feature = "archive-org",
+    all(feature = "local-metadata", feature = "controller")
+))]
+mod legacy_text;
 pub mod links;
 #[cfg(feature = "local-archives")]
 pub mod local_archive;

@@ -290,6 +290,16 @@ impl SourceKind {
                 stream: true,
                 ..SourceCapabilities::default()
             },
+            Self::ArchiveOrg => SourceCapabilities {
+                search: true,
+                video_details: true,
+                pagination: true,
+                playlists: true,
+                comments_read: true,
+                download: true,
+                stream: true,
+                ..SourceCapabilities::default()
+            },
             Self::LibriVox => SourceCapabilities {
                 search: true,
                 video_details: true,
@@ -300,7 +310,6 @@ impl SourceKind {
             },
             Self::PeerTube
             | Self::WikimediaCommons
-            | Self::ArchiveOrg
             | Self::Bandcamp
             | Self::Odysee
             | Self::Rumble
@@ -518,6 +527,32 @@ impl MediaId {
             external_id: external_id.into(),
         }
     }
+}
+
+/// Returns whether a URL is a stable, credential-free Archive.org audio-file address.
+///
+/// This pure check is available without the catalogue feature so saved History
+/// and playlist entries retain the same replay policy in every build. It checks
+/// the canonical download route, not the remote file's existence or encoding.
+#[must_use]
+pub fn is_canonical_archive_org_audio_url(url: &Url) -> bool {
+    if url.scheme() != "https"
+        || url.host_str() != Some("archive.org")
+        || url.port().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return false;
+    }
+    let Some(mut segments) = url.path_segments() else {
+        return false;
+    };
+    segments.next() == Some("download")
+        && segments.next().is_some_and(|id| !id.is_empty())
+        && segments.next().is_some_and(|file| !file.is_empty())
+        && !url.path().ends_with('/')
 }
 
 /// Builds the canonical persisted identity for one LibriVox book section.
@@ -1345,6 +1380,8 @@ pub enum Screen {
     Bandcamp,
     /// `Apple Podcasts` show search results and details.
     ApplePodcasts,
+    /// Internet Archive media search and item-file navigation.
+    ArchiveOrg,
     /// `LibriVox` public-domain audiobook search and book navigation.
     LibriVox,
     /// Curated public live-radio stations.
@@ -1416,6 +1453,9 @@ pub struct SessionState {
     /// Last selected row in the independent `Apple Podcasts` result list.
     #[serde(default)]
     pub apple_podcasts_selected_row: Option<usize>,
+    /// Last selected row in the independent archive.org result list.
+    #[serde(default)]
+    pub archive_org_selected_row: Option<usize>,
     /// Last selected row in the independent `LibriVox` result list.
     #[serde(default)]
     pub librivox_selected_row: Option<usize>,
@@ -1447,6 +1487,9 @@ pub struct SessionState {
     /// Last search text entered on the independent `Apple Podcasts` tab.
     #[serde(default)]
     pub apple_podcasts_search_text: String,
+    /// Last search text entered on the independent archive.org tab.
+    #[serde(default)]
+    pub archive_org_search_text: String,
     /// Last search text entered on the independent `LibriVox` tab.
     #[serde(default)]
     pub librivox_search_text: String,
@@ -1478,6 +1521,7 @@ impl Default for SessionState {
             yandex_music_selected_row: None,
             bandcamp_selected_row: None,
             apple_podcasts_selected_row: None,
+            archive_org_selected_row: None,
             librivox_selected_row: None,
             radio_selected_row: None,
             radio_selected_station_id: None,
@@ -1488,6 +1532,7 @@ impl Default for SessionState {
             yandex_music_search_text: String::new(),
             bandcamp_search_text: String::new(),
             apple_podcasts_search_text: String::new(),
+            archive_org_search_text: String::new(),
             librivox_search_text: String::new(),
             local_path: None,
             waveform_visible: false,
@@ -1833,6 +1878,80 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<Screen>(&encoded).unwrap(),
             Screen::Web
+        );
+    }
+
+    #[test]
+    fn archive_org_audio_url_validation_is_available_without_the_provider() {
+        for valid in [
+            "https://archive.org/download/fixture/01.mp3",
+            "https://archive.org/download/fixture/nested/02%20chapter.opus",
+            "https://archive.org/download/fixture/lossless.flac",
+        ] {
+            assert!(
+                is_canonical_archive_org_audio_url(&Url::parse(valid).unwrap()),
+                "{valid}"
+            );
+        }
+        for invalid in [
+            "https://archive.org/details/fixture",
+            "https://elsewhere.example/download/fixture/01.mp3",
+            "https://archive.org.evil.example/download/fixture/01.mp3",
+            "http://archive.org/download/fixture/01.mp3",
+            "https://user:password@archive.org/download/fixture/01.mp3",
+            "https://archive.org:8443/download/fixture/01.mp3",
+            "https://archive.org/download/fixture/01.mp3?token=secret",
+            "https://archive.org/download/fixture/01.mp3#part",
+            "https://archive.org/download/fixture/",
+            "https://archive.org/download//01.mp3",
+        ] {
+            assert!(
+                !is_canonical_archive_org_audio_url(&Url::parse(invalid).unwrap()),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn archive_org_screen_and_source_keep_stable_restart_names() {
+        let encoded = serde_json::to_string(&Screen::ArchiveOrg).expect("encode Archive screen");
+        assert_eq!(encoded, r#"{"screen":"archive-org"}"#);
+        assert_eq!(
+            serde_json::from_str::<Screen>(&encoded).unwrap(),
+            Screen::ArchiveOrg
+        );
+        assert_eq!(
+            serde_json::to_string(&SourceKind::ArchiveOrg).unwrap(),
+            r#""archive-org""#
+        );
+        assert_eq!(SourceKind::from("archive-org"), SourceKind::ArchiveOrg);
+    }
+
+    #[test]
+    fn older_sessions_default_independent_archive_org_state() {
+        let mut encoded = serde_json::to_value(SessionState::default()).expect("session fixture");
+        let object = encoded.as_object_mut().expect("session object");
+        object.remove("archive_org_selected_row");
+        object.remove("archive_org_search_text");
+        let restored: SessionState = serde_json::from_value(encoded).expect("older session");
+        assert_eq!(restored.archive_org_selected_row, None);
+        assert!(restored.archive_org_search_text.is_empty());
+    }
+
+    #[test]
+    fn archive_org_capabilities_expose_public_media_without_remote_writes() {
+        assert_eq!(
+            SourceKind::ArchiveOrg.capabilities(),
+            SourceCapabilities {
+                search: true,
+                video_details: true,
+                pagination: true,
+                playlists: true,
+                comments_read: true,
+                download: true,
+                stream: true,
+                ..SourceCapabilities::default()
+            }
         );
     }
 

@@ -80,7 +80,18 @@ function factsFor(kind: InformationPanelKind, details: DetailView): Array<[strin
     // missing data rather than as data that does not exist.
     case "Radio":
     case "YandexMusic":
+      break;
     case "Generic":
+			// Archive.org supplies item-level statistics, not YouTube likes/views.
+			if (details.media_id?.source === 'archive-org') {
+				rows.push(
+					['Length', fact(details.length)],
+					['Favourites', fact(details.likes)],
+					['Downloads', fact(details.views)],
+					['Comments', fact(details.comments)],
+					['Uploaded', fact(details.published)],
+				);
+			}
       break;
   }
   rows.push(["Source", fact(details.source)], ["License", fact(details.license)]);
@@ -244,9 +255,11 @@ export function Details({ view, kind }: { view: ViewModel; kind: InformationPane
 
   const facts = factsFor(kind, details);
   const isYouTube = details.media_id?.source === YOUTUBE;
+	const isArchiveOrg = details.media_id?.source === 'archive-org';
   const openable =
     view.external_opener_available &&
-    (kind === "Video" || kind === "Podcast" || kind === "Radio" || kind === "YandexMusic");
+    (kind === "Video" || kind === "Podcast" || kind === "Radio" || kind === "YandexMusic" ||
+			(isArchiveOrg && details.webpage_url !== null));
   const yandex = view.yandex_music_actions;
   const audioQuality = fact(details.local_audio_quality_description);
 
@@ -374,7 +387,7 @@ export function Details({ view, kind }: { view: ViewModel; kind: InformationPane
             Favorite
           </Action>
         ) : null}
-        {kind === "Video" && view.video_comments_available && isYouTube ? (
+        {(view.video_comments_available && kind === 'Video' && isYouTube) || (isArchiveOrg && view.screen === 'ArchiveOrg') ? (
           <Action onClick={() => void dispatch("OpenVideoComments")}>Comments</Action>
         ) : null}
         {kind === "Video" && view.video_summary_available && isYouTube ? (

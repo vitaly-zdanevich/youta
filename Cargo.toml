@@ -4,7 +4,7 @@ resolver = "3"
 
 [package]
 name = "youta"
-version = "0.59.0"
+version = "0.60.0"
 edition = "2024"
 rust-version = "1.95"
 description = "A low-resource YouTube TUI audio player and local subscription manager that uses yt-dlp and saves and shows listening progress"
@@ -33,6 +33,7 @@ required-features = ["cli"]
 [features]
 default = [
     "app",
+    "archive-org",
     "ascii-visualizer",
     "audio-quality",
     "commons-upload",
@@ -54,7 +55,7 @@ default = [
 # Yandex Music is included here so normal builds expose the complete top-level
 # source set. `app-core` remains the equivalent profile for distributors and
 # users who intentionally omit the private, experimental Yandex Music API.
-# Audio-quality analysis, GPM input, image rendering, QR encoding, SponsorBlock,
+# Archive.org, audio-quality analysis, GPM input, images, QR encoding, SponsorBlock,
 # video summaries, and SQLite remain independent features. Keeping them outside
 # this profile lets system packages map positive options directly to Cargo
 # features without subtracting a transitive default.
@@ -277,7 +278,7 @@ dearrow = ["network"]
 wikidata = ["network"]
 # Compatibility alias retained for older custom build scripts.
 wikimedia = ["commons-upload"]
-archive-org = ["network"]
+archive-org = ["network", "dep:chrono", "dep:html5gum", "dep:encoding_rs"]
 librivox = ["network"]
 apple-podcasts = ["rss"]
 litres = ["network", "dep:sha2"]

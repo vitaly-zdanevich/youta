@@ -110,6 +110,12 @@ jobs:
             feature_arguments: --no-default-features --features tui,acoustid,wikidata
           - feature_set: TUI with Apple Podcasts
             feature_arguments: --no-default-features --features tui,apple-podcasts
+          - feature_set: standalone Internet Archive provider
+            feature_arguments: --no-default-features --features archive-org
+          - feature_set: TUI with Internet Archive
+            feature_arguments: --no-default-features --features tui,archive-org
+          - feature_set: TUI with Internet Archive and Wikidata
+            feature_arguments: --no-default-features --features tui,archive-org,wikidata
           - feature_set: standalone LibriVox provider
             feature_arguments: --no-default-features --features librivox
           - feature_set: TUI with LibriVox
@@ -251,14 +257,14 @@ jobs:
       # tagged release cannot be the first attempt to link the 32-bit target.
       - name: Compile all release variants
         run: |
-          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary
-          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary
-          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,images,local-archives,nyan-cat,sponsorblock,summary
-          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,local-archives,nyan-cat,sponsorblock,summary
-          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,ascii-visualizer,audio-quality,commons-upload,evernote,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary
-          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,ascii-visualizer,audio-quality,commons-upload,evernote,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary
-          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,ascii-visualizer,audio-quality,commons-upload,evernote,images,local-archives,nyan-cat,sponsorblock,summary
-          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,ascii-visualizer,audio-quality,commons-upload,evernote,local-archives,nyan-cat,sponsorblock,summary
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,archive-org,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,archive-org,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,archive-org,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,images,local-archives,nyan-cat,sponsorblock,summary
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,archive-org,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,local-archives,nyan-cat,sponsorblock,summary
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,archive-org,ascii-visualizer,audio-quality,commons-upload,evernote,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,archive-org,ascii-visualizer,audio-quality,commons-upload,evernote,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,archive-org,ascii-visualizer,audio-quality,commons-upload,evernote,images,local-archives,nyan-cat,sponsorblock,summary
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,archive-org,ascii-visualizer,audio-quality,commons-upload,evernote,local-archives,nyan-cat,sponsorblock,summary
 
       - name: Validate and start the i686 executable
         run: |

@@ -256,6 +256,7 @@ fn optional_contract_exemptions_follow_the_compiled_feature_set() {
         "ViewModel",
         "status_line"
     ));
+
     assert!(!action_belongs_to_disabled_feature("Quit"));
 }
 
@@ -505,6 +506,7 @@ fn the_typescript_contract_names_only_fields_the_reducer_emits() {
             emitted_keys(&EvernoteNoteDraft::default()),
         );
     }
+
     emitted.insert(
         "SubscriptionsView",
         emitted_keys(&SubscriptionsView::default()),
@@ -560,6 +562,28 @@ fn the_typescript_contract_names_only_fields_the_reducer_emits() {
         }
     }
     assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// Comment labels must distinguish Archive.org reviews from YouTube comments.
+///
+/// Identical Rust and TypeScript field names alone cannot prove their wire
+/// values agree, so exercise the discriminator for both supported providers.
+#[test]
+fn public_comments_preserve_the_provider_discriminator_for_gui_labels() {
+    let declared = declared_interfaces(&contract_source());
+    assert!(declared["VideoCommentsPopupView"].contains("source"));
+    for (source, wire_value) in [
+        (SourceKind::YouTube, "you-tube"),
+        (SourceKind::ArchiveOrg, "archive-org"),
+    ] {
+        let popup = VideoCommentsPopupView {
+            source,
+            video_id: "public-item".to_owned(),
+            ..VideoCommentsPopupView::default()
+        };
+        let emitted = serde_json::to_value(popup).expect("serialized public comments");
+        assert_eq!(emitted["source"], wire_value);
+    }
 }
 
 /// The interfaces this test checks must actually be present in the file.

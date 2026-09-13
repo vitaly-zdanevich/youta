@@ -9,6 +9,8 @@
 //! terminal event loop never waits for these responses, while the process
 //! avoids an asynchronous runtime and its additional idle bookkeeping.
 
+#[cfg(feature = "archive-org")]
+mod archive_org;
 mod end_pause;
 #[cfg(feature = "web-browser")]
 mod web;
@@ -758,6 +760,8 @@ pub enum SearchRoute {
     Bandcamp,
     /// The podcast tab queries Apple's public, storefront-specific catalogue.
     ApplePodcasts,
+    /// The archive.org tab queries its public audio catalogue.
+    ArchiveOrg,
     /// The audiobook tab queries LibriVox's public-domain catalogue.
     LibriVox,
     /// The Web tab opens an explicitly supplied HTTP folder or direct media URL.
@@ -2354,6 +2358,7 @@ pub const fn search_route(screen: Screen) -> SearchRoute {
         Screen::YandexMusic => SearchRoute::YandexMusic,
         Screen::Bandcamp => SearchRoute::Bandcamp,
         Screen::ApplePodcasts => SearchRoute::ApplePodcasts,
+        Screen::ArchiveOrg => SearchRoute::ArchiveOrg,
         Screen::LibriVox => SearchRoute::LibriVox,
         Screen::Web => SearchRoute::Web,
         Screen::TrackerMusic => SearchRoute::TrackerArchives,
@@ -3760,6 +3765,12 @@ enum AutoplayOrigin {
         items: Arc<[QueueItem]>,
         index: usize,
     },
+    #[cfg(feature = "archive-org")]
+    ArchiveOrg {
+        /// Shared item metadata avoids copying its description once per track.
+        details: Arc<crate::providers::archive_org::ArchiveOrgItemDetails>,
+        index: usize,
+    },
     #[cfg(feature = "librivox")]
     Librivox {
         /// Credential-free audiobook sections captured when playback starts.
@@ -4772,6 +4783,13 @@ pub struct AppController {
     apple_podcast_episode_origin: ApplePodcastEpisodeOrigin,
     /// Selected episode retained while Details receives focus.
     apple_podcast_episode_selected: usize,
+    /// Public catalogue state and bounded worker owned by the archive.org tab.
+    #[cfg(feature = "archive-org")]
+    archive_org: archive_org::ArchiveOrgState,
+    /// Query retained independently for the archive.org tab.
+    archive_org_search_query: String,
+    /// Selected archive.org row retained while another tab is visible.
+    archive_org_selected: usize,
     /// Query retained independently for the LibriVox tab.
     librivox_search_query: String,
     /// Selected LibriVox row retained while another tab is visible.
@@ -5366,6 +5384,7 @@ pub struct AppController {
     /// Selected provider media and private authentication behind the Commons popup.
     #[cfg(feature = "commons-upload")]
     commons_upload_selection: Option<CommonsUploadSelection>,
+    /// Review-owned Archive transfer and session-only credentials.
     /// Authentication selected from Youta or Pywikibot for the current review.
     #[cfg(feature = "commons-upload")]
     commons_upload_authentication: Option<CommonsAuthentication>,
@@ -5855,6 +5874,8 @@ impl AppController {
                 #[cfg(feature = "bandcamp")]
                 StoredScreen::Bandcamp => saved.bandcamp_search_text.clone(),
                 StoredScreen::ApplePodcasts => saved.apple_podcasts_search_text.clone(),
+                #[cfg(feature = "archive-org")]
+                StoredScreen::ArchiveOrg => saved.archive_org_search_text.clone(),
                 StoredScreen::LibriVox => saved.librivox_search_text.clone(),
                 StoredScreen::Web => String::new(),
                 #[cfg(feature = "radio")]
@@ -6035,6 +6056,17 @@ impl AppController {
         });
         if view.screen == Screen::ApplePodcasts {
             view.selected = apple_podcasts_selected;
+        }
+        let archive_org_search_query = saved.archive_org_search_text.clone();
+        let archive_org_selected = saved.archive_org_selected_row.unwrap_or_else(|| {
+            if view.screen == Screen::ArchiveOrg {
+                view.selected
+            } else {
+                0
+            }
+        });
+        if view.screen == Screen::ArchiveOrg {
+            view.selected = archive_org_selected;
         }
         let librivox_search_query = saved.librivox_search_text.clone();
         let librivox_selected = saved.librivox_selected_row.unwrap_or_else(|| {
@@ -6236,6 +6268,10 @@ impl AppController {
             pending_apple_podcast_episodes: None,
             apple_podcast_episode_origin: ApplePodcastEpisodeOrigin::Shows(apple_podcasts_selected),
             apple_podcast_episode_selected: 0,
+            #[cfg(feature = "archive-org")]
+            archive_org: archive_org::ArchiveOrgState::default(),
+            archive_org_search_query,
+            archive_org_selected,
             librivox_search_query,
             librivox_selected,
             #[cfg(feature = "web-browser")]
@@ -7406,6 +7442,7 @@ impl AppController {
                 Ok(None) => self.submit_apple_podcasts_search(query),
                 Err(error) => self.view.status_line = error.to_owned(),
             },
+            SearchRoute::ArchiveOrg => self.submit_archive_org_search(query),
             SearchRoute::LibriVox => {
                 #[cfg(feature = "librivox")]
                 {
@@ -7418,6 +7455,45 @@ impl AppController {
                 self.view.status_line = "Search is not available on this screen".to_owned();
             }
         }
+    }
+
+    /// Keeps programmatic Archive search safe in builds without its provider.
+    #[cfg(not(feature = "archive-org"))]
+    fn submit_archive_org_search(&mut self, query: String) {
+        self.archive_org_search_query = query;
+        self.populate_archive_org();
+    }
+
+    /// Explains the omitted provider without leaving stale rows or Details.
+    #[cfg(not(feature = "archive-org"))]
+    fn populate_archive_org(&mut self) {
+        self.view.rows.clear();
+        self.view.details = None;
+        self.view.status_line = "This build omits the `archive-org` feature".to_owned();
+    }
+
+    /// Disabled providers have no selectable metadata.
+    #[cfg(not(feature = "archive-org"))]
+    fn update_archive_org_detail(&mut self) {
+        self.view.details = None;
+    }
+
+    /// Disabled providers cannot manufacture playable queue identities.
+    #[cfg(not(feature = "archive-org"))]
+    fn selected_archive_org_queue_item(&self) -> Result<QueueItem, String> {
+        Err("This build omits the `archive-org` feature".to_owned())
+    }
+
+    /// Gives explicit feedback if a disabled screen is activated programmatically.
+    #[cfg(not(feature = "archive-org"))]
+    fn activate_archive_org_selection(&mut self) {
+        self.populate_archive_org();
+    }
+
+    /// Disabled providers have no browser action.
+    #[cfg(not(feature = "archive-org"))]
+    fn current_archive_org_url(&self) -> Option<String> {
+        None
     }
 
     fn open_direct_video(&mut self, direct: DirectVideoInput) {
@@ -11406,6 +11482,18 @@ impl AppController {
 
     /// Opens cached comments or starts one worker-owned selected-video request.
     fn open_youtube_video_comments(&mut self) {
+        #[cfg(feature = "archive-org")]
+        if self.view.screen == Screen::ArchiveOrg
+            && self
+                .view
+                .details
+                .as_ref()
+                .and_then(|details| details.media_id.as_ref())
+                .is_some_and(|id| id.source == SourceKind::ArchiveOrg)
+        {
+            self.open_archive_org_comments();
+            return;
+        }
         if !self.youtube_video_comments_supported {
             self.view.status_line =
                 "The active YouTube provider does not support public comments".to_owned();
@@ -11436,6 +11524,7 @@ impl AppController {
         }
 
         self.view.video_comments_popup = Some(VideoCommentsPopupView {
+            source: SourceKind::YouTube,
             video_id: video_id.clone(),
             video_title,
             state: VideoCommentsPopupState::Loading,
@@ -13666,7 +13755,9 @@ impl AppController {
                     .view
                     .video_comments_popup
                     .as_ref()
-                    .filter(|popup| popup.video_id == video_id)
+                    .filter(|popup| {
+                        popup.source == SourceKind::YouTube && popup.video_id == video_id
+                    })
                     .map(|popup| popup.video_title.clone())
                 else {
                     return;
@@ -15129,6 +15220,7 @@ impl AppController {
             | Screen::YandexMusic
             | Screen::Bandcamp
             | Screen::ApplePodcasts
+            | Screen::ArchiveOrg
             | Screen::LibriVox
             | Screen::Web
             | Screen::Radio
@@ -15182,6 +15274,7 @@ impl AppController {
                         | Screen::YandexMusic
                         | Screen::Bandcamp
                         | Screen::ApplePodcasts
+                        | Screen::ArchiveOrg
                         | Screen::LibriVox
                         | Screen::Web
                         | Screen::Radio
@@ -15219,6 +15312,7 @@ impl AppController {
                 | Screen::YandexMusic
                 | Screen::Bandcamp
                 | Screen::ApplePodcasts
+                | Screen::ArchiveOrg
                 | Screen::LibriVox
                 | Screen::Web
                 | Screen::Radio
@@ -16468,6 +16562,10 @@ impl AppController {
                 }
                 return;
             }
+            Screen::ArchiveOrg => {
+                self.update_archive_org_detail();
+                return;
+            }
             Screen::LibriVox => {
                 self.update_librivox_detail();
                 return;
@@ -16667,6 +16765,9 @@ impl AppController {
                 }
                 ApplePodcastsRoute::Direct => self.refresh_apple_direct_view(),
             }
+        } else if self.view.screen == Screen::ArchiveOrg {
+            self.archive_org_selected = self.view.selected;
+            self.update_archive_org_detail();
         } else if self.view.screen == Screen::LibriVox {
             self.librivox_selected = self.view.selected;
             self.update_librivox_detail();
@@ -16729,6 +16830,9 @@ impl AppController {
                 }
                 ApplePodcastsRoute::Direct => self.refresh_apple_direct_view(),
             }
+        } else if self.view.screen == Screen::ArchiveOrg {
+            self.archive_org_selected = self.view.selected;
+            self.update_archive_org_detail();
         } else if self.view.screen == Screen::LibriVox {
             self.librivox_selected = self.view.selected;
             self.update_librivox_detail();
@@ -16778,6 +16882,9 @@ impl AppController {
     }
 
     fn selected_queue_item(&self) -> Result<QueueItem, String> {
+        if self.view.screen == Screen::ArchiveOrg {
+            return self.selected_archive_org_queue_item();
+        }
         #[cfg(feature = "web-browser")]
         if self.view.screen == Screen::Web {
             return self
@@ -16930,7 +17037,7 @@ impl AppController {
 
     /// Returns the selected exportable remote item or exact local file.
     #[cfg(feature = "evernote")]
-    fn selected_evernote_queue_item(&self) -> Result<QueueItem, String> {
+    fn selected_export_queue_item(&self) -> Result<QueueItem, String> {
         if self.view.screen != Screen::Local {
             return self.selected_queue_item();
         }
@@ -17250,6 +17357,13 @@ impl AppController {
             }
         }
 
+        if self.view.screen == Screen::ArchiveOrg {
+            #[cfg(feature = "archive-org")]
+            return self.selected_archive_org_playlist_identity();
+            #[cfg(not(feature = "archive-org"))]
+            return None;
+        }
+
         if self.view.screen == Screen::LibriVox {
             #[cfg(feature = "librivox")]
             {
@@ -17339,7 +17453,7 @@ impl AppController {
         #[cfg(feature = "evernote")]
         {
             self.view.evernote_available =
-                self.selected_evernote_queue_item()
+                self.selected_export_queue_item()
                     .is_ok_and(|item| match item.media.id.source {
                         SourceKind::Local => local_path_from_media_id(&item.media.id)
                             .is_some_and(|path| path.is_file()),
@@ -17506,7 +17620,7 @@ impl AppController {
                     None
                 }
             }
-            Screen::LibriVox | Screen::Web => {
+            Screen::ArchiveOrg | Screen::LibriVox | Screen::Web => {
                 let details = self.view.details.as_ref()?;
                 let media_id = details.media_id.clone()?;
                 Some(PrivateNoteSelection {
@@ -18613,7 +18727,7 @@ impl AppController {
             "An Evernote operation is already running".clone_into(&mut self.view.status_line);
             return;
         }
-        let item = match self.selected_evernote_queue_item() {
+        let item = match self.selected_export_queue_item() {
             Ok(item) => item,
             Err(error) => {
                 self.view.status_line = error;
@@ -20001,11 +20115,17 @@ impl AppController {
                 return;
             }
         };
-        let format = match configured_download_format(&self.config.subscriptions.audio_format) {
-            Ok(format) => format,
-            Err(error) => {
-                self.show_error_message("Download format is invalid", error);
-                return;
+        // Archive rows already identify one existing file. Never apply an Opus
+        // source filter, extraction or conversion to that exact selected audio.
+        let format = if item.media.id.source == SourceKind::ArchiveOrg {
+            DownloadFormat::ExactFile
+        } else {
+            match configured_download_format(&self.config.subscriptions.audio_format) {
+                Ok(format) => format,
+                Err(error) => {
+                    self.show_error_message("Download format is invalid", error);
+                    return;
+                }
             }
         };
         let request = DownloadRequest {
@@ -20281,6 +20401,10 @@ impl AppController {
         }
         if self.view.screen == Screen::ApplePodcasts {
             self.activate_apple_podcasts_selection();
+            return;
+        }
+        if self.view.screen == Screen::ArchiveOrg {
+            self.activate_archive_org_selection();
             return;
         }
         if self.view.screen == Screen::LibriVox {
@@ -21903,6 +22027,10 @@ impl AppController {
     }
 
     fn go_back(&mut self) {
+        #[cfg(feature = "archive-org")]
+        if self.view.screen == Screen::ArchiveOrg && self.go_back_archive_org() {
+            return;
+        }
         #[cfg(feature = "web-browser")]
         if self.view.screen == Screen::Web {
             self.open_web_parent();
@@ -24986,6 +25114,18 @@ impl AppController {
                     })
                 })
             }
+            #[cfg(feature = "archive-org")]
+            AutoplayOrigin::ArchiveOrg { details, index } => {
+                neighbour_list_step(&details.tracks, *index, direction, |index, track| {
+                    Some(AutoplayStep::Play {
+                        item: Box::new(archive_org::queue_item(&details.item, track)),
+                        origin: AutoplayOrigin::ArchiveOrg {
+                            details: Arc::clone(details),
+                            index,
+                        },
+                    })
+                })
+            }
             #[cfg(feature = "librivox")]
             AutoplayOrigin::Librivox { items, index } => {
                 neighbour_list_step(items, *index, direction, |index, item: &QueueItem| {
@@ -25294,6 +25434,14 @@ impl AppController {
             })
         };
         let mut canonical_input = PlaybackInput::new(item.playback_location.clone());
+        // Archive file identities remain direct media when replayed from History or playlists.
+        #[cfg(feature = "archive-org")]
+        if media_id.source == SourceKind::ArchiveOrg
+            && url::Url::parse(&canonical_input.location)
+                .is_ok_and(|url| archive_org::is_direct_audio_url(&url))
+        {
+            canonical_input.bypass_ytdl = true;
+        }
         // Web rows are already direct media, including saved queryless replays.
         if media_id.source == SourceKind::RemoteFiles
             && media_id.external_id.starts_with("web:sha256:")
@@ -25302,7 +25450,10 @@ impl AppController {
         }
         canonical_input.start_at = Duration::from_secs(start_at);
         canonical_input.title = Some(item.media.title.clone());
-        canonical_input.keep_open = media_id.source == SourceKind::YouTube && !live_stream;
+        canonical_input.keep_open = matches!(
+            media_id.source,
+            SourceKind::YouTube | SourceKind::ArchiveOrg
+        ) && !live_stream;
         #[cfg(feature = "waveform")]
         let local_playback_candidate = (media_id.source == SourceKind::Local)
             .then(|| local_playback_path(&canonical_input.location))
@@ -26389,6 +26540,12 @@ impl AppController {
                 self.web.selected = self.view.selected;
                 self.finish_search_activity(SearchActivity::Web);
             }
+            Screen::ArchiveOrg => {
+                self.archive_org_search_query
+                    .clone_from(&self.view.search_query);
+                self.archive_org_selected = self.view.selected;
+                self.finish_search_activity(SearchActivity::ArchiveOrg);
+            }
             Screen::LibriVox => {
                 self.librivox_search_query
                     .clone_from(&self.view.search_query);
@@ -26472,6 +26629,12 @@ impl AppController {
             Screen::Web => {
                 self.view.search_query.clone_from(&self.web.query);
                 self.view.selected = self.web.selected;
+            }
+            Screen::ArchiveOrg => {
+                self.view
+                    .search_query
+                    .clone_from(&self.archive_org_search_query);
+                self.view.selected = self.archive_org_selected;
             }
             Screen::LibriVox => {
                 self.view
@@ -26707,6 +26870,7 @@ impl AppController {
                 }
                 ApplePodcastsRoute::Direct => self.refresh_apple_direct_view(),
             },
+            Screen::ArchiveOrg => self.populate_archive_org(),
             Screen::LibriVox => self.populate_librivox(),
             Screen::Web => {
                 #[cfg(feature = "web-browser")]
@@ -29828,6 +29992,9 @@ impl AppController {
         }
         if self.view.screen == Screen::ApplePodcasts {
             return self.current_apple_podcasts_url();
+        }
+        if self.view.screen == Screen::ArchiveOrg {
+            return self.current_archive_org_url();
         }
         if self.view.screen == Screen::LibriVox {
             return self.current_librivox_url();
@@ -33848,6 +34015,10 @@ impl AppController {
                 }
                 ApplePodcastsRoute::Direct => {}
             }
+        } else if self.view.screen == Screen::ArchiveOrg {
+            self.archive_org_search_query
+                .clone_from(&self.view.search_query);
+            self.archive_org_selected = self.view.selected;
         } else if self.view.screen == Screen::LibriVox {
             self.librivox_search_query
                 .clone_from(&self.view.search_query);
@@ -33893,6 +34064,10 @@ impl AppController {
         };
         #[cfg(not(feature = "librivox"))]
         let persisted_librivox_selected_row = self.librivox_selected;
+        #[cfg(feature = "archive-org")]
+        let persisted_archive_org_selected_row = self.archive_org_catalogue_selection();
+        #[cfg(not(feature = "archive-org"))]
+        let persisted_archive_org_selected_row = self.archive_org_selected;
         let state = SessionState {
             screen: stored_session_screen(self.view.screen, &self.playlists_route),
             focus: if self.view.details_focused {
@@ -33908,6 +34083,7 @@ impl AppController {
             #[cfg(feature = "bandcamp")]
             bandcamp_selected_row: Some(self.bandcamp_selected),
             apple_podcasts_selected_row: Some(self.apple_podcasts_selected),
+            archive_org_selected_row: Some(persisted_archive_org_selected_row),
             librivox_selected_row: Some(persisted_librivox_selected_row),
             radio_selected_row: Some(persisted_radio_selected_row),
             radio_selected_station_id,
@@ -33919,6 +34095,7 @@ impl AppController {
             #[cfg(feature = "bandcamp")]
             bandcamp_search_text: self.bandcamp_search_query.clone(),
             apple_podcasts_search_text: self.apple_podcasts_search_query.clone(),
+            archive_org_search_text: self.archive_org_search_query.clone(),
             librivox_search_text: self.librivox_search_query.clone(),
             local_path: (!self.view.local_path.is_empty()).then(|| self.view.local_path.clone()),
             waveform_visible: self.view.waveform_visible,
@@ -35382,6 +35559,8 @@ impl UiController for AppController {
         if self.diagnostic_only {
             return;
         }
+        #[cfg(feature = "archive-org")]
+        self.poll_archive_org_worker();
         #[cfg(feature = "commons-upload")]
         {
             self.drain_commons_upload_responses();
@@ -40363,107 +40542,7 @@ fn normalized_local_id3v2_value(
 /// ordinary accented Latin text retain the exact value supplied by Lofty.
 #[cfg(feature = "local-metadata")]
 fn normalized_legacy_windows_1251_value(value: Option<&str>) -> Option<String> {
-    let value = value.map(str::trim).filter(|value| !value.is_empty())?;
-    let bytes = value
-        .chars()
-        .map(|character| u8::try_from(u32::from(character)))
-        .collect::<Result<Vec<_>, _>>();
-    let Ok(bytes) = bytes else {
-        return Some(value.to_owned());
-    };
-    let (decoded, had_errors) =
-        encoding_rs::WINDOWS_1251.decode_without_bom_handling(bytes.as_slice());
-    if had_errors || !has_strong_legacy_windows_1251_signature(value, decoded.as_ref()) {
-        return Some(value.to_owned());
-    }
-    Some(decoded.into_owned())
-}
-
-/// Recognizes word-level Cyrillic evidence while rejecting common Latin names.
-#[cfg(feature = "local-metadata")]
-fn has_strong_legacy_windows_1251_signature(source: &str, decoded: &str) -> bool {
-    #[derive(Default)]
-    struct WordEvidence {
-        letters: usize,
-        source_high_latin: usize,
-        decoded_cyrillic: usize,
-        cyrillic_vowels: usize,
-        cyrillic_consonants: usize,
-    }
-
-    fn qualifies(word: &WordEvidence, minimum_letters: usize) -> bool {
-        word.letters >= minimum_letters
-            && word.source_high_latin.saturating_mul(5) >= word.letters.saturating_mul(4)
-            && word.decoded_cyrillic.saturating_mul(5) >= word.letters.saturating_mul(4)
-            && word.cyrillic_vowels > 0
-            && word.cyrillic_consonants > 0
-    }
-
-    fn is_cyrillic(character: char) -> bool {
-        matches!(character, '\u{0400}'..='\u{052f}')
-    }
-
-    fn is_cyrillic_vowel(character: char) -> bool {
-        matches!(
-            character,
-            'А' | 'Е'
-                | 'Ё'
-                | 'И'
-                | 'О'
-                | 'У'
-                | 'Ы'
-                | 'Э'
-                | 'Ю'
-                | 'Я'
-                | 'а'
-                | 'е'
-                | 'ё'
-                | 'и'
-                | 'о'
-                | 'у'
-                | 'ы'
-                | 'э'
-                | 'ю'
-                | 'я'
-                | 'І'
-                | 'Ї'
-                | 'Є'
-                | 'і'
-                | 'ї'
-                | 'є'
-        )
-    }
-
-    if source == decoded || source.chars().any(is_cyrillic) {
-        return false;
-    }
-    let mut word = WordEvidence::default();
-    let mut strong_words = 0_usize;
-    let mut medium_words = 0_usize;
-    for (source_character, decoded_character) in
-        source.chars().zip(decoded.chars()).chain([(' ', ' ')])
-    {
-        if decoded_character.is_alphabetic() {
-            word.letters = word.letters.saturating_add(1);
-            word.source_high_latin = word.source_high_latin.saturating_add(usize::from(matches!(
-                source_character,
-                '\u{00c0}'..='\u{00ff}'
-            )));
-            if is_cyrillic(decoded_character) {
-                word.decoded_cyrillic = word.decoded_cyrillic.saturating_add(1);
-                if is_cyrillic_vowel(decoded_character) {
-                    word.cyrillic_vowels = word.cyrillic_vowels.saturating_add(1);
-                } else {
-                    word.cyrillic_consonants = word.cyrillic_consonants.saturating_add(1);
-                }
-            }
-            continue;
-        }
-        strong_words = strong_words.saturating_add(usize::from(qualifies(&word, 6)));
-        medium_words = medium_words.saturating_add(usize::from(qualifies(&word, 4)));
-        word = WordEvidence::default();
-    }
-    strong_words > 0 || medium_words >= 2
+    crate::legacy_text::normalized_legacy_windows_1251_value(value)
 }
 
 #[cfg(feature = "local-metadata")]
@@ -42331,6 +42410,10 @@ fn stored_screen_from_tui(screen: Screen) -> StoredScreen {
         Screen::ApplePodcasts => StoredScreen::ApplePodcasts,
         #[cfg(not(feature = "apple-podcasts"))]
         Screen::ApplePodcasts => StoredScreen::Search,
+        #[cfg(feature = "archive-org")]
+        Screen::ArchiveOrg => StoredScreen::ArchiveOrg,
+        #[cfg(not(feature = "archive-org"))]
+        Screen::ArchiveOrg => StoredScreen::Search,
         #[cfg(feature = "librivox")]
         Screen::LibriVox => StoredScreen::LibriVox,
         #[cfg(not(feature = "librivox"))]
@@ -42401,6 +42484,10 @@ fn tui_screen_from_stored(screen: &StoredScreen) -> Screen {
         StoredScreen::ApplePodcasts => Screen::ApplePodcasts,
         #[cfg(not(feature = "apple-podcasts"))]
         StoredScreen::ApplePodcasts => Screen::Search,
+        #[cfg(feature = "archive-org")]
+        StoredScreen::ArchiveOrg => Screen::ArchiveOrg,
+        #[cfg(not(feature = "archive-org"))]
+        StoredScreen::ArchiveOrg => Screen::Search,
         #[cfg(feature = "librivox")]
         StoredScreen::LibriVox => Screen::LibriVox,
         #[cfg(not(feature = "librivox"))]
@@ -43088,6 +43175,13 @@ fn history_replay_locator(item: &QueueItem) -> Option<String> {
         SourceKind::YouTube => validate_youtube_video_id(&item.media.id.external_id)
             .is_ok()
             .then(|| youtube_video_url(&item.media.id.external_id)),
+        SourceKind::ArchiveOrg => {
+            let url = &item.media.webpage_url;
+            if item.media.id.external_id != url.as_str() || item.playback_location != url.as_str() {
+                return None;
+            }
+            stable_history_remote_url(&SourceKind::ArchiveOrg, url).map(|url| url.to_string())
+        }
         SourceKind::LibriVox => {
             parse_librivox_section_external_id(&item.media.id.external_id)?;
             let audio_url = url::Url::parse(&item.playback_location).ok()?;
@@ -43272,6 +43366,11 @@ fn stable_history_remote_url(source: &SourceKind, url: &url::Url) -> Option<url:
             validate_youtube_video_id(&video_id).ok()?;
             stable = url::Url::parse(&youtube_video_url(&video_id)).ok()?;
         }
+        SourceKind::ArchiveOrg => {
+            if !crate::domain::is_canonical_archive_org_audio_url(&stable) {
+                return None;
+            }
+        }
         SourceKind::LibriVox => {
             if !is_canonical_librivox_audio_url(&stable) {
                 return None;
@@ -43327,6 +43426,10 @@ fn history_replay_target(entry: &HistoryEntry) -> Result<HistoryReplayTarget, St
                 .to_owned(),
         );
     };
+    if entry.media_id.source == SourceKind::ArchiveOrg && entry.media_id.external_id != url.as_str()
+    {
+        return Err("The saved archive.org file URL does not match its media identity".to_owned());
+    }
     Ok(HistoryReplayTarget::Remote(url))
 }
 
@@ -43408,6 +43511,15 @@ fn queue_item_from_playlist_entry(entry: &PlaylistEntry) -> Result<QueueItem, St
             stable_history_remote_url(&entry.media.id.source, &saved).ok_or_else(|| {
                 "The saved playlist has no credential-free stable replay URL".to_owned()
             })?;
+        if entry.media.id.source == SourceKind::ArchiveOrg
+            && (entry.media.id.external_id != stable.as_str()
+                || entry.media.webpage_url != stable
+                || entry.media.kind != MediaKind::Audio)
+        {
+            return Err(
+                "The saved archive.org file metadata does not match its media identity".to_owned(),
+            );
+        }
         (stable.clone(), stable.to_string())
     };
 
@@ -44556,6 +44668,7 @@ fn video_comments_popup(
         })
         .collect::<Vec<_>>();
     VideoCommentsPopupView {
+        source: SourceKind::YouTube,
         video_id,
         video_title,
         state: if comments.is_empty() {
@@ -53175,6 +53288,26 @@ mod tests {
         assert!(controller.lan_share_server.is_none());
         assert!(controller.view.lan_share_popup.is_none());
         assert_eq!(controller.view.status_line, "LAN sharing stopped");
+    }
+
+    #[test]
+    fn archive_org_popup_rejects_a_youtube_response_with_the_same_identifier() {
+        let (mut controller, _) = controller_with_mock_statuses([]);
+        let popup = VideoCommentsPopupView {
+            source: SourceKind::ArchiveOrg,
+            video_id: "dQw4w9WgXcQ".to_owned(),
+            video_title: "Archive item".to_owned(),
+            state: VideoCommentsPopupState::Loading,
+            ..VideoCommentsPopupView::default()
+        };
+        controller.view.video_comments_popup = Some(popup.clone());
+        controller.pending_youtube_video_comments = Some((7, popup.video_id.clone()));
+        controller.handle_provider_response(ProviderResponse::VideoComments {
+            generation: 7,
+            video_id: popup.video_id.clone(),
+            result: Ok(Vec::new()),
+        });
+        assert_eq!(controller.view.video_comments_popup, Some(popup));
     }
 
     #[test]
@@ -80667,6 +80800,285 @@ mod tests {
                 explicit: show.explicit,
             },
             episodes,
+        }
+    }
+
+    /// Persisted Archive files keep their validation even without the API adapter.
+    #[test]
+    fn archive_org_saved_replay_validation_does_not_depend_on_provider_feature() {
+        let canonical = "https://archive.org/download/fixture/01.mp3";
+        let history = HistoryEntry {
+            id: 1,
+            media_id: MediaId::new(SourceKind::ArchiveOrg, canonical),
+            title: "Fixture".to_owned(),
+            replay_locator: Some(canonical.to_owned()),
+            started_at: 1,
+            last_played_at: 2,
+            position_seconds: 0,
+            duration_seconds: None,
+            finished: false,
+        };
+        let playlist = PlaylistEntry {
+            media: PlaylistMediaSnapshot {
+                id: history.media_id.clone(),
+                kind: MediaKind::Audio,
+                title: history.title.clone(),
+                creator: None,
+                description: None,
+                webpage_url: url::Url::parse(canonical).unwrap(),
+                thumbnail_url: None,
+                duration_seconds: None,
+                replay_locator: canonical.to_owned(),
+            },
+            segment: None,
+            added_at: 1,
+        };
+        assert!(history_replay_target(&history).is_ok());
+        assert!(queue_item_from_playlist_entry(&playlist).is_ok());
+        for invalid in [
+            "https://archive.org/details/fixture",
+            "https://elsewhere.example/download/fixture/01.mp3",
+            "https://archive.org/download/fixture/01.mp3?token=secret",
+            "https://archive.org/download/fixture/02.opus",
+        ] {
+            let mut altered_history = history.clone();
+            altered_history.replay_locator = Some(invalid.to_owned());
+            assert!(
+                history_replay_target(&altered_history).is_err(),
+                "accepted History replay URL {invalid} without consistent file validation"
+            );
+            let mut altered_playlist = playlist.clone();
+            altered_playlist.media.replay_locator = invalid.to_owned();
+            altered_playlist.media.webpage_url = url::Url::parse(invalid).unwrap();
+            assert!(
+                queue_item_from_playlist_entry(&altered_playlist).is_err(),
+                "accepted playlist replay URL {invalid} without consistent file validation"
+            );
+        }
+        let mut altered_playlist = playlist;
+        altered_playlist.media.kind = MediaKind::Video;
+        assert!(queue_item_from_playlist_entry(&altered_playlist).is_err());
+    }
+
+    /// Saving History also enforces one identity for URL, metadata, and playback.
+    #[test]
+    fn archive_org_capture_locator_requires_exact_file_identity_in_all_builds() {
+        let canonical = "https://archive.org/download/fixture/01.mp3";
+        let history = HistoryEntry {
+            id: 1,
+            media_id: MediaId::new(SourceKind::ArchiveOrg, canonical),
+            title: "Fixture".to_owned(),
+            replay_locator: Some(canonical.to_owned()),
+            started_at: 1,
+            last_played_at: 2,
+            position_seconds: 0,
+            duration_seconds: None,
+            finished: false,
+        };
+        let original =
+            queue_item_from_history(&history, &history_replay_target(&history).unwrap()).unwrap();
+        assert_eq!(
+            history_replay_locator(&original).as_deref(),
+            Some(canonical)
+        );
+        let other = "https://archive.org/download/fixture/02.opus";
+        let mut changed_playback = original.clone();
+        changed_playback.playback_location = other.to_owned();
+        assert!(history_replay_locator(&changed_playback).is_none());
+        let mut changed_page = original.clone();
+        changed_page.media.webpage_url = url::Url::parse(other).unwrap();
+        assert!(history_replay_locator(&changed_page).is_none());
+        let mut changed_identity = original;
+        changed_identity.media.id.external_id = other.to_owned();
+        assert!(history_replay_locator(&changed_identity).is_none());
+    }
+
+    #[test]
+    fn archive_org_search_and_restart_routes_respect_feature_boundaries() {
+        assert_eq!(search_route(Screen::ArchiveOrg), SearchRoute::ArchiveOrg);
+        let expected_screen = if cfg!(feature = "archive-org") {
+            Screen::ArchiveOrg
+        } else {
+            Screen::Search
+        };
+        let expected_stored = if cfg!(feature = "archive-org") {
+            StoredScreen::ArchiveOrg
+        } else {
+            StoredScreen::Search
+        };
+        assert_eq!(
+            tui_screen_from_stored(&StoredScreen::ArchiveOrg),
+            expected_screen
+        );
+        assert_eq!(stored_screen_from_tui(Screen::ArchiveOrg), expected_stored);
+    }
+
+    #[cfg(not(feature = "archive-org"))]
+    #[test]
+    fn archive_org_disabled_build_preserves_independent_session_fields() {
+        let temporary = crate::test_support::canonical_tempdir("Archive disabled session");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open(&config).unwrap();
+        store
+            .save_session(
+                &SessionState {
+                    screen: StoredScreen::ArchiveOrg,
+                    search_text: "independent YouTube query".to_owned(),
+                    youtube_selected_row: Some(2),
+                    archive_org_selected_row: Some(17),
+                    archive_org_search_text: "preserve archive query".to_owned(),
+                    ..SessionState::default()
+                },
+                1,
+            )
+            .unwrap();
+        let mut controller = AppController::new(config, store, None, None);
+        assert!(controller.save_session());
+        let saved = controller.store.session().unwrap().unwrap();
+        assert_eq!(saved.archive_org_selected_row, Some(17));
+        assert_eq!(saved.archive_org_search_text, "preserve archive query");
+        assert_eq!(controller.view.screen, Screen::Search);
+        assert_eq!(controller.view.search_query, "independent YouTube query");
+        assert_eq!(saved.search_text, "independent YouTube query");
+    }
+
+    /// Two tracks share one large item description throughout list continuation.
+    #[cfg(feature = "archive-org")]
+    fn archive_org_replay_fixture() -> Arc<crate::providers::archive_org::ArchiveOrgItemDetails> {
+        Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "item": {
+                    "identifier": "fixture", "title": "Fixture collection",
+                    "description": "archival description ".repeat(2_000),
+                    "webpage_url": "https://archive.org/details/fixture",
+                    "collections": [], "topics": [], "languages": []
+                },
+                "tracks": [
+                    {"filename": "01.mp3", "title": "First",
+                        "download_url": "https://archive.org/download/fixture/01.mp3"},
+                    {"filename": "02.opus", "title": "Second",
+                        "download_url": "https://archive.org/download/fixture/02.opus"}
+                ],
+                "comments": []
+            }))
+            .unwrap(),
+        )
+    }
+
+    #[cfg(feature = "archive-org")]
+    #[test]
+    fn archive_org_autoplay_shares_metadata_and_advances_exact_track_identity() {
+        let (controller, _) = controller_with_mock_statuses([]);
+        let details = archive_org_replay_fixture();
+        let origin = AutoplayOrigin::ArchiveOrg {
+            details: Arc::clone(&details),
+            index: 0,
+        };
+        let AutoplayStep::Play { item, origin } = controller.next_autoplay_step(&origin) else {
+            panic!("Archive autoplay must advance to its next track");
+        };
+        assert_eq!(
+            item.media.id.external_id,
+            details.tracks[1].download_url.as_str()
+        );
+        assert_eq!(item.media.description, details.item.description);
+        let AutoplayOrigin::ArchiveOrg {
+            details: retained,
+            index,
+        } = &origin
+        else {
+            panic!("Archive autoplay must retain its original item");
+        };
+        assert!(Arc::ptr_eq(&details, retained));
+        assert_eq!(*index, 1);
+        assert!(matches!(
+            controller.next_autoplay_step(&origin),
+            AutoplayStep::Exhausted
+        ));
+    }
+
+    #[cfg(feature = "archive-org")]
+    #[test]
+    fn archive_org_history_and_playlist_replays_bypass_extraction_for_exact_files() {
+        let details = archive_org_replay_fixture();
+        let original = archive_org::queue_item(&details.item, &details.tracks[0]);
+        let url = original.playback_location.clone();
+        let snapshot = playlist_snapshot_from_queue_item(&original).unwrap();
+        assert_eq!(snapshot.replay_locator, url);
+        assert_eq!(snapshot.webpage_url.as_str(), url);
+        let playlist = queue_item_from_playlist_entry(&PlaylistEntry {
+            media: snapshot,
+            segment: None,
+            added_at: 1,
+        })
+        .unwrap();
+        let history = HistoryEntry {
+            id: 1,
+            media_id: original.media.id.clone(),
+            title: original.media.title.clone(),
+            replay_locator: Some(url.clone()),
+            started_at: 1,
+            last_played_at: 2,
+            position_seconds: 0,
+            duration_seconds: None,
+            finished: false,
+        };
+        let replay =
+            queue_item_from_history(&history, &history_replay_target(&history).unwrap()).unwrap();
+        let (mut controller, playback) = controller_with_mock_statuses([]);
+        for item in [original, playlist, replay] {
+            assert_eq!(item.media.id.external_id, url);
+            controller.play_queue_item(item, false);
+        }
+        let state = playback.lock().unwrap();
+        assert_eq!(state.played.len(), 3);
+        assert!(
+            state
+                .played
+                .iter()
+                .all(|input| input.location == url && input.bypass_ytdl)
+        );
+    }
+
+    #[cfg(feature = "archive-org")]
+    #[test]
+    fn archive_org_replays_reject_container_foreign_and_mismatched_file_urls() {
+        let details = archive_org_replay_fixture();
+        let original = archive_org::queue_item(&details.item, &details.tracks[0]);
+        let snapshot = playlist_snapshot_from_queue_item(&original).unwrap();
+        for invalid in [
+            "https://archive.org/details/fixture",
+            "https://elsewhere.example/download/fixture/01.mp3",
+            "https://archive.org/download/fixture/01.mp3?token=secret",
+            "https://archive.org/download/fixture/02.opus",
+        ] {
+            let history = HistoryEntry {
+                id: 1,
+                media_id: original.media.id.clone(),
+                title: "Fixture".to_owned(),
+                replay_locator: Some(invalid.to_owned()),
+                started_at: 1,
+                last_played_at: 2,
+                position_seconds: 0,
+                duration_seconds: None,
+                finished: false,
+            };
+            assert!(
+                history_replay_target(&history).is_err(),
+                "accepted History URL {invalid}"
+            );
+            let mut altered = snapshot.clone();
+            altered.replay_locator = invalid.to_owned();
+            altered.webpage_url = url::Url::parse(invalid).unwrap();
+            assert!(
+                queue_item_from_playlist_entry(&PlaylistEntry {
+                    media: altered,
+                    segment: None,
+                    added_at: 1,
+                })
+                .is_err(),
+                "accepted playlist URL {invalid}"
+            );
         }
     }
 

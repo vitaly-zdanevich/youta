@@ -221,6 +221,7 @@ export function HelpPopup({
   );
 }
 
+
 /** Review gate for a full-channel audio transfer. */
 export function ChannelDownloadPopup({ popup }: { popup: ChannelDownloadPopupView }) {
 	const estimate = popup.estimated_video_count === null
@@ -285,6 +286,7 @@ const COMMONS_LICENSE_LABELS = {
   CcBySa40: "Creative Commons Attribution-ShareAlike 4.0",
   Cc0: "CC0 1.0 public-domain dedication",
 } as const;
+
 
 /** One reducer-owned Commons text field; typing remains in the shared keymap. */
 function CommonsField({
@@ -1155,12 +1157,13 @@ export function ErrorPopup({
   );
 }
 
-/** Twenty bounded public comments for one selected video. */
+/** Bounded public YouTube comments or Archive.org item reviews. */
 export function VideoCommentsPopup({ popup }: { popup: VideoCommentsPopupView }) {
   const state = popup.state;
+	const archiveOrg = popup.source === 'archive-org';
   return (
     <Popup
-      title="Comments"
+      title={archiveOrg ? 'archive.org comments' : 'Comments'}
       subtitle={popup.video_title}
       layer={LAYER.videoComments}
       onDismiss={() => void dispatch("DismissVideoComments")}
@@ -1171,7 +1174,9 @@ export function VideoCommentsPopup({ popup }: { popup: VideoCommentsPopupView })
         </Body>
       ) : state === "Empty" ? (
         <Body>
-          <p className="text-ink-faint">This video has no public top-level comments.</p>
+					<p className='text-ink-faint'>
+						{archiveOrg ? 'This item has no public reviews.' : 'This video has no public top-level comments.'}
+					</p>
         </Body>
       ) : typeof state === "object" ? (
         <Body>
@@ -1189,7 +1194,10 @@ export function VideoCommentsPopup({ popup }: { popup: VideoCommentsPopupView })
             <div key={`${comment.author_name}-${index}`} className="mb-[8px]">
               <span className="text-accent">{comment.author_name}</span>
               <span className="text-ink-faint">
-                {` · ${comment.like_count} likes${comment.published ? ` · ${comment.published}` : ""}`}
+								{/* Archive review scores are not like counts. */}
+								{archiveOrg
+									? comment.published ? ` · ${comment.published}` : ''
+									: ` · ${comment.like_count} likes${comment.published ? ` · ${comment.published}` : ''}`}
               </span>
               {"\n"}
               <span className="text-ink-dim">{comment.text.trimEnd()}</span>
@@ -1339,6 +1347,7 @@ export function LanSharePopup({ popup }: { popup: LanSharePopupView }) {
 		</Popup>
 	);
 }
+
 
 /** Preference values are drafts until Save; a manual download check runs immediately. */
 export function PreferencesPopup({ popup }: { popup: PreferencesPopupView }) {

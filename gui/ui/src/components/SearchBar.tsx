@@ -116,6 +116,16 @@ export function SearchBar({
 			</button>
 		</>
       ) : null}
+			{view.screen === 'ArchiveOrg' ? (
+				<>
+					{view.search_activity === 'ArchiveOrg' ? (
+						<span role='status' aria-label='Loading archive.org' className='animate-spin text-accent'>◌</span>
+					) : null}
+					<button type='button' disabled={view.search_editing} onClick={() => void dispatch('GoBack')} className='shrink-0 text-[11px] text-accent disabled:opacity-50'>
+						[Esc] Back
+					</button>
+				</>
+			) : null}
       <span className="shrink-0 text-[11px] whitespace-nowrap text-ink-faint">
         {view.search_editing
           ? `Enter to ${verb.toLowerCase()} · Esc to cancel`

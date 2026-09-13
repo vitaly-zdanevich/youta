@@ -13,6 +13,25 @@ fn repository_path(relative: impl AsRef<Path>) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(relative)
 }
 
+/// Archive browsing is present by default without being forced by broad profiles.
+#[test]
+fn archive_org_is_default_but_independently_removable_in_both_frontends() {
+    let manifest = manifest();
+    assert!(feature_entries(&manifest, "default").contains(&"archive-org"));
+    for profile in ["app", "app-core", "sources", "controller", "tui"] {
+        assert!(
+            !feature_closure(&manifest, profile).contains("archive-org"),
+            "{profile}"
+        );
+    }
+    let archive = feature_closure(&manifest, "archive-org");
+    assert!(archive.contains("network"));
+    assert!(archive.contains("dep:html5gum"));
+    let gui: toml::Value = toml::from_str(&read_repository_file("gui/Cargo.toml")).unwrap();
+    assert!(feature_entries(&gui, "default").contains(&"archive-org"));
+    assert_eq!(feature_entries(&gui, "archive-org"), ["youta/archive-org"]);
+}
+
 /// Removing Web also removes its HTML parser without changing other sources.
 #[test]
 fn web_browser_is_default_but_independently_removable() {
@@ -108,6 +127,7 @@ fn default_release_features_keep_images_qr_and_sqlite_independent() {
     assert!(!text_only.contains("dep:mio"));
     assert!(!yandex_free.contains("gpm"));
     assert!(!yandex_free.contains("dep:mio"));
+    assert!(!tui.contains("dep:mio"));
     assert_eq!(feature_entries(&manifest, "gpm"), ["tui", "dep:mio"]);
     assert!(gpm.contains("tui"));
     assert!(gpm.contains("dep:mio"));
@@ -617,8 +637,14 @@ fn yandex_music_feature_and_credentials_remain_optional_and_documented() {
 
     let readme = read_repository_file("README.md");
     assert!(readme.contains("private client API"));
-    assert!(readme.contains("--features app,ascii-visualizer,audio-quality,commons-upload"));
-    assert!(readme.contains("--features app-core,ascii-visualizer,audio-quality,commons-upload"));
+    assert!(
+        readme.contains("--features app,archive-org,ascii-visualizer,audio-quality,commons-upload")
+    );
+    assert!(
+        readme.contains(
+            "--features app-core,archive-org,ascii-visualizer,audio-quality,commons-upload"
+        )
+    );
     assert!(readme.contains("Audiobook search is best-effort"));
     assert!(readme.contains("no stable first-class audiobook search or playback"));
 }
@@ -690,14 +716,14 @@ fn release_script_builds_gpm_and_linux_no_gpm_non_sqlite_executables() {
 
     assert!(!script.contains("--features bundled-sqlite"));
     for feature_set in [
-        "cargo_features=app,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,web-browser,youtube-captions",
-        "cargo_features=app,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,web-browser,youtube-captions",
-        "cargo_features=app,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,images,local-archives,nyan-cat,sponsorblock,summary,web-browser,youtube-captions",
-        "cargo_features=app,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,local-archives,nyan-cat,sponsorblock,summary,web-browser,youtube-captions",
-        "cargo_features=app,ascii-visualizer,audio-quality,commons-upload,evernote,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,web-browser,youtube-captions",
-        "cargo_features=app,ascii-visualizer,audio-quality,commons-upload,evernote,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,web-browser,youtube-captions",
-        "cargo_features=app,ascii-visualizer,audio-quality,commons-upload,evernote,images,local-archives,nyan-cat,sponsorblock,summary,web-browser,youtube-captions",
-        "cargo_features=app,ascii-visualizer,audio-quality,commons-upload,evernote,local-archives,nyan-cat,sponsorblock,summary,web-browser,youtube-captions",
+        "cargo_features=app,archive-org,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,web-browser,youtube-captions",
+        "cargo_features=app,archive-org,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,web-browser,youtube-captions",
+        "cargo_features=app,archive-org,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,images,local-archives,nyan-cat,sponsorblock,summary,web-browser,youtube-captions",
+        "cargo_features=app,archive-org,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,local-archives,nyan-cat,sponsorblock,summary,web-browser,youtube-captions",
+        "cargo_features=app,archive-org,ascii-visualizer,audio-quality,commons-upload,evernote,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,web-browser,youtube-captions",
+        "cargo_features=app,archive-org,ascii-visualizer,audio-quality,commons-upload,evernote,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,web-browser,youtube-captions",
+        "cargo_features=app,archive-org,ascii-visualizer,audio-quality,commons-upload,evernote,images,local-archives,nyan-cat,sponsorblock,summary,web-browser,youtube-captions",
+        "cargo_features=app,archive-org,ascii-visualizer,audio-quality,commons-upload,evernote,local-archives,nyan-cat,sponsorblock,summary,web-browser,youtube-captions",
     ] {
         assert!(
             script
@@ -896,14 +922,14 @@ fn workflows_validate_and_publish_the_documented_platform_contract() {
     assert!(ci.contains("sudo apt-get install --yes gcc-multilib libc6-dev-i386"));
     assert!(ci.contains("cargo build --locked --release --target i686-unknown-linux-gnu"));
     for feature_set in [
-        "app,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary",
-        "app,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary",
-        "app,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,images,local-archives,nyan-cat,sponsorblock,summary",
-        "app,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,local-archives,nyan-cat,sponsorblock,summary",
-        "app,ascii-visualizer,audio-quality,commons-upload,evernote,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary",
-        "app,ascii-visualizer,audio-quality,commons-upload,evernote,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary",
-        "app,ascii-visualizer,audio-quality,commons-upload,evernote,images,local-archives,nyan-cat,sponsorblock,summary",
-        "app,ascii-visualizer,audio-quality,commons-upload,evernote,local-archives,nyan-cat,sponsorblock,summary",
+        "app,archive-org,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary",
+        "app,archive-org,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary",
+        "app,archive-org,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,images,local-archives,nyan-cat,sponsorblock,summary",
+        "app,archive-org,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,local-archives,nyan-cat,sponsorblock,summary",
+        "app,archive-org,ascii-visualizer,audio-quality,commons-upload,evernote,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary",
+        "app,archive-org,ascii-visualizer,audio-quality,commons-upload,evernote,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary",
+        "app,archive-org,ascii-visualizer,audio-quality,commons-upload,evernote,images,local-archives,nyan-cat,sponsorblock,summary",
+        "app,archive-org,ascii-visualizer,audio-quality,commons-upload,evernote,local-archives,nyan-cat,sponsorblock,summary",
     ] {
         assert!(
             ci.contains(&format!(
@@ -1550,6 +1576,34 @@ fn live_wikidata_workflow_retries_each_probe_independently() {
                 .count(),
             1,
             "`{step_name}` chains another live Wikidata test inside its retry boundary"
+        );
+    }
+}
+/// Every explicit 32-bit release variant keeps the default-on Archive provider.
+#[test]
+fn i686_release_variants_include_archive_org() {
+    let workflow = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows/ci.yml"),
+    )
+    .expect("repository CI workflow");
+    let variants = workflow.lines().filter(|line| {
+        line.contains("cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features ")
+    }).collect::<Vec<_>>();
+    assert_eq!(
+        variants.len(),
+        8,
+        "check all published 32-bit feature variants"
+    );
+    for variant in variants {
+        let features = variant
+            .split_once("--features ")
+            .unwrap()
+            .1
+            .split(',')
+            .collect::<Vec<_>>();
+        assert!(
+            features.contains(&"archive-org"),
+            "release variant omits the default Archive provider: {variant}"
         );
     }
 }

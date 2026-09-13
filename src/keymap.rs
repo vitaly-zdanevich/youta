@@ -14,7 +14,6 @@
 use serde::{Deserialize, Serialize};
 
 use crate::config::SubscriptionsLayout;
-use crate::domain::SourceKind;
 use crate::subscriptions::SubscriptionKind;
 use crate::view::*;
 
@@ -1077,6 +1076,7 @@ fn unfiltered_key_action(
     if let Some(popup) = view.video_comments_popup.as_ref() {
         return video_comments_key_action(key, popup.scroll_offset, usize::MAX, 20);
     }
+
     #[cfg(feature = "commons-upload")]
     if let Some(popup) = view.commons_upload_popup.as_ref() {
         if popup.phase == CommonsUploadPhase::Complete {
@@ -1572,10 +1572,9 @@ fn unfiltered_key_action(
         Key::Char('Q')
             if !key.chorded()
                 && view.details.as_ref().is_some_and(|details| {
-                    details
-                        .media_id
-                        .as_ref()
-                        .is_some_and(|media_id| media_id.source == SourceKind::YouTube)
+                    details.media_id.as_ref().is_some_and(|media_id| {
+                        media_id.source == crate::domain::SourceKind::YouTube
+                    })
                 }) =>
         {
             Some(UiAction::OpenVideoQr)
@@ -1638,6 +1637,7 @@ fn unfiltered_key_action(
         Key::Char('E') if !key.chorded() && view.evernote_available => {
             Some(UiAction::OpenEvernoteNote)
         }
+
         Key::Char('l') if view.playlist_item.is_some() && !key.modified() => {
             Some(UiAction::ToggleTodoPlaylist)
         }
@@ -1803,7 +1803,14 @@ fn unfiltered_key_action(
             Some(UiAction::GoBack)
         }
         Key::Esc if view.playlist_back_available => Some(UiAction::GoBack),
-        Key::Esc if matches!(view.screen, Screen::LibriVox | Screen::Web) => Some(UiAction::GoBack),
+        Key::Esc
+            if matches!(
+                view.screen,
+                Screen::ArchiveOrg | Screen::LibriVox | Screen::Web
+            ) =>
+        {
+            Some(UiAction::GoBack)
+        }
         Key::Esc if view.screen == Screen::Local => Some(UiAction::OpenLocalParent),
         Key::Up if alt && details_line_scroll_available => {
             Some(UiAction::ScrollDetails(DetailsScroll::Lines(-1)))
@@ -1828,7 +1835,8 @@ fn unfiltered_key_action(
         Key::PageUp
             if matches!(
                 view.screen,
-                Screen::LibriVox
+                Screen::ArchiveOrg
+                    | Screen::LibriVox
                     | Screen::Local
                     | Screen::Web
                     | Screen::Radio
@@ -1842,7 +1850,8 @@ fn unfiltered_key_action(
         Key::PageDown
             if matches!(
                 view.screen,
-                Screen::LibriVox
+                Screen::ArchiveOrg
+                    | Screen::LibriVox
                     | Screen::Local
                     | Screen::Web
                     | Screen::Radio
@@ -1857,17 +1866,7 @@ fn unfiltered_key_action(
         Key::End if view.details_focused => Some(UiAction::ScrollDetails(DetailsScroll::End)),
         Key::Char('j') => Some(UiAction::MoveSelection(1)),
         Key::Char('k') => Some(UiAction::MoveSelection(-1)),
-        Key::F(6)
-            if view.video_comments_available
-                && view.details.as_ref().is_some_and(|details| {
-                    details
-                        .media_id
-                        .as_ref()
-                        .is_some_and(|media_id| media_id.source == SourceKind::YouTube)
-                }) =>
-        {
-            Some(UiAction::OpenVideoComments)
-        }
+        Key::F(6) if view.public_comments_available() => Some(UiAction::OpenVideoComments),
         Key::Char('G') if !key.chorded() && view.video_summary_available => {
             Some(UiAction::GenerateVideoSummary)
         }
