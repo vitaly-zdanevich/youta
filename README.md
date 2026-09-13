@@ -2296,6 +2296,66 @@ list before publication, so a missing architecture or bundle fails the release
 instead of shrinking it. Checksum sidecars are not attached because GitHub's
 Digest column already displays each published file's SHA-256 value.
 
+### crates.io publishing
+
+The release workflow supports both `youta` and `youta-gui`. Once configured,
+each successful tagged GitHub release publishes the matching crate versions.
+Branch and pull-request CI verifies both packages without uploading anything.
+[Cargo's workspace publishing](https://blog.rust-lang.org/2025/09/18/Rust-1.90.0/)
+checks both archives before uploading, publishes the core before the GUI, and
+waits for the dependency to become available. The package list is explicit, so
+adding another workspace member does not silently publish it.
+
+The GUI crate contains the built web interface; installing it does not require
+Node or npm. After the first publication, use `cargo install --locked youta`
+or `cargo install --locked youta-gui`. The GUI still needs the platform's
+[native build prerequisites](https://v2.tauri.app/start/prerequisites/), including
+GTK 3, WebKitGTK 4.1 and D-Bus development files on Linux. Cargo installs an
+executable, not the desktop installers listed above. Playback still uses mpv
+and the relevant source helpers.
+
+Maintainer setup is required once:
+
+1. Leave the repository Actions variable `PUBLISH_CRATES_IO` unset while
+   creating the first tagged release with this workflow. Its GitHub artifacts
+   publish normally; the registry upload job remains disabled.
+2. Sign in to [crates.io](https://crates.io/settings), verify your email, and
+   create a short-lived [API token](https://crates.io/settings/tokens) that can
+   publish both new crate names. From a clean checkout of that released tag,
+   use `cargo login` to enter the token locally. Do not paste it into issues or
+   commit it. With Rust 1.95, Node 24 and the native GUI prerequisites installed,
+   bootstrap both packages:
+
+   ```sh
+   test -z "$(git status --porcelain --untracked-files=all)"
+   npm --prefix gui/ui ci
+   npm --prefix gui/ui run build
+   test -s gui/frontend/index.html
+   test -s gui/frontend/app.js
+   test -s gui/frontend/app.css
+   test -z "$(git status --porcelain --untracked-files=all)"
+   cargo publish --dry-run --locked --package youta --package youta-gui --registry crates-io --allow-dirty
+   cargo publish --locked --package youta --package youta-gui --registry crates-io --allow-dirty
+   cargo logout
+   ```
+
+   `--allow-dirty` is needed only because Cargo counts the explicitly included,
+   Git-ignored frontend output as dirty. The source-cleanliness and asset checks
+   are required; do not use this flag to publish unreviewed edits.
+3. For **each** crate, configure
+   [Trusted Publishing](https://crates.io/docs/trusted-publishing) with owner
+   `vitaly-zdanevich`, repository `youta`, workflow `release.yml`, and no
+   environment. Revoke the bootstrap API token, then set the repository Actions
+   variable `PUBLISH_CRATES_IO` to `true`. Subsequent version tags publish both
+   crates using short-lived credentials, without a permanent GitHub secret.
+
+Registry versions cannot be overwritten, and publishing two crates is not an
+atomic registry transaction. If publication partly succeeds or times out,
+inspect both crates' versions before retrying; publish only a missing package
+from the same tag. The workflow reports errors rather than hiding them or
+replacing an existing version. Keep the GUI's exact core dependency version
+synchronized when bumping the release.
+
 ### Desktop and platform checks
 
 The window has its own CI lane on Linux, macOS, and Windows, which compiles it,

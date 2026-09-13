@@ -441,7 +441,7 @@ jobs:
           rustup toolchain install "${RUST_VERSION}" --profile minimal
           rustup default "${RUST_VERSION}"
 
-      # Node ships with every hosted runner image, and this workflow avoids
+      # Node ships with every hosted runner image, and this desktop job avoids
       # setup actions on purpose, exactly as the Rust toolchain step does.
       - name: Report the Node used to build the window page
         run: |
@@ -887,3 +887,73 @@ jobs:
               --verify-tag \
               --generate-notes
           fi
+
+  publish-crates:
+    name: Publish terminal and GUI crates
+    needs: publish
+    # Enable after both crates have their one-time bootstrap and trusted
+    # publisher mappings; unset must not break existing GitHub releases.
+    if: >-
+      github.repository == 'vitaly-zdanevich/youta' && startsWith(github.ref, 'refs/tags/v') && vars.PUBLISH_CRATES_IO == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      group: crates-io-${{ github.repository }}-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - name: Check out the validated release revision
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 10
+          persist-credentials: false
+
+      - name: Install Node for the packaged GUI page
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      - name: Install the release Rust toolchain
+        run: |
+          rustup toolchain install "${RUST_VERSION}" --profile minimal
+          rustup default "${RUST_VERSION}"
+
+      - name: Install native GUI build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev libdbus-1-dev
+
+      - name: Build and check the packaged GUI page
+        run: |
+          test -z "$(git status --porcelain --untracked-files=all)"
+          node --version
+          npm --prefix gui/ui ci
+          npm --prefix gui/ui run build
+          test -s gui/frontend/index.html
+          test -s gui/frontend/app.js
+          test -s gui/frontend/app.css
+          test -z "$(git status --porcelain --untracked-files=all)"
+
+      # Included, gitignored frontend files count as dirty to Cargo. The checks
+      # above permit only ignored build output, never edited/untracked sources.
+      # Cargo's temporary registry verifies both crates before either upload.
+      - name: Verify both registry packages
+        run: cargo publish --dry-run --locked --package youta --package youta-gui --registry crates-io --allow-dirty
+
+      - name: Obtain a short-lived crates.io token
+        id: auth
+        # v1.0.5 uses Node 24 and revokes its token in the post-job step.
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18
+
+      # Cargo orders these by dependency and waits for the core registry entry.
+      # Fail on registry errors; never conceal a partial or duplicate publish.
+      - name: Publish both crates to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish --locked --package youta --package youta-gui --registry crates-io --allow-dirty

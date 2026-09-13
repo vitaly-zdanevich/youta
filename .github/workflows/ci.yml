@@ -336,6 +336,17 @@ jobs:
       - name: Test the desktop crate without default capabilities
         run: cargo test --locked -p youta-gui --all-targets --no-default-features
 
+      # Exercise registry packaging on branches and pull requests without any
+      # publishing credentials. Cargo supplies a temporary registry for core.
+      - name: Verify both crates.io packages without uploading
+        if: runner.os == 'Linux'
+        run: |
+          test -s gui/frontend/index.html
+          test -s gui/frontend/app.js
+          test -s gui/frontend/app.css
+          test -z "$(git status --porcelain --untracked-files=all)"
+          cargo publish --dry-run --locked --package youta --package youta-gui --registry crates-io --allow-dirty
+
       - name: Run blocking Clippy lint groups on the desktop crate
         run: >-
           cargo clippy --locked -p youta-gui --all-targets --
