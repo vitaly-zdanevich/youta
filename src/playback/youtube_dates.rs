@@ -10,6 +10,9 @@ use std::time::Duration;
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use serde::Deserialize;
 
+use super::ytdlp::{
+    MAX_PODCAST_DESCRIPTION_BYTES, MAX_PODCAST_METADATA_BYTES, YouTubeEpisodeMetadata,
+};
 use super::{PlaybackError, Result};
 
 const PLAYER_ENDPOINT: &str = "https://www.youtube.com/youtubei/v1/player";
@@ -23,10 +26,14 @@ const DATE_FIELDS: &str = "videoDetails(videoId),microformat/playerMicroformatRe
 /// A stale version must fail back to yt-dlp, never require private credentials.
 const WEB_CLIENT_VERSION: &str = "2.20260708.00.00";
 
+/// Full text and date share one response, excluding all stream formats and URLs.
+const PODCAST_FIELDS: &str = "videoDetails(videoId,shortDescription),microformat/playerMicroformatRenderer(uploadDate,publishDate,liveBroadcastDetails,externalVideoId)";
+
 /// Connection-pooled requests for exact YouTube episode dates without login.
 ///
 /// Clones share the same HTTP agent and its idle connections. Responses are
-/// limited to 16 KiB and five seconds; redirects are disabled. No saved/browser
+/// limited to 16 KiB for dates or 512 KiB for full podcast metadata, with a shared
+/// five-second deadline; redirects are disabled. No saved/browser
 /// cookies or account credentials are loaded or required. With cookie support
 /// enabled, the fresh agent may retain anonymous visitor cookies from YouTube.
 #[derive(Clone)]
@@ -53,6 +60,32 @@ impl YouTubeDateClient {
         }
     }
 
+    /// Fetches full episode text and its exact date in one public metadata request.
+    ///
+    /// Player `shortDescription` is the video's complete plain-text description,
+    /// unlike the truncated `descriptionSnippet` returned by flat channel lists.
+    /// A missing/null field requires the extractor fallback, while empty text is
+    /// complete. Oversized descriptions are rejected rather than truncated.
+    pub(crate) fn podcast_metadata(&self, video_id: &str) -> Result<YouTubeEpisodeMetadata> {
+        let bytes =
+            self.fetch_response(video_id, PODCAST_FIELDS, MAX_PODCAST_METADATA_BYTES as u64)?;
+        let response = parse_response(&bytes)?;
+        let published_at = response_publication_date(&response, video_id)?;
+        let description = response
+            .video_details
+            .short_description
+            .ok_or_else(|| protocol_error("YouTube did not provide a full episode description"))?;
+        if description.len() > MAX_PODCAST_DESCRIPTION_BYTES {
+            return Err(protocol_error(
+                "YouTube full episode description exceeds the metadata limit",
+            ));
+        }
+        Ok(YouTubeEpisodeMetadata {
+            published_at: Some(published_at),
+            description: Some(description),
+        })
+    }
+
     /// Fetches a public video's exact UTC publication time without media work.
     ///
     /// Live/premiere start timestamps take precedence over upload timestamps,
@@ -66,6 +99,14 @@ impl YouTubeDateClient {
     /// exclude remote response bodies and transport details so callers can safely
     /// fall back to their existing metadata extractor.
     pub(crate) fn publication_date(&self, video_id: &str) -> Result<i64> {
+        parse_publication_date(
+            &self.fetch_response(video_id, DATE_FIELDS, MAX_RESPONSE_BYTES)?,
+            video_id,
+        )
+    }
+
+    /// Requests only the needed public fields under the existing connection/deadline policy.
+    fn fetch_response(&self, video_id: &str, fields: &str, limit: u64) -> Result<Vec<u8>> {
         if video_id.len() != 11
             || !video_id
                 .bytes()
@@ -85,7 +126,7 @@ impl YouTubeDateClient {
             .agent
             .post(&self.endpoint)
             .query("prettyPrint", "false")
-            .query("fields", DATE_FIELDS)
+            .query("fields", fields)
             .header("Origin", "https://www.youtube.com")
             .header("Accept", "application/json")
             .send_json(&payload)
@@ -99,12 +140,12 @@ impl YouTubeDateClient {
         let bytes = response
             .body_mut()
             .with_config()
-            .limit(MAX_RESPONSE_BYTES)
+            .limit(limit)
             .read_to_vec()
             .map_err(|_| {
                 protocol_error("YouTube publication-date response was unavailable or too large")
             })?;
-        parse_publication_date(&bytes, video_id)
+        Ok(bytes)
     }
 }
 
@@ -121,6 +162,7 @@ struct PlayerResponse {
 #[serde(default, rename_all = "camelCase")]
 struct VideoIdentity {
     video_id: Option<String>,
+    short_description: Option<String>,
 }
 
 /// Microformat envelope supplied by the public WEB player.
@@ -149,9 +191,18 @@ struct LiveDates {
 
 /// Checks every supplied identity before interpreting the matched episode dates.
 fn parse_publication_date(bytes: &[u8], video_id: &str) -> Result<i64> {
-    let response: PlayerResponse = serde_json::from_slice(bytes)
-        .map_err(|_| protocol_error("YouTube publication-date endpoint returned invalid JSON"))?;
-    let dates = response.microformat.player_microformat_renderer;
+    response_publication_date(&parse_response(bytes)?, video_id)
+}
+
+/// Decodes selected public fields once for either the date-only or full-text path.
+fn parse_response(bytes: &[u8]) -> Result<PlayerResponse> {
+    serde_json::from_slice(bytes)
+        .map_err(|_| protocol_error("YouTube publication-date endpoint returned invalid JSON"))
+}
+
+/// Validates all response identities before using any associated publication metadata.
+fn response_publication_date(response: &PlayerResponse, video_id: &str) -> Result<i64> {
+    let dates = &response.microformat.player_microformat_renderer;
     let identities = [
         response.video_details.video_id.as_deref(),
         dates.external_video_id.as_deref(),
@@ -164,13 +215,13 @@ fn parse_publication_date(bytes: &[u8], video_id: &str) -> Result<i64> {
         ));
     }
     [
-        dates.live_broadcast_details.start_timestamp,
-        dates.upload_date,
-        dates.publish_date,
+        dates.live_broadcast_details.start_timestamp.as_deref(),
+        dates.upload_date.as_deref(),
+        dates.publish_date.as_deref(),
     ]
     .into_iter()
     .flatten()
-    .find_map(|raw| parse_exact_date(&raw))
+    .find_map(parse_exact_date)
     .ok_or_else(|| {
         protocol_error("YouTube did not provide an exact publication date for the episode")
     })
@@ -253,6 +304,69 @@ mod tests {
         let mut client = YouTubeDateClient::new();
         client.endpoint = endpoint;
         (client, worker)
+    }
+
+    #[test]
+    fn podcast_metadata_keeps_full_unicode_description_in_one_anonymous_request() {
+        let full = format!(
+            "{}END OF FULL DESCRIPTION",
+            "История & <chapter> 世界\n".repeat(800)
+        );
+        let body = serde_json::json!({
+            "videoDetails": {"videoId": "00000000000", "shortDescription": full},
+            "microformat": {"playerMicroformatRenderer": {"uploadDate": "2024-02-29"}}
+        })
+        .to_string();
+        assert!(body.len() > 16 * 1024);
+        let (client, worker) = mock_response("200 OK", &body);
+        let metadata = client.podcast_metadata("00000000000");
+        let request = worker.join().unwrap();
+        let metadata = metadata.expect("full descriptions use a bounded larger response budget");
+        assert_eq!(metadata.description.as_deref(), Some(full.as_str()));
+        assert_eq!(metadata.published_at, Some(1_709_164_800));
+        assert!(request.contains("shortDescription"));
+        assert!(!request.to_ascii_lowercase().contains("\r\ncookie:"));
+        assert!(!request.to_ascii_lowercase().contains("\r\nauthorization:"));
+    }
+
+    #[test]
+    fn podcast_metadata_distinguishes_known_empty_from_missing_text() {
+        for description in [serde_json::Value::Null, serde_json::json!("")] {
+            let body = serde_json::json!({
+                "videoDetails": {"videoId": "00000000000", "shortDescription": description},
+                "microformat": {"playerMicroformatRenderer": {"uploadDate": "2024-02-29"}}
+            })
+            .to_string();
+            let (client, worker) = mock_response("200 OK", &body);
+            let result = client.podcast_metadata("00000000000");
+            worker.join().unwrap();
+            if description.is_null() {
+                assert!(
+                    result.is_err(),
+                    "missing description must use the extractor fallback"
+                );
+            } else {
+                assert_eq!(result.unwrap().description.as_deref(), Some(""));
+            }
+        }
+    }
+
+    #[test]
+    fn podcast_metadata_rejects_wrong_identity_and_oversized_full_text() {
+        for (id, description) in [
+            ("00000000001", "Wrong item".to_owned()),
+            ("00000000000", "x".repeat(MAX_PODCAST_DESCRIPTION_BYTES + 1)),
+            ("00000000000", "x".repeat(MAX_PODCAST_METADATA_BYTES + 1)),
+        ] {
+            let body = serde_json::json!({
+                "videoDetails": {"videoId": id, "shortDescription": description},
+                "microformat": {"playerMicroformatRenderer": {"uploadDate": "2024-02-29"}}
+            })
+            .to_string();
+            let (client, worker) = mock_response("200 OK", &body);
+            assert!(client.podcast_metadata("00000000000").is_err());
+            worker.join().unwrap();
+        }
     }
 
     #[test]

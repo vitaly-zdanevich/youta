@@ -10,11 +10,14 @@ mod socket_io;
 use socket_io::HttpStream;
 
 use chrono::{DateTime, Datelike, Utc};
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
@@ -29,10 +32,14 @@ use crate::playback::youtube_prewarm::{
     PrewarmedYouTubeAudio, YouTubePlayerClientPolicy, YouTubePrewarmCancellation,
     YouTubePrewarmConfig, YouTubePrewarmRequest, YouTubePrewarmResolver,
 };
-use crate::playback::ytdlp::ExtractedCollection;
+use crate::playback::ytdlp::{ExtractedCollection, MAX_PODCAST_DESCRIPTION_TOTAL_BYTES};
 use crate::providers::validate_youtube_video_id;
 
 const MAX_SHARED_FILES: usize = 10_000;
+/// Complete serialized XML is rendered once per immutable server.
+const MAX_PODCAST_RSS_BYTES: usize = 64 * 1024 * 1024;
+/// Caps tag parsing work, never an accepted description's text length.
+const MAX_LOCAL_PODCAST_TAG_BYTES: usize = 16 * 1024 * 1024;
 /// Includes active transfers, bounded per-class waiters, and header/control work.
 const MAX_CONCURRENT_CONNECTIONS: usize = 32;
 const MAX_MEDIA_CONNECTIONS: usize = 8;
@@ -81,6 +88,8 @@ pub enum LanShareKind {
 pub struct PreparedLocalShare {
     kind: LanShareKind,
     title: String,
+    /// Complete source description; `None` retains the generated fallback.
+    description: Option<String>,
     feed_artwork_route: Option<String>,
     files: Vec<SharedFile>,
     artwork: Vec<SharedArtwork>,
@@ -128,7 +137,7 @@ impl LanShareServer {
             LanShareKind::Files => format!("{base_url}/"),
             LanShareKind::Podcast => format!("{base_url}/feed.xml"),
         };
-        let state = Arc::new(ServerState::new(prepared, base_url));
+        let state = Arc::new(ServerState::new(prepared, base_url)?);
         let remote_cancellation = state
             .remote
             .as_ref()
@@ -186,6 +195,8 @@ pub fn prepare_file_share(target: &Path) -> io::Result<PreparedLocalShare> {
 /// remains the fallback used by Youta's normal local-artwork policy.
 /// Episode dates use each file's modification time; a filesystem does not
 /// reliably expose the audio's original publication date.
+/// Embedded podcast notes, descriptions, or comments are retained in full;
+/// malformed or unsupported tags retain the generated episode fallback.
 ///
 /// # Errors
 ///
@@ -274,6 +285,7 @@ fn prepare_local_share(
     let mut artwork = Vec::new();
     let mut artwork_routes: HashMap<PathBuf, String> = HashMap::new();
     let mut files = Vec::with_capacity(paths.len());
+    let mut description_bytes = 0;
     for (index, (path, label)) in paths.into_iter().enumerate() {
         let metadata = fs::metadata(&path)?;
         let route = format!(
@@ -306,6 +318,12 @@ fn prepare_local_share(
                     Some(route)
                 })
         });
+        let description = if podcast {
+            local_podcast_description(&path)?
+        } else {
+            None
+        };
+        add_podcast_description_bytes(&mut description_bytes, description.as_deref())?;
         let published_at = if podcast {
             Some(local_podcast_date(metadata.modified()?)?)
         } else {
@@ -318,6 +336,7 @@ fn prepare_local_share(
         files.push(SharedFile {
             guid: local_guid(&path, &metadata),
             label,
+            description,
             published_at,
             length: metadata.len(),
             mime: mime_type(&path),
@@ -333,6 +352,7 @@ fn prepare_local_share(
             LanShareKind::Files
         },
         title,
+        description: None,
         feed_artwork_route: if podcast {
             files.iter().find_map(|file| file.artwork_route.clone())
         } else {
@@ -498,6 +518,8 @@ fn prepare_youtube_podcast_share_with_boundary(
         youtube_podcast_episode_indices(&collection, first_video_id, skip_shorts)?
             .into_iter()
             .collect::<HashSet<_>>();
+    let mut description_bytes = 0;
+    add_podcast_description_bytes(&mut description_bytes, collection.description.as_deref())?;
     let title = if collection.title.trim().is_empty() {
         "YouTube channel".to_owned()
     } else {
@@ -520,6 +542,7 @@ fn prepare_youtube_podcast_share_with_boundary(
         if !retained_indices.contains(&entry_index) {
             continue;
         }
+        add_podcast_description_bytes(&mut description_bytes, entry.description.as_deref())?;
         let published_at = entry
             .published_at
             .and_then(rss_publication_date)
@@ -545,6 +568,7 @@ fn prepare_youtube_podcast_share_with_boundary(
         files.push(SharedFile {
             guid: format!("urn:youta:youtube:{}", entry.id),
             label,
+            description: entry.description,
             published_at: Some(published_at),
             length: 0,
             mime: YOUTUBE_PODCAST_MIME,
@@ -581,6 +605,7 @@ fn prepare_youtube_podcast_share_with_boundary(
     Ok(PreparedLocalShare {
         kind: LanShareKind::Podcast,
         title,
+        description: collection.description,
         feed_artwork_route,
         files,
         artwork,
@@ -638,6 +663,118 @@ fn collect_files(
     Ok(())
 }
 
+/// Reads complete embedded notes without decoding audio or shortening text.
+///
+/// Full podcast notes take precedence over descriptions and comments.
+/// Unsupported or malformed tags leave the existing fallback available;
+/// exceeding a parsing safety bound fails instead of shortening notes.
+fn local_podcast_description(path: &Path) -> io::Result<Option<String>> {
+    use lofty::config::{GlobalOptions, ParseOptions, apply_global_options};
+    use lofty::error::ErrorKind;
+    use lofty::file::{FileType, TaggedFileExt};
+    use lofty::probe::Probe;
+    use lofty::tag::ItemKey;
+
+    let file = File::open(path)?;
+    let _reset = LocalPodcastTagOptionsReset;
+    apply_global_options(
+        GlobalOptions::new()
+            .allocation_limit(MAX_LOCAL_PODCAST_TAG_BYTES)
+            .use_custom_resolvers(false)
+            .preserve_format_specific_items(false),
+    );
+    let limit_hit = Rc::new(Cell::new(false));
+    let result = (|| -> lofty::error::Result<_> {
+        let reader = LocalPodcastTagReader {
+            inner: BufReader::new(file),
+            remaining: MAX_LOCAL_PODCAST_TAG_BYTES,
+            limit_hit: Rc::clone(&limit_hit),
+        };
+        let mut probe = Probe::new(reader)
+            .options(
+                ParseOptions::new()
+                    .read_properties(false)
+                    .read_cover_art(false),
+            )
+            .guess_file_type()?;
+        if probe.file_type().is_none()
+            && let Some(file_type) = FileType::from_path(path)
+        {
+            probe = probe.set_file_type(file_type);
+        }
+        probe.read()
+    })();
+    // Some tolerant tag parsers recover from I/O errors. A read-limit hit
+    // must still reject the manifest rather than retain partial metadata.
+    if limit_hit.get() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "local podcast metadata exceeds the safe parsing limit",
+        ));
+    }
+    match result {
+        Ok(tagged) => Ok([
+            ItemKey::PodcastDescription,
+            ItemKey::Description,
+            ItemKey::Comment,
+        ]
+        .into_iter()
+        .find_map(|key| tagged.tags().iter().find_map(|tag| tag.get_string(key)))
+        .map(str::to_owned)),
+        Err(error)
+            if matches!(error.kind(), ErrorKind::TooMuchData | ErrorKind::Alloc(_))
+                || matches!(error.kind(), ErrorKind::Io(error) if error.kind() == io::ErrorKind::FileTooLarge) =>
+        {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "local podcast metadata exceeds the safe parsing limit",
+            ))
+        }
+        Err(_) => Ok(None),
+    }
+}
+
+/// Keeps tag parsing bounded even when a malformed file repeatedly seeks.
+struct LocalPodcastTagReader<R> {
+    inner: R,
+    remaining: usize,
+    limit_hit: Rc<Cell<bool>>,
+}
+
+impl<R: Read> Read for LocalPodcastTagReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        if self.remaining == 0 {
+            self.limit_hit.set(true);
+            return Err(io::Error::new(
+                io::ErrorKind::FileTooLarge,
+                "podcast tag read limit exceeded",
+            ));
+        }
+        let allowed = buffer.len().min(self.remaining);
+        let read = self.inner.read(&mut buffer[..allowed])?;
+        self.remaining -= read;
+        Ok(read)
+    }
+}
+
+impl<R: Seek> Seek for LocalPodcastTagReader<R> {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        self.inner.seek(position)
+    }
+}
+
+/// Restores Lofty's thread-local defaults after the isolated metadata read.
+struct LocalPodcastTagOptionsReset;
+
+impl Drop for LocalPodcastTagOptionsReset {
+    fn drop(&mut self) {
+        lofty::config::apply_global_options(lofty::config::GlobalOptions::default());
+    }
+}
+
 fn is_playable(path: &Path) -> bool {
     classify_local_file(path).is_some_and(LocalEntryKind::is_playable)
 }
@@ -667,10 +804,72 @@ fn rss_publication_date(seconds: i64) -> Option<DateTime<Utc>> {
     DateTime::from_timestamp(seconds, 0).filter(|date| (1900..=9999).contains(&date.year()))
 }
 
+/// Accounts retained text and rejects XML-invalid data without clipping.
+fn add_podcast_description_bytes(total: &mut usize, description: Option<&str>) -> io::Result<()> {
+    let Some(description) = description else {
+        return Ok(());
+    };
+    if description.chars().any(|character| !matches!(character,
+        '\u{9}' | '\u{a}' | '\u{d}' | '\u{20}'..='\u{d7ff}' | '\u{e000}'..='\u{fffd}' | '\u{10000}'..='\u{10ffff}')) {
+        return Err(io::Error::new(io::ErrorKind::InvalidData,
+            "podcast description contains characters invalid in XML 1.0"));
+    }
+    *total = total
+        .checked_add(description.len())
+        .filter(|bytes| *bytes <= MAX_PODCAST_DESCRIPTION_TOTAL_BYTES)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "podcast descriptions exceed the 32 MiB total text limit; choose a smaller episode range",
+            )
+        })?;
+    Ok(())
+}
+
+/// Escapes borrowed XML text directly; CR references preserve source line endings.
+struct XmlText<'a>(&'a str);
+impl fmt::Display for XmlText<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut start = 0;
+        for (index, character) in self.0.char_indices() {
+            let escaped = match character {
+                '&' => "&amp;",
+                '<' => "&lt;",
+                '>' => "&gt;",
+                '"' => "&quot;",
+                '\'' => "&apos;",
+                '\r' => "&#13;",
+                _ => continue,
+            };
+            formatter.write_str(&self.0[start..index])?;
+            formatter.write_str(escaped)?;
+            start = index + character.len_utf8();
+        }
+        formatter.write_str(&self.0[start..])
+    }
+}
+
+/// Allocation-free first pass caps the complete RSS body after XML expansion.
+struct RssSize {
+    bytes: usize,
+}
+impl fmt::Write for RssSize {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        self.bytes = self
+            .bytes
+            .checked_add(value.len())
+            .filter(|bytes| *bytes <= MAX_PODCAST_RSS_BYTES)
+            .ok_or(fmt::Error)?;
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 struct SharedFile {
     guid: String,
     label: String,
+    /// Unabridged episode text, separate from compact UI/cache excerpts.
+    description: Option<String>,
     /// Required by podcast manifests; optional only for plain file sharing.
     published_at: Option<DateTime<Utc>>,
     length: u64,
@@ -705,8 +904,12 @@ enum SharedArtworkSource {
 }
 
 struct ServerState {
+    /// Connection workers only borrow this immutable shared body.
+    rss_body: String,
     kind: LanShareKind,
     title: String,
+    /// Complete source description; `None` retains the generated fallback.
+    description: Option<String>,
     feed_artwork_route: Option<String>,
     base_url: String,
     files: Vec<SharedFile>,
@@ -728,88 +931,133 @@ struct CachedYouTubeResolution {
 }
 
 impl ServerState {
-    fn new(prepared: PreparedLocalShare, base_url: String) -> Self {
+    /// Pre-renders bounded podcast XML before the listener serves requests.
+    fn new(prepared: PreparedLocalShare, base_url: String) -> io::Result<Self> {
         let remote = prepared.remote_config.map(|config| RemoteRuntime {
             resolver: YouTubePrewarmResolver::new(config),
             cancellation: YouTubePrewarmCancellation::new(),
             cache: Mutex::new(HashMap::new()),
             agent: remote_agent(),
         });
-        Self {
+        let mut state = Self {
+            rss_body: String::new(),
             kind: prepared.kind,
             title: prepared.title,
+            description: prepared.description,
             feed_artwork_route: prepared.feed_artwork_route,
             base_url,
             files: prepared.files,
             artwork: prepared.artwork,
             remote,
+        };
+        if state.kind == LanShareKind::Podcast {
+            state.rss_body = state.render_rss()?;
         }
+        Ok(state)
     }
 
-    fn rss(&self) -> String {
-        let title = escape_xml(&self.title);
-        let channel_link = escape_xml(&format!("{}/", self.base_url));
-        let channel_artwork = self.feed_artwork_route.as_ref().map_or_else(
-            String::new,
-            |route| {
-                let artwork_url = format!("{}{}", self.base_url, escape_xml(route));
-                format!(
-                    "\n<itunes:image href=\"{artwork_url}\"/>\n<image>\n<url>{artwork_url}</url>\n<title>{title}</title>\n<link>{channel_link}</link>\n</image>"
-                )
-            },
-        );
-        let channel_description = if self.remote.is_some() {
+    /// Borrows the one validated XML body shared by all connection workers.
+    fn rss(&self) -> &str {
+        &self.rss_body
+    }
+
+    /// Counts escaped output before allocating exactly one bounded feed buffer.
+    fn render_rss(&self) -> io::Result<String> {
+        let mut size = RssSize { bytes: 0 };
+        self.write_rss(&mut size).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "podcast RSS exceeds the 64 MiB serialized feed limit; choose a smaller episode range",
+            )
+        })?;
+        let mut body = String::new();
+        body.try_reserve_exact(size.bytes)
+            .map_err(io::Error::other)?;
+        self.write_rss(&mut body)
+            .map_err(|_| io::Error::other("podcast RSS formatting failed"))?;
+        Ok(body)
+    }
+
+    /// Writes each source description once, escaping without intermediate copies.
+    fn write_rss(&self, output: &mut impl fmt::Write) -> fmt::Result {
+        write!(
+            output,
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<rss version=\"2.0\" xmlns:itunes=\"http://www.itunes.com/dtds/podcast-1.0.dtd\">\n<channel>\n<title>{}</title>\n<link>{}/</link>\n<description>",
+            XmlText(&self.title),
+            XmlText(&self.base_url)
+        )?;
+        let fallback = if self.remote.is_some() {
             "YouTube audio resolved and shared by Youta while the application is running."
         } else {
             "Local audio shared by Youta while the application is running."
         };
-        let items = self
-			.files
-			.iter()
-			.map(|file| {
-				let episode_artwork = file.artwork_route.as_ref().map_or_else(String::new, |route| {
-					format!(
-						"\n<itunes:image href=\"{}{}\"/>",
-						self.base_url,
-						escape_xml(route)
-					)
-				});
-				let (description, duration) = match &file.source {
-					SharedFileSource::Local(_) => (
-						format!("Local audio shared by Youta: {}", file.label),
-						String::new(),
-					),
-					SharedFileSource::YouTube {
-						duration_seconds,
-						..
-					} => (
-						format!("YouTube audio shared by Youta: {}", file.label),
-						duration_seconds.map_or_else(String::new, |seconds| {
-							format!("\n<itunes:duration>{seconds}</itunes:duration>")
-						}),
-					),
-				};
-				// Podcast preparation validates dates: local modification time or
-				// the YouTube upload's original publication time, always in UTC.
-				let publication_date = file.published_at
-					.expect("podcast manifests contain a validated episode date")
-					.to_rfc2822();
-				format!(
-					"<item>\n<title>{}</title>\n<description>{}</description>\n<pubDate>{publication_date}</pubDate>\n<guid isPermaLink=\"false\">{}</guid>\n<enclosure url=\"{}{}\" length=\"{}\" type=\"{}\"/>{episode_artwork}{duration}\n</item>",
-					escape_xml(&file.label),
-					escape_xml(&description),
-					file.guid,
-					self.base_url,
-					escape_xml(&file.route),
-					file.length,
-					file.mime,
-				)
-			})
-			.collect::<Vec<_>>()
-			.join("\n");
-        format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<rss version=\"2.0\" xmlns:itunes=\"http://www.itunes.com/dtds/podcast-1.0.dtd\">\n<channel>\n<title>{title}</title>\n<link>{channel_link}</link>\n<description>{channel_description}</description>\n<language>und</language>{channel_artwork}\n{items}\n</channel>\n</rss>\n",
-        )
+        write!(
+            output,
+            "{}</description>\n<language>und</language>",
+            XmlText(self.description.as_deref().unwrap_or(fallback))
+        )?;
+        if let Some(route) = &self.feed_artwork_route {
+            write!(
+                output,
+                "\n<itunes:image href=\"{}{}\"/>\n<image>\n<url>{}{}</url>\n<title>{}</title>\n<link>{}/</link>\n</image>",
+                XmlText(&self.base_url),
+                XmlText(route),
+                XmlText(&self.base_url),
+                XmlText(route),
+                XmlText(&self.title),
+                XmlText(&self.base_url)
+            )?;
+        }
+        for file in &self.files {
+            write!(
+                output,
+                "\n<item>\n<title>{}</title>\n<description>",
+                XmlText(&file.label)
+            )?;
+            if let Some(description) = &file.description {
+                write!(output, "{}", XmlText(description))?;
+            } else {
+                let source = match &file.source {
+                    SharedFileSource::Local(_) => "Local",
+                    SharedFileSource::YouTube { .. } => "YouTube",
+                };
+                write!(
+                    output,
+                    "{source} audio shared by Youta: {}",
+                    XmlText(&file.label)
+                )?;
+            }
+            let date = file
+                .published_at
+                .expect("validated podcast publication date")
+                .to_rfc2822();
+            write!(
+                output,
+                "</description>\n<pubDate>{date}</pubDate>\n<guid isPermaLink=\"false\">{}</guid>\n<enclosure url=\"{}{}\" length=\"{}\" type=\"{}\"/>",
+                XmlText(&file.guid),
+                XmlText(&self.base_url),
+                XmlText(&file.route),
+                file.length,
+                file.mime
+            )?;
+            if let Some(route) = &file.artwork_route {
+                write!(
+                    output,
+                    "\n<itunes:image href=\"{}{}\"/>",
+                    XmlText(&self.base_url),
+                    XmlText(route)
+                )?;
+            }
+            if let SharedFileSource::YouTube {
+                duration_seconds: Some(seconds),
+                ..
+            } = &file.source
+            {
+                write!(output, "\n<itunes:duration>{seconds}</itunes:duration>")?;
+            }
+            output.write_str("\n</item>")?;
+        }
+        output.write_str("\n</channel>\n</rss>\n")
     }
 
     fn index_html(&self) -> String {
@@ -2434,6 +2682,255 @@ mod tests {
     use super::*;
     use crate::test_support::canonical_tempdir;
 
+    /// Exercises Unicode, XML escaping, and a tail beyond cached UI excerpts.
+    fn full_description_fixture() -> String {
+        format!(
+            "  {}\nEND-OF-FULL-DESCRIPTION  ",
+            "ქართული 🐈 <notes> & \"quotes\" 'apostrophe'\n".repeat(2_000)
+        )
+    }
+
+    /// Makes tag-only MP3 metadata without downloading or encoding audio.
+    fn write_description_mp3(path: &Path, description: &str) {
+        use lofty::config::WriteOptions;
+        use lofty::tag::{Accessor, Tag, TagExt, TagType};
+
+        let mut tag = Tag::new(TagType::Id3v2);
+        tag.set_comment(description.to_owned());
+        let mut bytes = Vec::new();
+        tag.dump_to(&mut bytes, WriteOptions::default())
+            .expect("encode description tag");
+        bytes.extend_from_slice(&[0_u8; 256]);
+        fs::write(path, bytes).expect("write description fixture");
+    }
+
+    #[test]
+    fn podcast_description_budget_rejects_aggregate_overflow_without_truncation() {
+        let mut collection = dated_youtube_collection();
+        collection.entries.truncate(2);
+        for entry in &mut collection.entries {
+            entry.published_at = Some(1_700_000_000);
+            entry.description = Some(
+                "x".repeat(crate::playback::ytdlp::MAX_PODCAST_DESCRIPTION_TOTAL_BYTES / 2 + 1),
+            );
+        }
+        let boundary = collection.entries[0].id.clone();
+        assert!(
+            prepare_youtube_podcast_share(
+                collection.clone(),
+                YouTubePrewarmConfig::default(),
+                false,
+            )
+            .is_err(),
+            "an over-budget feed must fail rather than retain or clip its descriptions"
+        );
+        assert!(
+            prepare_youtube_podcast_share_from(
+                collection,
+                YouTubePrewarmConfig::default(),
+                &boundary,
+                false,
+            )
+            .is_ok(),
+            "descriptions outside the retained boundary must not consume the feed budget"
+        );
+    }
+
+    #[test]
+    fn podcast_serialized_budget_rejects_xml_escape_expansion_before_serving() {
+        let mut collection = dated_youtube_collection();
+        collection.entries.truncate(1);
+        collection.entries[0].description = Some("\"".repeat(11 * 1024 * 1024));
+        let prepared =
+            prepare_youtube_podcast_share(collection, YouTubePrewarmConfig::default(), false)
+                .expect("raw descriptions fit their budget");
+        assert!(
+            LanShareServer::start(prepared).is_err(),
+            "XML escaping beyond 64 MiB must fail before a feed can be served"
+        );
+    }
+
+    #[test]
+    fn podcast_rss_reuses_one_serialized_body_for_repeated_requests() {
+        let mut collection = dated_youtube_collection();
+        collection.entries.truncate(1);
+        let prepared =
+            prepare_youtube_podcast_share(collection, YouTubePrewarmConfig::default(), false)
+                .expect("small podcast manifest");
+        let state =
+            ServerState::new(prepared, "http://127.0.0.1:8123".to_owned()).expect("bounded RSS");
+        let first = state.rss();
+        let second = state.rss();
+        assert_eq!(
+            first.as_ptr(),
+            second.as_ptr(),
+            "requests must borrow one immutable RSS body"
+        );
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn podcast_descriptions_reject_xml_controls_and_preserve_valid_whitespace() {
+        for invalid in ["before\0after", "before\u{b}after"] {
+            let mut collection = dated_youtube_collection();
+            collection.entries.truncate(1);
+            collection.description = Some(invalid.to_owned());
+            assert!(
+                prepare_youtube_podcast_share(collection, YouTubePrewarmConfig::default(), false,)
+                    .is_err(),
+                "illegal XML description characters must fail explicitly"
+            );
+        }
+        let mut collection = dated_youtube_collection();
+        collection.entries.truncate(1);
+        collection.entries[0].description = Some("ქართული\r\n\tfull notes".to_owned());
+        let prepared =
+            prepare_youtube_podcast_share(collection, YouTubePrewarmConfig::default(), false)
+                .expect("ordinary Unicode and whitespace remain valid");
+        let state =
+            ServerState::new(prepared, "http://127.0.0.1:8123".to_owned()).expect("bounded RSS");
+        assert!(
+            state.rss().contains("ქართული&#13;\n\tfull notes"),
+            "numeric CR escaping must prevent XML newline normalization from losing source text"
+        );
+    }
+
+    #[test]
+    fn youtube_podcast_feed_preserves_full_channel_and_episode_descriptions() {
+        let mut collection = dated_youtube_collection();
+        collection.entries.truncate(1);
+        let channel_description = format!("CHANNEL\n{}", full_description_fixture());
+        let episode_description = format!("EPISODE\n{}", full_description_fixture());
+        collection.description = Some(channel_description.clone());
+        collection.entries[0].description = Some(episode_description.clone());
+        let prepared =
+            prepare_youtube_podcast_share(collection, YouTubePrewarmConfig::default(), false)
+                .expect("prepare fully described feed");
+        let rss = ServerState::new(prepared, "http://192.0.2.10:8123".to_owned())
+            .expect("bounded RSS")
+            .rss()
+            .to_owned();
+
+        for description in [channel_description, episode_description] {
+            assert!(
+                rss.contains(&format!(
+                    "<description>{}</description>",
+                    escape_xml(&description)
+                )),
+                "the unabridged source description must survive XML escaping"
+            );
+        }
+        assert!(!rss.contains("YouTube audio shared by Youta:"));
+        assert!(!rss.contains("YouTube audio resolved and shared by Youta"));
+        assert!(!rss.contains("<content:encoded>"));
+        assert_eq!(rss.matches("END-OF-FULL-DESCRIPTION").count(), 2);
+    }
+
+    #[test]
+    fn youtube_podcast_feed_distinguishes_empty_descriptions_from_missing_metadata() {
+        for description in [Some(String::new()), None] {
+            let mut collection = dated_youtube_collection();
+            collection.entries.truncate(1);
+            collection.description = description.clone();
+            collection.entries[0].description = description.clone();
+            let prepared =
+                prepare_youtube_podcast_share(collection, YouTubePrewarmConfig::default(), false)
+                    .expect("prepare optional descriptions");
+            let rss = ServerState::new(prepared, "http://192.0.2.10:8123".to_owned())
+                .expect("bounded RSS")
+                .rss()
+                .to_owned();
+
+            if description.is_some() {
+                assert_eq!(rss.matches("<description></description>").count(), 2);
+                assert!(!rss.contains("shared by Youta"));
+            } else {
+                assert!(rss.contains("YouTube audio resolved and shared by Youta"));
+                assert!(rss.contains("YouTube audio shared by Youta:"));
+            }
+        }
+    }
+
+    #[test]
+    fn local_podcast_prefers_full_podcast_notes_over_short_comments() {
+        use lofty::config::WriteOptions;
+        use lofty::tag::{ItemKey, Tag, TagExt, TagType};
+
+        let directory = canonical_tempdir("lan-podcast-long-notes");
+        let path = directory.path().join("episode.mp3");
+        let description = full_description_fixture();
+        let mut tag = Tag::new(TagType::Id3v2);
+        tag.insert_text(ItemKey::PodcastDescription, description.clone());
+        tag.insert_text(
+            ItemKey::Comment,
+            "Short summary, not the full notes".to_owned(),
+        );
+        let mut bytes = Vec::new();
+        tag.dump_to(&mut bytes, WriteOptions::default())
+            .expect("encode full podcast notes");
+        bytes.extend_from_slice(&[0_u8; 256]);
+        fs::write(&path, bytes).expect("write podcast notes");
+
+        assert!(
+            local_podcast_description(&path).expect("read full notes") == Some(description),
+            "full podcast notes must take precedence over the short comment"
+        );
+    }
+
+    #[test]
+    fn local_podcast_tag_reader_keeps_its_read_limit_after_seeking() {
+        let mut reader = LocalPodcastTagReader {
+            inner: io::Cursor::new(b"123456"),
+            remaining: 4,
+            limit_hit: Rc::default(),
+        };
+        let mut bytes = [0; 4];
+        reader
+            .read_exact(&mut bytes[..2])
+            .expect("first metadata read");
+        reader
+            .rewind()
+            .expect("seek does not replenish read budget");
+        reader
+            .read_exact(&mut bytes[..2])
+            .expect("last metadata read");
+        assert_eq!(
+            reader
+                .read(&mut bytes)
+                .expect_err("read limit must be explicit")
+                .kind(),
+            io::ErrorKind::FileTooLarge
+        );
+        assert!(
+            reader.limit_hit.get(),
+            "a tolerant parser must not hide the limit hit"
+        );
+    }
+
+    #[test]
+    fn local_podcast_feed_preserves_full_embedded_description() {
+        let directory = canonical_tempdir("lan-podcast-description");
+        let path = directory.path().join("episode.mp3");
+        let description = full_description_fixture();
+        write_description_mp3(&path, &description);
+        let prepared = prepare_podcast_share(&path, &directory.path().join("cache"))
+            .expect("prepare tagged feed");
+        let rss = ServerState::new(prepared, "http://192.0.2.10:8123".to_owned())
+            .expect("bounded RSS")
+            .rss()
+            .to_owned();
+
+        assert!(
+            rss.contains(&format!(
+                "<description>{}</description>",
+                escape_xml(&description)
+            )),
+            "the complete tag description, including whitespace and tail, must reach RSS"
+        );
+        assert!(!rss.contains("Local audio shared by Youta: episode.mp3"));
+        assert_eq!(rss.matches("END-OF-FULL-DESCRIPTION").count(), 1);
+    }
+
     #[test]
     fn podcast_feed_escapes_titles_and_exposes_unique_enclosures() {
         let directory = canonical_tempdir("lan-podcast");
@@ -2443,7 +2940,8 @@ mod tests {
         fs::write(&second, b"second").expect("write second audio");
         let cache = directory.path().join("artwork");
         let prepared = prepare_podcast_share(directory.path(), &cache).expect("prepare feed");
-        let state = ServerState::new(prepared, "http://192.0.2.10:8123".to_owned());
+        let state =
+            ServerState::new(prepared, "http://192.0.2.10:8123".to_owned()).expect("bounded RSS");
 
         let rss = state.rss();
         assert!(rss.contains("<title>one &amp; two.opus</title>"));
@@ -2462,7 +2960,10 @@ mod tests {
         }
         let prepared = prepare_podcast_share(directory.path(), &directory.path().join("cache"))
             .expect("prepare dated feed");
-        let rss = ServerState::new(prepared, "http://192.0.2.10:8123".to_owned()).rss();
+        let rss = ServerState::new(prepared, "http://192.0.2.10:8123".to_owned())
+            .expect("bounded RSS")
+            .rss()
+            .to_owned();
         let dates = rss
             .split("<pubDate>")
             .skip(1)
@@ -2497,8 +2998,10 @@ mod tests {
         .expect("write sidecar cover");
         let prepared = prepare_podcast_share(directory.path(), &directory.path().join("cache"))
             .expect("prepare feed");
-        let mut state = ServerState::new(prepared, "http://192.0.2.10:8123".to_owned());
+        let mut state =
+            ServerState::new(prepared, "http://192.0.2.10:8123".to_owned()).expect("bounded RSS");
         state.title = "Local fixture".to_owned();
+        state.rss_body = state.render_rss().expect("bounded fixture RSS");
 
         let rss = state.rss();
         assert!(rss.contains("<itunes:image href=\"http://192.0.2.10:8123/artwork/0\"/>"));
@@ -2556,6 +3059,7 @@ mod tests {
     #[test]
     fn youtube_feed_uses_stable_proxy_routes_and_artwork_for_every_episode() {
         let collection = ExtractedCollection {
+            description: None,
             id: "UCfixture".to_owned(),
             title: "Fixture channel".to_owned(),
             extractor: Some("YoutubeTab".to_owned()),
@@ -2565,6 +3069,7 @@ mod tests {
             ),
             entries: vec![
                 crate::playback::ytdlp::CollectionEntry {
+                    description: None,
                     id: "dQw4w9WgXcQ".to_owned(),
                     title: "First & episode".to_owned(),
                     webpage_url: None,
@@ -2576,6 +3081,7 @@ mod tests {
                     ),
                 },
                 crate::playback::ytdlp::CollectionEntry {
+                    description: None,
                     id: "M7lc1UVf-VE".to_owned(),
                     title: "Second episode".to_owned(),
                     webpage_url: None,
@@ -2612,7 +3118,8 @@ mod tests {
                 .map(|config| config.player_client_policy),
             Some(YouTubePlayerClientPolicy::EmbeddedThenDefault)
         );
-        let state = ServerState::new(prepared, "http://192.0.2.10:8123".to_owned());
+        let state =
+            ServerState::new(prepared, "http://192.0.2.10:8123".to_owned()).expect("bounded RSS");
 
         let rss = state.rss();
         assert!(rss.contains("<title>First &amp; episode</title>"));
@@ -2630,6 +3137,7 @@ mod tests {
     #[test]
     fn youtube_podcast_boundary_keeps_the_selected_video_and_newer_uploads_oldest_first() {
         let entry = |id: &str, title: &str| crate::playback::ytdlp::CollectionEntry {
+            description: None,
             id: id.to_owned(),
             title: title.to_owned(),
             webpage_url: None,
@@ -2638,6 +3146,7 @@ mod tests {
             thumbnail_url: None,
         };
         let collection = ExtractedCollection {
+            description: None,
             id: "UCfixture".to_owned(),
             title: "Fixture channel".to_owned(),
             extractor: Some("YoutubeTab".to_owned()),
@@ -2666,7 +3175,8 @@ mod tests {
             ["Selected episode", "After selection"]
         );
         assert_eq!(prepared.files[0].route, "/media/0/M7lc1UVf%2DVE.webm");
-        let state = ServerState::new(prepared, "http://192.0.2.10:8123".to_owned());
+        let state =
+            ServerState::new(prepared, "http://192.0.2.10:8123".to_owned()).expect("bounded RSS");
         assert!(state.rss().contains(
             "<image>\n<url>http://192.0.2.10:8123/artwork/0</url>\n<title>Fixture channel</title>"
         ));
@@ -2675,6 +3185,7 @@ mod tests {
     #[test]
     fn youtube_podcast_skip_shorts_uses_provider_urls_after_the_selected_boundary() {
         let entry = |id: &str, title: &str, path: &str| crate::playback::ytdlp::CollectionEntry {
+            description: None,
             id: id.to_owned(),
             title: title.to_owned(),
             webpage_url: Some(
@@ -2686,6 +3197,7 @@ mod tests {
             thumbnail_url: None,
         };
         let collection = ExtractedCollection {
+            description: None,
             id: "UCfixture".to_owned(),
             title: "Fixture channel".to_owned(),
             extractor: Some("YoutubeTab".to_owned()),
@@ -2712,6 +3224,7 @@ mod tests {
     #[test]
     fn youtube_podcast_global_upload_order_and_short_boundary_do_not_retain_older_tabs() {
         let entry = |id: &str, title: &str, short: bool| crate::playback::ytdlp::CollectionEntry {
+            description: None,
             id: id.to_owned(),
             title: title.to_owned(),
             webpage_url: Some(
@@ -2727,6 +3240,7 @@ mod tests {
             thumbnail_url: None,
         };
         let collection = ExtractedCollection {
+            description: None,
             id: "UCfixture".to_owned(),
             title: "Fixture channel".to_owned(),
             extractor: Some("YoutubeTab".to_owned()),
@@ -2771,7 +3285,8 @@ mod tests {
             false,
         )
         .expect("selected and newer feed");
-        let state = ServerState::new(selected, "http://192.0.2.10:8123".to_owned());
+        let state =
+            ServerState::new(selected, "http://192.0.2.10:8123".to_owned()).expect("bounded RSS");
         assert_eq!(
             state
                 .files
@@ -2802,6 +3317,7 @@ mod tests {
     /// Makes a newest-first upload catalogue with distinct dated episodes.
     fn dated_youtube_collection() -> ExtractedCollection {
         let entry = |id: &str, published_at, short: bool| crate::playback::ytdlp::CollectionEntry {
+            description: None,
             id: id.to_owned(),
             title: id.to_owned(),
             webpage_url: short.then(|| {
@@ -2812,6 +3328,7 @@ mod tests {
             thumbnail_url: None,
         };
         ExtractedCollection {
+            description: None,
             id: "UCfixture".to_owned(),
             title: "Dated uploads".to_owned(),
             extractor: Some("YoutubeTab".to_owned()),
@@ -2845,7 +3362,10 @@ mod tests {
             true,
         )
         .expect("prepare dated YouTube feed");
-        let rss = ServerState::new(prepared, "http://192.0.2.10:8123".to_owned()).rss();
+        let rss = ServerState::new(prepared, "http://192.0.2.10:8123".to_owned())
+            .expect("bounded RSS")
+            .rss()
+            .to_owned();
         let episodes = rss.split("<item>").skip(1).collect::<Vec<_>>();
         assert_eq!(episodes.len(), 2);
         for (episode, id, date) in [
@@ -3231,7 +3751,9 @@ mod tests {
 
     /// Minimal immutable state for direct admission-handler deadline tests.
     fn admission_test_state(kind: LanShareKind) -> ServerState {
-        ServerState {
+        let mut state = ServerState {
+            rss_body: String::new(),
+            description: None,
             kind,
             title: "Fixture".to_owned(),
             feed_artwork_route: None,
@@ -3239,7 +3761,11 @@ mod tests {
             files: Vec::new(),
             artwork: Vec::new(),
             remote: None,
+        };
+        if kind == LanShareKind::Podcast {
+            state.rss_body = state.render_rss().expect("bounded fixture RSS");
         }
+        state
     }
 
     #[test]
@@ -3457,6 +3983,7 @@ mod tests {
         let directory = canonical_tempdir("lan-admission-error");
         let mut state = admission_test_state(LanShareKind::Files);
         state.files.push(SharedFile {
+            description: None,
             guid: "missing".to_owned(),
             label: "Missing".to_owned(),
             published_at: None,
@@ -3784,7 +4311,8 @@ mod tests {
     fn server_admission_feed_body_outlasts_its_short_header_deadline() {
         let mut state = admission_test_state(LanShareKind::Podcast);
         state.title = "x".repeat(16 * 1024 * 1024);
-        let expected_feed = state.rss();
+        state.rss_body = state.render_rss().expect("bounded fixture RSS");
+        let expected_feed = state.rss().to_owned();
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let address = listener.local_addr().unwrap();
         let worker = thread::spawn(move || {
@@ -3922,7 +4450,9 @@ mod tests {
         fs::write(directory.path().join("episode.opus"), b"audio").expect("audio fixture");
         let prepared = prepare_podcast_share(directory.path(), &directory.path().join("artwork"))
             .expect("podcast fixture");
-        let state = Arc::new(ServerState::new(prepared, "http://127.0.0.1".to_owned()));
+        let state = Arc::new(
+            ServerState::new(prepared, "http://127.0.0.1".to_owned()).expect("bounded RSS"),
+        );
         for (first, remaining) in [
             ("", "GET /feed.xml HTTP/1.1\r\nHost: test\r\n\r\n"),
             ("GET /feed", ".xml HTTP/1.1\r\nHost: test\r\n\r\n"),
@@ -4178,6 +4708,8 @@ printf '{"url":"https://cdn.example.test/%s.webm","acodec":"opus","vcodec":"none
         fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
         let calls = helper.with_extension("calls");
         let state = ServerState {
+            rss_body: String::new(),
+            description: None,
             kind: LanShareKind::Podcast,
             title: "Fixture".to_owned(),
             feed_artwork_route: None,
@@ -4252,6 +4784,8 @@ printf '{"url":"https://cdn.example.test/%s.webm","acodec":"opus","vcodec":"none
             agent: remote_agent(),
         };
         let state = ServerState {
+            rss_body: String::new(),
+            description: None,
             kind: LanShareKind::Podcast,
             title: "Fixture".to_owned(),
             feed_artwork_route: None,
@@ -4350,6 +4884,8 @@ printf '{"url":"https://cdn.example.test/%s.webm","acodec":"opus","vcodec":"none
             requests
         });
         let state = ServerState {
+            rss_body: String::new(),
+            description: None,
             kind: LanShareKind::Podcast,
             title: "Fixture".to_owned(),
             feed_artwork_route: None,
@@ -5097,6 +5633,8 @@ printf '{"url":"https://cdn.example.test/%s.webm","acodec":"opus","vcodec":"none
         let downstream = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind proxy client");
         let downstream_address = downstream.local_addr().expect("proxy client address");
         let state = ServerState {
+            rss_body: String::new(),
+            description: None,
             kind: LanShareKind::Podcast,
             title: "Fixture".to_owned(),
             feed_artwork_route: None,

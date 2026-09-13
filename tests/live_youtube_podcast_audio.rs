@@ -93,6 +93,7 @@ fn resume_offset(value: Option<&str>) -> Result<u64, &'static str> {
 /// Supplies metadata only to construct enclosure routes, not to test publication dates.
 fn transport_collection(ids: &[String]) -> ExtractedCollection {
     ExtractedCollection {
+        description: None,
         id: "UC0000000000000000000000".to_owned(),
         title: "Live audio transport fixture".to_owned(),
         extractor: Some("youtube:tab".to_owned()),
@@ -100,6 +101,7 @@ fn transport_collection(ids: &[String]) -> ExtractedCollection {
         entries: ids
             .iter()
             .map(|id| CollectionEntry {
+                description: None,
                 id: id.clone(),
                 title: format!("Transport fixture {id}"),
                 webpage_url: Some(

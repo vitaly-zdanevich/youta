@@ -3297,10 +3297,10 @@ fn send_official_youtube_page_dates(
     }
 }
 
-/// Reuses precise cached dates and resolves only retained episodes, preserving
-/// the complete catalogue for an inclusive boundary on a filtered Short.
+/// Reuses cached dates and resolves complete descriptions for retained episodes.
+/// Keeps the complete catalogue for an inclusive boundary on a filtered Short.
 #[cfg(feature = "lan-sharing")]
-fn populate_youtube_podcast_dates(
+fn populate_youtube_podcast_metadata(
     mut collection: ExtractedCollection,
     first_video_id: Option<&str>,
     skip_shorts: bool,
@@ -3323,6 +3323,7 @@ fn populate_youtube_podcast_dates(
     populate(&mut episodes)?;
     for (index, episode) in indices.into_iter().zip(episodes) {
         collection.entries[index].published_at = episode.published_at;
+        collection.entries[index].description = episode.description;
     }
     Ok(collection)
 }
@@ -10874,6 +10875,12 @@ impl AppController {
             Ok(prepared) => prepared,
             Err(error) => {
                 self.view.status_line = format!("Cannot prepare LAN share: {error}");
+                if podcast {
+                    self.show_actionable_message(
+                        "Could not create podcast feed",
+                        self.view.status_line.clone(),
+                    );
+                }
                 return;
             }
         };
@@ -10896,7 +10903,16 @@ impl AppController {
         } else {
             "Local selection is available while Youta is running"
         };
-        let _ = self.install_lan_share(prepared, title, message.to_owned(), status.to_owned());
+        if !self.install_lan_share(prepared, title, message.to_owned(), status.to_owned())
+            && podcast
+        {
+            // A serialized-feed size rejection must remain visible after the
+            // local confirmation popup has closed, just like metadata errors.
+            self.show_actionable_message(
+                "Could not create podcast feed",
+                self.view.status_line.clone(),
+            );
+        }
     }
 
     /// Toggles the inclusive selected-item boundary in the review popup.
@@ -11163,9 +11179,9 @@ impl AppController {
     }
 
     /// Enumerates one whole channel off the UI thread before publishing its feed.
-    /// Already fetched official dates are reused first; an existing API key can
-    /// fill missing dates in bounded batches before keyless/yt-dlp fallback.
-    /// Feed boundaries and Shorts filtering precede all date requests.
+    /// Reuses cached dates and full descriptions; an existing API key fills
+    /// missing metadata in bounded batches before keyless/yt-dlp fallback.
+    /// Feed boundaries and Shorts filtering precede all metadata requests.
     #[cfg(feature = "lan-sharing")]
     fn start_youtube_channel_podcast(
         &mut self,
@@ -11202,7 +11218,7 @@ impl AppController {
                 crate::providers::youtube_official::YouTubeOfficialProvider::with_options(
                     key.clone(),
                     Duration::from_secs(8),
-                    256 * 1024,
+                    4 * 1024 * 1024,
                 )
                 .ok()
             });
@@ -11227,25 +11243,32 @@ impl AppController {
                     )
                     .map_err(|error| error.to_string())
                     .and_then(|collection| {
-                        populate_youtube_podcast_dates(
+                        populate_youtube_podcast_metadata(
                             collection,
                             date_boundary.as_deref(),
                             skip_shorts,
                             &known_dates,
                             |episodes| {
                                 client
-                                    .populate_youtube_publication_dates_with_batch(
+                                    .populate_youtube_podcast_metadata_with_batch(
                                         episodes,
                                         &date_cache,
                                         &worker_cancellation,
                                         |ids| {
                                             #[cfg(feature = "youtube-official")]
                                             if let Some(provider) = official_dates.as_ref() {
-                                                return provider.publication_dates(ids).map_err(|_| {
-                                                    PlaybackError::Protocol(
-                                                        "YouTube publication-date API request failed".to_owned(),
-                                                    )
-                                                });
+                                                return provider.podcast_metadata(ids)
+                                                    .map(|metadata| metadata.into_iter().map(|(id, (date, description))| {
+                                                        (id, crate::playback::ytdlp::YouTubeEpisodeMetadata {
+                                                            published_at: Some(date),
+                                                            description: Some(description),
+                                                        })
+                                                    }).collect())
+                                                    .map_err(|_| {
+                                                        PlaybackError::Protocol(
+                                                            "YouTube podcast metadata API request failed".to_owned(),
+                                                        )
+                                                    });
                                             }
                                             let _ = ids;
                                             Ok(HashMap::new())
@@ -52763,8 +52786,31 @@ mod tests {
 
     #[cfg(feature = "lan-sharing")]
     #[test]
+    fn local_podcast_preparation_failure_remains_visible() {
+        let temporary = crate::test_support::canonical_tempdir("local-podcast-error");
+        let config = Config::for_dir(temporary.path().join("config"));
+        let store = StateStore::open_in_memory().expect("in-memory store");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.share_local_target(&temporary.path().join("missing-folder"), true, None);
+        let popup = controller
+            .view
+            .error_popup
+            .as_ref()
+            .expect("visible feed error");
+        assert_eq!(popup.title, "Could not create podcast feed");
+        assert_eq!(popup.report, controller.view.status_line);
+        assert!(
+            !popup.reportable,
+            "ordinary setup errors are not bug reports"
+        );
+        assert!(controller.view.lan_share_popup.is_none());
+    }
+
+    #[cfg(feature = "lan-sharing")]
+    #[test]
     fn podcast_date_reuse_keeps_unknown_ids_for_the_missing_date_lookup() {
         let entry = |id: &str| crate::playback::ytdlp::CollectionEntry {
+            description: None,
             id: id.to_owned(),
             title: id.to_owned(),
             webpage_url: None,
@@ -52773,6 +52819,7 @@ mod tests {
             published_at: None,
         };
         let collection = ExtractedCollection {
+            description: None,
             id: "UCfixture".to_owned(),
             title: "Fixture".to_owned(),
             extractor: None,
@@ -52787,13 +52834,19 @@ mod tests {
             ("aaaaaaaaaaa".to_owned(), 1_704_164_645),
             ("not-in-feed".to_owned(), 1_704_164_650),
         ]);
-        let dated = populate_youtube_podcast_dates(
+        let dated = populate_youtube_podcast_metadata(
             collection,
             Some("bbbbbbbbbbb"),
             false,
             &known_dates,
             |episodes| {
                 assert_eq!(episodes.len(), 2, "older items stay outside date requests");
+                for episode in episodes.iter_mut() {
+                    episode.description = Some(format!(
+                        "{}\nTHE END",
+                        "Полное описание & <text>\n".repeat(900)
+                    ));
+                }
                 let missing = episodes
                     .iter()
                     .filter(|entry| entry.published_at.is_none())
@@ -52818,6 +52871,15 @@ mod tests {
         )
         .expect("precise date reuse");
         assert_eq!(dated.entries[0].published_at, Some(1_704_164_645));
+        let full_description = format!("{}\nTHE END", "Полное описание & <text>\n".repeat(900));
+        assert_eq!(
+            dated.entries[0].description.as_deref(),
+            Some(full_description.as_str())
+        );
+        assert_eq!(
+            dated.entries[1].description.as_deref(),
+            Some(full_description.as_str())
+        );
         assert_eq!(dated.entries[1].published_at, Some(1_704_164_646));
         assert_eq!(dated.entries[2].published_at, None);
     }
@@ -52857,6 +52919,7 @@ mod tests {
     #[test]
     fn podcast_date_lookup_only_enriches_retained_episodes() {
         let entry = |id: &str, short: bool| crate::playback::ytdlp::CollectionEntry {
+            description: None,
             id: id.to_owned(),
             title: id.to_owned(),
             webpage_url: Some(
@@ -52872,6 +52935,7 @@ mod tests {
             published_at: None,
         };
         let collection = ExtractedCollection {
+            description: None,
             id: "UCfixture".to_owned(),
             title: "Fixture".to_owned(),
             extractor: None,
@@ -52883,7 +52947,7 @@ mod tests {
                 entry("ddddddddddd", false),
             ],
         };
-        let dated = populate_youtube_podcast_dates(
+        let dated = populate_youtube_podcast_metadata(
             collection,
             Some("ccccccccccc"),
             true,
@@ -53079,11 +53143,13 @@ mod tests {
             generation: 7,
             channel_id: "UCfixture".to_owned(),
             result: Ok(ExtractedCollection {
+                description: None,
                 id: "UCfixture".to_owned(),
                 title: "Fixture channel".to_owned(),
                 extractor: Some("YoutubeTab".to_owned()),
                 thumbnail_url: None,
                 entries: vec![crate::playback::ytdlp::CollectionEntry {
+                    description: None,
                     id: "dQw4w9WgXcQ".to_owned(),
                     title: "Fixture episode".to_owned(),
                     webpage_url: None,

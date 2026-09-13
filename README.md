@@ -1948,7 +1948,7 @@ review, including a channel selected without a video, also offers a default-off
 **Skip Shorts** checkbox. It omits entries whose provider URL belongs to the
 Shorts tab while retaining regular videos and live uploads.
 After confirmation, YouTube feeds keep a slow preparation animation visible
-while Youta reads the channel and episode dates; `[Esc] Hide` returns to
+while Youta reads the channel and episode metadata; `[Esc] Hide` returns to
 browsing without stopping that worker, and preparation failures remain visible
 in the popup.
 
@@ -1970,6 +1970,22 @@ relative labels such as “years ago” or the current time for a YouTube public
 date; if a retained episode has no usable date, preparation reports the error.
 Local episodes use each file's modification time. Dates are serialized in UTC
 and do not change the selected cutoff, item order, or episode identifiers.
+
+Feeds also preserve complete episode descriptions, including long text and
+line breaks, instead of substituting Youta's sharing notice. Local files use
+embedded full podcast notes, description, or comment tags when available.
+YouTube descriptions come from full metadata, not search previews or the
+UI's shortened-description cache. Dates and descriptions share the official
+50-video batches or the anonymous/helper fallback. Full episode metadata is
+cached separately for reuse; an old date-only cache does not imply that the
+description has already been fetched. Preparing a channel for the first time
+can therefore require metadata requests even when its dates were cached.
+Available channel descriptions are retained too. Descriptions are XML-escaped
+without being cut; source-size safety limits reject unsuitable metadata
+explicitly instead of silently shortening it. A feed accepts up to 32 MiB of
+description text and 64 MiB of serialized XML; an oversized selection must be
+reduced, not silently clipped. The server prepares the XML once and reuses it
+for subsequent requests, including concurrent requests from podcast apps.
 
 #### YouTube channel feeds and audio delivery
 

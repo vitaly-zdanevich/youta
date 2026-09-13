@@ -17,6 +17,12 @@ use super::youtube_prewarm::{YouTubePrewarmCancellation, run_bounded_json_comman
 use super::{PlaybackError, Result};
 
 const MAX_METADATA_BYTES: usize = 16 * 1024 * 1024;
+/// Full text has its own generous bound; exceeding it is an error, never truncation.
+pub(crate) const MAX_PODCAST_DESCRIPTION_BYTES: usize = 64 * 1024;
+/// Maximum aggregate full episode text retained while preparing one podcast feed.
+pub const MAX_PODCAST_DESCRIPTION_TOTAL_BYTES: usize = 32 * 1024 * 1024;
+/// JSON escaping can expand the raw description, independently of its text limit.
+pub(crate) const MAX_PODCAST_METADATA_BYTES: usize = 512 * 1024;
 const DEFAULT_AUDIO_FORMAT: &str = "bestaudio[acodec^=opus]/bestaudio";
 const DOWNLOAD_OPUS_FORMAT: &str = "bestaudio[acodec^=opus]";
 
@@ -79,6 +85,8 @@ pub struct CollectionEntry {
     pub id: String,
     /// Entry title when the flat extractor exposes it.
     pub title: String,
+    /// Full provider text; `None` is unknown and `Some("")` is known empty.
+    pub description: Option<String>,
     /// Canonical or extractor-provided webpage URL.
     pub webpage_url: Option<Url>,
     /// Duration in whole seconds when known.
@@ -97,12 +105,23 @@ pub struct ExtractedCollection {
     pub id: String,
     /// Collection title.
     pub title: String,
+    /// Full collection description, preserving known empty text separately from absence.
+    pub description: Option<String>,
     /// Extractor that handled the URL.
     pub extractor: Option<String>,
     /// Collection artwork, preferring a square channel avatar when available.
     pub thumbnail_url: Option<Url>,
     /// Flat entries in provider order.
     pub entries: Vec<CollectionEntry>,
+}
+
+/// Exact publication metadata and full text needed by a YouTube podcast episode.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct YouTubeEpisodeMetadata {
+    /// Provider publication time in Unix seconds, if supplied by this response.
+    pub published_at: Option<i64>,
+    /// Full description; an explicit empty string is valid, missing text is unknown.
+    pub description: Option<String>,
 }
 
 /// Download behavior selected by the user.
@@ -522,6 +541,213 @@ impl YtDlp {
         )
     }
 
+    /// Populates exact dates and complete descriptions without resolving media.
+    ///
+    /// Full-text cache entries are separate from UI snippets and legacy date-only
+    /// records. Missing dates OR descriptions request the same batches of at most
+    /// 50 IDs. Unresolved items use at most four anonymous metadata/helper lookups
+    /// together. Explicit empty descriptions are complete, never cache misses.
+    /// At most 32 MiB of aggregate episode text is retained; each decoded provider
+    /// batch is merged and released before another batch starts.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid IDs, inconsistent or oversized metadata, cancellation, and
+    /// episodes whose exact date or full description remains unavailable. Text is
+    /// never truncated; disposable cache write failures do not fail a valid feed.
+    pub fn populate_youtube_podcast_metadata_with_batch(
+        &self,
+        entries: &mut [CollectionEntry],
+        cache_dir: &Path,
+        cancellation: &YouTubePrewarmCancellation,
+        lookup_batch: impl FnMut(&[String]) -> Result<HashMap<String, YouTubeEpisodeMetadata>>,
+    ) -> Result<()> {
+        #[cfg(feature = "network")]
+        let fast_client = super::youtube_dates::YouTubeDateClient::new();
+        #[cfg(feature = "network")]
+        let failures = std::sync::atomic::AtomicUsize::new(0);
+        self.populate_youtube_podcast_metadata_with_batch_lookup(
+            entries,
+            cache_dir,
+            cancellation,
+            lookup_batch,
+            |id| {
+                #[cfg(feature = "network")]
+                {
+                    use std::sync::atomic::Ordering;
+                    if failures.load(Ordering::Relaxed) < 3 {
+                        match fast_client.podcast_metadata(id) {
+                            Ok(metadata) => {
+                                failures.store(0, Ordering::Relaxed);
+                                return Ok(metadata);
+                            }
+                            Err(_) => {
+                                failures.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
+                ensure_publication_lookup_active(cancellation)?;
+                self.youtube_podcast_metadata(id, cancellation)
+            },
+        )
+    }
+
+    /// Uses the production aggregate budget for independently testable metadata lookups.
+    fn populate_youtube_podcast_metadata_with_batch_lookup(
+        &self,
+        entries: &mut [CollectionEntry],
+        cache_dir: &Path,
+        cancellation: &YouTubePrewarmCancellation,
+        lookup_batch: impl FnMut(&[String]) -> Result<HashMap<String, YouTubeEpisodeMetadata>>,
+        lookup_one: impl Fn(&str) -> Result<YouTubeEpisodeMetadata> + Sync,
+    ) -> Result<()> {
+        self.populate_youtube_podcast_metadata_with_batch_lookup_limit(
+            entries,
+            cache_dir,
+            cancellation,
+            lookup_batch,
+            lookup_one,
+            MAX_PODCAST_DESCRIPTION_TOTAL_BYTES,
+        )
+    }
+
+    /// Allows small deterministic budget fixtures without allocating oversized channels.
+    fn populate_youtube_podcast_metadata_with_batch_lookup_limit(
+        &self,
+        entries: &mut [CollectionEntry],
+        cache_dir: &Path,
+        cancellation: &YouTubePrewarmCancellation,
+        mut lookup_batch: impl FnMut(&[String]) -> Result<HashMap<String, YouTubeEpisodeMetadata>>,
+        lookup_one: impl Fn(&str) -> Result<YouTubeEpisodeMetadata> + Sync,
+        description_limit: usize,
+    ) -> Result<()> {
+        let budget = PodcastDescriptionBudget::new(description_limit);
+        // Preflight caller-owned text before reading caches or retaining more text.
+        for entry in entries.iter() {
+            ensure_publication_lookup_active(cancellation)?;
+            validate_publication_video_id(&entry.id)?;
+            validate_podcast_description(entry.description.as_deref())?;
+            budget.reserve(entry.description.as_deref())?;
+        }
+        ensure_publication_lookup_active(cancellation)?;
+        let mut missing = Vec::new();
+        let mut seen = HashSet::new();
+        for entry in entries.iter_mut() {
+            ensure_publication_lookup_active(cancellation)?;
+            validate_publication_video_id(&entry.id)?;
+            entry.published_at = entry
+                .published_at
+                .filter(|date| valid_publication_timestamp(*date));
+            validate_podcast_description(entry.description.as_deref())?;
+            let cached = load_podcast_metadata(cache_dir, &entry.id);
+            if !podcast_metadata_complete(entry) {
+                if let Some(cached) = &cached {
+                    merge_podcast_metadata(entry, cached, &budget)?;
+                }
+                if entry.published_at.is_none() {
+                    entry.published_at = load_publication_date(cache_dir, &entry.id);
+                }
+            }
+            if podcast_metadata_complete(entry) {
+                // Repeated feeds read full text without rewriting every cache file.
+                if !cached.as_ref().is_some_and(|cached| {
+                    cached.published_at == entry.published_at
+                        && cached.description == entry.description
+                }) {
+                    let _ = store_podcast_metadata(cache_dir, entry);
+                }
+            } else if seen.insert(entry.id.clone()) {
+                missing.push(entry.id.clone());
+            }
+        }
+
+        for ids in missing.chunks(50) {
+            ensure_publication_lookup_active(cancellation)?;
+            let result = lookup_batch(ids);
+            ensure_publication_lookup_active(cancellation)?;
+            let Ok(batch) = result else {
+                break;
+            };
+            for (id, item) in &batch {
+                if !ids.contains(id) {
+                    return Err(PlaybackError::Protocol(
+                        "YouTube podcast batch returned an unexpected video ID".to_owned(),
+                    ));
+                }
+                validate_podcast_metadata(item)?;
+            }
+            // Never retain a second whole-channel map of complete descriptions.
+            // Only this bounded batch coexists with the growing, budgeted entries.
+            for entry in entries.iter_mut() {
+                if let Some(item) = batch.get(&entry.id) {
+                    merge_podcast_metadata(entry, item, &budget)?;
+                    if podcast_metadata_complete(entry) {
+                        let _ = store_podcast_metadata(cache_dir, entry);
+                    }
+                }
+            }
+        }
+
+        let mut missing = entries
+            .iter_mut()
+            .filter(|entry| !podcast_metadata_complete(entry))
+            .collect::<Vec<_>>();
+        for batch in missing.chunks_mut(4) {
+            let lookup_one = &lookup_one;
+            let budget = &budget;
+            std::thread::scope(|scope| -> Result<()> {
+                let workers = batch.iter_mut().map(|entry| {
+                    scope.spawn(move || -> Result<()> {
+                        ensure_publication_lookup_active(cancellation)?;
+                        let item = match load_podcast_metadata(cache_dir, &entry.id) {
+                            Some(cached) => cached,
+                            None => lookup_one(&entry.id)?,
+                        };
+                        ensure_publication_lookup_active(cancellation)?;
+                        merge_podcast_metadata(entry, &item, budget)?;
+                        if !podcast_metadata_complete(entry) {
+                            return Err(PlaybackError::Protocol(format!(
+                                "YouTube did not provide an exact publication date and full description for episode {}",
+                                entry.id,
+                            )));
+                        }
+                        let _ = store_podcast_metadata(cache_dir, entry);
+                        Ok(())
+                    })
+                }).collect::<Vec<_>>();
+                for worker in workers {
+                    worker.join().map_err(|_| {
+                        PlaybackError::Protocol("YouTube episode metadata worker failed".to_owned())
+                    })??;
+                }
+                Ok(())
+            })?;
+        }
+        ensure_publication_lookup_active(cancellation)
+    }
+
+    /// Last-resort full text and date extraction in one bounded supervised helper.
+    fn youtube_podcast_metadata(
+        &self,
+        video_id: &str,
+        cancellation: &YouTubePrewarmCancellation,
+    ) -> Result<YouTubeEpisodeMetadata> {
+        let mut command = build_podcast_metadata_command(&self.config, video_id);
+        let output = run_bounded_json_command(
+            &mut command,
+            Duration::from_secs(30),
+            MAX_PODCAST_METADATA_BYTES,
+            cancellation,
+        )
+        .map_err(|error| {
+            PlaybackError::Protocol(format!(
+                "YouTube episode metadata lookup failed for {video_id}: {error}"
+            ))
+        })?;
+        parse_youtube_podcast_metadata(&output, video_id)
+    }
+
     /// Keeps cache and batch policy independently testable without live services.
     fn populate_youtube_publication_dates_with_batch_lookup(
         &self,
@@ -837,6 +1063,7 @@ fn merge_youtube_channel_collections(
             channel.title
         },
         extractor: channel.extractor.or(uploads.extractor),
+        description: channel.description.or(uploads.description),
         thumbnail_url: channel.thumbnail_url.or(uploads.thumbnail_url),
         entries: uploads.entries,
     }
@@ -848,6 +1075,8 @@ struct ExtractedCollectionJson {
     /// Flat extractors can omit a title or explicitly report JSON null.
     #[serde(default)]
     title: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
     #[serde(default)]
     extractor: Option<String>,
     // yt-dlp emits both extractor fields for channel and playlist documents.
@@ -867,6 +1096,14 @@ struct ExtractedCollectionEntryJson {
     /// Missing and null titles share the existing empty-title display fallback.
     #[serde(default)]
     title: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    ie_key: Option<String>,
+    #[serde(default)]
+    extractor: Option<String>,
+    #[serde(default)]
+    extractor_key: Option<String>,
     #[serde(default)]
     webpage_url: Option<String>,
     #[serde(default)]
@@ -959,6 +1196,28 @@ fn ensure_publication_lookup_active(cancellation: &YouTubePrewarmCancellation) -
 
 /// Fetches the original webpage's microformat date while skipping media work.
 fn build_publication_date_command(config: &YtDlpConfig, video_id: &str) -> Command {
+    build_episode_metadata_command(
+        config,
+        video_id,
+        "%(.{id,timestamp,release_timestamp,upload_date})j",
+    )
+}
+
+/// Adds complete description extraction without adding a second metadata request.
+fn build_podcast_metadata_command(config: &YtDlpConfig, video_id: &str) -> Command {
+    build_episode_metadata_command(
+        config,
+        video_id,
+        "%(.{id,timestamp,release_timestamp,upload_date,description})j",
+    )
+}
+
+/// Shares the metadata-only extraction options while retaining the date-only API.
+fn build_episode_metadata_command(
+    config: &YtDlpConfig,
+    video_id: &str,
+    projection: &str,
+) -> Command {
     let mut command = build_base_command(config);
     command
         .args([
@@ -976,7 +1235,7 @@ fn build_publication_date_command(config: &YtDlpConfig, video_id: &str) -> Comma
             "--extractor-args",
             "youtube:player_client=web;player_skip=configs,js;skip=hls,dash;webpage_skip=",
             "--print",
-            "%(.{id,timestamp,release_timestamp,upload_date})j",
+            projection,
             "--",
         ])
         .arg(format!("https://www.youtube.com/watch?v={video_id}"));
@@ -1004,6 +1263,200 @@ fn parse_youtube_publication_date(bytes: &[u8], video_id: &str) -> Result<i64> {
             "YouTube did not provide a publication date for episode {video_id}"
         ))
     })
+}
+
+/// Rejects malformed full text rather than silently using a truncated RSS description.
+fn validate_podcast_description(description: Option<&str>) -> Result<()> {
+    if description.is_some_and(|text| text.len() > MAX_PODCAST_DESCRIPTION_BYTES) {
+        Err(PlaybackError::Protocol(
+            "YouTube full description exceeds the podcast metadata limit".to_owned(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// Validates supplied fields before they can populate a feed or its full-text cache.
+fn validate_podcast_metadata(metadata: &YouTubeEpisodeMetadata) -> Result<()> {
+    if metadata
+        .published_at
+        .is_some_and(|date| !valid_publication_timestamp(date))
+    {
+        return Err(PlaybackError::Protocol(
+            "YouTube podcast metadata contains an invalid date".to_owned(),
+        ));
+    }
+    validate_podcast_description(metadata.description.as_deref())
+}
+
+/// Missing text differs from a verified empty description, including on cache hits.
+fn podcast_metadata_complete(entry: &CollectionEntry) -> bool {
+    entry.published_at.is_some_and(valid_publication_timestamp) && entry.description.is_some()
+}
+
+/// Shared reservations bound retained text across all four concurrent fallback workers.
+struct PodcastDescriptionBudget {
+    used: std::sync::atomic::AtomicUsize,
+    limit: usize,
+}
+
+impl PodcastDescriptionBudget {
+    /// Starts one feed's incremental text budget, independent of disposable cache size.
+    fn new(limit: usize) -> Self {
+        Self {
+            used: std::sync::atomic::AtomicUsize::new(0),
+            limit,
+        }
+    }
+
+    /// Reserves complete text before cloning or retaining it; failures never truncate.
+    fn reserve(&self, description: Option<&str>) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        let bytes = description.map_or(0, str::len);
+        self.used
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                used.checked_add(bytes).filter(|total| *total <= self.limit)
+            })
+            .map(|_| ())
+            .map_err(|_| {
+                PlaybackError::Protocol(
+                    "YouTube podcast descriptions exceed the aggregate metadata size limit; choose a smaller episode range"
+                        .to_owned(),
+                )
+            })
+    }
+}
+
+/// Fills unknown fields only, reserving space before retaining verified full text.
+fn merge_podcast_metadata(
+    entry: &mut CollectionEntry,
+    metadata: &YouTubeEpisodeMetadata,
+    budget: &PodcastDescriptionBudget,
+) -> Result<()> {
+    validate_podcast_metadata(metadata)?;
+    if entry.description.is_none() {
+        budget.reserve(metadata.description.as_deref())?;
+    }
+    if entry.published_at.is_none() {
+        entry.published_at = metadata.published_at;
+    }
+    if entry.description.is_none() {
+        entry.description.clone_from(&metadata.description);
+    }
+    Ok(())
+}
+
+/// A full helper response must match the exact requested video; null text is unknown.
+fn parse_youtube_podcast_metadata(bytes: &[u8], video_id: &str) -> Result<YouTubeEpisodeMetadata> {
+    #[derive(Deserialize)]
+    struct Metadata {
+        id: String,
+        #[serde(default)]
+        description: Option<String>,
+        #[serde(flatten)]
+        publication: PublicationDateJson,
+    }
+    let raw: Metadata = serde_json::from_slice(bytes).map_err(|_| {
+        PlaybackError::Protocol("YouTube episode metadata lookup returned invalid JSON".to_owned())
+    })?;
+    if raw.id != video_id {
+        return Err(PlaybackError::Protocol(
+            "YouTube episode metadata lookup returned another video's metadata".to_owned(),
+        ));
+    }
+    let metadata = YouTubeEpisodeMetadata {
+        published_at: raw.publication.published_at(),
+        description: raw.description,
+    };
+    validate_podcast_metadata(&metadata)?;
+    Ok(metadata)
+}
+
+/// Complete metadata is kept apart from legacy date records and truncated UI caches.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CachedPodcastMetadata {
+    version: u8,
+    id: String,
+    published_at: i64,
+    description: String,
+}
+
+/// Reads a bounded ordinary full-text cache record; stale or partial records miss.
+fn load_podcast_metadata(cache_dir: &Path, video_id: &str) -> Option<YouTubeEpisodeMetadata> {
+    validate_publication_video_id(video_id).ok()?;
+    let path = cache_dir
+        .join("podcast-metadata-v1")
+        .join(format!("{video_id}.json"));
+    let file_metadata = std::fs::symlink_metadata(&path).ok()?;
+    if !file_metadata.is_file() || file_metadata.len() > MAX_PODCAST_METADATA_BYTES as u64 {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(MAX_PODCAST_METADATA_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > MAX_PODCAST_METADATA_BYTES {
+        return None;
+    }
+    let cached: CachedPodcastMetadata = serde_json::from_slice(&bytes).ok()?;
+    if cached.version != 1 || cached.id != video_id {
+        return None;
+    }
+    let metadata = YouTubeEpisodeMetadata {
+        published_at: Some(cached.published_at),
+        description: Some(cached.description),
+    };
+    validate_podcast_metadata(&metadata).ok()?;
+    Some(metadata)
+}
+
+/// Publishes verified, untruncated metadata atomically using private cache permissions.
+fn store_podcast_metadata(cache_dir: &Path, entry: &CollectionEntry) -> std::io::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
+    if validate_publication_video_id(&entry.id).is_err()
+        || !podcast_metadata_complete(entry)
+        || validate_podcast_description(entry.description.as_deref()).is_err()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid podcast metadata cache entry",
+        ));
+    }
+    let cache_dir = cache_dir.join("podcast-metadata-v1");
+    crate::private_files::create_private_directory(&cache_dir)?;
+    let cached = CachedPodcastMetadata {
+        version: 1,
+        id: entry.id.clone(),
+        published_at: entry.published_at.expect("validated exact date"),
+        description: entry
+            .description
+            .clone()
+            .expect("validated full description"),
+    };
+    let bytes = serde_json::to_vec(&cached).map_err(std::io::Error::other)?;
+    let sequence = NEXT_TEMPORARY.fetch_add(1, Ordering::Relaxed);
+    let temporary = cache_dir.join(format!(
+        ".{}.{}.{sequence}.tmp",
+        entry.id,
+        std::process::id()
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    let mut file = crate::private_files::open_privately(&mut options).open(&temporary)?;
+    let result = (|| {
+        file.write_all(&bytes)?;
+        file.flush()?;
+        drop(file);
+        std::fs::rename(&temporary, cache_dir.join(format!("{}.json", entry.id)))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
 }
 
 /// Versioned cache stores only public immutable identity and publication metadata.
@@ -1079,18 +1532,43 @@ fn store_publication_date(
     result
 }
 
+/// Flat YouTube descriptions are previews even when the extractor calls them description.
+fn is_youtube_extractor(extractor: Option<&str>) -> bool {
+    extractor.is_some_and(|name| {
+        name.get(..7)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("youtube"))
+    })
+}
+
+/// Mixed collections can identify YouTube leaves through their canonical webpage URL.
+fn is_youtube_webpage(url: &Url) -> bool {
+    url.host_str().is_some_and(|host| {
+        host == "youtu.be" || host == "youtube.com" || host.ends_with(".youtube.com")
+    })
+}
+
 impl TryFrom<ExtractedCollectionJson> for ExtractedCollection {
     type Error = PlaybackError;
 
     fn try_from(value: ExtractedCollectionJson) -> Result<Self> {
         let thumbnail_url = preferred_collection_thumbnail(value.thumbnail, value.thumbnails);
         let mut entries = Vec::new();
-        let mut pending = VecDeque::from(value.entries);
-        while let Some(entry) = pending.pop_front() {
+        let youtube = is_youtube_extractor(value.extractor.as_deref())
+            || is_youtube_extractor(value.extractor_key.as_deref());
+        let mut pending = value
+            .entries
+            .into_iter()
+            .map(|entry| (entry, youtube))
+            .collect::<VecDeque<_>>();
+        while let Some((entry, inherited_youtube)) = pending.pop_front() {
+            let youtube = inherited_youtube
+                || is_youtube_extractor(entry.ie_key.as_deref())
+                || is_youtube_extractor(entry.extractor.as_deref())
+                || is_youtube_extractor(entry.extractor_key.as_deref());
             if !entry.entries.is_empty() {
                 // Prepending in reverse retains yt-dlp's depth-first provider order.
                 for child in entry.entries.into_iter().rev() {
-                    pending.push_front(child);
+                    pending.push_front((child, youtube));
                 }
             } else {
                 let raw_url = entry.webpage_url.or(entry.url);
@@ -1117,6 +1595,13 @@ impl TryFrom<ExtractedCollectionJson> for ExtractedCollection {
                 entries.push(CollectionEntry {
                     id: entry.id,
                     title: entry.title.unwrap_or_default(),
+                    // YouTube flat extraction exposes descriptionSnippet, not full text.
+                    description: if youtube || webpage_url.as_ref().is_some_and(is_youtube_webpage)
+                    {
+                        None
+                    } else {
+                        entry.description
+                    },
                     webpage_url,
                     duration_seconds,
                     thumbnail_url,
@@ -1128,6 +1613,7 @@ impl TryFrom<ExtractedCollectionJson> for ExtractedCollection {
         Ok(Self {
             id: value.id,
             title: value.title.unwrap_or_default(),
+            description: value.description,
             extractor: value.extractor_key.or(value.extractor),
             thumbnail_url,
             entries,
@@ -1365,6 +1851,551 @@ fn parse_extractor_list(output: &[u8]) -> Vec<String> {
 mod tests {
     use super::*;
 
+    /// Long provider text includes XML metacharacters, Unicode and a final sentinel.
+    fn full_podcast_description() -> String {
+        format!(
+            "{}END OF FULL DESCRIPTION",
+            "История & <chapter> \"世界\"\n".repeat(800)
+        )
+    }
+
+    /// A canonical episode fixture whose date may already exist in the old cache.
+    fn podcast_entry(index: usize) -> CollectionEntry {
+        CollectionEntry {
+            id: format!("{index:011}"),
+            title: "Episode".to_owned(),
+            description: None,
+            webpage_url: None,
+            duration_seconds: None,
+            thumbnail_url: None,
+            published_at: Some(1_709_164_800),
+        }
+    }
+
+    #[test]
+    fn podcast_metadata_preserves_full_collection_text_and_known_empty() {
+        let full = full_podcast_description();
+        let raw = serde_json::json!({
+            "id": "collection", "extractor_key": "PeerTubePlaylist",
+            "description": full, "entries": [
+                {"id": "entry", "description": full},
+                {"id": "empty", "description": ""},
+                {"id": "unknown", "description": null}
+            ]
+        });
+        let collection = ExtractedCollection::try_from(
+            serde_json::from_value::<ExtractedCollectionJson>(raw).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(collection.description.as_deref(), Some(full.as_str()));
+        assert_eq!(
+            collection.entries[0].description.as_deref(),
+            Some(full.as_str())
+        );
+        assert_eq!(collection.entries[1].description.as_deref(), Some(""));
+        assert_eq!(collection.entries[2].description, None);
+    }
+
+    #[test]
+    fn podcast_metadata_does_not_trust_youtube_flat_description_snippets() {
+        for extractor in ["YoutubeTab", "youtube:tab"] {
+            let raw = serde_json::json!({
+                "id": "channel", "extractor": extractor,
+                "description": "Full channel description",
+                "entries": [{"id": "00000000000", "description": "Truncated preview…"}]
+            });
+            let collection = ExtractedCollection::try_from(
+                serde_json::from_value::<ExtractedCollectionJson>(raw).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                collection.description.as_deref(),
+                Some("Full channel description")
+            );
+            assert_eq!(collection.entries[0].description, None);
+        }
+    }
+
+    #[test]
+    fn podcast_metadata_batches_fetch_text_even_when_all_dates_are_cached() {
+        let directory = tempfile::tempdir().unwrap();
+        let client = YtDlp::new(YtDlpConfig::default());
+        let mut entries = (0..121).map(podcast_entry).collect::<Vec<_>>();
+        entries[0].description = Some("Already complete".to_owned());
+        entries[1].description = Some(String::new());
+        let full = full_podcast_description();
+        let mut batches = Vec::new();
+        client
+            .populate_youtube_podcast_metadata_with_batch_lookup(
+                &mut entries,
+                directory.path(),
+                &YouTubePrewarmCancellation::new(),
+                |ids| {
+                    batches.push(ids.len());
+                    Ok(ids
+                        .iter()
+                        .map(|id| {
+                            (
+                                id.clone(),
+                                YouTubeEpisodeMetadata {
+                                    published_at: Some(1_709_164_801),
+                                    description: Some(full.clone()),
+                                },
+                            )
+                        })
+                        .collect())
+                },
+                |_| panic!("complete batch metadata must not trigger per-video work"),
+            )
+            .unwrap();
+        assert_eq!(batches, [50, 50, 19]);
+        assert_eq!(entries[0].description.as_deref(), Some("Already complete"));
+        assert_eq!(entries[1].description.as_deref(), Some(""));
+        assert!(
+            entries[2..]
+                .iter()
+                .all(|entry| entry.description.as_deref() == Some(full.as_str()))
+        );
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.published_at == Some(1_709_164_800))
+        );
+        let expected = entries.clone();
+        for entry in &mut entries {
+            entry.published_at = None;
+            entry.description = None;
+        }
+        client
+            .populate_youtube_podcast_metadata_with_batch_lookup(
+                &mut entries,
+                directory.path(),
+                &YouTubePrewarmCancellation::new(),
+                |_| panic!("full metadata cache must avoid repeat API requests"),
+                |_| panic!("full metadata cache must avoid repeat helper requests"),
+            )
+            .unwrap();
+        assert_eq!(entries, expected);
+    }
+
+    #[test]
+    fn podcast_metadata_old_date_cache_still_requires_full_text() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut entries = vec![podcast_entry(0)];
+        entries[0].published_at = None;
+        store_publication_date(directory.path(), &entries[0].id, 1_709_164_800).unwrap();
+        let full = full_podcast_description();
+        YtDlp::new(YtDlpConfig::default())
+            .populate_youtube_podcast_metadata_with_batch_lookup(
+                &mut entries,
+                directory.path(),
+                &YouTubePrewarmCancellation::new(),
+                |_| Ok(HashMap::new()),
+                |_| {
+                    Ok(YouTubeEpisodeMetadata {
+                        published_at: Some(1_709_164_801),
+                        description: Some(full.clone()),
+                    })
+                },
+            )
+            .unwrap();
+        assert_eq!(entries[0].description.as_deref(), Some(full.as_str()));
+        assert_eq!(entries[0].published_at, Some(1_709_164_800));
+    }
+
+    #[test]
+    fn podcast_metadata_missing_full_description_fails_instead_of_silently_omitting_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut entries = vec![podcast_entry(0)];
+        let result = YtDlp::new(YtDlpConfig::default())
+            .populate_youtube_podcast_metadata_with_batch_lookup(
+                &mut entries,
+                directory.path(),
+                &YouTubePrewarmCancellation::new(),
+                |_| Ok(HashMap::new()),
+                |_| {
+                    Ok(YouTubeEpisodeMetadata {
+                        published_at: Some(1_709_164_800),
+                        description: None,
+                    })
+                },
+            );
+        assert!(
+            result.is_err(),
+            "unknown full text must prevent an incomplete feed"
+        );
+    }
+
+    #[test]
+    fn podcast_metadata_merge_preserves_channel_description_and_known_empty() {
+        for description in [None, Some(String::new()), Some(full_podcast_description())] {
+            let channel = ExtractedCollection {
+                id: "channel".to_owned(),
+                title: "Channel".to_owned(),
+                description: description.clone(),
+                extractor: Some("YoutubeTab".to_owned()),
+                thumbnail_url: None,
+                entries: Vec::new(),
+            };
+            let uploads = ExtractedCollection {
+                id: "uploads".to_owned(),
+                title: "Uploads".to_owned(),
+                description: Some("Uploads text".to_owned()),
+                extractor: None,
+                thumbnail_url: None,
+                entries: Vec::new(),
+            };
+            let merged = merge_youtube_channel_collections(channel, uploads);
+            assert_eq!(
+                merged.description,
+                description.or(Some("Uploads text".to_owned()))
+            );
+        }
+    }
+
+    #[test]
+    fn podcast_metadata_nested_and_mixed_youtube_snippets_remain_unknown() {
+        let raw = serde_json::json!({
+            "id": "mixed", "entries": [
+                {"id": "wrapper", "ie_key": "YoutubeTab", "entries": [
+                    {"id": "00000000000", "description": "Preview inside wrapper"}
+                ]},
+                {"id": "00000000001", "ie_key": "Youtube", "description": "Preview"},
+                {"id": "00000000002", "webpage_url": "https://www.youtube.com/watch?v=00000000002", "description": "Preview"}
+            ]
+        });
+        let collection = ExtractedCollection::try_from(
+            serde_json::from_value::<ExtractedCollectionJson>(raw).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(collection.entries.len(), 3);
+        assert!(
+            collection
+                .entries
+                .iter()
+                .all(|entry| entry.description.is_none())
+        );
+    }
+
+    #[test]
+    fn podcast_metadata_helper_retains_full_text_with_identity_and_size_bounds() {
+        let full = full_podcast_description();
+        let raw = serde_json::json!({
+            "id": "00000000000", "upload_date": "20240229", "description": full,
+        });
+        let bytes = serde_json::to_vec(&raw).unwrap();
+        let metadata = parse_youtube_podcast_metadata(&bytes, "00000000000").unwrap();
+        assert_eq!(metadata.description.as_deref(), Some(full.as_str()));
+        assert_eq!(metadata.published_at, Some(1_709_164_800));
+        assert!(parse_youtube_podcast_metadata(&bytes, "00000000001").is_err());
+        for description in [
+            serde_json::json!({}),
+            serde_json::json!("x".repeat(MAX_PODCAST_DESCRIPTION_BYTES + 1)),
+        ] {
+            let mut invalid = raw.clone();
+            invalid["description"] = description;
+            assert!(
+                parse_youtube_podcast_metadata(
+                    &serde_json::to_vec(&invalid).unwrap(),
+                    "00000000000"
+                )
+                .is_err()
+            );
+        }
+        let command = build_podcast_metadata_command(&YtDlpConfig::default(), "00000000000");
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy())
+            .collect::<Vec<_>>();
+        assert!(args.windows(2).any(|pair| pair
+            == [
+                "--print",
+                "%(.{id,timestamp,release_timestamp,upload_date,description})j"
+            ]));
+        assert!(args.iter().any(|arg| arg == "--skip-download"));
+        assert!(args.iter().any(|arg| arg == "--ignore-config"));
+        assert!(!args.iter().any(|arg| arg.contains("cookies")));
+    }
+
+    #[test]
+    fn podcast_metadata_rejects_invalid_batches_and_cancellation_without_fallback() {
+        let client = YtDlp::new(YtDlpConfig::default());
+        for (id, date, description) in [
+            ("00000000001", Some(1_709_164_800), Some(String::new())),
+            ("00000000000", Some(-1), Some(String::new())),
+            (
+                "00000000000",
+                Some(1_709_164_800),
+                Some("x".repeat(MAX_PODCAST_DESCRIPTION_BYTES + 1)),
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut entries = vec![podcast_entry(0)];
+            assert!(
+                client
+                    .populate_youtube_podcast_metadata_with_batch_lookup(
+                        &mut entries,
+                        directory.path(),
+                        &YouTubePrewarmCancellation::new(),
+                        |_| Ok(HashMap::from([(
+                            id.to_owned(),
+                            YouTubeEpisodeMetadata {
+                                published_at: date,
+                                description: description.clone()
+                            }
+                        )])),
+                        |_| panic!("invalid batch metadata must not trigger a fallback"),
+                    )
+                    .is_err()
+            );
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let cancellation = YouTubePrewarmCancellation::new();
+        cancellation.cancel();
+        assert!(
+            client
+                .populate_youtube_podcast_metadata_with_batch_lookup(
+                    &mut [podcast_entry(0)],
+                    directory.path(),
+                    &cancellation,
+                    |_| panic!("cancelled requests must not start"),
+                    |_| panic!("cancelled helpers must not start"),
+                )
+                .is_err()
+        );
+        let mut invalid = podcast_entry(0);
+        invalid.id = "../unsafe".to_owned();
+        assert!(
+            client
+                .populate_youtube_podcast_metadata_with_batch_lookup(
+                    &mut [invalid],
+                    directory.path(),
+                    &YouTubePrewarmCancellation::new(),
+                    |_| panic!("invalid IDs must not start requests"),
+                    |_| panic!("invalid IDs must not start helpers"),
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn podcast_metadata_sparse_text_fallbacks_use_four_workers_and_keep_empty_text() {
+        use std::sync::{Condvar, Mutex};
+        let directory = tempfile::tempdir().unwrap();
+        let mut entries = (0..13).map(podcast_entry).collect::<Vec<_>>();
+        for (index, entry) in entries.iter_mut().enumerate() {
+            entry.description = (index % 4 != 0).then(String::new);
+        }
+        let arrivals = Condvar::new();
+        let counts = Mutex::new((0_usize, 0_usize, 0_usize));
+        YtDlp::new(YtDlpConfig::default())
+            .populate_youtube_podcast_metadata_with_batch_lookup(
+                &mut entries,
+                directory.path(),
+                &YouTubePrewarmCancellation::new(),
+                |_| Ok(HashMap::new()),
+                |id| {
+                    assert_eq!(id.parse::<usize>().unwrap() % 4, 0);
+                    let mut state = counts.lock().unwrap();
+                    state.0 += 1;
+                    state.1 += 1;
+                    state.2 = state.2.max(state.1);
+                    arrivals.notify_all();
+                    let (mut state, timeout) = arrivals
+                        .wait_timeout_while(state, Duration::from_secs(5), |state| state.0 < 4)
+                        .unwrap();
+                    state.1 -= 1;
+                    if timeout.timed_out() && state.0 < 4 {
+                        return Err(PlaybackError::Protocol(
+                            "full text requests did not run concurrently".to_owned(),
+                        ));
+                    }
+                    Ok(YouTubeEpisodeMetadata {
+                        published_at: Some(1_709_164_800),
+                        description: Some(String::new()),
+                    })
+                },
+            )
+            .unwrap();
+        assert_eq!(counts.into_inner().unwrap(), (4, 0, 4));
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.description.as_deref() == Some(""))
+        );
+    }
+
+    #[test]
+    fn podcast_metadata_cache_rejects_partial_wrong_identity_version_and_oversized_text() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = directory.path().join("podcast-metadata-v1");
+        std::fs::create_dir(&cache).unwrap();
+        let path = cache.join("00000000000.json");
+        for raw in [
+            serde_json::json!({"version": 1, "id": "00000000001", "published_at": 1_709_164_800, "description": ""}),
+            serde_json::json!({"version": 9, "id": "00000000000", "published_at": 1_709_164_800, "description": ""}),
+            serde_json::json!({"version": 1, "id": "00000000000", "published_at": -1, "description": ""}),
+            serde_json::json!({"version": 1, "id": "00000000000", "published_at": 1_709_164_800}),
+            serde_json::json!({"version": 1, "id": "00000000000", "published_at": 1_709_164_800, "description": "x".repeat(MAX_PODCAST_DESCRIPTION_BYTES + 1)}),
+        ] {
+            std::fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
+            assert!(load_podcast_metadata(directory.path(), "00000000000").is_none());
+        }
+        std::fs::write(&path, vec![b' '; MAX_PODCAST_METADATA_BYTES + 1]).unwrap();
+        assert!(load_podcast_metadata(directory.path(), "00000000000").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn podcast_metadata_cache_is_private_and_repeated_feeds_do_not_rewrite_it() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let directory = tempfile::tempdir().unwrap();
+        let mut entry = podcast_entry(0);
+        entry.description = Some(full_podcast_description());
+        store_podcast_metadata(directory.path(), &entry).unwrap();
+        let cache = directory.path().join("podcast-metadata-v1");
+        let path = cache.join("00000000000.json");
+        let original = std::fs::File::open(&path).unwrap();
+        let metadata = original.metadata().unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            std::fs::metadata(&cache).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        entry.published_at = None;
+        entry.description = None;
+        YtDlp::new(YtDlpConfig::default())
+            .populate_youtube_podcast_metadata_with_batch_lookup(
+                &mut [entry],
+                directory.path(),
+                &YouTubePrewarmCancellation::new(),
+                |_| panic!("cached feed must not fetch metadata"),
+                |_| panic!("cached feed must not launch helpers"),
+            )
+            .unwrap();
+        assert_eq!(metadata.ino(), std::fs::metadata(path).unwrap().ino());
+    }
+
+    #[test]
+    fn podcast_metadata_total_budget_rejects_initial_text_before_io() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut entries = (0..2).map(podcast_entry).collect::<Vec<_>>();
+        for entry in &mut entries {
+            entry.description = Some("12345678".to_owned());
+        }
+        let result = YtDlp::new(YtDlpConfig::default())
+            .populate_youtube_podcast_metadata_with_batch_lookup_limit(
+                &mut entries,
+                directory.path(),
+                &YouTubePrewarmCancellation::new(),
+                |_| panic!("over-budget input must not request metadata"),
+                |_| panic!("over-budget input must not run helpers"),
+                15,
+            );
+        let error = result.expect_err("preexisting text must count against the channel budget");
+        assert!(error.to_string().contains("choose a smaller episode range"));
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn podcast_metadata_total_budget_counts_cache_before_retaining_text() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut entries = (0..2).map(podcast_entry).collect::<Vec<_>>();
+        for entry in &mut entries {
+            entry.description = Some("12345678".to_owned());
+            store_podcast_metadata(directory.path(), entry).unwrap();
+            entry.description = None;
+        }
+        let result = YtDlp::new(YtDlpConfig::default())
+            .populate_youtube_podcast_metadata_with_batch_lookup_limit(
+                &mut entries,
+                directory.path(),
+                &YouTubePrewarmCancellation::new(),
+                |_| panic!("over-budget cache must stop before network"),
+                |_| panic!("over-budget cache must stop before helpers"),
+                15,
+            );
+        assert!(
+            result.is_err(),
+            "cached full text must count toward the budget"
+        );
+        assert_eq!(entries[0].description.as_deref(), Some("12345678"));
+        assert_eq!(entries[1].description, None);
+    }
+
+    #[test]
+    fn podcast_metadata_total_budget_spans_official_batches_without_truncation() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut entries = (0..51).map(podcast_entry).collect::<Vec<_>>();
+        let mut requests = 0;
+        let result = YtDlp::new(YtDlpConfig::default())
+            .populate_youtube_podcast_metadata_with_batch_lookup_limit(
+                &mut entries,
+                directory.path(),
+                &YouTubePrewarmCancellation::new(),
+                |ids| {
+                    requests += 1;
+                    Ok(ids
+                        .iter()
+                        .map(|id| {
+                            (
+                                id.clone(),
+                                YouTubeEpisodeMetadata {
+                                    published_at: Some(1_709_164_800),
+                                    description: Some("FULL".to_owned()),
+                                },
+                            )
+                        })
+                        .collect())
+                },
+                |_| panic!("official full text must not invoke helper"),
+                200,
+            );
+        assert!(
+            result.is_err(),
+            "aggregate budget must span more than one batch"
+        );
+        assert_eq!(requests, 2);
+        assert!(
+            entries[..50]
+                .iter()
+                .all(|entry| entry.description.as_deref() == Some("FULL"))
+        );
+        assert_eq!(entries[50].description, None);
+    }
+
+    #[test]
+    fn podcast_metadata_total_budget_is_shared_by_concurrent_keyless_fallbacks() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut entries = (0..4).map(podcast_entry).collect::<Vec<_>>();
+        let result = YtDlp::new(YtDlpConfig::default())
+            .populate_youtube_podcast_metadata_with_batch_lookup_limit(
+                &mut entries,
+                directory.path(),
+                &YouTubePrewarmCancellation::new(),
+                |_| Ok(HashMap::new()),
+                |_| {
+                    Ok(YouTubeEpisodeMetadata {
+                        published_at: Some(1_709_164_800),
+                        description: Some("FULL".to_owned()),
+                    })
+                },
+                10,
+            );
+        assert!(result.is_err(), "four workers must share one budget");
+        assert_eq!(
+            entries
+                .iter()
+                .filter_map(|entry| entry.description.as_ref())
+                .map(String::len)
+                .sum::<usize>(),
+            8
+        );
+        assert!(entries.iter().all(
+            |entry| entry.description.is_none() || entry.description.as_deref() == Some("FULL")
+        ));
+    }
+
     #[test]
     fn publication_date_batches_replace_per_episode_helpers_and_reuse_cache() {
         let directory = tempfile::tempdir().expect("date cache");
@@ -1376,6 +2407,7 @@ mod tests {
             .map(|index| CollectionEntry {
                 id: format!("{index:011}"),
                 title: "Episode".to_owned(),
+                description: None,
                 webpage_url: None,
                 duration_seconds: None,
                 thumbnail_url: None,
@@ -1430,6 +2462,7 @@ mod tests {
             .map(|index| CollectionEntry {
                 id: format!("{index:011}"),
                 title: "Episode".to_owned(),
+                description: None,
                 webpage_url: None,
                 duration_seconds: None,
                 thumbnail_url: None,
@@ -1483,6 +2516,7 @@ mod tests {
             .map(|index| CollectionEntry {
                 id: format!("{index:011}"),
                 title: "Episode".to_owned(),
+                description: None,
                 webpage_url: None,
                 duration_seconds: None,
                 thumbnail_url: None,
@@ -1543,6 +2577,7 @@ mod tests {
         let entry = CollectionEntry {
             id: "jNQXAC9IVRw".to_owned(),
             title: "Episode".to_owned(),
+            description: None,
             webpage_url: None,
             duration_seconds: None,
             thumbnail_url: None,
@@ -1627,6 +2662,7 @@ mod tests {
         let mut entries = [CollectionEntry {
             id: "jNQXAC9IVRw".to_owned(),
             title: "Test".to_owned(),
+            description: None,
             webpage_url: None,
             duration_seconds: None,
             thumbnail_url: None,
@@ -1763,6 +2799,7 @@ mod tests {
         let mut entries = [CollectionEntry {
             id: "jNQXAC9IVRw".to_owned(),
             title: "Test".to_owned(),
+            description: None,
             webpage_url: None,
             duration_seconds: None,
             thumbnail_url: None,
@@ -2351,6 +3388,7 @@ mod tests {
                 Ok(ExtractedCollection {
                     id: "fixture".to_owned(),
                     title: "Fixture".to_owned(),
+                    description: None,
                     extractor: None,
                     thumbnail_url: None,
                     entries: Vec::new(),

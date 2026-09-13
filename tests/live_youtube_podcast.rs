@@ -3,7 +3,7 @@
 //! Normal test runs exercise the offline harness but never contact YouTube.
 //! Run `scripts/test-live-youtube-podcast.sh UC_CHANNEL_ID` explicitly. The
 //! optional API key comes only from `YOUTA_LIVE_PODCAST_API_KEY`; this test
-//! never reads Youta credentials or uses the user's publication-date cache.
+//! never reads Youta credentials or uses the user's date/full-description cache.
 
 #![cfg(all(feature = "lan-sharing", feature = "rss"))]
 
@@ -22,7 +22,9 @@ use youta::lan_share::{
     prepare_youtube_podcast_share_from,
 };
 use youta::playback::youtube_prewarm::{YouTubePrewarmCancellation, YouTubePrewarmConfig};
-use youta::playback::ytdlp::{CollectionEntry, ExtractedCollection, YtDlp, YtDlpConfig};
+use youta::playback::ytdlp::{
+    CollectionEntry, ExtractedCollection, YouTubeEpisodeMetadata, YtDlp, YtDlpConfig,
+};
 
 /// Maximum duration of the live metadata run, including feed assertions.
 const LIVE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -40,23 +42,24 @@ struct OfficialBatchStats {
 
 impl OfficialBatchStats {
     /// Cancels on an API failure so explicit-key runs cannot pass via fallback.
-    fn record<E>(
+    fn record<T, E>(
         &self,
-        result: Result<HashMap<String, i64>, E>,
+        result: Result<HashMap<String, T>, E>,
         cancellation: &YouTubePrewarmCancellation,
-    ) -> youta::playback::Result<HashMap<String, i64>> {
+    ) -> youta::playback::Result<HashMap<String, T>> {
         self.attempts.set(self.attempts.get() + 1);
         match result {
-            Ok(dates) => {
+            Ok(metadata) => {
                 self.successful.set(self.successful.get() + 1);
-                self.returned_ids.set(self.returned_ids.get() + dates.len());
-                Ok(dates)
+                self.returned_ids
+                    .set(self.returned_ids.get() + metadata.len());
+                Ok(metadata)
             }
             Err(_) => {
                 self.failures.set(self.failures.get() + 1);
                 cancellation.cancel();
                 Err(youta::playback::PlaybackError::Protocol(
-                    "explicit live publication-date API request failed".to_owned(),
+                    "explicit live podcast metadata API request failed".to_owned(),
                 ))
             }
         }
@@ -206,7 +209,7 @@ fn assert_local_route(value: &str, advertised: &Url, expected_path: &str) {
     assert!(resource.query().is_none() && resource.fragment().is_none());
 }
 
-/// Serves and validates every episode's identity, date, artwork, and enclosure.
+/// Serves and validates every episode's identity, full text, date, artwork, and enclosure.
 fn assert_served_feed(
     prepared: PreparedLocalShare,
     expected: &[CollectionEntry],
@@ -243,6 +246,17 @@ fn assert_served_feed(
             original.id
         );
         assert!(episode.published.is_some(), "publication date is required");
+        if let Some(description) = &original.description {
+            assert_eq!(
+                episode
+                    .summary
+                    .as_ref()
+                    .map(|summary| summary.content.as_str()),
+                Some(description.as_str()),
+                "full description must survive the served RSS body for {}",
+                original.id,
+            );
+        }
         let contents = episode
             .media
             .iter()
@@ -350,7 +364,7 @@ fn youtube_large_channel_podcast_dates_and_cache() {
     )
     .expect("YOUTA_LIVE_PODCAST_MIN_EPISODES must be between 500 and 10000");
     let temporary = tempfile::tempdir().expect("isolated metadata cache");
-    let cache = temporary.path().join("publication-dates");
+    let cache = temporary.path().join("podcast-metadata");
     let deadline = LiveDeadline::start(LIVE_TIMEOUT);
     let ytdlp = YtDlp::new(YtDlpConfig {
         executable: std::env::var_os("YOUTA_TEST_YT_DLP")
@@ -394,7 +408,7 @@ fn youtube_large_channel_podcast_dates_and_cache() {
         youta::providers::youtube_official::YouTubeOfficialProvider::with_options(
             key,
             Duration::from_secs(8),
-            256 * 1024,
+            4 * 1024 * 1024,
         )
         .unwrap_or_else(|_| panic!("could not initialize the explicitly configured API client"))
     });
@@ -405,18 +419,32 @@ fn youtube_large_channel_podcast_dates_and_cache() {
     );
     let batches = OfficialBatchStats::default();
     let cold_started = Instant::now();
-    let date_result = ytdlp.populate_youtube_publication_dates_with_batch(
+    let metadata_result = ytdlp.populate_youtube_podcast_metadata_with_batch(
         &mut collection.entries,
         &cache,
         &deadline.cancellation,
         |ids| {
             assert!(
                 !ids.is_empty() && ids.len() <= 50,
-                "publication dates must be batched safely"
+                "full episode metadata must be batched safely"
             );
             #[cfg(feature = "youtube-official")]
             if let Some(provider) = &official {
-                return batches.record(provider.publication_dates(ids), &deadline.cancellation);
+                let metadata = provider.podcast_metadata(ids).map(|items| {
+                    items
+                        .into_iter()
+                        .map(|(id, (published_at, description))| {
+                            (
+                                id,
+                                YouTubeEpisodeMetadata {
+                                    published_at: Some(published_at),
+                                    description: Some(description),
+                                },
+                            )
+                        })
+                        .collect()
+                });
+                return batches.record(metadata, &deadline.cancellation);
             }
             Ok(HashMap::new())
         },
@@ -426,10 +454,11 @@ fn youtube_large_channel_podcast_dates_and_cache() {
         0,
         "explicit API-key requests failed; keyless fallback is not accepted in API mode"
     );
-    date_result.expect("populate all original publication dates using an isolated cold cache");
+    metadata_result
+        .expect("populate all original dates and full descriptions using an isolated cold cache");
     deadline.assert_active();
     println!(
-        "cold dates: {:?}; official API batch calls: {}; successful batches: {}; returned IDs: {}",
+        "cold metadata: {:?}; official API batch calls: {}; successful batches: {}; returned IDs: {}",
         cold_started.elapsed(),
         batches.attempts.get(),
         batches.successful.get(),
@@ -439,25 +468,31 @@ fn youtube_large_channel_podcast_dates_and_cache() {
         collection
             .entries
             .iter()
-            .all(|entry| entry.published_at.is_some()),
-        "every episode needs its original date"
+            .all(|entry| entry.published_at.is_some() && entry.description.is_some()),
+        "every episode needs its original date and a verified full description"
     );
     assert_feed_variants(&collection, temporary.path(), &deadline);
 
     let mut warm = collection.clone();
     for entry in &mut warm.entries {
         entry.published_at = None;
+        entry.description = None;
     }
     let offline = YtDlp::new(YtDlpConfig {
         executable: temporary.path().join("nonexistent-cache-miss-must-fail"),
         ..YtDlpConfig::default()
     });
     let warm_started = Instant::now();
-    // This cache-only-or-yt-dlp entry point has no HTTP fallback. A missing
-    // cache entry attempts the nonexistent executable and fails immediately.
+    // Every cache miss reaches the batch closure before any network fallback.
+    // A panic here proves the warm path needs neither HTTP nor the extractor.
     offline
-        .populate_youtube_publication_dates(&mut warm.entries, &cache, &deadline.cancellation)
-        .expect("warm cache must restore every date without network or an executable");
+        .populate_youtube_podcast_metadata_with_batch(
+            &mut warm.entries,
+            &cache,
+            &deadline.cancellation,
+            |_| panic!("warm full metadata cache must never request network or helper work"),
+        )
+        .expect("warm cache must restore every date and full description without network or an executable");
     println!(
         "warm cache: {:?}; episodes: {}",
         warm_started.elapsed(),
@@ -465,7 +500,7 @@ fn youtube_large_channel_podcast_dates_and_cache() {
     );
     assert_eq!(
         warm, collection,
-        "warm cache must preserve the exact dates and order"
+        "warm cache must preserve exact dates, full descriptions, and order"
     );
     assert_feed_variants(&warm, temporary.path(), &deadline);
     deadline.assert_active();
@@ -481,6 +516,10 @@ fn fixture_collection() -> ExtractedCollection {
         .into_iter()
         .enumerate()
         .map(|(index, id)| CollectionEntry {
+            description: Some(format!(
+                "Episode {index}\n{}\nDESCRIPTION END {index}",
+                "Полное описание 🎵 & <details>\n".repeat(600),
+            )),
             id: id.to_owned(),
             title: format!("Episode {index}"),
             webpage_url: Some(
@@ -499,6 +538,7 @@ fn fixture_collection() -> ExtractedCollection {
         })
         .collect();
     ExtractedCollection {
+        description: Some("Offline harness full channel description".to_owned()),
         id: "UC0000000000000000000000".to_owned(),
         title: "Offline harness fixture".to_owned(),
         extractor: Some("youtube:tab".to_owned()),
@@ -518,20 +558,37 @@ fn podcast_xml_harness_checks_order_cutoff_dates_and_artwork_offline() {
     assert_feed_variants(&collection, temporary.path(), &deadline);
 }
 
+/// Allows a verified empty source description without inventing fallback text.
+#[test]
+fn podcast_xml_harness_accepts_known_empty_descriptions_offline() {
+    let temporary = tempfile::tempdir().unwrap();
+    let deadline = LiveDeadline::start(Duration::from_secs(30));
+    let mut collection = fixture_collection();
+    collection.description = Some(String::new());
+    collection.entries[1].description = Some(String::new());
+    assert_feed_variants(&collection, temporary.path(), &deadline);
+}
+
 /// Ensures API-mode errors cannot silently fall back or print sensitive details.
 #[test]
 fn explicit_api_batch_failures_cancel_without_exposing_error_details() {
     let batches = OfficialBatchStats::default();
     let cancellation = YouTubePrewarmCancellation::new();
-    let dates = HashMap::from([("newest00001".to_owned(), 1_700_000_000)]);
+    let metadata = HashMap::from([(
+        "newest00001".to_owned(),
+        YouTubeEpisodeMetadata {
+            published_at: Some(1_700_000_000),
+            description: Some("Complete episode description".to_owned()),
+        },
+    )]);
     assert_eq!(
         batches
-            .record::<&str>(Ok(dates.clone()), &cancellation)
+            .record::<_, &str>(Ok(metadata.clone()), &cancellation)
             .unwrap(),
-        dates
+        metadata
     );
     let error = batches
-        .record(Err("private test credential"), &cancellation)
+        .record::<YouTubeEpisodeMetadata, _>(Err("private test credential"), &cancellation)
         .unwrap_err();
     assert!(cancellation.is_cancelled());
     assert_eq!(batches.attempts.get(), 2);

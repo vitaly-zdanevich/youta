@@ -448,6 +448,73 @@ impl YouTubeOfficialProvider {
         Ok(dates)
     }
 
+    /// Fetches exact dates and complete descriptions for one podcast batch.
+    ///
+    /// Returns `(Unix timestamp, description)` values keyed by video ID, using
+    /// one request for up to 50 distinct IDs. Descriptions are neither trimmed
+    /// nor shortened; an explicitly empty description is retained. Unavailable
+    /// resources are omitted so the caller can try another metadata source.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid/duplicate input or response IDs, missing descriptions,
+    /// malformed dates, and responses beyond the configured byte limit. Uses
+    /// the standard API-key-redacted HTTP error path.
+    pub fn podcast_metadata(
+        &self,
+        video_ids: &[String],
+    ) -> Result<HashMap<String, (i64, String)>, ProviderError> {
+        if video_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        if video_ids.len() > MAX_VIDEO_RESOURCE_IDS {
+            return Err(ProviderError::InvalidRequest(format!(
+                "YouTube podcast metadata accepts at most {MAX_VIDEO_RESOURCE_IDS} identifiers"
+            )));
+        }
+        for (index, video_id) in video_ids.iter().enumerate() {
+            validate_youtube_video_id(video_id)?;
+            if video_ids[..index].contains(video_id) {
+                return Err(ProviderError::InvalidRequest(
+                    "YouTube podcast metadata requires distinct video identifiers".to_owned(),
+                ));
+            }
+        }
+        let mut url = self.endpoint("videos")?;
+        {
+            let mut query = url.query_pairs_mut();
+            query.append_pair("part", "snippet");
+            query.append_pair("id", &video_ids.join(","));
+            query.append_pair("fields", "items(id,snippet(publishedAt,description))");
+        }
+        let response: Value = self.request_json(&url)?;
+        let invalid = || {
+            ProviderError::InvalidResponse(
+                "YouTube podcast metadata is missing, invalid, or mismatched".to_owned(),
+            )
+        };
+        let items = response["items"].as_array().ok_or_else(invalid)?;
+        if items.len() > video_ids.len() {
+            return Err(invalid());
+        }
+        let mut metadata = HashMap::with_capacity(items.len());
+        for item in items {
+            let id = item["id"].as_str().ok_or_else(invalid)?;
+            validate_response_video_id(id)?;
+            if !video_ids.iter().any(|requested| requested == id) || metadata.contains_key(id) {
+                return Err(invalid());
+            }
+            let snippet = &item["snippet"];
+            let published_at = snippet["publishedAt"]
+                .as_str()
+                .and_then(parse_rfc3339_epoch)
+                .ok_or_else(invalid)?;
+            let description = snippet["description"].as_str().ok_or_else(invalid)?;
+            metadata.insert(id.to_owned(), (published_at, description.to_owned()));
+        }
+        Ok(metadata)
+    }
+
     /// Enriches at most one official 50-ID batch with a partial response.
     ///
     /// # Errors
@@ -3127,6 +3194,94 @@ mod tests {
             Some("old_page_2"),
             "an incomplete refresh must not replace the last committed token chain"
         );
+    }
+
+    #[test]
+    fn podcast_metadata_preserves_full_descriptions_and_matches_ids() {
+        let description = format!(
+            "{}\nLast line: <end> & done",
+            "Полное описание 🎵\n".repeat(900)
+        );
+        let body = serde_json::json!({"items": [
+            {"id": "aaaaaaaaaaa", "snippet": {"publishedAt": "1970-01-02T00:00:00Z", "description": ""}},
+            {"id": VIDEO_ID, "snippet": {"publishedAt": "1970-01-01T00:00:01Z", "description": description}}
+        ]}).to_string();
+        let (provider, server) = provider_with_server(vec![json_response("200 OK", &body)]);
+        let ids = [
+            VIDEO_ID.to_owned(),
+            "aaaaaaaaaaa".to_owned(),
+            "bbbbbbbbbbb".to_owned(),
+        ];
+        let metadata = provider.podcast_metadata(&ids).expect("complete metadata");
+        assert_eq!(metadata.get(VIDEO_ID), Some(&(1, description)));
+        assert_eq!(metadata.get("aaaaaaaaaaa"), Some(&(86_400, String::new())));
+        assert!(!metadata.contains_key("bbbbbbbbbbb"));
+        let requests = server.finish();
+        assert_eq!(requests.len(), 1);
+        let pairs = query_pairs(&requests[0]);
+        assert_eq!(pairs.get("part").map(String::as_str), Some("snippet"));
+        assert_eq!(
+            pairs.get("fields").map(String::as_str),
+            Some("items(id,snippet(publishedAt,description))")
+        );
+    }
+
+    #[test]
+    fn podcast_metadata_requires_full_description_and_valid_matching_ids() {
+        for body in [
+            format!(r#"{{"items":[{{"id":"{VIDEO_ID}","snippet":{{"publishedAt":"2024-01-01T00:00:00Z"}}}}]}}"#),
+            format!(r#"{{"items":[{{"id":"{VIDEO_ID}","snippet":{{"publishedAt":"2024-01-01T00:00:00Z","description":null}}}}]}}"#),
+            format!(r#"{{"items":[{{"id":"{VIDEO_ID}","snippet":{{"publishedAt":"not a date","description":"text"}}}}]}}"#),
+            r#"{"items":[{"id":"aaaaaaaaaaa","snippet":{"publishedAt":"2024-01-01T00:00:00Z","description":"text"}}]}"#.into(),
+            format!(r#"{{"items":[{{"id":"{VIDEO_ID}","snippet":{{"publishedAt":"2024-01-01T00:00:00Z","description":"text"}}}},{{"id":"{VIDEO_ID}","snippet":{{"publishedAt":"2024-01-01T00:00:00Z","description":"duplicate"}}}}]}}"#),
+        ] {
+            let (provider, server) = provider_with_server(vec![json_response("200 OK", &body)]);
+            assert!(provider.podcast_metadata(&[VIDEO_ID.to_owned()]).is_err());
+            assert_eq!(server.finish().len(), 1);
+        }
+    }
+
+    #[test]
+    fn podcast_metadata_rejects_duplicate_resources_within_the_requested_count() {
+        let body = serde_json::json!({"items": [
+            {"id": VIDEO_ID, "snippet": {"publishedAt": "2024-01-01T00:00:00Z", "description": "first"}},
+            {"id": VIDEO_ID, "snippet": {"publishedAt": "2024-01-01T00:00:00Z", "description": "duplicate"}}
+        ]}).to_string();
+        let (provider, server) = provider_with_server(vec![json_response("200 OK", &body)]);
+        assert!(matches!(
+            provider.podcast_metadata(&[VIDEO_ID.to_owned(), "aaaaaaaaaaa".to_owned()]),
+            Err(ProviderError::InvalidResponse(_))
+        ));
+        assert_eq!(server.finish().len(), 1);
+    }
+
+    #[test]
+    fn podcast_metadata_batches_remain_bounded_and_skip_empty_requests() {
+        let (provider, server) = provider_with_server(Vec::new());
+        assert!(provider.podcast_metadata(&[]).expect("empty").is_empty());
+        for ids in [
+            vec!["short".to_owned()],
+            vec![VIDEO_ID.to_owned(), VIDEO_ID.to_owned()],
+            (0..51).map(|index| format!("v{index:010}")).collect(),
+        ] {
+            assert!(matches!(
+                provider.podcast_metadata(&ids),
+                Err(ProviderError::InvalidRequest(_))
+            ));
+        }
+        assert!(server.finish().is_empty());
+        let (provider, server) =
+            provider_with_server(vec![json_response("200 OK", r#"{"items":[]}"#)]);
+        let ids = (0..50)
+            .map(|index| format!("v{index:010}"))
+            .collect::<Vec<_>>();
+        assert!(
+            provider
+                .podcast_metadata(&ids)
+                .expect("full batch")
+                .is_empty()
+        );
+        assert_eq!(server.finish().len(), 1);
     }
 
     #[test]
