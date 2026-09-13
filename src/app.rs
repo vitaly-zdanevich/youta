@@ -16,6 +16,8 @@ mod archive_upload;
 #[cfg(feature = "yt-dlp")]
 mod download_choice;
 mod end_pause;
+#[cfg(feature = "s3-upload")]
+mod s3_upload;
 #[cfg(feature = "web-browser")]
 mod web;
 #[cfg(all(feature = "web-browser", feature = "local-metadata"))]
@@ -5397,6 +5399,8 @@ pub struct AppController {
     /// Review-owned Archive transfer and session-only credentials.
     #[cfg(feature = "archive-upload")]
     archive_upload: archive_upload::ArchiveUploadState,
+    #[cfg(feature = "s3-upload")]
+    s3_upload: s3_upload::S3UploadState,
     /// Authentication selected from Youta or Pywikibot for the current review.
     #[cfg(feature = "commons-upload")]
     commons_upload_authentication: Option<CommonsAuthentication>,
@@ -6674,6 +6678,8 @@ impl AppController {
             commons_upload_selection: None,
             #[cfg(feature = "archive-upload")]
             archive_upload: archive_upload::ArchiveUploadState::default(),
+            #[cfg(feature = "s3-upload")]
+            s3_upload: s3_upload::S3UploadState::default(),
             #[cfg(feature = "commons-upload")]
             commons_upload_authentication: None,
             #[cfg(feature = "commons-upload")]
@@ -17054,7 +17060,7 @@ impl AppController {
     }
 
     /// Returns the selected exportable remote item or exact local file.
-    #[cfg(feature = "evernote")]
+    #[cfg(any(feature = "evernote", feature = "s3-upload"))]
     fn selected_export_queue_item(&self) -> Result<QueueItem, String> {
         if self.view.screen != Screen::Local {
             return self.selected_queue_item();
@@ -17459,6 +17465,13 @@ impl AppController {
     /// Rehydrates quick-action state and the right-panel playlist membership.
     fn refresh_selected_playlist_state(&mut self) {
         self.refresh_selected_private_note_state();
+        #[cfg(feature = "s3-upload")]
+        {
+            self.view.s3_upload_available = self.selected_s3_queue_item().is_ok_and(|item| {
+                crate::s3_upload_media::s3_media_capabilities(&item.media, &item.playback_location)
+                    .is_some()
+            });
+        }
         #[cfg(feature = "archive-upload")]
         {
             self.view.archive_upload_available = self
@@ -34189,6 +34202,8 @@ impl AppController {
         self.shutdown_persistence_succeeded = Some(false);
         #[cfg(feature = "archive-upload")]
         self.shutdown_archive_upload();
+        #[cfg(feature = "s3-upload")]
+        self.shutdown_s3_upload();
         #[cfg(feature = "ascii-visualizer")]
         self.dismiss_ascii_visualizer();
         #[cfg(feature = "lan-sharing")]
@@ -35381,6 +35396,50 @@ impl UiController for AppController {
                 self.view.status_line = "RSS subscription canceled".to_owned();
             }
             UiAction::OpenPreferences => self.open_preferences(),
+            #[cfg(feature = "s3-upload")]
+            UiAction::OpenS3Upload => self.open_s3_upload(),
+            #[cfg(feature = "s3-upload")]
+            UiAction::SelectS3UploadField(field) => {
+                if self.s3_upload_review_is_editable()
+                    && let Some(popup) = self.view.s3_upload_popup.as_mut()
+                {
+                    popup.selected_field = field;
+                }
+            }
+            #[cfg(feature = "s3-upload")]
+            UiAction::AppendS3UploadCharacter(character) => {
+                self.edit_s3_upload(Some(character), false)
+            }
+            #[cfg(feature = "s3-upload")]
+            UiAction::DeleteS3UploadCharacter => self.edit_s3_upload(None, false),
+            #[cfg(feature = "s3-upload")]
+            UiAction::DeleteS3UploadWord => self.edit_s3_upload(None, true),
+            #[cfg(feature = "s3-upload")]
+            UiAction::ToggleS3UploadVideo => self.toggle_s3_upload_video(),
+            #[cfg(feature = "s3-upload")]
+            UiAction::SubmitS3Upload(generation) => self.submit_s3_upload(generation),
+            #[cfg(feature = "s3-upload")]
+            UiAction::DismissS3Upload => self.dismiss_s3_upload(),
+            #[cfg(feature = "s3-upload")]
+            UiAction::OpenS3Credentials => self.open_s3_credentials(),
+            #[cfg(feature = "s3-upload")]
+            UiAction::SelectS3CredentialField(field) => {
+                if let Some(popup) = self.view.s3_credentials_popup.as_mut() {
+                    popup.selected_field = field;
+                }
+            }
+            #[cfg(feature = "s3-upload")]
+            UiAction::AppendS3CredentialCharacter(character) => {
+                self.edit_s3_credentials(Some(character), false)
+            }
+            #[cfg(feature = "s3-upload")]
+            UiAction::DeleteS3CredentialCharacter => self.edit_s3_credentials(None, false),
+            #[cfg(feature = "s3-upload")]
+            UiAction::DeleteS3CredentialWord => self.edit_s3_credentials(None, true),
+            #[cfg(feature = "s3-upload")]
+            UiAction::SubmitS3Credentials => self.submit_s3_credentials(),
+            #[cfg(feature = "s3-upload")]
+            UiAction::DismissS3Credentials => self.dismiss_s3_credentials(),
             #[cfg(feature = "archive-upload")]
             UiAction::OpenArchiveUpload => self.open_archive_upload(),
             #[cfg(feature = "archive-upload")]
@@ -35799,6 +35858,8 @@ impl UiController for AppController {
         }
         #[cfg(feature = "archive-upload")]
         self.poll_archive_upload();
+        #[cfg(feature = "s3-upload")]
+        self.poll_s3_upload();
         self.update_player();
         #[cfg(feature = "ascii-visualizer")]
         self.refresh_ascii_visualizer();
@@ -45523,6 +45584,9 @@ mod tests {
     mod download_choice_tests;
     #[path = "end_pause.rs"]
     mod end_pause_tests;
+    #[cfg(feature = "s3-upload")]
+    #[path = "s3_upload.rs"]
+    mod s3_upload_tests;
     #[cfg(all(feature = "web-browser", feature = "local-metadata"))]
     #[path = "web_metadata.rs"]
     mod web_metadata_tests;

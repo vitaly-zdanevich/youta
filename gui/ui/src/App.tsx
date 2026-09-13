@@ -12,6 +12,8 @@ import { Waveform } from "./components/Waveform";
 import { AsciiVisualizer } from './components/AsciiVisualizer';
 import {
   AudioQualityPopup,
+	S3UploadPopup,
+	S3CredentialsPopup,
 	ArchiveUploadPopup,
 	ArchiveCredentialsPopup,
   ChannelDownloadPopup,
@@ -195,6 +197,7 @@ export function App() {
           audioQualitySupported={view.audio_quality_supported}
           asciiVisualizerSupported={view.ascii_visualizer_supported ?? false}
           commonsUploadSupported={view.commons_upload_supported}
+			s3UploadSupported={view.s3_upload_supported ?? false}
 			archiveUploadSupported={view.archive_upload_supported ?? false}
 			channelDownloadSupported={view.channel_download_supported}
 			evernoteSupported={view.evernote_supported}
@@ -224,6 +227,8 @@ export function App() {
 		) : null}
 		{view.archive_upload_popup ? <ArchiveUploadPopup popup={view.archive_upload_popup} /> : null}
 		{view.archive_credentials_editor ? <ArchiveCredentialsPopup editor={view.archive_credentials_editor} /> : null}
+		{view.s3_upload_popup ? <S3UploadPopup popup={view.s3_upload_popup} /> : null}
+		{view.s3_credentials_editor ? <S3CredentialsPopup editor={view.s3_credentials_editor} /> : null}
       {view.rss_subscription_open ? <CredentialEditorNotice editor="rss_subscription" /> : null}
       {view.preferences_popup ? <PreferencesPopup popup={view.preferences_popup} archiveSupported={sources.some((source) => source.id === 'ArchiveOrg')} /> : null}
       {view.local_file_popup ? <LocalFilePopup popup={view.local_file_popup} /> : null}

@@ -2246,6 +2246,58 @@ browsing. The next-release source ebuild template also has a default-on
 `archive-upload` USE flag. See the official [IAS3 upload API](https://archive.org/developers/ias3.html)
 and [metadata schema](https://archive.org/developers/metadata-schema/index.html).
 
+## Amazon S3 uploads
+
+S3 uploading is **not built by default**. Enable it with
+`cargo build --features s3-upload`, or add `s3-upload` to a custom feature list.
+The GUI forwards the same opt-in feature. The next-release Gentoo source
+ebuild has an opt-in `s3-upload` USE flag; default prebuilt binaries omit it.
+
+Select an exportable audio or video item, including a local file, and choose
+`Upload to S3` or press uppercase `M` (listed in Help only). Review the existing
+bucket, AWS region, exact object key, and optional AWS profile before pressing
+Upload or `Ctrl+S`. The object key is the path inside the bucket, for example
+`audiobooks/chapter-01.opus`. Existing objects are never overwritten. Youta
+does not create buckets, change access policies, or make an object public;
+the bucket's existing permissions determine who can access it.
+
+Audio is prepared as Opus. For video-capable sources, `F2` toggles the remembered
+`Upload video` checkbox: it retains the highest available video quality,
+preferring AV1/Opus when quality is equal, in an MKV container without video
+reencoding. Live streams must first be recorded as a finite local file.
+Opening or editing the review never starts an upload.
+Preparation is limited to 30 minutes and 8 GiB of temporary data, including
+input copies and intermediate files; local originals are never moved or modified.
+
+Authentication uses AWS environment credentials or the selected shared AWS
+profile; an empty profile uses `AWS_PROFILE` or `default`. Temporary credentials
+include the session token. If credentials are missing, a masked editor opens;
+`F1` / `Session keys…` opens it explicitly. Accepting keys returns to review
+and requires another Upload confirmation. Keys entered there are session-only,
+never written to Youta's configuration or serialized into the GUI snapshot.
+See [AWS authentication](https://docs.aws.amazon.com/sdk-for-rust/latest/dg/credentials.html)
+and [shared profile configuration](https://docs.aws.amazon.com/sdkref/latest/guide/file-format.html).
+
+Non-secret defaults are stored under `[s3_upload]` in `config.toml`:
+
+```toml
+[s3_upload]
+bucket = 'my-audio-bucket'
+region = 'eu-central-1'
+profile = 'personal'
+upload_video = false
+```
+
+The destination bucket and region must match. The initial implementation targets
+AWS S3, not custom S3-compatible endpoints. It does not run credential helper
+commands or automatically contact instance/container metadata services.
+Progress counts bytes acknowledged by S3. `Esc` requests cancellation and the
+popup stays open until the worker stops. Multipart failures trigger a bounded
+cleanup attempt; if cleanup cannot be confirmed, the error explains what to
+check. Storage and request charges can apply. A bucket lifecycle rule for
+incomplete multipart uploads is recommended as a safeguard against crashes.
+See [S3 conditional writes and multipart cleanup](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html).
+
 ## Wikimedia Commons transfer
 
 The default-on `commons-upload` feature adds a reviewed audio upload for exact

@@ -46,7 +46,7 @@ async function contractDefaults() {
 		if (ts.isTypeAliasDeclaration(node)) return value(node.type);
 		return Object.fromEntries(node.members.map((member) => [member.name.getText(parsed), value(member.type)]));
 	};
-	return Object.fromEntries(['ViewModel', 'DetailView', 'RowView', 'ArchiveUploadPopupView']
+	return Object.fromEntries(['ViewModel', 'DetailView', 'RowView', 'ArchiveUploadPopupView', 'S3UploadPopupView']
 		.map((name) => [name, named(name)]));
 }
 
@@ -120,7 +120,7 @@ test('Firefox renders Archive browsing, EOF seek controls and upload dialogs thr
 			new Promise((resolve) => browser.once('error', (error) => resolve({ ok: false, error: error.message }))),
 		]);
 		assert.equal(result.ok, true, `${JSON.stringify(result, null, 2)}\n${diagnostics}`);
-		assert.ok(result.checks.length >= 30, 'browser must complete all interaction checks');
+		assert.ok(result.checks.length >= 40, 'browser must complete all interaction checks');
 		context.diagnostic(`${result.checks.length} browser interaction assertions passed; native playback and uploads were mocked`);
 	} finally {
 		clearTimeout(timer);

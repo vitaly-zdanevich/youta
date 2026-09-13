@@ -39,8 +39,8 @@ impl PreparedArchiveMedia {
 }
 
 /// Maximum combined staging size, including partial downloads and merge inputs.
-const MAX_STAGING_BYTES: u64 = 8 * 1024 * 1024 * 1024;
-const MAX_PREPARATION_TIME: Duration = Duration::from_secs(30 * 60);
+pub(crate) const MAX_STAGING_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+pub(crate) const MAX_PREPARATION_TIME: Duration = Duration::from_secs(30 * 60);
 
 /// Prepares Opus audio, or the best available video/audio without video re-encoding.
 ///
@@ -138,17 +138,17 @@ fn prepare_with_limits(
 }
 
 /// One exporter-owned command, or an already completed bounded private copy.
-struct StagingPlan {
+pub(crate) struct StagingPlan {
     /// The configured supervised helper, absent for a byte-for-byte local Opus copy.
-    command: Option<Command>,
+    pub command: Option<Command>,
     /// Fixed output for FFmpeg/copies; yt-dlp reports its postprocessed path instead.
-    expected_output: Option<PathBuf>,
+    pub expected_output: Option<PathBuf>,
 }
 
 /// Shares the same private-directory, output, cancellation and resource policy
 /// between explicitly reviewed exporters. Builders may only prepare their own
 /// inputs inside the supplied directory and must honor the supplied deadline.
-fn prepare_staged_media(
+pub(crate) fn prepare_staged_media(
     filename_stem: &str,
     upload_video: bool,
     cancellation: &Arc<AtomicBool>,
@@ -336,7 +336,7 @@ fn staging_command(
 
 /// Reuses the normal download format policy; an exporter may require final MKV
 /// remuxing without changing the existing manual/Archive upload behavior.
-fn provider_staging_command(
+pub(crate) fn provider_staging_command(
     config: &Config,
     source_url: url::Url,
     destination: &Path,

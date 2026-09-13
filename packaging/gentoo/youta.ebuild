@@ -35,7 +35,7 @@ IUSE="
 	bandcamp bilibili bundled-sqlite cpu_flags_x86_sse2 dearrow discord +evernote
 	+commons-upload +funkwhale +generic-ytdlp google-drive gpm gpodder gui +invidious jack +jamendo
 	keyring +lan-sharing +lastfm +librivox +litres +local +local-archives +mpv native +nyan-cat odysee +peertube pipewire
-	podcast-index pulseaudio +qr +radio +rss rumble +rutube +soundcloud +soundstream
+	podcast-index pulseaudio +qr +radio +rss rumble +rutube s3-upload +soundcloud +soundstream
 	+sponsorblock sqlite ssh +summary telegram test +images torrent +tracker-music +tui +vimeo vk
 	+waveform +web-browser webdav +wikidata wikimedia yandex-disk yandex-music +youtube-music
 	+youtube-captions +youtube-official +yt-dlp
@@ -50,6 +50,7 @@ REQUIRED_USE="
 	bbc-radio? ( radio )
 	bundled-sqlite? ( sqlite )
 	archive-upload? ( yt-dlp )
+	s3-upload? ( yt-dlp )
 	commons-upload? ( yt-dlp )
 	evernote? ( yt-dlp )
 	gpodder? ( rss )
@@ -165,6 +166,7 @@ src_configure() {
 		$(usev archive-zip)
 		$(usev archive-org)
 		$(usev archive-upload)
+		$(usev s3-upload)
 		$(usev apple-podcasts)
 		$(usev bandcamp)
 		$(usev bbc-radio)
@@ -247,6 +249,9 @@ src_compile() {
 		if use archive-upload; then
 			gui_features+=,archive-upload
 		fi
+		if use s3-upload; then
+			gui_features+=,s3-upload
+		fi
 		if use ascii-visualizer; then
 			gui_features+=,ascii-visualizer
 		fi
@@ -311,6 +316,10 @@ src_test() {
 		if use archive-upload; then
 			[[ -n ${gui_test_features} ]] && gui_test_features+=,
 			gui_test_features+=archive-upload
+		fi
+		if use s3-upload; then
+			[[ -n ${gui_test_features} ]] && gui_test_features+=,
+			gui_test_features+=s3-upload
 		fi
 		if use commons-upload; then
 			[[ -n ${gui_test_features} ]] && gui_test_features+=,

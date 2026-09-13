@@ -51,6 +51,11 @@ use youta::view::{ChannelDownloadOption, ChannelDownloadPopupView};
 #[cfg(feature = "lan-sharing")]
 use youta::view::{LanSharePopupView, PodcastFeedOptionsPopupView};
 use youta::waveform::PeakPyramid;
+#[cfg(feature = "s3-upload")]
+use youta::{
+    s3_upload::S3UploadDraft,
+    view::{S3CredentialsPopupView, S3UploadPopupView},
+};
 
 /// Reads the declarations the window compiles against.
 fn contract_source() -> String {
@@ -155,6 +160,14 @@ fn field_belongs_to_disabled_feature(interface: &str, field: &str) -> bool {
                         | "commons_upload_popup"
                         | "commons_upload_supported"
                 ))
+            || (!cfg!(feature = "s3-upload")
+                && matches!(
+                    field,
+                    "s3_upload_supported"
+                        | "s3_upload_available"
+                        | "s3_upload_popup"
+                        | "s3_credentials_editor"
+                ))
             || (!cfg!(feature = "archive-upload")
                 && matches!(
                     field,
@@ -208,6 +221,19 @@ fn action_belongs_to_disabled_feature(name: &str) -> bool {
                     | "SelectCommonsUploadField"
                     | "SubmitCommonsCredentials"
                     | "SubmitCommonsUpload"
+            ))
+        || (!cfg!(feature = "s3-upload")
+            && matches!(
+                name,
+                "OpenS3Upload"
+                    | "SelectS3UploadField"
+                    | "ToggleS3UploadVideo"
+                    | "SubmitS3Upload"
+                    | "DismissS3Upload"
+                    | "OpenS3Credentials"
+                    | "SelectS3CredentialField"
+                    | "SubmitS3Credentials"
+                    | "DismissS3Credentials"
             ))
         || (!cfg!(feature = "archive-upload")
             && matches!(
@@ -291,7 +317,14 @@ fn optional_contract_exemptions_follow_the_compiled_feature_set() {
         "ViewModel",
         "status_line"
     ));
-
+    assert_eq!(
+        field_belongs_to_disabled_feature("ViewModel", "s3_upload_popup"),
+        !cfg!(feature = "s3-upload")
+    );
+    assert_eq!(
+        action_belongs_to_disabled_feature("SubmitS3Upload"),
+        !cfg!(feature = "s3-upload")
+    );
     assert!(!action_belongs_to_disabled_feature("Quit"));
 }
 
@@ -553,7 +586,23 @@ fn the_typescript_contract_names_only_fields_the_reducer_emits() {
             emitted_keys(&EvernoteNoteDraft::default()),
         );
     }
-
+    #[cfg(feature = "s3-upload")]
+    {
+        emitted.insert(
+            "S3UploadPopupView",
+            emitted_keys(&S3UploadPopupView::default()),
+        );
+        emitted.insert("S3UploadDraft", emitted_keys(&S3UploadDraft::default()));
+        let credentials = ViewModel {
+            s3_credentials_popup: Some(S3CredentialsPopupView::default()),
+            ..ViewModel::default()
+        };
+        let json = serde_json::to_value(credentials).expect("redacted S3 credentials");
+        emitted.insert(
+            "S3CredentialsEditorView",
+            emitted_keys(&json["s3_credentials_editor"]),
+        );
+    }
     #[cfg(feature = "archive-upload")]
     {
         emitted.insert(
@@ -696,6 +745,9 @@ fn every_checked_interface_is_actually_declared() {
         "CommonsCategorySuggestion",
         "EvernoteNotePopupView",
         "EvernoteNoteDraft",
+        "S3UploadPopupView",
+        "S3UploadDraft",
+        "S3CredentialsEditorView",
         "ArchiveUploadPopupView",
         "ArchiveUploadDraft",
         "ArchiveCredentialsEditorView",
@@ -1723,6 +1775,7 @@ fn the_contract_never_names_a_credential_bearing_editor() {
         "PrivateNotePopupView",
         "CommonsCredentialsPopupView",
         "EvernoteCredentialsPopupView",
+        "S3CredentialsPopupView",
         "ArchiveCredentialsPopupView",
         "youtube_setup_popup",
         "yandex_music_setup_popup",
@@ -1730,6 +1783,7 @@ fn the_contract_never_names_a_credential_bearing_editor() {
         "private_note_popup",
         "commons_credentials_popup",
         "evernote_credentials_popup",
+        "s3_credentials_popup",
         "archive_credentials_popup",
     ] {
         assert!(

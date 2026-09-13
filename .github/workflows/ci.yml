@@ -112,6 +112,10 @@ jobs:
             feature_arguments: --no-default-features --features tui,apple-podcasts
           - feature_set: standalone Internet Archive upload
             feature_arguments: --no-default-features --features archive-upload
+          - feature_set: standalone opt-in S3 upload
+            feature_arguments: --no-default-features --features s3-upload
+          - feature_set: TUI with opt-in S3 upload
+            feature_arguments: --no-default-features --features tui,s3-upload
           - feature_set: TUI with Internet Archive upload
             feature_arguments: --no-default-features --features tui,archive-upload
           - feature_set: TUI with Internet Archive browsing and upload

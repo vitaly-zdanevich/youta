@@ -266,6 +266,109 @@ mod wire_tests {
         );
     }
 
+    /// Every confirmation echoes its displayed review; closed feature builds expose no upload key.
+    #[cfg(feature = "s3-upload")]
+    #[test]
+    fn s3_upload_keys_preserve_generations_capabilities_and_credential_modality() {
+        use crate::view::{
+            S3CredentialField, S3CredentialsPopupView, S3UploadField, S3UploadPhase,
+            S3UploadPopupView,
+        };
+        let mut view = ViewModel {
+            s3_upload_available: true,
+            ..ViewModel::default()
+        };
+        assert_eq!(
+            key_action(KeyPress::new(Key::Char('M')), &view, None, None),
+            Some(UiAction::OpenS3Upload)
+        );
+        for generation in [7, 42] {
+            view.s3_upload_popup = Some(S3UploadPopupView {
+                generation,
+                video_available: true,
+                ..S3UploadPopupView::default()
+            });
+            assert_eq!(
+                key_action(
+                    KeyPress {
+                        ctrl: true,
+                        ..KeyPress::new(Key::Char('s'))
+                    },
+                    &view,
+                    None,
+                    None
+                ),
+                Some(UiAction::SubmitS3Upload(generation))
+            );
+            assert_eq!(
+                key_action(KeyPress::new(Key::Enter), &view, None, None),
+                Some(UiAction::SelectS3UploadField(S3UploadField::Region))
+            );
+            assert_eq!(
+                key_action(KeyPress::new(Key::F(1)), &view, None, None),
+                Some(UiAction::OpenS3Credentials)
+            );
+            assert_eq!(
+                key_action(KeyPress::new(Key::F(2)), &view, None, None),
+                Some(UiAction::ToggleS3UploadVideo)
+            );
+            assert_eq!(
+                key_action(KeyPress::new(Key::Char('q')), &view, None, None),
+                Some(UiAction::AppendS3UploadCharacter('q'))
+            );
+            view.s3_upload_popup.as_mut().unwrap().video_available = false;
+            assert_eq!(
+                key_action(KeyPress::new(Key::F(2)), &view, None, None),
+                None
+            );
+            view.s3_upload_popup.as_mut().unwrap().phase = S3UploadPhase::Uploading;
+            for key in [Key::F(1), Key::F(2), Key::Enter, Key::Char('M')] {
+                assert_eq!(key_action(KeyPress::new(key), &view, None, None), None);
+            }
+        }
+        view.s3_credentials_popup = Some(S3CredentialsPopupView::default());
+        assert_eq!(
+            key_action(KeyPress::new(Key::Enter), &view, None, None),
+            Some(UiAction::SubmitS3Credentials)
+        );
+        assert_eq!(
+            key_action(KeyPress::new(Key::BackTab), &view, None, None),
+            Some(UiAction::SelectS3CredentialField(
+                S3CredentialField::SessionToken
+            ))
+        );
+        assert_eq!(
+            key_action(
+                KeyPress {
+                    ctrl: true,
+                    ..KeyPress::new(Key::Char('s'))
+                },
+                &view,
+                None,
+                None
+            ),
+            None
+        );
+        assert_eq!(
+            key_action(KeyPress::new(Key::Esc), &view, None, None),
+            Some(UiAction::DismissS3Credentials)
+        );
+    }
+
+    #[cfg(not(feature = "s3-upload"))]
+    #[test]
+    fn s3_upload_shortcut_is_absent_without_the_feature() {
+        assert_eq!(
+            key_action(
+                KeyPress::new(Key::Char('M')),
+                &ViewModel::default(),
+                None,
+                None
+            ),
+            None
+        );
+    }
+
     #[cfg(feature = "archive-upload")]
     #[test]
     fn archive_upload_confirmation_uses_each_live_generation() {
@@ -1259,7 +1362,63 @@ fn unfiltered_key_action(
     if let Some(popup) = view.video_comments_popup.as_ref() {
         return video_comments_key_action(key, popup.scroll_offset, usize::MAX, 20);
     }
-
+    #[cfg(feature = "s3-upload")]
+    if let Some(popup) = view.s3_credentials_popup.as_ref() {
+        return match key.key {
+            Key::Esc => Some(UiAction::DismissS3Credentials),
+            Key::Enter => Some(UiAction::SubmitS3Credentials),
+            Key::Tab if reverse_tab(key) => Some(UiAction::SelectS3CredentialField(
+                popup.selected_field.previous(),
+            )),
+            Key::BackTab | Key::Up => Some(UiAction::SelectS3CredentialField(
+                popup.selected_field.previous(),
+            )),
+            Key::Tab | Key::Down => Some(UiAction::SelectS3CredentialField(
+                popup.selected_field.next(),
+            )),
+            Key::Backspace => Some(UiAction::DeleteS3CredentialCharacter),
+            Key::Char('w' | 'W') if is_delete_previous_word_key(key) => {
+                Some(UiAction::DeleteS3CredentialWord)
+            }
+            Key::Char(character) if !character.is_control() && !key.chorded() => {
+                Some(UiAction::AppendS3CredentialCharacter(character))
+            }
+            _ => None,
+        };
+    }
+    #[cfg(feature = "s3-upload")]
+    if let Some(popup) = view.s3_upload_popup.as_ref() {
+        if !popup.phase.is_editable() {
+            return if key.key == Key::Esc {
+                Some(UiAction::DismissS3Upload)
+            } else {
+                None
+            };
+        }
+        return match key.key {
+            Key::Esc => Some(UiAction::DismissS3Upload),
+            Key::Char('s' | 'S') if key.ctrl => Some(UiAction::SubmitS3Upload(popup.generation)),
+            Key::F(1) => Some(UiAction::OpenS3Credentials),
+            Key::F(2) if popup.video_available => Some(UiAction::ToggleS3UploadVideo),
+            Key::Tab if reverse_tab(key) => Some(UiAction::SelectS3UploadField(
+                popup.selected_field.previous(),
+            )),
+            Key::BackTab | Key::Up => Some(UiAction::SelectS3UploadField(
+                popup.selected_field.previous(),
+            )),
+            Key::Tab | Key::Down | Key::Enter => {
+                Some(UiAction::SelectS3UploadField(popup.selected_field.next()))
+            }
+            Key::Backspace => Some(UiAction::DeleteS3UploadCharacter),
+            Key::Char('w' | 'W') if is_delete_previous_word_key(key) => {
+                Some(UiAction::DeleteS3UploadWord)
+            }
+            Key::Char(character) if !character.is_control() && !key.chorded() => {
+                Some(UiAction::AppendS3UploadCharacter(character))
+            }
+            _ => None,
+        };
+    }
     #[cfg(feature = "archive-upload")]
     if let Some(popup) = view.archive_credentials_popup.as_ref() {
         return match key.key {
@@ -1911,7 +2070,10 @@ fn unfiltered_key_action(
         Key::Char('E') if !key.chorded() && view.evernote_available => {
             Some(UiAction::OpenEvernoteNote)
         }
-
+        #[cfg(feature = "s3-upload")]
+        Key::Char('M') if !key.chorded() && view.s3_upload_available => {
+            Some(UiAction::OpenS3Upload)
+        }
         #[cfg(feature = "archive-upload")]
         Key::Char('I') if !key.chorded() && view.archive_upload_available => {
             Some(UiAction::OpenArchiveUpload)

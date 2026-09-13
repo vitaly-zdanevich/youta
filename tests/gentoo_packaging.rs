@@ -10,6 +10,16 @@ use std::process::Command;
 
 /// Evaluates only the configuration, compilation, and testing phase dispatch.
 fn evaluate_template(archive_org: bool, ascii_visualizer: bool, archive_upload: bool) -> String {
+    evaluate_template_with_s3(archive_org, ascii_visualizer, archive_upload, false)
+}
+
+/// Includes an independent opt-in S3 setting without enabling another upload client.
+fn evaluate_template_with_s3(
+    archive_org: bool,
+    ascii_visualizer: bool,
+    archive_upload: bool,
+    s3_upload: bool,
+) -> String {
     let template = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("packaging/gentoo/youta.ebuild");
     assert!(
         template.is_file(),
@@ -40,9 +50,10 @@ src_test
         .env(
             "USE_FIXTURE",
             format!(
-                "gui {} {} {}",
+                "gui {} {} {} {}",
                 if archive_org { "archive-org" } else { "" },
                 if archive_upload { "archive-upload" } else { "" },
+                if s3_upload { "s3-upload" } else { "" },
                 if ascii_visualizer {
                     "ascii-visualizer"
                 } else {
@@ -81,6 +92,35 @@ fn archive_org_is_default_on_in_the_future_source_ebuild() {
     let flags = trace_fields(&trace, "IUSE|");
     assert!(flags.contains(&"+archive-org"));
     assert!(!flags.contains(&"archive-org"));
+}
+
+#[test]
+fn s3_use_is_opt_in_and_forwarded_to_both_frontends() {
+    for enabled in [false, true] {
+        let trace = evaluate_template_with_s3(false, false, false, enabled);
+        let flags = trace_fields(&trace, "IUSE|");
+        assert!(flags.contains(&"s3-upload"));
+        assert!(!flags.contains(&"+s3-upload"));
+        let tui = trace_fields(&trace, "TUI|");
+        assert_eq!(tui.contains(&"s3-upload"), enabled);
+        assert!(!tui.contains(&"archive-upload"));
+        for operation in ["build", "test"] {
+            let fields = trace_fields(&trace, &format!("GUI|cargo|{operation}|"));
+            let features = fields
+                .windows(2)
+                .find_map(|pair| (pair[0] == "--features").then_some(pair[1]))
+                .unwrap_or("");
+            assert_eq!(
+                features.split(',').any(|feature| feature == "s3-upload"),
+                enabled
+            );
+            assert!(
+                !features
+                    .split(',')
+                    .any(|feature| feature == "archive-upload")
+            );
+        }
+    }
 }
 
 #[test]

@@ -74,6 +74,39 @@ fn archive_upload_is_default_but_independently_removable_in_both_frontends() {
     assert!(ci.contains("feature_arguments: --no-default-features --features tui,archive-upload"));
 }
 
+/// Default builds contain neither S3 authentication dependencies nor its UI.
+#[test]
+fn s3_upload_sdk_and_ui_are_exclusively_opt_in() {
+    let manifest = manifest();
+    for profile in [
+        "default",
+        "app",
+        "app-core",
+        "sources",
+        "controller",
+        "tui",
+        "archive-upload",
+    ] {
+        let closure = feature_closure(&manifest, profile);
+        assert!(!closure.contains("s3-upload"), "{profile}");
+        assert!(!closure.contains("dep:aws-sdk-s3"), "{profile}");
+        assert!(!closure.contains("dep:aws-config"), "{profile}");
+    }
+    let upload = feature_closure(&manifest, "s3-upload");
+    for feature in ["controller", "yt-dlp", "dep:aws-sdk-s3", "dep:aws-config"] {
+        assert!(upload.contains(feature), "{feature}");
+    }
+    for unrelated in ["archive-upload", "commons-upload", "evernote"] {
+        assert!(!upload.contains(unrelated), "{unrelated}");
+    }
+    let gui: toml::Value = toml::from_str(&read_repository_file("gui/Cargo.toml")).unwrap();
+    assert!(!feature_entries(&gui, "default").contains(&"s3-upload"));
+    assert_eq!(feature_entries(&gui, "s3-upload"), ["youta/s3-upload"]);
+    let ci = read_repository_file(".github/workflows/ci.yml");
+    assert!(ci.contains("feature_arguments: --no-default-features --features s3-upload"));
+    assert!(ci.contains("feature_arguments: --no-default-features --features tui,s3-upload"));
+}
+
 /// Removing Web also removes its HTML parser without changing other sources.
 #[test]
 fn web_browser_is_default_but_independently_removable() {

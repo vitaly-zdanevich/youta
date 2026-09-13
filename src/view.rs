@@ -666,6 +666,33 @@ fn serialize_evernote_credentials_editor<S: serde::Serializer>(
     .serialize(serializer)
 }
 
+/// Sends only lengths and focus for the session-only S3 credential editor.
+#[cfg(feature = "s3-upload")]
+fn serialize_s3_credentials_editor<S: serde::Serializer>(
+    editor: &Option<S3CredentialsPopupView>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    #[derive(Serialize)]
+    struct RedactedS3CredentialsEditor {
+        access_key_length: usize,
+        secret_key_length: usize,
+        session_token_length: usize,
+        selected_field: S3CredentialField,
+        validation_failed: bool,
+    }
+    let Some(editor) = editor else {
+        return serializer.serialize_none();
+    };
+    RedactedS3CredentialsEditor {
+        access_key_length: editor.access_key.chars().count(),
+        secret_key_length: editor.secret_key.chars().count(),
+        session_token_length: editor.session_token.chars().count(),
+        selected_field: editor.selected_field,
+        validation_failed: editor.validation_error.is_some(),
+    }
+    .serialize(serializer)
+}
+
 /// Exposes only field lengths and focus for the session-only Archive key editor.
 #[cfg(feature = "archive-upload")]
 fn serialize_archive_credentials_editor<S: serde::Serializer>(
@@ -1935,6 +1962,168 @@ impl std::fmt::Debug for YandexMusicSetupPopupView {
     }
 }
 
+/// Editable S3 destination field; no field change starts an upload.
+#[cfg(feature = "s3-upload")]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub enum S3UploadField {
+    /// Existing bucket name, without a URL scheme.
+    #[default]
+    Bucket,
+    /// AWS region containing the bucket.
+    Region,
+    /// New object key within the bucket.
+    ObjectKey,
+    /// Optional SDK profile; empty uses AWS_PROFILE or the default profile.
+    Profile,
+}
+
+#[cfg(feature = "s3-upload")]
+impl S3UploadField {
+    /// Moves focus forward without confirming a transfer.
+    #[must_use]
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Bucket => Self::Region,
+            Self::Region => Self::ObjectKey,
+            Self::ObjectKey => Self::Profile,
+            Self::Profile => Self::Bucket,
+        }
+    }
+
+    /// Moves focus backward without confirming a transfer.
+    #[must_use]
+    pub const fn previous(self) -> Self {
+        match self {
+            Self::Bucket => Self::Profile,
+            Self::Region => Self::Bucket,
+            Self::ObjectKey => Self::Region,
+            Self::Profile => Self::ObjectKey,
+        }
+    }
+}
+
+/// Preparation and transfer phases; only a fresh review accepts edits.
+#[cfg(feature = "s3-upload")]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub enum S3UploadPhase {
+    /// Destination is editable and no upload has started.
+    #[default]
+    Review,
+    /// The selected media is being prepared locally.
+    Preparing,
+    /// Bytes are being transferred to the reviewed destination.
+    Uploading,
+    /// The worker is stopping after a cancellation request.
+    Cancelling,
+    /// S3 acknowledged the completed transfer.
+    Complete,
+    /// Preparation or transfer failed; the old review cannot be retried.
+    Failed,
+    /// Local work stopped; remote state may need inspection.
+    Cancelled,
+}
+
+#[cfg(feature = "s3-upload")]
+impl S3UploadPhase {
+    /// Whether destination edits and explicit submission are permitted.
+    #[must_use]
+    pub const fn is_editable(self) -> bool {
+        matches!(self, Self::Review)
+    }
+}
+
+/// Generation-bound destination review and progress, without credentials.
+#[cfg(feature = "s3-upload")]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct S3UploadPopupView {
+    /// Exact review epoch echoed by explicit confirmation.
+    pub generation: u64,
+    /// Destination and media-format selection.
+    pub draft: crate::s3_upload::S3UploadDraft,
+    /// Destination field receiving keyboard input.
+    pub selected_field: S3UploadField,
+    /// Current review, preparation, transfer, or terminal state.
+    pub phase: S3UploadPhase,
+    /// Bounded activity indicator frame.
+    pub animation_frame: usize,
+    /// Bytes transferred by the worker.
+    pub uploaded_bytes: u64,
+    /// Prepared media size when known.
+    pub total_bytes: Option<u64>,
+    /// Controller-redacted actionable failure.
+    pub validation_error: Option<String>,
+    /// Completed s3:// location; not assumed to be a public web link.
+    pub result_location: Option<String>,
+    /// Whether the selected source supports video preparation.
+    pub video_available: bool,
+}
+
+/// Sensitive session credential field currently receiving keyboard input.
+#[cfg(feature = "s3-upload")]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub enum S3CredentialField {
+    /// AWS access key identifier.
+    #[default]
+    AccessKey,
+    /// AWS secret access key.
+    SecretKey,
+    /// Optional temporary-session token.
+    SessionToken,
+}
+
+#[cfg(feature = "s3-upload")]
+impl S3CredentialField {
+    /// Advances to the next masked credential editor.
+    #[must_use]
+    pub const fn next(self) -> Self {
+        match self {
+            Self::AccessKey => Self::SecretKey,
+            Self::SecretKey => Self::SessionToken,
+            Self::SessionToken => Self::AccessKey,
+        }
+    }
+
+    /// Moves to the previous masked credential editor.
+    #[must_use]
+    pub const fn previous(self) -> Self {
+        match self {
+            Self::AccessKey => Self::SessionToken,
+            Self::SecretKey => Self::AccessKey,
+            Self::SessionToken => Self::SecretKey,
+        }
+    }
+}
+
+/// Session credentials retained in Rust; both Debug and JSON remain redacted.
+#[cfg(feature = "s3-upload")]
+#[derive(Clone, Default, Eq, PartialEq)]
+pub struct S3CredentialsPopupView {
+    /// Sensitive access key identifier.
+    pub access_key: String,
+    /// Sensitive secret access key.
+    pub secret_key: String,
+    /// Optional sensitive temporary-session token.
+    pub session_token: String,
+    /// Field receiving private editor input.
+    pub selected_field: S3CredentialField,
+    /// Inline error retained only in Rust.
+    pub validation_error: Option<String>,
+}
+
+#[cfg(feature = "s3-upload")]
+impl std::fmt::Debug for S3CredentialsPopupView {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("S3CredentialsPopupView")
+            .field("access_key", &"[REDACTED]")
+            .field("secret_key", &"[REDACTED]")
+            .field("session_token", &"[REDACTED]")
+            .field("selected_field", &self.selected_field)
+            .field("validation_failed", &self.validation_error.is_some())
+            .finish()
+    }
+}
+
 /// Editable metadata field in the Archive.org upload review.
 #[cfg(feature = "archive-upload")]
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -2564,7 +2753,22 @@ pub struct ViewModel {
         serialize_with = "serialize_evernote_credentials_editor"
     )]
     pub evernote_credentials_popup: Option<EvernoteCredentialsPopupView>,
-
+    /// Whether this build contains optional S3 upload support.
+    #[cfg(feature = "s3-upload")]
+    pub s3_upload_supported: bool,
+    /// Whether the current selected media can enter S3 review.
+    #[cfg(feature = "s3-upload")]
+    pub s3_upload_available: bool,
+    /// Reviewed S3 destination and transfer state.
+    #[cfg(feature = "s3-upload")]
+    pub s3_upload_popup: Option<S3UploadPopupView>,
+    /// Secret editor exposed to windows only as lengths and focus.
+    #[cfg(feature = "s3-upload")]
+    #[serde(
+        rename = "s3_credentials_editor",
+        serialize_with = "serialize_s3_credentials_editor"
+    )]
+    pub s3_credentials_popup: Option<S3CredentialsPopupView>,
     /// Whether this binary contains the removable Archive upload capability.
     #[cfg(feature = "archive-upload")]
     pub archive_upload_supported: bool,
@@ -2835,7 +3039,14 @@ impl Default for ViewModel {
             evernote_popup: None,
             #[cfg(feature = "evernote")]
             evernote_credentials_popup: None,
-
+            #[cfg(feature = "s3-upload")]
+            s3_upload_supported: true,
+            #[cfg(feature = "s3-upload")]
+            s3_upload_available: false,
+            #[cfg(feature = "s3-upload")]
+            s3_upload_popup: None,
+            #[cfg(feature = "s3-upload")]
+            s3_credentials_popup: None,
             #[cfg(feature = "archive-upload")]
             archive_upload_supported: true,
             #[cfg(feature = "archive-upload")]
@@ -3169,7 +3380,51 @@ pub enum UiAction {
     /// Review an explicit upload of the selected YouTube video to Archive.org.
     #[cfg(feature = "archive-upload")]
     OpenArchiveUpload,
-
+    /// Open a fresh S3 destination review without uploading.
+    #[cfg(feature = "s3-upload")]
+    OpenS3Upload,
+    /// Focus one destination field.
+    #[cfg(feature = "s3-upload")]
+    SelectS3UploadField(S3UploadField),
+    /// Append one character to the focused destination field.
+    #[cfg(feature = "s3-upload")]
+    AppendS3UploadCharacter(char),
+    /// Remove the final grapheme from the focused destination field.
+    #[cfg(feature = "s3-upload")]
+    DeleteS3UploadCharacter,
+    /// Remove the preceding word from the focused destination field.
+    #[cfg(feature = "s3-upload")]
+    DeleteS3UploadWord,
+    /// Toggle video only for media that supports it.
+    #[cfg(feature = "s3-upload")]
+    ToggleS3UploadVideo,
+    /// Explicitly upload the exact reviewed generation.
+    #[cfg(feature = "s3-upload")]
+    SubmitS3Upload(u64),
+    /// Cancel local transfer work or close its terminal review.
+    #[cfg(feature = "s3-upload")]
+    DismissS3Upload,
+    /// Focus one masked S3 credential field.
+    #[cfg(feature = "s3-upload")]
+    SelectS3CredentialField(S3CredentialField),
+    /// Append one character to the focused private credential field.
+    #[cfg(feature = "s3-upload")]
+    AppendS3CredentialCharacter(char),
+    /// Remove the final grapheme from the focused private credential field.
+    #[cfg(feature = "s3-upload")]
+    DeleteS3CredentialCharacter,
+    /// Remove the preceding word from the focused private credential field.
+    #[cfg(feature = "s3-upload")]
+    DeleteS3CredentialWord,
+    /// Open or replace session credentials from an editable review.
+    #[cfg(feature = "s3-upload")]
+    OpenS3Credentials,
+    /// Accept session credentials without automatically uploading.
+    #[cfg(feature = "s3-upload")]
+    SubmitS3Credentials,
+    /// Close the private editor and invalidate stale confirmations.
+    #[cfg(feature = "s3-upload")]
+    DismissS3Credentials,
     /// Focus one public metadata field without submitting it.
     #[cfg(feature = "archive-upload")]
     SelectArchiveUploadField(ArchiveUploadField),
@@ -3915,6 +4170,41 @@ mod tests {
             }),
             ..ViewModel::default()
         }
+    }
+
+    /// Both S3 keys and any credential-bearing error remain outside view snapshots and Debug.
+    #[cfg(feature = "s3-upload")]
+    #[test]
+    fn s3_credentials_never_appear_in_view_json_or_debug_output() {
+        let view = ViewModel {
+            s3_credentials_popup: Some(S3CredentialsPopupView {
+                access_key: "private-access".to_owned(),
+                secret_key: "private-secret".to_owned(),
+                session_token: "private-token".to_owned(),
+                selected_field: S3CredentialField::SessionToken,
+                validation_error: Some("private-error".to_owned()),
+            }),
+            ..ViewModel::default()
+        };
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(
+            json["s3_credentials_editor"],
+            serde_json::json!({
+                "access_key_length": 14, "secret_key_length": 14, "session_token_length": 13,
+                "selected_field": "SessionToken", "validation_failed": true,
+            })
+        );
+        let debug = format!("{:?}", view.s3_credentials_popup);
+        for secret in [
+            "private-access",
+            "private-secret",
+            "private-token",
+            "private-error",
+        ] {
+            assert!(!json.to_string().contains(secret));
+            assert!(!debug.contains(secret));
+        }
+        assert!(json.get("s3_credentials_popup").is_none());
     }
 
     #[cfg(feature = "archive-upload")]

@@ -737,6 +737,42 @@ export interface EvernoteCredentialsEditorView {
 	validation_failed: boolean;
 }
 
+/** Explicit S3 destination; it never implies public object access. */
+export interface S3UploadDraft {
+	region: string;
+	bucket: string;
+	object_key: string;
+	profile: string;
+	upload_video: boolean;
+}
+
+export type S3UploadField = 'Bucket' | 'Region' | 'ObjectKey' | 'Profile';
+export type S3UploadPhase = 'Review' | 'Preparing' | 'Uploading' | 'Cancelling' | 'Complete' | 'Failed' | 'Cancelled';
+export type S3CredentialField = 'AccessKey' | 'SecretKey' | 'SessionToken';
+
+/** Generation-bound destination, media choice and worker progress. */
+export interface S3UploadPopupView {
+	generation: number;
+	draft: S3UploadDraft;
+	selected_field: S3UploadField;
+	phase: S3UploadPhase;
+	animation_frame: number;
+	uploaded_bytes: number;
+	total_bytes: number | null;
+	validation_error: string | null;
+	result_location: string | null;
+	video_available: boolean;
+}
+
+/** Only field lengths and focus leave Rust; all AWS key values remain private. */
+export interface S3CredentialsEditorView {
+	access_key_length: number;
+	secret_key_length: number;
+	session_token_length: number;
+	selected_field: S3CredentialField;
+	validation_failed: boolean;
+}
+
 /** Public metadata reviewed before creating an Archive.org item. */
 export interface ArchiveUploadDraft {
 	identifier: string;
@@ -850,6 +886,10 @@ export interface ViewModel {
 	evernote_available: boolean;
 	evernote_popup: EvernoteNotePopupView | null;
 	evernote_credentials_editor: EvernoteCredentialsEditorView | null;
+	s3_upload_supported: boolean;
+	s3_upload_available: boolean;
+	s3_upload_popup: S3UploadPopupView | null;
+	s3_credentials_editor: S3CredentialsEditorView | null;
 	archive_upload_supported: boolean;
 	archive_upload_available: boolean;
 	archive_upload_popup: ArchiveUploadPopupView | null;

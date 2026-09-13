@@ -141,7 +141,7 @@
 		// inferring transitions from labels or turning a click into a real upload.
 		const youtubeId = { source: 'you-tube', external_id: 'dQw4w9WgXcQ' };
 		snapshot({ screen: 'Search', rows: [], details: { ...details('Fixture YouTube video', youtubeId), source: 'YouTube' },
-			archive_upload_supported: true, archive_upload_available: true });
+			archive_upload_supported: true, archive_upload_available: true, s3_upload_supported: true, s3_upload_available: true });
 		await until(() => button('Upload to archive.org'), 'Archive upload action');
 		await action('OpenArchiveUpload', () => button('Upload to archive.org').click(), 'Archive Details action opens publication review');
 		const archive = { ...clone(defaults.ArchiveUploadPopupView), generation: 7, selected_field: 'Description', phase: 'Review',
@@ -176,9 +176,31 @@
 		snapshot({ archive_upload_popup: null });
 		await until(() => !dialog(), 'closed Archive review');
 
-		snapshot({ archive_upload_supported: false, archive_upload_available: false });
-		await until(() => !dialog() && !button('Upload to archive.org'), 'feature-trimmed Details');
-		checks.push('Feature-trimmed snapshots expose no Archive upload action');
+		await action('OpenS3Upload', () => button('Upload to S3').click(), 'S3 Details action opens destination review');
+		const s3 = { ...clone(defaults.S3UploadPopupView), generation: 55, phase: 'Review', video_available: false,
+			draft: { region: 'us-east-1', bucket: 'fixture-bucket', object_key: 'audio/fixture.opus', profile: '', upload_video: false } };
+		snapshot({ s3_upload_popup: s3 });
+		await until(() => dialog()?.textContent.includes('Destination: s3://fixture-bucket/audio/fixture.opus'), 'S3 destination');
+		assert(dialog().textContent.includes('Bucket permissions apply.') && dialog().textContent.includes('Existing objects are not overwritten.'), 'S3 review states permissions and no-overwrite semantics');
+		const beforeDisabledClick = calls.length;
+		dialog().querySelector('[role=checkbox]').click();
+		assert(dialog().querySelector('[role=checkbox]').disabled && calls.length === beforeDisabledClick, 'Audio-only source cannot request video from its disabled checkbox');
+		await action('OpenS3Credentials', () => button('Session keys…', dialog()).click(), 'S3 review offers explicit session-key replacement');
+		snapshot({ s3_credentials_editor: { access_key_length: 16, secret_key_length: 32, session_token_length: 48,
+			selected_field: 'SessionToken', validation_failed: false }, s3_upload_popup: { ...s3, generation: 56 } });
+		await until(() => dialog()?.textContent.includes('Session token (optional)'), 'S3 credential editor');
+		assert(dialog().textContent.includes('48 characters entered') && dialog().textContent.includes('they are not saved'), 'S3 optional session token is count-only and session-scoped');
+		await action('SubmitS3Credentials', () => button('Use for session', dialog()).click(), 'S3 credential acceptance is separate from upload');
+		snapshot({ s3_credentials_editor: null, s3_upload_popup: { ...s3, generation: 57 } });
+		await until(() => document.querySelectorAll('[role=dialog]').length === 1, 'S3 fresh review');
+		await action({ SubmitS3Upload: 57 }, () => button('Upload', dialog()).click(), 'S3 submit uses the latest generation after editing credentials');
+		snapshot({ s3_upload_popup: { ...s3, phase: 'Complete', result_location: 's3://fixture-bucket/audio/fixture.opus' } });
+		await until(() => dialog()?.textContent.includes('Upload complete. Bucket permissions still apply.'), 'S3 completion');
+		assert(!button('Upload', dialog()) && !button('Open item', dialog()), 'S3 completion is read-only and does not imply a public web link');
+		snapshot({ s3_upload_popup: null, s3_upload_supported: false, s3_upload_available: false,
+			archive_upload_supported: false, archive_upload_available: false });
+		await until(() => !dialog() && !button('Upload to S3') && !button('Upload to archive.org'), 'feature-trimmed Details');
+		checks.push('Feature-trimmed snapshots expose neither upload action');
 		assert(failures.length === 0, 'The full browser journey reports no frontend runtime failures');
 	}
 	void run().then(() => ({ ok: true, checks }), (error) => ({ ok: false, error: String(error), checks,

@@ -22,6 +22,11 @@ upstream release variants. Use `media-sound/youta`, not `youta-bin`, when
 individual provider removal is required; no unsupported binary USE toggle
 is supplied here.
 
+`USE="s3-upload"` opts into Amazon S3 uploading in both the terminal and desktop
+source builds. It is off by default and does not enable the separate
+`archive-upload` feature. Default upstream binaries omit S3; use the source
+package to enable it.
+
 Run the mocked, offline phase-selection tests with:
 
 ```sh

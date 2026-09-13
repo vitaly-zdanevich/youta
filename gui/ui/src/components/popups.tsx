@@ -14,6 +14,10 @@ import { useEffect, useRef } from 'react';
 
 import type {
   AudioQualityPopupView,
+	S3UploadField,
+	S3UploadPopupView,
+	S3CredentialField,
+	S3CredentialsEditorView,
 	ArchiveUploadField,
 	ArchiveUploadPopupView,
 	ArchiveCredentialsEditorView,
@@ -56,6 +60,8 @@ export const LAYER = {
   commonsUpload: 3,
 	archiveUpload: 3.2,
 	archiveCredentials: 3.3,
+	s3Upload: 3.4,
+	s3Credentials: 3.5,
   preferences: 4,
   localFile: 5,
   channelDownload: 6,
@@ -89,6 +95,7 @@ export function HelpPopup({
   audioQualitySupported,
   asciiVisualizerSupported,
   commonsUploadSupported,
+	s3UploadSupported,
 	archiveUploadSupported,
 	channelDownloadSupported,
 	evernoteSupported,
@@ -100,6 +107,7 @@ export function HelpPopup({
   audioQualitySupported: boolean;
   asciiVisualizerSupported: boolean;
   commonsUploadSupported: boolean;
+	s3UploadSupported: boolean;
 	archiveUploadSupported: boolean;
 	channelDownloadSupported: boolean;
 	evernoteSupported: boolean;
@@ -168,6 +176,9 @@ export function HelpPopup({
 			: []),
 		...(archiveUploadSupported
 			? ([['I', 'upload selected YouTube media to archive.org']] satisfies Array<[string, string]>)
+			: []),
+		...(s3UploadSupported
+			? ([['M', 'upload selected media to S3']] satisfies Array<[string, string]>)
 			: []),
         ["s · n", "subscribe · private note"],
         ["P · F6 · Q", "playlist · comments · QR code"],
@@ -357,6 +368,89 @@ function ArchiveUploadFieldInput({
 				{selected && !disabled ? <span aria-hidden className='ml-px inline-block h-[13px] w-[2px] animate-pulse bg-accent' /> : null}
 			</span>
 		</button>
+	);
+}
+
+/** The shared reducer owns destination text, media choices, and explicit confirmation. */
+export function S3UploadPopup({ popup }: { popup: S3UploadPopupView }) {
+	const editable = popup.phase === 'Review';
+	const terminal = ['Complete', 'Failed', 'Cancelled'].includes(popup.phase);
+	const percent = popup.total_bytes && popup.total_bytes > 0
+		? Math.min(100, Math.round(popup.uploaded_bytes / popup.total_bytes * 100)) : null;
+	const status = popup.phase === 'Uploading'
+		? `Uploading ${percent === null ? '' : `${percent}% · `}${humanBytes(popup.uploaded_bytes)}${popup.total_bytes === null ? '' : ` / ${humanBytes(popup.total_bytes)}`}`
+		: popup.phase === 'Preparing' ? `Preparing ${popup.draft.upload_video ? 'video' : 'audio'}${'.'.repeat(Math.floor(popup.animation_frame / 4) % 3 + 1)}`
+		: popup.phase === 'Complete' ? 'Upload complete. Bucket permissions still apply.'
+		: popup.phase === 'Cancelling' ? 'Cancelling local work; inspect the destination if completion is uncertain.'
+		: popup.phase === 'Cancelled' ? 'Cancelled. Inspect the destination if completion is uncertain.'
+		: popup.phase === 'Failed' ? 'Upload failed. Inspect the destination before opening a fresh review.'
+		: 'Review the destination, then Upload. No transfer has started.';
+	const fields: Array<[S3UploadField, string, string]> = [
+		['Bucket', 'Bucket (required)', popup.draft.bucket],
+		['Region', 'Region (required)', popup.draft.region],
+		['ObjectKey', 'Object key', popup.draft.object_key],
+		['Profile', 'Profile (empty: AWS_PROFILE/default)', popup.draft.profile],
+	];
+	return (
+		<Popup title='Upload to S3' layer={LAYER.s3Upload} width='820px'
+			onDismiss={() => void dispatch('DismissS3Upload')}
+			footer={<>
+				{editable ? <PopupButton emphasis onClick={() => void dispatch({ SubmitS3Upload: popup.generation })}>Upload</PopupButton> : null}
+				<PopupButton onClick={() => void dispatch('DismissS3Upload')}>{terminal ? 'Close' : 'Cancel'}</PopupButton>
+				{editable ? <PopupButton onClick={() => void dispatch('OpenS3Credentials')}>Session keys…</PopupButton> : null}
+			</>}>
+			<Body><div className='grid gap-3'>
+				<p className='text-ink-dim'>Bucket permissions apply. Existing objects are not overwritten. Tab changes fields; F1 opens session keys, F2 toggles video, Ctrl+S uploads.</p>
+				{fields.map(([field, label, value]) => (
+					<button key={field} type='button' data-s3-field={field} disabled={!editable}
+						onMouseDown={(event) => event.preventDefault()}
+						onClick={() => void dispatch({ SelectS3UploadField: field })}
+						className={`grid grid-cols-[180px_minmax(0,1fr)] gap-2 rounded-[5px] border p-2 text-left ${editable && popup.selected_field === field ? 'border-accent bg-raised' : 'border-line-strong'}`}>
+						<span className='text-ink-dim'>{label}</span>
+						<span className='break-all'>{value || <span className='text-ink-faint'>Empty</span>}
+							{editable && popup.selected_field === field ? <span aria-hidden className='ml-px inline-block h-[13px] w-[2px] animate-pulse bg-accent' /> : null}
+						</span>
+					</button>
+				))}
+				<button type='button' role='checkbox' aria-checked={popup.draft.upload_video} disabled={!editable || !popup.video_available}
+					onClick={() => void dispatch('ToggleS3UploadVideo')} className='text-left'>
+					{popup.draft.upload_video ? '☑' : '☐'} Upload video{popup.video_available ? '' : ' (unavailable for this source)'}
+				</button>
+				<p className='break-all'>Destination: s3://{popup.draft.bucket}/{popup.draft.object_key}</p>
+				<p role='status' className='whitespace-pre-wrap'>{status}</p>
+				{popup.validation_error ? <p role='alert' className='whitespace-pre-wrap text-red-400'>{popup.validation_error}</p> : null}
+				{popup.result_location ? <p className='break-all'>{popup.result_location}</p> : null}
+			</div></Body>
+		</Popup>
+	);
+}
+
+/** Length-only AWS credential projection; secret values never enter the window. */
+export function S3CredentialsPopup({ editor }: { editor: S3CredentialsEditorView }) {
+	const fields: Array<[S3CredentialField, string, number]> = [
+		['AccessKey', 'Access key', editor.access_key_length],
+		['SecretKey', 'Secret key', editor.secret_key_length],
+		['SessionToken', 'Session token (optional)', editor.session_token_length],
+	];
+	return (
+		<Popup title='S3 session keys' layer={LAYER.s3Credentials} width='660px'
+			onDismiss={() => void dispatch('DismissS3Credentials')}
+			footer={<>
+				<PopupButton emphasis onClick={() => void dispatch('SubmitS3Credentials')}>Use for session</PopupButton>
+				<PopupButton onClick={() => void dispatch('DismissS3Credentials')}>Cancel</PopupButton>
+			</>}>
+			<Body><div className='grid gap-3'>
+				<p>Keys stay in memory for this session; they are not saved. Tab changes fields; Enter returns to review without uploading.</p>
+				{fields.map(([field, label, length]) => (
+					<button key={field} type='button' onMouseDown={(event) => event.preventDefault()}
+						onClick={() => void dispatch({ SelectS3CredentialField: field })}
+						className={`grid grid-cols-[170px_minmax(0,1fr)] rounded-[5px] border p-2 text-left ${editor.selected_field === field ? 'border-accent bg-raised' : 'border-line-strong'}`}>
+						<span>{label}</span><span>{length === 0 ? 'Empty' : `${length} characters entered`}</span>
+					</button>
+				))}
+				{editor.validation_failed ? <p role='alert' className='text-red-400'>Credentials could not be accepted. Check the keys and optional token.</p> : null}
+			</div></Body>
+		</Popup>
 	);
 }
 

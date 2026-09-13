@@ -1,6 +1,6 @@
 [package]
 name = "youta-gui"
-version = "0.62.0"
+version = "0.63.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Desktop front-end for the Youta player, sharing its reducer with the terminal UI"
@@ -34,6 +34,8 @@ custom-protocol = ["tauri/custom-protocol"]
 # distributors can disable both layers with `--no-default-features`.
 archive-org = ["youta/archive-org"]
 archive-upload = ["youta/archive-upload"]
+# Optional S3 client is omitted from both front ends' default builds.
+s3-upload = ["youta/s3-upload"]
 ascii-visualizer = ["youta/ascii-visualizer"]
 audio-quality = ["youta/audio-quality"]
 commons-upload = ["youta/commons-upload"]
@@ -52,7 +54,7 @@ youtube-captions = ["youta/youtube-captions"]
 # renderer, so Crossterm and Ratatui never enter this binary.
 # Keep the registry bound synchronized with this release: both front ends use
 # the same reducer/view contract, including across patch releases.
-youta = { version = "=0.62.0", path = "..", default-features = false, features = ["controller", "sources", "remote-artwork", "qr", "yandex-music"] }
+youta = { version = "=0.63.0", path = "..", default-features = false, features = ["controller", "sources", "remote-artwork", "qr", "yandex-music"] }
 
 percent-encoding = "2.3"
 serde = { version = "1.0", features = ["derive"] }

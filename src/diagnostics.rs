@@ -527,6 +527,7 @@ pub fn enabled_compile_features() -> Vec<&'static str> {
         "rss",
         "rumble",
         "rutube",
+        "s3-upload",
         "soundcloud",
         "soundstream",
         "sponsorblock",

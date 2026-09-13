@@ -183,6 +183,9 @@ pub struct Config {
     /// Remembered non-secret Internet Archive upload choices.
     #[serde(default)]
     pub archive_upload: ArchiveUploadConfig,
+    /// Remembered S3 destination choices, never access keys or upload authorization.
+    #[serde(default)]
+    pub s3_upload: S3UploadConfig,
     /// Terminal presentation preferences.
     pub ui: UiConfig,
     /// State persistence behavior.
@@ -215,6 +218,7 @@ impl Config {
             subscriptions: SubscriptionConfig::default(),
             downloads: DownloadConfig::default(),
             archive_upload: ArchiveUploadConfig::default(),
+            s3_upload: S3UploadConfig::default(),
             ui: UiConfig::default(),
             persistence: PersistenceConfig::default(),
             video_summary: VideoSummaryConfig::default(),
@@ -999,6 +1003,43 @@ impl Config {
         Ok(())
     }
 
+    /// Remembers non-secret S3 choices without storing credentials or object keys.
+    ///
+    /// # Errors
+    /// Rejects environment overrides, malformed tables, or failed private atomic writes;
+    /// memory and the existing document remain unchanged on failure.
+    #[cfg(feature = "s3-upload")]
+    pub fn save_s3_upload_choices(&mut self, settings: S3UploadConfig) -> Result<(), ConfigError> {
+        for field in ["BUCKET", "REGION", "PROFILE", "UPLOAD_VIDEO"] {
+            let name = format!("YOUTA_S3_UPLOAD__{field}");
+            if std::env::var_os(&name).is_some() {
+                return Err(ConfigError::Invalid(format!(
+                    "{name} overrides S3 choices; remove it before saving different defaults"
+                )));
+            }
+        }
+        self.ensure_directories()?;
+        let path = self.config_file();
+        let mut document = read_editable_config(&path)?;
+        let table = document
+            .as_table_mut()
+            .entry("s3_upload")
+            .or_insert_with(|| Item::Table(Table::new()))
+            .as_table_mut()
+            .ok_or_else(|| {
+                ConfigError::Invalid(
+                    "`s3_upload` must be a TOML table before Youta can update it".to_owned(),
+                )
+            })?;
+        table["bucket"] = value(settings.bucket.clone());
+        table["region"] = value(settings.region.clone());
+        table["profile"] = value(settings.profile.clone());
+        table["upload_video"] = value(settings.upload_video);
+        write_private_config(&path, document.to_string().as_bytes())?;
+        self.s3_upload = settings;
+        Ok(())
+    }
+
     /// Persists automatic same-source playback in `config.toml`.
     ///
     /// Existing unrelated settings, comments, and credentials are preserved.
@@ -1123,6 +1164,20 @@ impl Config {
 #[serde(default)]
 pub struct ArchiveUploadConfig {
     /// Upload video instead of Opus audio; changes are remembered immediately.
+    pub upload_video: bool,
+}
+
+/// Non-secret defaults for opt-in, explicitly confirmed S3 uploads.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+pub struct S3UploadConfig {
+    /// Existing destination bucket; Youta never creates one.
+    pub bucket: String,
+    /// Explicit AWS region of that bucket.
+    pub region: String,
+    /// Shared AWS profile name; empty uses AWS_PROFILE or the default profile.
+    pub profile: String,
+    /// Remembered video choice, applied only to video-capable selections.
     pub upload_video: bool,
 }
 

@@ -1828,7 +1828,14 @@ struct HitMap {
     private_note_scroll_offset: usize,
     /// Largest wrapped-line offset that can change the private-note viewport.
     private_note_scroll_maximum: usize,
-
+    #[cfg(feature = "s3-upload")]
+    s3_upload_fields: Vec<(S3UploadField, Rect)>,
+    #[cfg(feature = "s3-upload")]
+    s3_upload_buttons: Vec<(UiAction, Rect)>,
+    #[cfg(feature = "s3-upload")]
+    s3_credentials_fields: Vec<(S3CredentialField, Rect)>,
+    #[cfg(feature = "s3-upload")]
+    s3_credentials_buttons: Vec<(UiAction, Rect)>,
     #[cfg(feature = "archive-upload")]
     archive_upload_fields: Vec<(ArchiveUploadField, Rect)>,
     #[cfg(feature = "archive-upload")]
@@ -2202,7 +2209,10 @@ fn render_frame(
     let thumbnail_is_obscured = thumbnail_is_obscured
         || view.evernote_popup.is_some()
         || view.evernote_credentials_popup.is_some();
-
+    #[cfg(feature = "s3-upload")]
+    let thumbnail_is_obscured = thumbnail_is_obscured
+        || view.s3_upload_popup.is_some()
+        || view.s3_credentials_popup.is_some();
     #[cfg(feature = "archive-upload")]
     let thumbnail_is_obscured = thumbnail_is_obscured
         || view.archive_upload_popup.is_some()
@@ -2368,7 +2378,19 @@ fn render_frame(
             );
         }
     }
-
+    #[cfg(feature = "s3-upload")]
+    {
+        hit_map.s3_upload_fields.clear();
+        hit_map.s3_upload_buttons.clear();
+        hit_map.s3_credentials_fields.clear();
+        hit_map.s3_credentials_buttons.clear();
+        if let Some(popup) = &view.s3_upload_popup {
+            render_s3_upload_popup(frame, popup, &theme, hit_map);
+        }
+        if let Some(popup) = &view.s3_credentials_popup {
+            render_s3_credentials_popup(frame, popup, &theme, hit_map);
+        }
+    }
     hit_map.rss_subscription_field = None;
     hit_map.rss_subscription_buttons.clear();
     if let Some(popup) = view.rss_subscription_popup.as_ref() {
@@ -4250,7 +4272,8 @@ fn right_detail_button_reserves_full_row(
         UiAction::OpenCommonsUpload => true,
         #[cfg(feature = "evernote")]
         UiAction::OpenEvernoteNote => true,
-
+        #[cfg(feature = "s3-upload")]
+        UiAction::OpenS3Upload => true,
         #[cfg(feature = "archive-upload")]
         UiAction::OpenArchiveUpload => true,
         _ => false,
@@ -4421,7 +4444,17 @@ fn render_information_panel(
             UiAction::OpenArchiveUpload,
         );
     }
-
+    #[cfg(feature = "s3-upload")]
+    if show_text_selection && view.s3_upload_supported && view.s3_upload_available {
+        push_right_detail_button(
+            &mut lines,
+            &mut right_buttons,
+            inner.width,
+            "Upload to S3".to_owned(),
+            theme.accent,
+            UiAction::OpenS3Upload,
+        );
+    }
     if cfg!(feature = "local-trash") && view.screen == Screen::Downloaded {
         push_right_detail_button(
             &mut lines,
@@ -6995,7 +7028,12 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
     } else {
         selection_help.to_owned()
     };
-
+    #[cfg(feature = "s3-upload")]
+    let selection_help = if view.s3_upload_supported {
+        format!("{selection_help}  M S3 upload")
+    } else {
+        selection_help.to_owned()
+    };
     let help = [
         "Navigation",
         "  / search     Tab next tab     Shift+Tab previous tab     S subscriptions",
@@ -9579,7 +9617,7 @@ fn render_commons_credentials_popup(
 }
 
 /// Draws a clipped action rail whose hit targets never extend outside the popup.
-#[cfg(feature = "archive-upload")]
+#[cfg(any(feature = "archive-upload", feature = "s3-upload"))]
 fn render_archive_popup_buttons(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -9601,6 +9639,294 @@ fn render_archive_popup_buttons(
         targets.push((action.clone(), target));
         x = x.saturating_add(width).saturating_add(3);
     }
+}
+
+/// Draws a generation-bound S3 destination review without assuming public access.
+#[cfg(feature = "s3-upload")]
+fn render_s3_upload_popup(
+    frame: &mut Frame<'_>,
+    popup: &S3UploadPopupView,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+) {
+    let area = centered_sized_rect(104, 25, frame.area());
+    frame.render_widget(Clear, area);
+    frame.render_widget(panel_block(" Upload to S3 ", theme), area);
+    let inner = area.inner(ratatui::layout::Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+    if inner.is_empty() {
+        return;
+    }
+    let sections = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Length(3),
+        Constraint::Length(3),
+        Constraint::Length(3),
+        Constraint::Length(3),
+        Constraint::Length(1),
+        Constraint::Length(2),
+        Constraint::Min(2),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+    frame.render_widget(Paragraph::new("Bucket permissions apply. Existing objects are not overwritten.\nTab fields · F1 session keys · F2 video · Ctrl+S Upload").style(theme.muted).wrap(Wrap { trim: false }), sections[0]);
+    let editable = popup.phase.is_editable();
+    for (field, label, value, area) in [
+        (
+            S3UploadField::Bucket,
+            "Bucket (required)",
+            popup.draft.bucket.as_str(),
+            sections[1],
+        ),
+        (
+            S3UploadField::Region,
+            "Region (required)",
+            popup.draft.region.as_str(),
+            sections[2],
+        ),
+        (
+            S3UploadField::ObjectKey,
+            "Object key",
+            popup.draft.object_key.as_str(),
+            sections[3],
+        ),
+        (
+            S3UploadField::Profile,
+            "Profile (empty: AWS_PROFILE/default)",
+            popup.draft.profile.as_str(),
+            sections[4],
+        ),
+    ] {
+        if area.is_empty() {
+            continue;
+        }
+        let selected = editable && popup.selected_field == field;
+        let value = if selected {
+            format!("{value}▏")
+        } else {
+            value.to_owned()
+        };
+        let lines =
+            usize::from(terminal_text_width(&value)).div_ceil(usize::from(area.width).max(1));
+        let offset = if selected {
+            lines.saturating_sub(usize::from(area.height.saturating_sub(1)))
+        } else {
+            0
+        };
+        frame.render_widget(
+            Paragraph::new(value)
+                .wrap(Wrap { trim: false })
+                .scroll((u16::try_from(offset).unwrap_or(u16::MAX), 0))
+                .style(if selected { theme.selected } else { theme.base })
+                .block(
+                    Block::default()
+                        .borders(Borders::BOTTOM)
+                        .border_style(if selected { theme.accent } else { theme.border })
+                        .title(label),
+                ),
+            area,
+        );
+        if editable {
+            hit_map.s3_upload_fields.push((field, area));
+        }
+    }
+    if !sections[5].is_empty() {
+        let text = format!(
+            "[{}] Upload video{}",
+            if popup.draft.upload_video { "x" } else { " " },
+            if popup.video_available {
+                ""
+            } else {
+                " (unavailable for this source)"
+            }
+        );
+        let target = Rect::new(
+            sections[5].x,
+            sections[5].y,
+            terminal_text_width(&text).min(sections[5].width),
+            1,
+        );
+        frame.render_widget(
+            Paragraph::new(text).style(if editable && popup.video_available {
+                theme.accent
+            } else {
+                theme.muted
+            }),
+            target,
+        );
+        if editable && popup.video_available {
+            hit_map
+                .s3_upload_buttons
+                .push((UiAction::ToggleS3UploadVideo, target));
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(format!(
+            "Destination: s3://{}/{}",
+            popup.draft.bucket, popup.draft.object_key
+        ))
+        .style(theme.base)
+        .wrap(Wrap { trim: false }),
+        sections[6],
+    );
+    let mut status = match popup.phase {
+        S3UploadPhase::Review => {
+            "Review the destination, then Upload. No transfer has started.".to_owned()
+        }
+        S3UploadPhase::Preparing => format!(
+            "Preparing {}{}",
+            if popup.draft.upload_video {
+                "video"
+            } else {
+                "audio"
+            },
+            ".".repeat(popup.animation_frame / 4 % 3 + 1)
+        ),
+        S3UploadPhase::Uploading => match popup.total_bytes.filter(|total| *total > 0) {
+            Some(total) => format!(
+                "Uploading {}% · {} / {total} bytes",
+                popup
+                    .uploaded_bytes
+                    .saturating_mul(100)
+                    .checked_div(total)
+                    .unwrap_or_default()
+                    .min(100),
+                popup.uploaded_bytes
+            ),
+            None => format!("Uploading {} bytes", popup.uploaded_bytes),
+        },
+        S3UploadPhase::Cancelling => {
+            "Cancelling local work; inspect the destination if completion is uncertain.".to_owned()
+        }
+        S3UploadPhase::Complete => "Upload complete. Bucket permissions still apply.".to_owned(),
+        S3UploadPhase::Failed => {
+            "Upload failed. Inspect the destination before opening a fresh review.".to_owned()
+        }
+        S3UploadPhase::Cancelled => {
+            "Cancelled. Inspect the destination if completion is uncertain.".to_owned()
+        }
+    };
+    if let Some(error) = &popup.validation_error {
+        status.push_str(&format!("\n{error}"));
+    }
+    if let Some(location) = &popup.result_location {
+        status.push_str(&format!("\n{location}"));
+    }
+    frame.render_widget(
+        Paragraph::new(status)
+            .style(theme.base)
+            .wrap(Wrap { trim: false }),
+        sections[7],
+    );
+    let terminal = matches!(
+        popup.phase,
+        S3UploadPhase::Complete | S3UploadPhase::Failed | S3UploadPhase::Cancelled
+    );
+    let mut buttons = Vec::new();
+    if editable {
+        buttons.push(("Upload", UiAction::SubmitS3Upload(popup.generation)));
+    }
+    buttons.push((
+        if terminal { "Close" } else { "Cancel" },
+        UiAction::DismissS3Upload,
+    ));
+    if editable {
+        buttons.push(("Session keys…", UiAction::OpenS3Credentials));
+    }
+    render_archive_popup_buttons(
+        frame,
+        sections[8],
+        &buttons,
+        theme,
+        &mut hit_map.s3_upload_buttons,
+    );
+}
+
+/// Masks all three AWS credential values, including the optional session token.
+#[cfg(feature = "s3-upload")]
+fn render_s3_credentials_popup(
+    frame: &mut Frame<'_>,
+    popup: &S3CredentialsPopupView,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+) {
+    let area = centered_sized_rect(92, 18, frame.area());
+    frame.render_widget(Clear, area);
+    frame.render_widget(panel_block(" S3 session keys ", theme), area);
+    let inner = area.inner(ratatui::layout::Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+    if inner.is_empty() {
+        return;
+    }
+    let sections = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Length(3),
+        Constraint::Length(3),
+        Constraint::Length(3),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+    frame.render_widget(Paragraph::new("Keys stay in memory for this session; they are not saved.\nTab fields · Enter returns to review without uploading.").style(theme.muted).wrap(Wrap { trim: false }), sections[0]);
+    for (field, label, value, area) in [
+        (
+            S3CredentialField::AccessKey,
+            "Access key",
+            popup.access_key.as_str(),
+            sections[1],
+        ),
+        (
+            S3CredentialField::SecretKey,
+            "Secret key",
+            popup.secret_key.as_str(),
+            sections[2],
+        ),
+        (
+            S3CredentialField::SessionToken,
+            "Session token (optional)",
+            popup.session_token.as_str(),
+            sections[3],
+        ),
+    ] {
+        if area.is_empty() {
+            continue;
+        }
+        let selected = popup.selected_field == field;
+        frame.render_widget(
+            Paragraph::new(masked_setup_value(value, usize::from(area.width)))
+                .style(if selected { theme.selected } else { theme.base })
+                .block(
+                    Block::default()
+                        .borders(Borders::BOTTOM)
+                        .border_style(if selected { theme.accent } else { theme.border })
+                        .title(label),
+                ),
+            area,
+        );
+        hit_map.s3_credentials_fields.push((field, area));
+    }
+    if popup.validation_error.is_some() {
+        frame.render_widget(
+            Paragraph::new("Credentials could not be accepted. Check the keys and optional token.")
+                .style(Style::default().fg(Color::Red))
+                .wrap(Wrap { trim: false }),
+            sections[4],
+        );
+    }
+    render_archive_popup_buttons(
+        frame,
+        sections[5],
+        &[
+            ("Use for session", UiAction::SubmitS3Credentials),
+            ("Cancel", UiAction::DismissS3Credentials),
+        ],
+        theme,
+        &mut hit_map.s3_credentials_buttons,
+    );
 }
 
 /// Keeps reviewed public metadata, explicit submission, and transfer state in one modal.
@@ -12653,7 +12979,42 @@ fn mouse_action_unfiltered(
             _ => None,
         };
     }
-
+    #[cfg(feature = "s3-upload")]
+    if view.s3_credentials_popup.is_some() {
+        return match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => hit_map
+                .s3_credentials_fields
+                .iter()
+                .find(|(_, area)| contains(*area, mouse.column, mouse.row))
+                .map(|(field, _)| UiAction::SelectS3CredentialField(*field))
+                .or_else(|| {
+                    hit_map
+                        .s3_credentials_buttons
+                        .iter()
+                        .find(|(_, area)| contains(*area, mouse.column, mouse.row))
+                        .map(|(action, _)| action.clone())
+                }),
+            _ => None,
+        };
+    }
+    #[cfg(feature = "s3-upload")]
+    if view.s3_upload_popup.is_some() {
+        return match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => hit_map
+                .s3_upload_fields
+                .iter()
+                .find(|(_, area)| contains(*area, mouse.column, mouse.row))
+                .map(|(field, _)| UiAction::SelectS3UploadField(*field))
+                .or_else(|| {
+                    hit_map
+                        .s3_upload_buttons
+                        .iter()
+                        .find(|(_, area)| contains(*area, mouse.column, mouse.row))
+                        .map(|(action, _)| action.clone())
+                }),
+            _ => None,
+        };
+    }
     #[cfg(feature = "archive-upload")]
     if view.archive_credentials_popup.is_some() {
         return match mouse.kind {
@@ -16428,6 +16789,10 @@ for encoded, expected in json.load(sys.stdin):
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
 
+        assert_eq!(
+            rendered.contains("M S3 upload"),
+            cfg!(feature = "s3-upload")
+        );
         assert!(rendered.contains("Youta help"));
         assert_eq!(
             rendered.contains("I upload to archive.org"),
@@ -20262,6 +20627,159 @@ for encoded, expected in json.load(sys.stdin):
                 hit_map.subscription_source_first_index
             ))
         );
+    }
+
+    #[cfg(feature = "s3-upload")]
+    #[test]
+    fn s3_upload_popup_keeps_destination_confirmation_and_credentials_explicit() {
+        let mut view = ViewModel {
+            s3_upload_popup: Some(S3UploadPopupView {
+                generation: 42,
+                video_available: true,
+                draft: crate::s3_upload::S3UploadDraft {
+                    region: "us-east-1".to_owned(),
+                    bucket: "fixture-bucket".to_owned(),
+                    object_key: "audio/fixture.opus".to_owned(),
+                    ..crate::s3_upload::S3UploadDraft::default()
+                },
+                ..S3UploadPopupView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(120, 34)).unwrap();
+        let mut hit_map = HitMap::default();
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .unwrap();
+        let rendered = rendered_text(&terminal);
+        for expected in [
+            "Upload to S3",
+            "s3://fixture-bucket/audio/fixture.opus",
+            "Bucket permissions apply",
+            "Existing objects are not overwritten",
+            "AWS_PROFILE",
+            "Session keys",
+        ] {
+            assert!(rendered.contains(expected), "{expected}");
+        }
+        let target = hit_map
+            .s3_upload_buttons
+            .iter()
+            .find_map(|(action, area)| (*action == UiAction::SubmitS3Upload(42)).then_some(*area))
+            .unwrap();
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: target.x,
+                    row: target.y,
+                    modifiers: KeyModifiers::NONE
+                },
+                &hit_map,
+                &view
+            ),
+            Some(UiAction::SubmitS3Upload(42))
+        );
+        view.s3_credentials_popup = Some(S3CredentialsPopupView {
+            access_key: "private-access".to_owned(),
+            secret_key: "private-secret".to_owned(),
+            session_token: "private-token".to_owned(),
+            ..S3CredentialsPopupView::default()
+        });
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .unwrap();
+        let rendered = rendered_text(&terminal);
+        for secret in ["private-access", "private-secret", "private-token"] {
+            assert!(!rendered.contains(secret));
+        }
+        for label in ["Access key", "Secret key", "Session token", "not saved"] {
+            assert!(rendered.contains(label), "{label}");
+        }
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &view),
+            Some(UiAction::SubmitS3Credentials)
+        );
+    }
+
+    #[cfg(feature = "s3-upload")]
+    #[test]
+    fn s3_upload_terminal_states_and_small_popups_keep_bounded_hitboxes() {
+        for (width, height) in [(1, 1), (12, 5), (40, 12), (120, 34)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let mut hit_map = HitMap::default();
+            for phase in [
+                S3UploadPhase::Review,
+                S3UploadPhase::Preparing,
+                S3UploadPhase::Uploading,
+                S3UploadPhase::Cancelling,
+                S3UploadPhase::Complete,
+                S3UploadPhase::Failed,
+                S3UploadPhase::Cancelled,
+            ] {
+                let view = ViewModel {
+                    s3_upload_popup: Some(S3UploadPopupView {
+                        generation: 7,
+                        phase,
+                        video_available: false,
+                        result_location: Some("s3://fixture-bucket/audio.opus".to_owned()),
+                        ..S3UploadPopupView::default()
+                    }),
+                    ..ViewModel::default()
+                };
+                terminal
+                    .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+                    .unwrap();
+                for (_, area) in &hit_map.s3_upload_buttons {
+                    assert!(area.right() <= width && area.bottom() <= height);
+                }
+                if phase != S3UploadPhase::Review {
+                    assert!(hit_map.s3_upload_fields.is_empty());
+                    assert!(
+                        hit_map
+                            .s3_upload_buttons
+                            .iter()
+                            .all(|(action, _)| !matches!(
+                                action,
+                                UiAction::SubmitS3Upload(_)
+                                    | UiAction::OpenS3Credentials
+                                    | UiAction::ToggleS3UploadVideo
+                            ))
+                    );
+                }
+                assert!(
+                    !hit_map
+                        .s3_upload_buttons
+                        .iter()
+                        .any(|(action, _)| *action == UiAction::ToggleS3UploadVideo)
+                );
+            }
+            let view = ViewModel {
+                s3_credentials_popup: Some(S3CredentialsPopupView::default()),
+                ..ViewModel::default()
+            };
+            terminal
+                .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+                .unwrap();
+            for (_, area) in &hit_map.s3_credentials_fields {
+                assert!(area.right() <= width && area.bottom() <= height);
+            }
+            terminal
+                .draw(|frame| {
+                    render(
+                        frame,
+                        &ViewModel::default(),
+                        &UiSettings::default(),
+                        &mut hit_map,
+                    )
+                })
+                .unwrap();
+            assert!(hit_map.s3_upload_buttons.is_empty() && hit_map.s3_upload_fields.is_empty());
+            assert!(
+                hit_map.s3_credentials_buttons.is_empty()
+                    && hit_map.s3_credentials_fields.is_empty()
+            );
+        }
     }
 
     #[cfg(feature = "archive-upload")]

@@ -431,6 +431,9 @@ export function Details({ view, kind }: { view: ViewModel; kind: InformationPane
 		{view.archive_upload_supported && view.archive_upload_available && isYouTube ? (
 			<Action onClick={() => void dispatch('OpenArchiveUpload')}>Upload to archive.org</Action>
 		) : null}
+		{view.s3_upload_supported && view.s3_upload_available ? (
+			<Action onClick={() => void dispatch('OpenS3Upload')}>Upload to S3</Action>
+		) : null}
         {view.screen === "Downloaded" ? (
           <Action onClick={() => void dispatch("RequestDownloadedTrash")}>Move to Trash</Action>
         ) : null}
