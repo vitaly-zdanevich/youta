@@ -70,6 +70,7 @@
 	};
 	const button = (label, root = document) => [...root.querySelectorAll('button')]
 		.find((node) => node.textContent.trim() === label || node.getAttribute('aria-label') === label);
+	const dialog = () => [...document.querySelectorAll('[role=dialog]')].at(-1);
 	const action = async (expected, perform, label) => {
 		const start = calls.length;
 		perform();
@@ -136,6 +137,48 @@
 		await action('ToggleRepeat', () => button('Repeat').click(), 'Repeat click uses the shared global action');
 		await action('ToggleAutoplay', () => button('Autoplay').click(), 'Autoplay click uses the shared global action');
 
+		// Upload responses are manually emitted: no reducer or service is faked by
+		// inferring transitions from labels or turning a click into a real upload.
+		const youtubeId = { source: 'you-tube', external_id: 'dQw4w9WgXcQ' };
+		snapshot({ screen: 'Search', rows: [], details: { ...details('Fixture YouTube video', youtubeId), source: 'YouTube' },
+			archive_upload_supported: true, archive_upload_available: true });
+		await until(() => button('Upload to archive.org'), 'Archive upload action');
+		await action('OpenArchiveUpload', () => button('Upload to archive.org').click(), 'Archive Details action opens publication review');
+		const archive = { ...clone(defaults.ArchiveUploadPopupView), generation: 7, selected_field: 'Description', phase: 'Review',
+			draft: { identifier: 'fixture-review', title: 'Fixture title', description: 'Full description\nAnother line', creator: 'Fixture creator',
+				source_url: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ', upload_video: false } };
+		snapshot({ archive_upload_popup: archive });
+		await until(() => dialog()?.textContent.includes('Fixture title'), 'Archive review');
+		assert(dialog().querySelectorAll('[role=checkbox]').length === 1, 'Archive review has only the remembered video checkbox');
+		assert(!/Source:|youtube\.com\/watch|I own this content|▶\s*Description/.test(dialog().textContent), 'Archive review omits the removed source, permission and disclosure-looking rows');
+		await key('s', { Char: 's' }, { ctrlKey: true });
+		await action({ SubmitArchiveUpload: 7 }, () => button('Upload', dialog()).click(), 'Archive submit carries its rendered generation');
+		snapshot({ archive_upload_popup: { ...archive, generation: 8 }, archive_credentials_editor: {
+			access_key_length: 12, secret_key_length: 18, secret_selected: true, validation_failed: false } });
+		await until(() => dialog()?.textContent.includes('Session-only credentials'), 'Archive credential editor');
+		assert(dialog().textContent.includes('12 characters entered') && dialog().textContent.includes('18 characters entered'), 'Archive credential fields render counts, not key values');
+		assert(dialog().textContent.includes('secrets/archive-org.toml') && dialog().textContent.includes('Get archive.org upload keys'), 'Archive credentials show optional file instructions and the approved guide label');
+		await action('SubmitArchiveCredentials', () => button('Use for session', dialog()).click(), 'Credential acceptance requests review, not publication');
+		snapshot({ archive_credentials_editor: null, archive_upload_popup: { ...archive, generation: 42 } });
+		await until(() => document.querySelectorAll('[role=dialog]').length === 1, 'review after credentials');
+		await action({ SubmitArchiveUpload: 42 }, () => button('Upload', dialog()).click(), 'Archive review refreshes the confirmation generation after credentials');
+		snapshot({ archive_upload_popup: { ...archive, phase: 'Uploading', uploaded_bytes: 50, total_bytes: 100 } });
+		await until(() => dialog()?.textContent.includes('Uploading 50%'), 'Archive progress');
+		assert(!button('Upload', dialog()) && dialog().querySelector('[role=checkbox]').disabled, 'Busy Archive publication has no submit button or editable video choice');
+		await action('DismissArchiveUpload', () => button('Cancel', dialog()).click(), 'Busy cancel delegates cancellation to the controller');
+		snapshot({ archive_upload_popup: { ...archive, phase: 'Failed', validation_error: 'Inspect the destination before opening a fresh review.' } });
+		await until(() => dialog()?.textContent.includes('Inspect the destination before opening a fresh review.'), 'Archive failure');
+		assert(!button('Upload', dialog()), 'Failed Archive publication cannot retry the old review');
+		snapshot({ archive_upload_popup: { ...archive, phase: 'Complete', result_url: 'https://archive.org/details/fixture-review' } });
+		await until(() => button('Open item', dialog()), 'Archive accepted result');
+		assert(dialog().textContent.includes('Upload accepted; archive.org may still be processing.'), 'Archive success distinguishes acceptance from completed ingestion');
+		await action('OpenArchiveUploadResult', () => button('Open item', dialog()).click(), 'Archive result uses the explicit native opener action');
+		snapshot({ archive_upload_popup: null });
+		await until(() => !dialog(), 'closed Archive review');
+
+		snapshot({ archive_upload_supported: false, archive_upload_available: false });
+		await until(() => !dialog() && !button('Upload to archive.org'), 'feature-trimmed Details');
+		checks.push('Feature-trimmed snapshots expose no Archive upload action');
 		assert(failures.length === 0, 'The full browser journey reports no frontend runtime failures');
 	}
 	void run().then(() => ({ ok: true, checks }), (error) => ({ ok: false, error: String(error), checks,

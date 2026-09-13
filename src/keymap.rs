@@ -266,6 +266,142 @@ mod wire_tests {
         );
     }
 
+    #[cfg(feature = "archive-upload")]
+    #[test]
+    fn archive_upload_confirmation_uses_each_live_generation() {
+        for generation in [7, 42] {
+            let view = ViewModel {
+                archive_upload_popup: Some(crate::view::ArchiveUploadPopupView {
+                    generation,
+                    draft: crate::archive_upload::ArchiveUploadDraft {
+                        identifier: "fixture-item".to_owned(),
+                        title: "Fixture upload".to_owned(),
+                        source_url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_owned(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            assert_eq!(
+                key_action(
+                    KeyPress {
+                        key: Key::Char('s'),
+                        ctrl: true,
+                        alt: false,
+                        shift: false
+                    },
+                    &view,
+                    None,
+                    None
+                ),
+                Some(UiAction::SubmitArchiveUpload(generation))
+            );
+        }
+    }
+
+    #[cfg(not(feature = "archive-upload"))]
+    #[test]
+    fn archive_upload_shortcut_is_absent_without_the_feature() {
+        assert_eq!(
+            key_action(
+                KeyPress::new(Key::Char('I')),
+                &ViewModel::default(),
+                None,
+                None
+            ),
+            None
+        );
+    }
+
+    #[cfg(feature = "archive-upload")]
+    #[test]
+    fn archive_upload_keys_edit_without_implicit_publish_and_keep_credentials_modal() {
+        use crate::view::{
+            ArchiveCredentialsPopupView, ArchiveUploadField, ArchiveUploadPhase,
+            ArchiveUploadPopupView,
+        };
+        let mut view = ViewModel {
+            archive_upload_available: true,
+            external_opener_available: true,
+            ..ViewModel::default()
+        };
+        assert_eq!(
+            key_action(KeyPress::new(Key::Char('I')), &view, None, None),
+            Some(UiAction::OpenArchiveUpload)
+        );
+        view.archive_upload_popup = Some(ArchiveUploadPopupView {
+            generation: 42,
+            draft: crate::archive_upload::ArchiveUploadDraft {
+                identifier: "fixture-item".to_owned(),
+                title: "Fixture upload".to_owned(),
+                source_url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_owned(),
+                ..Default::default()
+            },
+            ..ArchiveUploadPopupView::default()
+        });
+        let submit = KeyPress {
+            ctrl: true,
+            ..KeyPress::new(Key::Char('s'))
+        };
+        assert_eq!(
+            key_action(submit, &view, None, None),
+            Some(UiAction::SubmitArchiveUpload(42))
+        );
+        assert_eq!(
+            key_action(KeyPress::new(Key::Enter), &view, None, None),
+            Some(UiAction::SelectArchiveUploadField(
+                ArchiveUploadField::Title
+            ))
+        );
+        assert_eq!(
+            key_action(KeyPress::new(Key::Char('v')), &view, None, None),
+            Some(UiAction::AppendArchiveUploadCharacter('v'))
+        );
+        assert_eq!(
+            key_action(KeyPress::new(Key::F(2)), &view, None, None),
+            Some(UiAction::ToggleArchiveUploadVideo)
+        );
+        assert_eq!(
+            key_action(KeyPress::new(Key::F(3)), &view, None, None),
+            None
+        );
+        let popup = view.archive_upload_popup.as_mut().unwrap();
+
+        popup.selected_field = ArchiveUploadField::Description;
+        assert_eq!(
+            key_action(submit, &view, None, None),
+            Some(UiAction::SubmitArchiveUpload(42))
+        );
+        assert_eq!(
+            key_action(KeyPress::new(Key::Enter), &view, None, None),
+            Some(UiAction::InsertArchiveUploadNewline)
+        );
+        view.archive_upload_popup.as_mut().unwrap().phase = ArchiveUploadPhase::Uploading;
+        assert_eq!(key_action(submit, &view, None, None), None);
+        assert_eq!(
+            key_action(KeyPress::new(Key::Char('q')), &view, None, None),
+            None
+        );
+        assert_eq!(
+            key_action(KeyPress::new(Key::Esc), &view, None, None),
+            Some(UiAction::DismissArchiveUpload)
+        );
+        view.archive_credentials_popup = Some(ArchiveCredentialsPopupView::default());
+        assert_eq!(
+            key_action(KeyPress::new(Key::Enter), &view, None, None),
+            Some(UiAction::SubmitArchiveCredentials)
+        );
+        assert_eq!(
+            key_action(KeyPress::new(Key::Tab), &view, None, None),
+            Some(UiAction::SelectArchiveCredentialField(true))
+        );
+        assert_eq!(
+            key_action(KeyPress::new(Key::F(1)), &view, None, None),
+            Some(UiAction::OpenArchiveCredentialsGuide)
+        );
+    }
+
     #[test]
     fn bracket_keys_navigate_chapters_without_replacing_queue_navigation() {
         let finite = ViewModel {
@@ -1124,6 +1260,78 @@ fn unfiltered_key_action(
         return video_comments_key_action(key, popup.scroll_offset, usize::MAX, 20);
     }
 
+    #[cfg(feature = "archive-upload")]
+    if let Some(popup) = view.archive_credentials_popup.as_ref() {
+        return match key.key {
+            Key::Esc => Some(UiAction::DismissArchiveCredentials),
+            Key::Enter => Some(UiAction::SubmitArchiveCredentials),
+            Key::Tab | Key::BackTab | Key::Up | Key::Down => Some(
+                UiAction::SelectArchiveCredentialField(!popup.secret_selected),
+            ),
+            Key::F(1) if view.external_opener_available => {
+                Some(UiAction::OpenArchiveCredentialsGuide)
+            }
+            Key::Backspace => Some(UiAction::DeleteArchiveCredentialCharacter),
+            Key::Char('w' | 'W') if is_delete_previous_word_key(key) => {
+                Some(UiAction::DeleteArchiveCredentialWord)
+            }
+            Key::Char(character) if !character.is_control() && !key.chorded() => {
+                Some(UiAction::AppendArchiveCredentialCharacter(character))
+            }
+            _ => None,
+        };
+    }
+    #[cfg(feature = "archive-upload")]
+    if let Some(popup) = view.archive_upload_popup.as_ref() {
+        if !popup.phase.is_editable() {
+            return match key.key {
+                Key::Esc => Some(UiAction::DismissArchiveUpload),
+                Key::Enter
+                    if popup.phase == ArchiveUploadPhase::Complete
+                        && popup.result_url.is_some()
+                        && view.external_opener_available =>
+                {
+                    Some(UiAction::OpenArchiveUploadResult)
+                }
+                _ => None,
+            };
+        }
+        if key.key == Key::Tab {
+            return Some(UiAction::SelectArchiveUploadField(if reverse_tab(key) {
+                popup.selected_field.previous()
+            } else {
+                popup.selected_field.next()
+            }));
+        }
+        return match key.key {
+            Key::Esc => Some(UiAction::DismissArchiveUpload),
+            Key::Char('s' | 'S') if key.ctrl => {
+                Some(UiAction::SubmitArchiveUpload(popup.generation))
+            }
+            Key::F(2) => Some(UiAction::ToggleArchiveUploadVideo),
+
+            Key::F(1) if view.external_opener_available => {
+                Some(UiAction::OpenArchiveCredentialsGuide)
+            }
+            Key::BackTab | Key::Up => Some(UiAction::SelectArchiveUploadField(
+                popup.selected_field.previous(),
+            )),
+            Key::Enter if popup.selected_field == ArchiveUploadField::Description => {
+                Some(UiAction::InsertArchiveUploadNewline)
+            }
+            Key::Down | Key::Enter => Some(UiAction::SelectArchiveUploadField(
+                popup.selected_field.next(),
+            )),
+            Key::Backspace => Some(UiAction::DeleteArchiveUploadCharacter),
+            Key::Char('w' | 'W') if is_delete_previous_word_key(key) => {
+                Some(UiAction::DeleteArchiveUploadWord)
+            }
+            Key::Char(character) if !character.is_control() && !key.chorded() => {
+                Some(UiAction::AppendArchiveUploadCharacter(character))
+            }
+            _ => None,
+        };
+    }
     #[cfg(feature = "commons-upload")]
     if let Some(popup) = view.commons_upload_popup.as_ref() {
         if popup.phase == CommonsUploadPhase::Complete {
@@ -1704,6 +1912,10 @@ fn unfiltered_key_action(
             Some(UiAction::OpenEvernoteNote)
         }
 
+        #[cfg(feature = "archive-upload")]
+        Key::Char('I') if !key.chorded() && view.archive_upload_available => {
+            Some(UiAction::OpenArchiveUpload)
+        }
         Key::Char('l') if view.playlist_item.is_some() && !key.modified() => {
             Some(UiAction::ToggleTodoPlaylist)
         }

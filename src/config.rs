@@ -180,6 +180,9 @@ pub struct Config {
     /// Explicit download format preferences; old configurations ask first.
     #[serde(default)]
     pub downloads: DownloadConfig,
+    /// Remembered non-secret Internet Archive upload choices.
+    #[serde(default)]
+    pub archive_upload: ArchiveUploadConfig,
     /// Terminal presentation preferences.
     pub ui: UiConfig,
     /// State persistence behavior.
@@ -211,6 +214,7 @@ impl Config {
             playback: PlaybackConfig::default(),
             subscriptions: SubscriptionConfig::default(),
             downloads: DownloadConfig::default(),
+            archive_upload: ArchiveUploadConfig::default(),
             ui: UiConfig::default(),
             persistence: PersistenceConfig::default(),
             video_summary: VideoSummaryConfig::default(),
@@ -959,6 +963,42 @@ impl Config {
         Ok(())
     }
 
+    /// Remembers the Archive video checkbox across popups and restarts.
+    ///
+    /// Only this non-secret setting is written. Other keys/comments are kept,
+    /// and memory changes only after the private atomic write succeeds.
+    ///
+    /// # Errors
+    ///
+    /// Fails for a shadowing environment override, malformed settings, or an
+    /// unsuccessful atomic write; the previous value remains unchanged.
+    #[cfg(feature = "archive-upload")]
+    pub fn save_archive_upload_video(&mut self, upload_video: bool) -> Result<(), ConfigError> {
+        const OVERRIDE: &str = "YOUTA_ARCHIVE_UPLOAD__UPLOAD_VIDEO";
+        if std::env::var_os(OVERRIDE).is_some() {
+            return Err(ConfigError::Invalid(format!(
+                "{OVERRIDE} overrides this setting; change or remove it before toggling Upload video"
+            )));
+        }
+        self.ensure_directories()?;
+        let path = self.config_file();
+        let mut document = read_editable_config(&path)?;
+        let archive = document
+            .as_table_mut()
+            .entry("archive_upload")
+            .or_insert_with(|| Item::Table(Table::new()))
+            .as_table_mut()
+            .ok_or_else(|| {
+                ConfigError::Invalid(
+                    "`archive_upload` must be a TOML table before Youta can update it".to_owned(),
+                )
+            })?;
+        archive["upload_video"] = value(upload_video);
+        write_private_config(&path, document.to_string().as_bytes())?;
+        self.archive_upload.upload_video = upload_video;
+        Ok(())
+    }
+
     /// Persists automatic same-source playback in `config.toml`.
     ///
     /// Existing unrelated settings, comments, and credentials are preserved.
@@ -1076,6 +1116,14 @@ impl Config {
         self.providers.bandcamp_audio_format = format;
         Ok(())
     }
+}
+
+/// Non-secret defaults for review-first Internet Archive uploads.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+pub struct ArchiveUploadConfig {
+    /// Upload video instead of Opus audio; changes are remembered immediately.
+    pub upload_video: bool,
 }
 
 /// Explicit download choices, kept separate from subscription automation.

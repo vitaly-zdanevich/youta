@@ -18,6 +18,10 @@ pub(crate) mod test_support;
 /// Canonical paths in the crate's one spelling; see the module's own account.
 pub(crate) mod fs_path;
 
+#[cfg(feature = "archive-upload")]
+pub mod archive_upload;
+#[cfg(feature = "archive-upload")]
+pub mod archive_upload_media;
 pub mod build_info;
 pub mod child_process;
 #[cfg(feature = "commons-upload")]

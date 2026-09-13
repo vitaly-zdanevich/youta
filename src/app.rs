@@ -11,6 +11,8 @@
 
 #[cfg(feature = "archive-org")]
 mod archive_org;
+#[cfg(feature = "archive-upload")]
+mod archive_upload;
 #[cfg(feature = "yt-dlp")]
 mod download_choice;
 mod end_pause;
@@ -5393,6 +5395,8 @@ pub struct AppController {
     #[cfg(feature = "commons-upload")]
     commons_upload_selection: Option<CommonsUploadSelection>,
     /// Review-owned Archive transfer and session-only credentials.
+    #[cfg(feature = "archive-upload")]
+    archive_upload: archive_upload::ArchiveUploadState,
     /// Authentication selected from Youta or Pywikibot for the current review.
     #[cfg(feature = "commons-upload")]
     commons_upload_authentication: Option<CommonsAuthentication>,
@@ -6668,6 +6672,8 @@ impl AppController {
             download_cancellation_notice_deadline: None,
             #[cfg(feature = "commons-upload")]
             commons_upload_selection: None,
+            #[cfg(feature = "archive-upload")]
+            archive_upload: archive_upload::ArchiveUploadState::default(),
             #[cfg(feature = "commons-upload")]
             commons_upload_authentication: None,
             #[cfg(feature = "commons-upload")]
@@ -17453,6 +17459,12 @@ impl AppController {
     /// Rehydrates quick-action state and the right-panel playlist membership.
     fn refresh_selected_playlist_state(&mut self) {
         self.refresh_selected_private_note_state();
+        #[cfg(feature = "archive-upload")]
+        {
+            self.view.archive_upload_available = self
+                .selected_queue_item()
+                .is_ok_and(|item| item.media.id.source == SourceKind::YouTube);
+        }
         #[cfg(feature = "commons-upload")]
         {
             self.view.commons_upload_available = self.selected_queue_item().is_ok_and(|item| {
@@ -34175,6 +34187,8 @@ impl AppController {
         // Prevent Drop from repeating partial teardown if a destructor or
         // worker join panics while this method is already running.
         self.shutdown_persistence_succeeded = Some(false);
+        #[cfg(feature = "archive-upload")]
+        self.shutdown_archive_upload();
         #[cfg(feature = "ascii-visualizer")]
         self.dismiss_ascii_visualizer();
         #[cfg(feature = "lan-sharing")]
@@ -35367,6 +35381,56 @@ impl UiController for AppController {
                 self.view.status_line = "RSS subscription canceled".to_owned();
             }
             UiAction::OpenPreferences => self.open_preferences(),
+            #[cfg(feature = "archive-upload")]
+            UiAction::OpenArchiveUpload => self.open_archive_upload(),
+            #[cfg(feature = "archive-upload")]
+            UiAction::SelectArchiveUploadField(field) => {
+                if self.archive_upload_review_is_editable()
+                    && let Some(popup) = self.view.archive_upload_popup.as_mut()
+                {
+                    popup.selected_field = field;
+                }
+            }
+            #[cfg(feature = "archive-upload")]
+            UiAction::AppendArchiveUploadCharacter(character) => {
+                self.edit_archive_upload(Some(character), false)
+            }
+            #[cfg(feature = "archive-upload")]
+            UiAction::InsertArchiveUploadNewline => self.edit_archive_upload(Some('\n'), false),
+            #[cfg(feature = "archive-upload")]
+            UiAction::DeleteArchiveUploadCharacter => self.edit_archive_upload(None, false),
+            #[cfg(feature = "archive-upload")]
+            UiAction::DeleteArchiveUploadWord => self.edit_archive_upload(None, true),
+            #[cfg(feature = "archive-upload")]
+            UiAction::ToggleArchiveUploadVideo => self.toggle_archive_upload_video(),
+            #[cfg(feature = "archive-upload")]
+            UiAction::SubmitArchiveUpload(generation) => self.submit_archive_upload(generation),
+            #[cfg(feature = "archive-upload")]
+            UiAction::DismissArchiveUpload => self.dismiss_archive_upload(),
+            #[cfg(feature = "archive-upload")]
+            UiAction::OpenArchiveUploadResult => self.open_archive_upload_result(),
+            #[cfg(feature = "archive-upload")]
+            UiAction::SelectArchiveCredentialField(secret_selected) => {
+                if let Some(popup) = self.view.archive_credentials_popup.as_mut() {
+                    popup.secret_selected = secret_selected;
+                }
+            }
+            #[cfg(feature = "archive-upload")]
+            UiAction::AppendArchiveCredentialCharacter(character) => {
+                self.edit_archive_credentials(Some(character), false)
+            }
+            #[cfg(feature = "archive-upload")]
+            UiAction::DeleteArchiveCredentialCharacter => {
+                self.edit_archive_credentials(None, false)
+            }
+            #[cfg(feature = "archive-upload")]
+            UiAction::DeleteArchiveCredentialWord => self.edit_archive_credentials(None, true),
+            #[cfg(feature = "archive-upload")]
+            UiAction::SubmitArchiveCredentials => self.submit_archive_credentials(),
+            #[cfg(feature = "archive-upload")]
+            UiAction::DismissArchiveCredentials => self.dismiss_archive_credentials(),
+            #[cfg(feature = "archive-upload")]
+            UiAction::OpenArchiveCredentialsGuide => self.open_archive_credentials_guide(),
             #[cfg(feature = "yt-dlp")]
             UiAction::MoveDownloadChoice(direction) => self.move_download_choice(direction),
             #[cfg(feature = "yt-dlp")]
@@ -35733,6 +35797,8 @@ impl UiController for AppController {
             self.start_next_automatic_download();
             self.poll_download_at(now);
         }
+        #[cfg(feature = "archive-upload")]
+        self.poll_archive_upload();
         self.update_player();
         #[cfg(feature = "ascii-visualizer")]
         self.refresh_ascii_visualizer();
@@ -45449,6 +45515,9 @@ pub fn is_confined_path(root: &Path, candidate: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "archive-upload")]
+    #[path = "archive_upload.rs"]
+    mod archive_upload_tests;
     #[cfg(feature = "yt-dlp")]
     #[path = "download_choice.rs"]
     mod download_choice_tests;

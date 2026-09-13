@@ -31,7 +31,7 @@ SLOT="0"
 KEYWORDS="~amd64 ~arm64 ~x86"
 
 IUSE="
-	+acoustid +alsa +ascii-visualizer +audio-quality archive-rar +archive-zip +archive-org apple-podcasts +bbc-radio
+	+acoustid +alsa +ascii-visualizer +audio-quality archive-rar +archive-zip +archive-org +archive-upload apple-podcasts +bbc-radio
 	bandcamp bilibili bundled-sqlite cpu_flags_x86_sse2 dearrow discord +evernote
 	+commons-upload +funkwhale +generic-ytdlp google-drive gpm gpodder gui +invidious jack +jamendo
 	keyring +lan-sharing +lastfm +librivox +litres +local +local-archives +mpv native +nyan-cat odysee +peertube pipewire
@@ -49,6 +49,7 @@ REQUIRED_USE="
 	bandcamp? ( yt-dlp )
 	bbc-radio? ( radio )
 	bundled-sqlite? ( sqlite )
+	archive-upload? ( yt-dlp )
 	commons-upload? ( yt-dlp )
 	evernote? ( yt-dlp )
 	gpodder? ( rss )
@@ -163,6 +164,7 @@ src_configure() {
 		$(usev archive-rar)
 		$(usev archive-zip)
 		$(usev archive-org)
+		$(usev archive-upload)
 		$(usev apple-podcasts)
 		$(usev bandcamp)
 		$(usev bbc-radio)
@@ -242,6 +244,9 @@ src_compile() {
 		if use archive-org; then
 			gui_features+=,archive-org
 		fi
+		if use archive-upload; then
+			gui_features+=,archive-upload
+		fi
 		if use ascii-visualizer; then
 			gui_features+=,ascii-visualizer
 		fi
@@ -302,6 +307,10 @@ src_test() {
 		if use audio-quality; then
 			[[ -n ${gui_test_features} ]] && gui_test_features+=,
 			gui_test_features+=audio-quality
+		fi
+		if use archive-upload; then
+			[[ -n ${gui_test_features} ]] && gui_test_features+=,
+			gui_test_features+=archive-upload
 		fi
 		if use commons-upload; then
 			[[ -n ${gui_test_features} ]] && gui_test_features+=,

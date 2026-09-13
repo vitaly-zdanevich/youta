@@ -1829,6 +1829,14 @@ struct HitMap {
     /// Largest wrapped-line offset that can change the private-note viewport.
     private_note_scroll_maximum: usize,
 
+    #[cfg(feature = "archive-upload")]
+    archive_upload_fields: Vec<(ArchiveUploadField, Rect)>,
+    #[cfg(feature = "archive-upload")]
+    archive_upload_buttons: Vec<(UiAction, Rect)>,
+    #[cfg(feature = "archive-upload")]
+    archive_credentials_fields: Vec<(bool, Rect)>,
+    #[cfg(feature = "archive-upload")]
+    archive_credentials_buttons: Vec<(UiAction, Rect)>,
     local_file_buttons: Vec<(UiAction, Rect)>,
     /// Exact modal choices and confirmation controls for one download request.
     download_choice_buttons: Vec<(UiAction, Rect)>,
@@ -2195,6 +2203,10 @@ fn render_frame(
         || view.evernote_popup.is_some()
         || view.evernote_credentials_popup.is_some();
 
+    #[cfg(feature = "archive-upload")]
+    let thumbnail_is_obscured = thumbnail_is_obscured
+        || view.archive_upload_popup.is_some()
+        || view.archive_credentials_popup.is_some();
     #[cfg(feature = "qr")]
     let thumbnail_is_obscured = thumbnail_is_obscured || view.video_qr_popup.is_some();
     #[cfg(feature = "lan-sharing")]
@@ -2323,6 +2335,31 @@ fn render_frame(
         hit_map.evernote_credentials_buttons.clear();
         if let Some(popup) = view.evernote_credentials_popup.as_ref() {
             render_evernote_credentials_popup(
+                frame,
+                popup,
+                view.external_opener_available,
+                &theme,
+                hit_map,
+            );
+        }
+    }
+    #[cfg(feature = "archive-upload")]
+    {
+        hit_map.archive_upload_fields.clear();
+        hit_map.archive_upload_buttons.clear();
+        hit_map.archive_credentials_fields.clear();
+        hit_map.archive_credentials_buttons.clear();
+        if let Some(popup) = view.archive_upload_popup.as_ref() {
+            render_archive_upload_popup(
+                frame,
+                popup,
+                view.external_opener_available,
+                &theme,
+                hit_map,
+            );
+        }
+        if let Some(popup) = view.archive_credentials_popup.as_ref() {
+            render_archive_credentials_popup(
                 frame,
                 popup,
                 view.external_opener_available,
@@ -4214,6 +4251,8 @@ fn right_detail_button_reserves_full_row(
         #[cfg(feature = "evernote")]
         UiAction::OpenEvernoteNote => true,
 
+        #[cfg(feature = "archive-upload")]
+        UiAction::OpenArchiveUpload => true,
         _ => false,
     }
 }
@@ -4362,6 +4401,24 @@ fn render_information_panel(
             "Save audio to Evernote".to_owned(),
             theme.accent,
             UiAction::OpenEvernoteNote,
+        );
+    }
+    #[cfg(feature = "archive-upload")]
+    if show_text_selection
+        && view.archive_upload_supported
+        && view.archive_upload_available
+        && details
+            .media_id
+            .as_ref()
+            .is_some_and(|id| id.source == SourceKind::YouTube)
+    {
+        push_right_detail_button(
+            &mut lines,
+            &mut right_buttons,
+            inner.width,
+            "Upload to archive.org".to_owned(),
+            theme.accent,
+            UiAction::OpenArchiveUpload,
         );
     }
 
@@ -6932,6 +6989,12 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
     }
     playlist_actions_help.push_str("  l toggle todo     P choose playlist");
     let selection_help = "  j/k select     Enter open/play";
+    #[cfg(feature = "archive-upload")]
+    let selection_help = if view.archive_upload_supported {
+        format!("{selection_help}     I upload to archive.org")
+    } else {
+        selection_help.to_owned()
+    };
 
     let help = [
         "Navigation",
@@ -9512,6 +9575,361 @@ fn render_commons_credentials_popup(
         ],
         theme,
         &mut hit_map.commons_credentials_buttons,
+    );
+}
+
+/// Draws a clipped action rail whose hit targets never extend outside the popup.
+#[cfg(feature = "archive-upload")]
+fn render_archive_popup_buttons(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    buttons: &[(&str, UiAction)],
+    theme: &Theme,
+    targets: &mut Vec<(UiAction, Rect)>,
+) {
+    if area.is_empty() {
+        return;
+    }
+    let mut x = area.x;
+    for (label, action) in buttons {
+        let width = terminal_text_width(label).min(area.right().saturating_sub(x));
+        if width == 0 {
+            break;
+        }
+        let target = Rect::new(x, area.y, width, 1);
+        frame.render_widget(Paragraph::new(*label).style(theme.accent), target);
+        targets.push((action.clone(), target));
+        x = x.saturating_add(width).saturating_add(3);
+    }
+}
+
+/// Keeps reviewed public metadata, explicit submission, and transfer state in one modal.
+#[cfg(feature = "archive-upload")]
+fn render_archive_upload_popup(
+    frame: &mut Frame<'_>,
+    popup: &ArchiveUploadPopupView,
+    external_opener_available: bool,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+) {
+    let area = centered_sized_rect(104, 27, frame.area());
+    frame.render_widget(Clear, area);
+    frame.render_widget(panel_block(" Upload to archive.org ", theme), area);
+    let inner = area.inner(ratatui::layout::Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+    if inner.is_empty() {
+        return;
+    }
+    let sections = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Length(3),
+        Constraint::Length(3),
+        Constraint::Length(5),
+        Constraint::Length(3),
+        Constraint::Length(1),
+        Constraint::Min(2),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+    frame.render_widget(Paragraph::new("Opus audio by default. Tab fields · Enter description newline · F2 video · Ctrl+S Upload")
+        .style(theme.muted).wrap(Wrap { trim: false }), sections[0]);
+    let editable = popup.phase.is_editable();
+    for (field, label, value, area) in [
+        (
+            ArchiveUploadField::Identifier,
+            "Identifier",
+            popup.draft.identifier.as_str(),
+            sections[1],
+        ),
+        (
+            ArchiveUploadField::Title,
+            "Title",
+            popup.draft.title.as_str(),
+            sections[2],
+        ),
+        (
+            ArchiveUploadField::Description,
+            "Description",
+            popup.draft.description.as_str(),
+            sections[3],
+        ),
+        (
+            ArchiveUploadField::Creator,
+            "Creator",
+            popup.draft.creator.as_str(),
+            sections[4],
+        ),
+    ] {
+        if area.is_empty() {
+            continue;
+        }
+        let selected = editable && popup.selected_field == field;
+        let value = if selected {
+            format!("{value}▏")
+        } else {
+            value.to_owned()
+        };
+        // Editors append at the end; retain newline boundaries and keep the caret visible.
+        let width = usize::from(area.width).max(1);
+        let rows = value
+            .lines()
+            .map(|line| {
+                usize::from(terminal_text_width(line))
+                    .max(1)
+                    .div_ceil(width)
+            })
+            .sum::<usize>();
+        let offset = if selected {
+            rows.saturating_sub(usize::from(area.height.saturating_sub(1)))
+        } else {
+            0
+        };
+        frame.render_widget(
+            Paragraph::new(value)
+                .wrap(Wrap { trim: false })
+                .scroll((u16::try_from(offset).unwrap_or(u16::MAX), 0))
+                .style(if selected { theme.selected } else { theme.base })
+                .block(
+                    Block::default()
+                        .borders(Borders::BOTTOM)
+                        .border_style(if selected { theme.accent } else { theme.border })
+                        .title(label),
+                ),
+            area,
+        );
+        if editable {
+            hit_map.archive_upload_fields.push((field, area));
+        }
+    }
+    let video_area = sections[5];
+    if !video_area.is_empty() {
+        let area = video_area;
+        let text = format!(
+            "[{}] Upload video (remembered)",
+            if popup.draft.upload_video { "x" } else { " " }
+        );
+        let target = Rect::new(
+            area.x,
+            area.y,
+            terminal_text_width(&text).min(area.width),
+            1,
+        );
+        frame.render_widget(
+            Paragraph::new(text).style(if editable { theme.accent } else { theme.muted }),
+            target,
+        );
+        if editable {
+            hit_map
+                .archive_upload_buttons
+                .push((UiAction::ToggleArchiveUploadVideo, target));
+        }
+    }
+    let mut status = match popup.phase {
+        ArchiveUploadPhase::Review => {
+            "Review the metadata, then Upload. No public upload has started.".to_owned()
+        }
+        ArchiveUploadPhase::Preparing => format!(
+            "Preparing {}{}",
+            if popup.draft.upload_video {
+                "video"
+            } else {
+                "Opus audio"
+            },
+            ".".repeat(popup.animation_frame / 4 % 3 + 1)
+        ),
+        ArchiveUploadPhase::Uploading => match popup.total_bytes.filter(|total| *total > 0) {
+            Some(total) => format!(
+                "Uploading {}% · {} / {total} bytes",
+                popup
+                    .uploaded_bytes
+                    .saturating_mul(100)
+                    .checked_div(total)
+                    .unwrap_or_default()
+                    .min(100),
+                popup.uploaded_bytes
+            ),
+            None => format!("Uploading {} bytes", popup.uploaded_bytes),
+        },
+        ArchiveUploadPhase::Cancelling => {
+            "Cancelling local work; already uploaded remote data may remain.".to_owned()
+        }
+        ArchiveUploadPhase::Complete => {
+            "Upload accepted; archive.org may still be processing.".to_owned()
+        }
+        ArchiveUploadPhase::Failed => {
+            "Upload failed. Inspect the status before opening a fresh review.".to_owned()
+        }
+        ArchiveUploadPhase::Cancelled => {
+            "Cancelled. Already uploaded remote data may remain.".to_owned()
+        }
+    };
+    if let Some(error) = &popup.validation_error {
+        status.push_str(&format!("\n{error}"));
+    }
+
+    if let Some(url) = &popup.result_url {
+        status.push_str(&format!("\n{url}"));
+    }
+    frame.render_widget(
+        Paragraph::new(status)
+            .style(theme.base)
+            .wrap(Wrap { trim: false }),
+        sections[6],
+    );
+    let terminal = matches!(
+        popup.phase,
+        ArchiveUploadPhase::Complete | ArchiveUploadPhase::Failed | ArchiveUploadPhase::Cancelled
+    );
+    let mut buttons = Vec::new();
+    if editable {
+        buttons.push(("Upload", UiAction::SubmitArchiveUpload(popup.generation)));
+    }
+    if popup.phase == ArchiveUploadPhase::Complete
+        && popup.result_url.is_some()
+        && external_opener_available
+    {
+        buttons.push(("Open item", UiAction::OpenArchiveUploadResult));
+    }
+    buttons.push((
+        if terminal { "Close" } else { "Cancel" },
+        UiAction::DismissArchiveUpload,
+    ));
+    if editable && external_opener_available {
+        buttons.push((
+            "Get archive.org upload keys",
+            UiAction::OpenArchiveCredentialsGuide,
+        ));
+    }
+    render_archive_popup_buttons(
+        frame,
+        sections[7],
+        &buttons,
+        theme,
+        &mut hit_map.archive_upload_buttons,
+    );
+}
+
+/// Masks both S3 keys and keeps validation text from revealing credential material.
+#[cfg(feature = "archive-upload")]
+fn render_archive_credentials_popup(
+    frame: &mut Frame<'_>,
+    popup: &ArchiveCredentialsPopupView,
+    external_opener_available: bool,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+) {
+    let area = centered_sized_rect(92, 23, frame.area());
+    frame.render_widget(Clear, area);
+    frame.render_widget(panel_block(" archive.org upload keys ", theme), area);
+    let inner = area.inner(ratatui::layout::Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+    if inner.is_empty() {
+        return;
+    }
+    // Reserve both key editors before optional guidance when terminal space is limited.
+    let intro_height = if inner.height >= 16 { 2 } else { 1 };
+    let field_height = inner
+        .height
+        .saturating_sub(intro_height + 1)
+        .div_ceil(2)
+        .min(3);
+    let extra_height = inner
+        .height
+        .saturating_sub(intro_height + field_height * 2 + 1);
+    let guide_height = extra_height.min(1);
+    let error_height = if popup.validation_error.is_some() {
+        extra_height.saturating_sub(guide_height).min(2)
+    } else {
+        0
+    };
+    let guidance_height = extra_height.saturating_sub(guide_height + error_height);
+    let sections = Layout::vertical([
+        Constraint::Length(intro_height),
+        Constraint::Length(field_height),
+        Constraint::Length(field_height),
+        Constraint::Length(guide_height),
+        Constraint::Length(guidance_height),
+        Constraint::Length(error_height),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+    frame.render_widget(Paragraph::new("Keys stay in memory for this session; they are not saved.\nTab switches fields · Enter confirms · F1 gets archive.org upload keys.")
+        .style(theme.muted).wrap(Wrap { trim: false }), sections[0]);
+    for (secret, label, value, area) in [
+        (false, "Access key", popup.access_key.as_str(), sections[1]),
+        (true, "Secret key", popup.secret_key.as_str(), sections[2]),
+    ] {
+        if area.is_empty() {
+            continue;
+        }
+        let selected = popup.secret_selected == secret;
+        frame.render_widget(
+            Paragraph::new(masked_setup_value(value, usize::from(area.width)))
+                .style(if selected { theme.selected } else { theme.base })
+                .block(
+                    Block::default()
+                        .borders(Borders::BOTTOM)
+                        .border_style(if selected { theme.accent } else { theme.border })
+                        .title(label),
+                ),
+            area,
+        );
+        hit_map.archive_credentials_fields.push((secret, area));
+    }
+    let guide = "Get archive.org upload keys: https://archive.org/account/s3.php";
+    let guide_area = Rect::new(
+        sections[3].x,
+        sections[3].y,
+        terminal_text_width(guide).min(sections[3].width),
+        sections[3].height.min(1),
+    );
+    frame.render_widget(Paragraph::new(guide).style(theme.accent), guide_area);
+    if external_opener_available && !guide_area.is_empty() {
+        hit_map
+            .archive_credentials_buttons
+            .push((UiAction::OpenArchiveCredentialsGuide, guide_area));
+    }
+    let guidance = "Optional key file under the Youta config directory:\nsecrets/archive-org.toml\n(default ~/.config/youta/secrets/archive-org.toml)\naccess_key = 'YOUR_ACCESS_KEY'\nsecret_key = 'YOUR_SECRET_KEY'";
+    let guidance_rows = guidance
+        .lines()
+        .map(|line| terminal_text_width(line).div_ceil(sections[4].width.max(1)))
+        .sum::<u16>();
+    if guidance_rows <= guidance_height {
+        frame.render_widget(
+            Paragraph::new(guidance)
+                .style(theme.muted)
+                .wrap(Wrap { trim: false }),
+            sections[4],
+        );
+    } else {
+        frame.render_widget(
+            Paragraph::new("Resize to see optional key-file instructions.")
+                .style(theme.muted)
+                .wrap(Wrap { trim: false }),
+            sections[4],
+        );
+    }
+    if popup.validation_error.is_some() {
+        frame.render_widget(
+            Paragraph::new("Credentials could not be accepted. Check both keys and try again.")
+                .style(Style::default().fg(Color::Red))
+                .wrap(Wrap { trim: false }),
+            sections[5],
+        );
+    }
+    render_archive_popup_buttons(
+        frame,
+        sections[6],
+        &[
+            ("Use for session", UiAction::SubmitArchiveCredentials),
+            ("Cancel", UiAction::DismissArchiveCredentials),
+        ],
+        theme,
+        &mut hit_map.archive_credentials_buttons,
     );
 }
 
@@ -12236,6 +12654,42 @@ fn mouse_action_unfiltered(
         };
     }
 
+    #[cfg(feature = "archive-upload")]
+    if view.archive_credentials_popup.is_some() {
+        return match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => hit_map
+                .archive_credentials_fields
+                .iter()
+                .find(|(_, area)| contains(*area, mouse.column, mouse.row))
+                .map(|(secret, _)| UiAction::SelectArchiveCredentialField(*secret))
+                .or_else(|| {
+                    hit_map
+                        .archive_credentials_buttons
+                        .iter()
+                        .find(|(_, area)| contains(*area, mouse.column, mouse.row))
+                        .map(|(action, _)| action.clone())
+                }),
+            _ => None,
+        };
+    }
+    #[cfg(feature = "archive-upload")]
+    if view.archive_upload_popup.is_some() {
+        return match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => hit_map
+                .archive_upload_fields
+                .iter()
+                .find(|(_, area)| contains(*area, mouse.column, mouse.row))
+                .map(|(field, _)| UiAction::SelectArchiveUploadField(*field))
+                .or_else(|| {
+                    hit_map
+                        .archive_upload_buttons
+                        .iter()
+                        .find(|(_, area)| contains(*area, mouse.column, mouse.row))
+                        .map(|(action, _)| action.clone())
+                }),
+            _ => None,
+        };
+    }
     #[cfg(feature = "commons-upload")]
     if view.commons_credentials_popup.is_some() {
         return match mouse.kind {
@@ -14467,6 +14921,8 @@ for encoded, expected in json.load(sys.stdin):
                 .unwrap();
             let rendered = rendered_text(&terminal);
             assert!(rendered.contains("Web: / open URL"));
+            #[cfg(feature = "archive-upload")]
+            assert!(rendered.contains("I upload to archive.org"));
             #[cfg(feature = "evernote")]
             assert!(rendered.contains("E Evernote audio"));
             if height >= 40 {
@@ -15973,6 +16429,10 @@ for encoded, expected in json.load(sys.stdin):
             .collect::<String>();
 
         assert!(rendered.contains("Youta help"));
+        assert_eq!(
+            rendered.contains("I upload to archive.org"),
+            cfg!(feature = "archive-upload")
+        );
         assert!(
             rendered.contains("w waveform"),
             "the reserved roadmap shortcut must remain discoverable"
@@ -19802,6 +20262,347 @@ for encoded, expected in json.load(sys.stdin):
                 hit_map.subscription_source_first_index
             ))
         );
+    }
+
+    #[cfg(feature = "archive-upload")]
+    #[test]
+    fn archive_upload_review_is_explicit_and_credentials_are_always_masked() {
+        let mut view = ViewModel {
+            archive_upload_available: true,
+            external_opener_available: true,
+            archive_upload_popup: Some(ArchiveUploadPopupView {
+                generation: 42,
+                selected_field: ArchiveUploadField::Description,
+                draft: crate::archive_upload::ArchiveUploadDraft {
+                    identifier: "fixture-item".to_owned(),
+                    title: "Fixture upload title".to_owned(),
+                    description: "First description line\nSecond description line".to_owned(),
+                    creator: "Fixture creator".to_owned(),
+                    source_url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_owned(),
+                    ..crate::archive_upload::ArchiveUploadDraft::default()
+                },
+                ..ArchiveUploadPopupView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(120, 34)).unwrap();
+        let mut hit_map = HitMap::default();
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .unwrap();
+        let rendered = rendered_text(&terminal);
+        for text in [
+            "Upload to archive.org",
+            "Fixture upload title",
+            "First description line",
+            "Second description line",
+            "Upload video",
+            "Opus",
+        ] {
+            assert!(rendered.contains(text), "{text}");
+        }
+        assert!(!rendered.contains("▶ Description"));
+        assert!(!rendered.contains("▶ Identifier"));
+        assert!(rendered.contains("Get archive.org upload keys"));
+        assert!(!rendered.contains("permission"));
+        assert!(!rendered.contains("F3"));
+        assert!(!rendered.contains("Source:"));
+        assert!(!rendered.contains("https://www.youtube.com/watch?v=dQw4w9WgXcQ"));
+        assert!(
+            hit_map
+                .archive_upload_buttons
+                .iter()
+                .any(|(action, _)| *action == UiAction::SubmitArchiveUpload(42))
+        );
+        for expected in [UiAction::ToggleArchiveUploadVideo] {
+            let target = hit_map
+                .archive_upload_buttons
+                .iter()
+                .find_map(|(action, target)| (action == &expected).then_some(*target))
+                .unwrap();
+            assert_eq!(
+                mouse_action(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: target.x,
+                        row: target.y,
+                        modifiers: KeyModifiers::NONE
+                    },
+                    &hit_map,
+                    &view
+                ),
+                Some(expected)
+            );
+        }
+
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .unwrap();
+        assert!(
+            hit_map
+                .archive_upload_buttons
+                .iter()
+                .any(|(action, _)| action == &UiAction::SubmitArchiveUpload(42))
+        );
+        view.archive_credentials_popup = Some(ArchiveCredentialsPopupView {
+            access_key: "private-access-fixture".to_owned(),
+            secret_key: "private-secret-fixture".to_owned(),
+            ..ArchiveCredentialsPopupView::default()
+        });
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .unwrap();
+        let rendered = rendered_text(&terminal);
+        assert!(!rendered.contains("private-access-fixture"));
+        assert!(!rendered.contains("private-secret-fixture"));
+        assert!(rendered.contains("not saved"));
+        assert!(rendered.contains("https://archive.org/account/s3.php"));
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &view),
+            Some(UiAction::SubmitArchiveCredentials)
+        );
+    }
+
+    #[cfg(feature = "archive-upload")]
+    #[test]
+    fn archive_upload_credentials_show_file_guidance_below_masked_fields() {
+        let view = ViewModel {
+            external_opener_available: true,
+            archive_credentials_popup: Some(ArchiveCredentialsPopupView::default()),
+            ..ViewModel::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(120, 34)).unwrap();
+        let mut hit_map = HitMap::default();
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .unwrap();
+        let rendered = rendered_text(&terminal);
+        for expected in [
+            "Get archive.org upload keys",
+            "secrets/archive-org.toml",
+            "default ~/.config/youta/secrets/archive-org.toml",
+            "access_key = 'YOUR_ACCESS_KEY'",
+            "secret_key = 'YOUR_SECRET_KEY'",
+        ] {
+            assert!(rendered.contains(expected), "{expected}");
+        }
+        assert!(
+            rendered.find("Secret key").unwrap()
+                < rendered.find("secrets/archive-org.toml").unwrap()
+        );
+        for (width, height) in [(80, 14), (40, 12)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+                .unwrap();
+            let rendered = rendered_text(&terminal);
+            assert!(rendered.contains("Access key"), "{width}x{height}");
+            assert!(rendered.contains("Secret key"), "{width}x{height}");
+            assert_eq!(hit_map.archive_credentials_fields.len(), 2);
+        }
+    }
+
+    #[cfg(feature = "archive-upload")]
+    #[test]
+    fn archive_upload_button_is_plain_and_follows_existing_export_actions() {
+        let mut view = ViewModel {
+            archive_upload_available: true,
+            details: Some(DetailView {
+                media_id: Some(MediaId::new(SourceKind::YouTube, "dQw4w9WgXcQ")),
+                title: "Selected YouTube fixture".to_owned(),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        #[cfg(feature = "commons-upload")]
+        {
+            view.commons_upload_available = true;
+        }
+        #[cfg(feature = "evernote")]
+        {
+            view.evernote_available = true;
+        }
+        let mut terminal = Terminal::new(TestBackend::new(160, 36)).unwrap();
+        let mut hit_map = HitMap::default();
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .unwrap();
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("Upload to archive.org"));
+        assert!(!rendered.contains("[I] Upload to archive.org"));
+        let archive = hit_map
+            .detail_buttons
+            .iter()
+            .position(|(action, _)| action == &UiAction::OpenArchiveUpload)
+            .unwrap();
+        #[cfg(feature = "commons-upload")]
+        assert!(
+            hit_map
+                .detail_buttons
+                .iter()
+                .position(|(action, _)| action == &UiAction::OpenCommonsUpload)
+                .unwrap()
+                < archive
+        );
+        #[cfg(feature = "evernote")]
+        assert!(
+            hit_map
+                .detail_buttons
+                .iter()
+                .position(|(action, _)| action == &UiAction::OpenEvernoteNote)
+                .unwrap()
+                < archive
+        );
+        let _ = archive;
+        view.archive_upload_available = false;
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .unwrap();
+        assert!(!rendered_text(&terminal).contains("Upload to archive.org"));
+    }
+
+    /// Terminal phases never offer a second publication, and targets remain within the frame.
+    #[cfg(feature = "archive-upload")]
+    #[test]
+    fn archive_upload_progress_terminal_states_and_small_popups_are_bounded() {
+        for (width, height) in [(120, 34), (40, 12), (12, 5), (1, 1)] {
+            for phase in [
+                ArchiveUploadPhase::Review,
+                ArchiveUploadPhase::Preparing,
+                ArchiveUploadPhase::Uploading,
+                ArchiveUploadPhase::Cancelling,
+                ArchiveUploadPhase::Complete,
+                ArchiveUploadPhase::Failed,
+                ArchiveUploadPhase::Cancelled,
+            ] {
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                let view = ViewModel {
+                    external_opener_available: true,
+                    archive_upload_popup: Some(ArchiveUploadPopupView {
+                        generation: 7,
+                        phase,
+                        uploaded_bytes: 50,
+                        total_bytes: Some(100),
+                        result_url: (phase == ArchiveUploadPhase::Complete).then(|| {
+                            url::Url::parse("https://archive.org/details/fixture-item").unwrap()
+                        }),
+                        draft: crate::archive_upload::ArchiveUploadDraft {
+                            identifier: "fixture-item".to_owned(),
+                            title: "Fixture upload".to_owned(),
+                            source_url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_owned(),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+                let mut hit_map = HitMap::default();
+                terminal
+                    .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+                    .unwrap();
+                for (_, target) in &hit_map.archive_upload_buttons {
+                    assert!(!target.is_empty());
+                    assert!(
+                        target.right() <= width && target.bottom() <= height,
+                        "{target:?} within {width}x{height}"
+                    );
+                }
+                for (_, target) in &hit_map.archive_upload_fields {
+                    assert!(!target.is_empty());
+                    assert!(target.right() <= width && target.bottom() <= height);
+                }
+                if phase != ArchiveUploadPhase::Review {
+                    assert!(hit_map.archive_upload_fields.is_empty());
+                    assert!(
+                        !hit_map
+                            .archive_upload_buttons
+                            .iter()
+                            .any(|(action, _)| matches!(
+                                action,
+                                UiAction::SubmitArchiveUpload(_)
+                                    | UiAction::ToggleArchiveUploadVideo
+                            ))
+                    );
+                    assert_eq!(
+                        key_action(
+                            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+                            &view
+                        ),
+                        None
+                    );
+                }
+                if width == 120 && height == 34 {
+                    if phase == ArchiveUploadPhase::Uploading {
+                        assert!(rendered_text(&terminal).contains("Uploading 50%"));
+                    }
+                    if phase == ArchiveUploadPhase::Review {
+                        let target = hit_map
+                            .archive_upload_buttons
+                            .iter()
+                            .find_map(|(action, target)| {
+                                (action == &UiAction::SubmitArchiveUpload(7)).then_some(*target)
+                            })
+                            .unwrap();
+                        assert_eq!(
+                            mouse_action(
+                                MouseEvent {
+                                    kind: MouseEventKind::Down(MouseButton::Left),
+                                    column: target.x,
+                                    row: target.y,
+                                    modifiers: KeyModifiers::NONE
+                                },
+                                &hit_map,
+                                &view
+                            ),
+                            Some(UiAction::SubmitArchiveUpload(7))
+                        );
+                    }
+                    if phase == ArchiveUploadPhase::Complete {
+                        assert!(
+                            hit_map
+                                .archive_upload_buttons
+                                .iter()
+                                .any(|(action, _)| *action == UiAction::OpenArchiveUploadResult)
+                        );
+                    }
+                }
+            }
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let view = ViewModel {
+                archive_credentials_popup: Some(ArchiveCredentialsPopupView::default()),
+                ..Default::default()
+            };
+            let mut hit_map = HitMap::default();
+            terminal
+                .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+                .unwrap();
+            for (_, target) in &hit_map.archive_credentials_buttons {
+                assert!(!target.is_empty());
+                assert!(target.right() <= width && target.bottom() <= height);
+            }
+            for (_, target) in &hit_map.archive_credentials_fields {
+                assert!(!target.is_empty());
+                assert!(target.right() <= width && target.bottom() <= height);
+            }
+            terminal
+                .draw(|frame| {
+                    render(
+                        frame,
+                        &ViewModel::default(),
+                        &UiSettings::default(),
+                        &mut hit_map,
+                    )
+                })
+                .unwrap();
+            assert!(
+                hit_map.archive_upload_buttons.is_empty()
+                    && hit_map.archive_credentials_buttons.is_empty()
+            );
+            assert!(
+                hit_map.archive_upload_fields.is_empty()
+                    && hit_map.archive_credentials_fields.is_empty()
+            );
+        }
     }
 
     /// The chooser owns navigation and explicit confirmation, never background playback keys.

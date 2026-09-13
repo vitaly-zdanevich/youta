@@ -4,7 +4,7 @@ resolver = "3"
 
 [package]
 name = "youta"
-version = "0.61.0"
+version = "0.62.0"
 edition = "2024"
 rust-version = "1.95"
 description = "A low-resource YouTube TUI audio player and local subscription manager that uses yt-dlp and saves and shows listening progress"
@@ -34,6 +34,7 @@ required-features = ["cli"]
 default = [
     "app",
     "archive-org",
+    "archive-upload",
     "ascii-visualizer",
     "audio-quality",
     "commons-upload",
@@ -205,6 +206,10 @@ keyring = []
 
 # Shared networking and first-class sources.
 network = ["dep:ureq"]
+# Explicit reviewed public transfers to Internet Archive, removable independently
+# of Archive browsing, Commons and Evernote. Private staging and credentials stay
+# behind this feature; no upload runs without a separate confirmation.
+archive-upload = ["controller", "network", "yt-dlp", "dep:getrandom", "dep:percent-encoding", "dep:tempfile"]
 # Explicit, review-first audio transfers to Wikimedia Commons. Cookie and
 # multipart support are kept behind this feature so distributors can remove
 # the authentication and upload code from constrained builds.
@@ -335,6 +340,8 @@ torrent = []
 bundled-sqlite = ["sqlite-state", "rusqlite/bundled"]
 
 [dependencies]
+getrandom = { version = "0.4.3", optional = true }
+tempfile = { version = "3.27.0", optional = true }
 aes = { version = "0.8.4", optional = true }
 anyhow = { version = "1.0.104", optional = true }
 base64 = { version = "0.22.1", optional = true }

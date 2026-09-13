@@ -481,6 +481,7 @@ pub fn enabled_compile_features() -> Vec<&'static str> {
         "apple-podcasts",
         "archive-org",
         "archive-rar",
+        "archive-upload",
         "archive-zip",
         "ascii-visualizer",
         "audio-quality",

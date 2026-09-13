@@ -22,6 +22,8 @@ use std::time::Duration;
 
 use serde::Serialize;
 
+#[cfg(feature = "archive-upload")]
+use youta::archive_upload::ArchiveUploadDraft;
 #[cfg(feature = "commons-upload")]
 use youta::commons_upload::{CommonsCategorySuggestion, CommonsUploadDraft};
 use youta::domain::{MediaId, SourceKind};
@@ -34,6 +36,8 @@ use youta::view::AsciiVisualizerView;
 use youta::view::CommonsUploadPopupView;
 #[cfg(feature = "evernote")]
 use youta::view::EvernoteNotePopupView;
+#[cfg(feature = "archive-upload")]
+use youta::view::{ArchiveCredentialsPopupView, ArchiveUploadPopupView};
 use youta::view::{
     AudioQualityPopupView, DetailLinkView, DetailTimecodeView, DetailVideoLinkView, DetailView,
     DetailWikidataEntityView, DownloadChoicePopupView, DownloadView, ErrorPopupView,
@@ -151,6 +155,14 @@ fn field_belongs_to_disabled_feature(interface: &str, field: &str) -> bool {
                         | "commons_upload_popup"
                         | "commons_upload_supported"
                 ))
+            || (!cfg!(feature = "archive-upload")
+                && matches!(
+                    field,
+                    "archive_upload_supported"
+                        | "archive_upload_available"
+                        | "archive_upload_popup"
+                        | "archive_credentials_editor"
+                ))
             || (!cfg!(feature = "evernote")
                 && matches!(
                     field,
@@ -197,6 +209,20 @@ fn action_belongs_to_disabled_feature(name: &str) -> bool {
                     | "SubmitCommonsCredentials"
                     | "SubmitCommonsUpload"
             ))
+        || (!cfg!(feature = "archive-upload")
+            && matches!(
+                name,
+                "OpenArchiveUpload"
+                    | "SelectArchiveUploadField"
+                    | "ToggleArchiveUploadVideo"
+                    | "SubmitArchiveUpload"
+                    | "DismissArchiveUpload"
+                    | "OpenArchiveUploadResult"
+                    | "SelectArchiveCredentialField"
+                    | "SubmitArchiveCredentials"
+                    | "DismissArchiveCredentials"
+                    | "OpenArchiveCredentialsGuide"
+            ))
         || (!cfg!(feature = "evernote")
             && matches!(
                 name,
@@ -236,6 +262,14 @@ fn optional_contract_exemptions_follow_the_compiled_feature_set() {
     assert_eq!(
         field_belongs_to_disabled_feature("ViewModel", "commons_upload_popup"),
         !cfg!(feature = "commons-upload")
+    );
+    assert_eq!(
+        field_belongs_to_disabled_feature("ViewModel", "archive_upload_popup"),
+        !cfg!(feature = "archive-upload")
+    );
+    assert_eq!(
+        action_belongs_to_disabled_feature("SubmitArchiveUpload"),
+        !cfg!(feature = "archive-upload")
     );
     assert_eq!(
         field_belongs_to_disabled_feature("ViewModel", "evernote_popup"),
@@ -520,6 +554,26 @@ fn the_typescript_contract_names_only_fields_the_reducer_emits() {
         );
     }
 
+    #[cfg(feature = "archive-upload")]
+    {
+        emitted.insert(
+            "ArchiveUploadPopupView",
+            emitted_keys(&ArchiveUploadPopupView::default()),
+        );
+        emitted.insert(
+            "ArchiveUploadDraft",
+            emitted_keys(&ArchiveUploadDraft::default()),
+        );
+        let credentials = ViewModel {
+            archive_credentials_popup: Some(ArchiveCredentialsPopupView::default()),
+            ..ViewModel::default()
+        };
+        let json = serde_json::to_value(credentials).expect("redacted Archive credentials");
+        emitted.insert(
+            "ArchiveCredentialsEditorView",
+            emitted_keys(&json["archive_credentials_editor"]),
+        );
+    }
     emitted.insert(
         "SubscriptionsView",
         emitted_keys(&SubscriptionsView::default()),
@@ -642,6 +696,9 @@ fn every_checked_interface_is_actually_declared() {
         "CommonsCategorySuggestion",
         "EvernoteNotePopupView",
         "EvernoteNoteDraft",
+        "ArchiveUploadPopupView",
+        "ArchiveUploadDraft",
+        "ArchiveCredentialsEditorView",
         "SubscriptionsView",
         "QueuePopupView",
         "QueueRowView",
@@ -1666,12 +1723,14 @@ fn the_contract_never_names_a_credential_bearing_editor() {
         "PrivateNotePopupView",
         "CommonsCredentialsPopupView",
         "EvernoteCredentialsPopupView",
+        "ArchiveCredentialsPopupView",
         "youtube_setup_popup",
         "yandex_music_setup_popup",
         "rss_subscription_popup",
         "private_note_popup",
         "commons_credentials_popup",
         "evernote_credentials_popup",
+        "archive_credentials_popup",
     ] {
         assert!(
             !declared_interfaces(&source)

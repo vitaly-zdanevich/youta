@@ -737,6 +737,41 @@ export interface EvernoteCredentialsEditorView {
 	validation_failed: boolean;
 }
 
+/** Public metadata reviewed before creating an Archive.org item. */
+export interface ArchiveUploadDraft {
+	identifier: string;
+	title: string;
+	description: string;
+	creator: string;
+	source_url: string;
+	upload_video: boolean;
+
+}
+
+/** Text focus and lifecycle are owned by the shared reducer. */
+export type ArchiveUploadField = 'Identifier' | 'Title' | 'Description' | 'Creator';
+export type ArchiveUploadPhase = 'Review' | 'Preparing' | 'Uploading' | 'Cancelling' | 'Complete' | 'Failed' | 'Cancelled';
+
+/** One generation-bound public upload review, progress report, or result. */
+export interface ArchiveUploadPopupView {
+	generation: number;
+	draft: ArchiveUploadDraft;
+	selected_field: ArchiveUploadField;
+	phase: ArchiveUploadPhase;
+	animation_frame: number;
+	uploaded_bytes: number;
+	total_bytes: number | null;
+	validation_error: string | null;
+	result_url: string | null;
+}
+
+/** Neither access nor secret key, nor credential errors, leave the Rust process. */
+export interface ArchiveCredentialsEditorView {
+	access_key_length: number;
+	secret_key_length: number;
+	secret_selected: boolean;
+	validation_failed: boolean;
+}
 
 /** The published snapshot. */
 export interface ViewModel {
@@ -815,6 +850,10 @@ export interface ViewModel {
 	evernote_available: boolean;
 	evernote_popup: EvernoteNotePopupView | null;
 	evernote_credentials_editor: EvernoteCredentialsEditorView | null;
+	archive_upload_supported: boolean;
+	archive_upload_available: boolean;
+	archive_upload_popup: ArchiveUploadPopupView | null;
+	archive_credentials_editor: ArchiveCredentialsEditorView | null;
   rss_subscription_open: boolean;
   private_note_open: boolean;
   quitting: boolean;

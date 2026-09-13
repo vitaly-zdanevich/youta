@@ -14,6 +14,9 @@ import { useEffect, useRef } from 'react';
 
 import type {
   AudioQualityPopupView,
+	ArchiveUploadField,
+	ArchiveUploadPopupView,
+	ArchiveCredentialsEditorView,
   ChannelDownloadPopupView,
 	DownloadChoicePopupView,
 	DownloadMode,
@@ -51,6 +54,8 @@ export const LAYER = {
   projectHistory: 1,
   credentialEditor: 2,
   commonsUpload: 3,
+	archiveUpload: 3.2,
+	archiveCredentials: 3.3,
   preferences: 4,
   localFile: 5,
   channelDownload: 6,
@@ -84,6 +89,7 @@ export function HelpPopup({
   audioQualitySupported,
   asciiVisualizerSupported,
   commonsUploadSupported,
+	archiveUploadSupported,
 	channelDownloadSupported,
 	evernoteSupported,
 	lanShareSupported,
@@ -94,6 +100,7 @@ export function HelpPopup({
   audioQualitySupported: boolean;
   asciiVisualizerSupported: boolean;
   commonsUploadSupported: boolean;
+	archiveUploadSupported: boolean;
 	channelDownloadSupported: boolean;
 	evernoteSupported: boolean;
 	lanShareSupported: boolean;
@@ -158,6 +165,9 @@ export function HelpPopup({
 			? ([
 					['E', 'save selected audio to Evernote'],
 				] satisfies Array<[string, string]>)
+			: []),
+		...(archiveUploadSupported
+			? ([['I', 'upload selected YouTube media to archive.org']] satisfies Array<[string, string]>)
 			: []),
         ["s · n", "subscribe · private note"],
         ["P · F6 · Q", "playlist · comments · QR code"],
@@ -330,6 +340,101 @@ const COMMONS_LICENSE_LABELS = {
   Cc0: "CC0 1.0 public-domain dedication",
 } as const;
 
+/** A reducer-owned public field: typing and multiline input use the shared keymap. */
+function ArchiveUploadFieldInput({
+	field, value, selected, disabled,
+}: {
+	field: ArchiveUploadField; value: string; selected: boolean; disabled: boolean;
+}) {
+	return (
+		<button type='button' disabled={disabled}
+			onMouseDown={(event) => event.preventDefault()}
+			onClick={() => void dispatch({ SelectArchiveUploadField: field })}
+			className={`grid min-h-[42px] w-full grid-cols-[105px_minmax(0,1fr)] gap-3 rounded-[5px] border px-[9px] py-[6px] text-left text-xs ${selected ? 'border-accent bg-raised' : 'border-line-strong'}`}>
+			<span className='text-ink-faint'>{field}</span>
+			<span className={field === 'Description' ? 'max-h-[180px] overflow-y-auto whitespace-pre-wrap break-words' : 'break-all'}>
+				{value || <span className='text-ink-faint'>Empty</span>}
+				{selected && !disabled ? <span aria-hidden className='ml-px inline-block h-[13px] w-[2px] animate-pulse bg-accent' /> : null}
+			</span>
+		</button>
+	);
+}
+
+/** Explicit publication review: the video checkbox never shares ordinary text-editing keys. */
+export function ArchiveUploadPopup({ popup }: { popup: ArchiveUploadPopupView }) {
+	const editable = popup.phase === 'Review';
+	const terminal = ['Complete', 'Failed', 'Cancelled'].includes(popup.phase);
+	const complete = popup.phase === 'Complete';
+	const percent = popup.total_bytes && popup.total_bytes > 0
+		? Math.min(100, Math.round(popup.uploaded_bytes / popup.total_bytes * 100)) : null;
+	const status = popup.phase === 'Uploading'
+		? `Uploading ${percent === null ? '' : `${percent}% · `}${humanBytes(popup.uploaded_bytes)}${popup.total_bytes === null ? '' : ` / ${humanBytes(popup.total_bytes)}`}`
+		: popup.phase === 'Preparing' ? `Preparing ${popup.draft.upload_video ? 'video' : 'Opus audio'}${'.'.repeat(Math.floor(popup.animation_frame / 4) % 3 + 1)}`
+		: popup.phase === 'Cancelling' ? 'Cancelling local work; already uploaded remote data may remain.'
+		: complete ? 'Upload accepted; archive.org may still be processing.'
+		: popup.phase === 'Cancelled' ? 'Cancelled. Already uploaded remote data may remain.'
+		: 'Review the metadata before uploading.';
+	return (
+		<Popup title='Upload to archive.org' subtitle='Opus audio by default'
+			layer={LAYER.archiveUpload} width='820px'
+			onDismiss={() => void dispatch('DismissArchiveUpload')}
+			footer={<>
+				{editable ? <PopupButton emphasis
+					onClick={() => void dispatch({ SubmitArchiveUpload: popup.generation })}>Upload</PopupButton> : null}
+				{complete && popup.result_url ? <PopupButton emphasis onClick={() => void dispatch('OpenArchiveUploadResult')}>Open item</PopupButton> : null}
+				<PopupButton onClick={() => void dispatch('DismissArchiveUpload')}>{terminal ? 'Close' : 'Cancel'}</PopupButton>
+			</>}>
+			<Body><div className='grid gap-3'>
+				<p className='text-ink-dim'>Opus audio by default. Tab changes fields; Enter adds a description line. F2 toggles video; Ctrl+S uploads.</p>
+				{(['Identifier', 'Title', 'Description', 'Creator'] as const).map((field) => (
+					<ArchiveUploadFieldInput key={field} field={field}
+						value={popup.draft[field.toLowerCase() as 'identifier' | 'title' | 'description' | 'creator']}
+						selected={popup.selected_field === field} disabled={!editable} />
+				))}
+
+				<button type='button' role='checkbox' aria-checked={popup.draft.upload_video} disabled={!editable}
+					onClick={() => void dispatch('ToggleArchiveUploadVideo')} className='text-left'>
+					{popup.draft.upload_video ? '☑' : '☐'} Upload video (remembered)
+				</button>
+
+				<p role='status' className='whitespace-pre-wrap'>{status}</p>
+				{popup.validation_error ? <p role='alert' className='whitespace-pre-wrap text-red-400'>{popup.validation_error}</p> : null}
+				{popup.result_url ? <p className='break-all'>{popup.result_url}</p> : null}
+			</div></Body>
+		</Popup>
+	);
+}
+
+/** Counts and focus only: both Archive S3 credentials stay inside the Rust editor. */
+export function ArchiveCredentialsPopup({ editor }: { editor: ArchiveCredentialsEditorView }) {
+	return (
+		<Popup title='archive.org upload keys' subtitle='Session-only credentials'
+			layer={LAYER.archiveCredentials} width='660px'
+			onDismiss={() => void dispatch('DismissArchiveCredentials')}
+			footer={<>
+				<PopupButton emphasis onClick={() => void dispatch('SubmitArchiveCredentials')}>Use for session</PopupButton>
+				<PopupButton onClick={() => void dispatch('DismissArchiveCredentials')}>Cancel</PopupButton>
+			</>}>
+			<Body><div className='grid gap-3'>
+				<p>Keys stay in memory for this session; they are not saved. Type into the selected field; Tab switches fields and Enter confirms.</p>
+				{([['Access key', false, editor.access_key_length], ['Secret key', true, editor.secret_key_length]] as const).map(([label, secret, length]) => (
+					<button key={label} type='button' onMouseDown={(event) => event.preventDefault()}
+						onClick={() => void dispatch({ SelectArchiveCredentialField: secret })}
+						className={`grid grid-cols-[120px_minmax(0,1fr)] rounded-[5px] border p-2 text-left ${editor.secret_selected === secret ? 'border-accent bg-raised' : 'border-line-strong'}`}>
+						<span>{label}</span><span>{length === 0 ? 'Empty' : `${length} characters entered`}</span>
+					</button>
+				))}
+				<button type='button' className='break-all text-left text-accent'
+					onClick={() => void dispatch('OpenArchiveCredentialsGuide')}>Get archive.org upload keys: https://archive.org/account/s3.php</button>
+				<div className='grid gap-1 text-ink-dim'>
+					<p>Optional key file under the Youta config directory: <code>secrets/archive-org.toml</code> (default ~/.config/youta/secrets/archive-org.toml)</p>
+					<pre className='whitespace-pre-wrap break-all'>{"access_key = 'YOUR_ACCESS_KEY'\nsecret_key = 'YOUR_SECRET_KEY'"}</pre>
+				</div>
+				{editor.validation_failed ? <p role='alert' className='text-red-400'>Credentials could not be accepted. Check both keys and try again.</p> : null}
+			</div></Body>
+		</Popup>
+	);
+}
 
 /** One reducer-owned Commons text field; typing remains in the shared keymap. */
 function CommonsField({

@@ -61,7 +61,8 @@ builds, see [Build and run](#build-and-run). For the desktop front-end, see
   [virtual-console mouse input](#mouse-input-on-a-linux-virtual-console)
 - [Subscriptions and preferences](#subscriptions-and-local-data),
   [channel downloads and LAN podcast feeds](#full-channel-downloads-and-session-lan-feeds)
-- [Commons uploads](#wikimedia-commons-transfer) and [Evernote notes](#evernote-audio-notes)
+- [Internet Archive uploads](#internet-archive-uploads),
+  [Commons uploads](#wikimedia-commons-transfer), and [Evernote notes](#evernote-audio-notes)
 - [Diagnostics](#diagnostics-and-issue-review), [audio quality](#audiophiles),
   and [packaging and tests](#packaging-and-quality)
 - [Roadmap](#service-roadmap), [license](#license),
@@ -749,7 +750,7 @@ dependencies, or the optional Linux virtual-console mouse client with:
 
 ```sh
 cargo build --release --locked --no-default-features \
-	--features app,archive-org,ascii-visualizer,audio-quality,commons-upload,evernote,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,web-browser,youtube-captions
+	--features app,archive-org,archive-upload,ascii-visualizer,audio-quality,commons-upload,evernote,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,web-browser,youtube-captions
 ```
 
 The `app` profile includes the experimental YandexMusic adapter but does not
@@ -760,7 +761,7 @@ with:
 
 ```sh
 cargo build --release --locked --no-default-features \
-	--features app-core,archive-org,ascii-visualizer,audio-quality,commons-upload,evernote,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,web-browser,youtube-captions
+	--features app-core,archive-org,archive-upload,ascii-visualizer,audio-quality,commons-upload,evernote,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,web-browser,youtube-captions
 ```
 
 Omit `images` from that command for the Yandex-free text-only variant. Omit
@@ -775,6 +776,7 @@ leave it out of an explicit `--no-default-features` feature list:
 | Feature | What it adds |
 | --- | --- |
 | `archive-org` | Internet Archive audio catalogue, metadata, reviews, and track browsing. |
+| `archive-upload` | Reviewed YouTube audio/video uploads to Internet Archive. |
 | `ascii-visualizer` | CAVA capture and fullscreen terminal/desktop spectrum renderers. |
 | `audio-quality` | Local spectral analysis and RustFFT. |
 | `commons-upload` | Commons authentication, upload client, and review UI. |
@@ -2200,6 +2202,50 @@ See the [tracker archive matrix](docs/FEASIBILITY.md#tracker-music) before
 enabling another catalog: several archives have no supported API, and Mirsoft
 has no HTTPS endpoint.
 
+## Internet Archive uploads
+
+Select a YouTube video and choose `Upload to archive.org`, or press uppercase
+`I` (shown in Help, not in the button label). Review the fresh item identifier,
+title, description and creator before publishing. The original YouTube URL is
+attached automatically as source metadata, without an extra field in the popup.
+Nothing is uploaded merely by opening the popup or entering credentials.
+
+Audio is prepared as Opus by default. `Upload video` keeps the highest-quality
+available video and audio without reencoding; resolution and frame rate take
+priority over the AV1/Opus codec preference. The checkbox remembers its value
+across popups and restarts in the configuration file:
+
+```toml
+[archive_upload]
+upload_video = false
+```
+
+`YOUTA_ARCHIVE_UPLOAD__UPLOAD_VIDEO` can override this setting; when overridden,
+the popup cannot save a different value. Only upload material you are
+authorized to publish.
+
+Use `Tab` to move between fields, `F2` to toggle video,
+and Upload or `Ctrl+S` to start. During preparation and upload the popup shows activity and
+available byte progress. `Esc` requests cancellation. A successful upload shows a
+clickable item link; Archive processing may continue afterward. A failed or
+cancelled transfer can leave a partial public item: check Archive before trying
+again. Youta does not automatically retry a publication.
+Media preparation is bounded to 30 minutes and 8 GiB of temporary staging,
+including partial downloads and merge inputs; exceeding either limit stops
+preparation before publication.
+
+Credentials are read from `~/.config/youta/secrets/archive-org.toml`
+(`access_key` and `secret_key`), or standard Internet Archive `ia.ini`
+configuration, including `IA_CONFIG_FILE`. Without configured credentials, the
+masked popup accepts session-only keys and links to the
+[Internet Archive keys page](https://archive.org/account/s3.php). Keys are not
+included in serialized UI state or saved from that popup.
+
+The default-on `archive-upload` Cargo feature is independent of `archive-org`
+browsing. The next-release source ebuild template also has a default-on
+`archive-upload` USE flag. See the official [IAS3 upload API](https://archive.org/developers/ias3.html)
+and [metadata schema](https://archive.org/developers/metadata-schema/index.html).
+
 ## Wikimedia Commons transfer
 
 The default-on `commons-upload` feature adds a reviewed audio upload for exact
@@ -2452,7 +2498,7 @@ npm --prefix gui/ui run test:browser
 
 This uses a private headless Firefox profile and a loopback-only test server.
 The actual built page receives a mocked native bridge, so Archive search,
-track navigation and EOF/seek snapshots can be checked without
+track navigation, EOF/seek snapshots, and upload dialogs can be checked without
 using the active player, provider services, upload credentials, or real uploads.
 It is not native Tauri/WebKit validation and does not exercise Rust playback;
 those require separate validation. The check skips when Firefox is unavailable

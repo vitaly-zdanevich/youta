@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 /// Evaluates only the configuration, compilation, and testing phase dispatch.
-fn evaluate_template(archive_org: bool, ascii_visualizer: bool) -> String {
+fn evaluate_template(archive_org: bool, ascii_visualizer: bool, archive_upload: bool) -> String {
     let template = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("packaging/gentoo/youta.ebuild");
     assert!(
         template.is_file(),
@@ -40,8 +40,9 @@ src_test
         .env(
             "USE_FIXTURE",
             format!(
-                "gui {} {}",
+                "gui {} {} {}",
                 if archive_org { "archive-org" } else { "" },
+                if archive_upload { "archive-upload" } else { "" },
                 if ascii_visualizer {
                     "ascii-visualizer"
                 } else {
@@ -76,17 +77,52 @@ fn trace_fields<'a>(trace: &'a str, phase: &str) -> Vec<&'a str> {
 
 #[test]
 fn archive_org_is_default_on_in_the_future_source_ebuild() {
-    let trace = evaluate_template(true, false);
+    let trace = evaluate_template(true, false, false);
     let flags = trace_fields(&trace, "IUSE|");
     assert!(flags.contains(&"+archive-org"));
     assert!(!flags.contains(&"archive-org"));
 }
 
 #[test]
+fn archive_upload_use_is_default_on_and_independent_in_terminal_and_desktop() {
+    for archive_org in [false, true] {
+        for enabled in [false, true] {
+            let trace = evaluate_template(archive_org, true, enabled);
+            assert!(trace_fields(&trace, "IUSE|").contains(&"+archive-upload"));
+            let tui = trace_fields(&trace, "TUI|");
+            assert_eq!(tui.contains(&"archive-upload"), enabled);
+            assert_eq!(tui.contains(&"archive-org"), archive_org);
+            for operation in ["build", "test"] {
+                let fields = trace_fields(&trace, &format!("GUI|cargo|{operation}|"));
+                let features = fields
+                    .windows(2)
+                    .find_map(|pair| (pair[0] == "--features").then_some(pair[1]))
+                    .unwrap_or("");
+                assert_eq!(
+                    features
+                        .split(',')
+                        .any(|feature| feature == "archive-upload"),
+                    enabled
+                );
+                assert_eq!(
+                    features.split(',').any(|feature| feature == "archive-org"),
+                    archive_org
+                );
+                assert!(
+                    features
+                        .split(',')
+                        .any(|feature| feature == "ascii-visualizer")
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn archive_org_use_controls_terminal_and_both_desktop_phases() {
     for (enabled, ascii_visualizer) in [(true, false), (false, false), (true, true), (false, true)]
     {
-        let trace = evaluate_template(enabled, ascii_visualizer);
+        let trace = evaluate_template(enabled, ascii_visualizer, false);
         let features = trace_fields(&trace, "TUI|");
         assert_eq!(features.contains(&"archive-org"), enabled);
         assert_eq!(features.contains(&"ascii-visualizer"), ascii_visualizer);

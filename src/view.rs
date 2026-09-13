@@ -30,6 +30,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "archive-upload")]
+use crate::archive_upload::ArchiveUploadDraft;
 #[cfg(feature = "ascii-visualizer")]
 use crate::ascii_visualizer::AsciiVisualizerRenderer;
 #[cfg(feature = "commons-upload")]
@@ -659,6 +661,31 @@ fn serialize_evernote_credentials_editor<S: serde::Serializer>(
     };
     RedactedEvernoteCredentialsEditor {
         token_length: editor.token.chars().count(),
+        validation_failed: editor.validation_error.is_some(),
+    }
+    .serialize(serializer)
+}
+
+/// Exposes only field lengths and focus for the session-only Archive key editor.
+#[cfg(feature = "archive-upload")]
+fn serialize_archive_credentials_editor<S: serde::Serializer>(
+    editor: &Option<ArchiveCredentialsPopupView>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    #[derive(Serialize)]
+    struct RedactedArchiveCredentialsEditor {
+        access_key_length: usize,
+        secret_key_length: usize,
+        secret_selected: bool,
+        validation_failed: bool,
+    }
+    let Some(editor) = editor else {
+        return serializer.serialize_none();
+    };
+    RedactedArchiveCredentialsEditor {
+        access_key_length: editor.access_key.chars().count(),
+        secret_key_length: editor.secret_key.chars().count(),
+        secret_selected: editor.secret_selected,
         validation_failed: editor.validation_error.is_some(),
     }
     .serialize(serializer)
@@ -1908,6 +1935,127 @@ impl std::fmt::Debug for YandexMusicSetupPopupView {
     }
 }
 
+/// Editable metadata field in the Archive.org upload review.
+#[cfg(feature = "archive-upload")]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub enum ArchiveUploadField {
+    /// Public Archive item identifier.
+    #[default]
+    Identifier,
+    /// Public item title.
+    Title,
+    /// Multiline public description.
+    Description,
+    /// Optional creator attribution.
+    Creator,
+}
+
+#[cfg(feature = "archive-upload")]
+impl ArchiveUploadField {
+    /// Advances through the metadata editor without submitting it.
+    #[must_use]
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Identifier => Self::Title,
+            Self::Title => Self::Description,
+            Self::Description => Self::Creator,
+            Self::Creator => Self::Identifier,
+        }
+    }
+
+    /// Moves to the previous metadata field.
+    #[must_use]
+    pub const fn previous(self) -> Self {
+        match self {
+            Self::Identifier => Self::Creator,
+            Self::Title => Self::Identifier,
+            Self::Description => Self::Title,
+            Self::Creator => Self::Description,
+        }
+    }
+}
+
+/// Explicit preparation/publication lifecycle shown by both frontends.
+#[cfg(feature = "archive-upload")]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub enum ArchiveUploadPhase {
+    /// Metadata is editable; no public upload has started.
+    #[default]
+    Review,
+    /// The selected media is being prepared for upload.
+    Preparing,
+    /// Bytes are being sent to Archive.org.
+    Uploading,
+    /// Cancellation has been requested and the worker is stopping.
+    Cancelling,
+    /// Archive.org accepted the upload; item processing may still be in progress.
+    Complete,
+    /// An actionable preparation or upload failure occurred.
+    Failed,
+    /// Local work has stopped after cancellation.
+    Cancelled,
+}
+
+#[cfg(feature = "archive-upload")]
+impl ArchiveUploadPhase {
+    /// Whether this fresh review can accept metadata changes and explicit submission.
+    #[must_use]
+    pub const fn is_editable(self) -> bool {
+        matches!(self, Self::Review)
+    }
+}
+
+/// Public upload draft and progress; credentials never appear in this snapshot.
+#[cfg(feature = "archive-upload")]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ArchiveUploadPopupView {
+    /// Exact review generation echoed by a submit action.
+    pub generation: u64,
+    /// Editable public metadata and explicit upload choices.
+    pub draft: ArchiveUploadDraft,
+    /// Field currently receiving keyboard input.
+    pub selected_field: ArchiveUploadField,
+    /// Current preparation, publication, or cancellation phase.
+    pub phase: ArchiveUploadPhase,
+    /// Monotonic frame counter for a bounded activity indicator.
+    pub animation_frame: usize,
+    /// Bytes acknowledged or transferred by the upload worker.
+    pub uploaded_bytes: u64,
+    /// Total staged media bytes when known.
+    pub total_bytes: Option<u64>,
+    /// Actionable failure, already redacted by the controller/backend.
+    pub validation_error: Option<String>,
+    /// Exact public item page after successful publication.
+    pub result_url: Option<url::Url>,
+}
+
+/// Session-only Archive keys retained in Rust, never serialized as plaintext.
+#[cfg(feature = "archive-upload")]
+#[derive(Clone, Default, Eq, PartialEq)]
+pub struct ArchiveCredentialsPopupView {
+    /// Sensitive S3 access key.
+    pub access_key: String,
+    /// Sensitive S3 secret key.
+    pub secret_key: String,
+    /// Whether the secret rather than access key has focus.
+    pub secret_selected: bool,
+    /// Inline credential error retained only inside the process.
+    pub validation_error: Option<String>,
+}
+
+#[cfg(feature = "archive-upload")]
+impl std::fmt::Debug for ArchiveCredentialsPopupView {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ArchiveCredentialsPopupView")
+            .field("access_key", &"[REDACTED]")
+            .field("secret_key", &"[REDACTED]")
+            .field("secret_selected", &self.secret_selected)
+            .field("validation_failed", &self.validation_error.is_some())
+            .finish()
+    }
+}
+
 /// Editable field focused in the Commons review popup.
 #[cfg(feature = "commons-upload")]
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -2417,6 +2565,22 @@ pub struct ViewModel {
     )]
     pub evernote_credentials_popup: Option<EvernoteCredentialsPopupView>,
 
+    /// Whether this binary contains the removable Archive upload capability.
+    #[cfg(feature = "archive-upload")]
+    pub archive_upload_supported: bool,
+    /// Whether the exact selected YouTube video can enter upload review.
+    #[cfg(feature = "archive-upload")]
+    pub archive_upload_available: bool,
+    /// Public Archive upload review/progress snapshot.
+    #[cfg(feature = "archive-upload")]
+    pub archive_upload_popup: Option<ArchiveUploadPopupView>,
+    /// Secret session-only keys exposed to the window only as lengths/focus.
+    #[cfg(feature = "archive-upload")]
+    #[serde(
+        rename = "archive_credentials_editor",
+        serialize_with = "serialize_archive_credentials_editor"
+    )]
+    pub archive_credentials_popup: Option<ArchiveCredentialsPopupView>,
     /// Focused RSS/Atom podcast-subscription editor.
     // Redacted: this editor holds a credential or private text, so only the one
     // bit saying it is open crosses. See the module header.
@@ -2672,6 +2836,14 @@ impl Default for ViewModel {
             #[cfg(feature = "evernote")]
             evernote_credentials_popup: None,
 
+            #[cfg(feature = "archive-upload")]
+            archive_upload_supported: true,
+            #[cfg(feature = "archive-upload")]
+            archive_upload_available: false,
+            #[cfg(feature = "archive-upload")]
+            archive_upload_popup: None,
+            #[cfg(feature = "archive-upload")]
+            archive_credentials_popup: None,
             rss_subscription_popup: None,
             preferences_popup: None,
             playlist_popup: None,
@@ -2994,7 +3166,58 @@ pub enum UiAction {
     /// Cancel the sole active supervised download.
     #[cfg(feature = "yt-dlp")]
     CancelDownload,
+    /// Review an explicit upload of the selected YouTube video to Archive.org.
+    #[cfg(feature = "archive-upload")]
+    OpenArchiveUpload,
 
+    /// Focus one public metadata field without submitting it.
+    #[cfg(feature = "archive-upload")]
+    SelectArchiveUploadField(ArchiveUploadField),
+    /// Append one character to the focused upload field.
+    #[cfg(feature = "archive-upload")]
+    AppendArchiveUploadCharacter(char),
+    /// Insert a line break in the public description.
+    #[cfg(feature = "archive-upload")]
+    InsertArchiveUploadNewline,
+    /// Remove the final grapheme in the focused upload field.
+    #[cfg(feature = "archive-upload")]
+    DeleteArchiveUploadCharacter,
+    /// Delete the preceding word from the focused upload field.
+    #[cfg(feature = "archive-upload")]
+    DeleteArchiveUploadWord,
+    /// Toggle and remember whether uploads include video rather than default Opus audio.
+    #[cfg(feature = "archive-upload")]
+    ToggleArchiveUploadVideo,
+    /// Explicitly publish only the exact reviewed generation.
+    #[cfg(feature = "archive-upload")]
+    SubmitArchiveUpload(u64),
+    /// Cancel local upload work or close its completed review.
+    #[cfg(feature = "archive-upload")]
+    DismissArchiveUpload,
+    /// Open the exact successfully created Archive item page.
+    #[cfg(feature = "archive-upload")]
+    OpenArchiveUploadResult,
+    /// Focus the secret key when true, or access key when false.
+    #[cfg(feature = "archive-upload")]
+    SelectArchiveCredentialField(bool),
+    /// Append one character to the focused session-only Archive key.
+    #[cfg(feature = "archive-upload")]
+    AppendArchiveCredentialCharacter(char),
+    /// Remove the final grapheme from the focused Archive key.
+    #[cfg(feature = "archive-upload")]
+    DeleteArchiveCredentialCharacter,
+    /// Delete the preceding word from the focused Archive key.
+    #[cfg(feature = "archive-upload")]
+    DeleteArchiveCredentialWord,
+    /// Validate the session-only keys before returning to the upload review.
+    #[cfg(feature = "archive-upload")]
+    SubmitArchiveCredentials,
+    /// Close the session-only credential editor without accepting its draft.
+    #[cfg(feature = "archive-upload")]
+    DismissArchiveCredentials,
+    /// Open Archive.org's official S3 key page.
+    #[cfg(feature = "archive-upload")]
+    OpenArchiveCredentialsGuide,
     /// Open the selected `YouTube`, Yandex Music, or Apple Podcasts Commons review.
     #[cfg(feature = "commons-upload")]
     OpenCommonsUpload,
@@ -3440,7 +3663,14 @@ impl UiAction {
         );
         #[cfg(not(feature = "evernote"))]
         let evernote = false;
-        standard || commons || evernote
+        #[cfg(feature = "archive-upload")]
+        let archive = matches!(
+            self,
+            Self::OpenArchiveUploadResult | Self::OpenArchiveCredentialsGuide
+        );
+        #[cfg(not(feature = "archive-upload"))]
+        let archive = false;
+        standard || commons || evernote || archive
     }
 }
 
@@ -3684,6 +3914,32 @@ mod tests {
                 validation_error: None,
             }),
             ..ViewModel::default()
+        }
+    }
+
+    #[cfg(feature = "archive-upload")]
+    #[test]
+    fn archive_credentials_never_appear_in_view_json_or_debug_output() {
+        let view = ViewModel {
+            archive_credentials_popup: Some(ArchiveCredentialsPopupView {
+                access_key: "private-access-fixture".to_owned(),
+                secret_key: "private-secret-fixture".to_owned(),
+                secret_selected: true,
+                validation_error: Some("private-secret-fixture must never be exposed".to_owned()),
+            }),
+            ..ViewModel::default()
+        };
+        let value = serde_json::to_value(&view).unwrap();
+        assert_eq!(
+            value["archive_credentials_editor"],
+            serde_json::json!({
+                "access_key_length": 22, "secret_key_length": 22,
+                "secret_selected": true, "validation_failed": true
+            })
+        );
+        for rendered in [value.to_string(), format!("{view:?}")] {
+            assert!(!rendered.contains("private-access-fixture"));
+            assert!(!rendered.contains("private-secret-fixture"));
         }
     }
 

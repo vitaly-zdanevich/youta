@@ -428,6 +428,9 @@ export function Details({ view, kind }: { view: ViewModel; kind: InformationPane
 		{view.evernote_available ? (
 			<Action onClick={() => void dispatch('OpenEvernoteNote')}>Save audio to Evernote</Action>
 		) : null}
+		{view.archive_upload_supported && view.archive_upload_available && isYouTube ? (
+			<Action onClick={() => void dispatch('OpenArchiveUpload')}>Upload to archive.org</Action>
+		) : null}
         {view.screen === "Downloaded" ? (
           <Action onClick={() => void dispatch("RequestDownloadedTrash")}>Move to Trash</Action>
         ) : null}

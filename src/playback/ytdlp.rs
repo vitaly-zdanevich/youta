@@ -1677,7 +1677,7 @@ fn build_base_command(config: &YtDlpConfig) -> Command {
 
 /// Builds the shared fixed download policy without spawning it or appending the source URL.
 /// Private exporters can add their own supervised lifecycle and helper location.
-fn build_download_command(config: &YtDlpConfig, request: &DownloadRequest) -> Command {
+pub(crate) fn build_download_command(config: &YtDlpConfig, request: &DownloadRequest) -> Command {
     let mut command = build_base_command(config);
     command
 		.arg("--no-overwrites")
