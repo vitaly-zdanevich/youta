@@ -27,6 +27,8 @@ fn windows_archive_upload_fixtures_run_before_the_broad_suite() {
     let focused = windows
         .find("cargo test --locked --lib --no-default-features --features archive-upload archive_upload::tests:: -- --test-threads=1")
         .expect("isolated, native Windows Archive upload fixtures");
+    // A plain YAML scalar treats the filter's final colon plus space as syntax.
+    assert!(windows[..focused].ends_with("run: |\n          "));
     let broad = windows
         .find("cargo test --locked --all-targets --no-fail-fast")
         .expect("retain the broad deterministic suite");
