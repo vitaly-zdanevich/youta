@@ -2527,6 +2527,12 @@ fn render_download_bar(
     };
     #[cfg(not(feature = "yt-dlp"))]
     let rendered_label = label;
+    let label = if completed {
+        // The gauge reverses filled label colors; keep completion text black on white.
+        Span::styled(rendered_label.as_str(), Style::default().fg(Color::Black))
+    } else {
+        Span::raw(rendered_label.as_str())
+    };
     frame.render_widget(
         Gauge::default()
             .block(
@@ -2540,7 +2546,7 @@ fn render_download_bar(
                 theme.progress
             })
             .ratio(ratio)
-            .label(rendered_label.as_str()),
+            .label(label),
         area,
     );
     #[cfg(feature = "yt-dlp")]
@@ -27609,6 +27615,54 @@ prose 07:25 remains clickable but is not a chapter";
         assert_eq!(human_bytes(0), "0 B");
         assert_eq!(human_bytes(1536), "1.5 KiB");
         assert_eq!(human_bytes(1024 * 1024), "1.0 MiB");
+    }
+
+    #[test]
+    fn completed_download_labels_use_black_text_on_the_white_progress_fill() {
+        for physical_linux_console in [false, true] {
+            for (collection, completed_files, prefix) in [
+                (false, 1, "Downloaded: "),
+                (true, 2, "Downloaded 2 file(s): "),
+                (true, 0, "Channel already up to date: "),
+            ] {
+                let path = "/home/listener/.config/youta/downloads/fixture.opus";
+                let label = format!("{prefix}{path}");
+                let download = DownloadView {
+                    completed_path: Some(path.to_owned()),
+                    collection,
+                    completed_files,
+                    ..DownloadView::default()
+                };
+                let mut terminal =
+                    Terminal::new(TestBackend::new(140, 2)).expect("download terminal");
+                let mut hit_map = HitMap::default();
+                terminal
+                    .draw(|frame| {
+                        render_download_bar(
+                            frame,
+                            frame.area(),
+                            &download,
+                            &Theme::new(physical_linux_console),
+                            &mut hit_map,
+                        );
+                    })
+                    .expect("draw completed download");
+
+                let buffer = terminal.backend().buffer();
+                let label_x = (140 - terminal_text_width(&label)) / 2;
+                for (offset, symbol) in label.chars().enumerate() {
+                    let x = label_x + u16::try_from(offset).expect("label fits terminal");
+                    let cell = &buffer[(x, 1)];
+                    assert_eq!(cell.symbol(), symbol.to_string());
+                    assert_eq!(
+                        cell.fg,
+                        Color::Black,
+                        "completed download label must contrast with its white fill"
+                    );
+                    assert_eq!(cell.bg, Color::White);
+                }
+            }
+        }
     }
 
     #[test]
