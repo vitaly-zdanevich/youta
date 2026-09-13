@@ -48,6 +48,8 @@ pub mod local_browser;
 pub mod opus_export;
 pub mod persistence;
 pub mod playback;
+#[cfg(all(feature = "yt-dlp", feature = "backend-mpv"))]
+pub(crate) mod playback_cache_download;
 pub mod private_files;
 pub mod providers;
 #[cfg(feature = "qr")]

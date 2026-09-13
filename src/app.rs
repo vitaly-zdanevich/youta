@@ -13,6 +13,8 @@
 mod archive_org;
 #[cfg(feature = "archive-upload")]
 mod archive_upload;
+#[cfg(all(feature = "yt-dlp", feature = "backend-mpv"))]
+mod cached_download;
 #[cfg(feature = "yt-dlp")]
 mod download_choice;
 mod end_pause;
@@ -5372,6 +5374,12 @@ pub struct AppController {
     download_launcher: Box<dyn DownloadLauncher>,
     #[cfg(feature = "yt-dlp")]
     active_download: Option<ActiveDownload>,
+    /// One opportunistic cache export, occupying the same manual-download slot.
+    #[cfg(all(feature = "yt-dlp", feature = "backend-mpv"))]
+    pending_cached_download: Option<cached_download::PendingCachedDownload>,
+    /// Injectable bounded cache preparation; no network download on a cache hit.
+    #[cfg(all(feature = "yt-dlp", feature = "backend-mpv"))]
+    cached_download_service: Box<dyn cached_download::CachedDownloadService>,
     /// Captured manual source and choices; independent of foreground navigation.
     #[cfg(feature = "yt-dlp")]
     pending_download_choice: Option<download_choice::PendingDownloadChoice>,
@@ -6660,6 +6668,10 @@ impl AppController {
             download_launcher,
             #[cfg(feature = "yt-dlp")]
             active_download: None,
+            #[cfg(all(feature = "yt-dlp", feature = "backend-mpv"))]
+            pending_cached_download: None,
+            #[cfg(all(feature = "yt-dlp", feature = "backend-mpv"))]
+            cached_download_service: Box::new(cached_download::SystemCachedDownloadService),
             #[cfg(feature = "yt-dlp")]
             pending_download_choice: None,
             #[cfg(feature = "yt-dlp")]
@@ -8834,7 +8846,7 @@ impl AppController {
             return;
         }
         #[cfg(feature = "yt-dlp")]
-        if self.active_download.is_some() {
+        if self.download_in_progress() {
             self.view.status_line =
                 "Another media download is already running; wait for it to finish".to_owned();
             return;
@@ -19637,7 +19649,7 @@ impl AppController {
 
     #[cfg(feature = "yt-dlp")]
     fn open_channel_download(&mut self) {
-        if self.active_download.is_some() {
+        if self.download_in_progress() {
             self.view.status_line =
                 "One download is already running; wait for it to finish or cancel it".to_owned();
             return;
@@ -19746,7 +19758,7 @@ impl AppController {
             self.view.channel_download_popup = None;
             return;
         };
-        if self.active_download.is_some() {
+        if self.download_in_progress() {
             self.view.status_line =
                 "One download is already running; wait for it to finish or cancel it".to_owned();
             return;
@@ -19965,7 +19977,7 @@ impl AppController {
     /// Starts the next queued channel without competing with a manual download.
     #[cfg(feature = "yt-dlp")]
     fn start_next_automatic_download(&mut self) {
-        if self.active_download.is_some() || self.pending_download_choice.is_some() {
+        if self.download_in_progress() || self.pending_download_choice.is_some() {
             return;
         }
         #[cfg(feature = "yandex-music")]
@@ -20077,6 +20089,16 @@ impl AppController {
         self.active_download = Some(active);
     }
 
+    /// Includes asynchronous cache verification in the sole foreground download slot.
+    #[cfg(feature = "yt-dlp")]
+    fn download_in_progress(&self) -> bool {
+        #[cfg(feature = "backend-mpv")]
+        if self.pending_cached_download.is_some() {
+            return true;
+        }
+        self.active_download.is_some()
+    }
+
     /// Cancels the running download and briefly retains its stopped progress row.
     #[cfg(feature = "yt-dlp")]
     fn cancel_active_download(&mut self) {
@@ -20087,6 +20109,10 @@ impl AppController {
     #[cfg(feature = "yt-dlp")]
     fn cancel_active_download_at(&mut self, now: Instant) {
         self.automatic_download_queue.clear();
+        #[cfg(feature = "backend-mpv")]
+        if self.cancel_cached_download_at(now) {
+            return;
+        }
         let Some(mut active) = self.active_download.take() else {
             self.view.status_line = "No download is running".to_owned();
             return;
@@ -20115,7 +20141,7 @@ impl AppController {
         }
         #[cfg(feature = "yandex-music")]
         self.drain_yandex_music_media_job_responses();
-        if self.active_download.is_some() {
+        if self.download_in_progress() {
             self.view.status_line =
                 "One download is already running; wait for it to finish".to_owned();
             return;
@@ -20149,7 +20175,7 @@ impl AppController {
         source_url: url::Url,
         format: DownloadFormat,
     ) {
-        if self.active_download.is_some() {
+        if self.download_in_progress() {
             self.view.status_line =
                 "One download is already running; wait for it to finish".to_owned();
             return;
@@ -20187,9 +20213,21 @@ impl AppController {
             write_thumbnail: self.config.subscriptions.download_thumbnails,
             archive_path: None,
         };
+        #[cfg(feature = "backend-mpv")]
+        if self.try_cached_manual_download(&item, &request) {
+            return;
+        }
+        self.start_prepared_manual_download(item, request);
+    }
+
+    /// Starts the captured request directly, never re-entering cache lookup after a miss.
+    #[cfg(feature = "yt-dlp")]
+    fn start_prepared_manual_download(&mut self, item: QueueItem, request: DownloadRequest) {
+        let destination = request.destination.clone();
         let process = match self.download_launcher.start(&request) {
             Ok(process) => process,
             Err(error) => {
+                mark_download_inactive(&mut self.view);
                 self.show_error_message("Download could not start", error);
                 return;
             }
@@ -20226,6 +20264,8 @@ impl AppController {
     /// Polls one active download and expires successful or cancelled notices at `now`.
     #[cfg(feature = "yt-dlp")]
     fn poll_download_at(&mut self, now: Instant) {
+        #[cfg(feature = "backend-mpv")]
+        self.poll_cached_download(now);
         expire_download_cancellation_notice(
             &mut self.view,
             &mut self.download_cancellation_notice_deadline,
@@ -34200,6 +34240,8 @@ impl AppController {
         // Prevent Drop from repeating partial teardown if a destructor or
         // worker join panics while this method is already running.
         self.shutdown_persistence_succeeded = Some(false);
+        #[cfg(all(feature = "yt-dlp", feature = "backend-mpv"))]
+        drop(self.pending_cached_download.take());
         #[cfg(feature = "archive-upload")]
         self.shutdown_archive_upload();
         #[cfg(feature = "s3-upload")]
@@ -45579,6 +45621,9 @@ mod tests {
     #[cfg(feature = "archive-upload")]
     #[path = "archive_upload.rs"]
     mod archive_upload_tests;
+    #[cfg(all(feature = "yt-dlp", feature = "backend-mpv"))]
+    #[path = "cached_download.rs"]
+    mod cached_download_tests;
     #[cfg(feature = "yt-dlp")]
     #[path = "download_choice.rs"]
     mod download_choice_tests;

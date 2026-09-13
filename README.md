@@ -1483,6 +1483,39 @@ rather than manually maintained tokens. Follow its current
 [PO Token guide](https://github.com/yt-dlp/yt-dlp/wiki/PO-Token-Guide) when the
 checked-format retry also fails.
 
+### Saving already cached YouTube audio
+
+With `backend-mpv` and `yt-dlp` enabled, an audio-only download first tries the
+currently playing YouTube item's complete Opus cache. This Unix-only fast path
+requires one raw cache range containing both the beginning and end, one audio
+track, a supported container, and at most 32 MiB of cached packet data. It does
+not use the seek bar's merged ranges as evidence of completeness.
+
+Export and verification run in the background. FFprobe checks the packet
+timeline, decoded sample count, duration, and codec; FFmpeg remuxes without
+re-encoding, preserving the cache's container: Opus-in-WebM saves as `.webm`,
+and Ogg Opus saves as `.opus`. This avoids changing the final audio padding
+when converting between containers. The result stays private until those
+checks and the playback-load identity pass. Existing download files are never
+replaced. `[C]` cancels the
+attempt without starting a fallback download. Unsupported, incomplete, or
+changed caches fall back once to the ordinary downloader. Original-file and
+video downloads always use the ordinary path because a cache remux cannot
+preserve the original container or provide video that was not played.
+
+The successful path needs no network connection. If thumbnail downloading is
+enabled, it also saves already cached artwork when available; otherwise the
+status explains that the thumbnail was not cached. Windows keeps normal
+downloading until cancellable cache-export IPC is supported there.
+
+mpv warns that its experimental
+[`dump-cache` command](https://mpv.io/manual/stable/#command-interface-dump-cache)
+can briefly stall playback and produce incomplete output; the size limit and
+independent validation address those risks. Youta does not enlarge its memory
+budget or enable an unbounded disk cache. Buffering speed still depends on the
+source and connection; changing the read-ahead target cannot guarantee that a
+long recording becomes available offline in a few seconds.
+
 ### SponsorBlock
 
 The default-on `sponsorblock` build feature requests the `sponsor` category

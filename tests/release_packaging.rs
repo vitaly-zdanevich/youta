@@ -199,10 +199,12 @@ fn default_release_features_keep_images_qr_and_sqlite_independent() {
     assert!(!text_only.contains("qr"));
     assert!(!text_only.contains("dep:qrcode"));
     assert!(!text_only.contains("gpm"));
-    assert!(!text_only.contains("dep:mio"));
+    // mpv's cache export now shares mio for bounded nonblocking Unix IPC.
+    assert!(text_only.contains("dep:mio"));
     assert!(!yandex_free.contains("gpm"));
-    assert!(!yandex_free.contains("dep:mio"));
+    assert!(yandex_free.contains("dep:mio"));
     assert!(!tui.contains("dep:mio"));
+    assert_eq!(feature_entries(&manifest, "backend-mpv"), ["dep:mio"]);
     assert_eq!(feature_entries(&manifest, "gpm"), ["tui", "dep:mio"]);
     assert!(gpm.contains("tui"));
     assert!(gpm.contains("dep:mio"));

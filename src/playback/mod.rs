@@ -23,6 +23,8 @@ mod mpv_ipc;
 
 pub mod threaded;
 
+pub mod cache_export;
+
 #[cfg(feature = "yt-dlp")]
 pub mod ytdlp;
 
@@ -424,6 +426,12 @@ pub enum PlaybackEndReason {
 
 /// Common interface implemented by playback engines.
 pub trait PlaybackBackend {
+    /// Returns a nonblocking ticket for the current complete-load cache source.
+    /// Unsupported backends retain `None`; no IPC is performed by this method.
+    fn cache_export_handle(&self) -> Option<cache_export::PlaybackCacheHandle> {
+        None
+    }
+
     /// Returns the operating-system process that owns backend playback.
     ///
     /// Frontends use this optional identity only to correlate an audio-server

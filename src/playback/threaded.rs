@@ -12,6 +12,7 @@
 //! acknowledgement so command failures keep surfacing exactly where they did
 //! before; only the per-tick polling becomes free.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
@@ -40,6 +41,8 @@ const MAX_EVENTS_PER_PASS: usize = 64;
 /// State published by the worker and read by the reducer without blocking.
 #[derive(Default)]
 struct Shared {
+    /// A ticket published with the last request actually processed by the worker.
+    cache_export: Option<super::cache_export::PlaybackCacheHandle>,
     /// Most recent successful snapshot.
     status: PlaybackStatus,
     /// Failure observed since the reducer last read one.
@@ -53,6 +56,8 @@ struct Shared {
 enum Job {
     /// Load and start a media item.
     Play {
+        /// Generation invalidated before this request entered the queue.
+        epoch: u64,
         /// Requested media.
         input: Box<PlaybackInput>,
         /// Acknowledgement channel.
@@ -60,6 +65,8 @@ enum Job {
     },
     /// Apply a playback command.
     Command {
+        /// Current generation, including any stop invalidation before queueing.
+        epoch: u64,
         /// Requested command.
         command: PlayerCommand,
         /// Acknowledgement channel.
@@ -74,6 +81,8 @@ enum Job {
 
 /// A playback backend supervised on its own thread.
 pub struct ThreadedBackend {
+    /// Invalidates cached tickets even while a load/stop waits behind polling.
+    cache_epoch: Arc<AtomicU64>,
     /// Process identity captured before the backend moves to its worker.
     process_id: Option<u32>,
     jobs: Sender<Job>,
@@ -93,12 +102,23 @@ impl ThreadedBackend {
         let (job_sender, job_receiver) = channel();
         let (event_sender, event_receiver) = channel();
         let shared = Arc::new(Mutex::new(Shared::default()));
+        let cache_epoch = Arc::new(AtomicU64::new(0));
+        let worker_epoch = Arc::clone(&cache_epoch);
         let worker_shared = Arc::clone(&shared);
         let worker = thread::Builder::new()
             .name("youta-playback".to_owned())
-            .spawn(move || run(backend, &job_receiver, &event_sender, &worker_shared))
+            .spawn(move || {
+                run(
+                    backend,
+                    &job_receiver,
+                    &event_sender,
+                    &worker_shared,
+                    &worker_epoch,
+                )
+            })
             .ok();
         Self {
+            cache_epoch,
             process_id,
             jobs: job_sender,
             events: event_receiver,
@@ -154,16 +174,28 @@ fn run<B>(
     jobs: &Receiver<Job>,
     events: &Sender<PlaybackEvent>,
     shared: &Arc<Mutex<Shared>>,
+    cache_epoch: &Arc<AtomicU64>,
 ) where
     B: PlaybackBackend,
 {
     let mut refresh = ACTIVE_REFRESH;
+    let mut processed_epoch = 0;
     loop {
         match jobs.recv_timeout(refresh) {
-            Ok(Job::Play { input, reply }) => {
+            Ok(Job::Play {
+                input,
+                reply,
+                epoch,
+            }) => {
+                processed_epoch = epoch;
                 let _ = reply.send(backend.play(&input));
             }
-            Ok(Job::Command { command, reply }) => {
+            Ok(Job::Command {
+                command,
+                reply,
+                epoch,
+            }) => {
+                processed_epoch = epoch;
                 let _ = reply.send(backend.command(command));
             }
             Ok(Job::Shutdown { reply }) => {
@@ -204,21 +236,52 @@ fn run<B>(
             }
             Err(error) => publish_failure(shared, error),
         }
+        let handle = backend
+            .cache_export_handle()
+            .map(|handle| handle.with_supervisor_epoch(Arc::clone(cache_epoch), processed_epoch));
+        shared
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .cache_export = handle;
     }
 }
 
 impl PlaybackBackend for ThreadedBackend {
+    fn cache_export_handle(&self) -> Option<super::cache_export::PlaybackCacheHandle> {
+        let handle = self.shared.try_lock().ok()?.cache_export.clone()?;
+        handle.is_current().then_some(handle)
+    }
+
     fn process_id(&self) -> Option<u32> {
         self.process_id
     }
 
     fn play(&mut self, input: &PlaybackInput) -> Result<()> {
+        let epoch = self
+            .cache_epoch
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
         let input = Box::new(input.clone());
-        self.request(|reply| Job::Play { input, reply })
+        self.request(|reply| Job::Play {
+            input,
+            reply,
+            epoch,
+        })
     }
 
     fn command(&mut self, command: PlayerCommand) -> Result<()> {
-        self.request(|reply| Job::Command { command, reply })
+        if matches!(
+            command,
+            PlayerCommand::Stop | PlayerCommand::ReleaseEndOfFile
+        ) {
+            self.cache_epoch.fetch_add(1, Ordering::AcqRel);
+        }
+        let epoch = self.cache_epoch.load(Ordering::Acquire);
+        self.request(|reply| Job::Command {
+            command,
+            reply,
+            epoch,
+        })
     }
 
     fn status(&mut self) -> Result<PlaybackStatus> {
@@ -236,6 +299,7 @@ impl PlaybackBackend for ThreadedBackend {
     }
 
     fn shutdown(&mut self) -> Result<()> {
+        self.cache_epoch.fetch_add(1, Ordering::AcqRel);
         let Some(worker) = self.worker.take() else {
             return Ok(());
         };
@@ -502,5 +566,103 @@ mod tests {
         let (handle, probe) = threaded(false);
         drop(handle);
         assert!(wait_until(|| probe.shutdowns.load(Ordering::Relaxed) == 1));
+    }
+
+    /// A backend paused inside status demonstrates that export lookup bypasses
+    /// the synchronous command queue and queued loads revoke the previous ticket.
+    #[test]
+    fn cache_ticket_lookup_never_waits_for_polling_and_queued_load_revokes_it() {
+        use super::super::cache_export::CacheExportControl;
+        use std::sync::atomic::AtomicBool;
+
+        struct CacheBackend {
+            control: CacheExportControl,
+            block: Arc<AtomicBool>,
+            entered: Arc<AtomicBool>,
+        }
+        impl PlaybackBackend for CacheBackend {
+            fn cache_export_handle(
+                &self,
+            ) -> Option<super::super::cache_export::PlaybackCacheHandle> {
+                self.control.handle()
+            }
+            fn play(&mut self, input: &PlaybackInput) -> Result<()> {
+                self.control.begin_load(&input.location);
+                Ok(())
+            }
+            fn command(&mut self, _: PlayerCommand) -> Result<()> {
+                Ok(())
+            }
+            fn status(&mut self) -> Result<PlaybackStatus> {
+                if self.block.load(Ordering::Acquire) {
+                    self.entered.store(true, Ordering::Release);
+                    let deadline = Instant::now() + Duration::from_secs(3);
+                    while self.block.load(Ordering::Acquire) && Instant::now() < deadline {
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                }
+                Ok(PlaybackStatus {
+                    idle: false,
+                    ..PlaybackStatus::default()
+                })
+            }
+            fn poll_event(&mut self) -> Result<Option<PlaybackEvent>> {
+                Ok(None)
+            }
+            fn shutdown(&mut self) -> Result<()> {
+                self.control.shutdown();
+                Ok(())
+            }
+        }
+        let control = CacheExportControl::new(
+            123,
+            "unused.sock".into(),
+            "/tmp/unused-cache-fixture".into(),
+        );
+        control.begin_load("https://example.invalid/first.opus");
+        control.loaded();
+        let block = Arc::new(AtomicBool::new(false));
+        let entered = Arc::new(AtomicBool::new(false));
+        let mut backend = ThreadedBackend::new(CacheBackend {
+            control,
+            block: Arc::clone(&block),
+            entered: Arc::clone(&entered),
+        });
+        assert!(wait_until(|| backend.cache_export_handle().is_some()));
+        let first = backend
+            .cache_export_handle()
+            .expect("published cache ticket");
+        block.store(true, Ordering::Release);
+        assert!(wait_until(|| entered.load(Ordering::Acquire)));
+        let lookup = Instant::now();
+        assert!(backend.cache_export_handle().is_some());
+        assert!(lookup.elapsed() < Duration::from_millis(50));
+        let epoch = Arc::clone(&backend.cache_epoch);
+        let before = epoch.load(Ordering::Acquire);
+        let worker = thread::spawn(move || {
+            let input = PlaybackInput {
+                location: "https://example.invalid/replacement.opus".to_owned(),
+                start_at: Duration::ZERO,
+                title: None,
+                verify_remote_format: false,
+                http_headers: super::super::PlaybackHttpHeaders::default(),
+                bypass_ytdl: true,
+                keep_open: false,
+            };
+            backend.play(&input).expect("queued load");
+            backend
+        });
+        assert!(wait_until(|| epoch.load(Ordering::Acquire) != before));
+        assert!(
+            !first.is_current(),
+            "revoke before the blocked worker sees the queued load"
+        );
+        block.store(false, Ordering::Release);
+        let mut backend = worker.join().expect("load worker");
+        assert!(
+            backend.cache_export_handle().is_none(),
+            "load acknowledgement is not a completed load"
+        );
+        backend.shutdown().expect("shutdown");
     }
 }

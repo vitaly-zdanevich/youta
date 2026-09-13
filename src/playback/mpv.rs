@@ -16,6 +16,7 @@ mod backend {
 
     use serde_json::{Value, json};
 
+    use super::super::cache_export::{CacheExportControl, PlaybackCacheHandle};
     use super::super::mpv_ipc::{self, IpcLink};
     use super::super::{
         AudioOutputDriver, BufferedRange, PlaybackBackend, PlaybackEnd, PlaybackEndReason,
@@ -43,6 +44,7 @@ mod backend {
     const YTDL_CHECKED_YOUTUBE_FORMAT: &str = "bestaudio[acodec^=opus]/bestaudio/best";
 
     struct MpvIpc {
+        cache_export: Option<CacheExportControl>,
         link: IpcLink,
         request_id: u64,
         events: VecDeque<PlaybackEvent>,
@@ -104,6 +106,11 @@ mod backend {
                 profile: config.profile,
                 process_exit_reported: false,
             };
+            backend.ipc.cache_export = Some(CacheExportControl::new(
+                backend.child.id(),
+                backend.socket_path.clone(),
+                config.runtime_dir.clone(),
+            ));
             configure_ipc(&mut backend.ipc)?;
             Ok(backend)
         }
@@ -120,6 +127,9 @@ mod backend {
                 return Ok(None);
             };
             self.process_exit_reported = true;
+            if let Some(cache) = &self.ipc.cache_export {
+                cache.shutdown();
+            }
             let context = self.ipc.diagnostic();
             let status = format!("mpv exited with {status}");
             let diagnostic = Some(match context {
@@ -185,6 +195,7 @@ mod backend {
     impl MpvIpc {
         fn new(link: IpcLink) -> Self {
             Self {
+                cache_export: None,
                 link,
                 request_id: 0,
                 events: VecDeque::new(),
@@ -236,6 +247,9 @@ mod backend {
         fn handle_event(&mut self, message: &Value) {
             match message.get("event").and_then(Value::as_str) {
                 Some("start-file") => {
+                    if let Some(cache) = &self.cache_export {
+                        cache.invalidate();
+                    }
                     // mpv may retain the previous file's metadata until the
                     // replacement stream publishes its first property event.
                     self.stream_title = None;
@@ -246,11 +260,17 @@ mod backend {
                     self.eof_held = false;
                 }
                 Some("file-loaded") => {
+                    if let Some(cache) = &self.cache_export {
+                        cache.loaded();
+                    }
                     self.media_loaded = true;
                     self.push_event(PlaybackEvent::MediaLoaded);
                 }
                 Some("playback-restart") => self.push_event(PlaybackEvent::PlaybackStarted),
                 Some("end-file") => {
+                    if let Some(cache) = &self.cache_export {
+                        cache.invalidate();
+                    }
                     self.media_loaded = false;
                     self.eof_held = false;
                     let reason_text = message
@@ -819,6 +839,10 @@ mod backend {
     }
 
     impl PlaybackBackend for MpvBackend {
+        fn cache_export_handle(&self) -> Option<PlaybackCacheHandle> {
+            self.ipc.cache_export.as_ref()?.handle()
+        }
+
         fn process_id(&self) -> Option<u32> {
             Some(self.child.id())
         }
@@ -833,6 +857,9 @@ mod backend {
             // mpv is loading a replacement.
             self.ipc.stream_title = None;
             let command = loadfile_command(input)?;
+            if let Some(cache) = &self.ipc.cache_export {
+                cache.begin_load(&input.location);
+            }
             // Replacement emits the previous file's terminal event first.
             // Install its new policy only once `start-file` identifies it.
             self.ipc.pending_keep_open = Some(input.keep_open);
@@ -950,6 +977,9 @@ mod backend {
                     self.set_property("stream-record", stream_recording_property_value(path)?)?;
                 }
                 PlayerCommand::Stop => {
+                    if let Some(cache) = &self.ipc.cache_export {
+                        cache.invalidate();
+                    }
                     self.send(&[json!("stop")])?;
                 }
             }
@@ -1046,6 +1076,9 @@ mod backend {
                         Ok(Some(event))
                     } else {
                         self.process_exit_reported = true;
+                        if let Some(cache) = &self.ipc.cache_export {
+                            cache.shutdown();
+                        }
                         Ok(Some(PlaybackEvent::ProcessExited {
                             diagnostic: self.ipc.diagnostic(),
                         }))
@@ -1056,6 +1089,9 @@ mod backend {
         }
 
         fn shutdown(&mut self) -> Result<()> {
+            if let Some(cache) = &self.ipc.cache_export {
+                cache.shutdown();
+            }
             let _ = self.send(&[json!("quit")]);
             if self.child.try_wait()?.is_none() {
                 self.child.kill()?;
@@ -1195,6 +1231,336 @@ mod backend {
                 .map(OsStr::to_string_lossy)
                 .map(std::borrow::Cow::into_owned)
                 .collect()
+        }
+
+        /// Exercises production IPC plus independent packet/decode validation on
+        /// generated Ogg and `WebM` after disconnecting the owned loopback source.
+        #[cfg(feature = "yt-dlp")]
+        #[test]
+        #[ignore = "requires native mpv/ffmpeg/ffprobe; generated loopback audio only"]
+        fn native_cache_export_validates_and_publishes_ogg_and_webm_offline() {
+            use crate::config::Config;
+            use std::net::TcpListener;
+            use std::sync::{
+                Arc,
+                atomic::{AtomicBool, AtomicUsize, Ordering},
+            };
+
+            struct LocalSource {
+                stop: Arc<AtomicBool>,
+                requests: Arc<AtomicUsize>,
+                worker: Option<thread::JoinHandle<()>>,
+                url: String,
+            }
+            impl LocalSource {
+                fn new(bytes: Vec<u8>, extension: &str) -> Self {
+                    let listener =
+                        TcpListener::bind("127.0.0.1:0").expect("owned loopback listener");
+                    listener
+                        .set_nonblocking(true)
+                        .expect("nonblocking loopback");
+                    let url = format!(
+                        "http://{}/synthetic.{extension}",
+                        listener.local_addr().expect("loopback address")
+                    );
+                    let stop = Arc::new(AtomicBool::new(false));
+                    let requests = Arc::new(AtomicUsize::new(0));
+                    let worker_stop = Arc::clone(&stop);
+                    let worker_requests = Arc::clone(&requests);
+                    let worker = thread::spawn(move || {
+                        while !worker_stop.load(Ordering::Acquire) {
+                            let (stream, _) = match listener.accept() {
+                                Ok(connection) => connection,
+                                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                    thread::sleep(Duration::from_millis(2));
+                                    continue;
+                                }
+                                Err(_) => return,
+                            };
+                            stream
+                                .set_read_timeout(Some(Duration::from_millis(100)))
+                                .expect("bounded request");
+                            stream
+                                .set_write_timeout(Some(Duration::from_secs(1)))
+                                .expect("bounded response");
+                            let mut reader = BufReader::new(stream);
+                            let mut request = String::new();
+                            let mut range = None;
+                            let mut head = false;
+                            loop {
+                                let mut line = String::new();
+                                if reader
+                                    .read_line(&mut line)
+                                    .ok()
+                                    .is_none_or(|count| count == 0)
+                                {
+                                    break;
+                                }
+                                if request.is_empty() {
+                                    head = line.starts_with("HEAD ");
+                                }
+                                if let Some(value) =
+                                    line.to_ascii_lowercase().strip_prefix("range: bytes=")
+                                {
+                                    range =
+                                        value.trim().split_once('-').and_then(|(start, end)| {
+                                            Some((
+                                                start.parse::<usize>().ok()?,
+                                                end.parse::<usize>().ok(),
+                                            ))
+                                        });
+                                }
+                                request.push_str(&line);
+                                if line == "\r\n" || request.len() > 16 * 1024 {
+                                    break;
+                                }
+                            }
+                            if !request.ends_with("\r\n\r\n") {
+                                continue;
+                            }
+                            worker_requests.fetch_add(1, Ordering::Relaxed);
+                            let (start, end) =
+                                range.map_or((0, bytes.len() - 1), |(start, end)| {
+                                    (start, end.unwrap_or(bytes.len() - 1).min(bytes.len() - 1))
+                                });
+                            if start > end {
+                                continue;
+                            }
+                            let status = if range.is_some() {
+                                "206 Partial Content"
+                            } else {
+                                "200 OK"
+                            };
+                            let stream = reader.get_mut();
+                            let header = format!(
+                                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nContent-Range: bytes {start}-{end}/{}\r\nConnection: close\r\n\r\n",
+                                end - start + 1,
+                                bytes.len()
+                            );
+                            if stream.write_all(header.as_bytes()).is_ok() && !head {
+                                let _ = stream.write_all(&bytes[start..=end]);
+                            }
+                        }
+                    });
+                    Self {
+                        stop,
+                        requests,
+                        worker: Some(worker),
+                        url,
+                    }
+                }
+                fn disconnect(&mut self) {
+                    self.stop.store(true, Ordering::Release);
+                    if let Some(worker) = self.worker.take() {
+                        worker.join().expect("loopback worker");
+                    }
+                }
+            }
+            impl Drop for LocalSource {
+                fn drop(&mut self) {
+                    self.disconnect();
+                }
+            }
+
+            fn packet_hashes(path: &Path) -> Vec<String> {
+                let output = Command::new("ffprobe")
+                    .args([
+                        "-v",
+                        "error",
+                        "-select_streams",
+                        "a:0",
+                        "-show_packets",
+                        "-show_data_hash",
+                        "sha256",
+                        "-show_entries",
+                        "packet=data_hash",
+                        "-of",
+                        "json",
+                    ])
+                    .arg(path)
+                    .output()
+                    .expect("packet hashes");
+                assert!(output.status.success(), "ffprobe packet hashes");
+                let data: Value = serde_json::from_slice(&output.stdout).expect("packet JSON");
+                let packets = data["packets"].as_array().expect("packet array");
+                assert_eq!(packets.len(), 3001);
+                packets
+                    .iter()
+                    .map(|packet| {
+                        packet["data_hash"]
+                            .as_str()
+                            .expect("packet hash")
+                            .to_owned()
+                    })
+                    .collect()
+            }
+
+            let directory = tempfile::tempdir().expect("private native fixture");
+            let config = Config::for_dir(directory.path().join("config"));
+            let destination = directory.path().join("downloads");
+            fs::create_dir(&destination).expect("download destination");
+            let mut process = ProcessPlaybackConfig::from_config(&config);
+            process.audio_output = AudioOutputDriver::Null;
+            let mut player = MpvBackend::spawn(&process).expect("native production mpv");
+            // Explicit test-only cache settings ensure a bounded short fixture is
+            // complete without waiting for a full playback or changing defaults.
+            for (property, value) in [
+                ("cache", json!("yes")),
+                ("cache-secs", json!(120)),
+                ("demuxer-max-bytes", json!(32 * 1024 * 1024)),
+                ("demuxer-max-back-bytes", json!(32 * 1024 * 1024)),
+            ] {
+                player
+                    .send(&[json!("set_property"), json!(property), value])
+                    .expect("fixture cache setup");
+            }
+            for extension in ["opus", "webm"] {
+                let source = directory.path().join(format!("synthetic.{extension}"));
+                let generated = Command::new("ffmpeg")
+                    .args([
+                        "-nostdin",
+                        "-v",
+                        "error",
+                        "-n",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        "sine=frequency=440:sample_rate=48000",
+                        "-t",
+                        "60",
+                        "-c:a",
+                        "libopus",
+                    ])
+                    .arg(&source)
+                    .status()
+                    .expect("generate synthetic Opus");
+                assert!(generated.success());
+                let mut server = LocalSource::new(
+                    fs::read(&source).expect("bounded synthetic fixture"),
+                    extension,
+                );
+                let input = PlaybackInput {
+                    location: server.url.clone(),
+                    start_at: Duration::ZERO,
+                    title: Some("Generated cache fixture".to_owned()),
+                    verify_remote_format: false,
+                    http_headers: PlaybackHttpHeaders::default(),
+                    bypass_ytdl: true,
+                    keep_open: true,
+                };
+                player.play(&input).expect("play loopback fixture");
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    while player.poll_event().expect("native lifecycle").is_some() {}
+                    let cache = player
+                        .property("demuxer-cache-state")
+                        .expect("raw cache state")
+                        .unwrap_or(Value::Null);
+                    if player.cache_export_handle().is_some()
+                        && cache["bof-cached"] == true
+                        && cache["eof-cached"] == true
+                        && cache["seekable-ranges"]
+                            .as_array()
+                            .is_some_and(|ranges| ranges.len() == 1)
+                    {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "native fixture cache did not become complete: {cache}"
+                    );
+                    thread::sleep(Duration::from_millis(10));
+                }
+                player
+                    .command(PlayerCommand::SetPaused(true))
+                    .expect("pause fixture before export");
+                let before = player.status().expect("paused fixture");
+                server.disconnect();
+                let requests = server.requests.load(Ordering::Relaxed);
+                let cancel = Arc::new(AtomicBool::new(false));
+                let handle = player.cache_export_handle().expect("native loaded ticket");
+                let started = Instant::now();
+                let export = handle
+                    .start(Arc::clone(&cancel))
+                    .expect("native export job")
+                    .wait(&cancel)
+                    .expect("native complete cache export");
+                eprintln!(
+                    "{extension}: native dump {:?}, expected duration {:?}, bytes {}",
+                    started.elapsed(),
+                    export.duration(),
+                    fs::metadata(export.path()).expect("dump size").len()
+                );
+                let prepared = crate::playback_cache_download::prepare_cached_opus(
+                    &config,
+                    export.path(),
+                    export.duration(),
+                    &destination,
+                    &cancel,
+                );
+                let prepared = match prepared {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        if std::env::var_os("YOUTA_KEEP_NATIVE_CACHE_FIXTURE").is_some() {
+                            let raw_extension = export
+                                .path()
+                                .extension()
+                                .and_then(std::ffi::OsStr::to_str)
+                                .expect("known private container");
+                            fs::copy(
+                                export.path(),
+                                directory
+                                    .path()
+                                    .join(format!("failed-cache-{extension}.{raw_extension}")),
+                            )
+                            .expect("preserve opted-in generated dump");
+                            player.shutdown().expect("stop native fixture");
+                            eprintln!(
+                                "Generated fixture retained at {}",
+                                directory.keep().display()
+                            );
+                        }
+                        panic!("independent cache validation: {error}");
+                    }
+                };
+                assert!(export.is_current());
+                let published = prepared
+                    .publish(&destination, "Synthetic cache", extension)
+                    .expect("no-overwrite publication");
+                assert_eq!(
+                    published.extension().and_then(std::ffi::OsStr::to_str),
+                    Some(extension),
+                    "preserve the container required for exact Opus tail padding"
+                );
+                assert_eq!(
+                    packet_hashes(&source),
+                    packet_hashes(&published),
+                    "all encoded packets preserved"
+                );
+                let after = player.status().expect("playback unchanged");
+                assert_eq!(after.paused, before.paused);
+                assert!(
+                    (after.position.as_secs_f64() - before.position.as_secs_f64()).abs() < 0.05
+                );
+                for position in [45_u32, 5, 55] {
+                    player
+                        .command(PlayerCommand::SeekAbsolute(Duration::from_secs(u64::from(
+                            position,
+                        ))))
+                        .expect("seek without the source server");
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    loop {
+                        let status = player.status().expect("offline seek status");
+                        if (status.position.as_secs_f64() - f64::from(position)).abs() < 0.1 {
+                            break;
+                        }
+                        assert!(Instant::now() < deadline, "offline seek did not complete");
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                }
+                assert_eq!(server.requests.load(Ordering::Relaxed), requests);
+            }
+            player.shutdown().expect("native shutdown");
         }
 
         fn ipc_after_script(messages: Vec<Value>) -> MpvIpc {
