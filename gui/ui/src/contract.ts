@@ -850,6 +850,8 @@ export interface ViewModel {
   selected_detail_link: number | null;
 	/** One requested inline-link reveal; manual scrolling clears it in Rust. */
 	detail_link_reveal: number | null;
+	/** Whether Archive can cancel an open, leave its track list or restore a prior metadata route. */
+	archive_org_back_available: boolean;
   selected_wikidata_media: number | null;
   subscriptions: SubscriptionsView;
   waveform: WaveformView;

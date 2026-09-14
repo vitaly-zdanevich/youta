@@ -2656,6 +2656,8 @@ pub struct ViewModel {
     pub selected_detail_link: Option<usize>,
     /// Keyboard-requested inline link to reveal; cleared by manual scrolling.
     pub detail_link_reveal: Option<usize>,
+    /// Archive can leave the current item, pending open, or metadata-search hop.
+    pub archive_org_back_available: bool,
     /// Selected Commons media control inside the expanded Wikidata spoiler.
     pub selected_wikidata_media: Option<usize>,
     /// Selected right-panel mode.
@@ -3051,6 +3053,7 @@ impl Default for ViewModel {
             details_scroll: 0,
             selected_detail_link: None,
             detail_link_reveal: None,
+            archive_org_back_available: false,
             selected_wikidata_media: None,
             right_panel_mode: RightPanelMode::Details,
             waveform_visible: false,

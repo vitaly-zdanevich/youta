@@ -465,6 +465,11 @@ resolver:
   submitted with Enter returns to ordinary text search; an unsubmitted edit
   of a metadata filter is discarded on tab change/restart. Values are escaped
   as literal phrases using Archive's [advanced-search fields](https://archive.org/advancedsearch.php).
+  `[Esc] Back` returns through Creator/Topics searches, restoring the previous
+  query, selected item or track, and description position. Inside a track list,
+  Back first returns to its catalogue. A new submitted text search clears this
+  history; history itself is session-only, limited to 16 locations and a 16 MiB
+  cache. Evicted locations reload bounded search pages when revisited.
   Strong legacy Cyrillic encoding errors in track titles are repaired for display
   using the same conservative handling as local tags. Ambiguous short titles
   require a matching Cyrillic word in the item's description or title. Original

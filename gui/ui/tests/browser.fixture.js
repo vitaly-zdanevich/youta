@@ -95,6 +95,7 @@
 	});
 	async function run() {
 		await until(() => document.querySelector('[title="Search archive.org"]'), 'Archive search');
+		assert(!button('[Esc] Back'), 'Archive root hides Back when no return route exists');
 		const tabs = [...document.querySelectorAll('[aria-label=Sources] button')].map((node) => node.textContent);
 		assert(tabs.indexOf('archive.org') < tabs.indexOf('LibriVox'), 'Archive tab preserves source catalogue order');
 		await action('BeginSearch', () => document.querySelector('[title="Search archive.org"]')
@@ -136,6 +137,15 @@
 		assert(button('Repeat').getAttribute('aria-pressed') === 'false' && button('Autoplay').getAttribute('aria-pressed') === 'false', 'Archive playback shows global repeat and autoplay off');
 		await action('ToggleRepeat', () => button('Repeat').click(), 'Repeat click uses the shared global action');
 		await action('ToggleAutoplay', () => button('Autoplay').click(), 'Autoplay click uses the shared global action');
+		snapshot({ archive_org_back_available: true, search_editing: true });
+		await until(() => button('[Esc] Back')?.disabled, 'Back while editing search');
+		checks.push('Archive Back does not interrupt an active search edit');
+		snapshot({ search_editing: false, search_activity: 'ArchiveOrg' });
+		await until(() => button('[Esc] Back') && !button('[Esc] Back').disabled, 'Back during topic loading');
+		await action('GoBack', () => button('[Esc] Back').click(), 'Archive Back uses shared navigation even while a topic is loading');
+		snapshot({ archive_org_back_available: false, search_activity: null });
+		await until(() => !button('[Esc] Back'), 'Back hidden after returning to root');
+		checks.push('Archive Back disappears when its last return route is consumed');
 
 		// Highlight ranges come from the reducer; browser rendering must preserve
 		// the original Unicode text and existing actions even when styles overlap.

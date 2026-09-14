@@ -3062,7 +3062,7 @@ fn render_body(
     }
 }
 
-/// Exposes global playback toggles below Archive item and track lists.
+/// Exposes playback toggles and actionable Back below Archive item and track lists.
 fn render_archive_org_controls(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -3075,26 +3075,32 @@ fn render_archive_org_controls(
         return;
     }
     let mut x = area.x;
-    for (key, label, action) in [
-        (
-            "A",
-            if view.autoplay {
-                "Autoplay: on"
-            } else {
-                "Autoplay: off"
-            },
-            UiAction::ToggleAutoplay,
-        ),
-        (
-            "r",
-            if view.repeating {
-                "Repeat: on"
-            } else {
-                "Repeat: off"
-            },
-            UiAction::ToggleRepeat,
-        ),
-    ] {
+    // Back has priority in narrow catalogue panes; the playback hotkeys remain global.
+    for (key, label, action) in view
+        .archive_org_back_available
+        .then_some(("Esc", "Back", UiAction::GoBack))
+        .into_iter()
+        .chain([
+            (
+                "A",
+                if view.autoplay {
+                    "Autoplay: on"
+                } else {
+                    "Autoplay: off"
+                },
+                UiAction::ToggleAutoplay,
+            ),
+            (
+                "r",
+                if view.repeating {
+                    "Repeat: on"
+                } else {
+                    "Repeat: off"
+                },
+                UiAction::ToggleRepeat,
+            ),
+        ])
+    {
         let label = button(key, label, show_hotkeys);
         let width = terminal_text_width(&label).min(area.right().saturating_sub(x));
         if width == 0 {
@@ -25367,7 +25373,69 @@ for encoded, expected in json.load(sys.stdin):
         assert!(!rendered.contains("Views:"));
     }
 
-    /// Archive playback toggles reuse the global keys and exact clickable labels.
+    /// Back remains visible even in the narrow list pane of an 80-column layout.
+    #[test]
+    fn archive_back_control_is_actionable_only_when_a_return_exists() {
+        for available in [false, true] {
+            let view = ViewModel {
+                screen: Screen::ArchiveOrg,
+                archive_org_back_available: available,
+                ..ViewModel::default()
+            };
+            let mut terminal = Terminal::new(TestBackend::new(36, 2)).unwrap();
+            let mut hit_map = HitMap::default();
+            terminal
+                .draw(|frame| {
+                    render_archive_org_controls(
+                        frame,
+                        frame.area(),
+                        &view,
+                        true,
+                        &Theme::new(false),
+                        &mut hit_map,
+                    )
+                })
+                .unwrap();
+            assert_eq!(rendered_text(&terminal).contains("[Esc] Back"), available);
+            assert_eq!(
+                hit_map
+                    .detail_buttons
+                    .iter()
+                    .any(|(action, _)| *action == UiAction::GoBack),
+                available
+            );
+        }
+    }
+
+    #[test]
+    fn archive_back_escape_precedes_details_focus_but_not_editor_or_artwork() {
+        let mut view = ViewModel {
+            screen: Screen::ArchiveOrg,
+            archive_org_back_available: true,
+            details_focused: true,
+            ..ViewModel::default()
+        };
+        let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(key_action(escape, &view), Some(UiAction::GoBack));
+        view.search_editing = true;
+        assert_eq!(key_action(escape, &view), Some(UiAction::CancelSearch));
+        view.search_editing = false;
+        view.details = Some(DetailView {
+            thumbnail_expanded: true,
+            ..DetailView::default()
+        });
+        assert_eq!(
+            key_action(escape, &view),
+            Some(UiAction::ToggleThumbnailExpansion)
+        );
+        view.details = None;
+        view.archive_org_back_available = false;
+        assert_eq!(
+            key_action(escape, &view),
+            Some(UiAction::SetDetailsFocus(false))
+        );
+    }
+
     #[test]
     fn archive_org_footer_shows_autoplay_repeat_and_working_controls() {
         for width in [160, 79] {

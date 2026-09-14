@@ -34620,6 +34620,8 @@ impl UiController for AppController {
                 self.download_twenty_yandex_music_recommendations();
             }
             UiAction::MoveSelection(delta) => {
+                #[cfg(feature = "archive-org")]
+                self.cancel_archive_restore_for_selection();
                 self.view.details_focused = false;
                 self.view.details_scroll = 0;
                 self.view.details_text_selection = None;
@@ -34627,6 +34629,8 @@ impl UiController for AppController {
                 self.move_selection(delta);
             }
             UiAction::SelectRow(row) => {
+                #[cfg(feature = "archive-org")]
+                self.cancel_archive_restore_for_selection();
                 self.view.details_focused = false;
                 self.view.details_scroll = 0;
                 self.view.details_text_selection = None;

@@ -121,9 +121,11 @@ export function SearchBar({
 					{view.search_activity === 'ArchiveOrg' ? (
 						<span role='status' aria-label='Loading archive.org' className='animate-spin text-accent'>◌</span>
 					) : null}
-					<button type='button' disabled={view.search_editing} onClick={() => void dispatch('GoBack')} className='shrink-0 text-[11px] text-accent disabled:opacity-50'>
-						[Esc] Back
-					</button>
+					{view.archive_org_back_available ? (
+						<button type='button' disabled={view.search_editing} onClick={() => void dispatch('GoBack')} className='shrink-0 text-[11px] text-accent disabled:opacity-50'>
+							[Esc] Back
+						</button>
+					) : null}
 				</>
 			) : null}
       <span className="shrink-0 text-[11px] whitespace-nowrap text-ink-faint">

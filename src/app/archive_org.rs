@@ -4,6 +4,8 @@
 #[path = "archive_org_worker_tests.rs"]
 mod worker_tests;
 
+mod history;
+
 use super::*;
 use crate::domain::ArchiveOrgSearchScope;
 #[cfg(any(feature = "yt-dlp", test))]
@@ -35,6 +37,8 @@ pub(super) struct ArchiveOrgState {
     download_lookup: Option<ArchiveDownloadLookup>,
     search_selected: usize,
     message: String,
+    history: VecDeque<history::ArchiveLocation>,
+    restoring: Option<history::ArchiveLocation>,
 }
 
 /// Manual download ownership is independent of the selected tab, item or row.
@@ -167,6 +171,7 @@ impl AppController {
             },
             false,
         );
+        self.update_archive_back_available();
         Ok(None)
     }
 
@@ -193,10 +198,13 @@ impl AppController {
             self.archive_org.request = None;
         }
         self.archive_org.download_lookup = None;
+        self.update_archive_back_available();
     }
 
     /// Starts a new search without reusing another tab's query or results.
     pub(super) fn submit_archive_org_search(&mut self, query: String) {
+        self.archive_org.history.clear();
+        self.archive_org.restoring = None;
         self.start_archive_org_search(query, ArchiveOrgSearchScope::Text);
     }
 
@@ -217,6 +225,7 @@ impl AppController {
         if self.view.screen != Screen::ArchiveOrg {
             self.show_screen(Screen::ArchiveOrg);
         }
+        self.remember_archive_location();
         self.start_archive_org_search(request.query, scope);
     }
 
@@ -393,6 +402,7 @@ impl AppController {
         }) {
             // The download popup polls the cache using its pinned file URL.
             // Do not open an item or rewrite another tab's rows/status/details.
+            self.update_archive_back_available();
             return;
         }
         match result {
@@ -437,6 +447,7 @@ impl AppController {
                 self.complete_archive_comments(&details);
             }
             Err(error) => {
+                self.archive_org.restoring = None;
                 self.archive_org.message = format!("Archive.org: {error}");
                 // Only explicit, still-visible navigation warrants a modal;
                 // background selection prefetches must not interrupt the user.
@@ -453,6 +464,10 @@ impl AppController {
                 }
             }
         }
+        if self.continue_archive_restore() {
+            self.refresh_selected_playlist_state();
+            return;
+        }
         if self.view.screen == Screen::ArchiveOrg {
             self.populate_archive_org();
             self.refresh_selected_playlist_state();
@@ -462,6 +477,9 @@ impl AppController {
     /// Projects the catalogue or one item's tracks, preserving the human item URL.
     pub(super) fn populate_archive_org(&mut self) {
         if self.view.screen != Screen::ArchiveOrg {
+            return;
+        }
+        if self.continue_archive_restore() {
             return;
         }
         if !self.archive_org.initialized {
@@ -537,7 +555,14 @@ impl AppController {
         } else {
             self.finish_search_activity(SearchActivity::ArchiveOrg);
         }
-        self.update_archive_org_detail();
+        self.update_archive_back_available();
+        if self.archive_org.restoring.is_some() {
+            // Automatic page/item restoration owns selection until completion;
+            // passive prefetch must not replace its pending request.
+            self.view.details = None;
+        } else {
+            self.update_archive_org_detail();
+        }
     }
 
     /// Returns selected metadata, merging counts already supplied by search.
@@ -606,6 +631,7 @@ impl AppController {
             self.archive_org.request = None;
             self.finish_search_activity(SearchActivity::ArchiveOrg);
         }
+        self.update_archive_back_available();
         let Some(item) = selected else {
             self.view.details = None;
             return;
@@ -679,6 +705,7 @@ impl AppController {
 
     /// Opens a container or starts the selected exact file with its track-order snapshot.
     pub(super) fn activate_archive_org_selection(&mut self) {
+        self.cancel_archive_restore_for_selection();
         if let Some(details) = &self.archive_org.active {
             let index = self.view.selected;
             if let Some(track) = details.tracks.get(index) {
@@ -718,6 +745,7 @@ impl AppController {
                     );
                     self.begin_search_activity(SearchActivity::ArchiveOrg);
                     self.view.status_line = "Opening archive.org item…".to_owned();
+                    self.update_archive_back_available();
                 }
             }
         } else if let Some(page) = self.archive_org.next_page
@@ -742,6 +770,12 @@ impl AppController {
 
     /// Leaves a track list or cancels an explicit pending open without losing search results.
     pub(super) fn go_back_archive_org(&mut self) -> bool {
+        if self.archive_download_lookup_pending() {
+            return false;
+        }
+        if self.archive_org.restoring.is_some() && !self.archive_org.history.is_empty() {
+            return self.restore_archive_location();
+        }
         let was_open = self.archive_org.active.take().is_some();
         let was_pending = self
             .archive_org
@@ -749,14 +783,17 @@ impl AppController {
             .as_ref()
             .is_some_and(|job| matches!(job.kind, ArchiveRequest::Details { open: true, .. }));
         if !was_open && !was_pending {
-            return false;
+            return self.restore_archive_location();
         }
+        self.archive_org.restoring = None;
         self.archive_org.generation = self.archive_org.generation.wrapping_add(1);
         self.archive_org.pending = None;
         self.archive_org.request = None;
         if was_open {
             self.archive_org_selected = self.archive_org.search_selected;
         }
+        self.view.selected_detail_link = None;
+        self.view.detail_link_reveal = None;
         self.archive_org.message = format!(
             "{} of {} archive.org items · Enter: open · /: search",
             self.archive_org.items.len(),
@@ -1110,7 +1147,7 @@ fn append_searchable_metadata(
 mod tests {
     use super::*;
 
-    fn item() -> ArchiveOrgItem {
+    pub(super) fn item() -> ArchiveOrgItem {
         serde_json::from_value(serde_json::json!({
             "identifier": "fixture", "title": "An audio collection",
             "creator": "A creator", "description": "Original description",
@@ -1139,7 +1176,7 @@ mod tests {
     }
 
     /// A standalone controller keeps lookup tests offline and independent of selected rows.
-    fn lookup_controller() -> (tempfile::TempDir, AppController) {
+    pub(super) fn lookup_controller() -> (tempfile::TempDir, AppController) {
         let directory = crate::test_support::canonical_tempdir("archive download lookup");
         let config = Config::for_dir(directory.path().join("config"));
         let store = StateStore::open_in_memory().unwrap();
@@ -1150,7 +1187,7 @@ mod tests {
     }
 
     /// Blocks real provider work while a test inspects queued request ownership.
-    fn occupy_archive_worker(controller: &mut AppController) {
+    pub(super) fn occupy_archive_worker(controller: &mut AppController) {
         let (_sender, response) = bounded(1);
         controller.archive_org.worker = Some(ArchiveWorker {
             job: ArchiveJob {
@@ -1445,7 +1482,7 @@ mod tests {
             .unwrap();
     }
 
-    fn lookup_details(identifier: &str) -> Arc<ArchiveOrgItemDetails> {
+    pub(super) fn lookup_details(identifier: &str) -> Arc<ArchiveOrgItemDetails> {
         let mut value = item();
         value.identifier = identifier.to_owned();
         value.webpage_url =
