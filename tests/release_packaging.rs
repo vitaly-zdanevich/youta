@@ -1046,44 +1046,46 @@ fn workflows_validate_and_publish_the_documented_platform_contract() {
     assert!(ci.contains("x86_64-pc-windows-msvc"));
     assert!(ci.contains("aarch64-pc-windows-msvc"));
     assert!(ci.contains("x86_64-unknown-freebsd"));
-    for workflow in [ci.as_str(), release.as_str()] {
-        assert!(
-            workflow.contains("--features app-core"),
-            "workflow omits the complete Yandex-free application lane"
-        );
-        assert!(
-            workflow.contains("--features app-core,images"),
-            "workflow omits the documented Yandex-free graphical application lane"
-        );
-        assert!(
-            workflow.contains("--features app,images"),
-            "workflow omits the image-enabled, QR-disabled release boundary"
-        );
-        assert!(
-            workflow.contains("--features app,qr"),
-            "workflow omits the text-only, QR-enabled release boundary"
-        );
-        assert!(
-            workflow.contains("--features qr"),
-            "workflow omits the standalone QR feature boundary"
-        );
-        assert!(
-            workflow.contains("--features tui,yandex-music\n"),
-            "workflow omits the standalone Yandex Music lane without Wikidata"
-        );
-        assert!(
-            workflow.contains("--features tui,librivox\n"),
-            "workflow omits the standalone LibriVox lane without Wikidata"
-        );
-        assert!(
-            workflow.contains("--features librivox\n"),
-            "workflow omits the isolated LibriVox provider boundary"
-        );
-        assert!(
-            workflow.contains("--features tui,librivox,wikidata"),
-            "workflow omits the LibriVox and Wikidata composition boundary"
-        );
-    }
+    assert!(
+        release.contains("uses: ./.github/workflows/ci.yml"),
+        "Release must use the same feature matrix as branch CI"
+    );
+    assert!(
+        ci.contains("--features app-core"),
+        "workflow omits the complete Yandex-free application lane"
+    );
+    assert!(
+        ci.contains("--features app-core,images"),
+        "workflow omits the documented Yandex-free graphical application lane"
+    );
+    assert!(
+        ci.contains("--features app,images"),
+        "workflow omits the image-enabled, QR-disabled release boundary"
+    );
+    assert!(
+        ci.contains("--features app,qr"),
+        "workflow omits the text-only, QR-enabled release boundary"
+    );
+    assert!(
+        ci.contains("--features qr"),
+        "workflow omits the standalone QR feature boundary"
+    );
+    assert!(
+        ci.contains("--features tui,yandex-music\n"),
+        "workflow omits the standalone Yandex Music lane without Wikidata"
+    );
+    assert!(
+        ci.contains("--features tui,librivox\n"),
+        "workflow omits the standalone LibriVox lane without Wikidata"
+    );
+    assert!(
+        ci.contains("--features librivox\n"),
+        "workflow omits the isolated LibriVox provider boundary"
+    );
+    assert!(
+        ci.contains("--features tui,librivox,wikidata"),
+        "workflow omits the LibriVox and Wikidata composition boundary"
+    );
 }
 
 #[test]

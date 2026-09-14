@@ -14,8 +14,8 @@ env:
   RUST_VERSION: 1.95.0
 
 jobs:
-  validate:
-    name: Validate release revision
+  validate-tag:
+    name: Validate the release version tag
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     steps:
@@ -39,130 +39,14 @@ jobs:
             exit 1
           fi
 
-      # A tag push starts the ordinary CI and release workflows concurrently.
-      # Repeat every deterministic release gate here so assets cannot publish
-      # before formatting, lint, documentation, or tests have passed.
-      - name: Install the release-validation Rust toolchain
-        run: |
-          rustup toolchain install "${RUST_VERSION}" \
-            --profile minimal \
-            --component clippy,rustfmt
-          rustup default "${RUST_VERSION}"
-
-      - name: Restore Cargo registry cache
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: release-validation-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
-
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
-      - name: Run blocking Clippy lint groups
-        run: >-
-          cargo clippy --locked --all-targets --all-features --
-          -D unused
-          -D future-incompatible
-          -D clippy::correctness
-          -D clippy::suspicious
-          -D clippy::perf
-
-      - name: Check Rustdoc
-        env:
-          RUSTDOCFLAGS: -D warnings
-        run: cargo doc --locked --no-deps --all-features
-
-      - name: Run the complete deterministic feature matrix
-        run: |
-          cargo test --locked --all-targets
-          cargo test --locked --all-targets --no-default-features
-          cargo test --locked --all-targets --no-default-features --features app-core
-          cargo test --locked --all-targets --no-default-features --features app-core,images
-          cargo test --locked --all-targets --no-default-features --features app-core,images,qr
-          cargo test --locked --lib --no-default-features --features librivox
-          cargo test --locked --all-targets --no-default-features --features tui,librivox
-          cargo test --locked --all-targets --no-default-features --features tui,librivox,wikidata
-          cargo test --locked --all-targets --no-default-features --features app
-          cargo test --locked --all-targets --no-default-features --features app,images
-          cargo test --locked --all-targets --no-default-features --features app,qr
-          cargo test --locked --all-targets --no-default-features --features sqlite-state
-          cargo test --locked --all-targets --no-default-features --features tui
-          cargo test --locked --lib --no-default-features --features audio-quality
-          cargo test --locked --all-targets --no-default-features --features tui,audio-quality
-          cargo test --locked --lib --no-default-features --features ascii-visualizer
-          cargo test --locked --all-targets --no-default-features --features tui,ascii-visualizer
-          cargo test --locked --lib --no-default-features --features summary
-          cargo test --locked --lib --no-default-features --features youtube-captions
-          cargo test --locked --all-targets --no-default-features --features tui,summary
-          cargo test --locked --all-targets --no-default-features --features tui,youtube-captions
-          cargo test --locked --lib --no-default-features --features sponsorblock
-          cargo test --locked --all-targets --no-default-features --features tui,sponsorblock
-          cargo test --locked --all-targets --no-default-features --features tui,nyan-cat
-          cargo test --locked --lib --no-default-features --features evernote
-          cargo test --locked --all-targets --no-default-features --features tui,evernote
-          cargo test --locked --lib --no-default-features --features lan-sharing
-          cargo test --locked --all-targets --no-default-features --features tui,lan-sharing
-          cargo test --locked --all-targets --no-default-features --features qr
-          cargo test --locked --all-targets --no-default-features --features tui,local
-          cargo test --locked --lib --no-default-features --features controller,web-browser web_
-          cargo test --locked --lib --no-default-features --features controller,web-browser,local-metadata web_
-          cargo test --locked --lib --no-default-features --features controller,web-browser,local-artwork web_
-          cargo test --locked --all-targets --no-default-features --features tui,local-archives
-          cargo test --locked --all-targets --no-default-features --features tui,acoustid,wikidata
-          cargo test --locked --all-targets --no-default-features --features tui,apple-podcasts
-          cargo test --locked --all-targets --no-default-features --features tui,bandcamp
-          cargo test --locked --all-targets --no-default-features --features tui,radio
-          cargo test --locked --all-targets --no-default-features --features tui,yandex-music
-          cargo test --locked --all-targets --no-default-features --features tui,yandex-music,wikidata
-          cargo test --locked --all-targets --all-features
-
-      - name: Run the explicit end-to-end terminal test
-        env:
-          TERM: xterm-256color
-        run: cargo test --locked --test e2e --all-features
-
-      - name: Run the complete Rustdoc test matrix
-        run: |
-          cargo test --locked --doc
-          cargo test --locked --doc --no-default-features
-          cargo test --locked --doc --no-default-features --features app-core
-          cargo test --locked --doc --no-default-features --features app-core,images
-          cargo test --locked --doc --no-default-features --features app-core,images,qr
-          cargo test --locked --doc --no-default-features --features librivox
-          cargo test --locked --doc --no-default-features --features tui,librivox
-          cargo test --locked --doc --no-default-features --features tui,librivox,wikidata
-          cargo test --locked --doc --no-default-features --features app
-          cargo test --locked --doc --no-default-features --features app,images
-          cargo test --locked --doc --no-default-features --features app,qr
-          cargo test --locked --doc --no-default-features --features sqlite-state
-          cargo test --locked --doc --no-default-features --features tui
-          cargo test --locked --doc --no-default-features --features audio-quality
-          cargo test --locked --doc --no-default-features --features tui,audio-quality
-          cargo test --locked --doc --no-default-features --features ascii-visualizer
-          cargo test --locked --doc --no-default-features --features tui,ascii-visualizer
-          cargo test --locked --doc --no-default-features --features summary
-          cargo test --locked --doc --no-default-features --features youtube-captions
-          cargo test --locked --doc --no-default-features --features tui,summary
-          cargo test --locked --doc --no-default-features --features tui,youtube-captions
-          cargo test --locked --doc --no-default-features --features sponsorblock
-          cargo test --locked --doc --no-default-features --features tui,sponsorblock
-          cargo test --locked --doc --no-default-features --features tui,nyan-cat
-          cargo test --locked --doc --no-default-features --features evernote
-          cargo test --locked --doc --no-default-features --features tui,evernote
-          cargo test --locked --doc --no-default-features --features lan-sharing
-          cargo test --locked --doc --no-default-features --features tui,lan-sharing
-          cargo test --locked --doc --no-default-features --features qr
-          cargo test --locked --doc --no-default-features --features tui,local
-          cargo test --locked --doc --no-default-features --features tui,local-archives
-          cargo test --locked --doc --no-default-features --features tui,acoustid,wikidata
-          cargo test --locked --doc --no-default-features --features tui,apple-podcasts
-          cargo test --locked --doc --no-default-features --features tui,bandcamp
-          cargo test --locked --doc --no-default-features --features tui,radio
-          cargo test --locked --doc --no-default-features --features tui,yandex-music
-          cargo test --locked --doc --no-default-features --features tui,yandex-music,wikidata
-          cargo test --locked --doc --all-features
+  # A local reusable workflow runs at this exact revision. Publication waits
+  # for its core, desktop/browser, cross-platform, and coverage gates together.
+  validate:
+    name: Validate release revision
+    needs: validate-tag
+    uses: ./.github/workflows/ci.yml
+    with:
+      release-validation: true
 
   binaries:
     name: ${{ matrix.operating_system }} ${{ matrix.architecture }}
@@ -747,6 +631,7 @@ jobs:
     name: Publish GitHub release assets
     if: startsWith(github.ref, 'refs/tags/v')
     needs:
+      - validate
       - binaries
       - desktop
       - desktop-i686

@@ -2510,7 +2510,7 @@ for USE flags and binary-size/debug settings.
 
 ### Continuous integration
 
-Every pushed revision and pull request runs formatting, Clippy, Rustdoc,
+Every branch push and pull request runs formatting, Clippy, Rustdoc,
 deterministic tests with default, no-default, and all features, an explicit
 terminal end-to-end target, and a 70% minimum line-coverage gate. It also runs
 required live Apple Podcasts, keyless YouTube Music, LibriVox, Wikidata, and public Radio
@@ -2523,6 +2523,19 @@ is checked through yt-dlp's public songs search with a 15-second process bound
 and no Google API key. Wikidata is checked through a live exact P1651 lookup.
 Each enabled live job retries once for a transient network failure; a second
 failure fails CI.
+
+Release tags call the same CI workflow at the tagged revision. Publication waits
+for the complete deterministic feature matrix, desktop tests on Linux, macOS,
+and Windows, the Linux Firefox browser test, platform compile checks, and the
+70% coverage gate. Live-service probes run on ordinary CI; they are omitted from
+release validation. Version-tag pushes use the release workflow to avoid running
+the deterministic suite twice.
+
+Coverage is generated once per CI run. SonarCloud downloads that run's LCOV
+artifact after coverage passes, for pushes to `main`, pull requests, and manual
+CI runs. Without `SONAR_TOKEN`, coverage still runs and only SonarCloud analysis
+is skipped. Both workflows use GitHub's
+[reusable workflows](https://docs.github.com/en/actions/how-tos/reuse-automations/reuse-workflows).
 
 ### Release artifacts
 

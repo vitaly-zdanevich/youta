@@ -1,20 +1,18 @@
 name: Build
 
+# Called only after CI has generated this run's coverage artifact. Keeping
+# analysis in the original run preserves pull-request context and secret scope.
 on:
-  push:
-    branches:
-      - main
-  pull_request:
-    types: [opened, synchronize, reopened]
-  workflow_dispatch:
+  workflow_call:
+    secrets:
+      SONAR_TOKEN:
+        required: false
 
 permissions:
   contents: read
 
 env:
-  CARGO_TERM_COLOR: always
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
-  RUST_VERSION: 1.95.0
 
 jobs:
   sonarcloud:
@@ -29,62 +27,14 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install Rust coverage tools
-        run: |
-          rustup toolchain install "${RUST_VERSION}" \
-            --profile minimal \
-            --component llvm-tools-preview
-          rustup default "${RUST_VERSION}"
-
-      - name: Restore Cargo build cache
-        uses: actions/cache@9255dc7a253b0ccc959486e2bca901246202afeb # v5.0.1
+      - name: Download this run's coverage report
+        uses: actions/download-artifact@v8
         with:
-          path: |
-            target
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: sonar-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            sonar-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-
+          name: coverage-lcov
+          path: coverage
 
-      - name: Restore cargo-llvm-cov binary cache
-        id: cargo-llvm-cov-cache
-        uses: actions/cache@9255dc7a253b0ccc959486e2bca901246202afeb # v5.0.1
-        with:
-          path: ~/.cargo/bin/cargo-llvm-cov
-          key: cargo-llvm-cov-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-0.8.7-v1
-
-      - name: Install the pinned coverage runner
-        if: steps.cargo-llvm-cov-cache.outputs.cache-hit != 'true'
-        run: cargo install cargo-llvm-cov --locked --version 0.8.7
-
-      - name: Show the coverage runner version
-        run: cargo llvm-cov --version
-
-      # `youta-gui` is excluded for the same reason as in ci.yml: it links
-      # Tauri, whose Linux backend needs the WebKitGTK and glib development
-      # packages that this runner does not install.
-      - name: Generate LCOV coverage
-        run: |
-          cargo llvm-cov \
-            --locked \
-            --workspace \
-            --exclude youta-gui \
-            --all-features \
-            --lib \
-            --bins \
-            --fail-under-lines 70 \
-            --lcov \
-            --output-path lcov.info
-          mkdir -p coverage
-          mv lcov.info coverage/lcov.info
-
-      - name: Upload LCOV coverage
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: sonarcloud-lcov
-          path: coverage/lcov.info
-          if-no-files-found: error
+      - name: Verify the coverage report
+        run: test -s coverage/lcov.info
 
       - name: Report unavailable SonarCloud credentials
         if: ${{ env.SONAR_TOKEN_AVAILABLE != 'true' }}

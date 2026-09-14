@@ -2,15 +2,30 @@ name: CI
 
 on:
   push:
+    branches:
+      - '**'
+    # Release calls this workflow for version tags, so their deterministic
+    # checks run once and finish before any assets or crates are published.
+    tags-ignore:
+      - 'v*'
   pull_request:
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      release-validation:
+        description: Run deterministic release gates without live probes or diagnostic uploads.
+        type: boolean
+        default: false
+    secrets:
+      SONAR_TOKEN:
+        required: false
 
 permissions:
   contents: read
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.sha }}
-  # Every pushed revision must finish the complete suite, including live
+  # Every branch revision must finish the complete suite, including live
   # service checks, even when another revision is pushed soon afterwards.
   cancel-in-progress: false
 
@@ -84,12 +99,34 @@ jobs:
             feature_arguments: --no-default-features --features app
           - feature_set: Yandex-free application without images or QR
             feature_arguments: --no-default-features --features app-core
+          - feature_set: Yandex-free graphical application without QR
+            feature_arguments: --no-default-features --features app-core,images
           - feature_set: Yandex-free graphical application
             feature_arguments: --no-default-features --features app-core,images,qr
           - feature_set: optional SQLite state
             feature_arguments: --no-default-features --features sqlite-state
           - feature_set: TUI only
             feature_arguments: --no-default-features --features tui
+          - feature_set: standalone audio quality
+            feature_arguments: --no-default-features --features audio-quality
+          - feature_set: TUI with audio quality
+            feature_arguments: --no-default-features --features tui,audio-quality
+          - feature_set: standalone ASCII visualizer
+            feature_arguments: --no-default-features --features ascii-visualizer
+          - feature_set: standalone summaries
+            feature_arguments: --no-default-features --features summary
+          - feature_set: TUI with summaries
+            feature_arguments: --no-default-features --features tui,summary
+          - feature_set: standalone YouTube captions
+            feature_arguments: --no-default-features --features youtube-captions
+          - feature_set: standalone SponsorBlock
+            feature_arguments: --no-default-features --features sponsorblock
+          - feature_set: standalone Evernote
+            feature_arguments: --no-default-features --features evernote
+          - feature_set: TUI with Evernote
+            feature_arguments: --no-default-features --features tui,evernote
+          - feature_set: standalone LAN sharing
+            feature_arguments: --no-default-features --features lan-sharing
           - feature_set: TUI with SponsorBlock
             feature_arguments: --no-default-features --features tui,sponsorblock
           - feature_set: TUI with Nyan Cat seek bar
@@ -235,6 +272,14 @@ jobs:
           cargo check --locked --no-default-features --features app
           cargo check --locked --no-default-features --features app,images
           cargo check --locked --no-default-features --features app,qr
+
+      # These focused behavior checks were originally release-only. Keep the
+      # Web composition boundaries covered before a version is tagged too.
+      - name: Test isolated Web browser compositions
+        run: |
+          cargo test --locked --lib --no-default-features --features controller,web-browser web_
+          cargo test --locked --lib --no-default-features --features controller,web-browser,local-metadata web_
+          cargo test --locked --lib --no-default-features --features controller,web-browser,local-artwork web_
 
   linux-i686-compile:
     name: Linux compile (i686)
@@ -452,6 +497,7 @@ jobs:
         run: file dist-desktop/youta-gui-*-linux-i686 | grep --fixed-strings 'ELF 32-bit LSB pie executable, Intel 80386'
 
       - name: Upload the unbundled GUI executable
+        if: ${{ !inputs.release-validation }}
         uses: actions/upload-artifact@v7
         with:
           archive: false
@@ -459,6 +505,7 @@ jobs:
           if-no-files-found: error
 
       - name: Upload the unbundled GUI executable checksum
+        if: ${{ !inputs.release-validation }}
         uses: actions/upload-artifact@v7
         with:
           archive: false
@@ -620,7 +667,7 @@ jobs:
     # ready to re-enable, and run scripts/test-live-youtube.sh locally before
     # each commit in the meantime. Set the repository Actions variable
     # RUN_LIVE_YOUTUBE to true when the hosted check is reliable again.
-    if: ${{ vars.RUN_LIVE_YOUTUBE == 'true' }}
+    if: ${{ !inputs.release-validation && vars.RUN_LIVE_YOUTUBE == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     steps:
@@ -757,6 +804,7 @@ jobs:
           done
 
   live-youtube-music:
+    if: ${{ !inputs.release-validation }}
     name: Live keyless YouTube Music search
     runs-on: ubuntu-24.04
     timeout-minutes: 360
@@ -813,6 +861,7 @@ jobs:
           done
 
   live-apple-podcasts:
+    if: ${{ !inputs.release-validation }}
     name: Live Apple Podcasts playback
     # Ubuntu 24.04 packages mpv 0.37, older than Youta's documented 0.38
     # minimum and its indexed `loadfile` JSON-IPC command.
@@ -892,6 +941,7 @@ jobs:
           done
 
   live-librivox:
+    if: ${{ !inputs.release-validation }}
     name: Live LibriVox API and pages
     runs-on: ubuntu-24.04
     timeout-minutes: 360
@@ -936,6 +986,7 @@ jobs:
           done
 
   live-wikidata:
+    if: ${{ !inputs.release-validation }}
     name: Live Wikidata lookup
     runs-on: ubuntu-24.04
     timeout-minutes: 360
@@ -1049,6 +1100,7 @@ jobs:
           done
 
   live-radio:
+    if: ${{ !inputs.release-validation }}
     name: Live public radio playback
     # The live test supplies per-file titles through the indexed `loadfile`
     # JSON-IPC signature introduced by mpv 0.38.
@@ -1173,7 +1225,15 @@ jobs:
             ~/.cargo/git
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
 
+      - name: Restore cargo-llvm-cov binary cache
+        id: cargo-llvm-cov-cache
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/bin/cargo-llvm-cov
+          key: cargo-llvm-cov-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-0.8.7-v1
+
       - name: Install the pinned coverage runner
+        if: steps.cargo-llvm-cov-cache.outputs.cache-hit != 'true'
         run: cargo install cargo-llvm-cov --locked --version 0.8.7
 
       # `youta-gui` is excluded deliberately, and the exclusion now means
@@ -1199,8 +1259,23 @@ jobs:
             --output-path lcov.info
 
       - name: Upload coverage report
+        if: ${{ !inputs.release-validation }}
         uses: actions/upload-artifact@v7
         with:
           name: coverage-lcov
           path: lcov.info
           if-no-files-found: error
+
+  # Sonar consumes the successful coverage report from this same run. Its
+  # original main-push, pull-request, and manual triggers remain unchanged.
+  sonarcloud:
+    name: SonarCloud analysis
+    needs: coverage
+    if: >-
+      ${{ !inputs.release-validation &&
+          ((github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+           github.event_name == 'pull_request' ||
+           github.event_name == 'workflow_dispatch') }}
+    uses: ./.github/workflows/build.yml
+    secrets:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
