@@ -668,6 +668,8 @@ impl AppController {
                 .loading_wikidata_item
                 .clone_from(&previous.loading_wikidata_item);
         }
+        // Passive metadata enrichment must not close the same item's artwork modal.
+        preserve_thumbnail_expansion(self.view.details.as_ref(), &mut detail);
         self.archive_org
             .search_highlighter
             .apply(&self.archive_org.submitted_query, &mut detail);
@@ -1146,6 +1148,90 @@ fn append_searchable_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Passive enrichment preserves the user's current artwork overlay for both
+    /// catalogue containers and playable tracks, without reopening a closed one.
+    #[test]
+    fn archive_artwork_expansion_survives_same_identity_metadata_refresh() {
+        for opened in [false, true] {
+            let (_temporary, mut app) = lookup_controller();
+            app.view.screen = Screen::ArchiveOrg;
+            let original = lookup_details("fixture");
+            app.archive_org.items = vec![original.item.clone()];
+            app.archive_org
+                .cache
+                .push_back(("fixture".into(), Ok(Arc::clone(&original))));
+            app.archive_org.active = opened.then(|| Arc::clone(&original));
+            app.populate_archive_org();
+            app.dispatch(UiAction::ToggleThumbnailExpansion);
+            assert!(app.view.expanded_thumbnail_available());
+            let mut enriched = (*original).clone();
+            enriched.item.description = Some("Enriched description with more metadata".into());
+            app.archive_org.cache.clear();
+            app.archive_org
+                .cache
+                .push_back(("fixture".into(), Ok(Arc::new(enriched.clone()))));
+            app.archive_org.active = opened.then(|| Arc::new(enriched));
+            app.update_archive_org_detail();
+            assert!(
+                app.view.expanded_thumbnail_available(),
+                "same identity, opened={opened}"
+            );
+            assert!(
+                app.view
+                    .details
+                    .as_ref()
+                    .unwrap()
+                    .description
+                    .contains("Enriched description")
+            );
+            app.dispatch(UiAction::ToggleThumbnailExpansion);
+            app.update_archive_org_detail();
+            assert!(
+                !app.view.expanded_thumbnail_available(),
+                "refresh must not reopen a closed overlay"
+            );
+        }
+    }
+
+    /// Expansion belongs to the exact item/file identity, never to a row index.
+    #[test]
+    fn archive_artwork_expansion_resets_on_new_item_track_or_missing_artwork() {
+        let (_temporary, mut app) = lookup_controller();
+        app.view.screen = Screen::ArchiveOrg;
+        let first = lookup_details("first");
+        let second = lookup_details("second");
+        app.archive_org.items = vec![first.item.clone(), second.item.clone()];
+        app.archive_org
+            .cache
+            .push_back(("first".into(), Ok(Arc::clone(&first))));
+        app.archive_org
+            .cache
+            .push_back(("second".into(), Ok(Arc::clone(&second))));
+        app.populate_archive_org();
+        app.dispatch(UiAction::ToggleThumbnailExpansion);
+        app.dispatch(UiAction::SelectRow(1));
+        assert!(!app.view.expanded_thumbnail_available());
+
+        let mut tracks = (*second).clone();
+        let mut next = tracks.tracks[0].clone();
+        next.filename = "02.opus".into();
+        next.download_url = url::Url::parse("https://archive.org/download/second/02.opus").unwrap();
+        tracks.tracks.push(next);
+        app.archive_org.active = Some(Arc::new(tracks));
+        app.archive_org_selected = 0;
+        app.populate_archive_org();
+        app.dispatch(UiAction::ToggleThumbnailExpansion);
+        app.dispatch(UiAction::SelectRow(1));
+        assert!(!app.view.expanded_thumbnail_available());
+
+        app.dispatch(UiAction::ToggleThumbnailExpansion);
+        let details = Arc::make_mut(app.archive_org.active.as_mut().unwrap());
+        details.item.artwork_url = None;
+        details.tracks[1].waveform_url = None;
+        app.update_archive_org_detail();
+        assert!(!app.view.details.as_ref().unwrap().thumbnail_expanded);
+    }
 
     pub(super) fn item() -> ArchiveOrgItem {
         serde_json::from_value(serde_json::json!({

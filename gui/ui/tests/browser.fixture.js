@@ -6,6 +6,33 @@
  */
 (() => {
 	const defaults = window.__YOUTA_FIXTURES__;
+	// Mock only the native artwork protocol boundary for one deterministic image.
+	// The production component must still request the same cached native URL.
+	const waveformUrl = 'https://archive.org/download/fixture/waveform.png';
+	const nativeWaveformUrl = `youta://artwork/${encodeURIComponent(waveformUrl)}`;
+	const waveformImage = 'data:image/svg+xml,' + encodeURIComponent(
+		'<svg xmlns="http://www.w3.org/2000/svg" width="800" height="200"><path d="M0 100H100L150 10L200 190L250 50L300 150L350 100H800" stroke="white" fill="none"/></svg>',
+	);
+	const setAttribute = Element.prototype.setAttribute;
+	const imageSource = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'src');
+	Object.defineProperty(HTMLImageElement.prototype, 'src', {
+		...imageSource,
+		set(value) {
+			if (value === nativeWaveformUrl) {
+				setAttribute.call(this, 'data-native-artwork', value);
+				imageSource.set.call(this, waveformImage);
+			} else {
+				imageSource.set.call(this, value);
+			}
+		},
+	});
+	Element.prototype.setAttribute = function(name, value) {
+		if (this instanceof HTMLImageElement && name === 'src' && value === nativeWaveformUrl) {
+			setAttribute.call(this, 'data-native-artwork', value);
+			return setAttribute.call(this, name, waveformImage);
+		}
+		return setAttribute.call(this, name, value);
+	};
 	const clone = (value) => structuredClone(value);
 	const calls = [];
 	const failures = [];
@@ -146,6 +173,29 @@
 		snapshot({ archive_org_back_available: false, search_activity: null });
 		await until(() => !button('[Esc] Back'), 'Back hidden after returning to root');
 		checks.push('Archive Back disappears when its last return route is consumed');
+
+		// Expansion is a shared controller state, not an independent browser modal.
+		const waveformDetails = { ...details('Waveform fixture'), thumbnail_url: waveformUrl,
+			expanded_thumbnail_url: waveformUrl, thumbnail_expanded: false };
+		snapshot({ details: waveformDetails });
+		const compactWaveform = await until(() => {
+			const image = document.querySelector('[aria-label=Details] img[data-native-artwork]');
+			return image?.naturalWidth === 800 && image;
+		}, 'native waveform fixture');
+		assert(compactWaveform.naturalHeight === 200, 'Waveform fixture preserves its native aspect ratio');
+		const compactWidth = compactWaveform.getBoundingClientRect().width;
+		await action('ToggleThumbnailExpansion', () => compactWaveform.click(), 'Waveform click requests shared artwork expansion');
+		snapshot({ details: { ...waveformDetails, thumbnail_expanded: true } });
+		const expandedWaveform = await until(() => dialog()?.querySelector('img[data-native-artwork]'), 'expanded waveform dialog');
+		assert(expandedWaveform.dataset.nativeArtwork === nativeWaveformUrl, 'Enlarged waveform reuses the cached native image URL');
+		assert(expandedWaveform.getBoundingClientRect().width > compactWidth, 'Expanded waveform uses space beyond the Details column');
+		assert(getComputedStyle(expandedWaveform).objectFit === 'contain', 'Expanded artwork fits completely without cropping');
+		await action('ToggleThumbnailExpansion', () => expandedWaveform.click(), 'Enlarged waveform click requests collapse');
+		await action('ToggleThumbnailExpansion', () => button('Close artwork', dialog()).click(), 'Artwork close button uses the same controller action');
+		await key('Escape', 'Esc');
+		snapshot({ details: waveformDetails });
+		await until(() => !dialog(), 'collapsed waveform snapshot');
+		checks.push('Shared collapsed snapshot removes the enlarged artwork');
 
 		// Highlight ranges come from the reducer; browser rendering must preserve
 		// the original Unicode text and existing actions even when styles overlap.

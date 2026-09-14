@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef } from "react";
 
 import type { InformationPanelKind } from "./contract";
 import { Details } from "./components/Details";
+import { ArtworkPopup } from './components/ArtworkPopup';
 import { DownloadBar } from "./components/DownloadBar";
 import { Player } from "./components/Player";
 import { ROW_HEIGHT, RowList } from "./components/RowList";
@@ -192,6 +193,7 @@ export function App() {
       {/* Drawn in the order `render_frame` draws them, bottom to top. Each
           popup carries its own stacking layer, so the order is stated once
           rather than implied by where a component sits in this tree. */}
+      <ArtworkPopup details={view.details} />
       {view.help_open ? (
         <HelpPopup
           audioQualitySupported={view.audio_quality_supported}

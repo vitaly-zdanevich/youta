@@ -27957,6 +27957,75 @@ for encoded, expected in json.load(sys.stdin):
         }
     }
 
+    /// Archive waveforms use the existing full-terminal image modal and close
+    /// before Escape can trigger catalogue/search Back navigation.
+    #[test]
+    fn archive_waveform_expansion_uses_fullscreen_and_shared_collapse_actions() {
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        let waveform = url::Url::parse(
+            "https://iiif.archive.org/image/iiif/3/fixture%2Faudio.png/full/max/0/default.jpg",
+        )
+        .unwrap();
+        let view = ViewModel {
+            screen: Screen::ArchiveOrg,
+            archive_org_back_available: true,
+            details_focused: true,
+            rows: vec![RowView {
+                title: "Hidden catalogue".into(),
+                ..RowView::default()
+            }],
+            details: Some(DetailView {
+                source: "archive.org".into(),
+                thumbnail_url: Some(waveform.clone()),
+                expanded_thumbnail_url: Some(waveform.clone()),
+                thumbnail_expanded: true,
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+        let mut thumbnails = MockThumbnailRenderer {
+            enabled: true,
+            rendered_artwork: true,
+            prepared_artwork_size: Some(Size::new(80, 20)),
+            ..MockThumbnailRenderer::default()
+        };
+        terminal
+            .draw(|frame| {
+                render_frame(
+                    frame,
+                    &view,
+                    &UiSettings::default(),
+                    &mut hit_map,
+                    Some(&mut thumbnails),
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            thumbnails.synchronized,
+            vec![(Some(waveform), Rect::new(0, 0, 120, 40))]
+        );
+        assert_eq!(hit_map.thumbnail_area, Some(Rect::new(20, 10, 80, 20)));
+        assert!(!rendered_text(&terminal).contains("Hidden catalogue"));
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &view),
+            Some(UiAction::ToggleThumbnailExpansion)
+        );
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: 0,
+                    row: 0,
+                    modifiers: KeyModifiers::NONE
+                },
+                &hit_map,
+                &view
+            ),
+            Some(UiAction::ToggleThumbnailExpansion)
+        );
+    }
+
     #[test]
     fn expanded_thumbnail_escape_precedes_details_and_parent_navigation() {
         let view = ViewModel {

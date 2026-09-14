@@ -447,7 +447,9 @@ resolver:
 
   Details show artwork, description, uploader/profile, upload date, topics,
   language, whole-item size, license, favourites, and links to the original
-  item and its collections when supplied by Archive.org. The content date is
+  item and its collections when supplied by Archive.org. Click artwork or a
+  waveform to expand it; click again or press Esc to close the expanded view.
+  The same bounded image source is reused. The content date is
   kept separate from the upload date. F6 opens up to twenty public reviews;
   review stars are not represented as likes. Metadata is fetched lazily on a
   bounded worker; restricted items and private files are not exposed for playback.
