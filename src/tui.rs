@@ -4371,7 +4371,12 @@ fn render_information_panel(
             .is_some_and(|row| row.title == details.title)
     };
     let mut lines = if !show_text_selection && !title_already_visible {
-        vec![Line::styled(&details.title, theme.heading)]
+        vec![Line::from(highlighted_detail_text(
+            details,
+            DetailHighlightField::Title,
+            &details.title,
+            theme.heading,
+        ))]
     } else {
         Vec::new()
     };
@@ -5027,21 +5032,49 @@ fn render_information_panel(
         }
         InformationPanelKind::Generic => {
             if archive_org_details {
-                for (name, value) in [
-                    ("Length", details.length.as_str()),
-                    ("Favourites", details.likes.as_str()),
-                    ("Downloads", details.views.as_str()),
-                    ("Comments", details.comments.as_str()),
-                    ("Uploaded", details.published.as_str()),
+                for (name, value, field) in [
+                    (
+                        "Length",
+                        details.length.as_str(),
+                        DetailHighlightField::Length,
+                    ),
+                    (
+                        "Favourites",
+                        details.likes.as_str(),
+                        DetailHighlightField::Likes,
+                    ),
+                    (
+                        "Downloads",
+                        details.views.as_str(),
+                        DetailHighlightField::Views,
+                    ),
+                    (
+                        "Comments",
+                        details.comments.as_str(),
+                        DetailHighlightField::Comments,
+                    ),
+                    (
+                        "Uploaded",
+                        details.published.as_str(),
+                        DetailHighlightField::Published,
+                    ),
                 ] {
-                    let value = value.trim();
+                    let source = value;
+                    let value = source.trim();
                     if value.is_empty() || value.eq_ignore_ascii_case("unknown") {
                         continue;
                     }
-                    lines.push(Line::from(vec![
-                        Span::styled(format!("{name}: "), theme.muted),
-                        Span::raw(value.to_owned()),
-                    ]));
+                    let start = source.len() - source.trim_start().len();
+                    let mut spans = vec![Span::styled(format!("{name}: "), theme.muted)];
+                    append_highlighted_detail_source(
+                        details,
+                        field,
+                        source,
+                        start..start + value.len(),
+                        Style::default(),
+                        &mut spans,
+                    );
+                    lines.push(Line::from(spans));
                 }
             }
         }
@@ -5059,10 +5092,20 @@ fn render_information_panel(
         || is_librivox_public_domain_license(&details.source, &details.license)
         || (archive_org_details && is_specified_archive_license(&details.license))
     {
-        lines.push(Line::from(vec![
-            Span::styled("License: ", theme.muted),
-            Span::styled(display_license_label(&details.license), theme.accent),
-        ]));
+        let label = display_license_label(&details.license);
+        let mut spans = vec![Span::styled("License: ", theme.muted)];
+        // Common licence aliases are presentation text, not the indexed source.
+        if label == details.license {
+            spans.extend(highlighted_detail_text(
+                details,
+                DetailHighlightField::License,
+                label,
+                theme.accent,
+            ));
+        } else {
+            spans.push(Span::styled(label, theme.accent));
+        }
+        lines.push(Line::from(spans));
     }
     if let Some(title) = details.dearrow_title.as_deref() {
         let alternate_title = format!("DeArrow title: {title}");
@@ -5381,7 +5424,12 @@ fn render_information_panel(
                     }
                 }
                 if !link.prefix.is_empty() {
-                    spans.push(Span::styled(&link.prefix, theme.base));
+                    spans.extend(highlighted_detail_text(
+                        details,
+                        DetailHighlightField::LinkPrefix(*index),
+                        &link.prefix,
+                        theme.base,
+                    ));
                     content_offset =
                         content_offset.saturating_add(terminal_text_width(&link.prefix));
                 }
@@ -5389,17 +5437,27 @@ fn render_information_panel(
                 let external_width = match link.presentation {
                     DetailLinkPresentation::LabelAndUrl
                     | DetailLinkPresentation::LabelAndUrlSpaced => {
-                        spans.extend([
-                            Span::styled(&link.label, theme.base),
-                            Span::styled(" — ", theme.muted),
-                            Span::styled(&link.url, theme.muted),
-                        ]);
+                        spans.extend(highlighted_detail_text(
+                            details,
+                            DetailHighlightField::LinkLabel(*index),
+                            &link.label,
+                            theme.base,
+                        ));
+                        spans.push(Span::styled(" — ", theme.muted));
+                        spans.extend(highlighted_detail_text(
+                            details,
+                            DetailHighlightField::LinkUrl(*index),
+                            &link.url,
+                            theme.muted,
+                        ));
                         terminal_text_width(&link.label)
                             .saturating_add(terminal_text_width(" — "))
                             .saturating_add(terminal_text_width(&link.url))
                     }
                     DetailLinkPresentation::LabelOnly | DetailLinkPresentation::LabelOnlySpaced => {
-                        spans.push(Span::styled(
+                        spans.extend(highlighted_detail_text(
+                            details,
+                            DetailHighlightField::LinkLabel(*index),
                             &link.label,
                             if view.external_opener_available {
                                 theme.accent.add_modifier(Modifier::UNDERLINED)
@@ -5410,7 +5468,9 @@ fn render_information_panel(
                         terminal_text_width(&link.label)
                     }
                     DetailLinkPresentation::UrlOnly | DetailLinkPresentation::UrlOnlySpaced => {
-                        spans.push(Span::styled(
+                        spans.extend(highlighted_detail_text(
+                            details,
+                            DetailHighlightField::LinkUrl(*index),
                             &link.url,
                             if view.external_opener_available {
                                 theme.accent.add_modifier(Modifier::UNDERLINED)
@@ -5763,6 +5823,72 @@ fn append_wikidata_source_spans<'a>(
     }
 }
 
+/// Splits original text only for styling; source offsets and hit boxes stay unchanged.
+fn append_highlighted_detail_source<'a>(
+    details: &DetailView,
+    field: DetailHighlightField,
+    source: &'a str,
+    range: std::ops::Range<usize>,
+    style: Style,
+    spans: &mut Vec<Span<'a>>,
+) {
+    let std::ops::Range { start, end } = range;
+    let Some(group) = details
+        .search_highlights
+        .iter()
+        .find(|group| group.field == field)
+    else {
+        spans.push(Span::styled(&source[start..end], style));
+        return;
+    };
+    let mut cursor = start;
+    let first = group
+        .ranges
+        .partition_point(|range| range.end_byte <= start);
+    for range in group.ranges[first..]
+        .iter()
+        .take_while(|range| range.start_byte < end)
+    {
+        let match_start = range.start_byte.max(start);
+        let match_end = range.end_byte.min(end);
+        if match_start < cursor
+            || match_start >= match_end
+            || !source.is_char_boundary(match_start)
+            || !source.is_char_boundary(match_end)
+        {
+            continue;
+        }
+        if cursor < match_start {
+            spans.push(Span::styled(&source[cursor..match_start], style));
+        }
+        spans.push(Span::styled(
+            &source[match_start..match_end],
+            style.patch(
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ));
+        cursor = match_end;
+    }
+    if cursor < end {
+        spans.push(Span::styled(&source[cursor..end], style));
+    }
+}
+
+/// Styles a complete field without changing its text or terminal width.
+fn highlighted_detail_text<'a>(
+    details: &DetailView,
+    field: DetailHighlightField,
+    text: &'a str,
+    style: Style,
+) -> Vec<Span<'a>> {
+    let mut spans = Vec::new();
+    append_highlighted_detail_source(details, field, text, 0..text.len(), style, &mut spans);
+    spans
+}
+
 /// Appends one source-text token while retaining clickable timecode spans.
 #[allow(
     clippy::too_many_arguments,
@@ -5792,12 +5918,22 @@ fn append_description_source_spans<'a>(
         if source_cursor < start {
             let plain = &source[source_cursor..start];
             *cell_cursor = cell_cursor.saturating_add(terminal_text_width(plain));
-            spans.push(Span::raw(plain));
+            append_highlighted_detail_source(
+                details,
+                DetailHighlightField::Description,
+                source,
+                source_cursor..start,
+                Style::default(),
+                spans,
+            );
         }
         let linked = &source[start..end];
         let linked_width = terminal_text_width(linked);
-        spans.push(Span::styled(
-            linked,
+        append_highlighted_detail_source(
+            details,
+            DetailHighlightField::Description,
+            source,
+            start..end,
             if active_line {
                 theme
                     .active_chapter
@@ -5805,7 +5941,8 @@ fn append_description_source_spans<'a>(
             } else {
                 theme.accent.add_modifier(Modifier::UNDERLINED)
             },
-        ));
+            spans,
+        );
         if let Some(media_id) = details.media_id.as_ref()
             && linked_width > 0
         {
@@ -5828,7 +5965,14 @@ fn append_description_source_spans<'a>(
     if source_cursor < end_byte {
         let plain = &source[source_cursor..end_byte];
         *cell_cursor = cell_cursor.saturating_add(terminal_text_width(plain));
-        spans.push(Span::raw(plain));
+        append_highlighted_detail_source(
+            details,
+            DetailHighlightField::Description,
+            source,
+            source_cursor..end_byte,
+            Style::default(),
+            spans,
+        );
     }
 }
 
@@ -22668,6 +22812,208 @@ for encoded, expected in json.load(sys.stdin):
             ),
             Some(UiAction::BeginDetailsTextSelection(_))
         ));
+    }
+
+    #[test]
+    fn archive_search_highlighting_preserves_unicode_wrapping_and_link_style() {
+        let source = "😀 ПРИВЕТ tail";
+        let start = "😀 ".len();
+        let end = start + "ПРИВЕТ".len();
+        let details = DetailView {
+            search_highlights: vec![DetailHighlightView {
+                field: DetailHighlightField::Description,
+                ranges: vec![DetailHighlightRange {
+                    start_byte: start,
+                    end_byte: end,
+                }],
+            }],
+            ..DetailView::default()
+        };
+        let style = Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::UNDERLINED);
+        let mut restored = String::new();
+        let mut highlighted = String::new();
+        for line in wrap_description_source(source, 4, &[]) {
+            for token in line.tokens {
+                let WrappedDescriptionToken::Source {
+                    start_byte,
+                    end_byte,
+                } = token
+                else {
+                    continue;
+                };
+                let mut spans = Vec::new();
+                append_highlighted_detail_source(
+                    &details,
+                    DetailHighlightField::Description,
+                    source,
+                    start_byte..end_byte,
+                    style,
+                    &mut spans,
+                );
+                for span in spans {
+                    restored.push_str(&span.content);
+                    if span.style.bg == Some(Color::Yellow) {
+                        highlighted.push_str(&span.content);
+                        assert!(span.style.add_modifier.contains(Modifier::UNDERLINED));
+                    }
+                }
+            }
+        }
+        assert_eq!(restored, source);
+        assert_eq!(highlighted, "ПРИВЕТ");
+    }
+
+    #[test]
+    fn archive_search_highlighting_retains_raw_metadata_offsets_after_display_trimming() {
+        let view = ViewModel {
+            screen: Screen::ArchiveOrg,
+            details: Some(DetailView {
+                media_id: Some(MediaId::new(SourceKind::ArchiveOrg, "fixture")),
+                published: "   Jazz  ".to_owned(),
+                search_highlights: vec![DetailHighlightView {
+                    field: DetailHighlightField::Published,
+                    ranges: vec![DetailHighlightRange {
+                        start_byte: 3,
+                        end_byte: 7,
+                    }],
+                }],
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(70, 20)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_details(
+                    frame,
+                    frame.area(),
+                    &view,
+                    true,
+                    0,
+                    &Theme::new(false),
+                    &mut HitMap::default(),
+                    None,
+                )
+            })
+            .unwrap();
+        assert!(rendered_text(&terminal).contains("Uploaded: Jazz"));
+        let highlighted: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .filter(|cell| cell.bg == Color::Yellow)
+            .map(|cell| cell.symbol())
+            .collect();
+        assert_eq!(highlighted, "Jazz");
+    }
+
+    #[test]
+    fn archive_search_highlighting_preserves_description_actions_and_copy_cells() {
+        let text = "Creator: Jazz\nTopics: JAZZ\n00:10 Jazz tail";
+        let timecode_start = text.find("00:10").unwrap();
+        let mut details = DetailView {
+            media_id: Some(MediaId::new(SourceKind::ArchiveOrg, "fixture")),
+            description: text.into(),
+            links: vec![DetailLinkView {
+                label: "Jazz collection".into(),
+                url: "https://archive.org/details/audio".into(),
+                ..DetailLinkView::default()
+            }],
+            timecodes: vec![DetailTimecodeView {
+                start_byte: timecode_start,
+                end_byte: timecode_start + 5,
+                seconds: 10,
+                is_chapter: false,
+            }],
+            ..DetailView::default()
+        };
+        details.search_highlights = vec![
+            DetailHighlightView {
+                field: DetailHighlightField::Description,
+                ranges: vec![
+                    DetailHighlightRange {
+                        start_byte: 9,
+                        end_byte: 13,
+                    },
+                    DetailHighlightRange {
+                        start_byte: timecode_start,
+                        end_byte: timecode_start + 5,
+                    },
+                ],
+            },
+            DetailHighlightView {
+                field: DetailHighlightField::LinkLabel(0),
+                ranges: vec![DetailHighlightRange {
+                    start_byte: 0,
+                    end_byte: 4,
+                }],
+            },
+        ];
+        let mut view = ViewModel {
+            screen: Screen::ArchiveOrg,
+            details: Some(details),
+            external_opener_available: true,
+            text_selection_mode: true,
+            ..ViewModel::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(70, 25)).unwrap();
+        let mut hits = HitMap::default();
+        let draw = |terminal: &mut Terminal<TestBackend>, view: &ViewModel, hits: &mut HitMap| {
+            *hits = HitMap::default();
+            terminal
+                .draw(|frame| {
+                    render_details(
+                        frame,
+                        frame.area(),
+                        view,
+                        true,
+                        0,
+                        &Theme::new(false),
+                        hits,
+                        None,
+                    )
+                })
+                .unwrap();
+        };
+        draw(&mut terminal, &view, &mut hits);
+        let styled_text = rendered_text(&terminal);
+        let styled_links = hits.detail_links.clone();
+        let styled_buttons = hits.detail_buttons.clone();
+        let copied_rows = hits.detail_text_rows.clone();
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .any(|cell| cell.bg == Color::Yellow)
+        );
+        view.details.as_mut().unwrap().search_highlights.clear();
+        draw(&mut terminal, &view, &mut hits);
+        assert_eq!(rendered_text(&terminal), styled_text);
+        assert_eq!(hits.detail_links, styled_links);
+        assert_eq!(hits.detail_buttons, styled_buttons);
+        assert_eq!(
+            hits.detail_text_rows
+                .iter()
+                .map(|row| (row.x, row.y, &row.cells))
+                .collect::<Vec<_>>(),
+            copied_rows
+                .iter()
+                .map(|row| (row.x, row.y, &row.cells))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .any(|cell| cell.bg == Color::Yellow)
+        );
     }
 
     #[test]

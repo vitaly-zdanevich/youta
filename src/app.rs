@@ -11,6 +11,8 @@
 
 #[cfg(feature = "archive-org")]
 mod archive_org;
+#[cfg(feature = "archive-org")]
+mod archive_org_highlight;
 #[cfg(feature = "archive-upload")]
 mod archive_upload;
 #[cfg(all(feature = "yt-dlp", feature = "backend-mpv"))]

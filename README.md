@@ -451,6 +451,12 @@ resolver:
   kept separate from the upload date. F6 opens up to twenty public reviews;
   review stars are not represented as likes. Metadata is fetched lazily on a
   bounded worker; restricted items and private files are not exposed for playback.
+  The submitted search is highlighted literally, ignoring letter case, throughout
+  visible details and metadata in both the TUI and GUI, including Creator and
+  Topics. Editing an unsubmitted search does not change the highlights. Text,
+  wrapping, links, timecodes, and copied content remain unchanged; the compiled
+  [Unicode-aware matcher](https://docs.rs/regex/latest/regex/struct.RegexBuilder.html)
+  and selected item's match ranges are reused until the query or text changes.
   Strong legacy Cyrillic encoding errors in track titles are repaired for display
   using the same conservative handling as local tags. Ambiguous short titles
   require a matching Cyrillic word in the item's description or title. Original

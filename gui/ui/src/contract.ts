@@ -162,14 +162,31 @@ export interface DetailWikidataMediaView {
   title: string;
 }
 
+/** UTF-8 byte bounds into one unchanged Details field. */
+export interface DetailHighlightRange {
+	start_byte: number;
+	end_byte: number;
+}
+
+/** Rust-owned match groups; indexed values refer to the corresponding link. */
+export type DetailHighlightField =
+	| 'Title' | 'Description' | 'ChannelName' | 'Source' | 'Length'
+	| 'Likes' | 'Views' | 'Comments' | 'Published' | 'License'
+	| { LinkLabel: number } | { LinkPrefix: number } | { LinkUrl: number };
+
+/** Case-insensitive literal search matches calculated by the controller. */
+export interface DetailHighlightView {
+	field: DetailHighlightField;
+	ranges: DetailHighlightRange[];
+}
+
 /**
  * The Details panel.
  *
- * Rich description content arrives as *structured* spans — timecodes, video
- * links, Wikidata entities — precisely so that no HTML is ever assembled from a
- * provider string.
+ * Rich description content arrives as structured byte spans, never provider HTML.
  */
 export interface DetailView {
+	search_highlights: DetailHighlightView[];
   media_id: MediaId | null;
   title: string;
   source: string;

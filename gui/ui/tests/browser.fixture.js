@@ -137,6 +137,44 @@
 		await action('ToggleRepeat', () => button('Repeat').click(), 'Repeat click uses the shared global action');
 		await action('ToggleAutoplay', () => button('Autoplay').click(), 'Autoplay click uses the shared global action');
 
+		// Highlight ranges come from the reducer; browser rendering must preserve
+		// the original Unicode text and existing actions even when styles overlap.
+		const description = 'Creator: Vitaly Zdanevich\nTopics: БРЭДБЕРИ\n📚 1:23 Zdanevich & <b>plain text</b>.';
+		const range = (text, match, start = 0) => {
+			const index = text.indexOf(match, start);
+			const prefix = new TextEncoder().encode(text.slice(0, index)).length;
+			return { start_byte: prefix, end_byte: prefix + new TextEncoder().encode(match).length };
+		};
+		const highlighted = { ...details('The Zdanevich collection'), description, license: '\uFEFFééé',
+			links: [{ prefix: 'Uploader: ', label: 'Vitaly Zdanevich', url: 'https://archive.org/details/@fixture',
+				wikidata_item_id: null, presentation: 'LabelAndUrl', internal_target: null }],
+			timecodes: [{ ...range(description, '1:23'), seconds: 83, is_chapter: true }],
+			search_highlights: [
+				{ field: 'Title', ranges: [range('The Zdanevich collection', 'Zdanevich')] },
+				{ field: 'Description', ranges: [range(description, 'Zdanevich'), range(description, 'Zdanevich', 30)] },
+				{ field: { LinkLabel: 0 }, ranges: [range('Vitaly Zdanevich', 'Zdanevich')] },
+				{ field: 'License', ranges: [{ start_byte: 3, end_byte: 5 }, { start_byte: 5, end_byte: 7 }, { start_byte: 7, end_byte: 9 }] },
+			],
+		};
+		snapshot({ details: highlighted });
+		await until(() => document.querySelectorAll('[aria-label=Details] mark').length >= 4, 'search highlights');
+		const licenseValue = [...document.querySelectorAll('[aria-label=Details] dt')].find((node) => node.textContent === 'License').nextElementSibling;
+		assert(licenseValue.textContent === 'ééé', 'Trimming a metadata prefix preserves Unicode match positions and text');
+		assert(licenseValue.querySelectorAll('mark').length === 3, 'All matches in trimmed metadata remain highlighted');
+		assert([...document.querySelectorAll('[aria-label=Details] mark')].filter((node) => node.textContent === 'Zdanevich').length === 4, 'All submitted search matches retain the original case');
+		assert(document.querySelector('[aria-label=Details]').textContent.includes(description), 'Search highlighting preserves the complete description text');
+		assert(!document.querySelector('[aria-label=Details] b'), 'Description markup remains literal text while highlighted');
+		await action({ ActivateDetailLink: 0 }, () => button('Vitaly Zdanevich').click(), 'Highlighted link still dispatches its original action');
+		snapshot({ details: { ...highlighted, search_highlights: [
+			{ field: 'Description', ranges: [range(description, '1:23'), range(description, 'БРЭДБЕРИ')] },
+		] } });
+		await until(() => button('1:23')?.querySelector('mark'), 'highlighted timecode');
+		assert([...document.querySelectorAll('[aria-label=Details] mark')].some((node) => node.textContent === 'БРЭДБЕРИ'), 'UTF-8 highlight positions preserve Cyrillic labels');
+		await action({ ActivateTimecode: { media_id: mediaId, seconds: 83 } }, () => button('1:23').click(), 'Highlighted timecode still seeks to its exact timestamp');
+		snapshot({ details: { ...highlighted, search_highlights: [] } });
+		await until(() => document.querySelectorAll('[aria-label=Details] mark').length === 0, 'cleared highlights');
+		checks.push('Clearing search highlights does not leave stale marks');
+
 		// Upload responses are manually emitted: no reducer or service is faked by
 		// inferring transitions from labels or turning a click into a real upload.
 		const youtubeId = { source: 'you-tube', external_id: 'dQw4w9WgXcQ' };

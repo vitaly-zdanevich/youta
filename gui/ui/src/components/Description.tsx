@@ -1,4 +1,5 @@
 import type {
+  DetailHighlightRange,
   DetailTimecodeView,
   DetailVideoLinkView,
   DetailWikidataEntityView,
@@ -7,6 +8,7 @@ import type {
 import { formatSeconds } from "../format";
 import { dispatch } from "../ipc";
 import { annotate } from "../spans";
+import { SearchHighlight } from './SearchHighlight';
 
 /**
  * A description span, tagged so one pass can render both kinds.
@@ -31,11 +33,13 @@ export function Description({
   timecodes,
   videoLinks,
   mediaId,
+  highlights = [],
 }: {
   text: string;
   timecodes: DetailTimecodeView[];
   videoLinks: DetailVideoLinkView[];
   mediaId: MediaId | null;
+  highlights?: readonly DetailHighlightRange[];
 }) {
   if (text === "") {
     return null;
@@ -72,13 +76,13 @@ export function Description({
                 span.is_chapter ? "text-accent" : "text-ink"
               }`}
             >
-              {covered}
+              <SearchHighlight text={covered} ranges={highlights} offset={span.start_byte} />
             </button>
           );
         }
         return (
           <span key={key}>
-            <span className="text-ink-faint">{covered}</span>
+            <span className="text-ink-faint"><SearchHighlight text={covered} ranges={highlights} offset={span.start_byte} /></span>
             <button
               type="button"
               title="Open this video in Youta"
@@ -96,7 +100,7 @@ export function Description({
             </button>
           </span>
         );
-      })}
+			}, (plain, start) => <SearchHighlight key={`plain-${start}`} text={plain} ranges={highlights} offset={start} />)}
     </div>
   );
 }

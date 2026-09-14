@@ -19,6 +19,9 @@ pub(super) struct ArchiveOrgState {
     items: Vec<ArchiveOrgItem>,
     active: Option<Arc<ArchiveOrgItemDetails>>,
     cache: VecDeque<(String, Result<Arc<ArchiveOrgItemDetails>, String>)>,
+    search_highlighter: super::archive_org_highlight::ArchiveSearchHighlighter,
+    /// Owns the displayed result set; persisted editor drafts may change separately.
+    submitted_query: String,
     next_page: Option<u32>,
     total: u64,
     generation: u64,
@@ -192,6 +195,9 @@ impl AppController {
     /// Starts a new search without reusing another tab's query or results.
     pub(super) fn submit_archive_org_search(&mut self, query: String) {
         self.archive_org_search_query = query.trim().to_owned();
+        self.archive_org
+            .submitted_query
+            .clone_from(&self.archive_org_search_query);
         self.archive_org.items.clear();
         self.archive_org.active = None;
         self.archive_org.next_page = None;
@@ -600,6 +606,9 @@ impl AppController {
                 .loading_wikidata_item
                 .clone_from(&previous.loading_wikidata_item);
         }
+        self.archive_org
+            .search_highlighter
+            .apply(&self.archive_org.submitted_query, &mut detail);
         self.view.details = Some(detail);
         if !same_identity {
             self.view.details_scroll = 0;
@@ -683,7 +692,7 @@ impl AppController {
         {
             self.queue_archive_request(
                 ArchiveRequest::Search(ArchiveOrgSearchRequest {
-                    query: self.archive_org_search_query.clone(),
+                    query: self.archive_org.submitted_query.clone(),
                     page,
                     limit: 50,
                 }),
@@ -1051,6 +1060,94 @@ mod tests {
         controller.view.screen = Screen::History;
         controller.archive_org.initialized = true;
         (directory, controller)
+    }
+
+    #[test]
+    fn archive_search_highlighting_uses_submitted_query_after_draft_save_and_tab_switch() {
+        let (_directory, mut controller) = lookup_controller();
+        controller.view.screen = Screen::ArchiveOrg;
+        // A completed synthetic worker occupies the slot until polled, keeping
+        // submission offline while exercising the real submitted-query path.
+        let occupy_worker = |controller: &mut AppController| {
+            let (_sender, response) = bounded(1);
+            controller.archive_org.worker = Some(ArchiveWorker {
+                job: ArchiveJob {
+                    generation: 0,
+                    kind: ArchiveRequest::Details {
+                        identifier: "fixture".into(),
+                        open: false,
+                    },
+                    due: Instant::now(),
+                },
+                response,
+                thread: thread::spawn(|| {}),
+            });
+        };
+        occupy_worker(&mut controller);
+        controller.submit_archive_org_search("original".to_owned());
+        controller
+            .archive_org
+            .worker
+            .take()
+            .unwrap()
+            .thread
+            .join()
+            .unwrap();
+        // Install the completed search's offline metadata without starting HTTP.
+        controller.archive_org.pending = None;
+        controller.archive_org.request = None;
+        controller.archive_org.active = Some(lookup_details("fixture"));
+        controller.populate_archive_org();
+        let highlights = controller
+            .view
+            .details
+            .as_ref()
+            .unwrap()
+            .search_highlights
+            .clone();
+        assert!(!highlights.is_empty());
+
+        controller.view.search_editing = true;
+        controller.view.search_query = "unsubmitted draft".to_owned();
+        assert!(controller.save_session());
+        controller.update_archive_org_detail();
+        assert_eq!(
+            controller.view.details.as_ref().unwrap().search_highlights,
+            highlights
+        );
+
+        controller.show_screen(Screen::History);
+        controller.show_screen(Screen::ArchiveOrg);
+        assert_eq!(
+            controller.view.details.as_ref().unwrap().search_highlights,
+            highlights
+        );
+        assert!(
+            controller.archive_org.worker.is_none(),
+            "draft restoration must not start a new search"
+        );
+        controller.archive_org.active = None;
+        controller.archive_org.next_page = Some(2);
+        occupy_worker(&mut controller);
+        controller.activate_archive_org_selection();
+        let ArchiveRequest::Search(request) =
+            &controller.archive_org.pending.as_ref().unwrap().kind
+        else {
+            panic!("expected the next search page");
+        };
+        assert_eq!(
+            request.query, "original",
+            "continuation retains the displayed results' query"
+        );
+        assert_eq!(request.page, 2);
+        controller
+            .archive_org
+            .worker
+            .take()
+            .unwrap()
+            .thread
+            .join()
+            .unwrap();
     }
 
     fn lookup_details(identifier: &str) -> Arc<ArchiveOrgItemDetails> {

@@ -39,13 +39,13 @@ use youta::view::EvernoteNotePopupView;
 #[cfg(feature = "archive-upload")]
 use youta::view::{ArchiveCredentialsPopupView, ArchiveUploadPopupView};
 use youta::view::{
-    AudioQualityPopupView, DetailLinkView, DetailTimecodeView, DetailVideoLinkView, DetailView,
-    DetailWikidataEntityView, DownloadChoicePopupView, DownloadView, ErrorPopupView,
-    GitHubIssueSubmissionView, LocalMoveDestinationView, NowPlayingView, PlaylistChoiceView,
-    PlaylistPopupView, PreferencesPopupView, ProjectCommitView, ProjectHistoryPopupView,
-    QueuePopupView, QueueRowView, RowView, SubscriptionsView, VideoCommentView,
-    VideoCommentsPopupView, VideoSummaryPopupView, ViewModel, WaveformView, YtDlpForbiddenView,
-    YtDlpGentooVersionView, YtDlpVersionLookupView,
+    AudioQualityPopupView, DetailHighlightField, DetailHighlightRange, DetailHighlightView,
+    DetailLinkView, DetailTimecodeView, DetailVideoLinkView, DetailView, DetailWikidataEntityView,
+    DownloadChoicePopupView, DownloadView, ErrorPopupView, GitHubIssueSubmissionView,
+    LocalMoveDestinationView, NowPlayingView, PlaylistChoiceView, PlaylistPopupView,
+    PreferencesPopupView, ProjectCommitView, ProjectHistoryPopupView, QueuePopupView, QueueRowView,
+    RowView, SubscriptionsView, VideoCommentView, VideoCommentsPopupView, VideoSummaryPopupView,
+    ViewModel, WaveformView, YtDlpForbiddenView, YtDlpGentooVersionView, YtDlpVersionLookupView,
 };
 use youta::view::{ChannelDownloadOption, ChannelDownloadPopupView};
 #[cfg(feature = "lan-sharing")]
@@ -443,6 +443,20 @@ fn the_typescript_contract_names_only_fields_the_reducer_emits() {
         );
     }
     emitted.insert("DetailView", emitted_keys(&DetailView::default()));
+    emitted.insert(
+        "DetailHighlightRange",
+        emitted_keys(&DetailHighlightRange {
+            start_byte: 0,
+            end_byte: 1,
+        }),
+    );
+    emitted.insert(
+        "DetailHighlightView",
+        emitted_keys(&DetailHighlightView {
+            field: DetailHighlightField::Description,
+            ranges: Vec::new(),
+        }),
+    );
     emitted.insert("RowView", emitted_keys(&RowView::default()));
     emitted.insert("DetailLinkView", emitted_keys(&DetailLinkView::default()));
     emitted.insert(
@@ -717,6 +731,8 @@ fn every_checked_interface_is_actually_declared() {
         "PlaybackStatus",
         "AsciiVisualizerView",
         "DetailView",
+        "DetailHighlightRange",
+        "DetailHighlightView",
         "RowView",
         "DetailLinkView",
         "DetailTimecodeView",

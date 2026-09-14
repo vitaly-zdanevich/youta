@@ -26,6 +26,9 @@ export interface ByteSpan {
 /** Renders one annotated region, given the exact text it covers. */
 export type SpanRenderer<T extends ByteSpan> = (span: T, text: string, key: string) => ReactNode;
 
+/** Optional styling of plain gaps, retaining their original UTF-8 positions. */
+export type PlainSpanRenderer = (text: string, startByte: number, endByte: number) => ReactNode;
+
 const encoder = new TextEncoder();
 // Non-fatal by default: a malformed slice degrades to U+FFFD rather than
 // throwing and blanking the panel. The reducer reports offsets on character
@@ -42,6 +45,7 @@ export function annotate<T extends ByteSpan>(
   text: string,
   spans: readonly T[],
   render: SpanRenderer<T>,
+  renderPlain?: PlainSpanRenderer,
 ): ReactNode {
   if (text === "") {
     return null;
@@ -58,7 +62,8 @@ export function annotate<T extends ByteSpan>(
       continue;
     }
     if (span.start_byte > cursor) {
-      pieces.push(decoder.decode(bytes.subarray(cursor, span.start_byte)));
+			const plain = decoder.decode(bytes.subarray(cursor, span.start_byte));
+			pieces.push(renderPlain ? renderPlain(plain, cursor, span.start_byte) : plain);
     }
     pieces.push(
       render(span, decoder.decode(bytes.subarray(span.start_byte, span.end_byte)), `s${index}`),
@@ -66,7 +71,8 @@ export function annotate<T extends ByteSpan>(
     cursor = span.end_byte;
   }
   if (cursor < bytes.length) {
-    pieces.push(decoder.decode(bytes.subarray(cursor)));
+		const plain = decoder.decode(bytes.subarray(cursor));
+		pieces.push(renderPlain ? renderPlain(plain, cursor, bytes.length) : plain);
   }
   return pieces;
 }

@@ -780,6 +780,8 @@ pub struct DetailView {
     pub length: String,
     /// Description text.
     pub description: String,
+    /// Literal submitted-search matches; ranges refer to unchanged field text.
+    pub search_highlights: Vec<DetailHighlightView>,
     /// Crowdsourced anti-clickbait title displayed alongside the original title.
     pub dearrow_title: Option<String>,
     /// Full Last.fm artist biography discovered after local fingerprinting.
@@ -1350,6 +1352,56 @@ pub struct DetailVideoLinkView {
     pub video_id: String,
     /// Optional initial position encoded in the URL.
     pub start_seconds: Option<u64>,
+}
+
+/// One original-text byte range styled as an active search match.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct DetailHighlightRange {
+    /// Inclusive UTF-8 byte boundary in the named original field.
+    pub start_byte: usize,
+    /// Exclusive UTF-8 byte boundary in the named original field.
+    pub end_byte: usize,
+}
+
+/// One displayed Details field, including the indexed provider link fields.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub enum DetailHighlightField {
+    /// Selected item or file title.
+    Title,
+    /// Full provider description, including its metadata preamble.
+    Description,
+    /// Displayed uploader or channel name.
+    ChannelName,
+    /// Provider label.
+    Source,
+    /// Formatted duration.
+    Length,
+    /// Formatted favourite or like count.
+    Likes,
+    /// Formatted download or view count.
+    Views,
+    /// Formatted comment count.
+    Comments,
+    /// Formatted date.
+    Published,
+    /// Displayed rights or licence text.
+    License,
+    /// Human-readable label of one Details link.
+    LinkLabel(usize),
+    /// Non-clickable prefix before one Details link.
+    LinkPrefix(usize),
+    /// Displayed URL of one Details link.
+    LinkUrl(usize),
+}
+
+/// Sorted, non-overlapping matches belonging to one unmodified Details field.
+/// Styling includes whole graphemes so combining marks and emoji stay intact.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct DetailHighlightView {
+    /// Field whose original UTF-8 bytes own the match offsets.
+    pub field: DetailHighlightField,
+    /// Matching source ranges, in ascending byte order.
+    pub ranges: Vec<DetailHighlightRange>,
 }
 
 /// One selectable external link displayed in a details or channel panel.

@@ -1,10 +1,12 @@
 import { useEffect, useRef } from "react";
 import type { ReactNode } from "react";
 
-import type { DetailLinkView, DetailView, InformationPanelKind, ViewModel } from "../contract";
+import type { DetailHighlightField, DetailLinkView, DetailView, InformationPanelKind, ViewModel } from "../contract";
 import { dispatch } from "../ipc";
+import { highlightRanges } from '../searchHighlights';
 import { Artwork } from "./Artwork";
 import { Description, WikidataSpoiler } from "./Description";
+import { SearchHighlight } from './SearchHighlight';
 
 /**
  * Pixels the reducer's scroll counter steps by.
@@ -18,6 +20,26 @@ const DETAILS_LINE_HEIGHT = 19;
 
 /** Provider identity of YouTube, as `SourceKind` serializes it. */
 const YOUTUBE = "you-tube";
+
+/** Display labels may differ by source while retaining the same DTO field. */
+type FactTextKey = 'length' | 'likes' | 'views' | 'comments' | 'published' | 'source' | 'license';
+const FACT_HIGHLIGHT_FIELDS: Partial<Record<string, [DetailHighlightField, FactTextKey]>> = {
+	Length: ['Length', 'length'], Likes: ['Likes', 'likes'], Favourites: ['Likes', 'likes'],
+	Views: ['Views', 'views'], Downloads: ['Views', 'views'], Comments: ['Comments', 'comments'],
+	Published: ['Published', 'published'], Uploaded: ['Published', 'published'],
+	Source: ['Source', 'source'], License: ['License', 'license'],
+};
+
+/** Trimming is presentation-only: match ranges still refer to the raw DTO text. */
+function FactValue({ details, label, value }: { details: DetailView; label: string; value: string }) {
+	const field = FACT_HIGHLIGHT_FIELDS[label];
+	if (!field) return value;
+	const source = details[field[1]];
+	const start = source.indexOf(value);
+	if (start < 0) return value;
+	const offset = new TextEncoder().encode(source.slice(0, start)).length;
+	return <SearchHighlight text={value} ranges={highlightRanges(details.search_highlights, field[0])} offset={offset} />;
+}
 
 /** Values a provider fills in with a placeholder rather than leaving empty. */
 function fact(value: string | null | undefined): string | null {
@@ -153,6 +175,8 @@ function Links({
           ? details.wikidata_entities.find((value) => value.item_id === link.wikidata_item_id)
           : undefined;
         const label = link.presentation.startsWith("Url") ? link.url : link.label || link.url;
+        const labelField: DetailHighlightField = link.presentation.startsWith('Url') || link.label === ''
+          ? { LinkUrl: index } : { LinkLabel: index };
         const showUrl = link.presentation.startsWith("LabelAndUrl") && link.label !== "";
         // Resolved outside the handler so the union stays narrowed: TypeScript
         // widens `link.internal_target` again inside a closure.
@@ -166,7 +190,7 @@ function Links({
         return (
           <li key={`${link.url}-${index}`}>
             <span className="flex flex-wrap items-baseline gap-x-[6px]">
-              {link.prefix ? <span className="text-ink-faint">{link.prefix}</span> : null}
+              {link.prefix ? <span className="text-ink-faint"><SearchHighlight text={link.prefix} ranges={highlightRanges(details.search_highlights, { LinkPrefix: index })} /></span> : null}
               <button
                 type="button"
                 title={link.url}
@@ -176,10 +200,10 @@ function Links({
                   index === selectedLink ? "text-accent" : "text-ink"
                 }`}
               >
-                {label}
+                <SearchHighlight text={label} ranges={highlightRanges(details.search_highlights, labelField)} />
               </button>
               {showUrl ? (
-                <span className="min-w-0 truncate text-[11px] text-ink-faint">{link.url}</span>
+                <span className="min-w-0 truncate text-[11px] text-ink-faint"><SearchHighlight text={link.url} ranges={highlightRanges(details.search_highlights, { LinkUrl: index })} /></span>
               ) : null}
               {internal !== null ? (
                 <button
@@ -291,10 +315,10 @@ export function Details({ view, kind }: { view: ViewModel; kind: InformationPane
       />
 
       <h2 className="mb-[2px] text-base leading-tight font-bold tracking-tight text-balance">
-        {details.title}
+        <SearchHighlight text={details.title} ranges={highlightRanges(details.search_highlights, 'Title')} />
       </h2>
       {fact(details.channel_name) ? (
-        <p className="mb-[10px] text-xs text-ink-faint">{details.channel_name}</p>
+        <p className="mb-[10px] text-xs text-ink-faint"><SearchHighlight text={details.channel_name} ranges={highlightRanges(details.search_highlights, 'ChannelName')} /></p>
       ) : null}
 
       {facts.length > 0 ? (
@@ -302,7 +326,7 @@ export function Details({ view, kind }: { view: ViewModel; kind: InformationPane
           {facts.map(([label, value]) => (
             <div key={label} className="contents">
               <dt className="text-ink-faint">{label}</dt>
-              <dd className="m-0">{value}</dd>
+							<dd className='m-0'><FactValue details={details} label={label} value={value} /></dd>
             </div>
           ))}
         </dl>
@@ -504,6 +528,7 @@ export function Details({ view, kind }: { view: ViewModel; kind: InformationPane
         timecodes={details.timecodes}
         videoLinks={details.video_links}
         mediaId={details.media_id}
+        highlights={highlightRanges(details.search_highlights, 'Description')}
       />
 
       {kind === "Local" && audioQuality !== null ? (
