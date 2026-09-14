@@ -74,6 +74,7 @@ impl AppController {
             Err(()) => {
                 self.view.status_line =
                     "Previous cache save is still stopping; try again shortly".to_owned();
+                self.defer_manual_download_cache(item, request);
                 return true;
             }
         };

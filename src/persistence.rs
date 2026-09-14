@@ -39,6 +39,7 @@ use crate::domain::{
 use crate::domain::{
     PendingYandexMusicReaction, YandexMusicReaction, YandexMusicReactionLedgerEntry,
 };
+use crate::download_queue::{DownloadQueue, MAX_DOWNLOAD_QUEUE_BYTES};
 #[cfg(all(
     any(feature = "local-rename", feature = "local-move"),
     feature = "sqlite-state"
@@ -384,10 +385,19 @@ const MIGRATIONS: &[&str] = &[
 		AND acknowledged_generation <= generation
 	);
 	",
+    r#"
+	CREATE TABLE download_queue (
+		singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+		generation INTEGER NOT NULL CHECK (generation >= 0),
+		queue_json TEXT NOT NULL CHECK (length(CAST(queue_json AS BLOB)) BETWEEN 2 AND 8388608)
+	);
+	INSERT INTO download_queue (singleton, generation, queue_json)
+	VALUES (1, 0, '{"next_id":1,"entries":[]}');
+	"#,
 ];
 
 /// Current on-disk schema version.
-pub const SCHEMA_VERSION: u32 = 14;
+pub const SCHEMA_VERSION: u32 = 15;
 
 /// One bounded `YouTube` search snapshot retained across application restarts.
 ///
@@ -621,6 +631,8 @@ impl LocalMoveStateRemap {
 #[cfg(feature = "sqlite-state")]
 struct SqliteStateStore {
     connection: Connection,
+    /// Last observed durable queue revision; stale writers cannot overwrite newer work.
+    download_queue_snapshot: std::cell::RefCell<(i64, String)>,
 }
 
 #[cfg(feature = "sqlite-state")]
@@ -668,7 +680,20 @@ impl SqliteStateStore {
         }
 
         run_migrations(&connection)?;
-        Ok(Self { connection })
+        Self::from_connection(connection)
+    }
+
+    /// Captures the current queue revision on an already migrated connection.
+    fn from_connection(connection: Connection) -> Result<Self, PersistenceError> {
+        let snapshot = connection.query_row(
+            "SELECT generation, queue_json FROM download_queue WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok(Self {
+            connection,
+            download_queue_snapshot: std::cell::RefCell::new(snapshot),
+        })
     }
 
     /// Returns the active `SQLite` journal mode.
@@ -3408,6 +3433,10 @@ pub trait StateBackend {
     fn backend_name(&self) -> &'static str;
     /// Returns the backend document or schema version.
     fn format_version(&self) -> Result<u32, PersistenceError>;
+    /// Loads and validates the durable manual-download queue.
+    fn download_queue(&self) -> Result<DownloadQueue, PersistenceError>;
+    /// Atomically saves validated queue intent, refusing external-state conflicts.
+    fn save_download_queue(&self, queue: &DownloadQueue) -> Result<(), PersistenceError>;
     /// Creates an empty playlist idempotently.
     fn create_playlist(
         &self,
@@ -3813,6 +3842,50 @@ impl StateBackend for SqliteStateStore {
 
     fn format_version(&self) -> Result<u32, PersistenceError> {
         self.schema_version()
+    }
+
+    fn download_queue(&self) -> Result<DownloadQueue, PersistenceError> {
+        let (generation, encoded): (i64, String) = self.connection.query_row(
+            "SELECT generation, queue_json FROM download_queue WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if encoded.len() > MAX_DOWNLOAD_QUEUE_BYTES {
+            return Err(PersistenceError::StateDocumentTooLarge {
+                document: "download queue",
+                maximum_bytes: MAX_DOWNLOAD_QUEUE_BYTES,
+            });
+        }
+        let queue: DownloadQueue = serde_json::from_str(&encoded)?;
+        validate_download_queue(&queue)?;
+        self.download_queue_snapshot.replace((generation, encoded));
+        Ok(queue)
+    }
+
+    fn save_download_queue(&self, queue: &DownloadQueue) -> Result<(), PersistenceError> {
+        validate_download_queue(queue)?;
+        let (generation, previous) = self.download_queue_snapshot.borrow().clone();
+        let previous_queue: DownloadQueue = serde_json::from_str(&previous)?;
+        validate_download_queue_replacement(&previous_queue, queue)?;
+        let next_generation =
+            generation
+                .checked_add(1)
+                .ok_or_else(|| PersistenceError::InvalidDownloadQueue {
+                    reason: "download queue generation is exhausted".to_owned(),
+                })?;
+        let encoded = serde_json::to_string(queue)?;
+        let changed = self.connection.execute(
+			"UPDATE download_queue SET queue_json = ?1, generation = ?2 WHERE singleton = 1 AND generation = ?3 AND queue_json = ?4",
+			params![encoded, next_generation, generation, previous],
+		)?;
+        if changed != 1 {
+            return Err(PersistenceError::StateDocumentChangedExternally {
+                document: "download queue",
+            });
+        }
+        self.download_queue_snapshot
+            .replace((next_generation, encoded));
+        Ok(())
     }
 
     fn create_playlist(
@@ -4304,6 +4377,12 @@ pub const ANOTHER_INSTANCE_MESSAGE: &str = "Another instance of Youta is already
 /// Errors raised by the local state store.
 #[derive(Debug, thiserror::Error)]
 pub enum PersistenceError {
+    /// Durable download intent contains invalid metadata or lifecycle state.
+    #[error("download queue is invalid: {reason}")]
+    InvalidDownloadQueue {
+        /// Fixed invariant diagnostic, without source URLs or downloader output.
+        reason: String,
+    },
     /// Application-directory preparation failed.
     #[error(transparent)]
     Config(#[from] ConfigError),
@@ -4570,6 +4649,39 @@ fn invalid_playlist(reason: impl Into<String>) -> PersistenceError {
     PersistenceError::InvalidPlaylist {
         reason: reason.into(),
     }
+}
+
+/// Applies one feature-independent queue boundary to both storage formats.
+fn validate_download_queue(queue: &DownloadQueue) -> Result<(), PersistenceError> {
+    queue
+        .validate()
+        .map_err(|reason| PersistenceError::InvalidDownloadQueue { reason })
+}
+
+/// Prevents deleted identities and stale attempt owners from becoming current again.
+fn validate_download_queue_replacement(
+    previous: &DownloadQueue,
+    next: &DownloadQueue,
+) -> Result<(), PersistenceError> {
+    let existing: HashMap<_, _> = previous
+        .entries
+        .iter()
+        .map(|entry| (entry.id, entry.attempt))
+        .collect();
+    if next.next_id < previous.next_id
+        || next
+            .entries
+            .iter()
+            .any(|entry| match existing.get(&entry.id) {
+                Some(attempt) => entry.attempt < *attempt,
+                None => entry.id < previous.next_id,
+            })
+    {
+        return Err(PersistenceError::InvalidDownloadQueue {
+            reason: "download identifiers and attempts must never be reused or decrease".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 fn validate_playlist_timestamp(timestamp: i64) -> Result<(), PersistenceError> {
@@ -7923,7 +8035,7 @@ mod tests {
             .expect("seed version-four session");
 
         run_migrations(&connection).expect("migrate to current schema");
-        let store = StateStore { connection };
+        let store = StateStore::from_connection(connection).expect("capture migrated queue state");
         assert_eq!(
             store.schema_version().expect("schema version"),
             SCHEMA_VERSION
@@ -7970,7 +8082,7 @@ mod tests {
             .expect("seed version-five session");
 
         run_migrations(&connection).expect("migrate to current schema");
-        let store = StateStore { connection };
+        let store = StateStore::from_connection(connection).expect("capture migrated queue state");
         assert_eq!(
             store.schema_version().expect("schema version"),
             SCHEMA_VERSION
@@ -8017,7 +8129,7 @@ mod tests {
             .expect("seed version-six session");
 
         run_migrations(&connection).expect("migrate to current schema");
-        let store = StateStore { connection };
+        let store = StateStore::from_connection(connection).expect("capture migrated queue state");
         assert_eq!(
             store.schema_version().expect("schema version"),
             SCHEMA_VERSION
@@ -8061,7 +8173,7 @@ mod tests {
             .expect("seed version-seven history");
 
         run_migrations(&connection).expect("migrate to current schema");
-        let store = StateStore { connection };
+        let store = StateStore::from_connection(connection).expect("capture migrated queue state");
         let entries = store.history(false, 10).expect("migrated history");
 
         assert_eq!(
@@ -8108,7 +8220,7 @@ mod tests {
             .expect("seed version-eight session");
 
         run_migrations(&connection).expect("migrate to current schema");
-        let store = StateStore { connection };
+        let store = StateStore::from_connection(connection).expect("capture migrated queue state");
         let restored = store
             .session()
             .expect("load migrated session")
@@ -8174,7 +8286,7 @@ mod tests {
             .expect("seed version-nine Apple snapshot");
 
         run_migrations(&connection).expect("migrate to current schema");
-        let store = StateStore { connection };
+        let store = StateStore::from_connection(connection).expect("capture migrated queue state");
         let restored = store
             .session()
             .expect("load migrated session")
@@ -8219,7 +8331,7 @@ mod tests {
         }
 
         run_migrations(&connection).expect("migrate to current schema");
-        let store = StateStore { connection };
+        let store = StateStore::from_connection(connection).expect("capture migrated queue state");
         let mapping = LocalMoveMapping {
             source: PathBuf::from("/music/source.flac"),
             target: PathBuf::from("/archive/source.flac"),
@@ -8268,7 +8380,7 @@ mod tests {
             .expect("seed version-eleven progress");
 
         run_migrations(&connection).expect("migrate to current schema");
-        let store = StateStore { connection };
+        let store = StateStore::from_connection(connection).expect("capture migrated queue state");
 
         assert_eq!(
             store.schema_version().expect("schema version"),
@@ -8322,7 +8434,7 @@ mod tests {
             .expect("seed version-twelve progress");
 
         run_migrations(&connection).expect("migrate to current schema");
-        let store = StateStore { connection };
+        let store = StateStore::from_connection(connection).expect("capture migrated queue state");
 
         assert_eq!(
             store.schema_version().expect("schema version"),
@@ -8374,7 +8486,7 @@ mod tests {
             .expect("seed version-thirteen reaction");
 
         run_migrations(&connection).expect("migrate to current schema");
-        let store = StateStore { connection };
+        let store = StateStore::from_connection(connection).expect("capture migrated queue state");
 
         assert_eq!(
             store
@@ -11658,6 +11770,205 @@ mod tests {
                 .cached_wikidata("P6456", "BV1xx411c7mD")
                 .expect("load fresh lookup")
                 .is_some()
+        );
+    }
+}
+
+#[cfg(test)]
+mod download_queue_tests {
+    use super::*;
+    use crate::download_queue::{DownloadQueueState, QueuedDownloadFormat};
+
+    /// Both backends retain order, choices, attempt ownership, and terminal records.
+    fn assert_backend_contract(store: &dyn StateBackend) {
+        let mut queue = crate::download_queue::tests::fixture();
+        assert_eq!(store.download_queue().unwrap(), DownloadQueue::default());
+        store.save_download_queue(&queue).unwrap();
+        assert_eq!(store.download_queue().unwrap(), queue);
+        queue.entries[0].state = DownloadQueueState::Running;
+        queue.entries[0].attempt = 2;
+        store.save_download_queue(&queue).unwrap();
+        let mut recovered = store.download_queue().unwrap();
+        assert!(recovered.recover_running());
+        assert_eq!(
+            recovered.entries[0].format,
+            Some(QueuedDownloadFormat::BestVideo)
+        );
+        store.save_download_queue(&recovered).unwrap();
+        let mut invalid = recovered.clone();
+        invalid.entries[0]
+            .source
+            .download_url
+            .set_query(Some("token=private"));
+        assert!(store.save_download_queue(&invalid).is_err());
+        assert_eq!(store.download_queue().unwrap(), recovered);
+        queue.entries[0].state = DownloadQueueState::Completed;
+        queue.entries[0].completed_path = Some(PathBuf::from("fixture.mp4"));
+        store.save_download_queue(&queue).unwrap();
+        assert_eq!(store.download_queue().unwrap(), queue);
+        let mut stale = queue.clone();
+        stale.entries[0].attempt = 1;
+        assert!(store.save_download_queue(&stale).is_err());
+        assert!(
+            store
+                .save_download_queue(&DownloadQueue::default())
+                .is_err()
+        );
+        let mut cleared = queue.clone();
+        cleared.entries.clear();
+        store.save_download_queue(&cleared).unwrap();
+        assert!(
+            store.save_download_queue(&queue).is_err(),
+            "removed identifiers cannot be resurrected"
+        );
+    }
+
+    #[test]
+    fn file_download_queue_matches_backend_contract() {
+        assert_backend_contract(&FileStateStore::open_in_memory().unwrap());
+    }
+
+    #[cfg(feature = "sqlite-state")]
+    #[test]
+    fn sqlite_download_queue_matches_backend_contract() {
+        assert_backend_contract(&SqliteStateStore::open_in_memory().unwrap());
+    }
+
+    #[test]
+    fn file_download_queue_survives_restart_and_rejects_external_edits() {
+        let directory = crate::test_support::canonical_tempdir("download queue persistence");
+        let config = Config::for_dir(directory.path().join("youta"));
+        let queue = crate::download_queue::tests::fixture();
+        {
+            let store = StateStore::open(&config).unwrap();
+            store.save_download_queue(&queue).unwrap();
+        }
+        let store = StateStore::open(&config).unwrap();
+        assert_eq!(store.download_queue().unwrap(), queue);
+        let path = config.state_dir().join("downloads.toml");
+        let edited = format!("{}\n# user edit\n", std::fs::read_to_string(&path).unwrap());
+        std::fs::write(&path, &edited).unwrap();
+        assert!(matches!(
+            store.save_download_queue(&queue),
+            Err(PersistenceError::StateDocumentChangedExternally {
+                document: "download queue"
+            })
+        ));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
+        drop(store);
+        assert_eq!(
+            StateStore::open(&config).unwrap().download_queue().unwrap(),
+            queue
+        );
+    }
+
+    #[test]
+    fn file_download_queue_upgrades_legacy_manifest_but_never_recreates_lost_work() {
+        let directory = crate::test_support::canonical_tempdir("download queue manifest migration");
+        let config = Config::for_dir(directory.path().join("youta"));
+        drop(StateStore::open(&config).unwrap());
+        let path = config.state_dir().join("downloads.toml");
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(
+            config.state_dir().join("manifest.toml"),
+            "format_version = 1\nbackend = 'files'\n",
+        )
+        .unwrap();
+        let queue = crate::download_queue::tests::fixture();
+        {
+            let store = StateStore::open(&config).unwrap();
+            assert_eq!(store.download_queue().unwrap(), DownloadQueue::default());
+            store.save_download_queue(&queue).unwrap();
+        }
+        std::fs::remove_file(&path).unwrap();
+        assert!(StateStore::open(&config).is_err());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn file_download_queue_corruption_is_preserved_for_repair() {
+        let directory = crate::test_support::canonical_tempdir("corrupt download queue");
+        let config = Config::for_dir(directory.path().join("youta"));
+        drop(StateStore::open(&config).unwrap());
+        let path = config.state_dir().join("downloads.toml");
+        let corrupt = "format_version = 1\nqueue = 'corrupt'\n";
+        std::fs::write(&path, corrupt).unwrap();
+        assert!(StateStore::open(&config).is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), corrupt);
+    }
+
+    #[cfg(feature = "sqlite-state")]
+    #[test]
+    fn sqlite_download_queue_detects_other_writer_and_survives_restart() {
+        let directory = crate::test_support::canonical_tempdir("concurrent download queue");
+        let config = Config::for_dir(directory.path().join("youta"));
+        let first = SqliteStateStore::open(&config).unwrap();
+        let second = SqliteStateStore::open(&config).unwrap();
+        let queue = crate::download_queue::tests::fixture();
+        first.save_download_queue(&queue).unwrap();
+        assert!(matches!(
+            second.save_download_queue(&DownloadQueue::default()),
+            Err(PersistenceError::StateDocumentChangedExternally {
+                document: "download queue"
+            })
+        ));
+        assert_eq!(second.download_queue().unwrap(), queue);
+        drop(first);
+        drop(second);
+        assert_eq!(
+            SqliteStateStore::open(&config)
+                .unwrap()
+                .download_queue()
+                .unwrap(),
+            queue
+        );
+    }
+
+    #[cfg(feature = "sqlite-state")]
+    #[test]
+    fn sqlite_download_queue_refuses_raw_edits_without_a_generation_bump() {
+        let store = SqliteStateStore::open_in_memory().unwrap();
+        let queue = crate::download_queue::tests::fixture();
+        let edited = serde_json::to_string(&queue).unwrap();
+        store
+            .connection
+            .execute("UPDATE download_queue SET queue_json = ?1", [edited])
+            .unwrap();
+        assert!(matches!(
+            store.save_download_queue(&DownloadQueue::default()),
+            Err(PersistenceError::StateDocumentChangedExternally {
+                document: "download queue"
+            })
+        ));
+        assert_eq!(store.download_queue().unwrap(), queue);
+    }
+
+    #[cfg(feature = "sqlite-state")]
+    #[test]
+    fn sqlite_download_queue_migration_from_v14_preserves_existing_progress() {
+        let directory = crate::test_support::canonical_tempdir("download queue sqlite migration");
+        let config = Config::for_dir(directory.path().join("youta"));
+        config.ensure_directories().unwrap();
+        let connection = Connection::open(config.database_file()).unwrap();
+        for migration in &MIGRATIONS[..14] {
+            connection.execute_batch(migration).unwrap();
+        }
+        connection.pragma_update(None, "user_version", 14).unwrap();
+        connection.execute("INSERT INTO playback_progress (source, external_id, position_seconds, updated_at) VALUES ('youtube', 'fixture', 17, 1)", []).unwrap();
+        drop(connection);
+        let store = SqliteStateStore::open(&config).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 15);
+        assert_eq!(store.download_queue().unwrap(), DownloadQueue::default());
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT position_seconds FROM playback_progress WHERE external_id = 'fixture'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            17
         );
     }
 }

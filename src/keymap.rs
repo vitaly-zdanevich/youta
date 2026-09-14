@@ -34,6 +34,8 @@ pub enum Key {
     Backspace,
     /// Delete.
     Delete,
+    /// Insert, used to mark a playable row for downloading.
+    Insert,
     /// Tab.
     Tab,
     /// Back-tab, where the source reports it as a distinct key.
@@ -219,6 +221,76 @@ mod wire_tests {
             }
             .chorded()
         );
+    }
+
+    /// Both downloader implementations expose the same cancellation command.
+    #[cfg(any(feature = "yt-dlp", feature = "yandex-music"))]
+    #[test]
+    fn active_download_cancellation_is_independent_of_download_backend() {
+        let view = ViewModel {
+            download: Some(crate::view::DownloadView {
+                active: true,
+                ..crate::view::DownloadView::default()
+            }),
+            ..ViewModel::default()
+        };
+        assert_eq!(
+            key_action(KeyPress::new(Key::Char('C')), &view, None, None),
+            Some(UiAction::CancelDownload)
+        );
+    }
+
+    /// Download controls remain modal and resolve selection to persistent job IDs.
+    #[test]
+    fn download_queue_keys_target_stable_entries_and_block_background_actions() {
+        use crate::view::{DownloadQueueEntryView, DownloadQueuePopupView};
+        let mut view = ViewModel::default();
+        assert_eq!(
+            key_action(KeyPress::new(Key::Insert), &view, None, None),
+            Some(UiAction::ToggleDownloadMark)
+        );
+        assert_eq!(
+            key_action(
+                KeyPress {
+                    ctrl: true,
+                    ..KeyPress::new(Key::Char('d'))
+                },
+                &view,
+                None,
+                None
+            ),
+            Some(UiAction::OpenDownloadQueue)
+        );
+        view.download_queue_popup = Some(DownloadQueuePopupView {
+            entries: vec![
+                DownloadQueueEntryView {
+                    id: 7,
+                    title: "First".to_owned(),
+                    state: "Failed".to_owned(),
+                },
+                DownloadQueueEntryView {
+                    id: 42,
+                    title: "Second".to_owned(),
+                    state: "Queued".to_owned(),
+                },
+            ],
+            selected: 0,
+        });
+        for (key, action) in [
+            (Key::Down, Some(UiAction::SelectDownloadQueueEntry(42))),
+            (Key::Char('r'), Some(UiAction::RetryQueuedDownload(7))),
+            (Key::Delete, Some(UiAction::CancelQueuedDownload(7))),
+            (Key::Esc, Some(UiAction::DismissDownloadQueue)),
+            (Key::Char('d'), None),
+            (Key::Insert, None),
+            (Key::Char('q'), None),
+        ] {
+            assert_eq!(key_action(KeyPress::new(key), &view, None, None), action);
+        }
+        view.download_queue_popup.as_mut().unwrap().entries.clear();
+        for key in [Key::Down, Key::Char('r'), Key::Delete] {
+            assert_eq!(key_action(KeyPress::new(key), &view, None, None), None);
+        }
     }
 
     /// Format choices remain modal over a background query and reject empty confirmation.
@@ -1765,6 +1837,36 @@ fn unfiltered_key_action(
             _ => None,
         };
     }
+    if let Some(popup) = view.download_queue_popup.as_ref() {
+        let selected = popup.selected.min(popup.entries.len().saturating_sub(1));
+        let entry = popup.entries.get(selected);
+        let index = match key.key {
+            Key::Up | Key::Char('k') => Some(selected.saturating_sub(1)),
+            Key::Down | Key::Char('j') => Some(
+                selected
+                    .saturating_add(1)
+                    .min(popup.entries.len().saturating_sub(1)),
+            ),
+            Key::Home => Some(0),
+            Key::End => Some(popup.entries.len().saturating_sub(1)),
+            _ => None,
+        };
+        return if let Some(index) = index {
+            popup
+                .entries
+                .get(index)
+                .map(|entry| UiAction::SelectDownloadQueueEntry(entry.id))
+        } else {
+            match key.key {
+                Key::Esc => Some(UiAction::DismissDownloadQueue),
+                Key::Char('r') => entry.map(|entry| UiAction::RetryQueuedDownload(entry.id)),
+                Key::Char('x') | Key::Delete => {
+                    entry.map(|entry| UiAction::CancelQueuedDownload(entry.id))
+                }
+                _ => None,
+            }
+        };
+    }
     #[cfg(feature = "yt-dlp")]
     if view.channel_download_popup.is_some() {
         return match key.key {
@@ -2002,6 +2104,7 @@ fn unfiltered_key_action(
     let wikidata_link_index = keyboard_wikidata_link_index(view);
     match key.key {
         Key::Char('q') => Some(UiAction::Quit),
+        Key::Char('d' | 'D') if key.ctrl && !key.alt => Some(UiAction::OpenDownloadQueue),
         #[cfg(feature = "qr")]
         Key::Char('Q')
             if !key.chorded()
@@ -2050,7 +2153,7 @@ fn unfiltered_key_action(
         Key::Char('v') => Some(UiAction::ToggleSearchKind),
         Key::Char('N') => Some(UiAction::ToggleYouTubeSearchSort),
         Key::Char('n') if key.ctrl => Some(UiAction::PlayNext),
-        #[cfg(feature = "yt-dlp")]
+        #[cfg(any(feature = "yt-dlp", feature = "yandex-music"))]
         Key::Char('C')
             if view
                 .download
@@ -2378,6 +2481,7 @@ fn unfiltered_key_action(
         Key::Backspace => Some(UiAction::GoBack),
         Key::Char('n') if !key.modified() => Some(UiAction::EditPrivateNote),
         Key::Char('a') => Some(UiAction::AddToQueue),
+        Key::Insert if !key.modified() => Some(UiAction::ToggleDownloadMark),
         Key::Char('d') => Some(UiAction::Download),
         Key::Char('o') => Some(UiAction::OpenInBrowser),
         Key::Char('O') if view.screen == Screen::Radio => Some(UiAction::OpenInBrowser),

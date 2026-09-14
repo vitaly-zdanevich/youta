@@ -2034,6 +2034,28 @@ page. The detailed disk bounds are documented in
 
 ### Manual download choices
 
+Press `Insert` to mark/unmark playable remote items, then `d` to enqueue the
+marked batch. With no marks, `d` enqueues the selected item. Marks retain their
+source identities and insertion order across navigation; they do not change
+the playback queue. In the GUI, `Ctrl`+click selects and marks a row.
+
+`Ctrl+D` opens the persistent download queue. Use Up/Down or click
+to select an entry, `r` to retry a failed/cancelled entry, `x` or Delete to
+cancel an entry, and Esc to close. `[C]` cancels the active transfer without
+discarding other queued items. One transfer runs at a time, including native
+Yandex Music downloads. Closing Youta stops its workers; pending/interrupted
+jobs resume on the next start. An interrupted transfer may restart rather than
+resume its bytes. Confirmed output choices survive restarts and retries.
+
+`[x]` means marked for download; `↓` means this queue saved a file that still
+exists in the downloads directory. File existence is rechecked periodically,
+not on every repaint. These indicators are separate from playback progress and
+Local move-selection marks. Older downloads without a source record are not
+guessed from filenames. Queue state uses `state/downloads.toml` with file
+persistence or the selected SQLite backend; credentials and resolved signed
+streams are never stored in it. Credential-bearing direct URLs cannot be
+persisted as download jobs. Local files are already local and are not queued.
+
 Manual YouTube downloads ask whether to keep video and audio or save audio
 only. YouTube's available streams are already encoded by YouTube; these are
 not the uploader's original source file. No additional re-encoding is used.

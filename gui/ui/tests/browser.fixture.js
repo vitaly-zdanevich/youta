@@ -139,6 +139,23 @@
 		const item = await until(() => button('Fixture archive item', document.querySelector('[aria-label=Results]')), 'catalogue item');
 		await action({ SelectRow: 0 }, () => item.click(), 'Catalogue click selects its row');
 		await action('ActivateSelection', () => item.dispatchEvent(new MouseEvent('dblclick', { bubbles: true })), 'Catalogue double click requests item tracks');
+		await key('Insert', 'Insert');
+		await key('d', { Char: 'd' }, { ctrlKey: true });
+		await action({ ToggleDownloadMarkAt: 0 }, () => item.dispatchEvent(new MouseEvent('click', { bubbles: true, ctrlKey: true })), 'Ctrl-click marks the exact catalogue row');
+		snapshot({ rows: [{ ...row('Fixture archive item'), download_marked: true, downloaded: true }] });
+		await until(() => document.querySelector('[aria-label="Marked for download"]'), 'marked download row');
+		assert(Boolean(document.querySelector('[aria-label="Downloaded"]')), 'Downloaded marker remains separate from the download selection mark');
+		snapshot({ download_queue_popup: { entries: [
+			{ id: 7, title: 'Failed fixture download', state: 'Failed' },
+			{ id: 42, title: 'Waiting fixture download', state: 'Queued' },
+		], selected: 0 } });
+		await until(() => dialog()?.textContent.includes('Download queue'), 'persistent download queue');
+		await action({ SelectDownloadQueueEntry: 42 }, () => button('Waiting fixture download · Queued', dialog()).click(), 'Download queue selection carries its stable job identity');
+		await action({ RetryQueuedDownload: 7 }, () => button('Retry', dialog()).click(), 'Download retry targets the selected stable job');
+		await action({ CancelQueuedDownload: 7 }, () => button('Cancel download', dialog()).click(), 'Download cancellation targets the selected stable job');
+		await action('DismissDownloadQueue', () => button('Close', dialog()).click(), 'Closing the download queue is distinct from cancellation');
+		snapshot({ download_queue_popup: null });
+		await until(() => !dialog(), 'closed download queue');
 		snapshot({ rows: [row('First fixture track'), row('Second fixture track', { ...mediaId, external_id: mediaId.external_id.replace('first', 'second') })], details: details('First fixture track') });
 		const track = await until(() => button('First fixture track', document.querySelector('[aria-label=Results]')), 'track rows');
 		assert(document.querySelector('[aria-label=Results]').textContent.includes('Second fixture track'), 'Item snapshot displays all fixture tracks');

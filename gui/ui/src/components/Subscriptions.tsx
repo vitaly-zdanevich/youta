@@ -246,7 +246,12 @@ function Pane({
                 <button
                   type="button"
 							aria-current={current}
-							onClick={() => onSelect(item.index)}
+							onClick={(event) => {
+								onSelect(item.index);
+								if (event.ctrlKey && pane === 'Items') {
+									void dispatch({ ToggleDownloadMarkAt: item.index });
+								}
+							}}
                   onDoubleClick={() => void dispatch("ActivateSelection")}
 							className={`grid h-full w-full grid-cols-[14px_28px_minmax(0,1fr)] items-center gap-[8px] rounded-[5px] px-2 text-left focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-accent ${
 								current ? "bg-raised" : ""
@@ -261,6 +266,8 @@ function Pane({
 										className={`block truncate ${current ? "text-accent" : ""}`}
                     >
                       {row.title}
+										{row.download_marked ? <span aria-label='Marked for download' title='Marked for download' className='ml-2 text-accent'>[x]</span> : null}
+										{row.downloaded ? <span aria-label='Downloaded' title='Downloaded' className='ml-2 text-accent'>↓</span> : null}
                     </span>
                     {row.subtitle ? (
                       <span className="block truncate text-[11px] text-ink-faint">

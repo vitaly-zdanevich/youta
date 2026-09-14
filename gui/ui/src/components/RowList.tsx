@@ -71,7 +71,9 @@ export function RowList({
               key={item.key}
               type="button"
               aria-current={current}
-              onClick={() => void dispatch({ SelectRow: item.index })}
+				onClick={(event) => void dispatch(event.ctrlKey
+					? { ToggleDownloadMarkAt: item.index }
+					: { SelectRow: item.index })}
               onDoubleClick={() => void dispatch("ActivateSelection")}
               className={`absolute top-0 left-0 grid w-full grid-cols-[28px_34px_minmax(0,1fr)_auto] items-center gap-[10px] rounded-[5px] px-2 text-left focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-accent ${
                 current ? "bg-raised" : ""
@@ -88,6 +90,8 @@ export function RowList({
                   className={`block truncate font-medium ${current ? "text-accent" : ""}`}
                 >
                   {row.title}
+					{row.download_marked ? <span aria-label='Marked for download' title='Marked for download' className='ml-2 text-accent'>[x]</span> : null}
+					{row.downloaded ? <span aria-label='Downloaded' title='Downloaded' className='ml-2 text-accent'>↓</span> : null}
                 </span>
                 {row.subtitle ? (
                   <span className="block truncate text-[11px] text-ink-faint">

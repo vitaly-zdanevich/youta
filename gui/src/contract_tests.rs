@@ -459,6 +459,18 @@ fn the_typescript_contract_names_only_fields_the_reducer_emits() {
         }),
     );
     emitted.insert("RowView", emitted_keys(&RowView::default()));
+    emitted.insert(
+        "DownloadQueuePopupView",
+        emitted_keys(&youta::view::DownloadQueuePopupView::default()),
+    );
+    emitted.insert(
+        "DownloadQueueEntryView",
+        emitted_keys(&youta::view::DownloadQueueEntryView {
+            id: 7,
+            title: "Fixture".to_owned(),
+            state: "Queued".to_owned(),
+        }),
+    );
     emitted.insert("DetailLinkView", emitted_keys(&DetailLinkView::default()));
     emitted.insert(
         "DetailUrlEscapeView",
@@ -762,6 +774,8 @@ fn every_checked_interface_is_actually_declared() {
         "PreferencesPopupView",
         "DownloadChoicePopupView",
         "PlaylistPopupView",
+        "DownloadQueueEntryView",
+        "DownloadQueuePopupView",
         "PlaylistChoiceView",
         "LocalMoveDestinationView",
         "DownloadView",

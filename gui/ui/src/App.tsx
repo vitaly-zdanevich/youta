@@ -18,7 +18,8 @@ import {
 	ArchiveUploadPopup,
 	ArchiveCredentialsPopup,
   ChannelDownloadPopup,
-	DownloadChoicePopup,
+		DownloadChoicePopup,
+		DownloadQueuePopup,
   CommonsCredentialsPopup,
   CommonsUploadPopup,
   CredentialEditorNotice,
@@ -237,7 +238,8 @@ export function App() {
 		{view.channel_download_popup ? (
 			<ChannelDownloadPopup popup={view.channel_download_popup} />
 		) : null}
-		{view.download_choice_popup ? <DownloadChoicePopup popup={view.download_choice_popup} /> : null}
+			{view.download_queue_popup ? <DownloadQueuePopup popup={view.download_queue_popup} /> : null}
+			{view.download_choice_popup ? <DownloadChoicePopup popup={view.download_choice_popup} /> : null}
       {view.playlist_popup ? <PlaylistPopup popup={view.playlist_popup} /> : null}
       {view.queue_popup ? <QueuePopup popup={view.queue_popup} /> : null}
       {view.private_note_open ? <CredentialEditorNotice editor="private_note" /> : null}

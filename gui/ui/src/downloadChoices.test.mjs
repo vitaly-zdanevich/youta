@@ -67,6 +67,74 @@ test('download chooser renders reducer labels and confirms exact option indices'
 	assert.ok(nodes(tree).every((node) => !node.props.dangerouslySetInnerHTML));
 });
 
+test('persistent download queue selects, retries and cancels exact stable entries', () => {
+	assert.equal(typeof module.exports.DownloadQueuePopup, 'function');
+	actions.length = 0;
+	const popup = { entries: [
+		{ id: 7, title: 'Failed <track>', state: 'Failed' },
+		{ id: 42, title: 'Waiting track', state: 'Queued' },
+	], selected: 0 };
+	const tree = module.exports.DownloadQueuePopup({ popup });
+	const buttons = nodes(tree).filter((node) => node.type === 'button');
+	buttons.find((node) => text(node).includes('Waiting track')).props.onClick();
+	assert.deepEqual(actions.pop(), [{ SelectDownloadQueueEntry: 42 }]);
+	buttons.find((node) => text(node) === 'Retry').props.onClick();
+	assert.deepEqual(actions.pop(), [{ RetryQueuedDownload: 7 }]);
+	buttons.find((node) => text(node) === 'Cancel download').props.onClick();
+	assert.deepEqual(actions.pop(), [{ CancelQueuedDownload: 7 }]);
+	buttons.find((node) => text(node) === 'Close').props.onClick();
+	assert.deepEqual(actions.pop(), ['DismissDownloadQueue']);
+	assert.ok(nodes(tree).every((node) => !node.props.dangerouslySetInnerHTML));
+	const empty = nodes(module.exports.DownloadQueuePopup({ popup: { entries: [], selected: 0 } }));
+	assert.equal(empty.some((node) => node.type === 'button' && text(node) === 'Retry'), false);
+});
+
+/** Exercise rendered row semantics with deterministic virtual rows and inert effects. */
+test('normal and subscription rows distinguish marks from downloaded files and dispatch Ctrl-click', async () => {
+	const load = async (file) => {
+		const code = ts.transpileModule(await readFile(new URL(file, import.meta.url), 'utf8'), {
+			compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX },
+		}).outputText;
+		const loaded = { exports: {} };
+		const rowRequire = (name) => {
+			if (name === 'react') return { ...React, useEffect: () => {}, useRef: (current) => ({ current }) };
+			if (name === '@tanstack/react-virtual') return { useVirtualizer: ({ count }) => ({
+				getTotalSize: () => count * 46,
+				getVirtualItems: () => Array.from({ length: count }, (_, index) => ({ index, key: index, size: 46, start: index * 46 })),
+			}) };
+			if (name === './Artwork') return { Artwork: () => null };
+			if (name === '../subscriptionPageRows') return { SUBSCRIPTION_ROW_HEIGHT: 46 };
+			return mockRequire(name);
+		};
+		new Function('require', 'module', 'exports', code)(rowRequire, loaded, loaded.exports);
+		return loaded.exports;
+	};
+	const { RowList } = await load('./components/RowList.tsx');
+	const { Subscriptions } = await load('./components/Subscriptions.tsx');
+	for (const marked of [false, true]) {
+		for (const downloaded of [false, true]) {
+			const row = { title: 'Fixture track', media_id: null, download_marked: marked, downloaded };
+			const trees = [
+				RowList({ rows: [row], selected: 0, playing: null }),
+				Subscriptions({ subscriptions: {
+					layout: 'drill-down', route: 'Items', focus: 'Items', items: [row], selected_item: 0,
+					source_kind: 'rss', source_title: 'Fixture feed', source_generation: 1,
+				}, playing: null, details: null }),
+			];
+			for (const tree of trees) {
+				const rendered = nodes(tree);
+				assert.equal(rendered.some((node) => node.props['aria-label'] === 'Marked for download'), marked);
+				assert.equal(rendered.some((node) => node.props['aria-label'] === 'Downloaded'), downloaded);
+				const button = rendered.find((node) => node.type === 'button' && text(node).includes('Fixture track'));
+				actions.length = 0;
+				button.props.onClick({ ctrlKey: true });
+				assert.deepEqual(actions.at(-1), [{ ToggleDownloadMarkAt: 0 }]);
+				assert.equal(nodes(button).filter((node) => node.type === 'button').length, 1);
+			}
+		}
+	}
+});
+
 test('download preferences show typed values and gate unsupported source capabilities', () => {
 	for (const [enabled, archiveSupported] of [[false, false], [false, true], [true, false], [true, true]]) {
 		actions.length = 0;

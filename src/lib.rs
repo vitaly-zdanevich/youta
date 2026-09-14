@@ -34,6 +34,7 @@ pub mod commons_upload;
 pub mod config;
 pub mod diagnostics;
 pub mod domain;
+pub mod download_queue;
 pub mod durability;
 #[cfg(feature = "evernote")]
 pub mod evernote;

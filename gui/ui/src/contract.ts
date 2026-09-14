@@ -77,6 +77,10 @@ export interface RowView {
   compact: boolean;
   radio_favorite: boolean;
   local_marked: boolean;
+	/** Selected for the next explicit download batch. */
+	download_marked: boolean;
+	/** A completed download still exists for this exact media identity. */
+	downloaded: boolean;
 }
 
 /** One chapter of the playing item. */
@@ -445,6 +449,19 @@ export interface ProjectHistoryPopupView {
 /** Closed, persisted choices shared with the controller configuration. */
 export type DownloadMode = 'ask-each-time' | 'video' | 'audio-only';
 export type ArchiveDownloadPreference = 'ask-each-time' | 'original-file' | 'archive-mp3';
+
+/** One persisted job projected without transport or credential details. */
+export interface DownloadQueueEntryView {
+	id: number;
+	title: string;
+	state: string;
+}
+
+/** Persistent downloads, separate from the playback queue. */
+export interface DownloadQueuePopupView {
+	entries: DownloadQueueEntryView[];
+	selected: number;
+}
 
 /** Display-only options for one exact download target retained in the reducer. */
 export interface DownloadChoicePopupView {
@@ -888,6 +905,7 @@ export interface ViewModel {
   channel_download_popup: ChannelDownloadPopupView | null;
   download: DownloadView | null;
 	download_choice_popup: DownloadChoicePopupView | null;
+	download_queue_popup: DownloadQueuePopupView | null;
   help_open: boolean;
   project_history_popup: ProjectHistoryPopupView | null;
   error_popup: ErrorPopupView | null;
@@ -981,6 +999,7 @@ export type Key =
   | "Esc"
   | "Backspace"
   | "Delete"
+	| 'Insert'
   | "Tab"
   | "BackTab"
   | "Left"

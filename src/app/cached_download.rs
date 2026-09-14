@@ -236,6 +236,8 @@ pub(super) struct PendingCachedDownload {
     item: QueueItem,
     request: DownloadRequest,
     job: Box<dyn CachedDownloadJob>,
+    /// Stable manual attempt, retained across a cache hit or network fallback.
+    owner: Option<(u64, u64)>,
 }
 
 impl AppController {
@@ -297,6 +299,7 @@ impl AppController {
             item: item.clone(),
             request: request.clone(),
             job,
+            owner: self.manual_downloads.active,
         });
         self.download_cancellation_notice_deadline = None;
         self.view.download = Some(DownloadView {
@@ -319,6 +322,9 @@ impl AppController {
             .pending_cached_download
             .take()
             .expect("polled cache job");
+        if pending.owner.is_some() && pending.owner != self.manual_downloads.active {
+            return;
+        }
         // Keep the job alive until publication: dropping it requests cancellation.
         let published = result
             .ok()
@@ -346,6 +352,9 @@ impl AppController {
             });
             self.download_completion_notice_deadline =
                 Some(now + DOWNLOAD_COMPLETION_NOTICE_DURATION);
+            if let Some(owner) = pending.owner {
+                self.finish_manual_download_for(owner, Ok(published.path.clone()));
+            }
             if self.view.screen == Screen::Downloaded {
                 self.populate_downloads();
                 self.refresh_selected_playlist_state();
@@ -374,6 +383,9 @@ impl AppController {
         self.download_cancellation_notice_deadline =
             Some(now + DOWNLOAD_CANCELLATION_NOTICE_DURATION);
         self.view.status_line = format!("Cancelled download: {}", pending.item.media.title);
+        if pending.owner.is_some() && pending.owner == self.manual_downloads.active {
+            self.cancel_manual_download_owner();
+        }
         true
     }
 }

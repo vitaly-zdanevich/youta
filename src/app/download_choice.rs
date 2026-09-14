@@ -62,9 +62,10 @@ impl AppController {
                 self.view.download_choice_popup = Some(DownloadChoicePopupView {
                     generation,
                     title: "Download from archive.org".to_owned(),
-                    explanation:
-                        "Loading available original files and Archive-generated encodings…"
-                            .to_owned(),
+                    explanation: format!(
+                        "{}\nLoading available original files and Archive-generated encodings…",
+                        item.media.title
+                    ),
                     options: Vec::new(),
                     selected: 0,
                 });
@@ -78,13 +79,17 @@ impl AppController {
             #[cfg(not(feature = "archive-org"))]
             SourceKind::ArchiveOrg => {
                 self.view.status_line = "This build omits the `archive-org` feature".to_owned();
+                self.finish_manual_download_choice(false);
             }
             _ => match configured_download_format(&self.config.subscriptions.audio_format) {
                 Ok(format) => {
-                    let source_url = item.media.webpage_url.clone();
+                    let source_url = self.captured_manual_download_url(&item);
                     self.launch_manual_download(item, source_url, format);
                 }
-                Err(error) => self.show_error_message("Download format is invalid", error),
+                Err(error) => {
+                    self.show_error_message("Download format is invalid", error);
+                    self.finish_manual_download_choice(false);
+                }
             },
         }
     }
@@ -112,7 +117,10 @@ impl AppController {
             self.cancel_archive_download_lookup();
             match result {
                 Ok(Some(variants)) => self.choose_archive_download(pending.item, variants),
-                Err(error) => self.show_error_message("Could not choose a download", error),
+                Err(error) => {
+                    self.show_error_message("Could not choose a download", error);
+                    self.finish_manual_download_choice(false);
+                }
                 Ok(None) => unreachable!("pending metadata was retained above"),
             }
         }
@@ -162,6 +170,7 @@ impl AppController {
                 "Could not choose a download",
                 "No downloadable files remain for this Archive track",
             );
+            self.finish_manual_download_choice(false);
             return;
         }
         let preference = self.config.downloads.archive_format;
@@ -238,7 +247,7 @@ impl AppController {
         self.view.download_choice_popup = Some(DownloadChoicePopupView {
             generation,
             title: title.to_owned(),
-            explanation: explanation.to_owned(),
+            explanation: format!("{}\n{explanation}", item.media.title),
             options: options
                 .iter()
                 .map(|option| option.label().to_owned())
@@ -313,5 +322,6 @@ impl AppController {
         self.view.download_choice_popup = None;
         #[cfg(feature = "archive-org")]
         self.cancel_archive_download_lookup();
+        self.finish_manual_download_choice(true);
     }
 }

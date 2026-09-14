@@ -20,8 +20,11 @@ mod cached_download;
 #[cfg(feature = "yt-dlp")]
 mod download_choice;
 mod end_pause;
+mod manual_downloads;
 #[cfg(all(feature = "archive-org", feature = "yt-dlp", feature = "backend-mpv"))]
 mod original_download;
+#[cfg(feature = "yandex-music")]
+mod queued_yandex_download;
 #[cfg(feature = "s3-upload")]
 mod s3_upload;
 #[cfg(feature = "web-browser")]
@@ -3582,6 +3585,8 @@ struct ActiveDownload {
     collection: bool,
     estimated_total_files: Option<u64>,
     owner: ActiveDownloadOwner,
+    /// Manual queue attempt that owns this child; automatic/channel jobs have none.
+    manual_queue_owner: Option<(u64, u64)>,
     process: Box<dyn RunningDownload>,
     output: Arc<Mutex<DownloadOutputBuffer>>,
     reader_threads: Vec<JoinHandle<()>>,
@@ -3649,6 +3654,7 @@ impl ActiveDownload {
             collection,
             estimated_total_files,
             owner,
+            manual_queue_owner: None,
             process,
             output,
             reader_threads: vec![progress_thread, error_thread],
@@ -5370,6 +5376,8 @@ pub struct AppController {
     youtube_prewarm_failure: Option<(MediaId, Instant)>,
     playback_factory: Option<PlaybackFactory>,
     player: Option<Box<dyn PlaybackBackend>>,
+    /// Durable manual transfer intents and transient multi-selection marks.
+    manual_downloads: manual_downloads::ManualDownloads,
     /// Injectable constructor for the on-demand CAVA FFT-band stream.
     #[cfg(feature = "ascii-visualizer")]
     ascii_visualizer_stream_factory: Box<dyn AudioSpectrumStreamFactory>,
@@ -6670,6 +6678,7 @@ impl AppController {
             youtube_prewarm_failure: None,
             playback_factory,
             player: None,
+            manual_downloads: manual_downloads::ManualDownloads::default(),
             #[cfg(feature = "ascii-visualizer")]
             ascii_visualizer_stream_factory: Box::new(SystemCavaSpectrumStreamFactory),
             #[cfg(feature = "ascii-visualizer")]
@@ -6785,6 +6794,7 @@ impl AppController {
             shutdown_persistence_succeeded: None,
         };
         controller.populate_local_screen();
+        controller.restore_manual_downloads();
         if controller.view.screen == Screen::Search && !controller.youtube_results.is_empty() {
             controller.cache_search_channel_subscriber_counts();
             controller.request_visible_channel_subscriber_counts();
@@ -8286,6 +8296,7 @@ impl AppController {
     #[cfg(feature = "yandex-music")]
     fn drain_yandex_music_media_job_responses(&mut self) {
         self.reap_retired_yandex_music_playback_threads();
+        self.reap_cancelled_yandex_music_download();
         while let Ok(response) = self.yandex_music_media_job_responses.try_recv() {
             match response {
                 YandexMusicMediaJobResponse::Playback {
@@ -8354,13 +8365,15 @@ impl AppController {
                     completed_paths,
                     failures,
                 } => {
+                    // A superseded response must not take the newer worker's
+                    // handle or cancellation flag before checking ownership.
+                    if generation != self.yandex_music_download_generation {
+                        continue;
+                    }
                     if let Some(handle) = self.yandex_music_download_thread.take() {
                         let _ = handle.join();
                     }
                     self.yandex_music_download_cancel = None;
-                    if generation != self.yandex_music_download_generation {
-                        continue;
-                    }
                     let completed = completed_paths.len();
                     self.view.download = Some(DownloadView {
                         title: batch_title.clone(),
@@ -8396,6 +8409,12 @@ impl AppController {
                             failures.join("\n"),
                         );
                     }
+                    let result = if failures.is_empty() {
+                        completed_paths.last().cloned().ok_or(())
+                    } else {
+                        Err(())
+                    };
+                    self.finish_queued_yandex_download(generation, result);
                 }
             }
         }
@@ -8762,30 +8781,6 @@ impl AppController {
         true
     }
 
-    /// Downloads one selected track through the authenticated highest-quality resolver.
-    #[cfg(feature = "yandex-music")]
-    fn download_selected_yandex_music_track(&mut self) {
-        let Some(YandexMusicRow::Track(track)) =
-            self.yandex_music_rows.get(self.view.selected).cloned()
-        else {
-            self.view.status_line = "Select a Yandex Music track before downloading it".to_owned();
-            return;
-        };
-        let title = track.title.clone();
-        let file_stem = format!(
-            "{} — {}",
-            yandex_music_artist_names(&track.artists),
-            track.title
-        );
-        self.start_yandex_music_download_batch(
-            format!("Yandex Music track — {title}"),
-            vec![YandexMusicDownloadItem {
-                track: *track,
-                file_stem,
-            }],
-        );
-    }
-
     #[cfg(feature = "yandex-music")]
     fn download_yandex_music_album(&mut self) {
         let Some(album) = self.yandex_music_album.as_ref() else {
@@ -8862,38 +8857,59 @@ impl AppController {
         batch_title: String,
         items: Vec<YandexMusicDownloadItem>,
     ) {
+        if self.manual_downloads.active.is_some() {
+            self.view.status_line =
+                "A queued media download is already running; wait for it to finish".to_owned();
+            return;
+        }
+        let _ = self.try_start_yandex_music_download_batch(batch_title, items);
+    }
+
+    /// Starts a native batch or reports why no terminal response will arrive.
+    #[cfg(feature = "yandex-music")]
+    fn try_start_yandex_music_download_batch(
+        &mut self,
+        batch_title: String,
+        items: Vec<YandexMusicDownloadItem>,
+    ) -> Result<u64, String> {
         self.drain_yandex_music_media_job_responses();
         if self.yandex_music_download_thread.is_some() {
             self.view.status_line = "One Yandex Music download batch is already running".to_owned();
-            return;
+            return Err(self.view.status_line.clone());
         }
         #[cfg(feature = "yt-dlp")]
         if self.download_in_progress() {
             self.view.status_line =
                 "Another media download is already running; wait for it to finish".to_owned();
-            return;
+            return Err(self.view.status_line.clone());
         }
         if items.is_empty() {
             self.view.status_line = "This Yandex Music batch has no tracks to download".to_owned();
-            return;
+            return Err(self.view.status_line.clone());
         }
         let Some(token) = self.config.providers.yandex_music_token.clone() else {
             self.open_yandex_music_setup();
-            return;
+            return Err("Configure a Yandex Music OAuth token before downloading".to_owned());
         };
         #[cfg(test)]
         if let Some(capture) = self.yandex_music_download_batch_capture.as_ref() {
             capture
                 .send((batch_title, items))
                 .expect("Yandex Music download-batch test observer");
-            return;
+            self.yandex_music_download_generation =
+                self.yandex_music_download_generation.wrapping_add(1);
+            self.yandex_music_download_thread = Some(thread::spawn(|| {}));
+            self.yandex_music_download_cancel = Some(Arc::new(AtomicBool::new(false)));
+            return Ok(self.yandex_music_download_generation);
         }
         if let Err(error) = self.config.ensure_directories() {
             self.show_error(
                 "Could not prepare the Yandex Music download directory",
                 &error,
             );
-            return;
+            return Err(format!(
+                "Could not prepare the Yandex Music download directory: {error}"
+            ));
         }
         let destination = self.config.downloads_dir();
         self.yandex_music_download_generation =
@@ -8929,9 +8945,13 @@ impl AppController {
                     ..DownloadView::default()
                 });
                 self.view.status_line = format!("Downloading {batch_title} in original quality…");
+                Ok(generation)
             }
             Err(error) => {
                 self.show_error("Could not start the Yandex Music download", &error);
+                Err(format!(
+                    "Could not start the Yandex Music download: {error}"
+                ))
             }
         }
     }
@@ -19999,7 +20019,11 @@ impl AppController {
     /// Starts the next queued channel without competing with a manual download.
     #[cfg(feature = "yt-dlp")]
     fn start_next_automatic_download(&mut self) {
-        if self.download_in_progress() || self.pending_download_choice.is_some() {
+        if self.download_in_progress()
+            || self.pending_download_choice.is_some()
+            || self.manual_downloads.active.is_some()
+            || self.manual_downloads.blocked
+        {
             return;
         }
         #[cfg(feature = "yandex-music")]
@@ -20130,12 +20154,24 @@ impl AppController {
     /// Schedules only an explicit cancellation notice using the supplied monotonic time.
     #[cfg(feature = "yt-dlp")]
     fn cancel_active_download_at(&mut self, now: Instant) {
+        #[cfg(feature = "yandex-music")]
+        if self.cancel_yandex_music_download() {
+            return;
+        }
         self.automatic_download_queue.clear();
         #[cfg(feature = "backend-mpv")]
         if self.cancel_cached_download_at(now) {
             return;
         }
         let Some(mut active) = self.active_download.take() else {
+            if self.manual_downloads.active.is_some() {
+                self.cancel_manual_download_owner();
+                mark_download_inactive(&mut self.view);
+                self.download_cancellation_notice_deadline =
+                    Some(now + DOWNLOAD_CANCELLATION_NOTICE_DURATION);
+                self.view.status_line = "Cancelled the waiting download".to_owned();
+                return;
+            }
             self.view.status_line = "No download is running".to_owned();
             return;
         };
@@ -20149,44 +20185,12 @@ impl AppController {
         self.download_cancellation_notice_deadline =
             Some(now + DOWNLOAD_CANCELLATION_NOTICE_DURATION);
         self.view.status_line = format!("Cancelled download: {title}");
+        self.cancel_manual_download_owner();
     }
 
-    #[cfg(feature = "yt-dlp")]
+    /// Persists a selected or marked batch before starting its first transfer.
     fn start_selected_download(&mut self) {
-        if self.pending_download_choice.is_some() {
-            return;
-        }
-        #[cfg(feature = "yandex-music")]
-        if self.view.screen == Screen::YandexMusic {
-            self.download_selected_yandex_music_track();
-            return;
-        }
-        #[cfg(feature = "yandex-music")]
-        self.drain_yandex_music_media_job_responses();
-        if self.download_in_progress() {
-            self.view.status_line =
-                "One download is already running; wait for it to finish".to_owned();
-            return;
-        }
-        #[cfg(feature = "yandex-music")]
-        if self.yandex_music_download_thread.is_some() {
-            self.view.status_line =
-                "A Yandex Music download batch is already running; wait for it to finish"
-                    .to_owned();
-            return;
-        }
-        clear_download_completion_notice(
-            &mut self.view,
-            &mut self.download_completion_notice_deadline,
-        );
-        let item = match self.selected_queue_item() {
-            Ok(item) => item,
-            Err(error) => {
-                self.view.status_line = error;
-                return;
-            }
-        };
-        self.choose_manual_download(item);
+        self.enqueue_selected_manual_download();
     }
 
     /// Starts one captured source after confirmation, rechecking concurrent transfers.
@@ -20197,6 +20201,9 @@ impl AppController {
         source_url: url::Url,
         format: DownloadFormat,
     ) {
+        if !self.capture_manual_download_choice(&item, &source_url, format) {
+            return;
+        }
         if self.download_in_progress() {
             self.view.status_line =
                 "One download is already running; wait for it to finish".to_owned();
@@ -20216,12 +20223,14 @@ impl AppController {
         {
             self.view.status_line =
                 "Downloads require a credential-free remote HTTP(S) item".to_owned();
+            self.finish_manual_download(Err(()));
             return;
         }
         let destination = match prepare_download_destination(&self.config) {
             Ok(destination) => destination,
             Err(error) => {
                 self.show_error_message("Download destination is unavailable", error);
+                self.finish_manual_download(Err(()));
                 return;
             }
         };
@@ -20235,6 +20244,10 @@ impl AppController {
             write_thumbnail: self.config.subscriptions.download_thumbnails,
             archive_path: None,
         };
+        clear_download_completion_notice(
+            &mut self.view,
+            &mut self.download_completion_notice_deadline,
+        );
         #[cfg(feature = "backend-mpv")]
         if self.try_cached_manual_download(&item, &request) {
             return;
@@ -20251,17 +20264,21 @@ impl AppController {
             Err(error) => {
                 mark_download_inactive(&mut self.view);
                 self.show_error_message("Download could not start", error);
+                self.finish_manual_download(Err(()));
                 return;
             }
         };
         let title = item.media.title;
-        let active = match ActiveDownload::start(title.clone(), destination, false, None, process) {
-            Ok(active) => active,
-            Err(error) => {
-                self.show_error_message("Download supervision could not start", error);
-                return;
-            }
-        };
+        let mut active =
+            match ActiveDownload::start(title.clone(), destination, false, None, process) {
+                Ok(active) => active,
+                Err(error) => {
+                    self.show_error_message("Download supervision could not start", error);
+                    self.finish_manual_download(Err(()));
+                    return;
+                }
+            };
+        active.manual_queue_owner = self.manual_downloads.active;
         self.download_cancellation_notice_deadline = None;
         self.view.download = Some(DownloadView {
             title: title.clone(),
@@ -20270,17 +20287,6 @@ impl AppController {
         });
         self.view.status_line = format!("Downloading {title}");
         self.active_download = Some(active);
-    }
-
-    #[cfg(not(feature = "yt-dlp"))]
-    fn start_selected_download(&mut self) {
-        #[cfg(feature = "yandex-music")]
-        if self.view.screen == Screen::YandexMusic {
-            self.download_selected_yandex_music_track();
-            return;
-        }
-        self.view.status_line =
-            "Download support was disabled when this Youta binary was built".to_owned();
     }
 
     /// Polls one active download and expires successful or cancelled notices at `now`.
@@ -20333,6 +20339,9 @@ impl AppController {
                 "Download output could not be read",
                 append_download_diagnostics(error, &diagnostics),
             );
+            if let Some(owner) = active.manual_queue_owner {
+                self.finish_manual_download_for(owner, Err(()));
+            }
             return;
         }
 
@@ -20350,6 +20359,9 @@ impl AppController {
                     "Download process could not be monitored",
                     append_download_diagnostics(error, &diagnostics),
                 );
+                if let Some(owner) = active.manual_queue_owner {
+                    self.finish_manual_download_for(owner, Err(()));
+                }
                 return;
             }
         };
@@ -20389,6 +20401,9 @@ impl AppController {
                 "Download output could not be read",
                 append_download_diagnostics(error, &diagnostics),
             );
+            if let Some(owner) = active.manual_queue_owner {
+                self.finish_manual_download_for(owner, Err(()));
+            }
             return;
         }
         if !exit.success {
@@ -20402,6 +20417,9 @@ impl AppController {
                     &diagnostics,
                 ),
             );
+            if let Some(owner) = active.manual_queue_owner {
+                self.finish_manual_download_for(owner, Err(()));
+            }
             return;
         }
         if let ActiveDownloadOwner::AutomaticBaseline {
@@ -20438,6 +20456,9 @@ impl AppController {
                 Err(error) => {
                     mark_download_inactive(&mut self.view);
                     self.show_error_message("Download path failed validation", error);
+                    if let Some(owner) = active.manual_queue_owner {
+                        self.finish_manual_download_for(owner, Err(()));
+                    }
                     return;
                 }
             },
@@ -20451,6 +20472,9 @@ impl AppController {
                         &diagnostics,
                     ),
                 );
+                if let Some(owner) = active.manual_queue_owner {
+                    self.finish_manual_download_for(owner, Err(()));
+                }
                 return;
             }
         };
@@ -20468,6 +20492,9 @@ impl AppController {
             completed_path: Some(completed_path.display().to_string()),
         });
         self.download_completion_notice_deadline = Some(now + DOWNLOAD_COMPLETION_NOTICE_DURATION);
+        if let Some(owner) = active.manual_queue_owner {
+            self.finish_manual_download_for(owner, Ok(completed_path.clone()));
+        }
         if self.view.screen == Screen::Downloaded {
             self.populate_downloads();
             self.refresh_selected_playlist_state();
@@ -34060,6 +34087,10 @@ impl AppController {
     #[cfg(feature = "yandex-music")]
     fn shutdown_yandex_music_media_workers(&mut self) {
         self.cancel_pending_yandex_music_playback();
+        // Shutdown leaves durable Running intent for the queue's restart
+        // recovery; aborted native responses must not turn it into completion.
+        self.yandex_music_download_generation =
+            self.yandex_music_download_generation.wrapping_add(1);
         if let Some(cancellation) = self.yandex_music_download_cancel.take() {
             cancellation.store(true, AtomicOrdering::Release);
         }
@@ -34370,6 +34401,7 @@ impl AppController {
         }
         #[cfg(feature = "yandex-music")]
         self.shutdown_yandex_music_media_workers();
+        let manual_download_state_ready = self.shutdown_manual_downloads();
         #[cfg(feature = "yandex-music")]
         let yandex_music_state_ready = self.shutdown_yandex_music_worker();
         #[cfg(not(feature = "yandex-music"))]
@@ -34379,7 +34411,7 @@ impl AppController {
             self.persist_pending_local_move_mappings(LocalMovePersistenceAttempt::Explicit);
         #[cfg(not(any(feature = "local-rename", feature = "local-move")))]
         let local_move_state_ready = true;
-        let mut persistence_succeeded = true;
+        let mut persistence_succeeded = manual_download_state_ready;
         if !self.diagnostic_only {
             self.session_dirty = true;
             if local_move_state_ready {
@@ -34393,7 +34425,8 @@ impl AppController {
                     #[cfg(any(feature = "local-rename", feature = "local-move"))]
                     LocalMovePersistenceAttempt::Explicit,
                 );
-                persistence_succeeded = yandex_music_state_ready
+                persistence_succeeded = manual_download_state_ready
+                    && yandex_music_state_ready
                     && position_saved
                     && checkpoint_published
                     && session_saved;
@@ -35055,6 +35088,23 @@ impl UiController for AppController {
             UiAction::UpdatePlaylist => self.update_selected_playlist(),
             UiAction::DismissPlaylistPopup => self.dismiss_playlist_popup(),
             UiAction::Download => self.start_selected_download(),
+            UiAction::ToggleDownloadMark => self.toggle_download_mark(),
+            UiAction::ToggleDownloadMarkAt(index) => {
+                if self.view.screen == Screen::Subscriptions {
+                    if index < self.view.subscriptions.items.len() {
+                        self.select_subscription_item(index);
+                        self.toggle_download_mark();
+                    }
+                } else if index < self.view.rows.len() {
+                    self.select_row(index);
+                    self.toggle_download_mark();
+                }
+            }
+            UiAction::OpenDownloadQueue => self.open_download_queue(),
+            UiAction::DismissDownloadQueue => self.view.download_queue_popup = None,
+            UiAction::SelectDownloadQueueEntry(id) => self.select_download_queue_entry(id),
+            UiAction::RetryQueuedDownload(id) => self.retry_queued_download(id),
+            UiAction::CancelQueuedDownload(id) => self.cancel_queued_download(id),
             #[cfg(feature = "yt-dlp")]
             UiAction::OpenChannelDownload => self.open_channel_download(),
             #[cfg(feature = "yt-dlp")]
@@ -35079,6 +35129,10 @@ impl UiController for AppController {
             UiAction::DismissChannelDownload => self.dismiss_channel_download(),
             #[cfg(feature = "yt-dlp")]
             UiAction::CancelDownload => self.cancel_active_download(),
+            #[cfg(all(feature = "yandex-music", not(feature = "yt-dlp")))]
+            UiAction::CancelDownload => {
+                self.cancel_yandex_music_download();
+            }
             #[cfg(feature = "commons-upload")]
             UiAction::OpenCommonsUpload => self.open_commons_upload(),
             #[cfg(feature = "commons-upload")]
@@ -35758,6 +35812,7 @@ impl UiController for AppController {
         #[cfg(feature = "audio-quality")]
         self.cancel_stale_local_audio_quality();
         self.refresh_video_summary_availability();
+        self.refresh_download_markers(false);
         self.session_dirty |= !self.diagnostic_only;
         if self.view.quitting
             && !self.diagnostic_only
@@ -35978,9 +36033,13 @@ impl UiController for AppController {
             self.request_due_youtube_prewarm(now);
             self.queue_due_automatic_download_check(now);
             self.poll_manual_download_choice();
-            self.start_next_automatic_download();
             self.poll_download_at(now);
         }
+        self.poll_manual_download_queue();
+        self.refresh_download_queue_popup();
+        self.refresh_download_markers(false);
+        #[cfg(feature = "yt-dlp")]
+        self.start_next_automatic_download();
         #[cfg(feature = "archive-upload")]
         self.poll_archive_upload();
         #[cfg(feature = "s3-upload")]
@@ -41291,6 +41350,8 @@ fn row_from_search_item_with_progress_mode(
                 compact: false,
                 radio_favorite: false,
                 local_marked: false,
+                download_marked: false,
+                downloaded: false,
             }
         }
         SearchItem::Channel(channel) => RowView {
@@ -45712,6 +45773,15 @@ mod tests {
     mod download_choice_tests;
     #[path = "end_pause.rs"]
     mod end_pause_tests;
+    #[cfg(feature = "yt-dlp")]
+    #[path = "manual_download_queue.rs"]
+    mod manual_download_queue_tests;
+    #[cfg(feature = "yt-dlp")]
+    #[path = "manual_download_sources.rs"]
+    mod manual_download_sources_tests;
+    #[cfg(feature = "yandex-music")]
+    #[path = "queued_yandex_download.rs"]
+    mod queued_yandex_download_tests;
     #[cfg(feature = "s3-upload")]
     #[path = "s3_upload.rs"]
     mod s3_upload_tests;
@@ -73442,7 +73512,7 @@ mod tests {
 
     #[cfg(feature = "yt-dlp")]
     #[test]
-    fn second_download_is_refused_and_shutdown_cancels_the_running_child() {
+    fn duplicate_download_is_not_requeued_and_shutdown_cancels_the_running_child() {
         let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -73458,7 +73528,8 @@ mod tests {
         controller.dispatch(UiAction::Download);
 
         assert_eq!(requests.lock().expect("download requests").len(), 1);
-        assert!(controller.view.status_line.contains("already running"));
+        assert!(controller.view.status_line.contains("already queued"));
+        assert_eq!(controller.store.download_queue().unwrap().entries.len(), 1);
         let stale_deadline = Instant::now();
         controller.download_completion_notice_deadline = Some(stale_deadline);
         controller.poll_download_at(stale_deadline);

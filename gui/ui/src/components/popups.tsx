@@ -23,6 +23,7 @@ import type {
 	ArchiveCredentialsEditorView,
   ChannelDownloadPopupView,
 	DownloadChoicePopupView,
+	DownloadQueuePopupView,
 	DownloadMode,
 	ArchiveDownloadPreference,
   CommonsCredentialsEditorView,
@@ -65,6 +66,7 @@ export const LAYER = {
   preferences: 4,
   localFile: 5,
   channelDownload: 6,
+	downloadQueue: 6.25,
 	downloadChoice: 6.5,
   playlist: 7,
   queue: 8,
@@ -159,6 +161,9 @@ export function HelpPopup({
       [
         ["Ctrl+n · a · u", "play next · add to queue · show the queue"],
         ["d · o · y", "download · open page · copy link"],
+		['Insert · Ctrl+click', 'mark an item for downloading'],
+		['d · Ctrl+D', 'download marked items · show download queue'],
+		['[x] · ↓', 'marked for download · downloaded locally'],
 		...(channelDownloadSupported
 			? ([
 					['D · C', 'download full YouTube channel · cancel active download'],
@@ -244,6 +249,35 @@ export function HelpPopup({
       </Body>
     </Popup>
   );
+}
+
+/** Render durable jobs and address each command by its stable queue identity. */
+export function DownloadQueuePopup({ popup }: { popup: DownloadQueuePopupView }) {
+	const selected = popup.entries[popup.selected];
+	return (
+		<Popup title='Download queue' layer={LAYER.downloadQueue}
+			subtitle='↑/↓ select · r retry · x cancel · Esc close'
+			onDismiss={() => void dispatch('DismissDownloadQueue')}
+			footer={<>
+				{selected ? <>
+					<PopupButton onClick={() => void dispatch({ RetryQueuedDownload: selected.id })}>Retry</PopupButton>
+					<PopupButton onClick={() => void dispatch({ CancelQueuedDownload: selected.id })}>Cancel download</PopupButton>
+				</> : null}
+				<PopupButton onClick={() => void dispatch('DismissDownloadQueue')}>Close</PopupButton>
+			</>}>
+			<Body><div className='grid gap-2'>
+				{popup.entries.length === 0 ? <p>No downloads queued. Insert marks items; d downloads them.</p> : null}
+				{popup.entries.map((entry, index) => (
+					<button key={entry.id} type='button' aria-current={index === popup.selected}
+						ref={(element) => { if (index === popup.selected) element?.scrollIntoView({ block: 'nearest' }); }}
+						className={`rounded-[5px] border px-3 py-2 text-left break-words ${index === popup.selected ? 'border-accent text-ink' : 'border-line-strong text-ink-dim'}`}
+						onClick={() => void dispatch({ SelectDownloadQueueEntry: entry.id })}>
+						{entry.title} · {entry.state}
+					</button>
+				))}
+			</div></Body>
+		</Popup>
+	);
 }
 
 /** Present controller-owned format choices without interpreting labels or fetching files. */

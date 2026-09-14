@@ -54,6 +54,9 @@ static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 struct ManifestDocument {
     format_version: u32,
     backend: String,
+    /// Legacy manifests omit this marker and receive one additive queue migration.
+    #[serde(default)]
+    downloads_initialized: bool,
 }
 
 impl Default for ManifestDocument {
@@ -61,6 +64,24 @@ impl Default for ManifestDocument {
         Self {
             format_version: FILE_FORMAT_VERSION,
             backend: "files".to_owned(),
+            downloads_initialized: true,
+        }
+    }
+}
+
+/// Authoritative download intent is never quarantined as regenerable runtime data.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct DownloadsDocument {
+    format_version: u32,
+    queue: DownloadQueue,
+}
+
+impl DownloadsDocument {
+    fn empty() -> Self {
+        Self {
+            format_version: FILE_FORMAT_VERSION,
+            queue: DownloadQueue::default(),
         }
     }
 }
@@ -378,6 +399,7 @@ impl ProviderCacheDocument {
 
 #[derive(Clone, Debug)]
 struct FileDocuments {
+    downloads: DownloadsDocument,
     progress: ProgressDocument,
     history: HistoryDocument,
     notes: NotesDocument,
@@ -395,6 +417,7 @@ struct FileDocuments {
 
 #[derive(Clone, Debug)]
 struct FilePaths {
+    downloads: PathBuf,
     manifest: PathBuf,
     progress: PathBuf,
     history: PathBuf,
@@ -415,6 +438,7 @@ impl FilePaths {
     fn from_config(config: &Config) -> Self {
         Self {
             manifest: config.state_dir().join("manifest.toml"),
+            downloads: config.state_dir().join("downloads.toml"),
             progress: config.state_dir().join("progress.toml"),
             history: config.state_dir().join("history.toml"),
             notes: config.state_dir().join("notes.toml"),
@@ -467,6 +491,7 @@ fn capture_document_generations(
     paths: &FilePaths,
 ) -> Result<HashMap<&'static str, Option<FileGeneration>>, PersistenceError> {
     let documents = [
+        ("download queue", &paths.downloads),
         ("progress", &paths.progress),
         ("history", &paths.history),
         ("notes", &paths.notes),
@@ -713,7 +738,7 @@ impl FileStateStore {
         let paths = FilePaths::from_config(config);
         let lock = open_state_lock(config)?;
         let initialized = paths.manifest.try_exists()?;
-        let manifest = if initialized {
+        let mut manifest: ManifestDocument = if initialized {
             load_required(&paths.manifest, "manifest", MAX_MANIFEST_DOCUMENT_BYTES)?
         } else {
             ManifestDocument::default()
@@ -728,6 +753,13 @@ impl FileStateStore {
             });
         }
         let mut documents = FileDocuments {
+            downloads: load_authoritative(
+                &paths.downloads,
+                "download queue",
+                MAX_DOWNLOAD_QUEUE_BYTES,
+                initialized && manifest.downloads_initialized,
+                DownloadsDocument::empty,
+            )?,
             progress: load_authoritative(
                 &paths.progress,
                 "progress",
@@ -822,6 +854,12 @@ impl FileStateStore {
         validate_file_documents(&documents)?;
         if !initialized {
             write_document(
+                &paths.downloads,
+                "download queue",
+                MAX_DOWNLOAD_QUEUE_BYTES,
+                &documents.downloads,
+            )?;
+            write_document(
                 &paths.progress,
                 "progress",
                 MAX_PROGRESS_DOCUMENT_BYTES,
@@ -903,6 +941,23 @@ impl FileStateStore {
                 &manifest,
             )?;
         }
+        if !manifest.downloads_initialized {
+            // Publish the new document before recording migration completion. If
+            // startup is interrupted, the still-legacy manifest permits a retry.
+            write_document(
+                &paths.downloads,
+                "download queue",
+                MAX_DOWNLOAD_QUEUE_BYTES,
+                &documents.downloads,
+            )?;
+            manifest.downloads_initialized = true;
+            write_document(
+                &paths.manifest,
+                "manifest",
+                MAX_MANIFEST_DOCUMENT_BYTES,
+                &manifest,
+            )?;
+        }
         recover_playback_checkpoint_files(&paths, &mut documents)?;
         let generations = capture_document_generations(&paths)?;
         Ok(Self {
@@ -919,6 +974,7 @@ impl FileStateStore {
         Ok(Self {
             paths: None,
             documents: Mutex::new(FileDocuments {
+                downloads: DownloadsDocument::empty(),
                 progress: ProgressDocument::empty(),
                 history: HistoryDocument::empty(),
                 notes: NotesDocument::empty(),
@@ -1159,6 +1215,32 @@ impl FileStateStore {
 }
 
 impl StateBackend for FileStateStore {
+    fn download_queue(&self) -> Result<DownloadQueue, PersistenceError> {
+        let documents = self.lock()?;
+        validate_download_queue(&documents.downloads.queue)?;
+        Ok(documents.downloads.queue.clone())
+    }
+
+    fn save_download_queue(&self, queue: &DownloadQueue) -> Result<(), PersistenceError> {
+        validate_download_queue(queue)?;
+        let mut documents = self.lock()?;
+        validate_download_queue_replacement(&documents.downloads.queue, queue)?;
+        let next = DownloadsDocument {
+            format_version: FILE_FORMAT_VERSION,
+            queue: queue.clone(),
+        };
+        if let Some(paths) = &self.paths {
+            self.persist_document(
+                &paths.downloads,
+                "download queue",
+                MAX_DOWNLOAD_QUEUE_BYTES,
+                &next,
+            )?;
+        }
+        documents.downloads = next;
+        Ok(())
+    }
+
     fn backend_name(&self) -> &'static str {
         "files"
     }
@@ -3306,6 +3388,7 @@ fn validate_file_documents(documents: &FileDocuments) -> Result<(), PersistenceE
 
     validate_playback_checkpoint(&documents.playback_checkpoint)?;
     validate_playlists_document(&documents.playlists)?;
+    validate_download_queue(&documents.downloads.queue)?;
     validate_local_moves_document(&documents.local_moves)?;
     #[cfg(feature = "yandex-music")]
     validate_yandex_music_reactions_document(&documents.yandex_music_reactions)?;
@@ -3542,6 +3625,7 @@ fn validate_provider_cache_document(
 
 fn ensure_documents_supported(documents: &FileDocuments) -> Result<(), PersistenceError> {
     for version in [
+        documents.downloads.format_version,
         documents.progress.format_version,
         documents.history.format_version,
         documents.notes.format_version,

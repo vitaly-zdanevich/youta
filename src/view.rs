@@ -593,6 +593,10 @@ pub struct RowView {
     pub radio_favorite: bool,
     /// Whether this Local row belongs to the current explicit move batch.
     pub local_marked: bool,
+    /// Whether this playable row is selected for the next download batch.
+    pub download_marked: bool,
+    /// Whether a completed download still exists locally for this media identity.
+    pub downloaded: bool,
 }
 
 /// One selected local video frame rendered through the thumbnail worker.
@@ -1004,6 +1008,26 @@ pub struct DownloadChoicePopupView {
     /// Labels in the same stable order as the controller's typed choices.
     pub options: Vec<String>,
     /// Currently highlighted choice; confirmation is always explicit.
+    pub selected: usize,
+}
+
+/// One durable download job projected without transport details or credentials.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct DownloadQueueEntryView {
+    /// Stable persisted job identity used by selection, retry, and cancellation.
+    pub id: u64,
+    /// Human-readable media title.
+    pub title: String,
+    /// Controller-owned status label.
+    pub state: String,
+}
+
+/// Persistent download queue shown independently of the playback queue.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct DownloadQueuePopupView {
+    /// Jobs in their controller-owned display order.
+    pub entries: Vec<DownloadQueueEntryView>,
+    /// Highlighted entry index, clamped when entries change.
     pub selected: usize,
 }
 
@@ -2900,6 +2924,8 @@ pub struct ViewModel {
     pub channel_download_popup: Option<ChannelDownloadPopupView>,
     /// Modal format choice for one explicit download request.
     pub download_choice_popup: Option<DownloadChoicePopupView>,
+    /// Durable download jobs and their retry/cancellation controls.
+    pub download_queue_popup: Option<DownloadQueuePopupView>,
     /// Active or most recently completed supervised download.
     pub download: Option<DownloadView>,
     /// Whether the controller has requested application shutdown.
@@ -3172,6 +3198,7 @@ impl Default for ViewModel {
             #[cfg(feature = "yt-dlp")]
             channel_download_popup: None,
             download_choice_popup: None,
+            download_queue_popup: None,
             download: None,
             quitting: false,
         }
@@ -3449,8 +3476,22 @@ pub enum UiAction {
     UpdatePlaylist,
     /// Return from the editor to its chooser, or close the playlist popup.
     DismissPlaylistPopup,
-    /// Download the selected item.
+    /// Enqueue marked items, or the selected item when nothing is marked.
     Download,
+    /// Toggle the selected playable item's membership in the download batch.
+    ToggleDownloadMark,
+    /// Select a clicked row, then toggle its membership in the download batch.
+    ToggleDownloadMarkAt(usize),
+    /// Show the persistent download queue.
+    OpenDownloadQueue,
+    /// Close the persistent download queue without cancelling jobs.
+    DismissDownloadQueue,
+    /// Highlight the queued job with this stable persisted identity.
+    SelectDownloadQueueEntry(u64),
+    /// Retry an eligible terminal job using its stable persisted identity.
+    RetryQueuedDownload(u64),
+    /// Cancel a queued or running job using its stable persisted identity.
+    CancelQueuedDownload(u64),
     /// Move the highlighted download format without starting a download.
     MoveDownloadChoice(i32),
     /// Confirm the highlighted controller-owned download choice.
@@ -3486,7 +3527,7 @@ pub enum UiAction {
     #[cfg(feature = "yt-dlp")]
     DismissChannelDownload,
     /// Cancel the sole active supervised download.
-    #[cfg(feature = "yt-dlp")]
+    #[cfg(any(feature = "yt-dlp", feature = "yandex-music"))]
     CancelDownload,
     /// Review an explicit upload of the selected YouTube video to Archive.org.
     #[cfg(feature = "archive-upload")]

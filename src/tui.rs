@@ -1848,6 +1848,8 @@ struct HitMap {
     local_file_buttons: Vec<(UiAction, Rect)>,
     /// Exact modal choices and confirmation controls for one download request.
     download_choice_buttons: Vec<(UiAction, Rect)>,
+    /// Stable-job controls inside the persistent download queue.
+    download_queue_buttons: Vec<(UiAction, Rect)>,
     #[cfg(feature = "yt-dlp")]
     channel_download_buttons: Vec<(UiAction, Rect)>,
     /// Visible destination rows inside the Local Move popup.
@@ -2200,6 +2202,7 @@ fn render_frame(
         || view.private_note_popup.is_some()
         || view.local_file_popup.is_some()
         || view.download_choice_popup.is_some()
+        || view.download_queue_popup.is_some()
         || view.video_comments_popup.is_some()
         || view.error_popup.is_some();
     #[cfg(feature = "yt-dlp")]
@@ -2418,6 +2421,10 @@ fn render_frame(
             render_channel_download_popup(frame, popup, &theme, hit_map);
         }
     }
+    hit_map.download_queue_buttons.clear();
+    if let Some(popup) = view.download_queue_popup.as_ref() {
+        render_download_queue_popup(frame, popup, settings.show_hotkeys, &theme, hit_map);
+    }
     hit_map.download_choice_buttons.clear();
     if let Some(popup) = view.download_choice_popup.as_ref() {
         render_download_choice_popup(frame, popup, settings.show_hotkeys, &theme, hit_map);
@@ -2591,15 +2598,15 @@ fn render_download_bar(
             download.title
         )
     };
-    #[cfg(feature = "yt-dlp")]
+    #[cfg(any(feature = "yt-dlp", feature = "yandex-music"))]
     let cancel_label = "[C] Cancel";
-    #[cfg(feature = "yt-dlp")]
+    #[cfg(any(feature = "yt-dlp", feature = "yandex-music"))]
     let rendered_label = if download.active {
         format!("{label}   {cancel_label}")
     } else {
         label
     };
-    #[cfg(not(feature = "yt-dlp"))]
+    #[cfg(not(any(feature = "yt-dlp", feature = "yandex-music")))]
     let rendered_label = label;
     let label = if completed {
         // The gauge reverses filled label colors; keep completion text black on white.
@@ -2623,7 +2630,7 @@ fn render_download_bar(
             .label(label),
         area,
     );
-    #[cfg(feature = "yt-dlp")]
+    #[cfg(any(feature = "yt-dlp", feature = "yandex-music"))]
     if download.active {
         let content_area = Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1);
         let label_width = terminal_text_width(&rendered_label);
@@ -3353,6 +3360,12 @@ fn render_row_list(
                 }
                 spans
             };
+            if row.download_marked {
+                title_spans.push(Span::styled("[x] ", marked_style));
+            }
+            if row.downloaded {
+                title_spans.push(Span::styled("↓ ", marked_style));
+            }
             title_spans.push(Span::styled(&row.title, title_style));
             if row_height == 1 && !row.subtitle.is_empty() {
                 title_spans.push(Span::styled(" · ", secondary_style));
@@ -7451,6 +7464,7 @@ fn search_kind_help(view: &ViewModel) -> &'static str {
     }
 }
 
+/// Keeps shared actions visible in compact popups by budgeting section spacer rows.
 fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
     let area = centered_rect(76, 92, frame.area());
     frame.render_widget(Clear, area);
@@ -7560,16 +7574,16 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
         "  Playlists: e edit selected playlist     Esc or Backspace up",
         "  F8 pointer: arrows move, Enter clicks, Esc/F8 exits.",
         "  Linux /dev/ttyN: physical mouse input requires a running GPM daemon.",
-        "",
         "Playback",
         "  Space pause     ←/→ 5 s     0–9 seek by 10%",
         "  ↑/↓ volume </> speed 10% [ prev chapter ] next chapter T chapter times",
         "  {/} previous / next item in the queue or its source list",
         "  r repeat     A autoplay next item from same source list   w waveform",
         "  Details: Alt+←/→ history  Alt+↑/↓ (Linux TTY: Alt+u/d) scroll",
-        "",
         "Actions",
         "  Ctrl+n play next     a add to queue     u show queue     d download",
+        "  Insert mark for download  d download marked items  Ctrl+D download queue",
+        "  [x] marked for download     ↓ downloaded locally",
         video_actions_help.as_str(),
         playlist_actions_help.as_str(),
         "  O channel page     i subscription description     p preferences",
@@ -12577,6 +12591,96 @@ fn render_local_file_popup(
     ));
 }
 
+/// Renders persistent jobs and binds pointer actions to stable queue identities.
+fn render_download_queue_popup(
+    frame: &mut Frame<'_>,
+    popup: &DownloadQueuePopupView,
+    show_hotkeys: bool,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+) {
+    let width = frame.area().width.saturating_sub(4).clamp(1, 100);
+    let height = u16::try_from(popup.entries.len().saturating_add(5))
+        .unwrap_or(u16::MAX)
+        .max(6)
+        .min(frame.area().height.saturating_sub(2).max(1));
+    let area = centered_sized_rect(width, height, frame.area());
+    frame.render_widget(Clear, area);
+    frame.render_widget(panel_block(" Download queue ", theme), area);
+    let inner = area.inner(ratatui::layout::Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+    if inner.is_empty() {
+        return;
+    }
+    let row_height = inner.height.saturating_sub(2);
+    let selected = popup.selected.min(popup.entries.len().saturating_sub(1));
+    let first = selected.saturating_sub(usize::from(row_height).saturating_sub(1));
+    if popup.entries.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No downloads queued. Insert marks items; d downloads them.")
+                .style(theme.muted),
+            Rect::new(inner.x, inner.y, inner.width, row_height),
+        );
+    }
+    for (index, entry) in popup
+        .entries
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(usize::from(row_height))
+    {
+        let target = Rect::new(
+            inner.x,
+            inner
+                .y
+                .saturating_add(u16::try_from(index - first).unwrap_or(u16::MAX)),
+            inner.width,
+            1,
+        );
+        frame.render_widget(
+            Paragraph::new(format!(
+                "{} {} · {}",
+                if index == selected { "▶" } else { " " },
+                entry.title,
+                entry.state
+            ))
+            .style(if index == selected {
+                theme.selected
+            } else {
+                theme.base
+            }),
+            target,
+        );
+        hit_map
+            .download_queue_buttons
+            .push((UiAction::SelectDownloadQueueEntry(entry.id), target));
+    }
+    let mut buttons = Vec::new();
+    if let Some(entry) = popup.entries.get(selected) {
+        buttons.push(("r", "Retry", UiAction::RetryQueuedDownload(entry.id)));
+        buttons.push((
+            "x",
+            "Cancel download",
+            UiAction::CancelQueuedDownload(entry.id),
+        ));
+    }
+    buttons.push(("Esc", "Close", UiAction::DismissDownloadQueue));
+    let mut x = inner.x;
+    for (key, label, action) in buttons {
+        let label = button(key, label, show_hotkeys);
+        let width = terminal_text_width(&label).min(inner.right().saturating_sub(x));
+        if width == 0 {
+            break;
+        }
+        let target = Rect::new(x, inner.bottom() - 1, width, 1);
+        frame.render_widget(Paragraph::new(label).style(theme.accent), target);
+        hit_map.download_queue_buttons.push((action, target));
+        x = x.saturating_add(width).saturating_add(2);
+    }
+}
+
 /// Renders exact controller choices and keeps every action inside its modal area.
 fn render_download_choice_popup(
     frame: &mut Frame<'_>,
@@ -13393,6 +13497,7 @@ fn key_press(key: KeyEvent) -> Option<KeyPress> {
         KeyCode::Esc => Key::Esc,
         KeyCode::Backspace => Key::Backspace,
         KeyCode::Delete => Key::Delete,
+        KeyCode::Insert => Key::Insert,
         KeyCode::Tab => Key::Tab,
         KeyCode::BackTab => Key::BackTab,
         KeyCode::Left => Key::Left,
@@ -13943,6 +14048,30 @@ fn mouse_action_unfiltered(
                 .map(|(action, _)| action.clone()),
             MouseEventKind::ScrollDown => Some(UiAction::MoveDownloadChoice(1)),
             MouseEventKind::ScrollUp => Some(UiAction::MoveDownloadChoice(-1)),
+            _ => None,
+        };
+    }
+    if let Some(popup) = view.download_queue_popup.as_ref() {
+        return match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => hit_map
+                .download_queue_buttons
+                .iter()
+                .find(|(_, area)| contains(*area, mouse.column, mouse.row))
+                .map(|(action, _)| action.clone()),
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+                let index = if mouse.kind == MouseEventKind::ScrollDown {
+                    popup
+                        .selected
+                        .saturating_add(1)
+                        .min(popup.entries.len().saturating_sub(1))
+                } else {
+                    popup.selected.saturating_sub(1)
+                };
+                popup
+                    .entries
+                    .get(index)
+                    .map(|entry| UiAction::SelectDownloadQueueEntry(entry.id))
+            }
             _ => None,
         };
     }
@@ -15843,6 +15972,18 @@ for encoded, expected in json.load(sys.stdin):
                 .unwrap();
             let rendered = rendered_text(&terminal);
             assert!(rendered.contains("Web: / open URL"));
+            for instruction in [
+                "Insert mark for download",
+                "d download marked items",
+                "Ctrl+D download queue",
+                "[x] marked for download",
+                "↓ downloaded locally",
+            ] {
+                assert!(
+                    rendered.contains(instruction),
+                    "{width}×{height} help hides {instruction}"
+                );
+            }
             #[cfg(feature = "archive-upload")]
             assert!(rendered.contains("I upload to archive.org"));
             #[cfg(feature = "evernote")]
@@ -21681,6 +21822,96 @@ for encoded, expected in json.load(sys.stdin):
                 hit_map.archive_upload_fields.is_empty()
                     && hit_map.archive_credentials_fields.is_empty()
             );
+        }
+    }
+
+    /// Queue controls retain exact identities and disappear when the popup closes.
+    #[test]
+    fn download_queue_popup_renders_jobs_and_clears_pointer_targets() {
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        let mut view = ViewModel {
+            download_queue_popup: Some(DownloadQueuePopupView {
+                entries: vec![DownloadQueueEntryView {
+                    id: 42,
+                    title: "Fixture audio".to_owned(),
+                    state: "Failed".to_owned(),
+                }],
+                selected: 0,
+            }),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .unwrap();
+        let rendered = rendered_text(&terminal);
+        for label in [
+            "Download queue",
+            "Fixture audio",
+            "Failed",
+            "[r] Retry",
+            "[x] Cancel download",
+            "[Esc] Close",
+        ] {
+            assert!(rendered.contains(label), "{label}");
+        }
+        for expected in [
+            UiAction::SelectDownloadQueueEntry(42),
+            UiAction::RetryQueuedDownload(42),
+            UiAction::CancelQueuedDownload(42),
+            UiAction::DismissDownloadQueue,
+        ] {
+            let (_, area) = hit_map
+                .download_queue_buttons
+                .iter()
+                .find(|(action, _)| *action == expected)
+                .unwrap();
+            assert_eq!(
+                mouse_action(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: area.x,
+                        row: area.y,
+                        modifiers: KeyModifiers::NONE
+                    },
+                    &hit_map,
+                    &view
+                ),
+                Some(expected)
+            );
+        }
+        view.download_queue_popup = None;
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .unwrap();
+        assert!(hit_map.download_queue_buttons.is_empty());
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Insert, KeyModifiers::NONE), &view),
+            Some(UiAction::ToggleDownloadMark)
+        );
+    }
+
+    /// Download marks and completed files have distinct symbols from Local move marks.
+    #[test]
+    fn download_row_markers_are_independent_and_visible_in_compact_rows() {
+        for compact in [false, true] {
+            let mut terminal = Terminal::new(TestBackend::new(100, 18)).unwrap();
+            let view = ViewModel {
+                rows: vec![RowView {
+                    title: "Fixture audio".to_owned(),
+                    local_marked: true,
+                    download_marked: true,
+                    downloaded: true,
+                    compact,
+                    ..RowView::default()
+                }],
+                ..ViewModel::default()
+            };
+            terminal
+                .draw(|frame| render(frame, &view, &UiSettings::default(), &mut HitMap::default()))
+                .unwrap();
+            let rendered = rendered_text(&terminal);
+            assert!(rendered.contains("✓ [x] ↓ Fixture audio"), "{rendered}");
         }
     }
 
