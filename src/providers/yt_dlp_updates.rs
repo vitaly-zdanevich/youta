@@ -582,8 +582,8 @@ fn map_ureq_error(error: ureq::Error) -> ProviderError {
 mod tests {
     #[cfg(feature = "network")]
     use std::{
-        io::{BufRead, BufReader, Write},
-        net::{TcpListener, TcpStream},
+        io::{BufRead, BufReader, Read, Write},
+        net::{Shutdown, TcpListener, TcpStream},
         sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
@@ -692,7 +692,10 @@ mod tests {
             let error = github_client(&server, 4096)
                 .latest_release()
                 .expect_err("invalid GitHub response should fail");
-            assert!(matches!(error, ProviderError::InvalidResponse(_)));
+            assert!(
+                matches!(error, ProviderError::InvalidResponse(_)),
+                "invalid fixture {body:?} returned {error:?}"
+            );
             server.finish();
         }
 
@@ -700,7 +703,10 @@ mod tests {
         let error = github_client(&rate_server, 4096)
             .latest_release()
             .expect_err("HTTP error should stay typed");
-        assert!(matches!(error, ProviderError::HttpStatus(403)));
+        assert!(
+            matches!(error, ProviderError::HttpStatus(403)),
+            "HTTP 403 fixture returned {error:?}"
+        );
         rate_server.finish();
 
         let large_server = MockServer::spawn(vec![json_response_without_length(
@@ -710,11 +716,110 @@ mod tests {
         let error = github_client(&large_server, 16)
             .latest_release()
             .expect_err("oversized JSON should fail before parsing");
-        assert!(matches!(
-            error,
-            ProviderError::ResponseTooLarge { limit: 16 }
-        ));
+        assert!(
+            matches!(error, ProviderError::ResponseTooLarge { limit: 16 }),
+            "oversized fixture returned {error:?}"
+        );
         large_server.finish();
+    }
+
+    /// An incomplete request must not consume the next canned HTTP response.
+    #[cfg(feature = "network")]
+    #[test]
+    fn mock_server_waits_for_complete_request_headers_before_responding() {
+        let server = MockServer::spawn(vec![json_response(200, "not json")]);
+        let address = server
+            .base_url
+            .socket_addrs(|| None)
+            .expect("fixture address")[0];
+        let mut incomplete = TcpStream::connect(address).expect("connect incomplete request");
+        incomplete
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("bound fixture observation");
+        incomplete
+            .write_all(b"GET /incomplete HTTP/1.1\r\nX-Fixture: truncated")
+            .expect("write partial header");
+        incomplete
+            .shutdown(Shutdown::Write)
+            .expect("finish partial request");
+        let mut response = Vec::new();
+        incomplete
+            .read_to_end(&mut response)
+            .expect("observe rejected request");
+        assert!(
+            response.is_empty(),
+            "partial headers consumed a canned response"
+        );
+
+        let error = github_client(&server, 4096)
+            .latest_release()
+            .expect_err("the next complete request receives the invalid JSON fixture");
+        assert!(
+            matches!(error, ProviderError::InvalidResponse(_)),
+            "{error:?}"
+        );
+        let requests = server.finish();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].target, "/repos/yt-dlp/yt-dlp/releases/latest");
+    }
+
+    /// Short socket reads cannot terminate headers, and malformed frames stay bounded.
+    #[cfg(feature = "network")]
+    #[test]
+    fn mock_request_reader_handles_fragments_and_rejects_truncated_or_oversized_headers() {
+        /// Deterministic transport fragmentation without scheduler-dependent sleeps.
+        struct ShortReads<'a> {
+            remaining: &'a [u8],
+            chunk_size: usize,
+        }
+
+        impl Read for ShortReads<'_> {
+            fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+                let count = output.len().min(self.chunk_size);
+                self.remaining.read(&mut output[..count])
+            }
+        }
+
+        for chunk_size in [1, 2, 3, 8] {
+            let request = read_request(ShortReads {
+                remaining:
+                    b"GET /fixture HTTP/1.1\r\nHost: localhost\r\nX-Fixture: complete\r\n\r\n",
+                chunk_size,
+            })
+            .expect("read fragmented request")
+            .expect("complete headers");
+            assert_eq!(request.target, "/fixture");
+            assert_eq!(request.header("x-fixture"), Some("complete"));
+        }
+        for incomplete in [
+            b"GET /fixture HTTP/1.1".as_slice(),
+            b"GET /fixture HTTP/1.1\r\nHost: localhost",
+            b"GET /fixture HTTP/1.1\r\nHost: localhost\r\n",
+            b"GET /fixture HTTP/1.1\r\nInvalid header\r\n\r\n",
+        ] {
+            assert!(
+                read_request(incomplete)
+                    .expect("read partial fixture")
+                    .is_none()
+            );
+        }
+        let oversized = format!(
+            "GET /fixture HTTP/1.1\r\nX-Fixture: {}\r\n\r\n",
+            "x".repeat(MAX_MOCK_REQUEST_BYTES)
+        );
+        let mut reader = ShortReads {
+            remaining: oversized.as_bytes(),
+            chunk_size: 3,
+        };
+        assert!(
+            read_request(&mut reader)
+                .expect("read oversized fixture")
+                .is_none()
+        );
+        assert_eq!(
+            reader.remaining.len(),
+            oversized.len() - MAX_MOCK_REQUEST_BYTES - 1
+        );
     }
 
     #[cfg(feature = "network")]
@@ -862,6 +967,14 @@ mod tests {
         thread: Option<JoinHandle<Vec<RecordedRequest>>>,
     }
 
+    /// HTTP fixtures need only small GET headers, never an unbounded request body.
+    #[cfg(feature = "network")]
+    const MAX_MOCK_REQUEST_BYTES: usize = 16 * 1024;
+
+    /// Bounds stalled or abandoned loopback connections without changing client policy.
+    #[cfg(feature = "network")]
+    const MOCK_STREAM_TIMEOUT: Duration = Duration::from_secs(5);
+
     #[cfg(feature = "network")]
     impl MockServer {
         fn spawn(responses: Vec<String>) -> Self {
@@ -875,13 +988,33 @@ mod tests {
             let thread = thread::spawn(move || {
                 let mut requests = Vec::new();
                 for response in responses {
-                    let mut stream = loop {
+                    let (mut stream, request) = loop {
                         match listener.accept() {
                             Ok((stream, _)) => {
                                 stream
                                     .set_nonblocking(false)
                                     .expect("mock stream should become blocking");
-                                break stream;
+                                stream
+                                    .set_read_timeout(Some(MOCK_STREAM_TIMEOUT))
+                                    .expect("bound mock request reads");
+                                stream
+                                    .set_write_timeout(Some(MOCK_STREAM_TIMEOUT))
+                                    .expect("bound mock response writes");
+                                match read_request(&stream) {
+                                    Ok(Some(request)) => break (stream, request),
+                                    Ok(None) => continue,
+                                    Err(error)
+                                        if matches!(
+                                            error.kind(),
+                                            std::io::ErrorKind::WouldBlock
+                                                | std::io::ErrorKind::TimedOut
+                                                | std::io::ErrorKind::ConnectionReset
+                                        ) =>
+                                    {
+                                        continue;
+                                    }
+                                    Err(error) => panic!("mock should read request: {error}"),
+                                }
                             }
                             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                                 if thread_stop.load(Ordering::Relaxed) {
@@ -892,7 +1025,7 @@ mod tests {
                             Err(error) => panic!("mock should accept request: {error}"),
                         }
                     };
-                    requests.push(read_request(&stream));
+                    requests.push(request);
                     stream
                         .write_all(response.as_bytes())
                         .expect("mock should write response");
@@ -927,33 +1060,35 @@ mod tests {
     }
 
     #[cfg(feature = "network")]
-    fn read_request(stream: &TcpStream) -> RecordedRequest {
-        let mut reader = BufReader::new(stream);
+    /// Reads a complete, size-bounded header frame across arbitrary short reads.
+    ///
+    /// EOF or malformed headers discard the connection, not its canned response.
+    fn read_request(stream: impl Read) -> std::io::Result<Option<RecordedRequest>> {
+        let mut reader = BufReader::new(stream.take(MAX_MOCK_REQUEST_BYTES as u64 + 1));
         let mut request_line = String::new();
-        reader
-            .read_line(&mut request_line)
-            .expect("mock request line should be readable");
-        let target = request_line
-            .split_ascii_whitespace()
-            .nth(1)
-            .expect("request target should exist")
-            .to_owned();
+        let mut bytes = reader.read_line(&mut request_line)?;
+        if !request_line.ends_with("\r\n") || bytes > MAX_MOCK_REQUEST_BYTES {
+            return Ok(None);
+        }
+        let Some(target) = request_line.split_ascii_whitespace().nth(1) else {
+            return Ok(None);
+        };
+        let target = target.to_owned();
         let mut headers = Vec::new();
         loop {
             let mut header = String::new();
-            reader
-                .read_line(&mut header)
-                .expect("mock header should be readable");
-            if header == "\r\n" || header.is_empty() {
-                break;
+            bytes += reader.read_line(&mut header)?;
+            if !header.ends_with("\r\n") || bytes > MAX_MOCK_REQUEST_BYTES {
+                return Ok(None);
             }
-            let (name, value) = header
-                .trim_end()
-                .split_once(':')
-                .expect("request header should contain a colon");
+            if header == "\r\n" {
+                return Ok(Some(RecordedRequest { target, headers }));
+            }
+            let Some((name, value)) = header.trim_end().split_once(':') else {
+                return Ok(None);
+            };
             headers.push((name.to_owned(), value.trim().to_owned()));
         }
-        RecordedRequest { target, headers }
     }
 
     #[cfg(feature = "network")]
