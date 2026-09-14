@@ -11,6 +11,7 @@
 // `whitespace-pre-wrap` is what preserves their shape — never markup.
 
 import { useEffect, useRef } from 'react';
+import type { UnitUiAction } from '../actions';
 
 import type {
   AudioQualityPopupView,
@@ -1637,13 +1638,13 @@ export function PreferencesPopup({ popup, archiveSupported }: {
 	popup: PreferencesPopupView;
 	archiveSupported: boolean;
 }) {
-  const toggles: Array<[string, boolean, string]> = [
+	const toggles: Array<[string, boolean, UnitUiAction]> = [
     ["Skip advertisement chapters", popup.skip_advertisement_chapters, "ToggleSkipAdvertisementChapters"],
     ["Prewarm the selected YouTube video", popup.youtube_prewarm, "ToggleYouTubePrewarm"],
     ["Show Local folder sizes", popup.show_local_folder_sizes, "ToggleLocalFolderSizes"],
     ["Show artwork on a Linux console", popup.show_images_in_tty, "ToggleTtyImages"],
   ];
-  const cycles: Array<[string, string, string]> = [
+	const cycles: Array<[string, string, UnitUiAction | 'SetSubscriptionsLayout']> = [
     ["Subscriptions layout", popup.subscriptions_layout, "SetSubscriptionsLayout"],
     ["YouTube thumbnail size", popup.youtube_thumbnail_size, "CycleYouTubeThumbnailSize"],
     ["Bandcamp audio format", popup.bandcamp_audio_format, "CycleBandcampAudioFormat"],
@@ -2107,7 +2108,7 @@ export type CredentialEditor =
   | "rss_subscription"
   | "private_note";
 
-const CREDENTIAL_EDITORS: Record<CredentialEditor, { title: string; body: string; dismiss: string }> =
+const CREDENTIAL_EDITORS: Record<CredentialEditor, { title: string; body: string; dismiss: UnitUiAction }> =
   {
     youtube_setup: {
       title: "YouTube credentials needed",

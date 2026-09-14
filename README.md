@@ -2660,6 +2660,13 @@ it links no terminal renderer. It is deliberately left out of the coverage gate:
 measuring it would mean installing the WebKitGTK toolchain on the coverage
 runner to instrument a thin shell over the reducer that gate already covers.
 
+The page's [typed actions](gui/ui/src/actions.ts) check names and payloads at
+compile time. Shared [action fixtures](tests/fixtures/ui-actions.json) are
+checked by both TypeScript and Rust, including identities, generations, and
+enum values. `cargo test --locked --test ui_action_contract --no-default-features
+--features controller` runs the core contract check without native GUI libraries.
+The serialized view remains an intentionally limited, credential-redacted subset.
+
 Linux desktop CI also runs the browser integration test against the built page,
 using Firefox supplied by the [Ubuntu runner image](https://github.com/actions/runner-images/blob/main/images/ubuntu/Ubuntu2404-Readme.md).
 The same check can be run locally with Firefox on `PATH`; set

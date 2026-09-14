@@ -22,6 +22,14 @@ use std::time::Duration;
 
 use serde::Serialize;
 
+#[path = "../../tests/support/ui_action_contract.rs"]
+mod action_contract;
+
+#[test]
+fn the_window_action_payload_fixtures_match_the_reducer() {
+    action_contract::assert_fixture_contract(action_belongs_to_disabled_feature);
+}
+
 #[cfg(feature = "archive-upload")]
 use youta::archive_upload::ArchiveUploadDraft;
 #[cfg(feature = "commons-upload")]
@@ -197,87 +205,19 @@ fn field_belongs_to_disabled_feature(interface: &str, field: &str) -> bool {
                 && matches!(field, "lan_share_popup" | "podcast_feed_options_popup")))
 }
 
-/// Whether one frontend action belongs to a capability omitted from this build.
-///
-/// Action names remain in the shared page so one frontend can serve every
-/// feature set. Runtime support flags prevent these dispatch sites from becoming
-/// reachable when the corresponding Rust enum variants are not compiled.
+/// Uses the window's forwarded features and its always-enabled source profile.
 fn action_belongs_to_disabled_feature(name: &str) -> bool {
-    (!cfg!(feature = "ascii-visualizer") && name == "DismissAsciiVisualizer")
-        || (!cfg!(feature = "commons-upload")
-            && matches!(
-                name,
-                "AddCommonsCategorySuggestionAt"
-                    | "CycleCommonsAuthMethod"
-                    | "CycleCommonsUploadLicense"
-                    | "DismissCommonsCredentials"
-                    | "DismissCommonsUpload"
-                    | "OpenCommonsAccountRegistration"
-                    | "OpenCommonsBotPasswordGuide"
-                    | "OpenCommonsCategorySuggestionAt"
-                    | "OpenCommonsUpload"
-                    | "OpenCommonsUploadResult"
-                    | "RemoveCommonsUploadCategory"
-                    | "SelectCommonsCredentialField"
-                    | "SelectCommonsUploadField"
-                    | "SubmitCommonsCredentials"
-                    | "SubmitCommonsUpload"
-            ))
-        || (!cfg!(feature = "s3-upload")
-            && matches!(
-                name,
-                "OpenS3Upload"
-                    | "SelectS3UploadField"
-                    | "ToggleS3UploadVideo"
-                    | "SubmitS3Upload"
-                    | "DismissS3Upload"
-                    | "OpenS3Credentials"
-                    | "SelectS3CredentialField"
-                    | "SubmitS3Credentials"
-                    | "DismissS3Credentials"
-            ))
-        || (!cfg!(feature = "archive-upload")
-            && matches!(
-                name,
-                "OpenArchiveUpload"
-                    | "SelectArchiveUploadField"
-                    | "ToggleArchiveUploadVideo"
-                    | "SubmitArchiveUpload"
-                    | "DismissArchiveUpload"
-                    | "OpenArchiveUploadResult"
-                    | "SelectArchiveCredentialField"
-                    | "SubmitArchiveCredentials"
-                    | "DismissArchiveCredentials"
-                    | "OpenArchiveCredentialsGuide"
-            ))
-        || (!cfg!(feature = "evernote")
-            && matches!(
-                name,
-                "DismissEvernoteCredentials"
-                    | "DismissEvernoteNote"
-                    | "InsertEvernoteCaptions"
-                    | "OpenEvernoteDeveloperTokenGuide"
-                    | "OpenEvernoteNote"
-                    | "OpenEvernoteNoteResult"
-                    | "SelectEvernoteNoteField"
-                    | "SubmitEvernoteCredentials"
-                    | "SubmitEvernoteNote"
-            ))
-        || (!cfg!(feature = "youtube-captions")
-            && matches!(name, "ActivateYouTubeCaption" | "DismissYouTubeCaptions"))
-        || (!cfg!(feature = "lan-sharing")
-            && matches!(
-                name,
-                "ConfirmPodcastFeed"
-                    | "DismissLanShare"
-                    | "DismissPodcastFeed"
-                    | "ShareLocalFiles"
-                    | "ShareLocalPodcast"
-                    | "ShareYouTubeChannelPodcast"
-                    | "StopLanShare"
-                    | "TogglePodcastFeedIgnoreBefore"
-                    | "TogglePodcastFeedSkipShorts"
-            ))
+    action_contract::action_belongs_to_disabled_feature(name, |feature| match feature {
+        "ascii-visualizer" => cfg!(feature = "ascii-visualizer"),
+        "commons-upload" => cfg!(feature = "commons-upload"),
+        "s3-upload" => cfg!(feature = "s3-upload"),
+        "archive-upload" => cfg!(feature = "archive-upload"),
+        "evernote" => cfg!(feature = "evernote"),
+        "youtube-captions" => cfg!(feature = "youtube-captions"),
+        "lan-sharing" => cfg!(feature = "lan-sharing"),
+        "qr" | "yt-dlp" | "yandex-music" => true,
+        _ => panic!("unknown action feature {feature}"),
+    })
 }
 
 #[test]

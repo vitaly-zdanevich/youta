@@ -114,14 +114,11 @@ export function Description({
               key={key}
               type="button"
               title={`Seek to ${formatSeconds(span.seconds)}`}
-              onClick={() =>
-                void dispatch({
-                  // The identity captured when the span was rendered travels
-                  // with the click, so the reducer can refuse a seek aimed at
-                  // media the selection has since moved away from.
-                  ActivateTimecode: { media_id: mediaId, seconds: span.seconds },
-                })
-              }
+							onClick={() => {
+								if (!mediaId) return;
+								// Keep the identity captured when this span was rendered.
+								void dispatch({ ActivateTimecode: { media_id: mediaId, seconds: span.seconds } });
+							}}
               className={`rounded-[3px] font-mono tabular-nums underline decoration-dotted underline-offset-2 hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-accent ${
                 span.is_chapter ? "text-accent" : "text-ink"
               }`}

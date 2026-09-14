@@ -2,8 +2,7 @@
 //
 // These declarations mirror `src/view.rs`, `src/keymap.rs`, and `src/playback`
 // in the Rust crate. They are the subset this window consumes, not the whole
-// contract: the reducer publishes about 65 top-level fields and accepts 164
-// actions.
+// contract. Semantic actions are typed separately in actions.ts.
 //
 // Every field name here is checked against the JSON the reducer actually emits
 // by `gui/src/contract_tests.rs`. Adding a field the serializer does not send
@@ -15,6 +14,9 @@
 // or feed URL that may itself be a credential — are skipped by the reducer, so
 // they never enter this process and must not be declared as if they might. The
 // Commons and Evernote editors below carry only lengths and control state.
+
+import type { ActionScreen, SourceKind } from './actions';
+export type { UiAction } from './actions';
 
 /** A serde `Duration`, which crosses as seconds plus nanoseconds. */
 export interface RustDuration {
@@ -35,7 +37,7 @@ export interface BufferedRange {
  * a click aimed at an item the selection has already moved away from.
  */
 export interface MediaId {
-  source: string;
+	source: SourceKind;
   external_id: string;
 }
 
@@ -974,7 +976,7 @@ export interface PlaybackTick {
  * window knows not to draw a search field there.
  */
 export interface ScreenEntry {
-  id: string;
+	id: ActionScreen;
   label: string;
   details_kind: InformationPanelKind;
   search_verb: string | null;
@@ -1035,16 +1037,3 @@ export interface PopupGeometry {
   project_history: ScrollGeometry;
   video_comments: ScrollGeometry;
 }
-
-/**
- * A semantic action.
- *
- * Unit variants are bare strings and payload variants are single-key objects,
- * matching Serde's external tagging. The window emits only the handful its
- * controls produce; every other action reaches the reducer through the shared
- * keyboard map instead, which is why this type is deliberately loose.
- *
- * A misspelled variant is rejected by the reducer rather than ignored, and
- * `ipc.ts` reports that rejection into the process log — see `dispatch`.
- */
-export type UiAction = string | Record<string, unknown>;
