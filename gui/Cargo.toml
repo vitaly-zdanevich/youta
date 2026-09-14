@@ -1,6 +1,6 @@
 [package]
 name = "youta-gui"
-version = "0.72.2"
+version = "0.72.3"
 edition = "2024"
 rust-version = "1.95"
 description = "Desktop front-end for the Youta player, sharing its reducer with the terminal UI"
@@ -54,7 +54,7 @@ youtube-captions = ["youta/youtube-captions"]
 # renderer, so Crossterm and Ratatui never enter this binary.
 # Keep the registry bound synchronized with this release: both front ends use
 # the same reducer/view contract, including across patch releases.
-youta = { version = "=0.72.2", path = "..", default-features = false, features = ["controller", "sources", "remote-artwork", "qr", "yandex-music"] }
+youta = { version = "=0.72.3", path = "..", default-features = false, features = ["controller", "sources", "remote-artwork", "qr", "yandex-music"] }
 
 percent-encoding = "2.3"
 serde = { version = "1.0", features = ["derive"] }

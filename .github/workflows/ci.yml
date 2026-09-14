@@ -1266,6 +1266,47 @@ jobs:
           path: lcov.info
           if-no-files-found: error
 
+  performance:
+    name: Offline performance baseline (report only)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2, Node 24
+
+      - name: Install the minimum Rust toolchain
+        run: |
+          rustup toolchain install "${RUST_VERSION}" --profile minimal
+          rustup default "${RUST_VERSION}"
+
+      - name: Restore Cargo registry cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Check baseline runner contracts
+        run: python3 -m unittest discover -s scripts/tests -p 'test_performance.py'
+
+      # The reduced profile omits network/source and playback adapters. Build
+      # time and deterministic fixture setup are not included in measurements.
+      # The runner owns the build and snapshots its executable, so stale or
+      # differently-featured binaries/probe files cannot be supplied as inputs.
+      - name: Build fixtures, measure offline baselines, and validate reports
+        run: python3 scripts/performance.py --output-dir performance-report
+
+      - name: Upload performance baseline report
+        if: ${{ !inputs.release-validation }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: performance-baseline
+          path: performance-report/
+          if-no-files-found: error
+
   # Sonar consumes the successful coverage report from this same run. Its
   # original main-push, pull-request, and manual triggers remain unchanged.
   sonarcloud:

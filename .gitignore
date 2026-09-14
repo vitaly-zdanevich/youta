@@ -1,4 +1,6 @@
 /target/
+/performance-report/
+/scripts/**/__pycache__/
 /dist/
 /dist-desktop/
 /.idea/

@@ -2559,6 +2559,62 @@ CI runs. Without `SONAR_TOKEN`, coverage still runs and only SonarCloud analysis
 is skipped. Both workflows use GitHub's
 [reusable workflows](https://docs.github.com/en/actions/how-tos/reuse-automations/reuse-workflows).
 
+### Offline performance baseline
+
+CI also produces the `performance-baseline` artifact with JSON raw samples and
+a Markdown summary. This is reporting first: only fixture/report correctness,
+finite metrics, process readiness, and clean shutdown are checked; there are
+**no timing regression thresholds**. Release validation runs the same probes
+but does not upload diagnostic artifacts into the release asset inventory.
+
+The fixed [fixture recipe](tests/fixtures/performance.json) uses 10,000 rows and
+128 description paragraphs. Ignored Rust tests measure real controller
+selection dispatch plus preliminary details separately from production TUI
+frame rendering through Ratatui's `TestBackend`. Fixture creation and row
+materialization are excluded. Five samples follow warm-up; render samples
+alternate description scroll positions to exercise wrapping and frame diffs.
+These are isolated controller/render measurements, not full-app interaction
+latency or terminal output throughput.
+
+The [standard-library Python runner](scripts/performance.py) separately launches
+the already-built executable three times in a 120×40 Linux PTY with an empty
+temporary configuration and helper path. Startup ends at the first recognizable
+`Video search` frame. After 200 ms of settling, each process is observed idle for
+three seconds using its own `/proc/<pid>/stat`: user+system CPU, elapsed wall time,
+CPU percentage relative to one core, and end-of-observation RSS, not peak RSS.
+The runner drains bounded terminal output, handles cursor queries, and always
+reaps the child. Readiness/shutdown deadlines prevent hung jobs, not speed
+regressions. CPU ticks can legitimately produce zero for short idle samples.
+
+CI builds `release --no-default-features --features tui`, without
+network/source adapters, playback, images, or GUI. They do **not** characterize
+the full default build or populated-library process startup. Shared CI runners
+remain noisy, and these fresh processes do not imply a cold filesystem cache.
+Reports record revision/dirty state, runner Rust toolchain, expected process
+profile/features, checked probe features, public
+machine metadata, fixture sizes, and SHA-256 hashes of the fixture recipe,
+probe sources, and executable. They contain no environment dump, private paths,
+configuration, or terminal transcript. Probe inputs embed their compile-time
+recipe, source definitions, and revision; stale probes are rejected before
+starting the process. The runner owns the fixed build command, snapshots its
+resulting executable, verifies Cargo's exact binary artifact/native target,
+optimization profile and features, and uses a fresh probe directory; it accepts neither an
+arbitrary binary nor previously generated measurements. Compare like
+profiles/recipes first.
+
+Run the same baseline on Linux (Python 3.11+). Its initial build phase may fetch
+locked dependencies, but build time is excluded and measurements are offline:
+
+```sh
+python3 -m unittest discover -s scripts/tests -p 'test_performance.py'
+python3 scripts/performance.py --output-dir performance-report
+```
+
+This first baseline adds no benchmark dependency; existing test fixtures,
+`std::time::Instant`, and [Python's PTY support](https://docs.python.org/3/library/pty.html)
+suffice for raw reporting. [Criterion](https://bheisler.github.io/criterion.rs/book/)
+remains an option when repeated baselines justify statistical regression analysis.
+
 ### Release artifacts
 
 Tagged releases build for Linux on amd64, i686, and arm64,

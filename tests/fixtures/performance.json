@@ -1,0 +1,15 @@
+{
+	"recipe_version": 1,
+	"rows": 10000,
+	"description_paragraphs": 128,
+	"samples": 5,
+	"warmup_iterations": 32,
+	"navigation_iterations": 1000,
+	"render_iterations": 20,
+	"terminal_columns": 120,
+	"terminal_rows": 40,
+	"process_samples": 3,
+	"idle_seconds": 3.0,
+	"settle_seconds": 0.2,
+	"readiness_timeout_seconds": 30.0
+}

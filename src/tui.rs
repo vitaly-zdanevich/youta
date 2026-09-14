@@ -3,6 +3,9 @@
 //! This module renders Youta's own controls. An external player backend never
 //! writes to the terminal and does not create a second user interface.
 
+#[cfg(test)]
+mod performance;
+
 use std::io::{self, IsTerminal, Stdout};
 use std::path::PathBuf;
 use std::time::Duration;

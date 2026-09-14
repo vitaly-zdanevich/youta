@@ -3,6 +3,9 @@
 //! Declared `#[cfg(test)]` in the crate root, so nothing here reaches a
 //! distribution build.
 
+#[cfg(feature = "tui")]
+pub(crate) mod performance;
+
 use std::path::PathBuf;
 
 use tempfile::TempDir;

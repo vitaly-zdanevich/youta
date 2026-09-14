@@ -153,9 +153,48 @@ fn shared_ci_does_not_upload_diagnostics_into_release_artifacts() {
         .split("      - name:")
         .filter(|step| step.contains("uses: actions/upload-artifact@"))
         .collect();
-    assert_eq!(uploads.len(), 3);
+    assert_eq!(uploads.len(), 4);
     for upload in uploads {
         assert!(upload.contains("if: ${{ !inputs.release-validation }}"));
+    }
+}
+
+/// Offline baselines report measurements without imposing timing thresholds.
+#[test]
+fn performance_baseline_builds_before_measuring_and_checks_report_shape() {
+    let ci = workflow("ci.yml");
+    let performance = job(&ci, "performance");
+    assert!(performance.contains("timeout-minutes: 360"));
+    assert!(!performance.contains("continue-on-error:"));
+    assert!(!performance.lines().any(|line| line.starts_with("    if:")));
+    assert!(
+        performance
+            .contains("python3 -m unittest discover -s scripts/tests -p 'test_performance.py'")
+    );
+    assert!(performance.contains("python3 scripts/performance.py --output-dir performance-report"));
+    let runner = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/performance.py"),
+    )
+    .unwrap();
+    let main = runner.split_once("def main():").unwrap().1;
+    assert!(main.find("build_fixtures(").unwrap() < main.find("collect_report(").unwrap());
+    assert!(
+        runner.contains("'--locked', '--release', '--no-default-features', '--features', 'tui'")
+    );
+    assert!(
+        !performance.contains("cargo build"),
+        "runner owns the fixed unmeasured build phase"
+    );
+    assert!(performance.contains("name: performance-baseline"));
+    assert!(performance.contains("path: performance-report/"));
+    assert!(performance.contains("if-no-files-found: error"));
+    for forbidden in [
+        "--fail-under",
+        "--threshold",
+        "SONAR_TOKEN",
+        "node-version: 20",
+    ] {
+        assert!(!performance.contains(forbidden), "{forbidden}");
     }
 }
 

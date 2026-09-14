@@ -45603,6 +45603,9 @@ mod tests {
     #[cfg(feature = "yt-dlp")]
     #[path = "manual_download_sources.rs"]
     mod manual_download_sources_tests;
+    #[cfg(feature = "tui")]
+    #[path = "performance.rs"]
+    mod performance_tests;
     #[cfg(feature = "yandex-music")]
     #[path = "queued_yandex_download.rs"]
     mod queued_yandex_download_tests;
