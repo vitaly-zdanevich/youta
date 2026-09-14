@@ -6,13 +6,29 @@ use crate::playback_cache_download::{PreparedCacheDownload, prepare_cached_opus}
 use std::sync::atomic::Ordering;
 
 /// One preparation across cancellation/restart bursts, including validator cleanup.
-static PREPARING_CACHE: AtomicBool = AtomicBool::new(false);
+pub(super) static PREPARING_CACHE: std::sync::LazyLock<CachePreparationGate> =
+    std::sync::LazyLock::new(CachePreparationGate::default);
 
-struct PreparationPermit;
+/// Shared by packet-cache and original-byte workers, including cancelled retirement.
+#[derive(Default)]
+pub(super) struct CachePreparationGate(Arc<AtomicBool>);
+
+impl CachePreparationGate {
+    /// Reserves one worker without waiting for disk I/O or a preceding cancellation.
+    pub(super) fn try_acquire(&self) -> Option<PreparationPermit> {
+        self.0
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()?;
+        Some(PreparationPermit(Arc::clone(&self.0)))
+    }
+}
+
+/// Retains exclusion until the worker exits, not merely until its UI owner drops.
+pub(super) struct PreparationPermit(Arc<AtomicBool>);
 
 impl Drop for PreparationPermit {
     fn drop(&mut self) {
-        PREPARING_CACHE.store(false, Ordering::Release);
+        self.0.store(false, Ordering::Release);
     }
 }
 
@@ -63,10 +79,7 @@ impl CachedDownloadService for SystemCachedDownloadService {
         thumbnail: Option<&url::Url>,
     ) -> Option<Box<dyn CachedDownloadJob>> {
         let handle = player.cache_export_handle()?;
-        PREPARING_CACHE
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .ok()?;
-        let permit = PreparationPermit;
+        let permit = PREPARING_CACHE.try_acquire()?;
         let cancellation = Arc::new(AtomicBool::new(false));
         let export = handle.start(Arc::clone(&cancellation))?;
         let (sender, receiver) = bounded(1);
@@ -162,13 +175,9 @@ impl CachedDownloadArtifact for SystemCachedArtifact {
         }
         let path = self.prepared.publish(destination, title, id)?;
         // An optional image never causes the now-committed audio to be downloaded again.
-        let thumbnail_saved = self.thumbnail.is_some_and(|thumbnail| {
-            std::fs::hard_link(
-                thumbnail.file.path(),
-                path.with_extension(thumbnail.extension),
-            )
-            .is_ok()
-        });
+        let thumbnail_saved = self
+            .thumbnail
+            .is_some_and(|thumbnail| thumbnail.publish(&path));
         Ok(CachedDownloadPublished {
             path,
             thumbnail_missing: self.thumbnail_requested && !thumbnail_saved,
@@ -177,13 +186,20 @@ impl CachedDownloadArtifact for SystemCachedArtifact {
 }
 
 /// Already downloaded artwork only: an offline audio save must remain offline.
-struct CachedThumbnail {
+pub(super) struct CachedThumbnail {
     file: tempfile::NamedTempFile,
     extension: &'static str,
 }
 
+impl CachedThumbnail {
+    /// Adds an already cached sidecar without replacing an existing file.
+    pub(super) fn publish(self, audio_path: &Path) -> bool {
+        std::fs::hard_link(self.file.path(), audio_path.with_extension(self.extension)).is_ok()
+    }
+}
+
 #[cfg(feature = "remote-artwork")]
-fn prepare_cached_thumbnail(
+pub(super) fn prepare_cached_thumbnail(
     config: &Config,
     source: Option<&url::Url>,
     destination: &Path,
@@ -207,7 +223,7 @@ fn prepare_cached_thumbnail(
 }
 
 #[cfg(not(feature = "remote-artwork"))]
-fn prepare_cached_thumbnail(
+pub(super) fn prepare_cached_thumbnail(
     _config: &Config,
     _source: Option<&url::Url>,
     _destination: &Path,
@@ -223,12 +239,16 @@ pub(super) struct PendingCachedDownload {
 }
 
 impl AppController {
-    /// Attempts only the complete audio of the exact currently playing YouTube item.
+    /// Attempts a complete cache for the exact playing Archive original or YouTube audio.
     pub(super) fn try_cached_manual_download(
         &mut self,
         item: &QueueItem,
         request: &DownloadRequest,
     ) -> bool {
+        #[cfg(feature = "archive-org")]
+        if self.try_cached_original_download(item, request) {
+            return true;
+        }
         if item.media.id.source != SourceKind::YouTube
             || !matches!(
                 item.media.kind,
@@ -262,6 +282,17 @@ impl AppController {
         ) else {
             return false;
         };
+        self.begin_cached_download(item, request, job);
+        true
+    }
+
+    /// Gives original-file and packet-cache jobs the same foreground/cancellation owner.
+    pub(super) fn begin_cached_download(
+        &mut self,
+        item: &QueueItem,
+        request: &DownloadRequest,
+        job: Box<dyn CachedDownloadJob>,
+    ) {
         self.pending_cached_download = Some(PendingCachedDownload {
             item: item.clone(),
             request: request.clone(),
@@ -274,7 +305,6 @@ impl AppController {
             ..DownloadView::default()
         });
         self.view.status_line = format!("Checking the playback cache for {}…", item.media.title);
-        true
     }
 
     /// Consumes one cache outcome; a miss starts the captured normal download once.

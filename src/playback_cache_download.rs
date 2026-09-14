@@ -191,7 +191,7 @@ pub fn prepare_cached_opus(
 }
 
 /// Restricts the only user-controlled components of the final filename.
-fn filename_component(value: &str, max_bytes: usize, fallback: &str) -> String {
+pub(crate) fn filename_component(value: &str, max_bytes: usize, fallback: &str) -> String {
     let mut result = String::new();
     for character in value.chars() {
         if result.len().saturating_add(character.len_utf8()) > max_bytes {

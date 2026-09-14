@@ -1,6 +1,176 @@
 use super::*;
 use crate::app::cached_download::*;
 
+#[cfg(feature = "archive-org")]
+mod archive_original {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+
+    /// The controller keeps canonical history while the player fills a private byte cache.
+    #[test]
+    fn archive_playback_then_original_download_is_byte_exact_without_a_second_fetch() {
+        let (mut controller, requests, _directory, _, _, _) = cached_controller();
+        let (mut player_controller, playback) = controller_with_mock_statuses([]);
+        controller.player = None;
+        controller.playback_factory = player_controller.playback_factory.take();
+        controller.config.subscriptions.download_thumbnails = false;
+        let source = url::Url::parse("https://archive.org/download/fixture/original.mp3").unwrap();
+        let mut item = controller.playback_queue.current().unwrap().clone();
+        item.media.id = MediaId::new(SourceKind::ArchiveOrg, source.as_str());
+        item.media.kind = MediaKind::Audio;
+        item.media.webpage_url = source.clone();
+        item.playback_location = source.to_string();
+        let expected = b"ID3original-title\0\xff\xfbaudio-with-original-containerTAGoriginal-tail";
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let origin =
+            url::Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let origin_worker = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        thread::sleep(Duration::from_millis(2))
+                    }
+                    Err(error) => {
+                        panic!("owned origin did not receive the playback request: {error}")
+                    }
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut headers = Vec::new();
+            while !headers.ends_with(b"\r\n\r\n") && headers.len() < 8192 {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                headers.push(byte[0]);
+            }
+            assert!(
+                String::from_utf8(headers)
+                    .unwrap()
+                    .to_ascii_lowercase()
+                    .contains("range: bytes=0-")
+            );
+            write!(stream, "HTTP/1.1 206 Partial Content\r\nETag: \"original\"\r\nContent-Type: audio/mpeg\r\nContent-Length: {}\r\nContent-Range: bytes 0-{}/{}\r\nConnection: close\r\n\r\n", expected.len(), expected.len() - 1, expected.len()).unwrap();
+            stream.write_all(expected).unwrap();
+            // Returning closes the source listener before the user requests Download.
+        });
+        controller.archive_playback_cache = Some(
+            crate::archive_playback_cache::ArchivePlaybackCache::start_with_origin(
+                source.clone(),
+                origin,
+            )
+            .unwrap(),
+        );
+        controller.play_queue_item(item.clone(), false);
+        let input = playback.lock().unwrap().played.last().unwrap().clone();
+        assert!(input.bypass_ytdl);
+        let local = url::Url::parse(&input.location).unwrap();
+        assert_eq!(local.host_str(), Some("127.0.0.1"));
+        assert_eq!(
+            controller
+                .playback_queue
+                .current()
+                .unwrap()
+                .playback_location,
+            source.as_str()
+        );
+        assert_eq!(
+            controller
+                .pending_history
+                .as_ref()
+                .unwrap()
+                .replay_locator
+                .as_deref(),
+            Some(source.as_str())
+        );
+        let mut stream = TcpStream::connect(("127.0.0.1", local.port().unwrap())).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        write!(
+            stream,
+            "GET {} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+            local.path(),
+            local.port().unwrap()
+        )
+        .unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 200"));
+        let body = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .unwrap()
+            + 4;
+        assert_eq!(&response[body..], expected);
+        origin_worker.join().unwrap();
+        let complete = controller
+            .archive_playback_cache
+            .as_ref()
+            .unwrap()
+            .completed()
+            .unwrap();
+        let cache_path = complete.path().to_owned();
+        drop(complete);
+        controller.playback_phase = PlaybackPhase::Playing;
+        controller.view.playback.idle = false;
+        controller.launch_manual_download(item.clone(), source.clone(), DownloadFormat::ExactFile);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while controller.pending_cached_download.is_some() && Instant::now() < deadline {
+            controller.poll_cached_download(Instant::now());
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "completed original bytes must bypass yt-dlp"
+        );
+        let path = controller
+            .view
+            .download
+            .as_ref()
+            .unwrap()
+            .completed_path
+            .as_ref()
+            .unwrap();
+        assert_eq!(Path::new(path).extension().unwrap(), "mp3");
+        assert_eq!(std::fs::read(path).unwrap(), expected);
+        assert_eq!(controller.current_media.as_ref(), Some(&item.media.id));
+        assert!(controller.pending_download_choice.is_none());
+        assert!(
+            controller
+                .view
+                .status_line
+                .starts_with("Saved from playback cache:")
+        );
+        // A ready original-file save obeys the existing cancellation owner too.
+        controller.launch_manual_download(item, source, DownloadFormat::ExactFile);
+        controller.cancel_active_download_at(Instant::now());
+        controller.poll_cached_download(Instant::now());
+        assert!(requests.lock().unwrap().is_empty());
+        assert!(!controller.view.download.as_ref().unwrap().active);
+        controller.shutdown();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while cache_path.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            !cache_path.exists(),
+            "stopped session cache is removed after its readers finish"
+        );
+    }
+}
+
 struct DeferredCacheService;
 struct DeferredCacheJob;
 

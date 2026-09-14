@@ -1526,8 +1526,8 @@ when converting between containers. The result stays private until those
 checks and the playback-load identity pass. Existing download files are never
 replaced. `[C]` cancels the
 attempt without starting a fallback download. Unsupported, incomplete, or
-changed caches fall back once to the ordinary downloader. Original-file and
-video downloads always use the ordinary path because a cache remux cannot
+changed caches fall back once to the ordinary downloader. YouTube original-file
+and video downloads use the ordinary path because a cache remux cannot
 preserve the original container or provide video that was not played.
 
 The successful path needs no network connection. If thumbnail downloading is
@@ -1542,6 +1542,33 @@ independent validation address those risks. Youta does not enlarge its memory
 budget or enable an unbounded disk cache. Buffering speed still depends on the
 source and connection; changing the read-ahead target cannot guarantee that a
 long recording becomes available offline in a few seconds.
+
+### Saving cached Archive.org originals
+
+With `archive-org`, `backend-mpv`, and `yt-dlp` enabled, Archive audio playback
+uses a private loopback read-through cache. Only mpv's requested blocks are
+fetched; there is no second background download. Repeated reads use the cached
+original bytes, including container headers and embedded tags.
+
+The cache accepts files up to 256 MiB, with a 512 MiB reservation limit across
+live and retiring caches. Complete coverage, exact byte length, a stable final
+URL, and an unchanged strong HTTP ETag are required before an original-file
+download can use it. The seek bar alone is not proof. Saving then copies bytes
+without FFmpeg, conversion, or a new network request. A different selected
+variant, an incomplete cache, unsupported HTTP response, or a larger file uses
+the normal download path. `[C]` cancels a cache save just like a download.
+If a cancelled save is still finishing disk I/O, Youta asks you to try again
+shortly instead of starting overlapping copies or downloading the file again.
+
+The optimization is skipped when an HTTP(S)/ALL proxy environment variable is
+nonempty, so normal playback keeps its configured network route.
+
+The temporary route listens only on `127.0.0.1`, not the LAN, and never replaces
+the canonical URL in History or playlists. Its files are retired when playback
+is replaced or Youta exits; outstanding saves cannot publish a retired cache.
+A forced process kill can leave temporary files for the operating system to clean up.
+This cache is separate from mpv's packet cache and does not reuse recordings
+played before this feature was enabled.
 
 ### SponsorBlock
 

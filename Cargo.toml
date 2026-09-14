@@ -4,7 +4,7 @@ resolver = "3"
 
 [package]
 name = "youta"
-version = "0.70.0"
+version = "0.71.0"
 edition = "2024"
 rust-version = "1.95"
 description = "A low-resource YouTube TUI audio player and local subscription manager that uses yt-dlp and saves and shows listening progress"
@@ -286,7 +286,7 @@ dearrow = ["network"]
 wikidata = ["network"]
 # Compatibility alias retained for older custom build scripts.
 wikimedia = ["commons-upload"]
-archive-org = ["network", "dep:chrono", "dep:html5gum", "dep:encoding_rs", "dep:regex"]
+archive-org = ["network", "dep:chrono", "dep:html5gum", "dep:encoding_rs", "dep:regex", "dep:getrandom"]
 librivox = ["network"]
 apple-podcasts = ["rss"]
 litres = ["network", "dep:sha2"]

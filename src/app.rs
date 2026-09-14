@@ -20,6 +20,8 @@ mod cached_download;
 #[cfg(feature = "yt-dlp")]
 mod download_choice;
 mod end_pause;
+#[cfg(all(feature = "archive-org", feature = "yt-dlp", feature = "backend-mpv"))]
+mod original_download;
 #[cfg(feature = "s3-upload")]
 mod s3_upload;
 #[cfg(feature = "web-browser")]
@@ -5384,6 +5386,9 @@ pub struct AppController {
     /// Injectable bounded cache preparation; no network download on a cache hit.
     #[cfg(all(feature = "yt-dlp", feature = "backend-mpv"))]
     cached_download_service: Box<dyn cached_download::CachedDownloadService>,
+    /// Private, session-only original bytes for the current Archive playback input.
+    #[cfg(all(feature = "archive-org", feature = "yt-dlp", feature = "backend-mpv"))]
+    archive_playback_cache: Option<crate::archive_playback_cache::ArchivePlaybackCache>,
     /// Captured manual source and choices; independent of foreground navigation.
     #[cfg(feature = "yt-dlp")]
     pending_download_choice: Option<download_choice::PendingDownloadChoice>,
@@ -6677,6 +6682,8 @@ impl AppController {
             pending_cached_download: None,
             #[cfg(all(feature = "yt-dlp", feature = "backend-mpv"))]
             cached_download_service: Box::new(cached_download::SystemCachedDownloadService),
+            #[cfg(all(feature = "archive-org", feature = "yt-dlp", feature = "backend-mpv"))]
+            archive_playback_cache: None,
             #[cfg(feature = "yt-dlp")]
             pending_download_choice: None,
             #[cfg(feature = "yt-dlp")]
@@ -25585,6 +25592,8 @@ impl AppController {
             input.bypass_ytdl = true;
             load_kind = PlaybackLoadKind::YouTubeDirect;
         }
+        #[cfg(all(feature = "archive-org", feature = "yt-dlp", feature = "backend-mpv"))]
+        self.cache_original_playback_input(&item, &mut input);
         let had_active_media = self.current_media.is_some();
         let first_result = self
             .player
@@ -25697,6 +25706,10 @@ impl AppController {
             }
             Err(error) => {
                 self.playback_load_kind = PlaybackLoadKind::Regular;
+                #[cfg(all(feature = "archive-org", feature = "yt-dlp", feature = "backend-mpv"))]
+                {
+                    self.archive_playback_cache = None;
+                }
                 self.show_error("Playback failed", &error);
             }
         }
@@ -26396,6 +26409,10 @@ impl AppController {
     }
 
     fn reset_playback_state(&mut self) {
+        #[cfg(all(feature = "archive-org", feature = "yt-dlp", feature = "backend-mpv"))]
+        {
+            self.archive_playback_cache = None;
+        }
         #[cfg(feature = "ascii-visualizer")]
         self.dismiss_ascii_visualizer();
         self.playback_phase = PlaybackPhase::Idle;
@@ -34287,6 +34304,10 @@ impl AppController {
         self.shutdown_persistence_succeeded = Some(false);
         #[cfg(all(feature = "yt-dlp", feature = "backend-mpv"))]
         drop(self.pending_cached_download.take());
+        #[cfg(all(feature = "archive-org", feature = "yt-dlp", feature = "backend-mpv"))]
+        {
+            self.archive_playback_cache = None;
+        }
         #[cfg(feature = "archive-upload")]
         self.shutdown_archive_upload();
         #[cfg(feature = "s3-upload")]
@@ -81347,9 +81368,39 @@ mod tests {
         let replay =
             queue_item_from_history(&history, &history_replay_target(&history).unwrap()).unwrap();
         let (mut controller, playback) = controller_with_mock_statuses([]);
+        let mut expected_inputs = Vec::new();
         for item in [original, playlist, replay] {
             assert_eq!(item.media.id.external_id, url);
             controller.play_queue_item(item, false);
+            assert_eq!(
+                controller
+                    .playback_queue
+                    .current()
+                    .unwrap()
+                    .playback_location,
+                url
+            );
+            assert_eq!(
+                controller
+                    .pending_history
+                    .as_ref()
+                    .unwrap()
+                    .replay_locator
+                    .as_deref(),
+                Some(url.as_str())
+            );
+            // Only the transient player input may use a private original-byte cache.
+            #[cfg(all(feature = "yt-dlp", feature = "backend-mpv"))]
+            let expected = controller.archive_playback_cache.as_ref().map_or_else(
+                || url.clone(),
+                |cache| {
+                    assert_eq!(cache.source_url().as_str(), url);
+                    cache.playback_url().to_owned()
+                },
+            );
+            #[cfg(not(all(feature = "yt-dlp", feature = "backend-mpv")))]
+            let expected = url.clone();
+            expected_inputs.push(expected);
         }
         let state = playback.lock().unwrap();
         assert_eq!(state.played.len(), 3);
@@ -81357,7 +81408,8 @@ mod tests {
             state
                 .played
                 .iter()
-                .all(|input| input.location == url && input.bypass_ytdl)
+                .zip(expected_inputs)
+                .all(|(input, expected)| input.location == expected && input.bypass_ytdl)
         );
     }
 
