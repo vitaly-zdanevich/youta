@@ -463,11 +463,14 @@ resolver:
   metadata filter inside Youta. In the TUI, Alt+j/k or Alt+Home/End selects a
   details link, and Enter (or Alt+Enter) opens it; inline links are revealed
   without adding duplicate rows. Manual scrolling remains unrestricted.
+  The uploader name likewise searches that public profile's uploads inside
+  Youta; its adjacent URL (or Shift+O) still opens the profile in your browser.
+  Uploader searches use only the validated profile ID, never a guessed name or email.
   These filters survive pagination, tab changes, and restart. A `/` search
   submitted with Enter returns to ordinary text search; an unsubmitted edit
   of a metadata filter is discarded on tab change/restart. Values are escaped
   as literal phrases using Archive's [advanced-search fields](https://archive.org/advancedsearch.php).
-  `[Esc] Back` returns through Creator/Topics searches, restoring the previous
+  `[Esc] Back` returns through Creator/Topics/uploader searches, restoring the previous
   query, selected item or track, and description position. Inside a track list,
   Back first returns to its catalogue. A new submitted text search clears this
   history; history itself is session-only, limited to 16 locations and a 16 MiB

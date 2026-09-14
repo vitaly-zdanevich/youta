@@ -1436,6 +1436,8 @@ pub enum ArchiveOrgSearchScope {
     Creator,
     /// One complete subject/topic value.
     Topic,
+    /// One validated public Archive profile identifier, including its at-sign.
+    Uploader,
 }
 
 /// Restart-safe terminal navigation and selection state.
@@ -1958,6 +1960,20 @@ mod tests {
             restored.archive_org_search_scope,
             ArchiveOrgSearchScope::Text
         );
+    }
+
+    /// Public uploader navigation remains restart-safe without the provider feature.
+    #[test]
+    fn archive_org_uploader_scope_round_trips_without_provider_state() {
+        let session = SessionState {
+            archive_org_search_text: "@public_account".to_owned(),
+            archive_org_search_scope: ArchiveOrgSearchScope::Uploader,
+            ..SessionState::default()
+        };
+        let encoded = serde_json::to_value(&session).expect("session");
+        assert_eq!(encoded["archive_org_search_scope"], "uploader");
+        let restored: SessionState = serde_json::from_value(encoded).expect("restored session");
+        assert_eq!(restored, session);
     }
 
     #[test]

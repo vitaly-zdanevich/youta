@@ -106,7 +106,8 @@ export type DetailLinkInternalTarget =
   | { YandexMusicAlbum: string }
 	| { LibriVoxAuthor: string }
 	| { ArchiveCreator: string }
-	| { ArchiveTopic: string };
+	| { ArchiveTopic: string }
+	| { ArchiveUploader: string };
 
 /** One selectable external link beside a media item or channel. */
 export interface DetailLinkView {

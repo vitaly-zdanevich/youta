@@ -1058,6 +1058,8 @@ fn detail_view(item: &ArchiveOrgItem, track: Option<&ArchiveOrgTrack>) -> Detail
             prefix: "Uploader: ".to_owned(),
             label: uploader.name.clone(),
             url: uploader.url.to_string(),
+            internal_target: crate::providers::archive_org::uploader_search_identity(&uploader.url)
+                .map(DetailLinkInternalTarget::ArchiveUploader),
             ..DetailLinkView::default()
         });
     }
@@ -1148,6 +1150,111 @@ fn append_searchable_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only the validated public profile URL supplies a search identity.
+    #[test]
+    fn archive_uploader_link_uses_profile_identity_not_its_display_label() {
+        let mut value = item();
+        let uploader = value.uploader.as_mut().unwrap();
+        uploader.name = "Different label: private-looking@example.com".into();
+        uploader.url = url::Url::parse("https://archive.org/details/@actual-account").unwrap();
+        let details = detail_view(&value, None);
+        let link = details
+            .links
+            .iter()
+            .find(|link| link.prefix == "Uploader: ")
+            .unwrap();
+        assert_eq!(link.label, "Different label: private-looking@example.com");
+        assert_eq!(
+            link.internal_target,
+            Some(DetailLinkInternalTarget::ArchiveUploader(
+                "@actual-account".into()
+            ))
+        );
+        assert_eq!(link.url, "https://archive.org/details/@actual-account");
+        assert_eq!(
+            details.channel_webpage_url.as_ref().map(url::Url::as_str),
+            Some(link.url.as_str())
+        );
+        for invalid in [
+            "https://archive.org/details/not-a-profile",
+            "https://example.com/details/@pretend",
+            "https://archive.org/details/@pretend?query=other",
+        ] {
+            value.uploader.as_mut().unwrap().name = "@pretend".into();
+            value.uploader.as_mut().unwrap().url = url::Url::parse(invalid).unwrap();
+            assert!(
+                detail_view(&value, None)
+                    .links
+                    .iter()
+                    .filter(|link| link.prefix == "Uploader: ")
+                    .all(|link| link.internal_target.is_none())
+            );
+        }
+        value.uploader = None;
+        assert!(
+            !detail_view(&value, None)
+                .links
+                .iter()
+                .any(|link| link.prefix == "Uploader: ")
+        );
+    }
+
+    /// Indexed activation works without an external opener and shares metadata Back.
+    #[test]
+    fn archive_uploader_navigation_uses_scope_and_history_without_external_opener() {
+        let (_temporary, mut app) = lookup_controller();
+        occupy_archive_worker(&mut app);
+        app.view.screen = Screen::ArchiveOrg;
+        app.view.external_opener_available = false;
+        app.archive_org.items = vec![item()];
+        app.archive_org.submitted_query = "old search".into();
+        app.archive_org_search_query = "old search".into();
+        app.populate_archive_org();
+        let index = app
+            .view
+            .details
+            .as_ref()
+            .unwrap()
+            .links
+            .iter()
+            .position(|link| link.prefix == "Uploader: ")
+            .unwrap();
+        assert_eq!(
+            app.current_channel_url().as_deref(),
+            Some("https://archive.org/details/@uploader")
+        );
+        app.dispatch(UiAction::OpenChannelInBrowser);
+        assert!(app.view.status_line.contains("unavailable"));
+        app.dispatch(UiAction::ActivateDetailLink(index));
+        assert!(
+            matches!(&app.archive_org.pending.as_ref().unwrap().kind, ArchiveRequest::Search(request) if request.scope == ArchiveOrgSearchScope::Uploader && request.query == "@uploader")
+        );
+        assert_eq!(app.archive_org.history.len(), 1);
+        assert!(app.go_back_archive_org());
+        assert_eq!(app.archive_org.submitted_query, "old search");
+        assert_eq!(app.archive_org.submitted_scope, ArchiveOrgSearchScope::Text);
+        app.dispatch(UiAction::SearchArchiveUploader("@uploader".into()));
+        assert_eq!(
+            app.archive_org.submitted_scope,
+            ArchiveOrgSearchScope::Uploader
+        );
+        let generation = app.archive_org.generation;
+        app.dispatch(UiAction::SearchArchiveUploader(
+            "private-looking@example.com".into(),
+        ));
+        assert_eq!(
+            app.archive_org.generation, generation,
+            "invalid explicit identities must not navigate"
+        );
+        app.archive_org
+            .worker
+            .take()
+            .unwrap()
+            .thread
+            .join()
+            .unwrap();
+    }
 
     /// Passive enrichment preserves the user's current artwork overlay for both
     /// catalogue containers and playable tracks, without reopening a closed one.

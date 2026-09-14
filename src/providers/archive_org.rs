@@ -271,6 +271,12 @@ impl ArchiveOrgClient {
             ArchiveOrgSearchScope::Topic => {
                 format!("subject:{}", quoted_search_phrase(request.query.trim()))
             }
+            ArchiveOrgSearchScope::Uploader => {
+                format!(
+                    "_uploader_useritem:{}",
+                    quoted_search_phrase(&request.query)
+                )
+            }
         };
         let mut query = "(mediatype:audio OR mediatype:etree) AND -access-restricted-item:true AND -access-restricted:true".to_owned();
         if !terms.is_empty() {
@@ -456,7 +462,7 @@ impl ArchiveOrgSearchRequest {
     /// # Errors
     ///
     /// Returns an invalid-request error for controls, oversized text, empty scoped
-    /// values, zero-based pages, or limits outside one through one hundred.
+    /// values, invalid public uploader IDs, zero-based pages, or invalid limits.
     pub fn validate(&self) -> Result<(), ProviderError> {
         if self.page == 0
             || !(1..=MAX_SEARCH_RESULTS).contains(&self.limit)
@@ -465,6 +471,11 @@ impl ArchiveOrgSearchRequest {
             || (self.scope != ArchiveOrgSearchScope::Text && self.query.trim().is_empty())
         {
             return Err(ProviderError::InvalidRequest("Archive.org requires a query of at most 512 bytes, a nonempty creator/topic value, a positive page, and a limit between 1 and 100".into()));
+        }
+        if self.scope == ArchiveOrgSearchScope::Uploader && profile_url(&self.query).is_none() {
+            return Err(ProviderError::InvalidRequest(
+                "Archive.org uploader search requires an exact public @account identifier of at most 100 ASCII bytes".into(),
+            ));
         }
         Ok(())
     }
@@ -568,6 +579,15 @@ fn profile_url(itemname: &str) -> Option<Url> {
         return None;
     }
     archive_url(&["details", itemname]).ok()
+}
+
+/// Returns an exact public uploader identity only from its canonical profile URL.
+/// Display names and private uploader metadata are never identity sources.
+/// Reconstructing the URL excludes credentials, queries, fragments, nondefault
+/// ports, encoded separators, and additional path segments without decoding them.
+pub(crate) fn uploader_search_identity(url: &Url) -> Option<String> {
+    let identifier = url.path().strip_prefix("/details/")?;
+    (profile_url(identifier)?.as_str() == url.as_str()).then(|| identifier.to_owned())
 }
 
 /// Treats unknown nonempty restriction flags conservatively as restricted.
@@ -2394,6 +2414,108 @@ mod tests {
             tracks[0].title, filename,
             "missing metadata must not rewrite the filename fallback"
         );
+    }
+
+    /// Public profile URLs supply account IDs without guessing from visible labels.
+    #[test]
+    fn uploader_search_identity_accepts_only_canonical_public_profiles() {
+        for identifier in [
+            "@public_account".to_owned(),
+            "@Reader-2.0".to_owned(),
+            format!("@{}", "a".repeat(99)),
+        ] {
+            let url = Url::parse(&format!("https://archive.org/details/{identifier}")).unwrap();
+            assert_eq!(uploader_search_identity(&url), Some(identifier));
+        }
+        for value in [
+            "http://archive.org/details/@public_account",
+            "https://archive.org.evil.example/details/@public_account",
+            "https://www.archive.org/details/@public_account",
+            "https://user:secret@archive.org/details/@public_account",
+            "https://archive.org:444/details/@public_account",
+            "https://archive.org/details/@public_account?tab=uploads",
+            "https://archive.org/details/@public_account#uploads",
+            "https://archive.org/details/@public_account/",
+            "https://archive.org/details/@public_account/file",
+            "https://archive.org/details/public_account",
+            "https://archive.org/details/@",
+            "https://archive.org/details/@@public_account",
+            "https://archive.org/details/@_public_account",
+            "https://archive.org/details/@public%2Faccount",
+            "https://archive.org/details/%40public_account",
+            "https://archive.org/details/@%2e%2e",
+        ] {
+            assert_eq!(
+                uploader_search_identity(&Url::parse(value).unwrap()),
+                None,
+                "{value}"
+            );
+        }
+    }
+
+    /// Searches an exact indexed account ID, not an email or credited creator.
+    #[test]
+    fn uploader_search_uses_public_account_field_and_keeps_access_restrictions() {
+        let (client, transport) = mock_client(vec![bytes(&json!({"response": {
+            "numFound": 0, "docs": []
+        }}))]);
+        client
+            .search(&ArchiveOrgSearchRequest {
+                query: "@Public-Account.2".into(),
+                scope: ArchiveOrgSearchScope::Uploader,
+                page: 1,
+                limit: 1,
+            })
+            .expect("public account search");
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1, "no profile lookup or per-result fanout");
+        let query = requests[0]
+            .query_pairs()
+            .find(|(key, _)| key == "q")
+            .unwrap()
+            .1
+            .into_owned();
+        assert_eq!(
+            query,
+            r#"(mediatype:audio OR mediatype:etree) AND -access-restricted-item:true AND -access-restricted:true AND (_uploader_useritem:"@Public\-Account.2")"#
+        );
+    }
+
+    /// Invalid or display-only identities fail before any HTTP request is sent.
+    #[test]
+    fn uploader_search_rejects_invalid_identity_before_transport() {
+        let (client, transport) = mock_client(Vec::new());
+        for query in [
+            String::new(),
+            "@".into(),
+            "Public Account".into(),
+            "private@example.com".into(),
+            "@@account".into(),
+            "@_account".into(),
+            "@a/b".into(),
+            "@a\\b".into(),
+            "@a%2Fb".into(),
+            " @account".into(),
+            "@account ".into(),
+            "@читатель".into(),
+            "@account\n".into(),
+            "@a\" OR mediatype:movies".into(),
+            format!("@{}", "a".repeat(100)),
+        ] {
+            assert!(
+                matches!(
+                    client.search(&ArchiveOrgSearchRequest {
+                        query: query.clone(),
+                        scope: ArchiveOrgSearchScope::Uploader,
+                        page: 1,
+                        limit: 1,
+                    }),
+                    Err(ProviderError::InvalidRequest(_))
+                ),
+                "invalid identity: {query:?}"
+            );
+        }
+        assert!(transport.requests.lock().unwrap().is_empty());
     }
 
     /// Navigation searches one literal metadata phrase, never caller-supplied syntax.

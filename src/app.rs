@@ -30308,6 +30308,8 @@ impl AppController {
                 DetailLinkInternalTarget::ArchiveTopic(value) => {
                     self.search_archive_metadata(value, crate::domain::ArchiveOrgSearchScope::Topic)
                 }
+                DetailLinkInternalTarget::ArchiveUploader(value) => self
+                    .search_archive_metadata(value, crate::domain::ArchiveOrgSearchScope::Uploader),
             }
             return;
         }
@@ -34652,6 +34654,9 @@ impl UiController for AppController {
             }
             UiAction::SearchArchiveTopic(value) => {
                 self.search_archive_metadata(value, crate::domain::ArchiveOrgSearchScope::Topic)
+            }
+            UiAction::SearchArchiveUploader(value) => {
+                self.search_archive_metadata(value, crate::domain::ArchiveOrgSearchScope::Uploader)
             }
             UiAction::ActivateDetailLink(index) => {
                 self.view.details_focused = true;
@@ -81225,35 +81230,37 @@ mod tests {
     #[cfg(not(feature = "archive-org"))]
     #[test]
     fn archive_org_disabled_build_preserves_independent_session_fields() {
-        let temporary = crate::test_support::canonical_tempdir("Archive disabled session");
-        let config = Config::for_dir(temporary.path().join("youta"));
-        let store = StateStore::open(&config).unwrap();
-        store
-            .save_session(
-                &SessionState {
-                    screen: StoredScreen::ArchiveOrg,
-                    search_text: "independent YouTube query".to_owned(),
-                    youtube_selected_row: Some(2),
-                    archive_org_selected_row: Some(17),
-                    archive_org_search_text: "preserve archive query".to_owned(),
-                    archive_org_search_scope: crate::domain::ArchiveOrgSearchScope::Topic,
-                    ..SessionState::default()
-                },
-                1,
-            )
-            .unwrap();
-        let mut controller = AppController::new(config, store, None, None);
-        assert!(controller.save_session());
-        let saved = controller.store.session().unwrap().unwrap();
-        assert_eq!(saved.archive_org_selected_row, Some(17));
-        assert_eq!(saved.archive_org_search_text, "preserve archive query");
-        assert_eq!(
-            saved.archive_org_search_scope,
-            crate::domain::ArchiveOrgSearchScope::Topic
-        );
-        assert_eq!(controller.view.screen, Screen::Search);
-        assert_eq!(controller.view.search_query, "independent YouTube query");
-        assert_eq!(saved.search_text, "independent YouTube query");
+        for scope in [
+            crate::domain::ArchiveOrgSearchScope::Topic,
+            crate::domain::ArchiveOrgSearchScope::Uploader,
+        ] {
+            let temporary = crate::test_support::canonical_tempdir("Archive disabled session");
+            let config = Config::for_dir(temporary.path().join("youta"));
+            let store = StateStore::open(&config).unwrap();
+            store
+                .save_session(
+                    &SessionState {
+                        screen: StoredScreen::ArchiveOrg,
+                        search_text: "independent YouTube query".to_owned(),
+                        youtube_selected_row: Some(2),
+                        archive_org_selected_row: Some(17),
+                        archive_org_search_text: "preserve archive query".to_owned(),
+                        archive_org_search_scope: scope,
+                        ..SessionState::default()
+                    },
+                    1,
+                )
+                .unwrap();
+            let mut controller = AppController::new(config, store, None, None);
+            assert!(controller.save_session());
+            let saved = controller.store.session().unwrap().unwrap();
+            assert_eq!(saved.archive_org_selected_row, Some(17));
+            assert_eq!(saved.archive_org_search_text, "preserve archive query");
+            assert_eq!(saved.archive_org_search_scope, scope);
+            assert_eq!(controller.view.screen, Screen::Search);
+            assert_eq!(controller.view.search_query, "independent YouTube query");
+            assert_eq!(saved.search_text, "independent YouTube query");
+        }
     }
 
     /// Two tracks share one large item description throughout list continuation.

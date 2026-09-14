@@ -154,11 +154,13 @@ function Links({
   details,
   selectedLink,
   selectedMedia,
+  externalOpenerAvailable,
 }: {
   links: DetailLinkView[];
   details: DetailView;
   selectedLink: number | null;
   selectedMedia: number | null;
+  externalOpenerAvailable: boolean;
 }) {
 	const railLinks = links.map((link, index) => ({ link, index }))
 		.filter(({ link }) => link.description_range == null);
@@ -182,6 +184,7 @@ function Links({
         const showUrl = link.presentation.startsWith("LabelAndUrl") && link.label !== "";
 				// Keep existing provider markers independent of external URL capabilities.
 				const target = link.internal_target;
+				const uploader = target !== null && 'ArchiveUploader' in target;
 				const internal = target === null ? null
 					: 'YandexMusicArtist' in target ? { OpenYandexMusicArtistById: target.YandexMusicArtist }
 						: 'YandexMusicAlbum' in target ? { OpenYandexMusicAlbumById: target.YandexMusicAlbum }
@@ -202,9 +205,16 @@ function Links({
                 <SearchHighlight text={label} ranges={highlightRanges(details.search_highlights, labelField)} />
               </button>
               {showUrl ? (
-                <span className="min-w-0 truncate text-[11px] text-ink-faint"><SearchHighlight text={link.url} ranges={highlightRanges(details.search_highlights, { LinkUrl: index })} /></span>
+								uploader ? (
+									<button type='button' title='Open uploader profile in browser'
+										disabled={!externalOpenerAvailable}
+										onClick={() => void dispatch('OpenChannelInBrowser')}
+										className='min-w-0 truncate text-left text-[11px] text-ink-faint underline decoration-dotted underline-offset-2 disabled:cursor-default disabled:no-underline not-disabled:hover:text-accent focus-visible:outline-2 focus-visible:outline-accent'>
+										<SearchHighlight text={link.url} ranges={highlightRanges(details.search_highlights, { LinkUrl: index })} />
+									</button>
+								) : <span className="min-w-0 truncate text-[11px] text-ink-faint"><SearchHighlight text={link.url} ranges={highlightRanges(details.search_highlights, { LinkUrl: index })} /></span>
               ) : null}
-              {internal !== null ? (
+              {internal !== null && !uploader ? (
                 <button
                   type="button"
                   title="Open inside Youta"
@@ -556,6 +566,7 @@ export function Details({ view, kind }: { view: ViewModel; kind: InformationPane
         details={details}
         selectedLink={view.selected_detail_link}
         selectedMedia={view.selected_wikidata_media}
+        externalOpenerAvailable={view.external_opener_available}
       />
     </aside>
   );

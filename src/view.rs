@@ -1436,6 +1436,8 @@ pub enum DetailLinkInternalTarget {
     ArchiveCreator(String),
     /// Replace the Archive search with this subject/topic value.
     ArchiveTopic(String),
+    /// Search uploads belonging to one validated public Archive profile ID.
+    ArchiveUploader(String),
 }
 
 impl DetailLinkInternalTarget {
@@ -1448,6 +1450,7 @@ impl DetailLinkInternalTarget {
             Self::LibriVoxAuthor(id) => UiAction::OpenLibriVoxAuthorById(id.clone()),
             Self::ArchiveCreator(value) => UiAction::SearchArchiveCreator(value.clone()),
             Self::ArchiveTopic(value) => UiAction::SearchArchiveTopic(value.clone()),
+            Self::ArchiveUploader(value) => UiAction::SearchArchiveUploader(value.clone()),
         }
     }
 }
@@ -2904,6 +2907,7 @@ impl ViewModel {
                         Some(
                             DetailLinkInternalTarget::ArchiveCreator(_)
                                 | DetailLinkInternalTarget::ArchiveTopic(_)
+                                | DetailLinkInternalTarget::ArchiveUploader(_)
                         )
                     )
                 })
@@ -3266,6 +3270,8 @@ pub enum UiAction {
     SearchArchiveCreator(String),
     /// Search public Archive audio tagged with one exact topic value.
     SearchArchiveTopic(String),
+    /// Search public Archive audio uploaded by one exact public profile ID.
+    SearchArchiveUploader(String),
     /// Download every track in the currently opened or selected album.
     DownloadYandexMusicAlbum,
     /// Download the first twenty current My Wave recommendations.

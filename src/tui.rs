@@ -5443,6 +5443,12 @@ fn render_information_panel(
                         content_offset.saturating_add(terminal_text_width(&link.prefix));
                 }
                 let external_offset = content_offset;
+                // Archive names navigate internally; the adjacent canonical URL
+                // remains a separate external destination rather than a marker.
+                let archive_uploader = matches!(
+                    link.internal_target,
+                    Some(DetailLinkInternalTarget::ArchiveUploader(_))
+                );
                 let external_width = match link.presentation {
                     DetailLinkPresentation::LabelAndUrl
                     | DetailLinkPresentation::LabelAndUrlSpaced => {
@@ -5450,14 +5456,27 @@ fn render_information_panel(
                             details,
                             DetailHighlightField::LinkLabel(*index),
                             &link.label,
-                            theme.base,
+                            if archive_uploader {
+                                if view.selected_detail_link == Some(*index) {
+                                    theme.selected
+                                } else {
+                                    theme.accent
+                                }
+                                .add_modifier(Modifier::UNDERLINED)
+                            } else {
+                                theme.base
+                            },
                         ));
                         spans.push(Span::styled(" — ", theme.muted));
                         spans.extend(highlighted_detail_text(
                             details,
                             DetailHighlightField::LinkUrl(*index),
                             &link.url,
-                            theme.muted,
+                            if archive_uploader && view.external_opener_available {
+                                theme.accent.add_modifier(Modifier::UNDERLINED)
+                            } else {
+                                theme.muted
+                            },
                         ));
                         terminal_text_width(&link.label)
                             .saturating_add(terminal_text_width(" — "))
@@ -5491,7 +5510,7 @@ fn render_information_panel(
                     }
                 };
                 content_offset = content_offset.saturating_add(external_width);
-                if let Some(target) = link.internal_target.as_ref() {
+                if !archive_uploader && let Some(target) = link.internal_target.as_ref() {
                     spans.push(Span::raw(" "));
                     content_offset = content_offset.saturating_add(1);
                     let marker = "↪";
@@ -5519,11 +5538,31 @@ fn render_information_panel(
                 let clickable_area = Rect::new(
                     link_area.x.saturating_add(clickable_offset),
                     link_area.y,
-                    external_width.min(link_area.width.saturating_sub(clickable_offset)),
+                    (if archive_uploader {
+                        terminal_text_width(&link.label)
+                    } else {
+                        external_width
+                    })
+                    .min(link_area.width.saturating_sub(clickable_offset)),
                     1,
                 );
-                if view.external_opener_available && clickable_area.width > 0 {
+                if (archive_uploader || view.external_opener_available) && clickable_area.width > 0
+                {
                     hit_map.detail_links.push((*index, clickable_area));
+                }
+                if archive_uploader && view.external_opener_available {
+                    let offset = external_offset
+                        .saturating_add(terminal_text_width(&link.label))
+                        .saturating_add(terminal_text_width(" — "))
+                        .min(link_area.width);
+                    let width =
+                        terminal_text_width(&link.url).min(link_area.width.saturating_sub(offset));
+                    if width > 0 {
+                        hit_map.detail_buttons.push((
+                            UiAction::OpenChannelInBrowser,
+                            Rect::new(link_area.x.saturating_add(offset), link_area.y, width, 1),
+                        ));
+                    }
                 }
                 cursor_y = cursor_y.saturating_add(1);
             }
@@ -25371,6 +25410,106 @@ for encoded, expected in json.load(sys.stdin):
         assert!(!rendered.contains("Length:"));
         assert!(!rendered.contains("Likes:"));
         assert!(!rendered.contains("Views:"));
+    }
+
+    /// A typed Archive name is internal even when the adjacent browser URL is disabled.
+    #[test]
+    fn archive_uploader_name_and_url_have_separate_actions_without_duplicate_marker() {
+        for opener in [false, true] {
+            let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+            let profile = url::Url::parse("https://archive.org/details/@uploader").unwrap();
+            let view = ViewModel {
+                screen: Screen::ArchiveOrg,
+                external_opener_available: opener,
+                selected_detail_link: Some(0),
+                details: Some(DetailView {
+                    media_id: Some(MediaId::new(SourceKind::ArchiveOrg, "item:fixture")),
+                    source: "archive.org".into(),
+                    channel_webpage_url: Some(profile.clone()),
+                    links: vec![DetailLinkView {
+                        prefix: "Uploader: ".into(),
+                        label: "Public name".into(),
+                        url: profile.to_string(),
+                        internal_target: Some(DetailLinkInternalTarget::ArchiveUploader(
+                            "@uploader".into(),
+                        )),
+                        ..DetailLinkView::default()
+                    }],
+                    ..DetailView::default()
+                }),
+                ..ViewModel::default()
+            };
+            let mut hit_map = HitMap::default();
+            terminal
+                .draw(|frame| {
+                    render_details(
+                        frame,
+                        frame.area(),
+                        &view,
+                        true,
+                        0,
+                        &Theme::new(false),
+                        &mut hit_map,
+                        None,
+                    )
+                })
+                .unwrap();
+            let rendered = rendered_text(&terminal);
+            assert!(
+                rendered.contains("Uploader: Public name — https://archive.org/details/@uploader")
+            );
+            assert!(!rendered.contains('↪'));
+            let (_, name) = hit_map
+                .detail_links
+                .iter()
+                .find(|(index, _)| *index == 0)
+                .expect("internal uploader label");
+            assert_eq!(name.width, terminal_text_width("Public name"));
+            assert_eq!(
+                mouse_action(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: name.x,
+                        row: name.y,
+                        modifiers: KeyModifiers::NONE
+                    },
+                    &hit_map,
+                    &view
+                ),
+                Some(UiAction::ActivateDetailLink(0))
+            );
+            let url_area = hit_map
+                .detail_buttons
+                .iter()
+                .find(|(action, _)| *action == UiAction::OpenChannelInBrowser)
+                .map(|(_, area)| *area);
+            assert_eq!(url_area.is_some(), opener);
+            if let Some(area) = url_area {
+                assert_eq!(area.x, name.right() + terminal_text_width(" — "));
+                assert_eq!(area.width, terminal_text_width(profile.as_str()));
+                assert_eq!(
+                    mouse_action(
+                        MouseEvent {
+                            kind: MouseEventKind::Down(MouseButton::Left),
+                            column: area.x,
+                            row: area.y,
+                            modifiers: KeyModifiers::NONE
+                        },
+                        &hit_map,
+                        &view
+                    ),
+                    Some(UiAction::OpenChannelInBrowser)
+                );
+            }
+            assert_eq!(
+                key_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT), &view),
+                Some(UiAction::ActivateDetailLink(0))
+            );
+            assert_eq!(
+                key_action(KeyEvent::new(KeyCode::Char('O'), KeyModifiers::NONE), &view),
+                opener.then_some(UiAction::OpenChannelInBrowser)
+            );
+        }
     }
 
     /// Back remains visible even in the narrow list pane of an 80-column layout.

@@ -299,6 +299,26 @@
 			await action(expected, () => document.querySelector('[title="Open inside Youta"]').click(), 'Existing provider marker retains its browser-independent action');
 		}
 
+		// The name browses uploads internally; its separate URL still opens the
+		// public profile and obeys the external-opener capability.
+		const uploaderUrl = 'https://archive.org/details/@different_account';
+		const uploaderDetails = { ...details('Uploader navigation fixture'), channel_webpage_url: uploaderUrl,
+			links: [{ prefix: 'Uploader: ', label: 'Public uploader name', url: uploaderUrl,
+				wikidata_item_id: null, presentation: 'LabelAndUrl', description_range: null,
+				internal_target: { ArchiveUploader: '@different_account' } }] };
+		snapshot({ details: uploaderDetails, external_opener_available: false });
+		const uploaderName = await until(() => button('Public uploader name'), 'uploader name');
+		await action({ ActivateDetailLink: 0 }, () => uploaderName.click(), 'Uploader name browses internally without a browser');
+		assert(!document.querySelector('[title="Open inside Youta"]'), 'Clickable uploader name does not add a redundant arrow');
+		const profile = button(uploaderUrl);
+		assert(profile?.disabled, 'Uploader profile URL remains visible but disabled without an external opener');
+		const beforeProfile = calls.length;
+		profile.click();
+		assert(calls.length === beforeProfile, 'Disabled uploader profile cannot dispatch an external open');
+		snapshot({ external_opener_available: true });
+		await until(() => button(uploaderUrl) && !button(uploaderUrl).disabled, 'enabled uploader profile URL');
+		await action('OpenChannelInBrowser', () => button(uploaderUrl).click(), 'Uploader URL opens its original public profile separately');
+
 		// Upload responses are manually emitted: no reducer or service is faked by
 		// inferring transitions from labels or turning a click into a real upload.
 		const youtubeId = { source: 'you-tube', external_id: 'dQw4w9WgXcQ' };
