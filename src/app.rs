@@ -15,6 +15,8 @@ mod archive_org;
 mod archive_org_highlight;
 #[cfg(feature = "archive-upload")]
 mod archive_upload;
+#[cfg(feature = "bandcamp")]
+mod bandcamp_resolver;
 #[cfg(all(feature = "yt-dlp", feature = "backend-mpv"))]
 mod cached_download;
 #[cfg(feature = "yt-dlp")]
@@ -54,6 +56,12 @@ use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError, bounded, u
 #[cfg(feature = "yandex-music")]
 use sha2::{Digest, Sha256};
 use unicode_segmentation::UnicodeSegmentation;
+
+#[cfg(feature = "bandcamp")]
+use self::bandcamp_resolver::{
+    BandcampResolveClient, BandcampResolverOwner, OwnedCompletion as BandcampOwnedCompletion,
+    SubmitError as BandcampSubmitError,
+};
 
 #[cfg(all(feature = "ascii-visualizer", test))]
 use crate::ascii_visualizer::{AudioSpectrum, CAVA_SPECTRUM_BANDS, CavaSpectrumError};
@@ -147,7 +155,7 @@ use crate::persistence::{
 use crate::persistence::{MAX_SAVED_BANDCAMP_SEARCH_RESULTS, SavedBandcampSearch};
 #[cfg(feature = "bandcamp")]
 use crate::playback::PlaybackHttpHeaders;
-#[cfg(any(feature = "bandcamp", test))]
+#[cfg(test)]
 use crate::playback::Result as PlaybackResult;
 #[cfg(feature = "yt-dlp")]
 use crate::playback::youtube_prewarm::{
@@ -3985,55 +3993,9 @@ enum LocalMovePersistenceAttempt {
     Explicit,
 }
 
-/// Resolve operation used by the bounded Bandcamp action worker.
-#[cfg(feature = "bandcamp")]
-trait BandcampResolveClient: Send {
-    /// Resolves one canonical release only after an explicit user action.
-    fn resolve(
-        &self,
-        source: &BandcampMediaUrl,
-        format: BandcampAudioFormat,
-        purpose: BandcampResolvePurpose,
-    ) -> PlaybackResult<BandcampResolution>;
-}
-
-#[cfg(feature = "bandcamp")]
-impl BandcampResolveClient for BandcampResolver {
-    fn resolve(
-        &self,
-        source: &BandcampMediaUrl,
-        format: BandcampAudioFormat,
-        purpose: BandcampResolvePurpose,
-    ) -> PlaybackResult<BandcampResolution> {
-        BandcampResolver::resolve(self, source, format, purpose)
-    }
-}
-
-/// One action-authorized request accepted by the latest-only Bandcamp worker.
-#[cfg(feature = "bandcamp")]
-enum BandcampResolveCommand {
-    /// Resolve the selected canonical page to short-lived playable media.
-    Resolve {
-        generation: u64,
-        media: BandcampMediaUrl,
-        format: BandcampAudioFormat,
-        purpose: BandcampResolvePurpose,
-    },
-    /// Stop the worker after its current bounded operation.
-    Shutdown,
-}
-
-/// URL-bearing completion retained only until the controller starts playback.
-#[cfg(feature = "bandcamp")]
-struct BandcampResolveCompletion {
-    generation: u64,
-    result: PlaybackResult<BandcampResolution>,
-}
-
 /// Stable selection that owns the latest explicit Bandcamp resolve action.
 #[cfg(feature = "bandcamp")]
-struct PendingBandcampResolution {
-    generation: u64,
+struct BandcampResolveContext {
     summary: BandcampSearchSummary,
     owner: BandcampResolutionOwner,
     /// Optional Details timecode retained until the signed stream resolves.
@@ -5338,27 +5300,9 @@ pub struct AppController {
     /// Dedicated worker handle joined during shutdown.
     #[cfg(feature = "yt-dlp")]
     youtube_prewarm_thread: Option<JoinHandle<()>>,
-    /// Resolver moved into the lazy Bandcamp worker on its first explicit use.
+    /// Sole owner of the bounded resolver lifecycle and latest selection context.
     #[cfg(feature = "bandcamp")]
-    bandcamp_resolver: Option<Box<dyn BandcampResolveClient>>,
-    /// Latest-only action queue for potentially slow Bandcamp extraction.
-    #[cfg(feature = "bandcamp")]
-    bandcamp_resolve_requests: Option<Sender<BandcampResolveCommand>>,
-    /// Receiver clone used to replace one queued obsolete resolve action.
-    #[cfg(feature = "bandcamp")]
-    bandcamp_resolve_request_drain: Option<Receiver<BandcampResolveCommand>>,
-    /// Latest-only Bandcamp resolver completions drained by the TUI tick.
-    #[cfg(feature = "bandcamp")]
-    bandcamp_resolve_responses: Option<Receiver<BandcampResolveCompletion>>,
-    /// Lazy Bandcamp resolver thread joined during shutdown.
-    #[cfg(feature = "bandcamp")]
-    bandcamp_resolve_thread: Option<JoinHandle<()>>,
-    /// Monotonic owner for explicit Bandcamp actions.
-    #[cfg(feature = "bandcamp")]
-    bandcamp_resolve_generation: u64,
-    /// Stable release selected when the latest action was submitted.
-    #[cfg(feature = "bandcamp")]
-    pending_bandcamp_resolution: Option<PendingBandcampResolution>,
+    bandcamp_resolution: BandcampResolverOwner<BandcampResolveContext>,
     /// Latest selection generation accepted for speculative resolution.
     #[cfg(feature = "yt-dlp")]
     youtube_prewarm_generation: u64,
@@ -6653,19 +6597,7 @@ impl AppController {
             #[cfg(feature = "yt-dlp")]
             youtube_prewarm_thread: None,
             #[cfg(feature = "bandcamp")]
-            bandcamp_resolver: Some(bandcamp_resolver),
-            #[cfg(feature = "bandcamp")]
-            bandcamp_resolve_requests: None,
-            #[cfg(feature = "bandcamp")]
-            bandcamp_resolve_request_drain: None,
-            #[cfg(feature = "bandcamp")]
-            bandcamp_resolve_responses: None,
-            #[cfg(feature = "bandcamp")]
-            bandcamp_resolve_thread: None,
-            #[cfg(feature = "bandcamp")]
-            bandcamp_resolve_generation: 0,
-            #[cfg(feature = "bandcamp")]
-            pending_bandcamp_resolution: None,
+            bandcamp_resolution: BandcampResolverOwner::new(bandcamp_resolver),
             #[cfg(feature = "yt-dlp")]
             youtube_prewarm_generation: 0,
             #[cfg(feature = "yt-dlp")]
@@ -20660,42 +20592,29 @@ impl AppController {
                 return;
             }
         };
-        if !self.ensure_bandcamp_resolver_worker() {
-            self.show_error_message(
-                "Bandcamp playback failed",
-                "the bounded Bandcamp resolver worker could not be started",
-            );
-            return;
-        }
-        self.bandcamp_resolve_generation = self.bandcamp_resolve_generation.wrapping_add(1);
-        let generation = self.bandcamp_resolve_generation;
-        if let Some(receiver) = self.bandcamp_resolve_request_drain.as_ref() {
-            while receiver.try_recv().is_ok() {}
-        }
-        let command = BandcampResolveCommand::Resolve {
-            generation,
+        match self.bandcamp_resolution.request(
             media,
-            format: self.config.providers.bandcamp_audio_format,
-            purpose: BandcampResolvePurpose::Playback,
-        };
-        let Some(sender) = self.bandcamp_resolve_requests.as_ref() else {
-            return;
-        };
-        match sender.try_send(command) {
+            self.config.providers.bandcamp_audio_format,
+            BandcampResolveContext {
+                summary,
+                owner,
+                start_at_seconds,
+            },
+        ) {
             Ok(()) => {
-                self.pending_bandcamp_resolution = Some(PendingBandcampResolution {
-                    generation,
-                    summary,
-                    owner,
-                    start_at_seconds,
-                });
                 self.begin_playback_start_activity();
                 self.view.status_line = format!(
                     "Resolving Bandcamp audio as {}…",
                     self.config.providers.bandcamp_audio_format.label()
                 );
             }
-            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
+            Err(BandcampSubmitError::Unavailable) => {
+                self.show_error_message(
+                    "Bandcamp playback failed",
+                    "the bounded Bandcamp resolver worker could not be started",
+                );
+            }
+            Err(BandcampSubmitError::NotAccepted) => {
                 self.show_error_message(
                     "Bandcamp playback failed",
                     "the bounded resolver worker could not accept the selected release",
@@ -20711,120 +20630,60 @@ impl AppController {
             "This build omits the `bandcamp` feature; rebuild with it enabled".to_owned();
     }
 
-    /// Lazily starts the single-request Bandcamp resolver worker.
-    #[cfg(feature = "bandcamp")]
-    fn ensure_bandcamp_resolver_worker(&mut self) -> bool {
-        if self.bandcamp_resolve_requests.is_some() {
-            return true;
-        }
-        let Some(resolver) = self.bandcamp_resolver.take() else {
-            return false;
-        };
-        let (request_sender, request_receiver) = bounded(1);
-        let request_drain = request_receiver.clone();
-        let (response_sender, response_receiver) = bounded(1);
-        let response_drain = response_receiver.clone();
-        let thread = thread::Builder::new()
-            .name("youta-bandcamp-resolver".to_owned())
-            .spawn(move || {
-                bandcamp_resolver_worker(
-                    request_receiver,
-                    response_sender,
-                    response_drain,
-                    resolver,
-                );
-            });
-        let Ok(thread) = thread else {
-            return false;
-        };
-        self.bandcamp_resolve_requests = Some(request_sender);
-        self.bandcamp_resolve_request_drain = Some(request_drain);
-        self.bandcamp_resolve_responses = Some(response_receiver);
-        self.bandcamp_resolve_thread = Some(thread);
-        true
-    }
-
     /// Invalidates ownership of a result whose selected row changed.
     #[cfg(feature = "bandcamp")]
     fn cancel_pending_bandcamp_resolution(&mut self) {
-        if self.pending_bandcamp_resolution.take().is_some() {
-            self.bandcamp_resolve_generation = self.bandcamp_resolve_generation.wrapping_add(1);
+        if self.bandcamp_resolution.cancel() {
             self.clear_playback_start_activity();
-        }
-    }
-
-    /// Stops and joins the lazy Bandcamp resolver without retaining media URLs.
-    #[cfg(feature = "bandcamp")]
-    fn shutdown_bandcamp_resolver(&mut self) {
-        self.pending_bandcamp_resolution = None;
-        self.bandcamp_resolve_generation = self.bandcamp_resolve_generation.wrapping_add(1);
-        if let Some(receiver) = self.bandcamp_resolve_request_drain.as_ref() {
-            while receiver.try_recv().is_ok() {}
-        }
-        if let Some(sender) = self.bandcamp_resolve_requests.take() {
-            let _ = sender.send(BandcampResolveCommand::Shutdown);
-        }
-        self.bandcamp_resolve_request_drain = None;
-        self.bandcamp_resolve_responses = None;
-        if let Some(thread) = self.bandcamp_resolve_thread.take() {
-            let _ = thread.join();
         }
     }
 
     /// Applies only the latest exact Bandcamp selection completion.
     #[cfg(feature = "bandcamp")]
     fn drain_bandcamp_resolver_responses(&mut self) {
-        loop {
-            let completion = self
-                .bandcamp_resolve_responses
-                .as_ref()
-                .and_then(|receiver| receiver.try_recv().ok());
-            let Some(completion) = completion else {
-                break;
-            };
-            let owns = self
-                .pending_bandcamp_resolution
-                .as_ref()
-                .is_some_and(|pending| pending.generation == completion.generation);
-            if !owns {
-                continue;
+        while let Some(completion) = self.bandcamp_resolution.poll() {
+            self.apply_bandcamp_completion(completion);
+        }
+    }
+
+    /// Validates UI ownership before applying a current worker result to playback.
+    #[cfg(feature = "bandcamp")]
+    fn apply_bandcamp_completion(
+        &mut self,
+        completion: BandcampOwnedCompletion<BandcampResolveContext>,
+    ) {
+        let pending = completion.context;
+        self.clear_playback_start_activity();
+        let still_selected = match &pending.owner {
+            BandcampResolutionOwner::SearchSelection => {
+                self.view.screen == Screen::Bandcamp
+                    && self
+                        .bandcamp_results
+                        .get(self.view.selected)
+                        .is_some_and(|selected| selected.id == pending.summary.id)
             }
-            let pending = self
-                .pending_bandcamp_resolution
-                .take()
-                .expect("matching Bandcamp resolve ownership was checked above");
-            self.clear_playback_start_activity();
-            let still_selected = match &pending.owner {
-                BandcampResolutionOwner::SearchSelection => {
-                    self.view.screen == Screen::Bandcamp
-                        && self
-                            .bandcamp_results
-                            .get(self.view.selected)
-                            .is_some_and(|selected| selected.id == pending.summary.id)
-                }
-                BandcampResolutionOwner::Playlist(owner) => {
-                    self.playlist_replay_selection_is_current(owner)
-                }
-            };
-            if !still_selected {
-                continue;
+            BandcampResolutionOwner::Playlist(owner) => {
+                self.playlist_replay_selection_is_current(owner)
             }
-            let playlist_entry = match &pending.owner {
-                BandcampResolutionOwner::SearchSelection => None,
-                BandcampResolutionOwner::Playlist(owner) => Some(owner.entry.clone()),
-            };
-            match completion.result {
-                Ok(resolution) => {
-                    self.play_bandcamp_resolution(
-                        pending.summary,
-                        resolution,
-                        playlist_entry.as_ref(),
-                        pending.start_at_seconds,
-                    );
-                }
-                Err(error) => {
-                    self.show_error("Bandcamp playback failed", &error);
-                }
+        };
+        if !still_selected {
+            return;
+        }
+        let playlist_entry = match &pending.owner {
+            BandcampResolutionOwner::SearchSelection => None,
+            BandcampResolutionOwner::Playlist(owner) => Some(owner.entry.clone()),
+        };
+        match completion.result {
+            Ok(resolution) => {
+                self.play_bandcamp_resolution(
+                    pending.summary,
+                    resolution,
+                    playlist_entry.as_ref(),
+                    pending.start_at_seconds,
+                );
+            }
+            Err(error) => {
+                self.show_error("Bandcamp playback failed", &error);
             }
         }
     }
@@ -34384,7 +34243,7 @@ impl AppController {
         self.finalize_radio_recording_for_shutdown();
         self.view.playing_media_id = None;
         #[cfg(feature = "bandcamp")]
-        self.shutdown_bandcamp_resolver();
+        self.bandcamp_resolution.shutdown();
         #[cfg(feature = "yt-dlp")]
         self.shutdown_youtube_prewarm();
         #[cfg(feature = "yt-dlp")]
@@ -36139,41 +35998,6 @@ fn youtube_prewarm_worker(
             completed_at: Instant::now(),
             result,
             intent: job.intent,
-        };
-        loop {
-            match responses.try_send(completion) {
-                Ok(()) => break,
-                Err(TrySendError::Full(returned)) => {
-                    completion = returned;
-                    let _ = response_drain.try_recv();
-                }
-                Err(TrySendError::Disconnected(_)) => return,
-            }
-        }
-    }
-}
-
-/// Resolves at most one active and one queued Bandcamp action off the TUI.
-#[cfg(feature = "bandcamp")]
-fn bandcamp_resolver_worker(
-    requests: Receiver<BandcampResolveCommand>,
-    responses: Sender<BandcampResolveCompletion>,
-    response_drain: Receiver<BandcampResolveCompletion>,
-    resolver: Box<dyn BandcampResolveClient>,
-) {
-    while let Ok(command) = requests.recv() {
-        let BandcampResolveCommand::Resolve {
-            generation,
-            media,
-            format,
-            purpose,
-        } = command
-        else {
-            break;
-        };
-        let mut completion = BandcampResolveCompletion {
-            generation,
-            result: resolver.resolve(&media, format, purpose),
         };
         loop {
             match responses.try_send(completion) {
@@ -69383,6 +69207,23 @@ mod tests {
         }
     }
 
+    /// Waits for a fake worker via the owner API without replacing private channels.
+    #[cfg(feature = "bandcamp")]
+    fn await_bandcamp_completion(controller: &mut AppController) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(completion) = controller.bandcamp_resolution.poll() {
+                controller.apply_bandcamp_completion(completion);
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "mock Bandcamp completion timed out"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     #[cfg(any(feature = "youtube-official", feature = "invidious"))]
     impl YouTubeProviderBuilder for MockYouTubeProviderBuilder {
         fn official(&self, _api_key: String) -> Result<Box<dyn Provider>, String> {
@@ -81830,16 +81671,17 @@ mod tests {
             BandcampMediaUrl::parse(summary.webpage_url.clone()).expect("canonical fixture");
         let signed_url = "https://t4.bcbits.com/stream/fixture.flac?token=short-lived";
         let calls = Arc::new(Mutex::new(Vec::new()));
-        controller.bandcamp_resolver = Some(Box::new(MockBandcampResolveClient {
-            calls: Arc::clone(&calls),
-            result: Mutex::new(Some(Ok(BandcampResolution {
-                source: source.clone(),
-                purpose: BandcampResolvePurpose::Playback,
-                format: BandcampAudioFormat::BestAvailable,
-                tracks: vec![resolved_bandcamp_track_fixture(&source, signed_url)],
-                possibly_truncated: false,
-            }))),
-        }));
+        controller.bandcamp_resolution =
+            BandcampResolverOwner::new(Box::new(MockBandcampResolveClient {
+                calls: Arc::clone(&calls),
+                result: Mutex::new(Some(Ok(BandcampResolution {
+                    source: source.clone(),
+                    purpose: BandcampResolvePurpose::Playback,
+                    format: BandcampAudioFormat::BestAvailable,
+                    tracks: vec![resolved_bandcamp_track_fixture(&source, signed_url)],
+                    possibly_truncated: false,
+                }))),
+            }));
         controller.show_screen(Screen::Bandcamp);
         controller.bandcamp_results = vec![summary.clone()];
         controller.refresh_bandcamp_rows();
@@ -81847,18 +81689,7 @@ mod tests {
 
         controller.dispatch(UiAction::ActivateSelection);
         assert!(controller.view.playback_starting);
-        let completion = controller
-            .bandcamp_resolve_responses
-            .as_ref()
-            .expect("Bandcamp response receiver")
-            .recv_timeout(Duration::from_secs(1))
-            .expect("mock Bandcamp resolution");
-        let (response_sender, response_receiver) = bounded(1);
-        response_sender
-            .send(completion)
-            .expect("restore resolver completion");
-        controller.bandcamp_resolve_responses = Some(response_receiver);
-        controller.drain_bandcamp_resolver_responses();
+        await_bandcamp_completion(&mut controller);
 
         let calls = calls.lock().expect("Bandcamp resolver calls");
         assert_eq!(calls.len(), 1);
@@ -81903,16 +81734,17 @@ mod tests {
         let source =
             BandcampMediaUrl::parse(summary.webpage_url.clone()).expect("canonical fixture");
         let signed_url = "https://t4.bcbits.com/stream/playlist.flac?token=short-lived";
-        controller.bandcamp_resolver = Some(Box::new(MockBandcampResolveClient {
-            calls: Arc::new(Mutex::new(Vec::new())),
-            result: Mutex::new(Some(Ok(BandcampResolution {
-                source: source.clone(),
-                purpose: BandcampResolvePurpose::Playback,
-                format: BandcampAudioFormat::BestAvailable,
-                tracks: vec![resolved_bandcamp_track_fixture(&source, signed_url)],
-                possibly_truncated: false,
-            }))),
-        }));
+        controller.bandcamp_resolution =
+            BandcampResolverOwner::new(Box::new(MockBandcampResolveClient {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                result: Mutex::new(Some(Ok(BandcampResolution {
+                    source: source.clone(),
+                    purpose: BandcampResolvePurpose::Playback,
+                    format: BandcampAudioFormat::BestAvailable,
+                    tracks: vec![resolved_bandcamp_track_fixture(&source, signed_url)],
+                    possibly_truncated: false,
+                }))),
+            }));
         let snapshot = PlaylistMediaSnapshot {
             id: summary.id.clone(),
             kind: MediaKind::Audio,
@@ -81934,26 +81766,8 @@ mod tests {
             media_id: snapshot.id.clone(),
             seconds: 3,
         });
-        assert!(matches!(
-            controller
-                .pending_bandcamp_resolution
-                .as_ref()
-                .map(|pending| &pending.owner),
-            Some(BandcampResolutionOwner::Playlist(_))
-        ));
-
-        let completion = controller
-            .bandcamp_resolve_responses
-            .as_ref()
-            .expect("Bandcamp response receiver")
-            .recv_timeout(Duration::from_secs(1))
-            .expect("mock Bandcamp playlist resolution");
-        let (response_sender, response_receiver) = bounded(1);
-        response_sender
-            .send(completion)
-            .expect("restore resolver completion");
-        controller.bandcamp_resolve_responses = Some(response_receiver);
-        controller.drain_bandcamp_resolver_responses();
+        assert!(controller.view.playback_starting);
+        await_bandcamp_completion(&mut controller);
 
         let playback = playback.lock().expect("mock playback");
         assert_eq!(playback.played.len(), 1);
@@ -82108,20 +81922,10 @@ mod tests {
             BandcampReleaseKind::Track,
         );
         let source = BandcampMediaUrl::parse(first.webpage_url.clone()).expect("canonical fixture");
-        controller.view.screen = Screen::Bandcamp;
-        controller.bandcamp_results = vec![first.clone(), second];
-        controller.view.selected = 1;
-        controller.pending_bandcamp_resolution = Some(PendingBandcampResolution {
-            generation: 42,
-            summary: first,
-            owner: BandcampResolutionOwner::SearchSelection,
-            start_at_seconds: None,
-        });
-        let (sender, receiver) = bounded(1);
-        sender
-            .send(BandcampResolveCompletion {
-                generation: 42,
-                result: Ok(BandcampResolution {
+        controller.bandcamp_resolution =
+            BandcampResolverOwner::new(Box::new(MockBandcampResolveClient {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                result: Mutex::new(Some(Ok(BandcampResolution {
                     source: source.clone(),
                     purpose: BandcampResolvePurpose::Playback,
                     format: BandcampAudioFormat::BestAvailable,
@@ -82130,14 +81934,23 @@ mod tests {
                         "https://t4.bcbits.com/stream/stale.flac?token=stale",
                     )],
                     possibly_truncated: false,
-                }),
-            })
-            .expect("stale completion fixture");
-        controller.bandcamp_resolve_responses = Some(receiver);
+                }))),
+            }));
+        controller.view.screen = Screen::Bandcamp;
+        controller.bandcamp_results = vec![first.clone(), second];
+        controller.view.selected = 0;
+        controller.request_bandcamp_resolution(
+            first,
+            BandcampResolutionOwner::SearchSelection,
+            None,
+        );
+        // Exercise the controller's exact-selection check independently of cancellation.
+        controller.view.selected = 1;
 
-        controller.drain_bandcamp_resolver_responses();
+        await_bandcamp_completion(&mut controller);
 
-        assert!(controller.pending_bandcamp_resolution.is_none());
+        assert!(controller.bandcamp_resolution.poll().is_none());
+        assert!(!controller.view.playback_starting);
         assert!(playback.lock().expect("mock playback").played.is_empty());
         assert!(controller.playback_queue.items.is_empty());
     }
