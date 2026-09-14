@@ -346,6 +346,14 @@ jobs:
       - name: Check the window page types
         run: npm --prefix gui/ui run typecheck
 
+      # The Ubuntu hosted image supplies Firefox. Check it explicitly so a
+      # missing browser cannot turn this required regression check into a skip.
+      - name: Test the built window page in Firefox
+        if: runner.os == 'Linux'
+        run: |
+          firefox --version
+          npm --prefix gui/ui run test:browser
+
       - name: Test the desktop crate
         run: cargo test --locked -p youta-gui --all-targets
 

@@ -2625,7 +2625,9 @@ it links no terminal renderer. It is deliberately left out of the coverage gate:
 measuring it would mean installing the WebKitGTK toolchain on the coverage
 runner to instrument a thin shell over the reducer that gate already covers.
 
-The opt-in browser integration test requires Firefox on `PATH`; set
+Linux desktop CI also runs the browser integration test against the built page,
+using Firefox supplied by the [Ubuntu runner image](https://github.com/actions/runner-images/blob/main/images/ubuntu/Ubuntu2404-Readme.md).
+The same check can be run locally with Firefox on `PATH`; set
 `YOUTA_TEST_FIREFOX` to an executable path to select another Firefox installation.
 Build the frontend first, then run the browser check from the repository root:
 
@@ -2640,8 +2642,10 @@ The actual built page receives a mocked native bridge, so Archive search,
 track navigation, EOF/seek snapshots, and upload dialogs can be checked without
 using the active player, provider services, upload credentials, or real uploads.
 It is not native Tauri/WebKit validation and does not exercise Rust playback;
-those require separate validation. The check skips when Firefox is unavailable
-and is not part of the ordinary frontend test or build command.
+those require separate validation. A missing Firefox fails the check when
+`CI=true`; outside CI it skips. The browser run remains separate from the
+ordinary frontend test and build commands, which test this required/optional
+behavior without launching a browser.
 
 Windows amd64 and arm64 are compile-checked in CI. The platform work is done:
 `mpv` is driven over a named pipe rather than a Unix socket, directory

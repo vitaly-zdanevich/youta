@@ -1,5 +1,6 @@
 /**
- * Opt-in, real-browser integration check for the built frontend and mocked IPC.
+ * Real-browser integration check for the built frontend and mocked IPC.
+ * Required in Linux CI; optional locally when Firefox is unavailable.
  * Run after `npm --prefix gui/ui run build`:
  *   npm --prefix gui/ui run test:browser
  *
@@ -20,6 +21,7 @@ const require = createRequire(import.meta.url);
 const ts = require('typescript');
 const firefox = process.env.YOUTA_TEST_FIREFOX ?? 'firefox';
 const available = spawnSync(firefox, ['--version'], { timeout: 5000 }).status === 0;
+const required = process.env.CI === 'true';
 
 /** Derive neutral fixture defaults from the public contract, not a second DTO. */
 async function contractDefaults() {
@@ -51,9 +53,10 @@ async function contractDefaults() {
 }
 
 test('Firefox renders Archive browsing, EOF seek controls and upload dialogs through mocked IPC', {
-	skip: !available && 'Firefox is unavailable; set YOUTA_TEST_FIREFOX to its executable',
+	skip: !available && !required && 'Firefox is unavailable; set YOUTA_TEST_FIREFOX to its executable',
 	timeout: 70000,
 }, async (context) => {
+	assert.ok(available, 'Firefox is required in CI; install it or set YOUTA_TEST_FIREFOX to its executable');
 	const defaults = await contractDefaults();
 	const frontend = new URL('../../frontend/', import.meta.url);
 	const index = (await readFile(new URL('index.html', frontend), 'utf8'))
