@@ -589,12 +589,49 @@ mod tests {
         }
     }
 
+    /// Publishes a fresh closed script and checks readiness without running its body.
     #[cfg(unix)]
     fn mock_config(directory: &Path, body: &str) -> Config {
+        use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
-        let helper = directory.join("mock-yt-dlp");
-        std::fs::write(&helper, format!("#!/bin/sh\nset -eu\noutput=\nwhile [ $# -gt 0 ]; do\n\tif [ \"$1\" = --paths ]; then shift; output=$1; fi\n\tshift\ndone\n{body}\n")).unwrap();
-        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        const READY_ARGUMENT: &str = "__youta_archive_fixture_ready__";
+        let mut fixture = tempfile::Builder::new()
+            .prefix("mock-yt-dlp-")
+            .tempfile_in(directory)
+            .unwrap();
+        fixture.write_all(format!("#!/bin/sh\nif [ \"${{1-}}\" = '{READY_ARGUMENT}' ]; then exit 0; fi\nset -eu\noutput=\nwhile [ $# -gt 0 ]; do\n\tif [ \"$1\" = --paths ]; then shift; output=$1; fi\n\tshift\ndone\n{body}\n").as_bytes()).unwrap();
+        fixture.as_file().sync_all().unwrap();
+        fixture
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        // Closing the writer before publishing a unique path avoids rewriting
+        // an inode still held by another fixture or an instrumented child.
+        let helper = fixture.into_temp_path().keep().unwrap();
+        let started = Instant::now();
+        loop {
+            match Command::new(&helper)
+                .arg(READY_ARGUMENT)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+            {
+                Ok(status) => {
+                    assert!(status.success(), "mock helper readiness failed: {status}");
+                    break;
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                        && started.elapsed() < Duration::from_secs(1) =>
+                {
+                    // Yield only for the observed fixture-publication race;
+                    // production spawn failures retain their original policy.
+                    thread::yield_now();
+                }
+                Err(error) => panic!("mock helper did not become executable: {error}"),
+            }
+        }
         let mut config = Config::for_dir(directory.join("config"));
         config.providers.yt_dlp_executable = helper;
         config.providers.ffmpeg_executable = directory.join("configured-ffmpeg");
@@ -876,6 +913,33 @@ mod tests {
             assert_eq!(std::fs::read(prepared.path()).unwrap(), b"video bytes");
             assert_eq!(prepared.filename(), format!("BaW_jenozKc.{extension}"));
         }
+    }
+
+    /// Reusing a script inode can retain another writer's Linux executable lock.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn successive_mock_helpers_do_not_reuse_a_write_locked_executable() {
+        let directory = tempfile::tempdir().unwrap();
+        let previous = mock_config(directory.path(), "exit 99");
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&previous.providers.yt_dlp_executable)
+            .unwrap();
+        let config = mock_config(
+            directory.path(),
+            "printf 'video bytes' > \"$output/media.mkv\"; printf 'youta-file|%s/media.mkv\\n' \"$output\"",
+        );
+        let prepared = prepare_archive_media(
+            &config,
+            &media(),
+            true,
+            &Arc::new(AtomicBool::new(false)),
+            |_, _| {},
+        )
+        .expect("the next mock must not execute the previous fixture's write-locked inode");
+        drop(writer);
+        assert_eq!(std::fs::read(prepared.path()).unwrap(), b"video bytes");
+        assert_eq!(prepared.filename(), "BaW_jenozKc.mkv");
     }
 
     #[test]
