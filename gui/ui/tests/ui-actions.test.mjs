@@ -18,15 +18,19 @@ const options = {
 	types: [],
 };
 
-/** Type-checks an in-memory fixture without writing files or emitting JavaScript. */
-function compile(source) {
+/** Type-checks an in-memory fixture; an injected filename also exercises Windows paths on Unix. */
+function compile(source, fixturePath = virtualPath) {
 	const host = ts.createCompilerHost(options);
 	const readSource = host.getSourceFile.bind(host);
-	host.getSourceFile = (path, languageVersion, onError, shouldCreateNewSourceFile) => path === virtualPath
+	// TypeScript requests normalized Windows paths, unlike fileURLToPath's backslashes.
+	// Preserve the compiler host's filesystem case policy when matching virtual files.
+	const canonicalPath = (path) => host.getCanonicalFileName(path.replaceAll('\\', '/'));
+	const canonicalFixturePath = canonicalPath(fixturePath);
+	host.getSourceFile = (path, languageVersion, onError, shouldCreateNewSourceFile) => canonicalPath(path) === canonicalFixturePath
 		? ts.createSourceFile(path, source, languageVersion, true)
 		: readSource(path, languageVersion, onError, shouldCreateNewSourceFile);
 	const bridgeTypes = fileURLToPath(new URL('../src/tauri.d.ts', import.meta.url));
-	const program = ts.createProgram([virtualPath, bridgeTypes], options, host);
+	const program = ts.createProgram([fixturePath, bridgeTypes], options, host);
 	return { program, diagnostics: ts.getPreEmitDiagnostics(program) };
 }
 
@@ -38,6 +42,14 @@ function expectNoDiagnostics(diagnostics) {
 		getNewLine: () => '\n',
 	}));
 }
+
+test('virtual compiler roots retain semantic checking with Windows path separators', () => {
+	const windowsPath = String.raw`D:\a\youta\youta\gui\ui\tests\__ui_action_type_fixture__.ts`;
+	const valid = compile('const value: number = 1;', windowsPath);
+	expectNoDiagnostics(valid.diagnostics);
+	const invalid = compile('const value: number = \'not a number\';', windowsPath);
+	assert.deepEqual(invalid.diagnostics.map((diagnostic) => diagnostic.code), [2322]);
+});
 
 /** Requires examples of every finite alternative and every nested payload field. */
 function expectTypeCoverage(checker, type, values, path) {
