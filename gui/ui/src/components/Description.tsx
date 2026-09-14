@@ -1,5 +1,7 @@
+import { useEffect, useRef } from 'react';
 import type {
   DetailHighlightRange,
+  DetailLinkView,
   DetailTimecodeView,
   DetailVideoLinkView,
   DetailWikidataEntityView,
@@ -11,15 +13,16 @@ import { annotate } from "../spans";
 import { SearchHighlight } from './SearchHighlight';
 
 /**
- * A description span, tagged so one pass can render both kinds.
+ * A description span, tagged so one pass can render each kind.
  *
- * Timecodes and video links are separate lists in Rust but interleave in the
- * text, so they have to be merged before slicing — two passes would each cut
- * the string with the other's ranges still inside.
+ * Timecodes, video links and metadata actions are separate lists in Rust but
+ * interleave in the text, so they are merged before slicing. Metadata values
+ * take priority when their labels also resemble timecodes or video URLs.
  */
 type DescriptionSpan =
   | ({ kind: "timecode" } & DetailTimecodeView)
-  | ({ kind: "video" } & DetailVideoLinkView);
+  | ({ kind: "video" } & DetailVideoLinkView)
+	| ({ kind: 'detail'; index: number } & DetailHighlightRange);
 
 /**
  * The description, with its timecodes and internal video links live.
@@ -34,30 +37,65 @@ export function Description({
   videoLinks,
   mediaId,
   highlights = [],
+	links = [],
+	selectedLink = null,
+	revealLink = null,
 }: {
   text: string;
   timecodes: DetailTimecodeView[];
   videoLinks: DetailVideoLinkView[];
   mediaId: MediaId | null;
   highlights?: readonly DetailHighlightRange[];
+	links?: readonly DetailLinkView[];
+	selectedLink?: number | null;
+	revealLink?: number | null;
 }) {
+	const container = useRef<HTMLDivElement>(null);
+	// Reveal only an explicit controller request, not every selected-link redraw.
+	// Manual scrolling clears this request without discarding link selection.
+	useEffect(() => {
+		if (revealLink === null) return;
+		container.current?.querySelector(`[data-detail-link="${revealLink}"]`)
+			?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+	}, [revealLink, links]);
+
   if (text === "") {
     return null;
   }
 
+	const inlineSpans = links.flatMap((link, index): DescriptionSpan[] => link.description_range == null ? [] : [
+		{ kind: 'detail', index, ...link.description_range },
+	]);
+	// Metadata values own their entire span, even if a topic resembles a timestamp.
+	const outsideMetadata = (span: DetailHighlightRange) => !inlineSpans.some((inline) =>
+		inline.start_byte < span.end_byte && inline.end_byte > span.start_byte);
   const spans: DescriptionSpan[] = [
     // A timecode is only actionable against the media it was parsed from; if
     // the selection has no identity there is nothing to seek within, so those
     // spans are dropped rather than rendered as buttons that cannot work.
     ...(mediaId === null
       ? []
-      : timecodes.map((timecode): DescriptionSpan => ({ kind: "timecode", ...timecode }))),
-    ...videoLinks.map((link): DescriptionSpan => ({ kind: "video", ...link })),
+      : timecodes.filter(outsideMetadata).map((timecode): DescriptionSpan => ({ kind: "timecode", ...timecode }))),
+    ...videoLinks.filter(outsideMetadata).map((link): DescriptionSpan => ({ kind: "video", ...link })),
+		...inlineSpans,
   ];
 
   return (
-    <div className="mt-3 border-t border-line pt-[10px] text-xs leading-relaxed whitespace-pre-wrap text-ink-dim">
+    <div ref={container} className="mt-3 border-t border-line pt-[10px] text-xs leading-relaxed whitespace-pre-wrap text-ink-dim">
       {annotate(text, spans, (span, covered, key) => {
+				if (span.kind === 'detail') {
+					return <button
+						key={key}
+						type='button'
+						data-detail-link={span.index}
+						title='Browse related items in Youta'
+						onFocus={() => void dispatch({ SelectDetailLink: span.index })}
+						onClick={() => void dispatch({ ActivateDetailLink: span.index })}
+						className={`rounded-[3px] text-left underline decoration-dotted underline-offset-2 hover:text-accent focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-accent ${
+							selectedLink === span.index ? 'text-accent' : 'text-ink'
+						}`}
+					><SearchHighlight text={covered} ranges={highlights} offset={span.start_byte} /></button>;
+				}
         if (span.kind === "timecode") {
           return (
             <button

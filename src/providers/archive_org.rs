@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use url::Url;
 
-use crate::domain::remote_url_has_non_public_host;
+use crate::domain::{ArchiveOrgSearchScope, remote_url_has_non_public_host};
 
 use super::{
     DEFAULT_REQUEST_TIMEOUT, MAX_VIDEO_COMMENT_AUTHOR_BYTES, MAX_VIDEO_COMMENT_AUTHOR_CHARS,
@@ -51,8 +51,11 @@ const MAX_COVER_DECODED_BYTES: u64 = 32 * 1024 * 1024;
 /// One bounded, one-based Internet Archive audio search.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ArchiveOrgSearchRequest {
-    /// Plain search text; an empty query browses recent public audio.
+    /// Search text or one complete metadata value; empty plain text browses recent audio.
     pub query: String,
+    /// Metadata field to search; older serialized requests retain plain-text search.
+    #[serde(default)]
+    pub scope: ArchiveOrgSearchScope,
     /// One-based page number.
     pub page: u32,
     /// Maximum number of results, between one and one hundred.
@@ -77,6 +80,10 @@ pub struct ArchiveOrgItem {
     pub title: String,
     /// Credited artist, author, or other creator; not necessarily the uploader.
     pub creator: Option<String>,
+    /// Individual original creator values, preserving metadata order and boundaries.
+    /// Older serialized items retain the joined compatibility label above.
+    #[serde(default)]
+    pub creators: Vec<String>,
     /// Bounded, terminal-safe plain-text description.
     pub description: Option<String>,
     /// Original public item page.
@@ -251,21 +258,20 @@ impl ArchiveOrgClient {
     ) -> Result<ArchiveOrgSearchPage, ProviderError> {
         request.validate()?;
         let mut url = archive_url(&["advancedsearch.php"])?;
-        let terms = request
-            .query
-            .split_whitespace()
-            .map(|term| {
-                let escaped = term.chars().fold(String::new(), |mut text, character| {
-                    if "+-&|!(){}[]^\"~*?:\\/".contains(character) {
-                        text.push('\\');
-                    }
-                    text.push(character);
-                    text
-                });
-                format!("\"{escaped}\"")
-            })
-            .collect::<Vec<_>>()
-            .join(" AND ");
+        let terms = match request.scope {
+            ArchiveOrgSearchScope::Text => request
+                .query
+                .split_whitespace()
+                .map(quoted_search_phrase)
+                .collect::<Vec<_>>()
+                .join(" AND "),
+            ArchiveOrgSearchScope::Creator => {
+                format!("creator:{}", quoted_search_phrase(request.query.trim()))
+            }
+            ArchiveOrgSearchScope::Topic => {
+                format!("subject:{}", quoted_search_phrase(request.query.trim()))
+            }
+        };
         let mut query = "(mediatype:audio OR mediatype:etree) AND -access-restricted-item:true AND -access-restricted:true".to_owned();
         if !terms.is_empty() {
             query.push_str(" AND (");
@@ -449,18 +455,34 @@ impl ArchiveOrgSearchRequest {
     ///
     /// # Errors
     ///
-    /// Returns an invalid-request error for controls, oversized text, zero-based
-    /// pages, or limits outside one through one hundred.
+    /// Returns an invalid-request error for controls, oversized text, empty scoped
+    /// values, zero-based pages, or limits outside one through one hundred.
     pub fn validate(&self) -> Result<(), ProviderError> {
         if self.page == 0
             || !(1..=MAX_SEARCH_RESULTS).contains(&self.limit)
             || self.query.len() > MAX_QUERY_BYTES
             || self.query.chars().any(char::is_control)
+            || (self.scope != ArchiveOrgSearchScope::Text && self.query.trim().is_empty())
         {
-            return Err(ProviderError::InvalidRequest("Archive.org requires a query of at most 512 bytes, a positive page, and a limit between 1 and 100".into()));
+            return Err(ProviderError::InvalidRequest("Archive.org requires a query of at most 512 bytes, a nonempty creator/topic value, a positive page, and a limit between 1 and 100".into()));
         }
         Ok(())
     }
+}
+
+/// Quotes one literal value using the Archive search engine's Lucene-style escaping.
+///
+/// Field names are chosen separately from the typed scope; a value cannot inject
+/// operators or remove the public-audio restriction clauses.
+fn quoted_search_phrase(value: &str) -> String {
+    let escaped = value.chars().fold(String::new(), |mut text, character| {
+        if "+-&|!(){}[]^\"~*?:\\/".contains(character) {
+            text.push('\\');
+        }
+        text.push(character);
+        text
+    });
+    format!("\"{escaped}\"")
 }
 
 /// Production transport never follows redirects to unvalidated hosts.
@@ -605,6 +627,24 @@ fn text_value(value: &Value, limit: usize, multiline: bool) -> Option<String> {
     (!text.is_empty() && text.len() <= limit).then_some(text)
 }
 
+/// Keeps individual creator values intact instead of splitting the joined display label.
+/// Invalid aggregate bounds omit the entire list, matching legacy creator handling.
+fn creator_values(value: &Value) -> Vec<String> {
+    let creators: Vec<_> = values(value, MAX_LABEL_BYTES)
+        .into_iter()
+        .map(|text| html_text(text, false))
+        .filter(|text| !text.is_empty())
+        .collect();
+    if creators
+        .iter()
+        .try_fold(0_usize, |total, text| total.checked_add(text.len()))
+        .is_none_or(|total| total > MAX_LABEL_BYTES)
+    {
+        return Vec::new();
+    }
+    creators
+}
+
 /// Splits semicolon-separated subjects while keeping multi-word labels intact.
 fn label_list(value: &Value) -> Vec<String> {
     let mut labels = Vec::new();
@@ -664,6 +704,7 @@ fn normalize_item(metadata: &Value) -> Result<ArchiveOrgItem, ProviderError> {
         title: text_value(&metadata["title"], MAX_LABEL_BYTES, false)
             .unwrap_or_else(|| identifier.into()),
         creator: text_value(&metadata["creator"], MAX_LABEL_BYTES, false),
+        creators: creator_values(&metadata["creator"]),
         description: text_value(&metadata["description"], MAX_DESCRIPTION_BYTES, true),
         webpage_url: archive_url(&["details", identifier])?,
         artwork_url: Some(archive_url(&["services", "img", identifier])?),
@@ -1942,6 +1983,7 @@ mod tests {
     fn search_rejects_bad_envelopes_but_skips_invalid_and_restricted_rows() {
         let request = ArchiveOrgSearchRequest {
             query: "jazz".into(),
+            scope: ArchiveOrgSearchScope::Text,
             page: 1,
             limit: 2,
         };
@@ -2015,6 +2057,7 @@ mod tests {
         let page = client
             .search(&ArchiveOrgSearchRequest {
                 query: "pride prejudice".into(),
+                scope: ArchiveOrgSearchScope::Text,
                 page: 1,
                 limit: 2,
             })
@@ -2144,6 +2187,7 @@ mod tests {
         let (client, _) = mock_client(vec![vec![b' '; MAX_SEARCH_JSON_BYTES + 1]]);
         let request = ArchiveOrgSearchRequest {
             query: String::new(),
+            scope: ArchiveOrgSearchScope::Text,
             page: 1,
             limit: 1,
         };
@@ -2352,6 +2396,172 @@ mod tests {
         );
     }
 
+    /// Navigation searches one literal metadata phrase, never caller-supplied syntax.
+    #[test]
+    fn scoped_searches_escape_whole_creator_and_topic_phrases() {
+        let public = "(mediatype:audio OR mediatype:etree) AND -access-restricted-item:true AND -access-restricted:true";
+        for (scope, field) in [
+            (ArchiveOrgSearchScope::Creator, "creator"),
+            (ArchiveOrgSearchScope::Topic, "subject"),
+        ] {
+            for (query, escaped) in [
+                ("Ray Bradbury", "Ray Bradbury"),
+                ("Живая музыка", "Живая музыка"),
+                (
+                    r#"Alice" OR mediatype:movies\*"#,
+                    r#"Alice\" OR mediatype\:movies\\\*"#,
+                ),
+                ("+-&|!(){}[]^~?:/", r"\+\-\&\|\!\(\)\{\}\[\]\^\~\?\:\/"),
+            ] {
+                let (client, transport) = mock_client(vec![bytes(&json!({"response": {
+                    "numFound": 0, "docs": []
+                }}))]);
+                client
+                    .search(&ArchiveOrgSearchRequest {
+                        query: query.into(),
+                        scope,
+                        page: 1,
+                        limit: 1,
+                    })
+                    .expect("scoped search");
+                let requests = transport.requests.lock().expect("requests");
+                let actual = requests[0]
+                    .query_pairs()
+                    .find(|(key, _)| key == "q")
+                    .expect("query")
+                    .1
+                    .into_owned();
+                assert_eq!(actual, format!("{public} AND ({field}:\"{escaped}\")"));
+            }
+        }
+    }
+
+    /// Field navigation rejects empty or oversized values without silently clipping them.
+    #[test]
+    fn scoped_search_bounds_fail_before_transport_and_keep_the_full_boundary_value() {
+        let (client, transport) = mock_client(Vec::new());
+        for scope in [ArchiveOrgSearchScope::Creator, ArchiveOrgSearchScope::Topic] {
+            for query in [
+                String::new(),
+                "   ".into(),
+                "é".repeat(257),
+                "a\nOR b".into(),
+            ] {
+                assert!(matches!(
+                    client.search(&ArchiveOrgSearchRequest {
+                        query,
+                        scope,
+                        page: 1,
+                        limit: 1,
+                    }),
+                    Err(ProviderError::InvalidRequest(_))
+                ));
+            }
+        }
+        assert!(transport.requests.lock().expect("requests").is_empty());
+        let (client, transport) = mock_client(vec![bytes(&json!({"response": {
+            "numFound": 0, "docs": []
+        }}))]);
+        let query = "é".repeat(MAX_QUERY_BYTES / 2);
+        client
+            .search(&ArchiveOrgSearchRequest {
+                query: query.clone(),
+                scope: ArchiveOrgSearchScope::Topic,
+                page: 1,
+                limit: 1,
+            })
+            .expect("full boundary query");
+        assert!(transport.requests.lock().expect("requests")[0].query_pairs()
+            .any(|(key, value)| key == "q" && value.ends_with(&format!("subject:\"{query}\")"))));
+    }
+
+    /// Array boundaries remain intact even when one credited name contains a semicolon.
+    #[test]
+    fn scoped_search_creators_preserve_individual_metadata_values_and_joined_compatibility() {
+        let mut value = metadata(json!([]));
+        value["metadata"]["creator"] = json!([
+            "Writer; Jr.",
+            "<b>Second Reader</b>",
+            null,
+            "",
+            "Writer; Jr."
+        ]);
+        value["metadata"]["subject"] =
+            json!(["Science fiction; Live reading", "Русская литература"]);
+        let response = json!({"response": {"numFound": 1, "docs": [value["metadata"].clone()]}});
+        let (client, _) = mock_client(vec![bytes(&response), bytes(&value)]);
+        let search = client
+            .search(&ArchiveOrgSearchRequest {
+                query: "Reader".into(),
+                scope: ArchiveOrgSearchScope::Text,
+                page: 1,
+                limit: 1,
+            })
+            .expect("search");
+        let details = client.item_details("mock_audio").expect("metadata");
+        for item in [&search.items[0], &details.item] {
+            assert_eq!(
+                item.creators,
+                ["Writer; Jr.", "Second Reader", "Writer; Jr."]
+            );
+            assert_eq!(
+                item.creator.as_deref(),
+                Some("Writer; Jr.; Second Reader; Writer; Jr.")
+            );
+            assert_eq!(
+                item.topics,
+                ["Science fiction", "Live reading", "Русская литература"]
+            );
+        }
+    }
+
+    /// Unbounded creator arrays are omitted as a whole, not presented as a partial list.
+    #[test]
+    fn scoped_search_creators_retain_existing_aggregate_metadata_bounds() {
+        for creator in [
+            json!(vec!["reader"; MAX_LIST_VALUES + 1]),
+            json!(["é".repeat(MAX_LABEL_BYTES / 2 + 1)]),
+        ] {
+            let mut value = metadata(json!([]));
+            value["metadata"]["creator"] = creator;
+            let (client, _) = mock_client(vec![bytes(&value)]);
+            let item = client
+                .item_details("mock_audio")
+                .expect("bounded item")
+                .item;
+            assert!(item.creators.is_empty());
+            assert_eq!(item.creator, None);
+        }
+    }
+
+    /// Old saved projections remain readable, and their free-text query semantics stay unchanged.
+    #[test]
+    fn scoped_search_defaults_preserve_older_serialized_requests_and_items() {
+        let request: ArchiveOrgSearchRequest = serde_json::from_value(json!({
+            "query": "jazz OR mediatype:movies", "page": 1, "limit": 1
+        }))
+        .expect("older request");
+        assert_eq!(request.scope, ArchiveOrgSearchScope::Text);
+        let (client, transport) = mock_client(vec![bytes(&json!({"response": {
+            "numFound": 1, "docs": [metadata(json!([]))["metadata"].clone()]
+        }}))]);
+        let page = client.search(&request).expect("ordinary search");
+        assert!(
+            transport.requests.lock().expect("requests")[0]
+                .query_pairs()
+                .any(|(key, value)| {
+                    key == "q" && value.ends_with(r#"("jazz" AND "OR" AND "mediatype\:movies")"#)
+                })
+        );
+        let mut older = serde_json::to_value(&page.items[0]).expect("item JSON");
+        older
+            .as_object_mut()
+            .expect("item object")
+            .remove("creators");
+        let restored: ArchiveOrgItem = serde_json::from_value(older).expect("older item");
+        assert!(restored.creators.is_empty());
+    }
+
     #[test]
     fn search_normalizes_arrays_counts_dates_and_pagination() {
         let (client, transport) = mock_client(vec![bytes(&json!({"response": {
@@ -2367,6 +2577,7 @@ mod tests {
         let page = client
             .search(&ArchiveOrgSearchRequest {
                 query: "jazz OR mediatype:movies".into(),
+                scope: ArchiveOrgSearchScope::Text,
                 page: 1,
                 limit: 2,
             })
@@ -2425,26 +2636,31 @@ mod tests {
         for request in [
             ArchiveOrgSearchRequest {
                 query: String::new(),
+                scope: ArchiveOrgSearchScope::Text,
                 page: 0,
                 limit: 10,
             },
             ArchiveOrgSearchRequest {
                 query: String::new(),
+                scope: ArchiveOrgSearchScope::Text,
                 page: 1,
                 limit: 0,
             },
             ArchiveOrgSearchRequest {
                 query: String::new(),
+                scope: ArchiveOrgSearchScope::Text,
                 page: 1,
                 limit: 101,
             },
             ArchiveOrgSearchRequest {
                 query: "x".repeat(513),
+                scope: ArchiveOrgSearchScope::Text,
                 page: 1,
                 limit: 10,
             },
             ArchiveOrgSearchRequest {
                 query: "x\u{1b}".into(),
+                scope: ArchiveOrgSearchScope::Text,
                 page: 1,
                 limit: 10,
             },

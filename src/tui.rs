@@ -5354,6 +5354,9 @@ fn render_information_panel(
         };
         let mut link_rows = Vec::with_capacity(details.links.len().saturating_mul(2));
         for (index, link) in details.links.iter().enumerate() {
+            if link.description_range.is_some() {
+                continue;
+            }
             link_rows.push(Some((index, link)));
             let next_is_wikidata = details
                 .links
@@ -5554,18 +5557,62 @@ fn render_information_panel(
         } else {
             (description_area, Rect::default())
         };
+        // Metadata navigation owns its source bytes, even when a value looks
+        // like a video URL. Do not inject a competing action into that label.
+        let video_links: std::borrow::Cow<'_, [DetailVideoLinkView]> = if details
+            .links
+            .iter()
+            .any(|link| link.description_range.is_some())
+        {
+            std::borrow::Cow::Owned(
+                details
+                    .video_links
+                    .iter()
+                    .filter(|video| {
+                        !details
+                            .links
+                            .iter()
+                            .filter_map(|link| link.description_range)
+                            .any(|range| {
+                                range.start_byte < video.end_byte
+                                    && range.end_byte > video.start_byte
+                            })
+                    })
+                    .cloned()
+                    .collect(),
+            )
+        } else {
+            std::borrow::Cow::Borrowed(&details.video_links)
+        };
         let description_lines = wrap_description_source(
             body_source,
             usize::from(description_text_area.width.max(1)),
-            if body_is_wikidata {
-                &[]
-            } else {
-                &details.video_links
-            },
+            if body_is_wikidata { &[] } else { &video_links },
         );
         let visible_lines = usize::from(description_text_area.height);
         let maximum_offset = description_lines.len().saturating_sub(visible_lines);
-        let offset = view.details_scroll.min(maximum_offset);
+        let mut offset = view.details_scroll.min(maximum_offset);
+        if !body_is_wikidata
+            && let Some(index) = view
+                .detail_link_reveal
+                .filter(|index| view.selected_detail_link == Some(*index))
+            && let Some(range) = details
+                .links
+                .get(index)
+                .and_then(|link| link.description_range)
+            && let Some(line) = description_lines.iter().position(|line| {
+                line.start_byte < range.end_byte && line.end_byte > range.start_byte
+            })
+        {
+            if line < offset {
+                offset = line;
+            } else if line >= offset.saturating_add(visible_lines) {
+                offset = line
+                    .saturating_add(1)
+                    .saturating_sub(visible_lines)
+                    .min(maximum_offset);
+            }
+        }
         hit_map.details_scroll_offset = offset;
         hit_map.details_scroll_maximum = maximum_offset;
         let visible = description_lines
@@ -5621,6 +5668,7 @@ fn render_information_panel(
                                 start_byte,
                                 end_byte,
                                 active_line,
+                                view.selected_detail_link,
                                 description_text_area,
                                 row,
                                 theme,
@@ -5631,7 +5679,7 @@ fn render_information_panel(
                         }
                     }
                     WrappedDescriptionToken::VideoAction { link_index } => {
-                        let Some(link) = details.video_links.get(link_index) else {
+                        let Some(link) = video_links.get(link_index) else {
                             continue;
                         };
                         let action_width = terminal_text_width(DESCRIPTION_VIDEO_ACTION_SYMBOL);
@@ -5895,6 +5943,104 @@ fn highlighted_detail_text<'a>(
     reason = "render geometry and mutable frame products belong to one row operation"
 )]
 fn append_description_source_spans<'a>(
+    details: &'a DetailView,
+    source: &'a str,
+    start_byte: usize,
+    end_byte: usize,
+    active_line: bool,
+    selected_link: Option<usize>,
+    description_area: Rect,
+    row: u16,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+    spans: &mut Vec<Span<'a>>,
+    cell_cursor: &mut u16,
+) {
+    let mut cursor = start_byte;
+    for (index, link) in details.links.iter().enumerate() {
+        let Some(range) = link.description_range.filter(|range| {
+            range.start_byte < end_byte
+                && range.end_byte > start_byte
+                && range.end_byte <= details.description.len()
+                && source.is_char_boundary(range.start_byte)
+                && source.is_char_boundary(range.end_byte)
+        }) else {
+            continue;
+        };
+        let start = range.start_byte.max(start_byte);
+        let end = range.end_byte.min(end_byte);
+        if start < cursor || start >= end {
+            continue;
+        }
+        if cursor < start {
+            append_description_unlinked_spans(
+                details,
+                source,
+                cursor,
+                start,
+                active_line,
+                description_area,
+                row,
+                theme,
+                hit_map,
+                spans,
+                cell_cursor,
+            );
+        }
+        let style = if selected_link == Some(index) {
+            theme
+                .selected
+                .add_modifier(Modifier::UNDERLINED | Modifier::REVERSED | Modifier::BOLD)
+        } else {
+            theme.accent.add_modifier(Modifier::UNDERLINED)
+        };
+        let width = terminal_text_width(&source[start..end]);
+        append_highlighted_detail_source(
+            details,
+            DetailHighlightField::Description,
+            source,
+            start..end,
+            style,
+            spans,
+        );
+        let clipped = width.min(description_area.width.saturating_sub(*cell_cursor));
+        if clipped > 0 {
+            hit_map.detail_links.push((
+                index,
+                Rect::new(
+                    description_area.x.saturating_add(*cell_cursor),
+                    row,
+                    clipped,
+                    1,
+                ),
+            ));
+        }
+        *cell_cursor = cell_cursor.saturating_add(width);
+        cursor = end;
+    }
+    if cursor < end_byte {
+        append_description_unlinked_spans(
+            details,
+            source,
+            cursor,
+            end_byte,
+            active_line,
+            description_area,
+            row,
+            theme,
+            hit_map,
+            spans,
+            cell_cursor,
+        );
+    }
+}
+
+/// Renders ordinary source text between metadata links, preserving timecodes.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one wrapped row shares geometry, styling and hit-map products"
+)]
+fn append_description_unlinked_spans<'a>(
     details: &'a DetailView,
     source: &'a str,
     start_byte: usize,
@@ -13091,8 +13237,9 @@ fn key_action_with_page_rows(
 }
 
 fn mouse_action(mouse: MouseEvent, hit_map: &HitMap, view: &ViewModel) -> Option<UiAction> {
-    mouse_action_unfiltered(mouse, hit_map, view)
-        .filter(|action| view.external_opener_available || !action.requires_external_opener())
+    mouse_action_unfiltered(mouse, hit_map, view).filter(|action| {
+        view.external_opener_available || !view.action_requires_external_opener(action)
+    })
 }
 
 /// Maps one pointer event before applying terminal-capability policy.
@@ -22863,6 +23010,321 @@ for encoded, expected in json.load(sys.stdin):
         }
         assert_eq!(restored, source);
         assert_eq!(highlighted, "ПРИВЕТ");
+    }
+
+    #[test]
+    fn archive_metadata_inline_links_keep_global_indices_without_extra_rows() {
+        let description = "Creator: Бьорк\nTopics: Live music\nBody remains unchanged";
+        let creator = description.find("Бьорк").unwrap();
+        let topic = description.find("Live music").unwrap();
+        let details = DetailView {
+            description: description.into(),
+            links: vec![
+                DetailLinkView {
+                    label: "Existing rail".into(),
+                    url: "https://example.org/".into(),
+                    ..DetailLinkView::default()
+                },
+                DetailLinkView {
+                    label: "Бьорк".into(),
+                    internal_target: Some(DetailLinkInternalTarget::ArchiveCreator("Бьорк".into())),
+                    description_range: Some(DetailHighlightRange {
+                        start_byte: creator,
+                        end_byte: creator + "Бьорк".len(),
+                    }),
+                    ..DetailLinkView::default()
+                },
+                DetailLinkView {
+                    label: "Live music".into(),
+                    internal_target: Some(DetailLinkInternalTarget::ArchiveTopic(
+                        "Live music".into(),
+                    )),
+                    description_range: Some(DetailHighlightRange {
+                        start_byte: topic,
+                        end_byte: topic + "Live music".len(),
+                    }),
+                    ..DetailLinkView::default()
+                },
+            ],
+            ..DetailView::default()
+        };
+        let mut view = ViewModel {
+            screen: Screen::ArchiveOrg,
+            details: Some(details),
+            selected_detail_link: Some(2),
+            external_opener_available: false,
+            text_selection_mode: true,
+            ..ViewModel::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(70, 20)).unwrap();
+        let mut hits = HitMap::default();
+        terminal
+            .draw(|frame| {
+                render_details(
+                    frame,
+                    frame.area(),
+                    &view,
+                    true,
+                    0,
+                    &Theme::new(false),
+                    &mut hits,
+                    None,
+                )
+            })
+            .unwrap();
+        let text = rendered_text(&terminal);
+        assert_eq!(text.matches("Бьорк").count(), 1);
+        assert_eq!(text.matches("Live music").count(), 1);
+        for index in [1, 2] {
+            assert!(hits.detail_links.iter().any(|(actual, _)| *actual == index));
+        }
+        let inline_rows: Vec<_> = hits
+            .detail_links
+            .iter()
+            .filter(|(index, _)| *index > 0)
+            .map(|(_, area)| area.y)
+            .collect();
+        let mut clicking = view.clone();
+        clicking.text_selection_mode = false;
+        for (index, area) in hits.detail_links.iter().filter(|(index, _)| *index > 0) {
+            assert_eq!(
+                mouse_action(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: area.x,
+                        row: area.y,
+                        modifiers: KeyModifiers::NONE
+                    },
+                    &hits,
+                    &clicking
+                ),
+                Some(UiAction::ActivateDetailLink(*index))
+            );
+        }
+        let baseline = hits.detail_text_rows.clone();
+        view.details.as_mut().unwrap().links.truncate(1);
+        let mut plain_hits = HitMap::default();
+        terminal
+            .draw(|frame| {
+                render_details(
+                    frame,
+                    frame.area(),
+                    &view,
+                    true,
+                    0,
+                    &Theme::new(false),
+                    &mut plain_hits,
+                    None,
+                )
+            })
+            .unwrap();
+        assert_eq!(rendered_text(&terminal), text);
+        assert_eq!(
+            baseline
+                .iter()
+                .map(|row| (row.x, row.y, &row.cells))
+                .collect::<Vec<_>>(),
+            plain_hits
+                .detail_text_rows
+                .iter()
+                .map(|row| (row.x, row.y, &row.cells))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            inline_rows
+                .iter()
+                .all(|row| baseline.iter().any(|copied| copied.y == *row))
+        );
+    }
+
+    #[test]
+    fn archive_metadata_inline_keyboard_enter_uses_selected_global_link() {
+        let view = ViewModel {
+            screen: Screen::ArchiveOrg,
+            external_opener_available: false,
+            details_focused: true,
+            selected_detail_link: Some(1),
+            details: Some(DetailView {
+                links: vec![
+                    DetailLinkView::default(),
+                    DetailLinkView {
+                        internal_target: Some(DetailLinkInternalTarget::ArchiveTopic(
+                            "jazz".into(),
+                        )),
+                        description_range: Some(DetailHighlightRange {
+                            start_byte: 0,
+                            end_byte: 4,
+                        }),
+                        ..DetailLinkView::default()
+                    },
+                ],
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &view),
+            Some(UiAction::ActivateDetailLink(1))
+        );
+        for (key, expected) in [
+            (KeyCode::Char('j'), UiAction::MoveDetailLink(1)),
+            (KeyCode::Char('k'), UiAction::MoveDetailLink(-1)),
+            (KeyCode::Home, UiAction::SelectDetailLink(0)),
+            (KeyCode::End, UiAction::SelectDetailLink(1)),
+        ] {
+            assert_eq!(
+                key_action(KeyEvent::new(key, KeyModifiers::ALT), &view),
+                Some(expected)
+            );
+        }
+        let mut list = view;
+        list.details_focused = false;
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &list),
+            Some(UiAction::ActivateSelection)
+        );
+    }
+
+    #[test]
+    fn archive_metadata_links_override_timestamp_and_video_url_actions() {
+        let description = "Creator: 00:10\nTopics: https://youtu.be/dQw4w9WgXcQ";
+        let video_start = description.find("https:").unwrap();
+        let view = ViewModel {
+            screen: Screen::ArchiveOrg,
+            details: Some(DetailView {
+                media_id: Some(MediaId::new(SourceKind::ArchiveOrg, "fixture")),
+                description: description.into(),
+                timecodes: vec![DetailTimecodeView {
+                    start_byte: 9,
+                    end_byte: 14,
+                    seconds: 10,
+                    is_chapter: false,
+                }],
+                video_links: vec![DetailVideoLinkView {
+                    start_byte: video_start,
+                    end_byte: description.len(),
+                    video_id: "dQw4w9WgXcQ".into(),
+                    start_seconds: None,
+                }],
+                links: vec![
+                    DetailLinkView {
+                        label: "00:10".into(),
+                        internal_target: Some(DetailLinkInternalTarget::ArchiveCreator(
+                            "00:10".into(),
+                        )),
+                        description_range: Some(DetailHighlightRange {
+                            start_byte: 9,
+                            end_byte: 14,
+                        }),
+                        ..DetailLinkView::default()
+                    },
+                    DetailLinkView {
+                        label: description[video_start..].into(),
+                        internal_target: Some(DetailLinkInternalTarget::ArchiveTopic(
+                            description[video_start..].into(),
+                        )),
+                        description_range: Some(DetailHighlightRange {
+                            start_byte: video_start,
+                            end_byte: description.len(),
+                        }),
+                        ..DetailLinkView::default()
+                    },
+                ],
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(70, 20)).unwrap();
+        let mut hits = HitMap::default();
+        terminal
+            .draw(|frame| {
+                render_details(
+                    frame,
+                    frame.area(),
+                    &view,
+                    true,
+                    0,
+                    &Theme::new(false),
+                    &mut hits,
+                    None,
+                )
+            })
+            .unwrap();
+        assert_eq!(hits.detail_links.len(), 2);
+        assert!(
+            !hits
+                .detail_buttons
+                .iter()
+                .any(|(action, _)| matches!(action, UiAction::ActivateTimecode { .. }))
+        );
+        assert!(hits.description_video_actions.is_empty());
+        assert!(!rendered_text(&terminal).contains(DESCRIPTION_VIDEO_ACTION_SYMBOL));
+    }
+
+    #[test]
+    fn archive_metadata_inline_keyboard_reveal_is_geometry_clamped_and_revocable() {
+        let description = format!(
+            "{}Topics: target\n{}",
+            "before\n".repeat(50),
+            "after\n".repeat(50)
+        );
+        let start = description.find("target").unwrap();
+        let view = ViewModel {
+            screen: Screen::ArchiveOrg,
+            details: Some(DetailView {
+                description,
+                links: vec![DetailLinkView {
+                    label: "target".into(),
+                    internal_target: Some(DetailLinkInternalTarget::ArchiveTopic("target".into())),
+                    description_range: Some(DetailHighlightRange {
+                        start_byte: start,
+                        end_byte: start + 6,
+                    }),
+                    ..DetailLinkView::default()
+                }],
+                ..DetailView::default()
+            }),
+            selected_detail_link: Some(0),
+            detail_link_reveal: Some(0),
+            ..ViewModel::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(70, 15)).unwrap();
+        let mut hits = HitMap::default();
+        terminal
+            .draw(|frame| {
+                render_details(
+                    frame,
+                    frame.area(),
+                    &view,
+                    true,
+                    0,
+                    &Theme::new(false),
+                    &mut hits,
+                    None,
+                )
+            })
+            .unwrap();
+        assert!(rendered_text(&terminal).contains("Topics: target"));
+        assert!(hits.details_scroll_offset > 0);
+        assert!(hits.detail_links.iter().any(|(index, _)| *index == 0));
+        let mut manual = view;
+        manual.detail_link_reveal = None;
+        manual.details_scroll = 0;
+        terminal
+            .draw(|frame| {
+                render_details(
+                    frame,
+                    frame.area(),
+                    &manual,
+                    true,
+                    0,
+                    &Theme::new(false),
+                    &mut HitMap::default(),
+                    None,
+                )
+            })
+            .unwrap();
+        assert!(!rendered_text(&terminal).contains("Topics: target"));
     }
 
     #[test]

@@ -1425,6 +1425,19 @@ pub enum PanelFocus {
     Player,
 }
 
+/// Closed Archive search fields retained even when its provider is compiled out.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArchiveOrgSearchScope {
+    /// Ordinary plain-text search across item metadata.
+    #[default]
+    Text,
+    /// One complete credited creator value.
+    Creator,
+    /// One complete subject/topic value.
+    Topic,
+}
+
 /// Restart-safe terminal navigation and selection state.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SessionState {
@@ -1490,6 +1503,9 @@ pub struct SessionState {
     /// Last search text entered on the independent archive.org tab.
     #[serde(default)]
     pub archive_org_search_text: String,
+    /// Exact Archive metadata field selected by an internal Creator/Topics link.
+    #[serde(default)]
+    pub archive_org_search_scope: ArchiveOrgSearchScope,
     /// Last search text entered on the independent `LibriVox` tab.
     #[serde(default)]
     pub librivox_search_text: String,
@@ -1533,6 +1549,7 @@ impl Default for SessionState {
             bandcamp_search_text: String::new(),
             apple_podcasts_search_text: String::new(),
             archive_org_search_text: String::new(),
+            archive_org_search_scope: ArchiveOrgSearchScope::Text,
             librivox_search_text: String::new(),
             local_path: None,
             waveform_visible: false,
@@ -1933,9 +1950,14 @@ mod tests {
         let object = encoded.as_object_mut().expect("session object");
         object.remove("archive_org_selected_row");
         object.remove("archive_org_search_text");
+        object.remove("archive_org_search_scope");
         let restored: SessionState = serde_json::from_value(encoded).expect("older session");
         assert_eq!(restored.archive_org_selected_row, None);
         assert!(restored.archive_org_search_text.is_empty());
+        assert_eq!(
+            restored.archive_org_search_scope,
+            ArchiveOrgSearchScope::Text
+        );
     }
 
     #[test]

@@ -457,6 +457,14 @@ resolver:
   wrapping, links, timecodes, and copied content remain unchanged; the compiled
   [Unicode-aware matcher](https://docs.rs/regex/latest/regex/struct.RegexBuilder.html)
   and selected item's match ranges are reused until the query or text changes.
+  Click an individual Creator or Topics value to replace the search with that
+  metadata filter inside Youta. In the TUI, Alt+j/k or Alt+Home/End selects a
+  details link, and Enter (or Alt+Enter) opens it; inline links are revealed
+  without adding duplicate rows. Manual scrolling remains unrestricted.
+  These filters survive pagination, tab changes, and restart. A `/` search
+  submitted with Enter returns to ordinary text search; an unsubmitted edit
+  of a metadata filter is discarded on tab change/restart. Values are escaped
+  as literal phrases using Archive's [advanced-search fields](https://archive.org/advancedsearch.php).
   Strong legacy Cyrillic encoding errors in track titles are repaired for display
   using the same conservative handling as local tags. Ambiguous short titles
   require a matching Cyrillic word in the item's description or title. Original

@@ -100,10 +100,13 @@ export type DetailLinkPresentation =
   | "UrlOnly"
   | "UrlOnlySpaced";
 
-/** A Yandex Music destination reachable without leaving Youta. */
+/** An exact provider destination reachable without leaving Youta. */
 export type DetailLinkInternalTarget =
   | { YandexMusicArtist: string }
-  | { YandexMusicAlbum: string };
+  | { YandexMusicAlbum: string }
+	| { LibriVoxAuthor: string }
+	| { ArchiveCreator: string }
+	| { ArchiveTopic: string };
 
 /** One selectable external link beside a media item or channel. */
 export interface DetailLinkView {
@@ -113,6 +116,8 @@ export interface DetailLinkView {
   wikidata_item_id: string | null;
   presentation: DetailLinkPresentation;
   internal_target: DetailLinkInternalTarget | null;
+	/** Inline description bounds, or null for an ordinary separate link row. */
+	description_range: DetailHighlightRange | null;
 }
 
 /**
@@ -843,6 +848,8 @@ export interface ViewModel {
   details_focused: boolean;
   details_scroll: number;
   selected_detail_link: number | null;
+	/** One requested inline-link reveal; manual scrolling clears it in Rust. */
+	detail_link_reveal: number | null;
   selected_wikidata_media: number | null;
   subscriptions: SubscriptionsView;
   waveform: WaveformView;

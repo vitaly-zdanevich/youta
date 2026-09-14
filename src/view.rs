@@ -1404,24 +1404,26 @@ pub struct DetailHighlightView {
     pub ranges: Vec<DetailHighlightRange>,
 }
 
-/// One selectable external link displayed in a details or channel panel.
+/// One selectable Details destination, on the link rail or inline in description text.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct DetailLinkView {
     /// Plain, non-clickable text rendered immediately before the link value.
     pub prefix: String,
     /// Human-readable link label, such as a Wikidata item name.
     pub label: String,
-    /// Absolute URL passed to the controller when the link is activated.
+    /// External URL; empty for destinations handled entirely inside Youta.
     pub url: String,
     /// Exact Wikidata Q-ID when this link owns a lazy property spoiler.
     pub wikidata_item_id: Option<String>,
     /// Provider-selected text and spacing treatment for this link.
     pub presentation: DetailLinkPresentation,
-    /// Optional exact destination opened inside Youta by the adjacent marker.
+    /// Exact destination opened inside Youta by an inline value or rail marker.
     pub internal_target: Option<DetailLinkInternalTarget>,
+    /// Original description bytes occupied by an inline link; no fixed rail row.
+    pub description_range: Option<DetailHighlightRange>,
 }
 
-/// Exact provider destination exposed by one Details-row internal-link marker.
+/// Exact provider destination exposed by a Details link or inline metadata value.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub enum DetailLinkInternalTarget {
     /// One stable Yandex Music artist identifier.
@@ -1430,6 +1432,10 @@ pub enum DetailLinkInternalTarget {
     YandexMusicAlbum(String),
     /// One stable numeric `LibriVox` author identifier.
     LibriVoxAuthor(String),
+    /// Replace the Archive search with this credited creator value.
+    ArchiveCreator(String),
+    /// Replace the Archive search with this subject/topic value.
+    ArchiveTopic(String),
 }
 
 impl DetailLinkInternalTarget {
@@ -1440,6 +1446,8 @@ impl DetailLinkInternalTarget {
             Self::YandexMusicArtist(id) => UiAction::OpenYandexMusicArtistById(id.clone()),
             Self::YandexMusicAlbum(id) => UiAction::OpenYandexMusicAlbumById(id.clone()),
             Self::LibriVoxAuthor(id) => UiAction::OpenLibriVoxAuthorById(id.clone()),
+            Self::ArchiveCreator(value) => UiAction::SearchArchiveCreator(value.clone()),
+            Self::ArchiveTopic(value) => UiAction::SearchArchiveTopic(value.clone()),
         }
     }
 }
@@ -2646,6 +2654,8 @@ pub struct ViewModel {
     pub details_scroll: usize,
     /// Selected external-link index, or `None` before link navigation begins.
     pub selected_detail_link: Option<usize>,
+    /// Keyboard-requested inline link to reveal; cleared by manual scrolling.
+    pub detail_link_reveal: Option<usize>,
     /// Selected Commons media control inside the expanded Wikidata spoiler.
     pub selected_wikidata_media: Option<usize>,
     /// Selected right-panel mode.
@@ -2879,6 +2889,28 @@ pub struct ViewModel {
 }
 
 impl ViewModel {
+    /// Resolves indexed metadata destinations before applying terminal URL policy.
+    pub(crate) fn action_requires_external_opener(&self, action: &UiAction) -> bool {
+        if let UiAction::ActivateDetailLink(index) = action
+            && self
+                .details
+                .as_ref()
+                .and_then(|details| details.links.get(*index))
+                .is_some_and(|link| {
+                    matches!(
+                        link.internal_target,
+                        Some(
+                            DetailLinkInternalTarget::ArchiveCreator(_)
+                                | DetailLinkInternalTarget::ArchiveTopic(_)
+                        )
+                    )
+                })
+        {
+            return false;
+        }
+        action.requires_external_opener()
+    }
+
     /// Whether the selection belongs to an implemented public-comments adapter.
     #[must_use]
     pub fn public_comments_available(&self) -> bool {
@@ -3018,6 +3050,7 @@ impl Default for ViewModel {
             details_focused: false,
             details_scroll: 0,
             selected_detail_link: None,
+            detail_link_reveal: None,
             selected_wikidata_media: None,
             right_panel_mode: RightPanelMode::Details,
             waveform_visible: false,
@@ -3226,6 +3259,10 @@ pub enum UiAction {
     OpenYandexMusicAlbumById(String),
     /// Open one exact `LibriVox` author selected from a Details link.
     OpenLibriVoxAuthorById(String),
+    /// Search public Archive audio credited to one exact creator value.
+    SearchArchiveCreator(String),
+    /// Search public Archive audio tagged with one exact topic value.
+    SearchArchiveTopic(String),
     /// Download every track in the currently opened or selected album.
     DownloadYandexMusicAlbum,
     /// Download the first twenty current My Wave recommendations.

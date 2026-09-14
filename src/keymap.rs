@@ -1069,8 +1069,9 @@ pub fn key_action(
             popups.video_comments.page_lines,
         );
     }
-    unfiltered_key_action(key, view, page_rows)
-        .filter(|action| view.external_opener_available || !action.requires_external_opener())
+    unfiltered_key_action(key, view, page_rows).filter(|action| {
+        view.external_opener_available || !view.action_requires_external_opener(action)
+    })
 }
 
 /// Maps the searchable caption browser before ordinary application shortcuts.
@@ -2320,6 +2321,17 @@ fn unfiltered_key_action(
                 .unwrap_or_default()
                 .min(detail_link_count - 1);
             Some(UiAction::ActivateDetailLink(selected))
+        }
+        Key::Enter
+            if view.details_focused
+                && view.selected_detail_link.is_some_and(|index| {
+                    view.details
+                        .as_ref()
+                        .and_then(|details| details.links.get(index))
+                        .is_some_and(|link| link.description_range.is_some())
+                }) =>
+        {
+            view.selected_detail_link.map(UiAction::ActivateDetailLink)
         }
         Key::Enter if view.details_focused && wikidata_media_count > 0 => {
             Some(UiAction::ActivateWikidataMedia(

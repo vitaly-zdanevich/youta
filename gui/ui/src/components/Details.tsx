@@ -160,12 +160,14 @@ function Links({
   selectedLink: number | null;
   selectedMedia: number | null;
 }) {
-  if (links.length === 0) {
+	const railLinks = links.map((link, index) => ({ link, index }))
+		.filter(({ link }) => link.description_range == null);
+  if (railLinks.length === 0) {
     return null;
   }
   return (
     <ul className="mt-3 grid list-none gap-[5px] border-t border-line pt-[10px] pl-0 text-xs">
-      {links.map((link, index) => {
+      {railLinks.map(({ link, index }) => {
         const expanded =
           link.wikidata_item_id !== null &&
           link.wikidata_item_id === details.expanded_wikidata_item;
@@ -178,15 +180,12 @@ function Links({
         const labelField: DetailHighlightField = link.presentation.startsWith('Url') || link.label === ''
           ? { LinkUrl: index } : { LinkLabel: index };
         const showUrl = link.presentation.startsWith("LabelAndUrl") && link.label !== "";
-        // Resolved outside the handler so the union stays narrowed: TypeScript
-        // widens `link.internal_target` again inside a closure.
-        const target = link.internal_target;
-        const internal =
-          target === null
-            ? null
-            : "YandexMusicArtist" in target
-              ? { OpenYandexMusicArtistById: target.YandexMusicArtist }
-              : { OpenYandexMusicAlbumById: target.YandexMusicAlbum };
+				// Keep existing provider markers independent of external URL capabilities.
+				const target = link.internal_target;
+				const internal = target === null ? null
+					: 'YandexMusicArtist' in target ? { OpenYandexMusicArtistById: target.YandexMusicArtist }
+						: 'YandexMusicAlbum' in target ? { OpenYandexMusicAlbumById: target.YandexMusicAlbum }
+							: { ActivateDetailLink: index };
         return (
           <li key={`${link.url}-${index}`}>
             <span className="flex flex-wrap items-baseline gap-x-[6px]">
@@ -529,6 +528,9 @@ export function Details({ view, kind }: { view: ViewModel; kind: InformationPane
         videoLinks={details.video_links}
         mediaId={details.media_id}
         highlights={highlightRanges(details.search_highlights, 'Description')}
+				links={details.links}
+				selectedLink={view.selected_detail_link}
+				revealLink={view.detail_link_reveal}
       />
 
       {kind === "Local" && audioQuality !== null ? (

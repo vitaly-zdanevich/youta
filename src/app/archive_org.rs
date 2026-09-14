@@ -5,6 +5,7 @@
 mod worker_tests;
 
 use super::*;
+use crate::domain::ArchiveOrgSearchScope;
 #[cfg(any(feature = "yt-dlp", test))]
 use crate::providers::archive_org::ArchiveOrgDownloadVariant;
 use crate::providers::archive_org::{
@@ -22,6 +23,8 @@ pub(super) struct ArchiveOrgState {
     search_highlighter: super::archive_org_highlight::ArchiveSearchHighlighter,
     /// Owns the displayed result set; persisted editor drafts may change separately.
     submitted_query: String,
+    /// Metadata field owning the displayed results and their continuations.
+    submitted_scope: ArchiveOrgSearchScope,
     next_page: Option<u32>,
     total: u64,
     generation: u64,
@@ -194,7 +197,34 @@ impl AppController {
 
     /// Starts a new search without reusing another tab's query or results.
     pub(super) fn submit_archive_org_search(&mut self, query: String) {
+        self.start_archive_org_search(query, ArchiveOrgSearchScope::Text);
+    }
+
+    /// Replaces the previous search with one validated metadata value.
+    pub(super) fn search_archive_metadata(&mut self, query: String, scope: ArchiveOrgSearchScope) {
+        let request = ArchiveOrgSearchRequest {
+            query: query.trim().to_owned(),
+            scope,
+            page: 1,
+            limit: 50,
+        };
+        if let Err(error) = request.validate() {
+            self.view.status_line = error.to_string();
+            return;
+        }
+        // Avoid an empty initial browse before the requested metadata search.
+        self.archive_org.initialized = true;
+        if self.view.screen != Screen::ArchiveOrg {
+            self.show_screen(Screen::ArchiveOrg);
+        }
+        self.start_archive_org_search(request.query, scope);
+    }
+
+    /// Owns accepted text and field independently of any subsequent editor draft.
+    fn start_archive_org_search(&mut self, query: String, scope: ArchiveOrgSearchScope) {
         self.archive_org_search_query = query.trim().to_owned();
+        self.archive_org_search_scope = scope;
+        self.archive_org.submitted_scope = scope;
         self.archive_org
             .submitted_query
             .clone_from(&self.archive_org_search_query);
@@ -204,10 +234,13 @@ impl AppController {
         self.archive_org.search_selected = 0;
         self.archive_org_selected = 0;
         self.view.selected = 0;
+        self.view.selected_detail_link = None;
+        self.view.detail_link_reveal = None;
         self.archive_org.initialized = true;
         self.view.search_editing = false;
         self.queue_archive_request(
             ArchiveRequest::Search(ArchiveOrgSearchRequest {
+                scope,
                 query: self.archive_org_search_query.clone(),
                 page: 1,
                 limit: 50,
@@ -433,7 +466,10 @@ impl AppController {
         }
         if !self.archive_org.initialized {
             let restored = self.archive_org_selected;
-            self.submit_archive_org_search(self.archive_org_search_query.clone());
+            self.start_archive_org_search(
+                self.archive_org_search_query.clone(),
+                self.archive_org_search_scope,
+            );
             self.archive_org_selected = restored;
             return;
         }
@@ -613,6 +649,7 @@ impl AppController {
         if !same_identity {
             self.view.details_scroll = 0;
             self.view.selected_detail_link = None;
+            self.view.detail_link_reveal = None;
         }
         if !self.archive_download_lookup_pending()
             && self.archive_org.active.is_none()
@@ -692,6 +729,7 @@ impl AppController {
         {
             self.queue_archive_request(
                 ArchiveRequest::Search(ArchiveOrgSearchRequest {
+                    scope: self.archive_org.submitted_scope,
                     query: self.archive_org.submitted_query.clone(),
                     page,
                     limit: 50,
@@ -937,12 +975,28 @@ pub(super) fn is_direct_audio_url(url: &url::Url) -> bool {
 fn detail_view(item: &ArchiveOrgItem, track: Option<&ArchiveOrgTrack>) -> DetailView {
     let artwork = track_artwork_url(item, track);
     let mut metadata = Vec::new();
-    if let Some(creator) = &item.creator {
-        metadata.push(format!("Creator: {creator}"));
-    }
-    if !item.topics.is_empty() {
-        metadata.push(format!("Topics: {}", item.topics.join(", ")));
-    }
+    let mut inline_links = Vec::new();
+    let creators: Vec<_> = if item.creators.is_empty() {
+        item.creator.as_deref().into_iter().collect()
+    } else {
+        item.creators.iter().map(String::as_str).collect()
+    };
+    append_searchable_metadata(
+        &mut metadata,
+        &mut inline_links,
+        "Creator: ",
+        &creators,
+        "; ",
+        DetailLinkInternalTarget::ArchiveCreator,
+    );
+    append_searchable_metadata(
+        &mut metadata,
+        &mut inline_links,
+        "Topics: ",
+        &item.topics.iter().map(String::as_str).collect::<Vec<_>>(),
+        ", ",
+        DetailLinkInternalTarget::ArchiveTopic,
+    );
     if !item.languages.is_empty() {
         metadata.push(format!("Language: {}", item.languages.join(", ")));
     }
@@ -983,6 +1037,7 @@ fn detail_view(item: &ArchiveOrgItem, track: Option<&ArchiveOrgTrack>) -> Detail
             ..DetailLinkView::default()
         });
     }
+    links.extend(inline_links);
     DetailView {
         media_id: Some(track.map_or_else(
             || MediaId::new(SourceKind::ArchiveOrg, format!("item:{}", item.identifier)),
@@ -1018,6 +1073,38 @@ fn detail_view(item: &ArchiveOrgItem, track: Option<&ArchiveOrgTrack>) -> Detail
         expanded_thumbnail_url: artwork,
         ..DetailView::default()
     }
+}
+
+/// Adds independently actionable metadata values without duplicating their text.
+fn append_searchable_metadata(
+    metadata: &mut Vec<String>,
+    links: &mut Vec<DetailLinkView>,
+    prefix: &str,
+    values: &[&str],
+    separator: &str,
+    target: fn(String) -> DetailLinkInternalTarget,
+) {
+    if values.is_empty() {
+        return;
+    }
+    let mut offset = metadata.iter().map(|line| line.len() + 1).sum::<usize>() + prefix.len();
+    for value in values {
+        // Long labels remain fully visible but cannot exceed the provider's
+        // bounded search contract merely by being clicked.
+        if !value.trim().is_empty() && value.len() <= 512 && !value.chars().any(char::is_control) {
+            links.push(DetailLinkView {
+                label: (*value).to_owned(),
+                internal_target: Some(target((*value).to_owned())),
+                description_range: Some(crate::view::DetailHighlightRange {
+                    start_byte: offset,
+                    end_byte: offset + value.len(),
+                }),
+                ..DetailLinkView::default()
+            });
+        }
+        offset += value.len() + separator.len();
+    }
+    metadata.push(format!("{prefix}{}", values.join(separator)));
 }
 #[cfg(test)]
 mod tests {
@@ -1060,6 +1147,214 @@ mod tests {
         controller.view.screen = Screen::History;
         controller.archive_org.initialized = true;
         (directory, controller)
+    }
+
+    /// Blocks real provider work while a test inspects queued request ownership.
+    fn occupy_archive_worker(controller: &mut AppController) {
+        let (_sender, response) = bounded(1);
+        controller.archive_org.worker = Some(ArchiveWorker {
+            job: ArchiveJob {
+                generation: 0,
+                kind: ArchiveRequest::Details {
+                    identifier: "fixture".into(),
+                    open: false,
+                },
+                due: Instant::now(),
+            },
+            response,
+            thread: thread::spawn(|| {}),
+        });
+    }
+
+    #[test]
+    fn archive_metadata_links_keep_original_creator_values_and_topic_byte_ranges() {
+        let mut value = item();
+        value.creators = vec!["Бьорк; orchestra".into(), "Another artist".into()];
+        value.creator = Some(value.creators.join("; "));
+        value.topics = vec!["Live music".into(), "История".into()];
+        let details = detail_view(&value, None);
+        assert!(details.description.starts_with(
+            "Creator: Бьорк; orchestra; Another artist\nTopics: Live music, История\n"
+        ));
+        let links: Vec<_> = details
+            .links
+            .iter()
+            .filter(|link| link.description_range.is_some())
+            .collect();
+        assert_eq!(links.len(), 4);
+        for (link, expected) in links.iter().zip([
+            "Бьорк; orchestra",
+            "Another artist",
+            "Live music",
+            "История",
+        ]) {
+            let range = link.description_range.unwrap();
+            assert_eq!(
+                &details.description[range.start_byte..range.end_byte],
+                expected
+            );
+            assert_eq!(link.label, expected);
+            assert!(
+                link.url.is_empty(),
+                "metadata must navigate internally, not open a browser"
+            );
+        }
+        assert_eq!(
+            links[0].internal_target.as_ref().unwrap().action(),
+            UiAction::SearchArchiveCreator("Бьорк; orchestra".into())
+        );
+        assert_eq!(
+            links[3].internal_target.as_ref().unwrap().action(),
+            UiAction::SearchArchiveTopic("История".into())
+        );
+        assert!(details.description.ends_with("Original description"));
+    }
+
+    #[test]
+    fn archive_metadata_search_replaces_old_query_and_survives_draft_restart_and_pagination() {
+        use crate::domain::ArchiveOrgSearchScope;
+        let (_directory, mut controller) = lookup_controller();
+        controller.view.screen = Screen::ArchiveOrg;
+        controller.archive_org_search_query = "old unrelated search".into();
+        occupy_archive_worker(&mut controller);
+        controller.dispatch(UiAction::SearchArchiveCreator("Бьорк; orchestra".into()));
+        assert_eq!(
+            controller.archive_org_search_scope,
+            ArchiveOrgSearchScope::Creator
+        );
+        let request = controller.archive_org.pending.as_ref().unwrap();
+        assert!(
+            matches!(&request.kind, ArchiveRequest::Search(request) if request.scope == ArchiveOrgSearchScope::Creator && request.query == "Бьорк; orchestra")
+        );
+        controller.archive_org.pending = None;
+        controller.archive_org.request = None;
+        controller.view.search_editing = true;
+        controller.view.search_query = "not submitted".into();
+        assert!(controller.save_session());
+        let saved = controller.store.session().unwrap().unwrap();
+        assert_eq!(
+            saved.archive_org_search_scope,
+            ArchiveOrgSearchScope::Creator
+        );
+        assert_eq!(saved.archive_org_search_text, "Бьорк; orchestra");
+        let restart_store = StateStore::open_in_memory().unwrap();
+        let mut restart_session = saved;
+        restart_session.screen = StoredScreen::History;
+        restart_store.save_session(&restart_session, 1).unwrap();
+        let mut restarted =
+            AppController::new(controller.config.clone(), restart_store, None, None);
+        occupy_archive_worker(&mut restarted);
+        restarted.show_screen(Screen::ArchiveOrg);
+        assert!(
+            matches!(&restarted.archive_org.pending.as_ref().unwrap().kind, ArchiveRequest::Search(request) if request.scope == ArchiveOrgSearchScope::Creator && request.query == "Бьорк; orchestra")
+        );
+        restarted
+            .archive_org
+            .worker
+            .take()
+            .unwrap()
+            .thread
+            .join()
+            .unwrap();
+        controller.show_screen(Screen::History);
+        controller.show_screen(Screen::ArchiveOrg);
+        assert_eq!(controller.view.search_query, "Бьорк; orchestra");
+        controller.archive_org.next_page = Some(2);
+        controller.activate_archive_org_selection();
+        assert!(
+            matches!(&controller.archive_org.pending.as_ref().unwrap().kind, ArchiveRequest::Search(request) if request.page == 2 && request.scope == ArchiveOrgSearchScope::Creator && request.query == "Бьорк; orchestra")
+        );
+        controller.archive_org.initialized = false;
+        controller.populate_archive_org();
+        assert!(
+            matches!(&controller.archive_org.pending.as_ref().unwrap().kind, ArchiveRequest::Search(request) if request.page == 1 && request.scope == ArchiveOrgSearchScope::Creator)
+        );
+        controller.dispatch(UiAction::SearchArchiveTopic("Live music".into()));
+        assert_eq!(
+            controller.archive_org_search_scope,
+            ArchiveOrgSearchScope::Topic
+        );
+        controller.submit_archive_org_search("new plain search".into());
+        assert_eq!(
+            controller.archive_org_search_scope,
+            ArchiveOrgSearchScope::Text
+        );
+        assert!(
+            matches!(&controller.archive_org.pending.as_ref().unwrap().kind, ArchiveRequest::Search(request) if request.scope == ArchiveOrgSearchScope::Text && request.query == "new plain search")
+        );
+        controller
+            .archive_org
+            .worker
+            .take()
+            .unwrap()
+            .thread
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn archive_metadata_inline_keyboard_reveal_stops_after_manual_scroll() {
+        let (_directory, mut controller) = lookup_controller();
+        controller.view.details = Some(DetailView {
+            expanded_wikidata_item: Some("Q42".into()),
+            links: vec![DetailLinkView {
+                description_range: Some(crate::view::DetailHighlightRange {
+                    start_byte: 0,
+                    end_byte: 3,
+                }),
+                ..DetailLinkView::default()
+            }],
+            ..DetailView::default()
+        });
+        controller.dispatch(UiAction::SelectDetailLink(0));
+        assert_eq!(controller.view.detail_link_reveal, Some(0));
+        assert!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .unwrap()
+                .expanded_wikidata_item
+                .is_none(),
+            "keyboard metadata focus must restore its visible description"
+        );
+        controller.dispatch(UiAction::SetDetailsScroll(20));
+        assert_eq!(controller.view.detail_link_reveal, None);
+        controller.dispatch(UiAction::MoveDetailLink(1));
+        assert_eq!(controller.view.detail_link_reveal, Some(0));
+        controller.dispatch(UiAction::ScrollDetails(DetailsScroll::Home));
+        assert_eq!(controller.view.detail_link_reveal, None);
+    }
+
+    #[test]
+    fn archive_metadata_indexed_activation_does_not_require_an_external_opener() {
+        let (_directory, mut controller) = lookup_controller();
+        controller.view.external_opener_available = false;
+        let details = detail_view(&item(), None);
+        let index = details
+            .links
+            .iter()
+            .position(|link| {
+                matches!(
+                    link.internal_target,
+                    Some(DetailLinkInternalTarget::ArchiveTopic(_))
+                )
+            })
+            .unwrap();
+        controller.view.details = Some(details);
+        occupy_archive_worker(&mut controller);
+        controller.dispatch(UiAction::ActivateDetailLink(index));
+        assert!(
+            matches!(&controller.archive_org.pending.as_ref().unwrap().kind, ArchiveRequest::Search(request) if request.scope == ArchiveOrgSearchScope::Topic && request.query == "History")
+        );
+        controller
+            .archive_org
+            .worker
+            .take()
+            .unwrap()
+            .thread
+            .join()
+            .unwrap();
     }
 
     #[test]

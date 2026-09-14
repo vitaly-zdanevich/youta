@@ -4798,6 +4798,8 @@ pub struct AppController {
     archive_org: archive_org::ArchiveOrgState,
     /// Query retained independently for the archive.org tab.
     archive_org_search_query: String,
+    /// Persisted metadata filter, independent of whether Archive is compiled in.
+    archive_org_search_scope: crate::domain::ArchiveOrgSearchScope,
     /// Selected archive.org row retained while another tab is visible.
     archive_org_selected: usize,
     /// Query retained independently for the LibriVox tab.
@@ -6297,6 +6299,7 @@ impl AppController {
             #[cfg(feature = "archive-org")]
             archive_org: archive_org::ArchiveOrgState::default(),
             archive_org_search_query,
+            archive_org_search_scope: saved.archive_org_search_scope,
             archive_org_selected,
             librivox_search_query,
             librivox_selected,
@@ -7500,6 +7503,16 @@ impl AppController {
     fn submit_archive_org_search(&mut self, query: String) {
         self.archive_org_search_query = query;
         self.populate_archive_org();
+    }
+
+    /// Keeps stored Archive filters untouched when this build cannot search them.
+    #[cfg(not(feature = "archive-org"))]
+    fn search_archive_metadata(
+        &mut self,
+        _query: String,
+        _scope: crate::domain::ArchiveOrgSearchScope,
+    ) {
+        self.view.status_line = "This build omits the `archive-org` feature".to_owned();
     }
 
     /// Explains the omitted provider without leaving stale rows or Details.
@@ -26632,8 +26645,10 @@ impl AppController {
                 self.finish_search_activity(SearchActivity::Web);
             }
             Screen::ArchiveOrg => {
-                self.archive_org_search_query
-                    .clone_from(&self.view.search_query);
+                if self.archive_org_search_scope == crate::domain::ArchiveOrgSearchScope::Text {
+                    self.archive_org_search_query
+                        .clone_from(&self.view.search_query);
+                }
                 self.archive_org_selected = self.view.selected;
                 self.finish_search_activity(SearchActivity::ArchiveOrg);
             }
@@ -26781,6 +26796,7 @@ impl AppController {
         self.view.details_focused = false;
         self.view.details_scroll = 0;
         self.view.selected_detail_link = None;
+        self.view.detail_link_reveal = None;
         self.populate_local_screen();
         if screen == Screen::Search && !self.youtube_results.is_empty() {
             self.request_visible_channel_subscriber_counts();
@@ -30228,6 +30244,7 @@ impl AppController {
         let next = (i64::try_from(current).unwrap_or_default() + i64::from(delta))
             .rem_euclid(link_count_i64);
         self.view.selected_detail_link = usize::try_from(next).ok();
+        self.reveal_selected_detail_link();
     }
 
     fn select_detail_link(&mut self, index: usize) {
@@ -30238,6 +30255,22 @@ impl AppController {
             .is_some_and(|details| index < details.links.len())
         {
             self.view.selected_detail_link = Some(index);
+            self.reveal_selected_detail_link();
+        }
+    }
+
+    /// Reveals keyboard-selected inline text, restoring its description if hidden.
+    fn reveal_selected_detail_link(&mut self) {
+        self.view.detail_link_reveal = self.view.selected_detail_link;
+        if let Some(index) = self.view.selected_detail_link
+            && let Some(details) = self.view.details.as_mut()
+            && details
+                .links
+                .get(index)
+                .is_some_and(|link| link.description_range.is_some())
+        {
+            details.expanded_wikidata_item = None;
+            self.view.selected_wikidata_media = None;
         }
     }
 
@@ -30269,6 +30302,11 @@ impl AppController {
                 }
                 DetailLinkInternalTarget::LibriVoxAuthor(author_id) => {
                     self.open_librivox_author(author_id);
+                }
+                DetailLinkInternalTarget::ArchiveCreator(value) => self
+                    .search_archive_metadata(value, crate::domain::ArchiveOrgSearchScope::Creator),
+                DetailLinkInternalTarget::ArchiveTopic(value) => {
+                    self.search_archive_metadata(value, crate::domain::ArchiveOrgSearchScope::Topic)
                 }
             }
             return;
@@ -34115,8 +34153,10 @@ impl AppController {
                 ApplePodcastsRoute::Direct => {}
             }
         } else if self.view.screen == Screen::ArchiveOrg {
-            self.archive_org_search_query
-                .clone_from(&self.view.search_query);
+            if self.archive_org_search_scope == crate::domain::ArchiveOrgSearchScope::Text {
+                self.archive_org_search_query
+                    .clone_from(&self.view.search_query);
+            }
             self.archive_org_selected = self.view.selected;
         } else if self.view.screen == Screen::LibriVox {
             self.librivox_search_query
@@ -34195,6 +34235,7 @@ impl AppController {
             bandcamp_search_text: self.bandcamp_search_query.clone(),
             apple_podcasts_search_text: self.apple_podcasts_search_query.clone(),
             archive_org_search_text: self.archive_org_search_query.clone(),
+            archive_org_search_scope: self.archive_org_search_scope,
             librivox_search_text: self.librivox_search_query.clone(),
             local_path: (!self.view.local_path.is_empty()).then(|| self.view.local_path.clone()),
             waveform_visible: self.view.waveform_visible,
@@ -34360,7 +34401,9 @@ impl UiController for AppController {
     }
 
     fn dispatch(&mut self, action: UiAction) {
-        if !self.view.external_opener_available && action.requires_external_opener() {
+        if !self.view.external_opener_available
+            && self.view.action_requires_external_opener(&action)
+        {
             self.view.status_line =
                 "External URL opening is unavailable on this Linux virtual console".to_owned();
             return;
@@ -34600,6 +34643,12 @@ impl UiController for AppController {
                 self.view.details_focused = true;
                 self.select_detail_link(index);
             }
+            UiAction::SearchArchiveCreator(value) => {
+                self.search_archive_metadata(value, crate::domain::ArchiveOrgSearchScope::Creator)
+            }
+            UiAction::SearchArchiveTopic(value) => {
+                self.search_archive_metadata(value, crate::domain::ArchiveOrgSearchScope::Topic)
+            }
             UiAction::ActivateDetailLink(index) => {
                 self.view.details_focused = true;
                 self.activate_detail_link(index);
@@ -34633,10 +34682,12 @@ impl UiController for AppController {
             }
             UiAction::ScrollDetails(movement) => {
                 self.view.details_text_selection = None;
+                self.view.detail_link_reveal = None;
                 self.scroll_details(movement);
             }
             UiAction::SetDetailsScroll(offset) => {
                 self.view.details_text_selection = None;
+                self.view.detail_link_reveal = None;
                 self.view.details_focused = true;
                 self.view.details_scroll = offset;
             }
@@ -81181,6 +81232,7 @@ mod tests {
                     youtube_selected_row: Some(2),
                     archive_org_selected_row: Some(17),
                     archive_org_search_text: "preserve archive query".to_owned(),
+                    archive_org_search_scope: crate::domain::ArchiveOrgSearchScope::Topic,
                     ..SessionState::default()
                 },
                 1,
@@ -81191,6 +81243,10 @@ mod tests {
         let saved = controller.store.session().unwrap().unwrap();
         assert_eq!(saved.archive_org_selected_row, Some(17));
         assert_eq!(saved.archive_org_search_text, "preserve archive query");
+        assert_eq!(
+            saved.archive_org_search_scope,
+            crate::domain::ArchiveOrgSearchScope::Topic
+        );
         assert_eq!(controller.view.screen, Screen::Search);
         assert_eq!(controller.view.search_query, "independent YouTube query");
         assert_eq!(saved.search_text, "independent YouTube query");

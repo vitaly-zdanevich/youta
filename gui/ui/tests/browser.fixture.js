@@ -175,6 +175,70 @@
 		await until(() => document.querySelectorAll('[aria-label=Details] mark').length === 0, 'cleared highlights');
 		checks.push('Clearing search highlights does not leave stale marks');
 
+		// Creator/topic values are inline internal links, not additional rail rows.
+		const metadataText = 'Creator: Vitaly Zdanevich\nTopics: space, здоровье\n\nFull item description.';
+		const inlineLink = (label, target, text = metadataText) => ({
+			prefix: '', label, url: '', wikidata_item_id: null, presentation: 'LabelOnly',
+			internal_target: target, description_range: range(text, label),
+		});
+		const linkedDetails = { ...details('Metadata navigation fixture'), description: metadataText,
+			links: [
+				{ prefix: 'Uploader: ', label: 'Uploader fixture', url: 'https://archive.org/details/@fixture',
+					wikidata_item_id: null, presentation: 'LabelOnly', internal_target: null, description_range: null },
+				inlineLink('Vitaly Zdanevich', { ArchiveCreator: 'Vitaly Zdanevich' }),
+				inlineLink('space', { ArchiveTopic: 'space' }),
+				inlineLink('здоровье', { ArchiveTopic: 'здоровье' }),
+			],
+			search_highlights: [{ field: 'Description', ranges: [range(metadataText, 'Zdanevich')] }],
+		};
+		snapshot({ details: linkedDetails, external_opener_available: false });
+		const creator = await until(() => document.querySelector('[data-detail-link="1"]'), 'inline creator link');
+		assert(document.querySelector('[aria-label=Details]').textContent.includes(metadataText), 'Inline metadata keeps the original compact text');
+		assert(document.querySelectorAll('[aria-label=Details] ul li').length === 1, 'Inline Creator and Topics do not add fixed action rows');
+		assert(creator.querySelector('mark')?.textContent === 'Zdanevich', 'Inline links retain active search highlighting');
+		await action({ SelectDetailLink: 1 }, () => creator.focus(), 'Keyboard focus selects the same global Creator link index');
+		await action({ ActivateDetailLink: 1 }, () => creator.click(), 'Creator navigation works without an external browser opener');
+		await action({ ActivateDetailLink: 2 }, () => document.querySelector('[data-detail-link="2"]').click(), 'First topic uses its own global link index');
+		await action({ ActivateDetailLink: 3 }, () => document.querySelector('[data-detail-link="3"]').click(), 'Unicode topic uses its own global link index');
+		const numericTopic = 'Topics: 1:23';
+		snapshot({ details: { ...linkedDetails, description: numericTopic, search_highlights: [],
+			links: [inlineLink('1:23', { ArchiveTopic: '1:23' }, numericTopic)],
+			timecodes: [{ ...range(numericTopic, '1:23'), seconds: 83, is_chapter: false }],
+		} });
+		await until(() => document.querySelector('[data-detail-link="0"]'), 'timestamp-shaped topic');
+		await action({ ActivateDetailLink: 0 }, () => document.querySelector('[data-detail-link="0"]').click(), 'Timestamp-shaped topic navigates instead of seeking');
+		const longText = metadataText + '\n' + 'Description line\n'.repeat(120) + 'distant topic';
+		snapshot({ details: { ...linkedDetails, description: longText, links: [...linkedDetails.links,
+			inlineLink('distant topic', { ArchiveTopic: 'distant topic' }, longText),
+		] }, selected_detail_link: 4, detail_link_reveal: 4 });
+		await until(() => {
+			const bounds = document.querySelector('[data-detail-link="4"]')?.getBoundingClientRect();
+			const panel = document.querySelector('[aria-label=Details]').getBoundingClientRect();
+			return bounds && bounds.top >= panel.top && bounds.bottom <= panel.bottom;
+		}, 'keyboard reveals distant inline link');
+		checks.push('Keyboard selection reveals an offscreen inline value');
+		snapshot({ detail_link_reveal: null });
+		await until(() => !failures.length, 'reveal cleared');
+		const detailPanel = document.querySelector('[aria-label=Details]');
+		detailPanel.scrollTop = 0;
+		await new Promise((resolve) => setTimeout(resolve, 60));
+		assert(detailPanel.scrollTop === 0, 'Manual scrolling is not trapped by selected inline metadata');
+
+		// Existing provider markers keep their direct internal actions: indexed
+		// external-link capability checks must not make them require a browser.
+		for (const [target, expected] of [
+			[{ YandexMusicArtist: 'artist-fixture' }, { OpenYandexMusicArtistById: 'artist-fixture' }],
+			[{ YandexMusicAlbum: 'album-fixture' }, { OpenYandexMusicAlbumById: 'album-fixture' }],
+		]) {
+			const label = `Provider fixture ${Object.keys(target)[0]}`;
+			snapshot({ details: { ...details('Existing provider navigation'), links: [{
+				prefix: '', label, url: 'https://music.yandex.ru/fixture',
+				wikidata_item_id: null, presentation: 'LabelOnly', internal_target: target, description_range: null,
+			}] }, external_opener_available: false });
+			await until(() => document.querySelector('[title="Open inside Youta"]')?.closest('li').textContent.includes(label), 'existing provider marker');
+			await action(expected, () => document.querySelector('[title="Open inside Youta"]').click(), 'Existing provider marker retains its browser-independent action');
+		}
+
 		// Upload responses are manually emitted: no reducer or service is faked by
 		// inferring transitions from labels or turning a click into a real upload.
 		const youtubeId = { source: 'you-tube', external_id: 'dQw4w9WgXcQ' };
