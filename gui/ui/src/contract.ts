@@ -121,6 +121,13 @@ export interface DetailLinkView {
 	description_range: DetailHighlightRange | null;
 }
 
+/** Display-only URL grapheme replacing exact bytes of the unchanged description. */
+export interface DetailUrlEscapeView {
+	start_byte: number;
+	end_byte: number;
+	text: string;
+}
+
 /**
  * A timecode found inside an untrusted description.
  *
@@ -193,6 +200,7 @@ export interface DetailHighlightView {
  */
 export interface DetailView {
 	search_highlights: DetailHighlightView[];
+	description_url_escapes: DetailUrlEscapeView[];
   media_id: MediaId | null;
   title: string;
   source: string;

@@ -23,6 +23,7 @@ pub(super) struct ArchiveOrgState {
     active: Option<Arc<ArchiveOrgItemDetails>>,
     cache: VecDeque<(String, Result<Arc<ArchiveOrgItemDetails>, String>)>,
     search_highlighter: super::archive_org_highlight::ArchiveSearchHighlighter,
+    description_urls: ArchiveDescriptionUrlCache,
     /// Owns the displayed result set; persisted editor drafts may change separately.
     submitted_query: String,
     /// Metadata field owning the displayed results and their continuations.
@@ -39,6 +40,36 @@ pub(super) struct ArchiveOrgState {
     message: String,
     history: VecDeque<history::ArchiveLocation>,
     restoring: Option<history::ArchiveLocation>,
+}
+
+/// Retains only the current description projection, independently of its search query.
+#[derive(Default)]
+struct ArchiveDescriptionUrlCache {
+    source: String,
+    escapes: Vec<crate::view::DetailUrlEscapeView>,
+    #[cfg(test)]
+    scans: usize,
+}
+
+impl ArchiveDescriptionUrlCache {
+    /// Produces display-only mappings without changing authoritative description bytes.
+    fn apply(&mut self, details: &mut DetailView) {
+        if details.description.len() > crate::links::MAX_URL_DISPLAY_SOURCE_BYTES {
+            self.source.clear();
+            self.escapes.clear();
+            details.description_url_escapes.clear();
+            return;
+        }
+        if self.source != details.description {
+            self.source.clone_from(&details.description);
+            self.escapes = crate::links::description_url_escapes(&details.description);
+            #[cfg(test)]
+            {
+                self.scans += 1;
+            }
+        }
+        details.description_url_escapes.clone_from(&self.escapes);
+    }
 }
 
 /// Manual download ownership is independent of the selected tab, item or row.
@@ -670,6 +701,7 @@ impl AppController {
         }
         // Passive metadata enrichment must not close the same item's artwork modal.
         preserve_thumbnail_expansion(self.view.details.as_ref(), &mut detail);
+        self.archive_org.description_urls.apply(&mut detail);
         self.archive_org
             .search_highlighter
             .apply(&self.archive_org.submitted_query, &mut detail);
@@ -1150,6 +1182,81 @@ fn append_searchable_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// URL readability is a cached display projection, never a rewrite of full metadata.
+    #[test]
+    fn archive_url_display_preserves_full_description_and_reuses_projection() {
+        let (_temporary, mut app) = lookup_controller();
+        app.view.screen = Screen::ArchiveOrg;
+        let mut details = (*lookup_details("fixture")).clone();
+        let raw = format!(
+            "{} https://commons.wikimedia.org/wiki/File:%C4%90_%D0%AF.png END",
+            "x".repeat(60_000)
+        );
+        details.item.description = Some(raw.clone());
+        app.archive_org.active = Some(Arc::new(details));
+        app.populate_archive_org();
+        let projected = app.view.details.as_ref().unwrap();
+        assert!(projected.description.ends_with(&raw));
+        assert!(!projected.description_url_escapes.is_empty());
+        assert!(
+            projected
+                .description_url_escapes
+                .iter()
+                .any(|escape| escape.text == "Đ")
+        );
+        assert!(
+            projected
+                .description_url_escapes
+                .iter()
+                .any(|escape| escape.text == "Я")
+        );
+        let escapes = projected.description_url_escapes.clone();
+        assert_eq!(app.archive_org.description_urls.scans, 1);
+        app.update_archive_org_detail();
+        app.archive_org.submitted_query = "changed highlight query".into();
+        app.update_archive_org_detail();
+        assert_eq!(app.archive_org.description_urls.scans, 1);
+        assert_eq!(
+            app.view.details.as_ref().unwrap().description_url_escapes,
+            escapes
+        );
+        Arc::make_mut(app.archive_org.active.as_mut().unwrap())
+            .item
+            .description = Some("No encoded links now".into());
+        app.update_archive_org_detail();
+        assert_eq!(app.archive_org.description_urls.scans, 2);
+        assert!(
+            app.view
+                .details
+                .as_ref()
+                .unwrap()
+                .description_url_escapes
+                .is_empty()
+        );
+    }
+
+    /// Oversized projections fall back to the complete raw field without a retained copy.
+    #[test]
+    fn archive_url_display_cache_bounds_do_not_truncate_metadata() {
+        let mut cache = ArchiveDescriptionUrlCache::default();
+        let mut details = DetailView {
+            description: "https://e.t/%D0%AF".into(),
+            ..DetailView::default()
+        };
+        cache.apply(&mut details);
+        assert_eq!(cache.scans, 1);
+        assert!(!details.description_url_escapes.is_empty());
+        details.description = "x".repeat(crate::links::MAX_URL_DISPLAY_SOURCE_BYTES + 1);
+        details.description.push_str(" https://e.t/%D0%AF END");
+        let original = details.description.clone();
+        cache.apply(&mut details);
+        assert_eq!(details.description, original);
+        assert!(details.description_url_escapes.is_empty());
+        assert!(cache.source.is_empty());
+        assert!(cache.escapes.is_empty());
+        assert_eq!(cache.scans, 1);
+    }
 
     /// Only the validated public profile URL supplies a search identity.
     #[test]

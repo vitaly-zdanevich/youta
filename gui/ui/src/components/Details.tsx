@@ -534,6 +534,7 @@ export function Details({ view, kind }: { view: ViewModel; kind: InformationPane
 
       <Description
         text={details.description}
+				urlEscapes={details.description_url_escapes}
         timecodes={details.timecodes}
         videoLinks={details.video_links}
         mediaId={details.media_id}

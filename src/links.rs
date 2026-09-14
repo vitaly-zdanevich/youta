@@ -214,6 +214,179 @@ pub fn parse_description_video_links(description: &str) -> Vec<DescriptionVideoL
         .collect()
 }
 
+/// Maps readable URL graphemes to their unchanged source bytes for display only.
+///
+/// Only printable, percent-encoded non-ASCII UTF-8 outside the authority is
+/// decoded, exactly once. ASCII escapes retain their delimiter/whitespace
+/// spelling. Opening, copying, and action parsing use the original text.
+/// Fields above 256 KiB or more than 4,096 replacements fall back completely to
+/// their original display; individual URLs above 16 KiB remain unchanged.
+#[cfg(feature = "controller")]
+#[must_use]
+pub fn description_url_escapes(description: &str) -> Vec<crate::view::DetailUrlEscapeView> {
+    if description.len() > MAX_URL_DISPLAY_SOURCE_BYTES {
+        return Vec::new();
+    }
+    let mut replacements = Vec::new();
+    for (start, end) in description_url_ranges(description) {
+        let raw = &description[start..end];
+        if raw.len() > 16 * 1024 || !raw.contains('%') {
+            continue;
+        }
+        if append_url_escapes(raw, start, &mut replacements).is_none() {
+            return Vec::new();
+        }
+    }
+    replacements
+}
+
+/// Caps both display scanning and a caller's optional copy of the current source.
+#[cfg(feature = "controller")]
+pub(crate) const MAX_URL_DISPLAY_SOURCE_BYTES: usize = 256 * 1024;
+
+/// Builds grapheme mappings from a bounded URL, retaining exact source boundaries.
+#[cfg(feature = "controller")]
+fn append_url_escapes(
+    raw: &str,
+    source_offset: usize,
+    replacements: &mut Vec<crate::view::DetailUrlEscapeView>,
+) -> Option<()> {
+    use unicode_segmentation::UnicodeSegmentation;
+
+    let Some(prefix) = raw
+        .strip_prefix("https://")
+        .or_else(|| raw.strip_prefix("http://"))
+    else {
+        return Some(());
+    };
+    if Url::parse(raw)
+        .ok()
+        .is_none_or(|url| url.host_str().is_none())
+    {
+        return Some(());
+    }
+    // Percent syntax is validated before decoding any part, including malformed
+    // sequences which Url accepts without repairing. Invalid UTF-8 runs stay raw.
+    let bytes = raw.as_bytes();
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        if bytes[cursor] == b'%' {
+            if bytes
+                .get(cursor + 1..cursor + 3)
+                .is_none_or(|pair| !pair.iter().all(u8::is_ascii_hexdigit))
+            {
+                return Some(());
+            }
+            cursor += 3;
+        } else {
+            cursor += 1;
+        }
+    }
+    let authority_end =
+        raw.len() - prefix.len() + prefix.find(['/', '?', '#']).unwrap_or(prefix.len());
+    let mut display = String::with_capacity(raw.len());
+    let mut boundaries = vec![(0, 0)];
+    append_literal_url_text(&raw[..authority_end], 0, &mut display, &mut boundaries);
+    cursor = authority_end;
+    while cursor < raw.len() {
+        if bytes[cursor] != b'%' {
+            let character = raw[cursor..].chars().next()?;
+            let end = cursor + character.len_utf8();
+            append_literal_url_text(&raw[cursor..end], cursor, &mut display, &mut boundaries);
+            cursor = end;
+            continue;
+        }
+        let mut end = cursor;
+        while bytes.get(end) == Some(&b'%') {
+            end += 3;
+        }
+        let decoded = percent_encoding::percent_decode_str(&raw[cursor..end]).decode_utf8();
+        if let Ok(decoded) = decoded {
+            for character in decoded.chars() {
+                let encoded_end = cursor + character.len_utf8() * 3;
+                if readable_url_character(character) {
+                    display.push(character);
+                    boundaries.push((display.len(), encoded_end));
+                } else {
+                    append_literal_url_text(
+                        &raw[cursor..encoded_end],
+                        cursor,
+                        &mut display,
+                        &mut boundaries,
+                    );
+                }
+                cursor = encoded_end;
+            }
+        } else {
+            append_literal_url_text(&raw[cursor..end], cursor, &mut display, &mut boundaries);
+        }
+        cursor = end;
+    }
+    for (start, grapheme) in display.grapheme_indices(true) {
+        let end = start + grapheme.len();
+        let original_start = boundaries[boundaries
+            .binary_search_by_key(&start, |&(byte, _)| byte)
+            .ok()?]
+        .1;
+        let original_end = boundaries[boundaries
+            .binary_search_by_key(&end, |&(byte, _)| byte)
+            .ok()?]
+        .1;
+        if original_start < authority_end || grapheme == &raw[original_start..original_end] {
+            continue;
+        }
+        // A combining mark must not decorate a reserved escape's trailing hex
+        // digit, disguising its spelling. Keep that entire grapheme unchanged.
+        if (original_start >= 1 && bytes[original_start - 1] == b'%')
+            || (original_start >= 2 && bytes[original_start - 2] == b'%')
+        {
+            continue;
+        }
+        if replacements.len() == 4_096 {
+            return None;
+        }
+        replacements.push(crate::view::DetailUrlEscapeView {
+            start_byte: source_offset + original_start,
+            end_byte: source_offset + original_end,
+            text: grapheme.to_owned(),
+        });
+    }
+    Some(())
+}
+
+/// Copies literal URL characters while recording their original UTF-8 endpoints.
+#[cfg(feature = "controller")]
+fn append_literal_url_text(
+    text: &str,
+    offset: usize,
+    display: &mut String,
+    boundaries: &mut Vec<(usize, usize)>,
+) {
+    for (start, character) in text.char_indices() {
+        display.push(character);
+        boundaries.push((display.len(), offset + start + character.len_utf8()));
+    }
+}
+
+/// Excludes invisible controls, directional formatting, and all encoded ASCII.
+/// Format ranges follow the Unicode 17.0 character database (`General_Category=Cf`):
+/// <https://www.unicode.org/Public/17.0.0/ucd/extracted/DerivedGeneralCategory.txt>.
+#[cfg(feature = "controller")]
+fn readable_url_character(character: char) -> bool {
+    !character.is_ascii()
+        && !character.is_control()
+        && !character.is_whitespace()
+        && !matches!(character,
+            '\u{ad}' | '\u{600}'..='\u{605}' | '\u{61c}' | '\u{6dd}' | '\u{70f}'
+            | '\u{890}'..='\u{891}' | '\u{8e2}' | '\u{180e}' | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{206f}'
+            | '\u{feff}' | '\u{fff9}'..='\u{fffb}' | '\u{fdd0}'..='\u{fdef}'
+            | '\u{110bd}' | '\u{110cd}' | '\u{13430}'..='\u{1343f}'
+            | '\u{1bca0}'..='\u{1bca3}' | '\u{1d173}'..='\u{1d17a}'
+            | '\u{e0001}' | '\u{e0020}'..='\u{e007f}')
+        && (u32::from(character) & 0xffff) < 0xfffe
+}
+
 /// Infers ordered chapters from line-leading timecodes in a description.
 ///
 /// A timecode may be indented with whitespace or preceded by one common list
@@ -439,49 +612,57 @@ pub fn parse_youtube_url(url: &Url) -> Option<LinkTarget> {
 }
 
 fn parse_url_links(description: &str) -> Vec<DescriptionLink> {
-    let mut links = Vec::new();
-    let mut index = 0;
-    while index < description.len() {
-        let Some(character) = description[index..].chars().next() else {
-            break;
-        };
-        let prefix = url_prefix(&description[index..]);
-        if prefix.is_none() || !is_url_start_boundary(description, index) {
-            index += character.len_utf8();
-            continue;
-        }
-
-        let mut end = description.len();
-        for (offset, candidate) in description[index..].char_indices() {
-            if offset > 0 && is_url_terminator(candidate) {
-                end = index + offset;
-                break;
-            }
-        }
-        end = trim_url_end(description, index, end);
-        if end <= index {
-            index += character.len_utf8();
-            continue;
-        }
-
-        let raw = &description[index..end];
-        let normalized = if raw.starts_with("http://") || raw.starts_with("https://") {
-            raw.to_owned()
-        } else {
-            format!("https://{raw}")
-        };
-        if let Ok(url) = Url::parse(&normalized)
-            && let Some(target) = parse_youtube_url(&url)
-        {
-            links.push(DescriptionLink {
-                start_byte: index,
-                end_byte: end,
+    description_url_ranges(description)
+        .filter_map(|(start_byte, end_byte)| {
+            let raw = &description[start_byte..end_byte];
+            let normalized = if raw.starts_with("http://") || raw.starts_with("https://") {
+                raw.to_owned()
+            } else {
+                format!("https://{raw}")
+            };
+            let target = parse_youtube_url(&Url::parse(&normalized).ok()?)?;
+            Some(DescriptionLink {
+                start_byte,
+                end_byte,
                 target,
-            });
+            })
+        })
+        .collect()
+}
+
+/// Shares existing URL boundaries between navigation and display-only decoding.
+fn description_url_ranges(description: &str) -> impl Iterator<Item = (usize, usize)> + '_ {
+    let mut index = 0;
+    std::iter::from_fn(move || {
+        while index < description.len() {
+            let Some(character) = description[index..].chars().next() else {
+                return None;
+            };
+            let prefix = url_prefix(&description[index..]);
+            if prefix.is_none() || !is_url_start_boundary(description, index) {
+                index += character.len_utf8();
+                continue;
+            }
+
+            let mut end = description.len();
+            for (offset, candidate) in description[index..].char_indices() {
+                if offset > 0 && is_url_terminator(candidate) {
+                    end = index + offset;
+                    break;
+                }
+            }
+            end = trim_url_end(description, index, end);
+            if end <= index {
+                index += character.len_utf8();
+                continue;
+            }
+
+            let start = index;
+            index = end.max(index + character.len_utf8());
+            return Some((start, end));
         }
-        index = end.max(index + character.len_utf8());
-    }
-    links
+        None
+    })
 }
 
 fn url_prefix(value: &str) -> Option<&'static str> {
@@ -731,6 +912,172 @@ fn hashtag_target(tag: &str) -> Option<LinkTarget> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Applies display replacements without mutating the original source fixture.
+    #[cfg(feature = "controller")]
+    fn readable_urls(source: &str) -> String {
+        let mut output = String::new();
+        let mut cursor = 0;
+        for escape in description_url_escapes(source) {
+            assert!(cursor <= escape.start_byte && escape.start_byte < escape.end_byte);
+            output.push_str(&source[cursor..escape.start_byte]);
+            output.push_str(&escape.text);
+            cursor = escape.end_byte;
+        }
+        output.push_str(&source[cursor..]);
+        output
+    }
+
+    /// Unicode labels do not shift existing timecode/video action coordinates.
+    #[cfg(feature = "controller")]
+    #[test]
+    fn url_display_decodes_cyrillic_without_changing_source_or_actions() {
+        let source = "🎵 Живая https://commons.wikimedia.org/wiki/File:%D0%91%D0%B5%D1%82%D0%BE%D0%BD.jpg 1:23 https://youtu.be/dQw4w9WgXcQ?t=2m";
+        let original = source.to_owned();
+        let actions = parse_description_links(source);
+        assert_eq!(
+            readable_urls(source),
+            "🎵 Живая https://commons.wikimedia.org/wiki/File:Бетон.jpg 1:23 https://youtu.be/dQw4w9WgXcQ?t=2m"
+        );
+        assert_eq!(source, original);
+        assert_eq!(parse_description_links(source), actions);
+        for escape in description_url_escapes(source) {
+            assert!(source.is_char_boundary(escape.start_byte));
+            assert!(source.is_char_boundary(escape.end_byte));
+            assert!(source[escape.start_byte..escape.end_byte].starts_with('%'));
+        }
+    }
+
+    /// Encoded combining marks and literal bases remain one mapped grapheme.
+    #[cfg(feature = "controller")]
+    #[test]
+    fn url_display_replacements_include_adjacent_grapheme_bases() {
+        let source = "https://example.test/e%CC%81/%D0%95%CC%88/%F0%9F%8E%B5";
+        let escapes = description_url_escapes(source);
+        assert_eq!(escapes.len(), 3);
+        assert_eq!(
+            &source[escapes[0].start_byte..escapes[0].end_byte],
+            "e%CC%81"
+        );
+        assert_eq!(escapes[0].text, "e\u{301}");
+        assert_eq!(escapes[1].text, "Е\u{308}");
+        assert_eq!(escapes[2].text, "🎵");
+        assert_eq!(
+            readable_urls("https://example.test/%2F%CC%81"),
+            "https://example.test/%2F%CC%81"
+        );
+    }
+
+    /// Delimiters, unsafe text, malformed UTF-8, and repeated escaping stay literal.
+    #[cfg(feature = "controller")]
+    #[test]
+    fn url_display_preserves_reserved_controls_bidi_and_invalid_encodings() {
+        for escaped in [
+            "%2F",
+            "%3F",
+            "%23",
+            "%25",
+            "%20",
+            "%2B",
+            "%3A",
+            "%40",
+            "%00",
+            "%09",
+            "%0A",
+            "%0D",
+            "%1B",
+            "%7F",
+            "%C2%85",
+            "%E2%80%AE",
+            "%E2%80%8E",
+            "%E2%81%A6",
+            "%EF%BB%BF",
+            "%E2%80%8B",
+            "%C2%AD",
+            "%E2%80%A8",
+            "%E2%80%A9",
+            "%FF",
+            "%D0%9F%FF",
+            "%D0%9F%G0",
+            "%C0%AF",
+            "%ED%A0%80",
+            "%G0",
+            "%",
+            "%D0",
+            "%25D0%2591",
+        ] {
+            let source = format!("https://example.test/{escaped}");
+            assert_eq!(
+                readable_urls(&source),
+                source,
+                "unsafe or ambiguous: {escaped}"
+            );
+        }
+    }
+
+    /// Unicode format controls are not covered by Rust's C0/C1 control predicate.
+    #[cfg(feature = "controller")]
+    #[test]
+    fn url_display_keeps_supplementary_and_script_format_controls_encoded() {
+        for character in [
+            '\u{e0001}',
+            '\u{e0061}',
+            '\u{1d173}',
+            '\u{1bca0}',
+            '\u{13430}',
+            '\u{110bd}',
+            '\u{110cd}',
+            '\u{600}',
+            '\u{6dd}',
+            '\u{70f}',
+            '\u{890}',
+            '\u{8e2}',
+        ] {
+            let encoded: String = character
+                .to_string()
+                .bytes()
+                .map(|byte| format!("%{byte:02X}"))
+                .collect();
+            let source = format!("https://example.test/{encoded}");
+            assert_eq!(
+                readable_urls(&source),
+                source,
+                "format U+{:04X}",
+                u32::from(character)
+            );
+        }
+    }
+
+    /// Authority spelling and non-URL provider text are never rewritten.
+    #[cfg(feature = "controller")]
+    #[test]
+    fn url_display_preserves_authority_and_ignores_non_urls() {
+        let source = "https://%65xample.test/%D0%91?q=%D0%91%2F#%D0%91";
+        assert_eq!(readable_urls(source), "https://%65xample.test/Б?q=Б%2F#Б");
+        for source in [
+            "plain %D0%91 text",
+            "ftp://example.test/%D0%91",
+            "xhttps://example.test/%D0%91",
+        ] {
+            assert_eq!(readable_urls(source), source);
+        }
+    }
+
+    /// Rendering bounds fall back to exact source text, never a clipped label.
+    #[cfg(feature = "controller")]
+    #[test]
+    fn url_display_bounds_fall_back_without_truncating_source() {
+        let oversized_field = format!("{} https://example.test/%D0%91", "x".repeat(256 * 1024));
+        assert!(description_url_escapes(&oversized_field).is_empty());
+        let oversized_url = format!("https://example.test/{}%D0%91", "x".repeat(16 * 1024));
+        assert!(description_url_escapes(&oversized_url).is_empty());
+        let excessive_replacements = "https://example.test/%C3%A9 ".repeat(4_097);
+        assert!(description_url_escapes(&excessive_replacements).is_empty());
+        assert_eq!(
+            description_url_escapes(&"https://example.test/%C3%A9 ".repeat(4_096)).len(),
+            4_096
+        );
+    }
 
     #[test]
     fn mixed_description_produces_ordered_non_overlapping_targets() {

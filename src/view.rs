@@ -780,6 +780,8 @@ pub struct DetailView {
     pub length: String,
     /// Description text.
     pub description: String,
+    /// Display-only URL graphemes; offsets and copied text retain the raw description.
+    pub description_url_escapes: Vec<DetailUrlEscapeView>,
     /// Literal submitted-search matches; ranges refer to unchanged field text.
     pub search_highlights: Vec<DetailHighlightView>,
     /// Crowdsourced anti-clickbait title displayed alongside the original title.
@@ -1352,6 +1354,17 @@ pub struct DetailVideoLinkView {
     pub video_id: String,
     /// Optional initial position encoded in the URL.
     pub start_seconds: Option<u64>,
+}
+
+/// A display-only URL grapheme mapped to its unchanged encoded source bytes.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct DetailUrlEscapeView {
+    /// Inclusive byte boundary in the unchanged description.
+    pub start_byte: usize,
+    /// Exclusive byte boundary in the unchanged description.
+    pub end_byte: usize,
+    /// One readable grapheme replacing the encoded source only for display.
+    pub text: String,
 }
 
 /// One original-text byte range styled as an active search match.

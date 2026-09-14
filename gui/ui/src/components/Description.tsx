@@ -4,6 +4,7 @@ import type {
   DetailLinkView,
   DetailTimecodeView,
   DetailVideoLinkView,
+  DetailUrlEscapeView,
   DetailWikidataEntityView,
   MediaId,
 } from "../contract";
@@ -11,6 +12,8 @@ import { formatSeconds } from "../format";
 import { dispatch } from "../ipc";
 import { annotate } from "../spans";
 import { SearchHighlight } from './SearchHighlight';
+import { DescriptionText } from './DescriptionText';
+import { copyOriginalDescriptionUrls } from '../urlSelection';
 
 /**
  * A description span, tagged so one pass can render each kind.
@@ -40,6 +43,7 @@ export function Description({
 	links = [],
 	selectedLink = null,
 	revealLink = null,
+	urlEscapes = [],
 }: {
   text: string;
   timecodes: DetailTimecodeView[];
@@ -49,6 +53,7 @@ export function Description({
 	links?: readonly DetailLinkView[];
 	selectedLink?: number | null;
 	revealLink?: number | null;
+	urlEscapes?: readonly DetailUrlEscapeView[];
 }) {
 	const container = useRef<HTMLDivElement>(null);
 	// Reveal only an explicit controller request, not every selected-link redraw.
@@ -58,6 +63,13 @@ export function Description({
 		container.current?.querySelector(`[data-detail-link="${revealLink}"]`)
 			?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
 	}, [revealLink, links]);
+	useEffect(() => {
+		const onCopy = (event: ClipboardEvent) => {
+			if (container.current) copyOriginalDescriptionUrls(container.current, event);
+		};
+		document.addEventListener('copy', onCopy);
+		return () => document.removeEventListener('copy', onCopy);
+	}, []);
 
   if (text === "") {
     return null;
@@ -81,7 +93,7 @@ export function Description({
   ];
 
   return (
-    <div ref={container} className="mt-3 border-t border-line pt-[10px] text-xs leading-relaxed whitespace-pre-wrap text-ink-dim">
+    <div ref={container} data-description className="mt-3 border-t border-line pt-[10px] text-xs leading-relaxed whitespace-pre-wrap text-ink-dim">
       {annotate(text, spans, (span, covered, key) => {
 				if (span.kind === 'detail') {
 					return <button
@@ -94,7 +106,7 @@ export function Description({
 						className={`rounded-[3px] text-left underline decoration-dotted underline-offset-2 hover:text-accent focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-accent ${
 							selectedLink === span.index ? 'text-accent' : 'text-ink'
 						}`}
-					><SearchHighlight text={covered} ranges={highlights} offset={span.start_byte} /></button>;
+					><DescriptionText text={covered} highlights={highlights} escapes={urlEscapes} offset={span.start_byte} /></button>;
 				}
         if (span.kind === "timecode") {
           return (
@@ -120,7 +132,7 @@ export function Description({
         }
         return (
           <span key={key}>
-            <span className="text-ink-faint"><SearchHighlight text={covered} ranges={highlights} offset={span.start_byte} /></span>
+            <span className="text-ink-faint"><DescriptionText text={covered} highlights={highlights} escapes={urlEscapes} offset={span.start_byte} /></span>
             <button
               type="button"
               title="Open this video in Youta"
@@ -138,7 +150,7 @@ export function Description({
             </button>
           </span>
         );
-			}, (plain, start) => <SearchHighlight key={`plain-${start}`} text={plain} ranges={highlights} offset={start} />)}
+			}, (plain, start) => <DescriptionText key={`plain-${start}`} text={plain} highlights={highlights} escapes={urlEscapes} offset={start} />)}
     </div>
   );
 }

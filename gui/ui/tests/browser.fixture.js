@@ -319,6 +319,77 @@
 		await until(() => button(uploaderUrl) && !button(uploaderUrl).disabled, 'enabled uploader profile URL');
 		await action('OpenChannelInBrowser', () => button(uploaderUrl).click(), 'Uploader URL opens its original public profile separately');
 
+		// Readable URL labels retain original UTF-8 positions and copy payloads.
+		const encodedUrl = 'https://commons.wikimedia.org/wiki/File:%D0%9F%D1%80.opus?literal=%2F';
+		const encodedDescription = `📚 Умываю руки здесь!\n${encodedUrl}\n1:23 More audio\nTopics: space`;
+		const readableDescription = encodedDescription.replace('%D0%9F%D1%80', 'Пр');
+		const escapedDetails = { ...details('Encoded URL fixture'), description: encodedDescription,
+			description_url_escapes: [
+				{ ...range(encodedDescription, '%D0%9F'), text: 'П' },
+				{ ...range(encodedDescription, '%D1%80'), text: 'р' },
+			],
+			search_highlights: [{ field: 'Description', ranges: [range(encodedDescription, '%D0%9F%D1%80')] }],
+			timecodes: [{ ...range(encodedDescription, '1:23'), seconds: 83, is_chapter: false }],
+			links: [inlineLink('space', { ArchiveTopic: 'space' }, encodedDescription)],
+		};
+		snapshot({ details: escapedDetails, detail_link_reveal: null });
+		const readable = await until(() => document.querySelector('[data-description]')?.textContent === readableDescription
+			&& document.querySelector('[data-description]'), 'readable URL description');
+		assert(readable.querySelectorAll('[data-url-escape-original]').length === 2, 'Display uses mapped Unicode URL characters without altering other escapes');
+		assert([...readable.querySelectorAll('mark')].map((node) => node.textContent).join('') === 'Пр', 'Original byte-range highlights follow the decoded URL characters');
+		await action({ ActivateTimecode: { media_id: mediaId, seconds: 83 } }, () => button('1:23', readable).click(), 'Timecode after a decoded URL retains its original seek target');
+		await action({ ActivateDetailLink: 0 }, () => button('space', readable).click(), 'Topic after a decoded URL retains its global link index');
+		const selection = document.getSelection();
+		const selectedRange = document.createRange();
+		selectedRange.selectNodeContents(readable);
+		selection.removeAllRanges();
+		selection.addRange(selectedRange);
+		const clipboard = {};
+		const copy = new Event('copy', { bubbles: true, cancelable: true });
+		Object.defineProperty(copy, 'clipboardData', { value: { setData: (type, value) => { clipboard[type] = value; } } });
+		document.dispatchEvent(copy);
+		assert(copy.defaultPrevented && clipboard['text/plain'] === encodedDescription, 'Copying the readable description preserves the exact original encoded URLs');
+		const descriptionTitle = [...document.querySelectorAll('h2')].find((node) => node.textContent === escapedDetails.title);
+		selectedRange.setStartBefore(descriptionTitle);
+		selectedRange.setEnd(readable, readable.childNodes.length);
+		selection.removeAllRanges();
+		selection.addRange(selectedRange);
+		const crossCopy = new Event('copy', { bubbles: true, cancelable: true });
+		Object.defineProperty(crossCopy, 'clipboardData', { value: { setData: (type, value) => { clipboard[type] = value; } } });
+		document.dispatchEvent(crossCopy);
+		assert(crossCopy.defaultPrevented && clipboard['text/plain'].startsWith(escapedDetails.title)
+			&& clipboard['text/plain'].endsWith(encodedDescription), 'Selection spanning the title and description also preserves original URL bytes');
+		selectedRange.selectNodeContents(descriptionTitle);
+		selection.removeAllRanges();
+		selection.addRange(selectedRange);
+		const outsideCopy = new Event('copy', { bubbles: true, cancelable: true });
+		Object.defineProperty(outsideCopy, 'clipboardData', { value: { setData: () => { throw new Error('Outside selection copy overridden'); } } });
+		document.dispatchEvent(outsideCopy);
+		assert(!outsideCopy.defaultPrevented, 'Selection outside the description retains native clipboard handling');
+		const decodedCharacter = readable.querySelector('[data-url-escape-original]');
+		selectedRange.selectNodeContents(decodedCharacter);
+		selection.removeAllRanges();
+		selection.addRange(selectedRange);
+		const partialCopy = new Event('copy', { bubbles: true, cancelable: true });
+		Object.defineProperty(partialCopy, 'clipboardData', { value: { setData: (type, value) => { clipboard[type] = value; } } });
+		document.dispatchEvent(partialCopy);
+		assert(clipboard['text/plain'] === '%D0%9F', 'Copying a single decoded character restores its complete encoded byte sequence');
+		const editor = document.createElement('input');
+		document.body.append(editor);
+		const editorCopy = new Event('copy', { bubbles: true, cancelable: true });
+		Object.defineProperty(editorCopy, 'clipboardData', { value: { setData: () => { throw new Error('Description intercepted editor copy'); } } });
+		editor.dispatchEvent(editorCopy);
+		assert(!editorCopy.defaultPrevented, 'Editing fields keep their native copy behavior despite an old description selection');
+		editor.remove();
+		selectedRange.selectNodeContents(button('space', readable));
+		selection.removeAllRanges();
+		selection.addRange(selectedRange);
+		const plainCopy = new Event('copy', { bubbles: true, cancelable: true });
+		Object.defineProperty(plainCopy, 'clipboardData', { value: { setData: () => { throw new Error('Unchanged text copy overridden'); } } });
+		document.dispatchEvent(plainCopy);
+		assert(!plainCopy.defaultPrevented, 'Unchanged description selections retain native clipboard handling');
+		selection.removeAllRanges();
+
 		// Upload responses are manually emitted: no reducer or service is faked by
 		// inferring transitions from labels or turning a click into a real upload.
 		const youtubeId = { source: 'you-tube', external_id: 'dQw4w9WgXcQ' };

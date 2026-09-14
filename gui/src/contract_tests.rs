@@ -40,12 +40,13 @@ use youta::view::EvernoteNotePopupView;
 use youta::view::{ArchiveCredentialsPopupView, ArchiveUploadPopupView};
 use youta::view::{
     AudioQualityPopupView, DetailHighlightField, DetailHighlightRange, DetailHighlightView,
-    DetailLinkView, DetailTimecodeView, DetailVideoLinkView, DetailView, DetailWikidataEntityView,
-    DownloadChoicePopupView, DownloadView, ErrorPopupView, GitHubIssueSubmissionView,
-    LocalMoveDestinationView, NowPlayingView, PlaylistChoiceView, PlaylistPopupView,
-    PreferencesPopupView, ProjectCommitView, ProjectHistoryPopupView, QueuePopupView, QueueRowView,
-    RowView, SubscriptionsView, VideoCommentView, VideoCommentsPopupView, VideoSummaryPopupView,
-    ViewModel, WaveformView, YtDlpForbiddenView, YtDlpGentooVersionView, YtDlpVersionLookupView,
+    DetailLinkView, DetailTimecodeView, DetailUrlEscapeView, DetailVideoLinkView, DetailView,
+    DetailWikidataEntityView, DownloadChoicePopupView, DownloadView, ErrorPopupView,
+    GitHubIssueSubmissionView, LocalMoveDestinationView, NowPlayingView, PlaylistChoiceView,
+    PlaylistPopupView, PreferencesPopupView, ProjectCommitView, ProjectHistoryPopupView,
+    QueuePopupView, QueueRowView, RowView, SubscriptionsView, VideoCommentView,
+    VideoCommentsPopupView, VideoSummaryPopupView, ViewModel, WaveformView, YtDlpForbiddenView,
+    YtDlpGentooVersionView, YtDlpVersionLookupView,
 };
 use youta::view::{ChannelDownloadOption, ChannelDownloadPopupView};
 #[cfg(feature = "lan-sharing")]
@@ -460,6 +461,14 @@ fn the_typescript_contract_names_only_fields_the_reducer_emits() {
     emitted.insert("RowView", emitted_keys(&RowView::default()));
     emitted.insert("DetailLinkView", emitted_keys(&DetailLinkView::default()));
     emitted.insert(
+        "DetailUrlEscapeView",
+        emitted_keys(&DetailUrlEscapeView {
+            start_byte: 0,
+            end_byte: 6,
+            text: "П".to_owned(),
+        }),
+    );
+    emitted.insert(
         "DetailTimecodeView",
         emitted_keys(&DetailTimecodeView::default()),
     );
@@ -733,6 +742,7 @@ fn every_checked_interface_is_actually_declared() {
         "DetailView",
         "DetailHighlightRange",
         "DetailHighlightView",
+        "DetailUrlEscapeView",
         "RowView",
         "DetailLinkView",
         "DetailTimecodeView",

@@ -798,6 +798,7 @@ fn youtube_description_is_short(details: &DetailView, pane_width: u16) -> bool {
         &details.description,
         usize::from(description_width),
         &details.video_links,
+        &[],
     );
     rendered_lines.len() < SHORT_YOUTUBE_DESCRIPTION_LINE_LIMIT
 }
@@ -1870,6 +1871,10 @@ struct SelectableDetailsRow {
     x: u16,
     y: u16,
     cells: Vec<String>,
+    /// Source newlines before a mapped row; `None` retains legacy row separation.
+    source_line_breaks: Option<usize>,
+    /// Display cell ranges whose first cell owns one complete encoded grapheme.
+    source_graphemes: Vec<std::ops::Range<usize>>,
 }
 
 /// Stable owner and layout of the currently rendered information panel.
@@ -5633,6 +5638,11 @@ fn render_information_panel(
             body_source,
             usize::from(description_text_area.width.max(1)),
             if body_is_wikidata { &[] } else { &video_links },
+            if body_is_wikidata {
+                &[]
+            } else {
+                &details.description_url_escapes
+            },
         );
         let visible_lines = usize::from(description_text_area.height);
         let maximum_offset = description_lines.len().saturating_sub(visible_lines);
@@ -5668,12 +5678,17 @@ fn render_information_panel(
         let active_chapter_line = (!body_is_wikidata)
             .then(|| active_description_chapter_line(view, details))
             .flatten();
+        let mapped_description = !body_is_wikidata && !details.description_url_escapes.is_empty();
+        let mut previous_copy_source_end = None;
         for (visible_index, source_line) in visible {
             let row = description_text_area.y.saturating_add(
                 u16::try_from(visible_index).unwrap_or(description_text_area.height),
             );
             let mut spans = Vec::new();
             let mut cell_cursor = 0_u16;
+            // Physical cells remain the selection coordinates; only their copy
+            // payload changes from a readable URL glyph back to its raw bytes.
+            let mut copy_overrides: Vec<(usize, usize, &str)> = Vec::new();
             let active_line = active_chapter_line.as_ref().is_some_and(|active| {
                 source_line.start_byte < active.end && source_line.end_byte > active.start
             });
@@ -5684,6 +5699,30 @@ fn render_information_panel(
             };
             for token in &source_line.tokens {
                 match *token {
+                    WrappedDescriptionToken::UrlEscape {
+                        index,
+                        start_byte,
+                        end_byte,
+                    } => {
+                        let escape = &details.description_url_escapes[index];
+                        let width = terminal_text_width(&escape.text);
+                        copy_overrides.push((
+                            usize::from(cell_cursor),
+                            usize::from(width),
+                            &body_source[start_byte..end_byte],
+                        ));
+                        append_description_url_escape(
+                            details,
+                            escape,
+                            view.selected_detail_link,
+                            description_text_area,
+                            row,
+                            theme,
+                            hit_map,
+                            &mut spans,
+                            &mut cell_cursor,
+                        );
+                    }
                     WrappedDescriptionToken::Source {
                         start_byte,
                         end_byte,
@@ -5728,6 +5767,13 @@ fn render_information_panel(
                             continue;
                         };
                         let action_width = terminal_text_width(DESCRIPTION_VIDEO_ACTION_SYMBOL);
+                        if mapped_description {
+                            copy_overrides.push((
+                                usize::from(cell_cursor),
+                                usize::from(action_width),
+                                "",
+                            ));
+                        }
                         spans.push(Span::styled(
                             DESCRIPTION_VIDEO_ACTION_SYMBOL,
                             theme
@@ -5757,11 +5803,54 @@ fn render_information_panel(
                 Rect::new(description_text_area.x, row, description_text_area.width, 1),
             );
             if show_text_selection {
-                capture_selectable_details_row(
+                capture_selectable_details_cells(
                     frame,
                     hit_map,
-                    Rect::new(description_text_area.x, row, description_text_area.width, 1),
+                    Rect::new(
+                        description_text_area.x,
+                        row,
+                        if mapped_description {
+                            cell_cursor.min(description_text_area.width)
+                        } else {
+                            description_text_area.width
+                        },
+                        1,
+                    ),
+                    !mapped_description,
                 );
+                if let Some(captured) = hit_map
+                    .detail_text_rows
+                    .last_mut()
+                    .filter(|captured| captured.y == row)
+                {
+                    if mapped_description {
+                        captured.source_line_breaks = previous_copy_source_end.map(|end| {
+                            body_source[end..source_line.start_byte]
+                                .bytes()
+                                .filter(|byte| *byte == b'\n')
+                                .count()
+                        });
+                        previous_copy_source_end = Some(source_line.end_byte);
+                    }
+                    for (column, width, original) in copy_overrides {
+                        if width > 1 && !original.is_empty() {
+                            captured.source_graphemes.push(column..column + width);
+                        }
+                        for (offset, cell) in captured
+                            .cells
+                            .iter_mut()
+                            .skip(column)
+                            .take(width)
+                            .enumerate()
+                        {
+                            if offset == 0 {
+                                original.clone_into(cell);
+                            } else {
+                                cell.clear();
+                            }
+                        }
+                    }
+                }
             }
         }
         if description_lines.len() > visible_lines
@@ -5982,6 +6071,69 @@ fn highlighted_detail_text<'a>(
     spans
 }
 
+/// Renders one mapped URL grapheme without splitting its style or original owner.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one glyph shares the row's rendering and hit-map products"
+)]
+fn append_description_url_escape<'a>(
+    details: &DetailView,
+    escape: &'a DetailUrlEscapeView,
+    selected_link: Option<usize>,
+    area: Rect,
+    row: u16,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+    spans: &mut Vec<Span<'a>>,
+    cell_cursor: &mut u16,
+) {
+    let inline = details.links.iter().enumerate().find(|(_, link)| {
+        link.description_range.is_some_and(|range| {
+            range.start_byte <= escape.start_byte && range.end_byte >= escape.end_byte
+        })
+    });
+    let mut style = match inline {
+        Some((index, _)) if selected_link == Some(index) => theme
+            .selected
+            .add_modifier(Modifier::UNDERLINED | Modifier::REVERSED | Modifier::BOLD),
+        Some(_) => theme.accent.add_modifier(Modifier::UNDERLINED),
+        None => Style::default(),
+    };
+    if let Some(highlights) = details
+        .search_highlights
+        .iter()
+        .find(|group| group.field == DetailHighlightField::Description)
+    {
+        let first = highlights
+            .ranges
+            .partition_point(|range| range.end_byte <= escape.start_byte);
+        if highlights
+            .ranges
+            .get(first)
+            .is_some_and(|range| range.start_byte < escape.end_byte)
+        {
+            style = style.patch(
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            );
+        }
+    }
+    let width = terminal_text_width(&escape.text);
+    if let Some((index, _)) = inline {
+        let clipped = width.min(area.width.saturating_sub(*cell_cursor));
+        if clipped > 0 {
+            hit_map.detail_links.push((
+                index,
+                Rect::new(area.x.saturating_add(*cell_cursor), row, clipped, 1),
+            ));
+        }
+    }
+    spans.push(Span::styled(escape.text.as_str(), style));
+    *cell_cursor = cell_cursor.saturating_add(width);
+}
+
 /// Appends one source-text token while retaining clickable timecode spans.
 #[allow(
     clippy::too_many_arguments,
@@ -6195,15 +6347,26 @@ fn active_description_chapter_line(
 
 /// Records only non-padding cells from one explicitly selectable text row.
 fn capture_selectable_details_row(frame: &mut Frame<'_>, hit_map: &mut HitMap, area: Rect) {
+    capture_selectable_details_cells(frame, hit_map, area, true);
+}
+
+/// Captures exact source-width rows without confusing their spaces with terminal padding.
+fn capture_selectable_details_cells(
+    frame: &mut Frame<'_>,
+    hit_map: &mut HitMap,
+    area: Rect,
+    trim_padding: bool,
+) {
     if area.width == 0 || area.height == 0 {
         return;
     }
     let mut cells = (area.left()..area.right())
         .map(|x| frame.buffer_mut()[(x, area.y)].symbol().to_owned())
         .collect::<Vec<_>>();
-    while cells
-        .last()
-        .is_some_and(|symbol| symbol.is_empty() || symbol.chars().all(char::is_whitespace))
+    while trim_padding
+        && cells
+            .last()
+            .is_some_and(|symbol| symbol.is_empty() || symbol.chars().all(char::is_whitespace))
     {
         cells.pop();
     }
@@ -6212,6 +6375,8 @@ fn capture_selectable_details_row(frame: &mut Frame<'_>, hit_map: &mut HitMap, a
             x: area.x,
             y: area.y,
             cells,
+            source_line_breaks: None,
+            source_graphemes: Vec::new(),
         });
     }
 }
@@ -6256,18 +6421,28 @@ impl HitMap {
             let Some(row) = self.detail_text_rows.get(row_index) else {
                 continue;
             };
-            let first = if row_index == start.row {
+            let mut first = if row_index == start.row {
                 start.column
             } else {
                 0
             };
+            if let Some(grapheme) = row
+                .source_graphemes
+                .iter()
+                .find(|grapheme| grapheme.contains(&first))
+            {
+                first = grapheme.start;
+            }
             let last = if row_index == end.row {
                 end.column
             } else {
                 row.cells.len().saturating_sub(1)
             };
             if !selected.is_empty() {
-                selected.push('\n');
+                selected.extend(std::iter::repeat_n(
+                    '\n',
+                    row.source_line_breaks.unwrap_or(1),
+                ));
             }
             if first <= last {
                 for symbol in row
@@ -12936,6 +13111,12 @@ const DESCRIPTION_VIDEO_ACTION_SYMBOL: &str = "↪";
 enum WrappedDescriptionToken {
     /// A contiguous UTF-8 source slice.
     Source { start_byte: usize, end_byte: usize },
+    /// One complete displayed URL grapheme, still owned by original source bytes.
+    UrlEscape {
+        index: usize,
+        start_byte: usize,
+        end_byte: usize,
+    },
     /// An injected action referring to [`DetailView::video_links`].
     VideoAction { link_index: usize },
 }
@@ -12986,11 +13167,25 @@ impl WrappedSourceLineBuilder {
         self.width = self.width.saturating_add(width);
     }
 
+    fn push_url_escape(&mut self, index: usize, escape: &DetailUrlEscapeView, width: usize) {
+        self.tokens.push(WrappedDescriptionToken::UrlEscape {
+            index,
+            start_byte: escape.start_byte,
+            end_byte: escape.end_byte,
+        });
+        self.width = self.width.saturating_add(width);
+    }
+
     fn finish(self) -> WrappedSourceLine {
         let source_range = self.tokens.iter().filter_map(|token| match token {
             WrappedDescriptionToken::Source {
                 start_byte,
                 end_byte,
+            }
+            | WrappedDescriptionToken::UrlEscape {
+                start_byte,
+                end_byte,
+                ..
             } => Some((*start_byte, *end_byte)),
             WrappedDescriptionToken::VideoAction { .. } => None,
         });
@@ -13013,6 +13208,7 @@ fn wrap_description_source(
     description: &str,
     width: usize,
     video_links: &[DetailVideoLinkView],
+    url_escapes: &[DetailUrlEscapeView],
 ) -> Vec<WrappedSourceLine> {
     let width = width.max(1);
     let action_width = usize::from(terminal_text_width(DESCRIPTION_VIDEO_ACTION_SYMBOL));
@@ -13032,6 +13228,8 @@ fn wrap_description_source(
     let mut wrapped = Vec::new();
     let mut source_line_start = 0_usize;
     let mut next_action = 0_usize;
+    let mut next_escape = 0_usize;
+    let mut covered_until = 0_usize;
     for raw_line in description.split('\n') {
         let visible_line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
         let source_line_end = source_line_start.saturating_add(visible_line.len());
@@ -13044,6 +13242,14 @@ fn wrap_description_source(
         let mut builder = WrappedSourceLineBuilder::new(source_line_start);
         for (byte_offset, character) in visible_line.char_indices() {
             let absolute_byte = source_line_start.saturating_add(byte_offset);
+            if absolute_byte < covered_until {
+                continue;
+            }
+            while next_escape < url_escapes.len()
+                && url_escapes[next_escape].start_byte < absolute_byte
+            {
+                next_escape += 1;
+            }
             while next_action < action_indexes.len()
                 && action_indexes[next_action].0 == absolute_byte
             {
@@ -13054,6 +13260,25 @@ fn wrap_description_source(
                 }
                 builder.push_video_action(link_index, action_width);
                 next_action = next_action.saturating_add(1);
+            }
+
+            if let Some(escape) = url_escapes.get(next_escape).filter(|escape| {
+                escape.start_byte == absolute_byte
+                    && escape.end_byte > absolute_byte
+                    && escape.end_byte <= source_line_end
+                    && description.is_char_boundary(escape.end_byte)
+                    && !escape.text.chars().any(char::is_control)
+                    && escape.text.graphemes(true).count() == 1
+            }) {
+                let glyph_width = usize::from(terminal_text_width(&escape.text));
+                if builder.width > 0 && builder.width.saturating_add(glyph_width) > width {
+                    wrapped.push(builder.finish());
+                    builder = WrappedSourceLineBuilder::new(absolute_byte);
+                }
+                builder.push_url_escape(next_escape, escape, glyph_width);
+                covered_until = escape.end_byte;
+                next_escape += 1;
+                continue;
             }
 
             let character_end = absolute_byte.saturating_add(character.len_utf8());
@@ -22182,6 +22407,8 @@ for encoded, expected in json.load(sys.stdin):
                 x: target.x,
                 y: target.y,
                 cells: vec!["x".to_owned(); usize::from(target.width)],
+                source_line_breaks: None,
+                source_graphemes: Vec::new(),
             }],
             ..HitMap::default()
         };
@@ -23026,7 +23253,7 @@ for encoded, expected in json.load(sys.stdin):
             .add_modifier(Modifier::UNDERLINED);
         let mut restored = String::new();
         let mut highlighted = String::new();
-        for line in wrap_description_source(source, 4, &[]) {
+        for line in wrap_description_source(source, 4, &[], &[]) {
             for token in line.tokens {
                 let WrappedDescriptionToken::Source {
                     start_byte,
@@ -23535,7 +23762,7 @@ for encoded, expected in json.load(sys.stdin):
             start_seconds: None,
         }];
 
-        let wrapped = wrap_description_source(&description, 11, &links);
+        let wrapped = wrap_description_source(&description, 11, &links, &[]);
         let logical = wrapped
             .iter()
             .flat_map(|line| line.tokens.iter())
@@ -23546,6 +23773,9 @@ for encoded, expected in json.load(sys.stdin):
                 } => description[*start_byte..*end_byte].to_owned(),
                 WrappedDescriptionToken::VideoAction { .. } => {
                     DESCRIPTION_VIDEO_ACTION_SYMBOL.to_owned()
+                }
+                WrappedDescriptionToken::UrlEscape { .. } => {
+                    unreachable!("fixture has no display escapes")
                 }
             })
             .collect::<String>();
@@ -23565,6 +23795,9 @@ for encoded, expected in json.load(sys.stdin):
                         end_byte,
                     } => usize::from(terminal_text_width(&description[*start_byte..*end_byte])),
                     WrappedDescriptionToken::VideoAction { .. } => 1,
+                    WrappedDescriptionToken::UrlEscape { .. } => {
+                        unreachable!("fixture has no display escapes")
+                    }
                 })
                 .sum::<usize>()
                 <= 11
@@ -25410,6 +25643,208 @@ for encoded, expected in json.load(sys.stdin):
         assert!(!rendered.contains("Length:"));
         assert!(!rendered.contains("Likes:"));
         assert!(!rendered.contains("Views:"));
+    }
+
+    /// Display graphemes own original encoded bytes across wrapping, styling and copying.
+    #[test]
+    fn archive_url_display_wraps_graphemes_and_copies_original_encoded_bytes() {
+        let raw_url = "https://e.t/%E7%95%8C_e%CC%81_%E2%9D%A4%EF%B8%8F.ogg";
+        let video_url = "https://youtu.be/dQw4w9WgXcQ";
+        let raw = format!("{raw_url}\n\n00:05 next\n{video_url}");
+        let escapes = [
+            ("%E7%95%8C", "界"),
+            ("e%CC%81", "e\u{301}"),
+            ("%E2%9D%A4%EF%B8%8F", "❤️"),
+        ]
+        .map(|(encoded, text)| {
+            let start_byte = raw.find(encoded).unwrap();
+            DetailUrlEscapeView {
+                start_byte,
+                end_byte: start_byte + encoded.len(),
+                text: text.into(),
+            }
+        })
+        .to_vec();
+        for width in [18, 120] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 40)).unwrap();
+            let view = ViewModel {
+                screen: Screen::ArchiveOrg,
+                external_opener_available: false,
+                details: Some(DetailView {
+                    source: "archive.org".into(),
+                    media_id: Some(MediaId::new(SourceKind::ArchiveOrg, "fixture")),
+                    description: raw.clone(),
+                    description_url_escapes: escapes.clone(),
+                    search_highlights: vec![DetailHighlightView {
+                        field: DetailHighlightField::Description,
+                        ranges: vec![DetailHighlightRange {
+                            start_byte: escapes[0].start_byte,
+                            end_byte: escapes[0].end_byte,
+                        }],
+                    }],
+                    links: vec![DetailLinkView {
+                        label: raw_url.into(),
+                        internal_target: Some(DetailLinkInternalTarget::ArchiveTopic(
+                            raw_url.into(),
+                        )),
+                        description_range: Some(DetailHighlightRange {
+                            start_byte: 0,
+                            end_byte: raw_url.len(),
+                        }),
+                        ..DetailLinkView::default()
+                    }],
+                    timecodes: vec![DetailTimecodeView {
+                        start_byte: raw_url.len() + 2,
+                        end_byte: raw_url.len() + 7,
+                        seconds: 5,
+                        is_chapter: true,
+                    }],
+                    video_links: vec![DetailVideoLinkView {
+                        start_byte: raw.find(video_url).unwrap(),
+                        end_byte: raw.len(),
+                        video_id: "dQw4w9WgXcQ".into(),
+                        start_seconds: None,
+                    }],
+                    ..DetailView::default()
+                }),
+                ..ViewModel::default()
+            };
+            let mut hit_map = HitMap::default();
+            terminal
+                .draw(|frame| {
+                    render_details(
+                        frame,
+                        frame.area(),
+                        &view,
+                        true,
+                        0,
+                        &Theme::new(false),
+                        &mut hit_map,
+                        None,
+                    )
+                })
+                .unwrap();
+            let rendered = rendered_text(&terminal);
+            for grapheme in ["界", "e\u{301}", "❤️"] {
+                assert!(rendered.contains(grapheme), "{width}: {grapheme}");
+            }
+            assert!(!rendered.contains("%E7"));
+            assert!(
+                terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .any(|cell| cell.symbol() == "界" && cell.bg == Color::Yellow)
+            );
+            assert!(hit_map.detail_links.iter().any(|(index, _)| *index == 0));
+            assert!(hit_map.detail_buttons.iter().any(|(action, area)| matches!(
+                action,
+                UiAction::ActivateTimecode { seconds: 5, .. }
+            ) && area.width == 5));
+            assert_eq!(hit_map.description_video_actions.len(), 1);
+            let last = hit_map.detail_text_rows.len() - 1;
+            let copied = hit_map.selected_details_text(DetailsTextSelection {
+                dragging: false,
+                anchor: DetailsTextPosition { row: 0, column: 0 },
+                focus: DetailsTextPosition {
+                    row: last,
+                    column: hit_map.detail_text_rows[last].cells.len() - 1,
+                },
+            });
+            assert_eq!(copied, raw);
+            for escape in &escapes {
+                let original = &raw[escape.start_byte..escape.end_byte];
+                let (row, column) = hit_map
+                    .detail_text_rows
+                    .iter()
+                    .enumerate()
+                    .find_map(|(row, content)| {
+                        content
+                            .cells
+                            .iter()
+                            .position(|cell| cell == original)
+                            .map(|column| (row, column))
+                    })
+                    .expect("mapped grapheme owns an exact source payload");
+                let position = DetailsTextPosition { row, column };
+                assert_eq!(
+                    hit_map.selected_details_text(DetailsTextSelection {
+                        dragging: false,
+                        anchor: position,
+                        focus: position,
+                    }),
+                    original,
+                );
+                if terminal_text_width(&escape.text) > 1 {
+                    let continuation = DetailsTextPosition {
+                        row,
+                        column: column + 1,
+                    };
+                    assert_eq!(
+                        hit_map.selected_details_text(DetailsTextSelection {
+                            dragging: false,
+                            anchor: continuation,
+                            focus: continuation,
+                        }),
+                        original,
+                        "a partial wide glyph still owns all original bytes",
+                    );
+                }
+            }
+            assert_eq!(view.details.as_ref().unwrap().description, raw);
+        }
+    }
+
+    /// Actual source spaces remain copyable when a narrow row ends at a word boundary.
+    #[test]
+    fn archive_url_display_preserves_source_spaces_at_soft_wraps() {
+        let raw = "https://e.t/%D0%AF A B END";
+        for width in 14..=18 {
+            let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
+            let view = ViewModel {
+                screen: Screen::ArchiveOrg,
+                external_opener_available: false,
+                details: Some(DetailView {
+                    description: raw.into(),
+                    description_url_escapes: vec![DetailUrlEscapeView {
+                        start_byte: 12,
+                        end_byte: 18,
+                        text: "Я".into(),
+                    }],
+                    ..DetailView::default()
+                }),
+                ..ViewModel::default()
+            };
+            let mut hit_map = HitMap::default();
+            terminal
+                .draw(|frame| {
+                    render_details(
+                        frame,
+                        frame.area(),
+                        &view,
+                        true,
+                        0,
+                        &Theme::new(false),
+                        &mut hit_map,
+                        None,
+                    )
+                })
+                .unwrap();
+            let last = hit_map.detail_text_rows.len() - 1;
+            assert_eq!(
+                hit_map.selected_details_text(DetailsTextSelection {
+                    dragging: false,
+                    anchor: DetailsTextPosition { row: 0, column: 0 },
+                    focus: DetailsTextPosition {
+                        row: last,
+                        column: hit_map.detail_text_rows[last].cells.len() - 1,
+                    },
+                }),
+                raw,
+                "actual source whitespace survives wrapping at width {width}",
+            );
+        }
     }
 
     /// A typed Archive name is internal even when the adjacent browser URL is disabled.
@@ -35274,6 +35709,8 @@ prose 07:25 remains clickable but is not a chapter";
                         .chars()
                         .map(|character| character.to_string())
                         .collect(),
+                    source_line_breaks: None,
+                    source_graphemes: Vec::new(),
                 },
                 SelectableDetailsRow {
                     x: 70,
@@ -35282,6 +35719,8 @@ prose 07:25 remains clickable but is not a chapter";
                         .chars()
                         .map(|character| character.to_string())
                         .collect(),
+                    source_line_breaks: None,
+                    source_graphemes: Vec::new(),
                 },
             ],
             ..HitMap::default()
@@ -35325,6 +35764,8 @@ prose 07:25 remains clickable but is not a chapter";
                 x: 51,
                 y: 4,
                 cells: vec!["D".to_owned()],
+                source_line_breaks: None,
+                source_graphemes: Vec::new(),
             }],
             ..HitMap::default()
         };
