@@ -1725,6 +1725,14 @@ mod tests {
         assert_eq!(resolved.episodes[0].duration_seconds, Some(5_157));
         assert_eq!(resolved.episodes[1].duration_seconds, Some(3_600));
         assert_eq!(
+            resolved
+                .episodes
+                .iter()
+                .map(|episode| episode.published_at.as_deref())
+                .collect::<Vec<_>>(),
+            [Some("2025-07-28T07:00:00Z"), Some("2025-07-21T07:00:00Z")]
+        );
+        assert_eq!(
             resolved.episodes[1].media_url.as_ref().map(Url::as_str),
             Some("https://cdn.example.test/older.m4a")
         );
@@ -1849,8 +1857,36 @@ mod tests {
         assert_eq!(episode.duration_seconds, Some(5_157));
         assert_eq!(episode.explicit, Some(true));
         assert_eq!(
+            episode.published_at.as_deref(),
+            Some("2025-07-28T07:00:00Z")
+        );
+        assert_eq!(
             episode.media_url.expect("fixture has episodeUrl").as_str(),
             "https://cdn.example.test/episode.mp3"
+        );
+    }
+
+    /// Missing publication metadata must remain absent rather than inventing a date.
+    #[test]
+    fn episode_lookup_preserves_a_missing_publication_date() {
+        let mut fixture: Value =
+            serde_json::from_str(EPISODE_LOOKUP_FIXTURE).expect("fixture should parse");
+        fixture["results"][1]
+            .as_object_mut()
+            .expect("fixture episode")
+            .remove("releaseDate");
+        let response = serde_json::from_value(fixture).expect("undated fixture should parse");
+        let link =
+            parse_link("https://podcasts.apple.com/us/podcast/show/id1756129194?i=1000719462606")
+                .expect("fixture link should parse");
+        let resolved = normalize_lookup(link, &response).expect("undated fixture should normalize");
+
+        assert!(
+            resolved
+                .episode
+                .expect("fixture episode")
+                .published_at
+                .is_none()
         );
     }
 

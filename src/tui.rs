@@ -5008,6 +5008,18 @@ fn render_information_panel(
                     Span::raw(&details.length),
                 ]));
             }
+            // Compact episode titles may clip their date suffix; keep the
+            // selected podcast's publication timestamp readable in Details.
+            let published = details.published.trim();
+            if kind == InformationPanelKind::Podcast
+                && !published.is_empty()
+                && !published.eq_ignore_ascii_case("unknown")
+            {
+                lines.push(Line::from(vec![
+                    Span::styled("Published: ", theme.muted),
+                    Span::raw(published),
+                ]));
+            }
         }
         InformationPanelKind::YandexMusic => {}
         InformationPanelKind::Channel => {
@@ -25854,6 +25866,7 @@ for encoded, expected in json.load(sys.stdin):
                     url::Url::parse("https://podcasts.example/show").expect("podcast website"),
                 ),
                 length: "42:05".to_owned(),
+                published: "2026 July 27 · 14:00 +04:00".to_owned(),
                 likes: "must not render".to_owned(),
                 views: "must not render".to_owned(),
                 ..DetailView::default()
@@ -25869,6 +25882,7 @@ for encoded, expected in json.load(sys.stdin):
 
         assert!(rendered.contains(&format!("[o] {} podcast", system_url_opener_name())));
         assert!(rendered.contains("Length: 42:05"));
+        assert!(rendered.contains("Published: 2026 July 27 · 14:00 +04:00"));
         assert!(!rendered.contains("open video"));
         assert!(!rendered.contains("open channel"));
         assert!(!rendered.contains("Likes:"));
@@ -25886,6 +25900,14 @@ for encoded, expected in json.load(sys.stdin):
                 .all(|(action, _)| action != &UiAction::OpenChannelInBrowser)
         );
 
+        for unavailable in ["", "unknown", "   "] {
+            view.details.as_mut().unwrap().published = unavailable.to_owned();
+            terminal
+                .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+                .expect("draw episode without a publication timestamp");
+            assert!(!rendered_text(&terminal).contains("Published:"));
+        }
+
         view.rows[0].title = "Fixture show".to_owned();
         view.details = Some(DetailView {
             title: "Fixture show".to_owned(),
@@ -25902,6 +25924,7 @@ for encoded, expected in json.load(sys.stdin):
         let rendered = rendered_text(&terminal);
         assert!(rendered.contains(&format!("[o] {} podcast", system_url_opener_name())));
         assert!(!rendered.contains("Length:"));
+        assert!(!rendered.contains("Published:"));
         assert!(!rendered.contains("Likes:"));
         assert!(!rendered.contains("Views:"));
     }

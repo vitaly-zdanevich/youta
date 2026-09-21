@@ -1354,9 +1354,11 @@ These are distinct integration modes:
   episodes play from their public RSS enclosure, while direct shows open the
   same bounded episode view and preserve Back navigation. The storefront,
   query, show results, and selected row are cached independently across
-  restarts. No Apple account, API key, or played-status synchronization is
-  implied. Apple API redirects stay on the exact original origin. Returned
-  feed, artwork, and enclosure URLs reject non-public literals and obvious
+  restarts. Episode Details show the supplied release date and local time
+  with its UTC offset, without additional metadata requests. No Apple account,
+  API key, or played-status synchronization is implied. Apple API redirects
+  stay on the exact original origin. Returned feed, artwork, and enclosure
+  URLs reject non-public literals and obvious
   local-only names; Youta does not fetch the returned feed. Thumbnail fetches
   also require public DNS results and reject redirects. Enclosures are handed
   to the external playback backend, which owns later media DNS and redirects.

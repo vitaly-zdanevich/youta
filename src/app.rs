@@ -14733,7 +14733,7 @@ impl AppController {
                 .published_at
                 .as_deref()
                 .and_then(|published| {
-                    format_rfc3339_local_date_relative(published, Local::now().date_naive())
+                    format_rfc3339_local_datetime_relative(published, Local::now().date_naive())
                 })
                 .or_else(|| episode.published_at.clone())
                 .unwrap_or_default(),
@@ -39957,10 +39957,15 @@ fn apply_resolved_direct_view(
             .map_or_else(|| "unknown".to_owned(), format_seconds),
         description: media.description.clone(),
         timecodes: detail_timecodes(&media.description),
-        published: media
-            .published
-            .clone()
-            .unwrap_or_else(|| "unknown".to_owned()),
+        published: match media.published.as_deref() {
+            #[cfg(feature = "apple-podcasts")]
+            Some(value) if media.source == SourceKind::ApplePodcasts => {
+                format_rfc3339_local_datetime_relative(value, Local::now().date_naive())
+                    .unwrap_or_else(|| value.to_owned())
+            }
+            Some(value) => value.to_owned(),
+            None => "unknown".to_owned(),
+        },
         license: media.license.clone(),
         wikidata: "not loaded".to_owned(),
         thumbnail_url: media.artwork_url.clone(),
@@ -44998,6 +45003,19 @@ fn format_rfc3339_local_date_relative(value: &str, today: NaiveDate) -> Option<S
     let timestamp = DateTime::parse_from_rfc3339(value).ok()?.timestamp();
     let formatted = format_unix_local_date_relative(timestamp, today);
     (formatted != "unknown").then_some(formatted)
+}
+
+/// Keeps the clock time and numeric UTC offset in selected podcast details.
+///
+/// Both the date and clock use the same local instant, including across day
+/// boundaries. Compact episode rows keep their existing date-only subtitle.
+#[cfg(feature = "apple-podcasts")]
+fn format_rfc3339_local_datetime_relative(value: &str, today: NaiveDate) -> Option<String> {
+    let published = DateTime::parse_from_rfc3339(value)
+        .ok()?
+        .with_timezone(&Local);
+    let date = format_unix_local_date_relative(published.timestamp(), today);
+    (date != "unknown").then(|| format!("{date} · {}", published.format("%H:%M %:z")))
 }
 
 /// Formats a validated civil date with an English month name.
@@ -51926,6 +51944,35 @@ mod tests {
         );
         assert_eq!(
             format_rfc3339_local_date_relative("not a timestamp", today),
+            None
+        );
+    }
+
+    /// Provider offsets must not separate an episode's local date and time.
+    #[cfg(feature = "apple-podcasts")]
+    #[test]
+    fn apple_release_timestamp_retains_local_time_and_offset() {
+        let published = NaiveDate::from_ymd_opt(2026, 1, 1)
+            .unwrap()
+            .and_hms_opt(0, 5, 0)
+            .unwrap()
+            .and_local_timezone(Local)
+            .single()
+            .expect("unambiguous fixture time");
+        let provider_value = published
+            .with_timezone(&chrono::FixedOffset::east_opt(14 * 60 * 60).unwrap())
+            .to_rfc3339();
+        let today = NaiveDate::from_ymd_opt(2026, 1, 2).unwrap();
+        assert_eq!(
+            format_rfc3339_local_datetime_relative(&provider_value, today),
+            Some(format!(
+                "2026 January 1 (yesterday) · 00:05 {}",
+                published.format("%:z")
+            ))
+        );
+        assert_eq!(format_rfc3339_local_datetime_relative("", today), None);
+        assert_eq!(
+            format_rfc3339_local_datetime_relative("not a timestamp", today),
             None
         );
     }
@@ -82191,6 +82238,21 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["Metadata-only episode", "Playable episode"]
         );
+        let local_release_time = DateTime::parse_from_rfc3339("2026-07-27T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Local)
+            .format(" · %H:%M %:z")
+            .to_string();
+        assert!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .unwrap()
+                .published
+                .ends_with(&local_release_time),
+            "selected episode details must retain the release clock time"
+        );
         assert!(
             controller.view.rows[0]
                 .subtitle
@@ -82457,6 +82519,21 @@ mod tests {
 
         assert_eq!(controller.apple_podcasts_route, ApplePodcastsRoute::Direct);
         assert_eq!(controller.view.rows[0].title, "Direct podcast episode");
+        let local_release_time = DateTime::parse_from_rfc3339("2026-07-27T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Local)
+            .format(" · %H:%M %:z")
+            .to_string();
+        assert!(
+            controller
+                .view
+                .details
+                .as_ref()
+                .unwrap()
+                .published
+                .ends_with(&local_release_time),
+            "direct episode details must format the same local release time"
+        );
         assert_eq!(controller.current_url().as_deref(), Some(public_url));
         controller.dispatch(UiAction::ActivateSelection);
         let playback = playback.lock().expect("mock playback");
