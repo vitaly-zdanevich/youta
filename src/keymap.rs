@@ -2481,7 +2481,8 @@ fn unfiltered_key_action(
         Key::PageUp
             if matches!(
                 view.screen,
-                Screen::ArchiveOrg
+                Screen::ApplePodcasts
+                    | Screen::ArchiveOrg
                     | Screen::LibriVox
                     | Screen::Local
                     | Screen::Web
@@ -2496,7 +2497,8 @@ fn unfiltered_key_action(
         Key::PageDown
             if matches!(
                 view.screen,
-                Screen::ArchiveOrg
+                Screen::ApplePodcasts
+                    | Screen::ArchiveOrg
                     | Screen::LibriVox
                     | Screen::Local
                     | Screen::Web

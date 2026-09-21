@@ -82655,6 +82655,91 @@ mod tests {
         assert_eq!(controller.view.rows[1].title, "Systems at Night");
     }
 
+    /// Page-sized navigation changes only the selected episode and its details.
+    #[cfg(feature = "apple-podcasts")]
+    #[test]
+    fn apple_episode_page_selection_clamps_updates_details_and_never_starts_playback() {
+        let temporary = crate::test_support::canonical_tempdir("apple episode paging");
+        let (factory, playback, _, _) = mock_playback_factory([], []);
+        let config = Config::for_dir(temporary.path().join("config"));
+        let mut controller = AppController::new(
+            config,
+            StateStore::open_in_memory().expect("in-memory state"),
+            None,
+            Some(factory),
+        );
+        let (requests, captured_requests) = unbounded();
+        controller.provider_requests = Some(requests);
+        controller.config.playback.autoplay = true;
+        controller.view.autoplay = true;
+        controller.view.screen = Screen::ApplePodcasts;
+        controller.apple_podcasts_route = ApplePodcastsRoute::Episodes;
+        controller.active_apple_podcast_show =
+            Some(apple_podcast_show_fixture(1_001, "Paging fixture show"));
+        controller.apple_podcast_episodes = (0_u64..23)
+            .map(|index| {
+                apple_podcast_episode_fixture(
+                    1_001,
+                    2_000 + index,
+                    &format!("Episode {index}"),
+                    Some("https://media.example.test/apple/page-fixture.m4a"),
+                )
+            })
+            .collect();
+        controller.refresh_apple_podcast_episode_rows();
+        controller.update_apple_podcast_episode_detail();
+
+        for (delta, expected) in [
+            (-7, 0),
+            (7, 7),
+            (7, 14),
+            (7, 21),
+            (7, 22),
+            (7, 22),
+            (-7, 15),
+            (-7, 8),
+            (-7, 1),
+            (-7, 0),
+            (i32::MAX, 22),
+            (i32::MIN, 0),
+            (7, 7),
+        ] {
+            controller.view.details_scroll = 3;
+            controller.dispatch(UiAction::MoveSelection(delta));
+            assert_eq!(controller.view.selected, expected, "delta {delta}");
+            assert_eq!(controller.apple_podcast_episode_selected, expected);
+            let details = controller.view.details.as_ref().expect("selected episode");
+            assert_eq!(details.title, format!("Episode {expected}"));
+            assert_eq!(
+                details.media_id, controller.view.rows[expected].media_id,
+                "details must follow the page destination"
+            );
+            let expected_url = format!(
+                "https://podcasts.apple.com/us/podcast/fixture-show/id1001?i={}",
+                2_000 + expected
+            );
+            assert_eq!(
+                controller.current_url().as_deref(),
+                Some(expected_url.as_str())
+            );
+            assert_eq!(controller.view.details_scroll, 0);
+            assert!(!controller.view.details_focused);
+            assert!(playback.lock().expect("mock playback").played.is_empty());
+        }
+
+        controller.show_screen(Screen::History);
+        controller.show_screen(Screen::ApplePodcasts);
+        assert_eq!(controller.view.selected, 7);
+        assert_eq!(controller.view.details.as_ref().unwrap().title, "Episode 7");
+        assert!(controller.view.autoplay);
+        assert!(controller.playback_queue.items.is_empty());
+        assert!(controller.current_autoplay_origin.is_none());
+        assert!(controller.pending_history.is_none());
+        assert!(controller.store.history(false, 10).unwrap().is_empty());
+        assert!(captured_requests.is_empty());
+        assert!(playback.lock().expect("mock playback").played.is_empty());
+    }
+
     #[cfg(feature = "apple-podcasts")]
     #[test]
     fn apple_search_refresh_preserves_last_good_rows_and_storefront_on_failure() {

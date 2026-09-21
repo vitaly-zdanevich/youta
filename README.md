@@ -1374,7 +1374,9 @@ These are distinct integration modes:
   local-only names; Youta does not fetch the returned feed. Thumbnail fetches
   also require public DNS results and reject redirects. Enclosures are handed
   to the external playback backend, which owns later media DNS and redirects.
-  In the terminal, catalogue links below artwork use normal text color and
+  In the terminal, `PageUp`/`PageDown` move through shows and episodes by the
+  visible list capacity; when Details is focused, they scroll its text instead.
+  Catalogue links below artwork use normal text color and
   show only the URL. After a preview loads, recognized Apple CDN covers warm a
   best-effort 2048-pixel version in the background, already fitted and encoded
   for fullscreen display. These enlarged images stay in the bounded RAM cache;

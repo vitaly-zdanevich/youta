@@ -18193,6 +18193,98 @@ for encoded, expected in json.load(sys.stdin):
         );
     }
 
+    /// Podcast episode paging follows rendered capacity, not a fixed item count.
+    #[test]
+    fn podcast_episode_page_keys_use_the_rendered_capacity_and_preserve_focus() {
+        for (height, subtitle, row_height) in [
+            (24, "2026 September 21 · 42:05", 1),
+            (12, "2026 September 21 · 42:05", 1),
+            (24, "2026 September 21 · 42:05", 2),
+            (12, "2026 September 21 · 42:05", 2),
+            (24, "", 1),
+        ] {
+            let mut terminal = Terminal::new(TestBackend::new(100, height)).unwrap();
+            let mut view = ViewModel {
+                screen: Screen::ApplePodcasts,
+                selected: 20,
+                rows: (0..60)
+                    .map(|index| RowView {
+                        title: format!("Episode {index}"),
+                        subtitle: subtitle.to_owned(),
+                        compact: row_height == 1,
+                        source: "Apple Podcasts".to_owned(),
+                        media_id: Some(crate::domain::MediaId::new(
+                            SourceKind::ApplePodcasts,
+                            format!("episode-{index}"),
+                        )),
+                        ..RowView::default()
+                    })
+                    .collect(),
+                ..ViewModel::default()
+            };
+            let mut hit_map = HitMap::default();
+            terminal
+                .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+                .unwrap();
+            assert_eq!(hit_map.rows_row_height, row_height);
+            let capacity = visible_main_list_page_rows(&hit_map, &view).expect("visible episodes");
+            assert_eq!(
+                capacity,
+                usize::from((hit_map.rows.height / row_height).max(1))
+            );
+            assert!(capacity < view.rows.len());
+            for (key, direction) in [(KeyCode::PageUp, -1), (KeyCode::PageDown, 1)] {
+                assert_eq!(
+                    key_action_with_page_rows(
+                        KeyEvent::new(key, KeyModifiers::NONE),
+                        &view,
+                        Some(capacity),
+                        None,
+                    ),
+                    Some(UiAction::MoveSelection(
+                        direction * i32::try_from(capacity).unwrap()
+                    )),
+                    "episode paging at height {height}, row height {row_height}"
+                );
+                for missing_capacity in [None, Some(0)] {
+                    assert_eq!(
+                        key_action_with_page_rows(
+                            KeyEvent::new(key, KeyModifiers::NONE),
+                            &view,
+                            missing_capacity,
+                            None,
+                        ),
+                        None,
+                        "an unrendered episode list must not guess a page size"
+                    );
+                }
+                view.details_focused = true;
+                assert_eq!(
+                    key_action_with_page_rows(
+                        KeyEvent::new(key, KeyModifiers::NONE),
+                        &view,
+                        Some(capacity),
+                        None,
+                    ),
+                    Some(UiAction::ScrollDetails(DetailsScroll::Pages(direction))),
+                );
+                view.details_focused = false;
+                view.search_editing = true;
+                assert_eq!(
+                    key_action_with_page_rows(
+                        KeyEvent::new(key, KeyModifiers::NONE),
+                        &view,
+                        Some(capacity),
+                        None,
+                    ),
+                    None,
+                    "paging must not escape the search editor"
+                );
+                view.search_editing = false;
+            }
+        }
+    }
+
     #[test]
     fn subscription_page_keys_use_the_rendered_active_pane_capacity() {
         let mut view = ViewModel {
