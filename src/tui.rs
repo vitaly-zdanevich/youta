@@ -1555,6 +1555,12 @@ fn event_wait(view: &ViewModel, settings: &UiSettings) -> Duration {
         || view.subscriptions.metadata_pending
         || view.playback_starting
         || view.playback_end_releasing
+        || (cfg!(feature = "invidious")
+            && view
+                .youtube_setup_popup
+                .as_ref()
+                .and_then(|setup| setup.invidious_instances.as_ref())
+                .is_some_and(|picker| picker.loading))
     {
         playback_wait.min(settings.playing_tick)
     } else {
@@ -9389,10 +9395,18 @@ fn render_youtube_setup_popup(
         ])
         .split(inner);
 
+    let picker = setup
+        .invidious_instances
+        .as_ref()
+        .filter(|_| cfg!(feature = "invidious"));
     frame.render_widget(
-        Paragraph::new("Choose one metadata provider. Tab/↑/↓ switches; Enter saves and retries.")
-            .style(theme.base)
-            .wrap(Wrap { trim: false }),
+        Paragraph::new(if picker.is_some() {
+            "↑/↓ chooses; Enter fills the URL; Esc returns to manual setup."
+        } else {
+            "Choose one metadata provider. Tab/↑/↓ switches; Enter saves and retries."
+        })
+        .style(theme.base)
+        .wrap(Wrap { trim: false }),
         sections[0],
     );
 
@@ -9468,6 +9482,33 @@ fn render_youtube_setup_popup(
     hit_map
         .youtube_setup_fields
         .push((YouTubeSetupField::InvidiousUrl, sections[2]));
+
+    if cfg!(feature = "invidious") && sections[2].height > 0 {
+        let label = "[F4] Choose instance";
+        let width = terminal_text_width(label).min(sections[2].width.saturating_sub(2));
+        if width > 0 {
+            let target = Rect::new(sections[2].x + 1, sections[2].bottom() - 1, width, 1);
+            frame.render_widget(Paragraph::new(label).style(theme.accent), target);
+            hit_map
+                .youtube_setup_buttons
+                .push((UiAction::OpenInvidiousInstancePicker, target));
+        }
+    }
+    if let Some(picker) = picker {
+        // The dropdown owns input until it closes; underlying setup controls
+        // must never save a draft or switch fields through stale hit targets.
+        hit_map.youtube_setup_fields.clear();
+        hit_map.youtube_setup_buttons.clear();
+        render_invidious_instance_picker(
+            frame,
+            picker,
+            inner,
+            sections[2].bottom(),
+            theme,
+            hit_map,
+        );
+        return;
+    }
 
     let guide_sections = Layout::default()
         .direction(Direction::Vertical)
@@ -9645,6 +9686,126 @@ fn render_youtube_setup_popup(
             Rect::new(button_x, sections[5].y, width, sections[5].height),
         ));
         button_x = button_x.saturating_add(width).saturating_add(3);
+    }
+}
+
+/// Anchors a bounded instance list below the URL field, moving it upward on
+/// small terminals so the selected row and close/retry controls remain visible.
+fn render_invidious_instance_picker(
+    frame: &mut Frame<'_>,
+    picker: &InvidiousInstancePickerView,
+    available: Rect,
+    anchor_y: u16,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+) {
+    let rows = if picker.loading || picker.error.is_some() || picker.instances.is_empty() {
+        4
+    } else {
+        u16::try_from(picker.instances.len().min(8)).unwrap_or(8)
+    };
+    let height = rows.saturating_add(3).min(available.height);
+    let area = Rect::new(
+        available.x,
+        anchor_y.min(available.bottom().saturating_sub(height)),
+        available.width,
+        height,
+    );
+    frame.render_widget(Clear, area);
+    frame.render_widget(panel_block(" Public Invidious instances ", theme), area);
+    let inner = area.inner(ratatui::layout::Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
+    if inner.is_empty() {
+        return;
+    }
+    let list = Rect::new(
+        inner.x,
+        inner.y,
+        inner.width,
+        inner.height.saturating_sub(1),
+    );
+    if picker.loading {
+        let spinner =
+            ASCII_ACTIVITY_FRAMES[usize::from(picker.loading_frame) % ASCII_ACTIVITY_FRAMES.len()];
+        frame.render_widget(
+            Paragraph::new(format!("{spinner} Loading public instances…"))
+                .style(theme.base)
+                .wrap(Wrap { trim: true }),
+            list,
+        );
+    } else if let Some(error) = picker.error.as_ref() {
+        frame.render_widget(
+            Paragraph::new(error.as_str())
+                .style(theme.base)
+                .wrap(Wrap { trim: true }),
+            list,
+        );
+    } else if picker.instances.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No public API instances found")
+                .style(theme.base)
+                .wrap(Wrap { trim: true }),
+            list,
+        );
+    } else {
+        let selected = picker.selected.min(picker.instances.len() - 1);
+        let start = selected.saturating_sub(usize::from(list.height).saturating_sub(1));
+        for (row, (index, instance)) in picker
+            .instances
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(usize::from(list.height))
+            .enumerate()
+        {
+            let target = Rect::new(
+                list.x,
+                list.y + u16::try_from(row).unwrap_or_default(),
+                list.width,
+                1,
+            );
+            let label = if instance.label.is_empty() {
+                instance.url.as_str()
+            } else {
+                instance.label.as_str()
+            };
+            frame.render_widget(
+                Paragraph::new(format!(
+                    "{} {label}",
+                    if index == selected { '>' } else { ' ' }
+                ))
+                .style(if index == selected {
+                    theme.selected
+                } else {
+                    theme.base
+                }),
+                target,
+            );
+            hit_map
+                .youtube_setup_buttons
+                .push((UiAction::SelectInvidiousInstance(index), target));
+        }
+    }
+    let labels = if inner.width >= 23 {
+        ["[F4] Retry", "[Esc] Close"]
+    } else {
+        ["[F4]", "[Esc]"]
+    };
+    let mut x = inner.x;
+    for (label, action) in labels.into_iter().zip([
+        UiAction::OpenInvidiousInstancePicker,
+        UiAction::DismissInvidiousInstancePicker,
+    ]) {
+        let width = terminal_text_width(label).min(inner.right().saturating_sub(x));
+        if width == 0 {
+            break;
+        }
+        let target = Rect::new(x, inner.bottom() - 1, width, 1);
+        frame.render_widget(Paragraph::new(label).style(theme.accent), target);
+        hit_map.youtube_setup_buttons.push((action, target));
+        x = x.saturating_add(width).saturating_add(2);
     }
 }
 
@@ -14244,21 +14405,43 @@ fn mouse_action_unfiltered(
             _ => None,
         };
     }
-    if view.youtube_setup_popup.is_some() {
+    if let Some(setup) = view.youtube_setup_popup.as_ref() {
+        if cfg!(feature = "invidious") && setup.invidious_instances.is_some() {
+            return match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left) => hit_map
+                    .youtube_setup_buttons
+                    .iter()
+                    .find(|(action, area)| {
+                        contains(*area, mouse.column, mouse.row)
+                            && matches!(
+                                action,
+                                UiAction::OpenInvidiousInstancePicker
+                                    | UiAction::DismissInvidiousInstancePicker
+                                    | UiAction::SelectInvidiousInstance(_)
+                            )
+                    })
+                    .map(|(action, _)| action.clone()),
+                MouseEventKind::ScrollUp => Some(UiAction::MoveInvidiousInstance(-1)),
+                MouseEventKind::ScrollDown => Some(UiAction::MoveInvidiousInstance(1)),
+                _ => None,
+            };
+        }
         return match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                if let Some((field, _)) = hit_map
+                if let Some((action, _)) = hit_map
+                    .youtube_setup_buttons
+                    .iter()
+                    .find(|(_, area)| contains(*area, mouse.column, mouse.row))
+                {
+                    Some(action.clone())
+                } else if let Some((field, _)) = hit_map
                     .youtube_setup_fields
                     .iter()
                     .find(|(_, area)| contains(*area, mouse.column, mouse.row))
                 {
                     Some(UiAction::SelectYouTubeSetupField(*field))
                 } else {
-                    hit_map
-                        .youtube_setup_buttons
-                        .iter()
-                        .find(|(_, area)| contains(*area, mouse.column, mouse.row))
-                        .map(|(action, _)| action.clone())
+                    None
                 }
             }
             _ => None,
@@ -15697,6 +15880,44 @@ for encoded, expected in json.load(sys.stdin):
             event_wait(&ViewModel::default(), &zero_settings),
             Duration::from_millis(1)
         );
+    }
+
+    /// The picker animates on the existing active tick without polling after completion.
+    #[test]
+    fn invidious_instance_loading_uses_existing_active_redraw_cadence() {
+        let settings = UiSettings {
+            idle_tick: Duration::from_secs(2),
+            playing_tick: Duration::from_millis(250),
+            ..UiSettings::default()
+        };
+        let mut view = ViewModel {
+            youtube_setup_popup: Some(YouTubeSetupPopupView {
+                invidious_instances: Some(InvidiousInstancePickerView {
+                    loading: true,
+                    ..InvidiousInstancePickerView::default()
+                }),
+                ..YouTubeSetupPopupView::default()
+            }),
+            ..ViewModel::default()
+        };
+        assert_eq!(
+            event_wait(&view, &settings),
+            if cfg!(feature = "invidious") {
+                settings.playing_tick
+            } else {
+                settings.idle_tick
+            }
+        );
+        view.youtube_setup_popup
+            .as_mut()
+            .unwrap()
+            .invidious_instances
+            .as_mut()
+            .unwrap()
+            .loading = false;
+        assert_eq!(event_wait(&view, &settings), settings.idle_tick);
+        view.youtube_setup_popup = None;
+        assert_eq!(event_wait(&view, &settings), settings.idle_tick);
     }
 
     #[test]
@@ -25543,7 +25764,10 @@ for encoded, expected in json.load(sys.stdin):
         assert!(!rendered.contains("[F1]"));
         assert!(!rendered.contains("[F2]"));
         assert!(!rendered.contains("[F3]"));
-        assert_eq!(hit_map.youtube_setup_buttons.len(), 2);
+        assert_eq!(
+            hit_map.youtube_setup_buttons.len(),
+            2 + usize::from(cfg!(feature = "invidious"))
+        );
         assert_eq!(
             key_action(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE), &view),
             None
@@ -32513,6 +32737,7 @@ prose 07:25 remains clickable but is not a chapter";
                 api_key_path: "/home/listener/.config/youta/secrets/credentials.toml".to_owned(),
                 invidious_path: "/home/listener/.config/youta/config.toml".to_owned(),
                 validation_error: Some("API key was rejected".to_owned()),
+                ..YouTubeSetupPopupView::default()
             }),
             ..ViewModel::default()
         };
@@ -32571,7 +32796,256 @@ prose 07:25 remains clickable but is not a chapter";
         assert!(normalized.contains("[Enter] Save and retry"));
         assert!(normalized.contains("[Esc] Cancel"));
         assert_eq!(hit_map.youtube_setup_fields.len(), 2);
-        assert_eq!(hit_map.youtube_setup_buttons.len(), 5);
+        assert_eq!(
+            hit_map.youtube_setup_buttons.len(),
+            5 + usize::from(cfg!(feature = "invidious"))
+        );
+    }
+
+    /// The optional picker opens only through its button; manual URL editing remains.
+    #[test]
+    fn youtube_setup_instance_picker_button_follows_the_provider_feature() {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut view = ViewModel {
+            youtube_setup_popup: Some(YouTubeSetupPopupView {
+                invidious_url: "https://manual.example".to_owned(),
+                ..YouTubeSetupPopupView::default()
+            }),
+            ..ViewModel::default()
+        };
+        if !cfg!(feature = "invidious") {
+            view.youtube_setup_popup
+                .as_mut()
+                .unwrap()
+                .invidious_instances = Some(InvidiousInstancePickerView {
+                loading: true,
+                ..InvidiousInstancePickerView::default()
+            });
+        }
+        let mut hits = HitMap::default();
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hits))
+            .unwrap();
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("https://manual.example"));
+        assert_eq!(
+            rendered.contains("[F4] Choose instance"),
+            cfg!(feature = "invidious")
+        );
+        assert!(!rendered.contains("Loading public instances"));
+        assert!(
+            hits.youtube_setup_fields
+                .iter()
+                .any(|(field, _)| *field == YouTubeSetupField::InvidiousUrl)
+        );
+        let target = hits
+            .youtube_setup_buttons
+            .iter()
+            .find_map(|(action, area)| {
+                (*action == UiAction::OpenInvidiousInstancePicker).then_some(*area)
+            });
+        assert_eq!(target.is_some(), cfg!(feature = "invidious"));
+        if let Some(target) = target {
+            assert_eq!(
+                mouse_action(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: target.x,
+                        row: target.y,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    &hits,
+                    &view
+                ),
+                Some(UiAction::OpenInvidiousInstancePicker)
+            );
+        }
+    }
+
+    /// The selected row stays visible in short terminals and cannot trigger setup Save.
+    #[cfg(feature = "invidious")]
+    #[test]
+    fn invidious_instance_picker_scrolls_and_owns_its_mouse_targets() {
+        for (width, height) in [(100, 26), (40, 12), (20, 7)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let view = ViewModel {
+                youtube_setup_popup: Some(YouTubeSetupPopupView {
+                    invidious_instances: Some(InvidiousInstancePickerView {
+                        instances: (0..12)
+                            .map(|index| InvidiousInstanceView {
+                                label: format!("Instance {index}"),
+                                url: format!("https://video{index}.example"),
+                            })
+                            .collect(),
+                        selected: 9,
+                        ..InvidiousInstancePickerView::default()
+                    }),
+                    ..YouTubeSetupPopupView::default()
+                }),
+                ..ViewModel::default()
+            };
+            let mut hits = HitMap::default();
+            terminal
+                .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hits))
+                .unwrap();
+            assert!(rendered_text(&terminal).contains("Instance 9"));
+            assert!(!rendered_text(&terminal).contains("https://video9.example"));
+            assert!(hits.youtube_setup_fields.is_empty());
+            assert!(
+                hits.youtube_setup_buttons
+                    .iter()
+                    .all(|(action, _)| *action != UiAction::SubmitYouTubeSetup)
+            );
+            for expected in [
+                UiAction::SelectInvidiousInstance(9),
+                UiAction::DismissInvidiousInstancePicker,
+                UiAction::OpenInvidiousInstancePicker,
+            ] {
+                let target = hits
+                    .youtube_setup_buttons
+                    .iter()
+                    .find_map(|(action, area)| (*action == expected).then_some(*area))
+                    .expect("picker target");
+                assert!(target.width > 0 && target.height > 0);
+                assert!(target.right() <= width && target.bottom() <= height);
+                assert_eq!(
+                    mouse_action(
+                        MouseEvent {
+                            kind: MouseEventKind::Down(MouseButton::Left),
+                            column: target.x,
+                            row: target.y,
+                            modifiers: KeyModifiers::NONE,
+                        },
+                        &hits,
+                        &view
+                    ),
+                    Some(expected)
+                );
+            }
+            assert_eq!(
+                mouse_action(
+                    MouseEvent {
+                        kind: MouseEventKind::ScrollDown,
+                        column: 1,
+                        row: 1,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    &hits,
+                    &view
+                ),
+                Some(UiAction::MoveInvidiousInstance(1))
+            );
+            let stale_hits = HitMap {
+                youtube_setup_buttons: vec![(UiAction::SubmitYouTubeSetup, Rect::new(1, 1, 2, 1))],
+                youtube_setup_fields: vec![(YouTubeSetupField::ApiKey, Rect::new(1, 1, 2, 1))],
+                ..HitMap::default()
+            };
+            assert_eq!(
+                mouse_action(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: 1,
+                        row: 1,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    &stale_hits,
+                    &view
+                ),
+                None,
+                "an old setup hit map must not save or edit fields while the picker owns input"
+            );
+        }
+    }
+
+    /// Narrow layouts preserve the wrapped failure reason and retry guidance.
+    #[cfg(feature = "invidious")]
+    #[test]
+    fn invidious_instance_picker_wraps_error_details_on_narrow_terminals() {
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        let view = ViewModel {
+            youtube_setup_popup: Some(YouTubeSetupPopupView {
+                invidious_instances: Some(InvidiousInstancePickerView {
+                    error: Some(
+                        "Public instance list unavailable: HTTP 503. Please retry.".to_owned(),
+                    ),
+                    ..InvidiousInstancePickerView::default()
+                }),
+                ..YouTubeSetupPopupView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut hits = HitMap::default();
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hits))
+            .unwrap();
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("Public instance list"));
+        assert!(rendered.contains("HTTP 503"));
+        assert!(rendered.contains("Please retry."));
+    }
+
+    /// Loading uses controller animation frames, while failures and empty results stay actionable.
+    #[cfg(feature = "invidious")]
+    #[test]
+    fn invidious_instance_picker_renders_loading_error_and_empty_states() {
+        for (picker, expected) in [
+            (
+                InvidiousInstancePickerView {
+                    loading: true,
+                    loading_frame: 0,
+                    ..InvidiousInstancePickerView::default()
+                },
+                "| Loading public instances",
+            ),
+            (
+                InvidiousInstancePickerView {
+                    loading: true,
+                    loading_frame: 1,
+                    ..InvidiousInstancePickerView::default()
+                },
+                "/ Loading public instances",
+            ),
+            (
+                InvidiousInstancePickerView {
+                    error: Some("Public list unavailable".to_owned()),
+                    ..InvidiousInstancePickerView::default()
+                },
+                "Public list unavailable",
+            ),
+            (
+                InvidiousInstancePickerView::default(),
+                "No public API instances found",
+            ),
+        ] {
+            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            let view = ViewModel {
+                youtube_setup_popup: Some(YouTubeSetupPopupView {
+                    invidious_instances: Some(picker),
+                    ..YouTubeSetupPopupView::default()
+                }),
+                ..ViewModel::default()
+            };
+            let mut hits = HitMap::default();
+            terminal
+                .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hits))
+                .unwrap();
+            assert!(rendered_text(&terminal).contains(expected));
+            assert!(
+                hits.youtube_setup_buttons
+                    .iter()
+                    .any(|(action, _)| *action == UiAction::OpenInvidiousInstancePicker)
+            );
+            assert!(
+                hits.youtube_setup_buttons
+                    .iter()
+                    .all(|(action, _)| !matches!(
+                        action,
+                        UiAction::SelectInvidiousInstance(_)
+                            | UiAction::ConfirmInvidiousInstance
+                            | UiAction::SubmitYouTubeSetup
+                    ))
+            );
+        }
     }
 
     #[test]
@@ -33064,7 +33538,10 @@ prose 07:25 remains clickable but is not a chapter";
                 "80x24 popup omitted `{expected}`:\n{normalized}"
             );
         }
-        assert_eq!(hit_map.youtube_setup_buttons.len(), 5);
+        assert_eq!(
+            hit_map.youtube_setup_buttons.len(),
+            5 + usize::from(cfg!(feature = "invidious"))
+        );
     }
 
     #[test]

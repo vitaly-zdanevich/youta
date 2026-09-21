@@ -27,6 +27,8 @@ pub mod funkwhale;
 pub mod github;
 #[cfg(feature = "invidious")]
 pub mod invidious;
+#[cfg(feature = "invidious")]
+pub mod invidious_instances;
 #[cfg(feature = "jamendo")]
 pub mod jamendo;
 #[cfg(feature = "lastfm")]

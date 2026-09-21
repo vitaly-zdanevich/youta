@@ -22,6 +22,7 @@ mod cached_download;
 #[cfg(feature = "yt-dlp")]
 mod download_choice;
 mod end_pause;
+mod invidious_instances;
 mod manual_downloads;
 #[cfg(all(feature = "archive-org", feature = "yt-dlp", feature = "backend-mpv"))]
 mod original_download;
@@ -5179,6 +5180,9 @@ pub struct AppController {
     youtube_search_request: Option<SearchRequest>,
     youtube_provider_available: bool,
     youtube_provider_builder: Box<dyn YouTubeProviderBuilder>,
+    /// On-demand directory work, isolated from searches and playback.
+    #[cfg(feature = "invidious")]
+    invidious_instances: invidious_instances::InstanceDirectoryState,
     provider_requests: Option<Sender<ProviderRequest>>,
     provider_responses: Receiver<ProviderResponse>,
     provider_thread: Option<JoinHandle<()>>,
@@ -6521,6 +6525,8 @@ impl AppController {
             youtube_search_request,
             youtube_provider_available,
             youtube_provider_builder: Box::new(SystemYouTubeProviderBuilder),
+            #[cfg(feature = "invidious")]
+            invidious_instances: invidious_instances::InstanceDirectoryState::default(),
             provider_requests,
             provider_responses,
             provider_thread,
@@ -6999,6 +7005,7 @@ impl AppController {
     }
 
     fn open_youtube_setup(&mut self) {
+        self.dismiss_invidious_instance_picker();
         let selected_field = match self.config.providers.youtube_backend {
             YouTubeBackend::Invidious => YouTubeSetupField::InvidiousUrl,
             YouTubeBackend::Auto
@@ -7020,6 +7027,7 @@ impl AppController {
                 .map_or_else(String::new, ToString::to_string),
             api_key_path: self.config.credentials_file().display().to_string(),
             invidious_path: self.config.config_file().display().to_string(),
+            invidious_instances: None,
             validation_error: None,
         });
         self.view.search_editing = false;
@@ -7135,6 +7143,11 @@ impl AppController {
         let Some(popup) = self.view.youtube_setup_popup.as_ref() else {
             return;
         };
+        // Choosing an instance edits the draft; saving remains a separate step.
+        if popup.invidious_instances.is_some() {
+            self.confirm_invidious_instance();
+            return;
+        }
         let selected_field = popup.selected_field;
         let api_key = popup.api_key.trim().to_owned();
         let invidious_url = popup.invidious_url.trim().to_owned();
@@ -35337,6 +35350,7 @@ impl UiController for AppController {
                 }
             }
             UiAction::SelectYouTubeSetupField(field) => {
+                self.dismiss_invidious_instance_picker();
                 if let Some(popup) = self.view.youtube_setup_popup.as_mut() {
                     popup.selected_field = field;
                     popup.validation_error = None;
@@ -35358,8 +35372,14 @@ impl UiController for AppController {
             UiAction::OpenInvidiousInstances => {
                 self.open_external_url(INVIDIOUS_INSTANCES_URL);
             }
+            UiAction::OpenInvidiousInstancePicker => self.open_invidious_instance_picker(),
+            UiAction::MoveInvidiousInstance(delta) => self.move_invidious_instance(delta),
+            UiAction::SelectInvidiousInstance(index) => self.select_invidious_instance(index),
+            UiAction::ConfirmInvidiousInstance => self.confirm_invidious_instance(),
+            UiAction::DismissInvidiousInstancePicker => self.dismiss_invidious_instance_picker(),
             UiAction::SubmitYouTubeSetup => self.submit_youtube_setup(),
             UiAction::DismissYouTubeSetup => {
+                self.dismiss_invidious_instance_picker();
                 self.view.youtube_setup_popup = None;
                 self.view.status_line =
                     "YouTube provider setup cancelled; your selection was kept".to_owned();
@@ -35845,6 +35865,8 @@ impl UiController for AppController {
         if self.diagnostic_only {
             return;
         }
+        #[cfg(feature = "invidious")]
+        self.poll_invidious_instances();
         #[cfg(feature = "archive-org")]
         self.poll_archive_org_worker();
         #[cfg(feature = "commons-upload")]
@@ -71244,9 +71266,28 @@ mod tests {
                 .as_mut()
                 .expect("setup popup");
             popup.selected_field = YouTubeSetupField::InvidiousUrl;
-            popup.invidious_url = "https://invidious.example.test".to_owned();
+            popup.invidious_instances = Some(crate::view::InvidiousInstancePickerView {
+                instances: vec![crate::view::InvidiousInstanceView {
+                    label: "invidious.example.test".to_owned(),
+                    url: "https://invidious.example.test/".to_owned(),
+                }],
+                ..Default::default()
+            });
         }
 
+        // The first Enter chooses a candidate without changing durable state.
+        controller.dispatch(UiAction::SubmitYouTubeSetup);
+        let popup = controller
+            .view
+            .youtube_setup_popup
+            .as_ref()
+            .expect("URL draft");
+        assert_eq!(popup.invidious_url, "https://invidious.example.test/");
+        assert!(popup.invidious_instances.is_none());
+        assert!(!controller.youtube_provider_available);
+        assert!(!config_file.exists());
+
+        // The second Enter retains the existing save-and-retry behavior.
         controller.dispatch(UiAction::SubmitYouTubeSetup);
 
         assert!(controller.view.youtube_setup_popup.is_none());

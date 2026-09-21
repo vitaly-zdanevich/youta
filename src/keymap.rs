@@ -148,6 +148,90 @@ mod wire_tests {
     #[cfg(feature = "evernote")]
     use crate::view::{EvernoteNoteField, EvernoteNotePhase, EvernoteNotePopupView};
 
+    /// Choosing an instance edits the setup draft; only the closed picker permits Save.
+    #[test]
+    fn invidious_instance_picker_owns_setup_keys_without_saving() {
+        let mut view = ViewModel {
+            youtube_setup_popup: Some(crate::view::YouTubeSetupPopupView::default()),
+            ..ViewModel::default()
+        };
+        assert_eq!(
+            key_action(KeyPress::new(Key::F(4)), &view, None, None),
+            cfg!(feature = "invidious").then_some(UiAction::OpenInvidiousInstancePicker)
+        );
+        view.youtube_setup_popup
+            .as_mut()
+            .unwrap()
+            .invidious_instances = Some(crate::view::InvidiousInstancePickerView {
+            instances: vec![crate::view::InvidiousInstanceView {
+                label: "Fixture instance".to_owned(),
+                url: "https://video.example/".to_owned(),
+            }],
+            ..crate::view::InvidiousInstancePickerView::default()
+        });
+        for (key, picker_action, setup_action) in [
+            (
+                Key::Enter,
+                Some(UiAction::ConfirmInvidiousInstance),
+                Some(UiAction::SubmitYouTubeSetup),
+            ),
+            (
+                Key::Esc,
+                Some(UiAction::DismissInvidiousInstancePicker),
+                Some(UiAction::DismissYouTubeSetup),
+            ),
+            (Key::F(4), Some(UiAction::OpenInvidiousInstancePicker), None),
+            (
+                Key::Down,
+                Some(UiAction::MoveInvidiousInstance(1)),
+                Some(UiAction::SelectYouTubeSetupField(
+                    crate::view::YouTubeSetupField::InvidiousUrl,
+                )),
+            ),
+            (
+                Key::Up,
+                Some(UiAction::MoveInvidiousInstance(-1)),
+                Some(UiAction::SelectYouTubeSetupField(
+                    crate::view::YouTubeSetupField::InvidiousUrl,
+                )),
+            ),
+            (
+                Key::Char('a'),
+                None,
+                Some(UiAction::AppendYouTubeSetupCharacter('a')),
+            ),
+        ] {
+            assert_eq!(
+                key_action(KeyPress::new(key), &view, None, None),
+                if cfg!(feature = "invidious") {
+                    picker_action
+                } else {
+                    setup_action
+                }
+            );
+        }
+        let picker = view
+            .youtube_setup_popup
+            .as_mut()
+            .unwrap()
+            .invidious_instances
+            .as_mut()
+            .unwrap();
+        picker.loading = true;
+        assert_eq!(
+            key_action(KeyPress::new(Key::Enter), &view, None, None),
+            (!cfg!(feature = "invidious")).then_some(UiAction::SubmitYouTubeSetup)
+        );
+        view.youtube_setup_popup
+            .as_mut()
+            .unwrap()
+            .invidious_instances = None;
+        assert_eq!(
+            key_action(KeyPress::new(Key::Enter), &view, None, None),
+            Some(UiAction::SubmitYouTubeSetup)
+        );
+    }
+
     /// The window builds this JSON by hand in JavaScript, so the exact shape is
     /// part of the contract rather than an implementation detail of Serde.
     #[test]
@@ -2022,6 +2106,20 @@ fn unfiltered_key_action(
         };
     }
     if let Some(setup) = view.youtube_setup_popup.as_ref() {
+        if cfg!(feature = "invidious")
+            && let Some(picker) = setup.invidious_instances.as_ref()
+        {
+            let selectable =
+                !picker.loading && picker.error.is_none() && !picker.instances.is_empty();
+            return match key.key {
+                Key::Esc => Some(UiAction::DismissInvidiousInstancePicker),
+                Key::F(4) => Some(UiAction::OpenInvidiousInstancePicker),
+                Key::Up if selectable => Some(UiAction::MoveInvidiousInstance(-1)),
+                Key::Down if selectable => Some(UiAction::MoveInvidiousInstance(1)),
+                Key::Enter if selectable => Some(UiAction::ConfirmInvidiousInstance),
+                _ => None,
+            };
+        }
         let other_field = match setup.selected_field {
             YouTubeSetupField::ApiKey => YouTubeSetupField::InvidiousUrl,
             YouTubeSetupField::InvidiousUrl => YouTubeSetupField::ApiKey,
@@ -2032,6 +2130,7 @@ fn unfiltered_key_action(
             Key::F(1) => Some(UiAction::OpenYouTubeApiKeyGuide),
             Key::F(2) => Some(UiAction::OpenGoogleCloudCredentials),
             Key::F(3) => Some(UiAction::OpenInvidiousInstances),
+            Key::F(4) if cfg!(feature = "invidious") => Some(UiAction::OpenInvidiousInstancePicker),
             Key::Tab | Key::BackTab | Key::Up | Key::Down => {
                 Some(UiAction::SelectYouTubeSetupField(other_field))
             }

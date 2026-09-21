@@ -863,6 +863,16 @@ opens the official [Invidious instance
 list](https://docs.invidious.io/instances/). All three links also accept mouse
 clicks.
 
+With Invidious support enabled, `[F4] Choose instance` opens a dropdown and
+fetches the [official instance directory](https://api.invidious.io/instances.json)
+in the background, with an animated loading indicator. Only public HTTPS
+instances currently reported as API-capable are listed; directory status can
+lag, so a listed instance is not guaranteed to work. Use `↑`/`↓` and `Enter`, or
+click a row, to fill the URL field. Press `Enter` again to save and retry the
+search. `Esc` closes just the dropdown, and `[F4]` refreshes a completed or
+failed request. No directory request runs at startup. An empty list or network
+failure still leaves manual URLs available, including self-hosted instances.
+
 The provider selection and Invidious URL can be configured manually in
 `~/.config/youta/config.toml`:
 

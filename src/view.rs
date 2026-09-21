@@ -2000,6 +2000,30 @@ pub struct ProjectHistoryPopupView {
     pub scroll_offset: usize,
 }
 
+/// One public, API-capable candidate from the official Invidious directory.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InvidiousInstanceView {
+    /// Validated instance base URL, copied into the editable draft on selection.
+    pub url: String,
+    /// Human-readable domain and optional location.
+    pub label: String,
+}
+
+/// Transient on-demand directory dropdown; selecting never saves configuration.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct InvidiousInstancePickerView {
+    /// A bounded directory request is queued or running off the UI thread.
+    pub loading: bool,
+    /// ASCII animation frame advanced only while loading by the existing tick.
+    pub loading_frame: u8,
+    /// Directory candidates, not a guarantee of current instance availability.
+    pub instances: Vec<InvidiousInstanceView>,
+    /// Highlighted row, clamped to the available list.
+    pub selected: usize,
+    /// Request failure shown alongside the explicit retry action.
+    pub error: Option<String>,
+}
+
 /// Editable setup shown when a YouTube search needs provider credentials.
 ///
 /// The API key remains in controller-owned memory while the popup is open.
@@ -2012,6 +2036,8 @@ pub struct YouTubeSetupPopupView {
     pub api_key: String,
     /// Base URL of a user-selected Invidious instance.
     pub invidious_url: String,
+    /// Optional public-instance chooser, fetched only on explicit opening.
+    pub invidious_instances: Option<InvidiousInstancePickerView>,
     /// Exact private credentials path where an official API key is stored.
     pub api_key_path: String,
     /// Exact general configuration path where an Invidious URL is stored.
@@ -2027,6 +2053,7 @@ impl std::fmt::Debug for YouTubeSetupPopupView {
             .field("selected_field", &self.selected_field)
             .field("api_key", &"[REDACTED]")
             .field("invidious_url", &self.invidious_url)
+            .field("invidious_instances", &self.invidious_instances)
             .field("api_key_path", &self.api_key_path)
             .field("invidious_path", &self.invidious_path)
             .field("validation_error", &self.validation_error)
@@ -3870,6 +3897,16 @@ pub enum UiAction {
     OpenGoogleCloudCredentials,
     /// Open the official Invidious public-instance list.
     OpenInvidiousInstances,
+    /// Open or explicitly retry the on-demand public-instance dropdown.
+    OpenInvidiousInstancePicker,
+    /// Move the public-instance highlight by a signed row count.
+    MoveInvidiousInstance(i32),
+    /// Copy a clicked candidate into the URL draft without saving it.
+    SelectInvidiousInstance(usize),
+    /// Copy the highlighted candidate into the URL draft without saving it.
+    ConfirmInvidiousInstance,
+    /// Close only the dropdown, retaining the previous URL draft.
+    DismissInvidiousInstancePicker,
     /// Validate and save the selected YouTube provider configuration.
     SubmitYouTubeSetup,
     /// Close the YouTube setup popup without saving.
@@ -4339,6 +4376,7 @@ mod tests {
                 selected_field: YouTubeSetupField::ApiKey,
                 api_key: "AIzaSyTOTALLY_SECRET_API_KEY_000000000".to_owned(),
                 invidious_url: "https://inv.example.org/".to_owned(),
+                invidious_instances: None,
                 api_key_path: "/config/secrets/credentials.toml".to_owned(),
                 invidious_path: "/config/config.toml".to_owned(),
                 validation_error: None,
