@@ -13,6 +13,7 @@ import type {
 	S3UploadField,
 	SubscriptionPane,
 	SubscriptionsLayout,
+	YouTubeSetupField,
 } from './contract';
 
 /** Rust view::Screen spellings returned by the screen-metadata command. */
@@ -83,6 +84,7 @@ export type UnitUiAction =
 	| 'ConfirmChannelDownload'
 	| 'ConfirmDownloadedTrash'
 	| 'ConfirmGitHubIssueSubmission'
+	| 'ConfirmInvidiousInstance'
 	| 'ConfirmLocalMoveHere'
 	| 'ConfirmLocalTrash'
 	| 'ConfirmPodcastFeed'
@@ -111,6 +113,7 @@ export type UnitUiAction =
 	| 'DismissErrorPopup'
 	| 'DismissEvernoteCredentials'
 	| 'DismissEvernoteNote'
+	| 'DismissInvidiousInstancePicker'
 	| 'DismissLanShare'
 	| 'DismissLocalFilePopup'
 	| 'DismissPlaylistPopup'
@@ -152,6 +155,7 @@ export type UnitUiAction =
 	| 'OpenGentooYtDlpPackage'
 	| 'OpenGitHubIssueSubmissionTarget'
 	| 'OpenInBrowser'
+	| 'OpenInvidiousInstancePicker'
 	| 'OpenPlaylistPopup'
 	| 'OpenRssSubscriptionPopup'
 	| 'OpenS3Credentials'
@@ -160,6 +164,7 @@ export type UnitUiAction =
 	| 'OpenVideoQr'
 	| 'OpenYandexMusicAlbum'
 	| 'OpenYandexMusicArtist'
+	| 'OpenYouTubeProviderSettings'
 	| 'OpenYtDlpProject'
 	| 'RefreshSubscriptionVideos'
 	| 'RefreshWeb'
@@ -179,6 +184,7 @@ export type UnitUiAction =
 	| 'SubmitLocalRename'
 	| 'SubmitPreferences'
 	| 'SubmitS3Credentials'
+	| 'SubmitYouTubeSetup'
 	| 'ToggleArchiveUploadVideo'
 	| 'ToggleAutoplay'
 	| 'ToggleChannelAutoDownload'
@@ -228,6 +234,7 @@ export interface UiActionPayloads {
 	ChangeVolume: number;
 	ConfirmDownloadChoice: number;
 	FocusSubscriptionPane: SubscriptionPane;
+	MoveInvidiousInstance: number;
 	OpenCommonsCategorySuggestionAt: number;
 	OpenWikidataValue: string;
 	OpenYandexMusicAlbumById: string;
@@ -247,6 +254,7 @@ export interface UiActionPayloads {
 	SelectDownloadChoice: { generation: number; index: number; };
 	SelectDownloadQueueEntry: number;
 	SelectEvernoteNoteField: EvernoteNoteField;
+	SelectInvidiousInstance: number;
 	SelectLocalMoveDestination: number;
 	SelectPlaylistEditorField: PlaylistEditorField;
 	SelectPlaylistPopupRow: number;
@@ -256,6 +264,7 @@ export interface UiActionPayloads {
 	SelectS3UploadField: S3UploadField;
 	SelectSubscriptionItem: number;
 	SelectSubscriptionSource: number;
+	SelectYouTubeSetupField: YouTubeSetupField;
 	SetAudioQualityPopupScroll: number;
 	SetDetailsFocus: boolean;
 	SetDetailsScroll: number;

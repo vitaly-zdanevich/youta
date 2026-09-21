@@ -120,8 +120,74 @@
 		description: 'Complete fixture description.\nSecond paragraph remains visible.',
 		webpage_url: 'https://archive.org/details/fixture',
 	});
+	/** Exercise provider settings without providing a credential to the web-view fixture. */
+	async function checkProviderSettings() {
+		const preferences = { ...clone(defaults.PreferencesPopupView), youtube_provider_settings_supported: true };
+		snapshot({ preferences_popup: preferences });
+		await until(() => button('YouTube provider settings', dialog()), 'provider settings in Preferences');
+		await action('OpenYouTubeProviderSettings', () => button('YouTube provider settings', dialog()).click(), 'Preferences opens the shared provider editor');
+		const editor = { selected_field: 'ApiKey', api_key_length: 23, invidious_url_length: 0,
+			invidious_url: null, invidious_instances: null, validation_failed: false, from_preferences: true,
+			official_supported: true, invidious_supported: true };
+		snapshot({ preferences_popup: null, youtube_provider_editor: editor });
+		await until(() => dialog()?.textContent.includes('23 characters entered'), 'masked YouTube editor');
+		assert(document.querySelectorAll('[role=dialog]').length === 1, 'Preferences is parked while the provider child editor is open');
+		assert(!dialog().querySelector('input, textarea'), 'Provider drafts are not copied into browser text controls');
+		assert(button('Save', dialog()) && !button('Save and retry', dialog()), 'Preferences provider changes save without retrying a search');
+		await action({ SelectYouTubeSetupField: 'ApiKey' }, () => button('YouTube API key', dialog()).click(), 'API key field selection uses the shared reducer');
+		await key('k', { Char: 'k' });
+		await key('Backspace', 'Backspace');
+		await action({ SelectYouTubeSetupField: 'InvidiousUrl' }, () => button('Invidious instance URL', dialog()).click(), 'Manual Invidious editing remains available');
+		await action('OpenInvidiousInstancePicker', () => button('Choose instance', dialog()).click(), 'The instance directory loads only on request');
+		const picker = { loading: true, loading_frame: 0, instances: [], selected: 0, error: null };
+		snapshot({ youtube_provider_editor: { ...editor, selected_field: 'InvidiousUrl', invidious_instances: picker } });
+		await until(() => dialog()?.querySelector('[role=status]')?.textContent.includes('|'), 'first loading animation frame');
+		snapshot({ youtube_provider_editor: { ...editor, invidious_instances: { ...picker, loading_frame: 1 } } });
+		await until(() => dialog()?.querySelector('[role=status]')?.textContent.includes('/'), 'second loading animation frame');
+		assert(button('Save', dialog()).disabled, 'An open directory cannot accidentally save the provider draft');
+		await key('Escape', 'Esc');
+		await action('DismissInvidiousInstancePicker', () => button('Close instance list', dialog()).click(), 'Closing the chooser leaves the provider editor open');
+		snapshot({ youtube_provider_editor: { ...editor, invidious_instances: { ...picker, loading: false, error: 'Directory temporarily unavailable' } } });
+		await until(() => dialog()?.textContent.includes('Directory temporarily unavailable'), 'instance directory error');
+		await action('OpenInvidiousInstancePicker', () => button('Retry', dialog()).click(), 'Directory failure can be retried explicitly');
+		snapshot({ youtube_provider_editor: { ...editor, invidious_instances: { ...picker, loading: false } } });
+		await until(() => dialog()?.textContent.includes('No public instances are available'), 'empty instance directory');
+		const instances = Array.from({ length: 30 }, (_, index) => ({ url: `https://instance-${index}.example/`, label: `instance-${index}.example (Fixture)` }));
+		snapshot({ youtube_provider_editor: { ...editor, invidious_instances: { ...picker, loading: false, instances, selected: 29 } } });
+		const selectedInstance = await until(() => dialog()?.querySelector('[role=option][aria-selected=true]'), 'selected instance row');
+		await until(() => dialog()?.querySelector('[role=listbox]')?.scrollTop > 0, 'selected instance scrolls into the bounded list');
+		assert(selectedInstance.textContent.includes('instance-29.example'), 'The controller owns directory selection');
+		dialog().style.width = '260px';
+		dialog().style.maxHeight = '360px';
+		await until(() => dialog()?.clientWidth <= 260, 'narrow provider editor');
+		assert(dialog().scrollWidth <= dialog().clientWidth, 'The provider editor remains within a narrow window');
+		await key('ArrowUp', 'Up');
+		await key('Enter', 'Enter');
+		const selectionStart = calls.length;
+		await action({ SelectInvidiousInstance: 29 }, () => selectedInstance.click(), 'Clicking an instance fills the reducer draft');
+		assert(!calls.slice(selectionStart).some((call) => call.command === 'dispatch' && call.args.action === 'SubmitYouTubeSetup'), 'Instance selection does not automatically save');
+		snapshot({ youtube_provider_editor: { ...editor, selected_field: 'InvidiousUrl', invidious_url: instances[29].url, invidious_url_length: instances[29].url.length } });
+		await until(() => dialog()?.textContent.includes(instances[29].url), 'safe validated instance URL');
+		await action('SubmitYouTubeSetup', () => button('Save', dialog()).click(), 'Provider Save is a separate explicit action');
+		snapshot({ youtube_provider_editor: { ...editor, validation_failed: true, invidious_url_length: 41 } });
+		await until(() => dialog()?.querySelector('[role=alert]'), 'generic provider validation feedback');
+		assert(dialog().textContent.includes('41 characters entered'), 'Invalid manual URL contents stay masked in the web view');
+		await action('DismissYouTubeSetup', () => button('Cancel', dialog()).click(), 'Cancel returns through the shared reducer');
+		snapshot({ youtube_provider_editor: { ...editor, official_supported: false, from_preferences: false } });
+		await until(() => button('Save and retry', dialog()), 'search-origin setup retry action');
+		assert(!button('YouTube API key', dialog()), 'Builds without the official provider hide the API-key field');
+		snapshot({ youtube_provider_editor: { ...editor, invidious_supported: false } });
+		await until(() => !button('Choose instance', dialog()), 'feature-disabled Invidious chooser');
+		assert(!button('Invidious instance URL', dialog()), 'Builds without Invidious hide its manual field and directory');
+		snapshot({ youtube_provider_editor: null, preferences_popup: { ...preferences, youtube_provider_settings_supported: false } });
+		await until(() => dialog()?.textContent.includes('Preferences'), 'restored preferences');
+		assert(!button('YouTube provider settings', dialog()), 'Unsupported builds hide provider settings in Preferences');
+		snapshot({ preferences_popup: null });
+		await until(() => !dialog(), 'closed provider fixtures');
+	}
 	async function run() {
 		await until(() => document.querySelector('[title="Search archive.org"]'), 'Archive search');
+		await checkProviderSettings();
 		assert(!button('[Esc] Back'), 'Archive root hides Back when no return route exists');
 		const tabs = [...document.querySelectorAll('[aria-label=Sources] button')].map((node) => node.textContent);
 		assert(tabs.indexOf('archive.org') < tabs.indexOf('LibriVox'), 'Archive tab preserves source catalogue order');

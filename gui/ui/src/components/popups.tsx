@@ -46,6 +46,8 @@ import type {
   VideoQrPopupView,
   VideoSummaryPopupView,
   YouTubeCaptionsPopupView,
+	YouTubeProviderEditorView,
+	YouTubeSetupField,
   YtDlpForbiddenView,
   YtDlpVersionLookupView,
 } from "../contract";
@@ -1680,6 +1682,11 @@ export function PreferencesPopup({ popup, archiveSupported }: {
     >
       <Body>
         <div className="grid gap-[7px]">
+					{popup.youtube_provider_settings_supported ? (
+						<PopupButton onClick={() => void dispatch('OpenYouTubeProviderSettings')}>
+							YouTube provider settings
+						</PopupButton>
+					) : null}
           <label className="flex items-center justify-between gap-4">
             <span className="text-ink-dim">Save playback history</span>
             <PopupButton
@@ -2101,21 +2108,106 @@ export function LocalFilePopup({ popup }: { popup: LocalFilePopupView }) {
   );
 }
 
+/**
+ * Provider replacement without reflecting credentials into the web view.
+ * Button-shaped fields use App's existing sendKey path; the reducer owns every
+ * typed character, selected directory row, validation result and save decision.
+ */
+export function YouTubeProviderPopup({ editor }: { editor: YouTubeProviderEditorView }) {
+	const picker = editor.invidious_supported ? editor.invidious_instances : null;
+	const selected = useRef<HTMLButtonElement>(null);
+	useEffect(() => {
+		selected.current?.scrollIntoView({ block: 'nearest' });
+	}, [picker?.selected, picker?.instances]);
+	const fieldSummary = (length: number) => length === 0
+		? 'Empty' : `${length} character${length === 1 ? '' : 's'} entered`;
+	const fields: Array<[YouTubeSetupField, string, string]> = [];
+	if (editor.official_supported) fields.push(['ApiKey', 'YouTube API key', fieldSummary(editor.api_key_length)]);
+	if (editor.invidious_supported) fields.push(['InvidiousUrl', 'Invidious instance URL',
+		editor.invidious_url ?? fieldSummary(editor.invidious_url_length)]);
+	const dismiss = () => void dispatch(picker ? 'DismissInvidiousInstancePicker' : 'DismissYouTubeSetup');
+	return (
+		<Popup
+			title='YouTube provider settings'
+			layer={LAYER.credentialEditor}
+			width='620px'
+			onDismiss={dismiss}
+			dismissLabel={picker ? 'Close instance list' : 'Cancel'}
+			footer={<>
+				<PopupButton emphasis disabled={picker !== null || fields.length === 0}
+					onClick={() => void dispatch('SubmitYouTubeSetup')}>
+					{editor.from_preferences ? 'Save' : 'Save and retry'}
+				</PopupButton>
+				<PopupButton onClick={() => void dispatch('DismissYouTubeSetup')}>Cancel</PopupButton>
+			</>}
+		>
+			<Body><div className='grid min-w-0 gap-3'>
+				<p className='m-0 text-ink-dim'>
+					Type into the selected field; Ctrl+W deletes a word. Tab switches fields; Enter saves.
+					Credentials stay in the Youta process; API keys and unvalidated URLs are shown only as character counts.
+				</p>
+				{fields.map(([field, label, value]) => (
+					<button key={field} type='button' aria-label={label} disabled={picker !== null}
+						aria-pressed={editor.selected_field === field}
+						onMouseDown={(event) => event.preventDefault()}
+						onClick={() => void dispatch({ SelectYouTubeSetupField: field })}
+						className={`grid min-h-[42px] w-full min-w-0 gap-1 rounded-[5px] border px-[9px] py-[6px] text-left text-xs disabled:opacity-50 ${
+							editor.selected_field === field ? 'border-accent bg-raised' : 'border-line-strong hover:border-ink-faint'
+						}`}>
+						<span className='text-ink-faint'>{label}</span>
+						<span className='break-all'>{value}</span>
+					</button>
+				))}
+				{editor.invidious_supported ? (
+					<PopupButton onClick={() => void dispatch('OpenInvidiousInstancePicker')}>
+						{picker ? 'Retry' : 'Choose instance'}
+					</PopupButton>
+				) : null}
+				{picker ? (
+					<section aria-label='Public Invidious instances' className='grid min-w-0 gap-2 rounded-[5px] border border-line-strong p-2'>
+						<p className='m-0 text-ink-faint'>Up/Down selects; Enter fills the URL without saving. Esc closes this list; F4 retries.</p>
+						{picker.loading ? (
+							<p role='status' className='m-0 text-ink-dim'>
+								<span aria-hidden>{['|', '/', '-', '\\'][picker.loading_frame % 4]} </span>
+								Loading public instances…
+							</p>
+						) : picker.error ? (
+							<p role='alert' className='m-0 whitespace-pre-wrap break-words text-accent'>{picker.error}</p>
+						) : picker.instances.length === 0 ? (
+							<p className='m-0 text-ink-dim'>No public instances are available. Retry or enter a URL manually.</p>
+						) : (
+							<div role='listbox' aria-label='Invidious instances' className='max-h-[180px] min-w-0 overflow-y-auto'>
+								{picker.instances.map((instance, index) => (
+									<button key={instance.url} type='button' role='option' aria-selected={index === picker.selected}
+										ref={index === picker.selected ? selected : undefined}
+										onClick={() => void dispatch({ SelectInvidiousInstance: index })}
+										className={`block w-full break-all rounded px-2 py-1 text-left ${index === picker.selected ? 'bg-raised text-ink' : 'text-ink-dim hover:bg-raised'}`}>
+										{instance.label || instance.url}
+									</button>
+								))}
+							</div>
+						)}
+						<div className='flex flex-wrap gap-2'>
+							<PopupButton disabled={picker.loading || Boolean(picker.error) || picker.instances.length === 0}
+								onClick={() => void dispatch('ConfirmInvidiousInstance')}>Use selected instance</PopupButton>
+							<PopupButton onClick={() => void dispatch('DismissInvidiousInstancePicker')}>Close instance list</PopupButton>
+						</div>
+					</section>
+				) : null}
+				{editor.validation_failed ? <p role='alert' className='m-0 text-accent'>Could not save these provider settings. Check the selected field and try again.</p> : null}
+			</div></Body>
+		</Popup>
+	);
+}
+
 /** Which credential-bearing editor the reducer has opened. */
 export type CredentialEditor =
-  | "youtube_setup"
   | "yandex_music_setup"
   | "rss_subscription"
   | "private_note";
 
 const CREDENTIAL_EDITORS: Record<CredentialEditor, { title: string; body: string; dismiss: UnitUiAction }> =
   {
-    youtube_setup: {
-      title: "YouTube credentials needed",
-      body:
-        "YouTube asked for an API key or an Invidious instance. That editor holds a credential, so it is only offered by the terminal front-end — run youta in a terminal to fill it in, or set the key in the configuration file.",
-      dismiss: "DismissYouTubeSetup",
-    },
     yandex_music_setup: {
       title: "Yandex Music token needed",
       body:
@@ -2141,8 +2233,7 @@ const CREDENTIAL_EDITORS: Record<CredentialEditor, { title: string; body: string
  *
  * This is a real gap rather than a placeholder for one. These editors are
  * modal, so while one is open the shared keyboard map routes every key into it
- * — and the YouTube one opens by itself the first time a search runs without
- * credentials. Without this the window would look like an ordinary screen that
+ * rather than normal navigation. Without this the window would look like a screen that
  * had simply stopped responding. The reducer sends one bit for exactly this
  * reason; see the module header in `src/view.rs`.
  */

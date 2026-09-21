@@ -9404,6 +9404,8 @@ fn render_youtube_setup_popup(
     frame.render_widget(
         Paragraph::new(if picker.is_some() {
             "↑/↓ chooses; Enter fills the URL; Esc returns to manual setup."
+        } else if setup.from_preferences {
+            "Choose one metadata provider. Tab/↑/↓ switches; Enter saves."
         } else {
             "Choose one metadata provider. Tab/↑/↓ switches; Enter saves and retries."
         })
@@ -9412,7 +9414,8 @@ fn render_youtube_setup_popup(
         sections[0],
     );
 
-    let api_selected = setup.selected_field == YouTubeSetupField::ApiKey;
+    let api_supported = YouTubeSetupField::ApiKey.enabled();
+    let api_selected = api_supported && setup.selected_field == YouTubeSetupField::ApiKey;
     let api_key = masked_setup_value(
         &setup.api_key,
         usize::from(sections[1].width.saturating_sub(2)),
@@ -9437,7 +9440,9 @@ fn render_youtube_setup_popup(
                     } else {
                         theme.border
                     })
-                    .title(if api_selected {
+                    .title(if !api_supported {
+                        " YouTube API key (masked) - unavailable "
+                    } else if api_selected {
                         " ▶ YouTube API key (masked) "
                     } else {
                         " YouTube API key (masked) "
@@ -9445,11 +9450,15 @@ fn render_youtube_setup_popup(
             ),
         sections[1],
     );
-    hit_map
-        .youtube_setup_fields
-        .push((YouTubeSetupField::ApiKey, sections[1]));
+    if api_supported {
+        hit_map
+            .youtube_setup_fields
+            .push((YouTubeSetupField::ApiKey, sections[1]));
+    }
 
-    let invidious_selected = setup.selected_field == YouTubeSetupField::InvidiousUrl;
+    let invidious_supported = YouTubeSetupField::InvidiousUrl.enabled();
+    let invidious_selected =
+        invidious_supported && setup.selected_field == YouTubeSetupField::InvidiousUrl;
     let invidious = if setup.invidious_url.is_empty() {
         "https://your-invidious-instance.example".to_owned()
     } else {
@@ -9473,7 +9482,9 @@ fn render_youtube_setup_popup(
                     } else {
                         theme.border
                     })
-                    .title(if invidious_selected {
+                    .title(if !invidious_supported {
+                        " Invidious instance URL - unavailable "
+                    } else if invidious_selected {
                         " ▶ Invidious instance URL "
                     } else {
                         " Invidious instance URL "
@@ -9481,9 +9492,11 @@ fn render_youtube_setup_popup(
             ),
         sections[2],
     );
-    hit_map
-        .youtube_setup_fields
-        .push((YouTubeSetupField::InvidiousUrl, sections[2]));
+    if invidious_supported {
+        hit_map
+            .youtube_setup_fields
+            .push((YouTubeSetupField::InvidiousUrl, sections[2]));
+    }
 
     if cfg!(feature = "invidious") && sections[2].height > 0 {
         let label = "[F4] Choose instance";
@@ -9657,8 +9670,13 @@ fn render_youtube_setup_popup(
         sections[4],
     );
 
+    let save_label = if setup.from_preferences {
+        "[Enter] Save"
+    } else {
+        "[Enter] Save and retry"
+    };
     let buttons = [
-        ("[Enter] Save and retry", UiAction::SubmitYouTubeSetup),
+        (save_label, UiAction::SubmitYouTubeSetup),
         ("[Esc] Cancel", UiAction::DismissYouTubeSetup),
     ];
     let controls = buttons
@@ -9672,17 +9690,10 @@ fn render_youtube_setup_popup(
             .style(theme.accent),
         sections[5],
     );
-    let labels_width = buttons
-        .iter()
-        .map(|(label, _)| label.chars().count())
-        .sum::<usize>()
-        .saturating_add(3);
-    let labels_width = u16::try_from(labels_width).unwrap_or(u16::MAX);
-    let mut button_x = sections[5]
-        .x
-        .saturating_add(sections[5].width.saturating_sub(labels_width) / 2);
+    // Match Paragraph's center rounding when the label and area have different parity.
+    let mut button_x = centered_line_x(sections[5], terminal_text_width(&controls));
     for (label, action) in buttons {
-        let width = u16::try_from(label.chars().count()).unwrap_or(u16::MAX);
+        let width = terminal_text_width(label);
         hit_map.youtube_setup_buttons.push((
             action,
             Rect::new(button_x, sections[5].y, width, sections[5].height),
@@ -12641,6 +12652,28 @@ fn render_preferences_popup(
         ));
     }
 
+    if preferences.youtube_provider_settings_supported && sections[9].height > 1 {
+        // The summary row already reserves a blank line, so provider settings
+        // remain visible without taking space from narrow-terminal notes.
+        let provider_area = Rect::new(sections[9].x, sections[9].y + 1, sections[9].width, 1);
+        let label = button("Y", "YouTube provider", show_hotkeys);
+        frame.render_widget(
+            Paragraph::new(label.clone())
+                .style(theme.accent)
+                .alignment(Alignment::Center),
+            provider_area,
+        );
+        hit_map.preferences_buttons.push((
+            UiAction::OpenYouTubeProviderSettings,
+            Rect::new(
+                centered_line_x(provider_area, terminal_text_width(&label)),
+                provider_area.y,
+                terminal_text_width(&label).min(provider_area.width),
+                1,
+            ),
+        ));
+    }
+
     let mut notes = format!(
         "Will save UI, playback, persistence, and summary preferences in:\n{}\n\nCodex receives bounded captions only after Summarize; Youta does not read Codex credentials or save summaries.\nDrill-down is the low-width default. YouTube preparation is short-lived; folder sizes are measured lazily.\nThumbnail and terminal-image behavior follows build support. Bandcamp resolves audio only after playback.",
         preferences.config_path
@@ -14436,10 +14469,10 @@ fn mouse_action_unfiltered(
                     .find(|(_, area)| contains(*area, mouse.column, mouse.row))
                 {
                     Some(action.clone())
-                } else if let Some((field, _)) = hit_map
-                    .youtube_setup_fields
-                    .iter()
-                    .find(|(_, area)| contains(*area, mouse.column, mouse.row))
+                } else if let Some((field, _)) =
+                    hit_map.youtube_setup_fields.iter().find(|(field, area)| {
+                        field.enabled() && contains(*area, mouse.column, mouse.row)
+                    })
                 {
                     Some(UiAction::SelectYouTubeSetupField(*field))
                 } else {
@@ -18964,7 +18997,7 @@ for encoded, expected in json.load(sys.stdin):
         );
         assert_eq!(
             key_action(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &view),
-            Some(UiAction::SelectYouTubeSetupField(
+            cfg!(feature = "invidious").then_some(UiAction::SelectYouTubeSetupField(
                 YouTubeSetupField::InvidiousUrl
             ))
         );
@@ -19003,7 +19036,8 @@ for encoded, expected in json.load(sys.stdin):
             .selected_field = YouTubeSetupField::InvidiousUrl;
         assert_eq!(
             key_action(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &view),
-            Some(UiAction::SelectYouTubeSetupField(YouTubeSetupField::ApiKey))
+            cfg!(feature = "youtube-official")
+                .then_some(UiAction::SelectYouTubeSetupField(YouTubeSetupField::ApiKey))
         );
     }
 
@@ -22494,6 +22528,10 @@ for encoded, expected in json.load(sys.stdin):
         let mut terminal = Terminal::new(backend).expect("terminal");
         let view = ViewModel {
             preferences_popup: Some(PreferencesPopupView {
+                youtube_provider_settings_supported: cfg!(any(
+                    feature = "youtube-official",
+                    feature = "invidious"
+                )),
                 subscriptions_layout: SubscriptionsLayout::DrillDown,
                 save_playback_history: true,
                 skip_advertisement_chapters: true,
@@ -22559,6 +22597,25 @@ for encoded, expected in json.load(sys.stdin):
         #[cfg(feature = "bandcamp")]
         assert!(rendered.contains("[b] Bandcamp audio: Best available"));
         assert!(rendered.contains("[c] Video summaries: Codex CLI"));
+        assert_eq!(
+            rendered.contains("[Y] YouTube provider"),
+            cfg!(any(feature = "youtube-official", feature = "invidious"))
+        );
+        assert_eq!(
+            key_action(
+                KeyEvent::new(KeyCode::Char('Y'), KeyModifiers::SHIFT),
+                &view
+            ),
+            cfg!(any(feature = "youtube-official", feature = "invidious"))
+                .then_some(UiAction::OpenYouTubeProviderSettings)
+        );
+        assert_eq!(
+            hit_map
+                .preferences_buttons
+                .iter()
+                .any(|(action, _)| { *action == UiAction::OpenYouTubeProviderSettings }),
+            cfg!(any(feature = "youtube-official", feature = "invidious"))
+        );
         assert!(rendered.contains("UI, playback, persistence, and summary preferences"));
         assert!(rendered.contains("/tmp/youta/config.toml"));
         assert_eq!(
@@ -22860,6 +22917,11 @@ for encoded, expected in json.load(sys.stdin):
                 UiAction::CycleArchiveDownloadPreference,
                 "[F] archive.org format: Ask each time",
             ),
+            #[cfg(any(feature = "youtube-official", feature = "invidious"))]
+            (
+                UiAction::OpenYouTubeProviderSettings,
+                "[Y] YouTube provider",
+            ),
             (UiAction::SubmitPreferences, "[Enter] Save"),
             (UiAction::DismissPreferences, "[Esc] Cancel"),
         ] {
@@ -22909,8 +22971,34 @@ for encoded, expected in json.load(sys.stdin):
         assert!(!rendered.contains("[m] Download mode"));
         #[cfg(feature = "archive-org")]
         assert!(!rendered.contains("[F] archive.org format"));
+        assert_eq!(
+            rendered.contains("YouTube provider"),
+            cfg!(any(feature = "youtube-official", feature = "invidious"))
+        );
+        assert!(!rendered.contains("[Y] YouTube provider"));
 
         let mut view = view;
+        view.preferences_popup
+            .as_mut()
+            .expect("preferences")
+            .youtube_provider_settings_supported = false;
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw preferences without a YouTube metadata provider");
+        assert!(!rendered_text(&terminal).contains("YouTube provider"));
+        assert_eq!(
+            key_action(
+                KeyEvent::new(KeyCode::Char('Y'), KeyModifiers::SHIFT),
+                &view
+            ),
+            None
+        );
+        assert!(
+            hit_map
+                .preferences_buttons
+                .iter()
+                .all(|(action, _)| { *action != UiAction::OpenYouTubeProviderSettings })
+        );
         view.preferences_popup
             .as_mut()
             .expect("preferences")
@@ -22943,6 +23031,10 @@ for encoded, expected in json.load(sys.stdin):
         let mut terminal = Terminal::new(backend).expect("terminal");
         let view = ViewModel {
             preferences_popup: Some(PreferencesPopupView {
+                youtube_provider_settings_supported: cfg!(any(
+                    feature = "youtube-official",
+                    feature = "invidious"
+                )),
                 subscriptions_layout: SubscriptionsLayout::DrillDown,
                 save_playback_history: false,
                 skip_advertisement_chapters: true,
@@ -22978,6 +23070,8 @@ for encoded, expected in json.load(sys.stdin):
             "Subscriptions layout.",
             "Enter to save.",
             "Save playback history: off",
+            #[cfg(any(feature = "youtube-official", feature = "invidious"))]
+            "[Y] YouTube provider",
             "[Enter] Save   [Esc] Cancel",
         ] {
             assert!(
@@ -22992,6 +23086,10 @@ for encoded, expected in json.load(sys.stdin):
         let view = ViewModel {
             text_selection_mode: true,
             preferences_popup: Some(PreferencesPopupView {
+                youtube_provider_settings_supported: cfg!(any(
+                    feature = "youtube-official",
+                    feature = "invidious"
+                )),
                 subscriptions_layout: SubscriptionsLayout::DrillDown,
                 save_playback_history: true,
                 skip_advertisement_chapters: true,
@@ -32891,11 +32989,117 @@ prose 07:25 remains clickable but is not a chapter";
         assert!(normalized.contains("Error: API key was rejected"));
         assert!(normalized.contains("[Enter] Save and retry"));
         assert!(normalized.contains("[Esc] Cancel"));
-        assert_eq!(hit_map.youtube_setup_fields.len(), 2);
+        assert_eq!(
+            hit_map.youtube_setup_fields.len(),
+            usize::from(cfg!(feature = "youtube-official"))
+                + usize::from(cfg!(feature = "invidious"))
+        );
         assert_eq!(
             hit_map.youtube_setup_buttons.len(),
             5 + usize::from(cfg!(feature = "invidious"))
         );
+    }
+
+    /// Provider replacement masks the key and saves without implying a retried search.
+    #[test]
+    fn youtube_provider_preferences_setup_masks_secret_and_only_offers_save() {
+        let mut terminal = Terminal::new(TestBackend::new(140, 34)).expect("terminal");
+        let secret = "AIzaReplacementSecretNeverRender";
+        let view = ViewModel {
+            youtube_setup_popup: Some(YouTubeSetupPopupView {
+                from_preferences: true,
+                api_key: secret.to_owned(),
+                ..YouTubeSetupPopupView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw provider settings");
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("Enter saves."));
+        assert!(!rendered.contains("retries"));
+        assert!(!rendered.contains("Save and retry"));
+        assert!(!rendered.contains(secret));
+        assert!(rendered.contains(&"*".repeat(secret.len())));
+        let target = hit_map
+            .youtube_setup_buttons
+            .iter()
+            .find_map(|(action, area)| (*action == UiAction::SubmitYouTubeSetup).then_some(*area))
+            .expect("provider Save button");
+        let label = (target.x..target.right())
+            .map(|column| terminal.backend().buffer()[(column, target.y)].symbol())
+            .collect::<String>();
+        assert_eq!(label, "[Enter] Save");
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: target.x,
+                    row: target.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            Some(UiAction::SubmitYouTubeSetup)
+        );
+    }
+
+    /// Both setup origins keep clickable footer cells aligned across width parity.
+    #[test]
+    fn youtube_setup_footer_click_targets_match_both_labels_at_odd_and_even_widths() {
+        for from_preferences in [false, true] {
+            for width in [80, 81, 139, 140] {
+                let mut terminal = Terminal::new(TestBackend::new(width, 34)).expect("terminal");
+                let view = ViewModel {
+                    youtube_setup_popup: Some(YouTubeSetupPopupView {
+                        from_preferences,
+                        ..YouTubeSetupPopupView::default()
+                    }),
+                    ..ViewModel::default()
+                };
+                let mut hit_map = HitMap::default();
+                terminal
+                    .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+                    .expect("draw provider footer");
+                let save_label = if from_preferences {
+                    "[Enter] Save"
+                } else {
+                    "[Enter] Save and retry"
+                };
+                for (action, expected_label) in [
+                    (UiAction::SubmitYouTubeSetup, save_label),
+                    (UiAction::DismissYouTubeSetup, "[Esc] Cancel"),
+                ] {
+                    let target = hit_map
+                        .youtube_setup_buttons
+                        .iter()
+                        .find_map(|(candidate, area)| (*candidate == action).then_some(*area))
+                        .expect("visible setup footer button");
+                    let label = (target.x..target.right())
+                        .map(|column| terminal.backend().buffer()[(column, target.y)].symbol())
+                        .collect::<String>();
+                    assert_eq!(label, expected_label, "setup footer at width {width}");
+                    for column in [target.x, target.right() - 1] {
+                        assert_eq!(
+                            mouse_action(
+                                MouseEvent {
+                                    kind: MouseEventKind::Down(MouseButton::Left),
+                                    column,
+                                    row: target.y,
+                                    modifiers: KeyModifiers::NONE,
+                                },
+                                &hit_map,
+                                &view
+                            ),
+                            Some(action.clone())
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// The optional picker opens only through its button; manual URL editing remains.
@@ -32929,10 +33133,25 @@ prose 07:25 remains clickable but is not a chapter";
             cfg!(feature = "invidious")
         );
         assert!(!rendered.contains("Loading public instances"));
-        assert!(
+        assert_eq!(
             hits.youtube_setup_fields
                 .iter()
-                .any(|(field, _)| *field == YouTubeSetupField::InvidiousUrl)
+                .any(|(field, _)| *field == YouTubeSetupField::InvidiousUrl),
+            cfg!(feature = "invidious")
+        );
+        assert_eq!(
+            hits.youtube_setup_fields
+                .iter()
+                .any(|(field, _)| *field == YouTubeSetupField::ApiKey),
+            cfg!(feature = "youtube-official")
+        );
+        assert_eq!(
+            rendered.contains("YouTube API key (masked) - unavailable"),
+            !cfg!(feature = "youtube-official")
+        );
+        assert_eq!(
+            rendered.contains("Invidious instance URL - unavailable"),
+            !cfg!(feature = "invidious")
         );
         let target = hits
             .youtube_setup_buttons
@@ -36727,7 +36946,10 @@ prose 07:25 remains clickable but is not a chapter";
         };
         let hit_map = HitMap {
             tabs: vec![(Screen::History, Rect::new(0, 0, 20, 2))],
-            youtube_setup_fields: vec![(YouTubeSetupField::InvidiousUrl, Rect::new(20, 8, 60, 3))],
+            youtube_setup_fields: vec![
+                (YouTubeSetupField::ApiKey, Rect::new(20, 4, 60, 3)),
+                (YouTubeSetupField::InvidiousUrl, Rect::new(20, 8, 60, 3)),
+            ],
             youtube_setup_buttons: vec![
                 (UiAction::OpenYouTubeApiKeyGuide, Rect::new(20, 14, 60, 2)),
                 (
@@ -36747,9 +36969,21 @@ prose 07:25 remains clickable but is not a chapter";
         };
         assert_eq!(
             mouse_action(click_field, &hit_map, &view),
-            Some(UiAction::SelectYouTubeSetupField(
+            cfg!(feature = "invidious").then_some(UiAction::SelectYouTubeSetupField(
                 YouTubeSetupField::InvidiousUrl
             ))
+        );
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    row: 5,
+                    ..click_field
+                },
+                &hit_map,
+                &view
+            ),
+            cfg!(feature = "youtube-official")
+                .then_some(UiAction::SelectYouTubeSetupField(YouTubeSetupField::ApiKey))
         );
 
         let click_guide = MouseEvent {

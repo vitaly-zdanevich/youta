@@ -38,6 +38,7 @@ import {
   VideoQrPopup,
   VideoSummaryPopup,
   YouTubeCaptionsPopup,
+	YouTubeProviderPopup,
 } from "./components/popups";
 import { namedKey } from "./keys";
 import { sendKey } from "./ipc";
@@ -216,7 +217,7 @@ export function App() {
       {view.project_history_popup ? (
         <ProjectHistoryPopup popup={view.project_history_popup} />
       ) : null}
-      {view.youtube_setup_open ? <CredentialEditorNotice editor="youtube_setup" /> : null}
+		{view.youtube_provider_editor ? <YouTubeProviderPopup editor={view.youtube_provider_editor} /> : null}
       {view.yandex_music_setup_open ? (
         <CredentialEditorNotice editor="yandex_music_setup" />
       ) : null}

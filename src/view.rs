@@ -16,9 +16,11 @@
 //!
 //! Most secret-bearing [`ViewModel`] fields serialize as a bare `open` boolean
 //! rather than being skipped outright, through `serialize_editor_presence`.
-//! The Commons and Evernote editors use redacted projections containing only
-//! field lengths, focus, login method where relevant, and whether validation failed. Withholding even that
-//! state is worse than useless: these editors are modal, so while one is open
+//! The YouTube, Commons and Evernote editors use redacted projections containing
+//! field lengths, focus, login method where relevant, and whether validation failed.
+//! The YouTube editor additionally exposes validated, credential-free base URLs
+//! and the public instance directory; unchecked URL drafts stay private.
+//! Withholding even that state is worse than useless: these editors are modal, so while one is open
 //! the keyboard map routes every key into it. A frontend that cannot see that
 //! an editor exists renders an ordinary screen that silently ignores input —
 //! and the `YouTube` setup editor opens by itself the first time a search runs
@@ -620,6 +622,54 @@ fn serialize_editor_presence<T, S: serde::Serializer>(
     serializer.serialize_bool(editor.is_some())
 }
 
+/// Canonicalizes only an already credential-free HTTP(S) base URL for display.
+fn youtube_setup_public_url(value: &str) -> Option<String> {
+    let url = url::Url::parse(value).ok()?;
+    (matches!(url.scheme(), "http" | "https")
+        && url.host_str().is_some()
+        && !url.cannot_be_a_base()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none())
+    .then(|| url.to_string())
+}
+
+/// Publishes masked editing state, never keys, unchecked drafts, paths or validation text.
+fn serialize_youtube_provider_editor<S: serde::Serializer>(
+    editor: &Option<YouTubeSetupPopupView>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    #[derive(Serialize)]
+    struct RedactedYouTubeProviderEditor<'a> {
+        selected_field: YouTubeSetupField,
+        api_key_length: usize,
+        invidious_url_length: usize,
+        invidious_url: Option<String>,
+        invidious_instances: Option<&'a InvidiousInstancePickerView>,
+        validation_failed: bool,
+        from_preferences: bool,
+        official_supported: bool,
+        invidious_supported: bool,
+    }
+
+    let Some(editor) = editor else {
+        return serializer.serialize_none();
+    };
+    RedactedYouTubeProviderEditor {
+        selected_field: editor.selected_field,
+        api_key_length: editor.api_key.chars().count(),
+        invidious_url_length: editor.invidious_url.chars().count(),
+        invidious_url: youtube_setup_public_url(&editor.invidious_url),
+        invidious_instances: editor.invidious_instances.as_ref(),
+        validation_failed: editor.validation_error.is_some(),
+        from_preferences: editor.from_preferences,
+        official_supported: YouTubeSetupField::ApiKey.enabled(),
+        invidious_supported: YouTubeSetupField::InvidiousUrl.enabled(),
+    }
+    .serialize(serializer)
+}
+
 /// Serializes only the non-secret shape needed to draw the Commons editor.
 #[cfg(feature = "commons-upload")]
 fn serialize_commons_credentials_editor<S: serde::Serializer>(
@@ -1034,6 +1084,8 @@ pub struct DownloadQueuePopupView {
 /// Focused in-app editor for preferences that are implemented at runtime.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct PreferencesPopupView {
+    /// Whether this build can edit an official YouTube or Invidious provider.
+    pub youtube_provider_settings_supported: bool,
     /// Draft Subscriptions layout saved only when the user confirms.
     pub subscriptions_layout: SubscriptionsLayout,
     /// Draft playback-history saving policy saved only on confirmation.
@@ -2001,7 +2053,7 @@ pub struct ProjectHistoryPopupView {
 }
 
 /// One public, API-capable candidate from the official Invidious directory.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct InvidiousInstanceView {
     /// Validated instance base URL, copied into the editable draft on selection.
     pub url: String,
@@ -2010,7 +2062,7 @@ pub struct InvidiousInstanceView {
 }
 
 /// Transient on-demand directory dropdown; selecting never saves configuration.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct InvidiousInstancePickerView {
     /// A bounded directory request is queued or running off the UI thread.
     pub loading: bool,
@@ -2024,12 +2076,14 @@ pub struct InvidiousInstancePickerView {
     pub error: Option<String>,
 }
 
-/// Editable setup shown when a YouTube search needs provider credentials.
+/// Editable provider setup opened automatically or explicitly from Preferences.
 ///
 /// The API key remains in controller-owned memory while the popup is open.
 /// Rendering always masks it, including in test and alternate-screen buffers.
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct YouTubeSetupPopupView {
+    /// Return to the parked Preferences draft instead of retrying an operation.
+    pub from_preferences: bool,
     /// Input currently receiving keyboard characters.
     pub selected_field: YouTubeSetupField,
     /// YouTube Data API key. The renderer never displays this value directly.
@@ -2050,6 +2104,7 @@ impl std::fmt::Debug for YouTubeSetupPopupView {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("YouTubeSetupPopupView")
+            .field("from_preferences", &self.from_preferences)
             .field("selected_field", &self.selected_field)
             .field("api_key", &"[REDACTED]")
             .field("invidious_url", &self.invidious_url)
@@ -2555,6 +2610,17 @@ pub enum YouTubeSetupField {
     InvidiousUrl,
 }
 
+impl YouTubeSetupField {
+    /// Whether the compiled provider can accept a value from this editor field.
+    #[must_use]
+    pub const fn enabled(self) -> bool {
+        match self {
+            Self::ApiKey => cfg!(feature = "youtube-official"),
+            Self::InvidiousUrl => cfg!(feature = "invidious"),
+        }
+    }
+}
+
 /// Progress and completion information for one supervised media download.
 ///
 /// Only one download can be active at a time. The controller owns successful
@@ -2837,11 +2903,11 @@ pub struct ViewModel {
     #[cfg(feature = "lan-sharing")]
     pub podcast_feed_options_popup: Option<PodcastFeedOptionsPopupView>,
     /// Editable provider setup shown after an unavailable YouTube operation.
-    // Redacted: this editor holds a credential or private text, so only the one
-    // bit saying it is open crosses. See the module header.
+    // The separate projection never serializes the stored key, unchecked URL
+    // draft, file paths or arbitrary validation errors. See the module header.
     #[serde(
-        rename = "youtube_setup_open",
-        serialize_with = "serialize_editor_presence"
+        rename = "youtube_provider_editor",
+        serialize_with = "serialize_youtube_provider_editor"
     )]
     pub youtube_setup_popup: Option<YouTubeSetupPopupView>,
     /// Editable OAuth-token setup for the optional Yandex Music source.
@@ -3883,6 +3949,8 @@ pub enum UiAction {
     OpenGitHubIssueSubmissionTarget,
     /// Copy the report and open the repository's new-issue page.
     CopyAndOpenGitHubIssue,
+    /// Edit the YouTube provider while preserving the current Preferences draft.
+    OpenYouTubeProviderSettings,
     /// Select the credential field edited by the YouTube setup popup.
     SelectYouTubeSetupField(YouTubeSetupField),
     /// Add one printable character to the selected YouTube setup field.
@@ -4392,6 +4460,7 @@ mod tests {
     fn view_holding_every_secret() -> ViewModel {
         ViewModel {
             youtube_setup_popup: Some(YouTubeSetupPopupView {
+                from_preferences: false,
                 selected_field: YouTubeSetupField::ApiKey,
                 api_key: "AIzaSyTOTALLY_SECRET_API_KEY_000000000".to_owned(),
                 invidious_url: "https://inv.example.org/".to_owned(),
@@ -4578,6 +4647,63 @@ mod tests {
         }
     }
 
+    /// The window receives only masked field shape and validated public editor state.
+    #[test]
+    fn youtube_provider_editor_projection_never_exposes_keys_paths_or_validation_text() {
+        let mut view = view_holding_every_secret();
+        let popup = view.youtube_setup_popup.as_mut().unwrap();
+        popup.from_preferences = true;
+        popup.validation_error = Some("PRIVATE_VALIDATION_TEXT".to_owned());
+        let key_length = popup.api_key.chars().count();
+        let encoded = serde_json::to_value(&view).unwrap();
+        assert_eq!(
+            encoded["youtube_provider_editor"],
+            serde_json::json!({
+                "selected_field": "ApiKey",
+                "api_key_length": key_length,
+                "invidious_url_length": "https://inv.example.org/".len(),
+                "invidious_url": "https://inv.example.org/",
+                "invidious_instances": null,
+                "validation_failed": true,
+                "from_preferences": true,
+                "official_supported": cfg!(feature = "youtube-official"),
+                "invidious_supported": cfg!(feature = "invidious"),
+            })
+        );
+        for excluded in [
+            "youtube_setup_open",
+            "youtube_setup_popup",
+            "PRIVATE_VALIDATION_TEXT",
+            "/config/",
+        ] {
+            assert!(!encoded.to_string().contains(excluded));
+        }
+        let closed = serde_json::to_value(ViewModel::default()).unwrap();
+        assert!(closed["youtube_provider_editor"].is_null());
+    }
+
+    /// Manual instance drafts remain private until they form a credential-free base URL.
+    #[test]
+    fn youtube_provider_editor_projection_withholds_unchecked_instance_drafts() {
+        for draft in [
+            "unfinished-private-draft",
+            "https://user:private-password@example.test/",
+            "https://example.test/?token=private-query",
+            "https://example.test/#private-fragment",
+            "file:///private-path",
+        ] {
+            let mut view = view_holding_every_secret();
+            view.youtube_setup_popup.as_mut().unwrap().invidious_url = draft.to_owned();
+            let encoded = serde_json::to_value(&view).unwrap();
+            assert!(encoded["youtube_provider_editor"]["invidious_url"].is_null());
+            assert_eq!(
+                encoded["youtube_provider_editor"]["invidious_url_length"],
+                draft.chars().count()
+            );
+            assert!(!encoded.to_string().contains(draft));
+        }
+    }
+
     /// The one bit a frontend needs is the one bit it gets.
     ///
     /// These editors are modal: while one is open the keyboard map sends every
@@ -4593,7 +4719,6 @@ mod tests {
             serde_json::to_value(ViewModel::default()).expect("the view model must serialize");
 
         for marker in [
-            "youtube_setup_open",
             "yandex_music_setup_open",
             "rss_subscription_open",
             "private_note_open",

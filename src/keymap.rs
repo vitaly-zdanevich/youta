@@ -148,6 +148,39 @@ mod wire_tests {
     #[cfg(feature = "evernote")]
     use crate::view::{EvernoteNoteField, EvernoteNotePhase, EvernoteNotePopupView};
 
+    /// Switching fields must not offer a metadata backend omitted from this build.
+    #[test]
+    fn youtube_setup_field_switches_only_to_compiled_providers() {
+        use crate::view::{YouTubeSetupField, YouTubeSetupPopupView};
+
+        for (selected_field, target, supported) in [
+            (
+                YouTubeSetupField::ApiKey,
+                YouTubeSetupField::InvidiousUrl,
+                cfg!(feature = "invidious"),
+            ),
+            (
+                YouTubeSetupField::InvidiousUrl,
+                YouTubeSetupField::ApiKey,
+                cfg!(feature = "youtube-official"),
+            ),
+        ] {
+            let view = ViewModel {
+                youtube_setup_popup: Some(YouTubeSetupPopupView {
+                    selected_field,
+                    ..YouTubeSetupPopupView::default()
+                }),
+                ..ViewModel::default()
+            };
+            for key in [Key::Tab, Key::BackTab, Key::Up, Key::Down] {
+                assert_eq!(
+                    key_action(KeyPress::new(key), &view, None, None),
+                    supported.then_some(UiAction::SelectYouTubeSetupField(target))
+                );
+            }
+        }
+    }
+
     /// Choosing an instance edits the setup draft; only the closed picker permits Save.
     #[test]
     fn invidious_instance_picker_owns_setup_keys_without_saving() {
@@ -184,14 +217,14 @@ mod wire_tests {
             (
                 Key::Down,
                 Some(UiAction::MoveInvidiousInstance(1)),
-                Some(UiAction::SelectYouTubeSetupField(
+                cfg!(feature = "invidious").then_some(UiAction::SelectYouTubeSetupField(
                     crate::view::YouTubeSetupField::InvidiousUrl,
                 )),
             ),
             (
                 Key::Up,
                 Some(UiAction::MoveInvidiousInstance(-1)),
-                Some(UiAction::SelectYouTubeSetupField(
+                cfg!(feature = "invidious").then_some(UiAction::SelectYouTubeSetupField(
                     crate::view::YouTubeSetupField::InvidiousUrl,
                 )),
             ),
@@ -2031,6 +2064,9 @@ fn unfiltered_key_action(
                 Some(UiAction::ToggleNyanCatSeekbar)
             }
             Key::Char('y') => Some(UiAction::ToggleYouTubePrewarm),
+            Key::Char('Y') if preferences.youtube_provider_settings_supported && !key.chorded() => {
+                Some(UiAction::OpenYouTubeProviderSettings)
+            }
             Key::Char('e') if preferences.auto_download_supported => {
                 Some(UiAction::ToggleHourlyAutoDownload)
             }
@@ -2131,9 +2167,9 @@ fn unfiltered_key_action(
             Key::F(2) => Some(UiAction::OpenGoogleCloudCredentials),
             Key::F(3) => Some(UiAction::OpenInvidiousInstances),
             Key::F(4) if cfg!(feature = "invidious") => Some(UiAction::OpenInvidiousInstancePicker),
-            Key::Tab | Key::BackTab | Key::Up | Key::Down => {
-                Some(UiAction::SelectYouTubeSetupField(other_field))
-            }
+            Key::Tab | Key::BackTab | Key::Up | Key::Down => other_field
+                .enabled()
+                .then_some(UiAction::SelectYouTubeSetupField(other_field)),
             Key::Backspace => Some(UiAction::DeleteYouTubeSetupCharacter),
             Key::Char('w' | 'W') if is_delete_previous_word_key(key) => {
                 Some(UiAction::DeleteYouTubeSetupWord)

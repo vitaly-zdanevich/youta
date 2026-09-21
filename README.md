@@ -847,8 +847,8 @@ youta extractors              # list extractors reported by installed yt-dlp
 
 On the first YouTube search without a configured metadata provider, Youta opens
 a setup popup where the user can enter
-either a YouTube Data API key or an Invidious instance URL. The popup shows the
-exact destination before saving: API keys go to
+either a YouTube Data API key or an Invidious instance URL. The terminal popup
+shows the exact destination before saving: API keys go to
 `~/.config/youta/secrets/credentials.toml`, while an Invidious instance URL
 goes to `~/.config/youta/config.toml`. On Unix, Youta creates private
 directories with mode `0700` and files with mode `0600`; stored keys remain
@@ -872,6 +872,16 @@ click a row, to fill the URL field. Press `Enter` again to save and retry the
 search. `Esc` closes just the dropdown, and `[F4]` refreshes a completed or
 failed request. No directory request runs at startup. An empty list or network
 failure still leaves manual URLs available, including self-hosted instances.
+
+To replace an existing key or switch instances, open Preferences with `p` or
+`F7`, then choose **YouTube provider** (`Y` in the terminal). The same editor and
+on-demand instance dropdown are available in the desktop window. The API-key
+field starts empty and stays masked; the existing key is never copied into it.
+Selecting a directory entry changes only the draft. **Save** applies the chosen
+provider and returns to the unchanged Preferences draft without starting a
+search; **Cancel** returns without changing the provider. Other Preferences
+changes still need their own Save. Providers omitted from a build are disabled.
+Environment overrides continue to prevent saving values they would shadow.
 
 The provider selection and Invidious URL can be configured manually in
 `~/.config/youta/config.toml`:
@@ -992,11 +1002,14 @@ ends Youta and playback; the tray does not keep it running. The Subscriptions
 layout preference is shared with the terminal, with room to show sources,
 items, and Details together.
 
-Four editors remain terminal-only: the YouTube API key, Yandex Music OAuth
-token, RSS feed URL, and private notes. Their contents never leave the player
-process. The desktop shows a notice with a dismissal action while one is open,
-including automatic YouTube setup on a first search without credentials. Use
-the terminal front-end or configuration files for those values.
+Three editors remain terminal-only: the Yandex Music OAuth token, RSS feed URL,
+and private notes. Their contents never leave the player process. The desktop
+shows a notice with a dismissal action while one is open. Use the terminal
+front-end or configuration files for those values. YouTube provider setup is
+available in both interfaces, including on a first search without credentials.
+Its desktop projection contains only masked field lengths, validated
+credential-free instance URLs, public directory entries, and validation state;
+API keys, unchecked URL drafts, credential paths, and raw errors stay in Rust.
 
 <details>
 <summary>Desktop implementation and security boundaries</summary>

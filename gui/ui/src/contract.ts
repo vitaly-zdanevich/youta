@@ -477,6 +477,8 @@ export interface DownloadChoicePopupView {
 
 /** The runtime preferences editor. Values are drafts until it is submitted. */
 export interface PreferencesPopupView {
+	/** Whether either configurable YouTube provider is compiled into this build. */
+	youtube_provider_settings_supported: boolean;
   subscriptions_layout: string;
   save_playback_history: boolean;
   video_summary_backend: "off" | "codex";
@@ -929,9 +931,8 @@ export interface ViewModel {
   playlist_popup: PlaylistPopupView | null;
   queue_popup: QueuePopupView | null;
   local_file_popup: LocalFilePopupView | null;
-  // Most credential-bearing editors cross as one bit. Commons and Evernote
-  // have redacted projections so the window can draw controls without secrets.
-  youtube_setup_open: boolean;
+  // Redacted projections expose editor controls without returning credentials.
+	youtube_provider_editor: YouTubeProviderEditorView | null;
   yandex_music_setup_open: boolean;
   commons_upload_supported: boolean;
   commons_upload_available: boolean;
@@ -955,6 +956,38 @@ export interface ViewModel {
   search_animation_frame: number;
   local_fingerprint_animation_frame: number;
   playback_start_animation_frame: number;
+}
+
+/** Exact reducer field tags; typed values stay in the native process. */
+export type YouTubeSetupField = 'ApiKey' | 'InvidiousUrl';
+
+/** A validated public directory entry, never a browser-fetched destination. */
+export interface InvidiousInstanceView {
+	url: string;
+	label: string;
+}
+
+/** On-demand directory state, including the shared tick's loading animation. */
+export interface InvidiousInstancePickerView {
+	loading: boolean;
+	loading_frame: number;
+	instances: InvidiousInstanceView[];
+	selected: number;
+	error: string | null;
+}
+
+/** Safe provider controls: keys and invalid URL drafts are represented by length only. */
+export interface YouTubeProviderEditorView {
+	selected_field: YouTubeSetupField;
+	api_key_length: number;
+	invidious_url_length: number;
+	/** Only a validated credential-free HTTP(S) base URL may be displayed. */
+	invidious_url: string | null;
+	invidious_instances: InvidiousInstancePickerView | null;
+	validation_failed: boolean;
+	from_preferences: boolean;
+	official_supported: boolean;
+	invidious_supported: boolean;
 }
 
 /** The high-frequency group carried on its own channel. */

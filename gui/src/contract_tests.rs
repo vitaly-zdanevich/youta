@@ -316,6 +316,7 @@ fn preferences() -> PreferencesPopupView {
         nyan_cat_seekbar: true,
         nyan_cat_supported: true,
         youtube_prewarm: false,
+        youtube_provider_settings_supported: true,
         download_new_episodes_every_hour: true,
         download_mode: youta::config::DownloadMode::AskEachTime,
         archive_download_preference: youta::config::ArchiveDownloadPreference::AskEachTime,
@@ -373,6 +374,30 @@ fn the_typescript_contract_names_only_fields_the_reducer_emits() {
     let view = ViewModel::default();
     let mut emitted: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
     emitted.insert("ViewModel", emitted_keys(&view));
+    let provider = serde_json::to_value(ViewModel {
+        youtube_setup_popup: Some(youta::view::YouTubeSetupPopupView {
+            invidious_instances: Some(youta::view::InvidiousInstancePickerView {
+                instances: vec![youta::view::InvidiousInstanceView {
+                    url: "https://instance.example/".to_owned(),
+                    label: "instance.example".to_owned(),
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..ViewModel::default()
+    })
+    .expect("redacted YouTube provider editor");
+    let provider = &provider["youtube_provider_editor"];
+    emitted.insert("YouTubeProviderEditorView", emitted_keys(provider));
+    emitted.insert(
+        "InvidiousInstancePickerView",
+        emitted_keys(&provider["invidious_instances"]),
+    );
+    emitted.insert(
+        "InvidiousInstanceView",
+        emitted_keys(&provider["invidious_instances"]["instances"][0]),
+    );
     emitted.insert("PopupGeometry", emitted_keys(&PopupGeometry::default()));
     emitted.insert("ScrollGeometry", emitted_keys(&ScrollGeometry::default()));
     emitted.insert("PlaybackStatus", emitted_keys(&view.playback));

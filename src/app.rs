@@ -5180,6 +5180,8 @@ pub struct AppController {
     youtube_search_request: Option<SearchRequest>,
     youtube_provider_available: bool,
     youtube_provider_builder: Box<dyn YouTubeProviderBuilder>,
+    /// Parent draft parked while the provider editor owns the modal surface.
+    youtube_setup_preferences: Option<PreferencesPopupView>,
     /// On-demand directory work, isolated from searches and playback.
     #[cfg(feature = "invidious")]
     invidious_instances: invidious_instances::InstanceDirectoryState,
@@ -6525,6 +6527,7 @@ impl AppController {
             youtube_search_request,
             youtube_provider_available,
             youtube_provider_builder: Box::new(SystemYouTubeProviderBuilder),
+            youtube_setup_preferences: None,
             #[cfg(feature = "invidious")]
             invidious_instances: invidious_instances::InstanceDirectoryState::default(),
             provider_requests,
@@ -7004,6 +7007,7 @@ impl AppController {
         }
     }
 
+    /// Opens the existing editor without exposing a previously stored API key.
     fn open_youtube_setup(&mut self) {
         self.dismiss_invidious_instance_picker();
         let selected_field = match self.config.providers.youtube_backend {
@@ -7016,7 +7020,19 @@ impl AppController {
             }
             YouTubeBackend::Official | YouTubeBackend::Auto => YouTubeSetupField::ApiKey,
         };
+        let selected_field = if !selected_field.enabled() {
+            if YouTubeSetupField::ApiKey.enabled() {
+                YouTubeSetupField::ApiKey
+            } else if YouTubeSetupField::InvidiousUrl.enabled() {
+                YouTubeSetupField::InvidiousUrl
+            } else {
+                selected_field
+            }
+        } else {
+            selected_field
+        };
         self.view.youtube_setup_popup = Some(YouTubeSetupPopupView {
+            from_preferences: self.youtube_setup_preferences.is_some(),
             selected_field,
             api_key: String::new(),
             invidious_url: self
@@ -7033,6 +7049,28 @@ impl AppController {
         self.view.search_editing = false;
         self.view.status_line =
             "Choose a YouTube API key or an Invidious instance in the setup popup".to_owned();
+    }
+
+    /// Parks unsaved preferences so the credential editor is the only active modal.
+    fn open_youtube_provider_settings(&mut self) {
+        if !YouTubeSetupField::ApiKey.enabled() && !YouTubeSetupField::InvidiousUrl.enabled() {
+            return;
+        }
+        let Some(preferences) = self.view.preferences_popup.take() else {
+            return;
+        };
+        self.youtube_setup_preferences = Some(preferences);
+        self.open_youtube_setup();
+    }
+
+    /// Restores the exact unsaved parent draft without persisting any preferences.
+    fn restore_youtube_setup_preferences(&mut self) -> bool {
+        if let Some(preferences) = self.youtube_setup_preferences.take() {
+            self.view.preferences_popup = Some(preferences);
+            true
+        } else {
+            false
+        }
     }
 
     fn append_youtube_setup_character(&mut self, character: char) {
@@ -7149,6 +7187,12 @@ impl AppController {
             return;
         }
         let selected_field = popup.selected_field;
+        if !selected_field.enabled() {
+            self.set_youtube_setup_error(
+                "The selected YouTube provider is unavailable in this build",
+            );
+            return;
+        }
         let api_key = popup.api_key.trim().to_owned();
         let invidious_url = popup.invidious_url.trim().to_owned();
 
@@ -7208,15 +7252,41 @@ impl AppController {
 
         // The supervisor publishes one shared replacement to both lanes, but
         // calls that already cloned the old provider may still complete. Bump
-        // every YouTube-owned generation before retrying so those responses
-        // cannot repopulate caches or restore an obsolete continuation chain.
-        self.search_generation = self.search_generation.wrapping_add(1);
-        self.subscription_generation = self.subscription_generation.wrapping_add(1);
-        self.clear_subscription_loading_state();
+        // every YouTube-owned generation so those responses cannot repopulate
+        // caches or restore an obsolete continuation chain. Preferences can
+        // open over another provider's search, scan or resolution: its shared
+        // generation must survive because this save does not retry that work.
+        let from_preferences = self.youtube_setup_preferences.is_some();
+        let preserve_other_search =
+            from_preferences && self.view.search_activity != Some(SearchActivity::YouTube);
+        if !preserve_other_search {
+            self.search_generation = self.search_generation.wrapping_add(1);
+            self.finish_search_activity(SearchActivity::YouTube);
+        }
+        // RSS and YouTube item pages share one route generation. Entering an
+        // RSS route already invalidated earlier YouTube pages, so its current
+        // request and loading state must survive a Preferences-origin save.
+        #[cfg(feature = "rss")]
+        let preserve_rss_subscription = from_preferences
+            && self.active_subscription_rss_url.is_some()
+            && self.active_subscription_channel_id.is_none();
+        #[cfg(not(feature = "rss"))]
+        let preserve_rss_subscription = false;
+        if !preserve_rss_subscription {
+            self.subscription_generation = self.subscription_generation.wrapping_add(1);
+            self.clear_subscription_loading_state();
+            self.subscription_automatic_prefetch_count = 0;
+            self.subscription_viewport_end = None;
+        }
         self.pending_subscription_refresh = None;
-        self.subscription_automatic_prefetch_count = 0;
-        self.subscription_viewport_end = None;
-        self.invalidate_subscription_video_metadata_ownership();
+        if from_preferences {
+            // Video Details are YouTube-owned, but Wikidata enriches other
+            // providers too. Saving here does not change the visible identity.
+            self.details_generation = self.details_generation.wrapping_add(1);
+            self.clear_scheduled_subscription_video_metadata();
+        } else {
+            self.invalidate_subscription_video_metadata_ownership();
+        }
         self.youtube_channel_statistics_mode = channel_statistics_mode;
         self.youtube_provider_generation = self.youtube_provider_generation.wrapping_add(1);
         self.channel_subscriber_cache.clear();
@@ -7237,11 +7307,25 @@ impl AppController {
         self.pending_channel_details.clear();
         self.channel_details_generation = self.channel_details_generation.wrapping_add(1);
         self.scheduled_channel_details = None;
-        self.subscription_video_cache.clear();
-        self.subscription_cache_order.clear();
+        if from_preferences {
+            // RSS cache keys are absolute HTTP(S) feed URLs; YouTube keys are
+            // opaque channel IDs. Preserve feeds, including inactive ones.
+            self.subscription_video_cache.retain(|source_id, _| {
+                source_id.starts_with("http://") || source_id.starts_with("https://")
+            });
+            self.subscription_cache_order
+                .retain(|source_id| self.subscription_video_cache.contains_key(source_id));
+        } else {
+            self.subscription_video_cache.clear();
+            self.subscription_cache_order.clear();
+        }
         self.youtube_provider_available = true;
         self.view.youtube_setup_popup = None;
-        if self.view.screen == Screen::Subscriptions {
+        self.dismiss_invidious_instance_picker();
+        if self.restore_youtube_setup_preferences() {
+            self.view.status_line =
+                format!("Using {provider_name}; returned to unsaved preferences");
+        } else if self.view.screen == Screen::Subscriptions {
             self.view.status_line = format!("Using {provider_name}; retrying subscription videos…");
             self.load_selected_subscription_videos();
         } else {
@@ -32443,7 +32527,11 @@ impl AppController {
         self.view.status_line = "This build omits the `local` feature".to_owned();
     }
 
+    /// Opens preferences unless their existing draft is parked behind a child editor.
     fn open_preferences(&mut self) {
+        if self.youtube_setup_preferences.is_some() {
+            return;
+        }
         self.view.search_editing = false;
         self.view.help_open = false;
         self.view.text_selection_mode = false;
@@ -32469,6 +32557,10 @@ impl AppController {
         .collect::<Vec<_>>()
         .join(", ");
         self.view.preferences_popup = Some(PreferencesPopupView {
+            youtube_provider_settings_supported: cfg!(any(
+                feature = "youtube-official",
+                feature = "invidious"
+            )),
             subscriptions_layout: self.config.ui.subscriptions_layout,
             skip_advertisement_chapters: self.config.playback.skip_advertisement_chapters,
             sponsorblock_enabled: self.config.playback.sponsorblock_enabled,
@@ -35349,11 +35441,14 @@ impl UiController for AppController {
                     self.view.status_line = "This build omits yt-dlp support".to_owned();
                 }
             }
+            UiAction::OpenYouTubeProviderSettings => self.open_youtube_provider_settings(),
             UiAction::SelectYouTubeSetupField(field) => {
-                self.dismiss_invidious_instance_picker();
-                if let Some(popup) = self.view.youtube_setup_popup.as_mut() {
-                    popup.selected_field = field;
-                    popup.validation_error = None;
+                if field.enabled() {
+                    self.dismiss_invidious_instance_picker();
+                    if let Some(popup) = self.view.youtube_setup_popup.as_mut() {
+                        popup.selected_field = field;
+                        popup.validation_error = None;
+                    }
                 }
             }
             UiAction::AppendYouTubeSetupCharacter(character) => {
@@ -35381,8 +35476,12 @@ impl UiController for AppController {
             UiAction::DismissYouTubeSetup => {
                 self.dismiss_invidious_instance_picker();
                 self.view.youtube_setup_popup = None;
-                self.view.status_line =
-                    "YouTube provider setup cancelled; your selection was kept".to_owned();
+                self.view.status_line = if self.restore_youtube_setup_preferences() {
+                    "YouTube provider changes cancelled; returned to unsaved preferences"
+                } else {
+                    "YouTube provider setup cancelled; your selection was kept"
+                }
+                .to_owned();
             }
             UiAction::AppendYandexMusicTokenCharacter(character) => {
                 #[cfg(feature = "yandex-music")]
@@ -71077,6 +71176,588 @@ mod tests {
         );
     }
 
+    /// Preferences can replace an existing provider without losing its unsaved draft.
+    #[cfg(any(feature = "youtube-official", feature = "invidious"))]
+    #[test]
+    fn preferences_youtube_provider_cancel_preserves_draft_credentials_and_selection() {
+        let temporary = crate::test_support::canonical_tempdir("provider preferences");
+        let mut config = Config::for_dir(temporary.path().join("youta"));
+        let old_key = "AIzaSyPrevious_key_123456789012345678";
+        config
+            .save_youtube_provider(YouTubeProviderSetting::OfficialApiKey(old_key.to_owned()))
+            .expect("save previous key");
+        config.providers.invidious_base_url =
+            Some(url::Url::parse("https://previous.example.test/").unwrap());
+        let before_config = std::fs::read(config.config_file()).unwrap();
+        let before_credentials = std::fs::read(config.credentials_file()).unwrap();
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.view.screen = Screen::Local;
+        controller.view.search_query = "preserve unrelated query".to_owned();
+        controller.dispatch(UiAction::OpenPreferences);
+        controller.dispatch(UiAction::ToggleSkipAdvertisementChapters);
+        let draft = controller.view.preferences_popup.clone().unwrap();
+
+        controller.dispatch(UiAction::OpenYouTubeProviderSettings);
+
+        assert!(
+            controller.view.preferences_popup.is_none(),
+            "park the parent modal"
+        );
+        let popup = controller
+            .view
+            .youtube_setup_popup
+            .as_ref()
+            .expect("provider settings");
+        assert!(popup.from_preferences);
+        assert!(popup.api_key.is_empty(), "never preload the stored key");
+        assert_eq!(popup.invidious_url, "https://previous.example.test/");
+        assert!(!format!("{:?}", controller.view).contains(old_key));
+        assert!(
+            !serde_json::to_string(&controller.view)
+                .unwrap()
+                .contains(old_key)
+        );
+        // Native menus bypass the keyboard modal guard; they must not replace the parent.
+        controller.dispatch(UiAction::OpenPreferences);
+        assert!(controller.view.preferences_popup.is_none());
+        assert!(controller.view.youtube_setup_popup.is_some());
+        controller.dispatch(UiAction::OpenYouTubeProviderSettings);
+        controller.dispatch(UiAction::DismissYouTubeSetup);
+
+        assert!(controller.view.youtube_setup_popup.is_none());
+        assert_eq!(controller.view.preferences_popup, Some(draft));
+        assert_eq!(controller.view.screen, Screen::Local);
+        assert_eq!(controller.view.search_query, "preserve unrelated query");
+        assert!(controller.view.search_activity.is_none());
+        assert_eq!(
+            std::fs::read(controller.config.config_file()).unwrap(),
+            before_config
+        );
+        assert_eq!(
+            std::fs::read(controller.config.credentials_file()).unwrap(),
+            before_credentials
+        );
+    }
+
+    /// Saving either provider returns to Preferences without submitting another screen's query.
+    #[cfg(any(feature = "youtube-official", feature = "invidious"))]
+    #[test]
+    fn preferences_youtube_provider_save_replaces_only_provider_and_restores_draft() {
+        for (screen, field) in [
+            #[cfg(feature = "youtube-official")]
+            (Screen::Local, YouTubeSetupField::ApiKey),
+            #[cfg(feature = "invidious")]
+            (Screen::Radio, YouTubeSetupField::InvidiousUrl),
+        ] {
+            let temporary = crate::test_support::canonical_tempdir("provider preferences save");
+            let mut config = Config::for_dir(temporary.path().join("youta"));
+            config
+                .save_youtube_provider(YouTubeProviderSetting::OfficialApiKey(
+                    "AIzaSyPrevious_key_123456789012345678".to_owned(),
+                ))
+                .expect("save previous key");
+            config
+                .save_youtube_provider(YouTubeProviderSetting::InvidiousUrl(
+                    url::Url::parse("https://previous.example.test/").unwrap(),
+                ))
+                .expect("save previous instance");
+            let before_config = std::fs::read(config.config_file()).unwrap();
+            let before_credentials = std::fs::read(config.credentials_file()).unwrap();
+            let store = StateStore::open_in_memory().expect("in-memory state");
+            let mut controller = AppController::new(config, store, None, None);
+            controller.youtube_provider_builder = Box::new(MockYouTubeProviderBuilder);
+            let (sender, requests) = unbounded();
+            controller.provider_requests = Some(sender);
+            controller.view.screen = screen;
+            controller.view.rows = vec![RowView {
+                title: "unrelated row".to_owned(),
+                ..Default::default()
+            }];
+            controller.view.search_query = "unrelated screen query".to_owned();
+            let saved_skip_advertisements = controller.config.playback.skip_advertisement_chapters;
+            controller.dispatch(UiAction::OpenPreferences);
+            controller.dispatch(UiAction::ToggleSkipAdvertisementChapters);
+            let draft = controller.view.preferences_popup.clone().unwrap();
+            controller.dispatch(UiAction::OpenYouTubeProviderSettings);
+            let popup = controller
+                .view
+                .youtube_setup_popup
+                .as_mut()
+                .expect("provider settings");
+            popup.selected_field = field;
+            popup.api_key = "AIzaSyReplacement_key_123456789012345678".to_owned();
+            if field == YouTubeSetupField::InvidiousUrl {
+                popup.invidious_instances = Some(crate::view::InvidiousInstancePickerView {
+                    instances: vec![crate::view::InvidiousInstanceView {
+                        label: "replacement.example.test".to_owned(),
+                        url: "https://replacement.example.test/".to_owned(),
+                    }],
+                    ..Default::default()
+                });
+                controller.dispatch(UiAction::SubmitYouTubeSetup);
+                assert!(controller.view.preferences_popup.is_none());
+                assert!(controller.view.youtube_setup_popup.is_some());
+                assert_eq!(
+                    std::fs::read(controller.config.config_file()).unwrap(),
+                    before_config,
+                    "choosing does not save"
+                );
+                assert_eq!(
+                    std::fs::read(controller.config.credentials_file()).unwrap(),
+                    before_credentials
+                );
+                assert!(requests.try_recv().is_err());
+            }
+
+            controller.dispatch(UiAction::SubmitYouTubeSetup);
+
+            assert!(controller.view.youtube_setup_popup.is_none());
+            assert_eq!(controller.view.preferences_popup, Some(draft));
+            assert_eq!(controller.view.screen, screen);
+            assert_eq!(controller.view.rows[0].title, "unrelated row");
+            assert_eq!(controller.view.search_query, "unrelated screen query");
+            assert!(controller.view.search_activity.is_none());
+            assert!(matches!(
+                requests.try_recv().unwrap(),
+                ProviderRequest::ReplaceYouTubeProvider { .. }
+            ));
+            assert!(
+                requests.try_recv().is_err(),
+                "saving must not start a search or subscription load"
+            );
+            assert_eq!(
+                controller.config.playback.skip_advertisement_chapters, saved_skip_advertisements,
+                "the parent draft was not saved"
+            );
+            let public_config = std::fs::read_to_string(controller.config.config_file()).unwrap();
+            assert!(!public_config.contains("AIzaSyReplacement"));
+            if field == YouTubeSetupField::ApiKey {
+                let credentials =
+                    std::fs::read_to_string(controller.config.credentials_file()).unwrap();
+                assert!(credentials.contains("AIzaSyReplacement"));
+                assert!(!credentials.contains("AIzaSyPrevious"));
+                assert!(
+                    public_config.contains("https://previous.example.test/"),
+                    "retain the other backend"
+                );
+            } else {
+                assert!(public_config.contains("https://replacement.example.test/"));
+                assert!(!public_config.contains("https://previous.example.test/"));
+                assert_eq!(
+                    std::fs::read(controller.config.credentials_file()).unwrap(),
+                    before_credentials
+                );
+            }
+        }
+    }
+
+    /// Replacing YouTube cancels only its obsolete search, not another provider's work.
+    #[cfg(any(feature = "youtube-official", feature = "invidious"))]
+    #[test]
+    fn preferences_youtube_provider_save_preserves_unrelated_search_ownership() {
+        for activity in [
+            Some(SearchActivity::YouTube),
+            Some(SearchActivity::TrackerArchives),
+            None,
+        ] {
+            let temporary = crate::test_support::canonical_tempdir("provider search ownership");
+            let config = Config::for_dir(temporary.path().join("youta"));
+            let store = StateStore::open_in_memory().expect("in-memory state");
+            let mut controller = AppController::new(config, store, None, None);
+            controller.youtube_provider_builder = Box::new(MockYouTubeProviderBuilder);
+            let (sender, requests) = unbounded();
+            controller.provider_requests = Some(sender);
+            controller.view.screen = Screen::Local;
+            if let Some(activity) = activity {
+                controller.begin_search_activity(activity);
+            } else {
+                #[cfg(feature = "local-browser")]
+                {
+                    controller.open_local_input(DirectLocalInput {
+                        path: temporary.path().to_owned(),
+                        directory: true,
+                    });
+                    assert!(matches!(
+                        requests.try_recv().unwrap(),
+                        ProviderRequest::ScanLocal { .. }
+                    ));
+                    assert!(controller.view.search_activity.is_none());
+                }
+            }
+            let generation = controller.search_generation;
+            controller.dispatch(UiAction::OpenPreferences);
+            controller.dispatch(UiAction::OpenYouTubeProviderSettings);
+            let popup = controller.view.youtube_setup_popup.as_mut().unwrap();
+            if YouTubeSetupField::ApiKey.enabled() {
+                popup.selected_field = YouTubeSetupField::ApiKey;
+                popup.api_key = "AIzaSyReplacement_key_123456789012345678".to_owned();
+            } else {
+                popup.selected_field = YouTubeSetupField::InvidiousUrl;
+                popup.invidious_url = "https://replacement.example.test/".to_owned();
+            }
+            controller.dispatch(UiAction::SubmitYouTubeSetup);
+            assert!(matches!(
+                requests.try_recv().unwrap(),
+                ProviderRequest::ReplaceYouTubeProvider { .. }
+            ));
+            assert!(requests.try_recv().is_err(), "no implicit search retry");
+            if activity == Some(SearchActivity::YouTube) {
+                assert_ne!(controller.search_generation, generation);
+                assert!(
+                    controller.view.search_activity.is_none(),
+                    "obsolete YouTube work cannot keep spinning"
+                );
+            } else {
+                assert_eq!(
+                    controller.search_generation, generation,
+                    "unrelated response ownership survives"
+                );
+                assert_eq!(controller.view.search_activity, activity);
+                if activity.is_some() {
+                    controller
+                        .handle_provider_response(ProviderResponse::TrackerComplete { generation });
+                } else {
+                    #[cfg(feature = "local-browser")]
+                    {
+                        controller.handle_provider_response(ProviderResponse::LocalScan {
+                            generation,
+                            root: temporary.path().to_owned(),
+                            result: Ok(Vec::new()),
+                        });
+                        assert!(controller.view.rows.is_empty());
+                        assert!(
+                            controller
+                                .view
+                                .status_line
+                                .starts_with("0 playable file(s) found")
+                        );
+                    }
+                }
+                assert!(
+                    controller.view.search_activity.is_none(),
+                    "the original response remains accepted"
+                );
+            }
+            assert_eq!(controller.view.screen, Screen::Local);
+            assert!(controller.view.preferences_popup.is_some());
+        }
+    }
+
+    /// A YouTube replacement keeps an active RSS refresh and its cached rows owned by RSS.
+    #[cfg(all(
+        feature = "rss",
+        any(feature = "youtube-official", feature = "invidious")
+    ))]
+    #[test]
+    fn preferences_youtube_provider_save_preserves_rss_refresh_and_cache() {
+        let temporary = crate::test_support::canonical_tempdir("provider RSS ownership");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let feed_url = url::Url::parse("https://podcasts.example/feed.xml").unwrap();
+        save_fixture_rss_subscription(&config, &feed_url);
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.youtube_provider_builder = Box::new(MockYouTubeProviderBuilder);
+        let (sender, requests) = unbounded();
+        controller.provider_requests = Some(sender);
+        let old_subscription_generation = controller.subscription_generation;
+        let old_provider_generation = controller.youtube_provider_generation;
+        controller.dispatch(UiAction::ShowScreen(Screen::Subscriptions));
+        controller.dispatch(UiAction::ActivateSelection);
+        let ProviderRequest::RssFeed {
+            generation,
+            source_url,
+        } = requests.try_recv().unwrap()
+        else {
+            panic!("expected RSS request");
+        };
+        controller.handle_provider_response(ProviderResponse::RssFeed {
+            generation,
+            requested_url: source_url,
+            result: Ok(fixture_rss_feed(&feed_url, &["episode-one", "episode-two"])),
+        });
+        controller.insert_subscription_cache_value(
+            "UCfixture".to_owned(),
+            CachedSubscriptionVideos {
+                items: vec![SearchItem::Video(subscription_video_summary())],
+                ..CachedSubscriptionVideos::default()
+            },
+        );
+        controller.dispatch(UiAction::SelectSubscriptionItem(1));
+        controller.dispatch(UiAction::RefreshSubscriptionVideos);
+        let ProviderRequest::RssFeed {
+            generation,
+            source_url,
+        } = requests.try_recv().unwrap()
+        else {
+            panic!("expected RSS refresh");
+        };
+        controller.dispatch(UiAction::OpenPreferences);
+        controller.dispatch(UiAction::OpenYouTubeProviderSettings);
+        let popup = controller.view.youtube_setup_popup.as_mut().unwrap();
+        if YouTubeSetupField::ApiKey.enabled() {
+            popup.selected_field = YouTubeSetupField::ApiKey;
+            popup.api_key = "AIzaSyReplacement_key_123456789012345678".to_owned();
+        } else {
+            popup.selected_field = YouTubeSetupField::InvidiousUrl;
+            popup.invidious_url = "https://replacement.example.test/".to_owned();
+        }
+        controller.dispatch(UiAction::SubmitYouTubeSetup);
+        assert!(matches!(
+            requests.try_recv().unwrap(),
+            ProviderRequest::ReplaceYouTubeProvider { .. }
+        ));
+        assert!(requests.try_recv().is_err(), "no automatic provider retry");
+        assert_eq!(
+            controller.subscription_generation, generation,
+            "RSS keeps its response owner"
+        );
+        assert!(controller.view.subscriptions.loading);
+        assert!(controller.pending_rss_subscription_refresh.is_some());
+        assert_eq!(
+            controller.subscription_video_cache[feed_url.as_str()]
+                .items
+                .len(),
+            2
+        );
+        assert_eq!(controller.view.subscriptions.items.len(), 2);
+        assert!(
+            !controller
+                .subscription_video_cache
+                .contains_key("UCfixture")
+        );
+        assert!(
+            !controller
+                .subscription_cache_order
+                .iter()
+                .any(|key| key == "UCfixture")
+        );
+        assert_ne!(
+            controller.youtube_provider_generation,
+            old_provider_generation
+        );
+
+        // Prior YouTube requests still cannot refill either shared or YouTube-only caches.
+        controller.handle_provider_response(ProviderResponse::ChannelVideos {
+            generation: old_subscription_generation,
+            request: ChannelVideosRequest {
+                channel_id: "UCfixture".to_owned(),
+                page: 1,
+            },
+            result: Ok(SearchPage {
+                page: 1,
+                items: vec![SearchItem::Video(subscription_video_summary())],
+                next_page: None,
+            }),
+        });
+        controller.handle_provider_response(ProviderResponse::ChannelSubscriberCounts {
+            provider_generation: old_provider_generation,
+            requested_ids: vec!["UCfixture".to_owned()],
+            result: Ok(Vec::new()),
+        });
+        assert!(
+            !controller
+                .subscription_video_cache
+                .contains_key("UCfixture")
+        );
+        assert!(
+            !controller
+                .channel_subscriber_cache
+                .contains_key("UCfixture")
+        );
+        assert!(controller.view.subscriptions.loading);
+        controller.handle_provider_response(ProviderResponse::RssFeed {
+            generation,
+            requested_url: source_url,
+            result: Ok(fixture_rss_feed(
+                &feed_url,
+                &["new-episode", "episode-one", "episode-two"],
+            )),
+        });
+        assert!(!controller.view.subscriptions.loading);
+        assert!(controller.pending_rss_subscription_refresh.is_none());
+        assert_eq!(controller.view.subscriptions.items.len(), 3);
+        assert_eq!(
+            controller.view.subscriptions.selected_item, 2,
+            "refresh retains episode identity"
+        );
+        assert!(controller.view.preferences_popup.is_some());
+    }
+
+    /// Provider replacement rejects obsolete YouTube details without cancelling other metadata.
+    #[cfg(all(
+        feature = "wikidata",
+        any(feature = "youtube-official", feature = "invidious")
+    ))]
+    #[test]
+    fn preferences_youtube_provider_save_preserves_unrelated_wikidata_details() {
+        use crate::providers::wikidata::WikidataExternalKind;
+
+        let temporary = crate::test_support::canonical_tempdir("provider details ownership");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.youtube_provider_builder = Box::new(MockYouTubeProviderBuilder);
+        let (sender, requests) = unbounded();
+        controller.provider_requests = Some(sender);
+        controller.view.screen = Screen::Local;
+        controller.view.details = Some(DetailView {
+            title: "Local recording".to_owned(),
+            media_id: Some(MediaId::new(SourceKind::Local, "fixture.opus")),
+            ..DetailView::default()
+        });
+        controller.request_wikidata(
+            WikidataExternalKind::MusicBrainzRecording,
+            "b8bd3870-ae9f-42ec-a040-bd6cc0effa3b",
+        );
+        let ProviderRequest::Wikidata {
+            generation,
+            kind,
+            external_id,
+        } = requests.try_recv().unwrap()
+        else {
+            panic!("expected exact Wikidata lookup");
+        };
+        let old_details_generation = controller.details_generation;
+        controller.dispatch(UiAction::OpenPreferences);
+        controller.dispatch(UiAction::OpenYouTubeProviderSettings);
+        let popup = controller.view.youtube_setup_popup.as_mut().unwrap();
+        if YouTubeSetupField::ApiKey.enabled() {
+            popup.selected_field = YouTubeSetupField::ApiKey;
+            popup.api_key = "AIzaSyReplacement_key_123456789012345678".to_owned();
+        } else {
+            popup.selected_field = YouTubeSetupField::InvidiousUrl;
+            popup.invidious_url = "https://replacement.example.test/".to_owned();
+        }
+        controller.dispatch(UiAction::SubmitYouTubeSetup);
+        assert!(matches!(
+            requests.try_recv().unwrap(),
+            ProviderRequest::ReplaceYouTubeProvider { .. }
+        ));
+        assert!(requests.try_recv().is_err());
+        assert_eq!(
+            controller.wikidata_generation, generation,
+            "Wikidata belongs to the unchanged visible item"
+        );
+        assert_ne!(
+            controller.details_generation, old_details_generation,
+            "YouTube video details still become stale"
+        );
+        controller.handle_provider_response(ProviderResponse::Details {
+            generation: old_details_generation,
+            result: Ok(subscription_video_details("Obsolete YouTube title")),
+        });
+        assert!(controller.youtube_video_details_cache.is_empty());
+        assert_eq!(
+            controller.view.details.as_ref().unwrap().title,
+            "Local recording"
+        );
+        controller.handle_provider_response(ProviderResponse::Wikidata {
+            generation,
+            property_id: kind.property_id().to_owned(),
+            external_id,
+            result: Ok(vec![crate::domain::WikidataLink {
+                item_id: "Q638".to_owned(),
+                label: "Music".to_owned(),
+                description: Some("auditory art form".to_owned()),
+                url: url::Url::parse("https://www.wikidata.org/wiki/Q638").unwrap(),
+            }]),
+        });
+        let details = controller.view.details.as_ref().unwrap();
+        assert_eq!(details.title, "Local recording");
+        assert!(
+            details
+                .links
+                .iter()
+                .any(|link| link.wikidata_item_id.as_deref() == Some("Q638"))
+        );
+    }
+
+    /// Validation and filesystem errors keep the child editor and parked parent draft intact.
+    #[cfg(feature = "youtube-official")]
+    #[test]
+    fn preferences_youtube_provider_save_failure_keeps_the_parked_draft() {
+        let temporary = crate::test_support::canonical_tempdir("provider preferences failure");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        use_mock_diagnostics(&mut controller);
+        controller.youtube_provider_builder = Box::new(MockYouTubeProviderBuilder);
+        let (sender, requests) = unbounded();
+        controller.provider_requests = Some(sender);
+        controller.dispatch(UiAction::OpenPreferences);
+        controller.dispatch(UiAction::ToggleSkipAdvertisementChapters);
+        let draft = controller.view.preferences_popup.clone().unwrap();
+        controller.dispatch(UiAction::OpenYouTubeProviderSettings);
+        controller
+            .view
+            .youtube_setup_popup
+            .as_mut()
+            .unwrap()
+            .api_key = "short".to_owned();
+        controller.dispatch(UiAction::SubmitYouTubeSetup);
+        assert!(
+            controller
+                .view
+                .youtube_setup_popup
+                .as_ref()
+                .unwrap()
+                .validation_error
+                .is_some()
+        );
+        assert!(controller.view.preferences_popup.is_none());
+        assert!(requests.try_recv().is_err());
+        assert!(!controller.config.credentials_file().exists());
+        controller.dispatch(UiAction::DismissYouTubeSetup);
+        assert_eq!(controller.view.preferences_popup, Some(draft.clone()));
+
+        controller.view.error_popup = None;
+        controller.dispatch(UiAction::OpenYouTubeProviderSettings);
+        controller
+            .view
+            .youtube_setup_popup
+            .as_mut()
+            .unwrap()
+            .api_key = "AIzaSyReplacement_key_123456789012345678".to_owned();
+        controller
+            .config
+            .ensure_directories()
+            .expect("private config directory");
+        std::fs::write(controller.config.config_file(), "[malformed")
+            .expect("invalid existing config");
+        controller.dispatch(UiAction::SubmitYouTubeSetup);
+        assert!(
+            controller
+                .view
+                .youtube_setup_popup
+                .as_ref()
+                .unwrap()
+                .validation_error
+                .is_some()
+        );
+        assert!(controller.view.preferences_popup.is_none());
+        assert!(requests.try_recv().is_err());
+        assert!(!controller.config.credentials_file().exists());
+        controller.dispatch(UiAction::DismissYouTubeSetup);
+        assert_eq!(controller.view.preferences_popup, Some(draft));
+    }
+
+    /// Feature-minimal builds cannot open a provider editor without a backend.
+    #[cfg(not(any(feature = "youtube-official", feature = "invidious")))]
+    #[test]
+    fn preferences_youtube_provider_without_backends_keeps_preferences_open() {
+        let temporary = crate::test_support::canonical_tempdir("provider preferences disabled");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        controller.dispatch(UiAction::OpenPreferences);
+        let draft = controller.view.preferences_popup.clone().unwrap();
+        assert!(!draft.youtube_provider_settings_supported);
+        controller.dispatch(UiAction::OpenYouTubeProviderSettings);
+        assert_eq!(controller.view.preferences_popup, Some(draft));
+        assert!(controller.view.youtube_setup_popup.is_none());
+    }
+
     #[test]
     fn missing_youtube_provider_opens_setup_popup_with_exact_storage_paths() {
         let temporary = crate::test_support::canonical_tempdir("temporary directory");
@@ -71096,7 +71777,14 @@ mod tests {
             .expect("provider setup popup");
         assert_eq!(popup.api_key_path, expected_api_key_path);
         assert_eq!(popup.invidious_path, expected_invidious_path);
-        assert_eq!(popup.selected_field, YouTubeSetupField::ApiKey);
+        assert_eq!(
+            popup.selected_field,
+            if !YouTubeSetupField::ApiKey.enabled() && YouTubeSetupField::InvidiousUrl.enabled() {
+                YouTubeSetupField::InvidiousUrl
+            } else {
+                YouTubeSetupField::ApiKey
+            }
+        );
         assert!(popup.api_key.is_empty());
         assert!(controller.view.error_popup.is_none());
         assert!(
@@ -71120,16 +71808,15 @@ mod tests {
         for _ in 0..300 {
             controller.dispatch(UiAction::AppendYouTubeSetupCharacter('A'));
         }
-        assert_eq!(
-            controller
-                .view
-                .youtube_setup_popup
-                .as_ref()
-                .expect("setup popup")
-                .api_key
-                .len(),
-            256
-        );
+        let popup = controller
+            .view
+            .youtube_setup_popup
+            .as_ref()
+            .expect("setup popup");
+        match popup.selected_field {
+            YouTubeSetupField::ApiKey => assert_eq!(popup.api_key.len(), 256),
+            YouTubeSetupField::InvidiousUrl => assert_eq!(popup.invidious_url.len(), 300),
+        }
         controller.dispatch(UiAction::DismissYouTubeSetup);
         assert!(controller.view.youtube_setup_popup.is_none());
         assert_eq!(controller.view.search_query, "fixture query");
