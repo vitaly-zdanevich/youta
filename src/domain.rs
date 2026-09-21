@@ -1499,7 +1499,7 @@ pub struct SessionState {
     /// Last search text entered on the independent Bandcamp tab.
     #[serde(default)]
     pub bandcamp_search_text: String,
-    /// Last search text entered on the independent `Apple Podcasts` tab.
+    /// Last search text entered on the independent `Podcasts` tab.
     #[serde(default)]
     pub apple_podcasts_search_text: String,
     /// Last search text entered on the independent archive.org tab.

@@ -355,12 +355,12 @@ implement the same playback interface without changing screens or history.
   details, with description-link extraction;
 - an independent YouTube Music tab that searches playable tracks through
   `yt-dlp` without requiring a YouTube Data API key;
-- an experimental authenticated YandexMusic tab for account recommendations,
+- an experimental authenticated Yandex tab for account recommendations,
   music and podcast search, best-effort audiobook discovery, reactions, album
   browsing, and bounded batch downloads;
 - an independent Bandcamp tab that searches public track and album pages and
   resolves only the selected release for explicit playback through `yt-dlp`;
-- an independent Apple Podcasts tab that searches the public, unauthenticated
+- an independent Podcasts tab that searches the public, unauthenticated
   Apple catalogue by storefront and lazily loads playable episode metadata;
 - an archive.org tab for public audio search, item and track browsing, downloads,
   artwork, provenance, licenses, favourites, and public reviews on F6;
@@ -1288,7 +1288,7 @@ These are distinct integration modes:
   When an official or Invidious metadata provider is configured, it may enrich
   the selected track with full public video details; basic music search and
   playback remain keyless.
-- The experimental **YandexMusic** tab uses Yandex Music's private client API,
+- The experimental **Yandex** tab uses Yandex Music's private client API,
   which is neither a documented public developer API nor a stability
   commitment from Yandex. It is isolated behind the `yandex-music` Cargo
   feature so distributors can omit the client and its signing dependencies.
@@ -1342,7 +1342,7 @@ These are distinct integration modes:
   external identifiers where available and keeps the existing collapsed `[W]`
   details behavior. It does not guess an entity from a title-only,
   artist-name-only, or album-title-only match.
-- The separate **Apple Podcasts** tab uses Apple's documented,
+- The separate **Podcasts** tab uses Apple's documented,
   unauthenticated [iTunes Search
   API](https://developer.apple.com/library/archive/documentation/AudioVideo/Conceptual/iTuneSearchAPI/Searching.html)
   to discover podcast shows. Apple documents podcast-show search, but not

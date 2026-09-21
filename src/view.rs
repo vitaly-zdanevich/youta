@@ -227,9 +227,9 @@ impl Screen {
         match self {
             Self::Search => "YT",
             Self::YouTubeMusic => "YT Music",
-            Self::YandexMusic => "YandexMusic",
+            Self::YandexMusic => "Yandex",
             Self::Bandcamp => "Bandcamp",
-            Self::ApplePodcasts => "Apple Podcasts",
+            Self::ApplePodcasts => "Podcasts",
             Self::ArchiveOrg => "archive.org",
             Self::LibriVox => "LibriVox",
             Self::Radio => "Radio",
@@ -252,7 +252,7 @@ impl Screen {
             Self::YouTubeMusic => "YT Music",
             Self::YandexMusic => "Yandex",
             Self::Bandcamp => "Bandcamp",
-            Self::ApplePodcasts => "Apple",
+            Self::ApplePodcasts => "Podcasts",
             Self::ArchiveOrg => "archive.org",
             Self::LibriVox => "LibriVox",
             Self::Radio => "Radio",
@@ -4147,6 +4147,28 @@ pub trait UiController {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Display-only renames must preserve the saved and frontend screen ID.
+    #[test]
+    fn podcasts_tab_labels_preserve_the_existing_screen_identity() {
+        assert_eq!(Screen::ApplePodcasts.label(), "Podcasts");
+        assert_eq!(Screen::ApplePodcasts.compact_label(), "Podcasts");
+        assert_eq!(
+            serde_json::to_value(Screen::ApplePodcasts).expect("serialize podcast screen"),
+            serde_json::json!("ApplePodcasts")
+        );
+    }
+
+    /// The shorter Yandex tab label must not rename its persisted screen ID.
+    #[test]
+    fn yandex_tab_labels_preserve_the_existing_screen_identity() {
+        assert_eq!(Screen::YandexMusic.label(), "Yandex");
+        assert_eq!(Screen::YandexMusic.compact_label(), "Yandex");
+        assert_eq!(
+            serde_json::to_value(Screen::YandexMusic).expect("serialize Yandex screen"),
+            serde_json::json!("YandexMusic")
+        );
+    }
 
     #[test]
     fn youtube_auto_download_is_available_only_for_channel_entities() {

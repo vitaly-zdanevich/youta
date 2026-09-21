@@ -954,7 +954,7 @@ enum YandexMusicMediaJobResponse {
     },
 }
 
-/// Current level inside the independent Apple Podcasts tab.
+/// Current level inside the independent Podcasts tab.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum ApplePodcastsRoute {
     /// Storefront show-search results.
@@ -4700,7 +4700,7 @@ pub struct AppController {
     /// Current terminal-window height used by adaptive Yandex artwork sizing.
     #[cfg(feature = "yandex-music")]
     terminal_window_height_pixels: Option<u16>,
-    /// Query retained independently for the `Apple Podcasts` tab.
+    /// Query retained independently for the `Podcasts` tab.
     apple_podcasts_search_query: String,
     /// Lowercase storefront owning the retained Apple show results.
     #[cfg(feature = "apple-podcasts")]
@@ -4748,7 +4748,7 @@ pub struct AppController {
     bbc_quality_cache: HashMap<String, CachedBbcQuality>,
     /// Storefront-specific show summaries returned by Apple's public catalogue.
     apple_podcasts_results: Vec<PodcastShowSummary>,
-    /// Current navigation level inside the Apple Podcasts tab.
+    /// Current navigation level inside the Podcasts tab.
     apple_podcasts_route: ApplePodcastsRoute,
     /// Show owning the currently loaded Apple episode list.
     #[cfg(feature = "apple-podcasts")]
