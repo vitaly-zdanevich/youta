@@ -655,6 +655,25 @@ fn the_typescript_contract_names_only_fields_the_reducer_emits() {
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
 
+/// Compact tab labels preserve the original screen identifiers on the GUI bridge.
+#[test]
+fn the_window_screen_catalog_uses_compact_labels_without_changing_ids() {
+    let screens = serde_json::to_value(super::screens()).expect("serialized screen catalogue");
+    let screens = screens.as_array().expect("screen catalogue array");
+    for (id, label) in [
+        ("Playlists", "Lists"),
+        ("Downloaded", "Offline"),
+        ("Subscriptions", "Subs"),
+    ] {
+        let matches = screens
+            .iter()
+            .filter(|screen| screen["id"] == id)
+            .collect::<Vec<_>>();
+        assert_eq!(matches.len(), 1, "screen catalogue must retain {id}");
+        assert_eq!(matches[0]["label"], label, "visible label for {id}");
+    }
+}
+
 /// Comment labels must distinguish Archive.org reviews from YouTube comments.
 ///
 /// Identical Rust and TypeScript field names alone cannot prove their wire
@@ -1320,6 +1339,19 @@ fn subscription_continuation_has_a_static_indicator_without_animating_refresh() 
     }
 }
 
+/// Navigation shortcuts use the labels displayed by the corresponding tabs.
+#[test]
+fn the_window_help_uses_current_navigation_labels() {
+    let source = window_source("components/popups.tsx");
+    for label in [
+        "offline · history · lists · stats",
+        "offline · lists · stats",
+        "subs · preferences · recent commits",
+    ] {
+        assert!(source.contains(label), "window Help must name {label}");
+    }
+}
+
 #[test]
 fn the_window_help_documents_the_youtube_shorts_hotkey() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1335,7 +1367,7 @@ fn the_window_help_documents_the_youtube_shorts_hotkey() {
         "window Help must document the same contextual Shorts binding as the terminal"
     );
     assert!(
-        source.contains("[\"PageUp · PageDown\", \"page through Subscriptions\"]"),
+        source.contains("['PageUp · PageDown', 'page through Subs']"),
         "window Help must document subscription page navigation"
     );
 }

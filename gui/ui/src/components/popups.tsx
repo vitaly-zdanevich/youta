@@ -131,11 +131,11 @@ export function HelpPopup({
         [
           playbackHistoryEnabled ? "F2 · F3 · F4 · F5" : "F2 · F4 · F5",
           playbackHistoryEnabled
-            ? "offline · history · playlists · stats"
-            : "offline · playlists · stats",
+			? 'offline · history · lists · stats'
+			: 'offline · lists · stats',
         ],
-        ["S · p · F9", "subscriptions · preferences · recent commits"],
-		["PageUp · PageDown", "page through Subscriptions"],
+		['S · p · F9', 'subs · preferences · recent commits'],
+		['PageUp · PageDown', 'page through Subs'],
         ["R · h", "refresh subscription videos · show/hide Shorts"],
       ],
     ],

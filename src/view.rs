@@ -236,9 +236,9 @@ impl Screen {
             Self::TrackerMusic => "MOD",
             Self::Local => "Local",
             Self::Web => "Web",
-            Self::Subscriptions => "Subscriptions",
-            Self::Playlists => "Playlists",
-            Self::Downloaded => "Downloaded",
+            Self::Subscriptions => "Subs",
+            Self::Playlists => "Lists",
+            Self::Downloaded => "Offline",
             Self::History => "History",
             Self::Statistics => "Stats",
         }
@@ -4213,6 +4213,25 @@ mod tests {
             serde_json::to_value(Screen::YandexMusic).expect("serialize Yandex screen"),
             serde_json::json!("YandexMusic")
         );
+    }
+
+    /// Collection tab names are display-only and retain their saved/frontend IDs.
+    #[test]
+    fn collection_tab_labels_preserve_the_existing_screen_identity() {
+        for (screen, label, id) in [
+            (Screen::Playlists, "Lists", "Playlists"),
+            (Screen::Downloaded, "Offline", "Downloaded"),
+            (Screen::Subscriptions, "Subs", "Subscriptions"),
+        ] {
+            assert_eq!(screen.label(), label);
+            assert_eq!(screen.compact_label(), label);
+            let serialized = serde_json::to_value(screen).expect("serialize collection screen");
+            assert_eq!(serialized, serde_json::json!(id));
+            assert_eq!(
+                serde_json::from_value::<Screen>(serialized).expect("restore collection screen"),
+                screen
+            );
+        }
     }
 
     /// Search videos may subscribe their channel, but never unsubscribe it.

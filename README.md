@@ -246,7 +246,7 @@ Preferences, or `YOUTA_PLAYBACK__YOUTUBE_PREWARM=false`.
 
 `[A] Autoplay` is off by default and persists its state in
 `playback.autoplay`. When enabled, EOF advances through the same YouTube,
-YouTube Music, Podcasts, archive.org, subscription-channel, Local, Downloaded,
+YouTube Music, Podcasts, archive.org, subscription-channel, Local, Offline,
 playlist, or MOD/tracker list. Items added with **Play next** or **Add to queue**
 always run first; Youta then resumes the original source list. Replacing a live search
 stops that list's continuation instead of accidentally playing an unrelated
@@ -257,7 +257,7 @@ what it can start directly. The same-source position is tracked even while
 autoplay is off, so a manual skip can use it; the toggle decides only whether
 end-of-file continues on its own.
 
-`[r] Repeat: off/on` follows Autoplay in both Subscriptions layouts, including
+`[r] Repeat: off/on` follows Autoplay in both **Subs** layouts, including
 RSS episode lists. It repeats the **currently playing item** from the beginning
 each time it ends, taking precedence over queued items and Autoplay until
 disabled. Repeat is session-only and starts off each time Youta opens. Manual
@@ -1008,7 +1008,7 @@ placeholder explaining the missing build step. The window selects `controller`
 and `sources`, not `tui`; `cargo tree -p youta-gui -i ratatui` must match no
 package.
 
-Subscriptions supports both saved navigation layouts. Its information panel
+The **Subs** tab supports both saved navigation layouts. Its information panel
 shows the channel/feed while choosing a source, then the selected item after
 entering it. Details selection and copying are native: Ctrl-C stays with the
 web view whenever text is selected. Scrolling is native too, but the reducer
@@ -1107,7 +1107,7 @@ tag's claimed MIME type, and neither is decoded here — pixel and allocation
 limits belong to whichever renderer actually decodes, which is the only side
 that knows what those limits are.
 
-Downloaded rows carry their covers in the list itself, not only in the
+**Offline** rows carry their covers in the list itself, not only in the
 information panel, because that is where a sidecar thumbnail is cheap: the whole
 list comes from one directory, so one extra pass over it covers every row
 instead of one lookup per row. Embedded pictures stay lazy and per selection,
@@ -1235,7 +1235,7 @@ Youta keeps one private note per exact target:
 - media targets include a YouTube video, YouTube Music or Bandcamp track,
   Apple Podcasts episode, MOD/tracker item, resolved direct-source item, or
   local file; the same media target is reused when selected through
-  **Downloaded**, **History**, or a playlist;
+  **Offline**, **History**, or a playlist;
 - source targets include a YouTube channel, Bandcamp album/release, an
   RSS/podcast subscription, or an Apple Podcasts show.
 
@@ -1838,7 +1838,7 @@ Details shows `Playlists: name1, name2` only when the selected item belongs to
 one or more playlists. The line wraps with the Details panel and remains
 selectable in Details text-selection mode.
 
-Open the **Playlists** tab with `F4` or normal tab navigation. `Enter` opens the
+Open the **Lists** tab with `F4` or normal tab navigation. `Enter` opens the
 selected playlist; another `Enter` replays its selected item, and `Esc` or
 `Backspace` returns to the playlist index. Local entries replay their original
 file when it still exists. Remote entries resolve a fresh stream from their
@@ -1856,7 +1856,7 @@ Private notes, folders, bookmarks, playback positions, and provider IDs do
 not fit OPML reliably, so they remain in the selected state backend and can be
 exported separately.
 
-At the Subscriptions source root, `[a] Add RSS feed` accepts an absolute
+At the **Subs** source root, `[a] Add RSS feed` accepts an absolute
 HTTP(S) RSS or Atom URL without an embedded username or password. Youta removes
 the URL fragment and saves the subscription to the private portable OPML file
 shown in the popup. Query parameters are preserved because some private feeds
@@ -1902,7 +1902,7 @@ and link data is fetched again after a restart.
 `Tab` cycles forward through every enabled top-level screen, while `Shift+Tab`
 cycles backward; both wrap at the ends. `Ctrl+Tab` and `Ctrl+Shift+Tab` are
 aliases when the terminal reports those combinations distinctly. Uppercase
-`S` is the global Subscriptions shortcut and always returns to the
+`S` is the global **Subs** shortcut and always returns to the
 subscription-source root. Youta provides two layouts:
 
 - `drill-down` is the default for narrow terminals. Sources appear on the
@@ -1925,7 +1925,7 @@ subscription-source root. Youta provides two layouts:
   available after the source has been opened.
 
 `PageUp` and `PageDown` move by the number of rows rendered in the active
-Subscriptions pane. For an official YouTube channel, Youta requests the API's
+**Subs** pane. For an official YouTube channel, Youta requests the API's
 50-upload maximum and keeps one continuation page ahead of the current
 selection or desktop viewport; the first successful page therefore starts
 loading page two before the user reaches the final rows. Continuation loading
@@ -2108,8 +2108,8 @@ and [FFmpeg stream copying](https://ffmpeg.org/ffmpeg.html#Streamcopy).
 
 Every YouTube channel offers an **Auto-download** checkbox (`X` in the terminal).
 The checkbox and shortcut are available when a channel is selected, including
-channel search results and Subscriptions, not on individual video details.
-Enabling it also adds that channel to local Subscriptions. Youta checks opted-in
+channel search results and **Subs**, not on individual video details.
+Enabling it also adds that channel to local subscriptions. Youta checks opted-in
 channels on startup and, by default, every hour while it remains open. The first
 check records all existing upload IDs without downloading audio; later checks download
 new uploads as audio, including Shorts and streams, using the configured download
@@ -2210,7 +2210,7 @@ for subsequent requests, including concurrent requests from podcast apps.
 #### YouTube channel feeds and audio delivery
 
 `[F12] Podcast feed` is also available on a YouTube channel in Search and in
-YouTube Subscriptions. Its button is shown only for channel selections; the
+the **Subs** tab. Its button is shown only for channel selections; the
 F12 shortcut also works on a selected episode to open the inclusive-boundary
 review described above. Feed creation uses channel and publication metadata,
 downloads no media, gives every episode a stable Youta URL and artwork route, and uses the

@@ -7600,13 +7600,15 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
     #[cfg(not(feature = "ascii-visualizer"))]
     let project_history_help = "  F9 recent commits and installation details";
     #[cfg(feature = "yt-dlp")]
-    let subscription_help = "  Subscriptions: PageUp/Down page R refresh h Shorts on/off i info D full channel C cancel";
+    let subscription_help =
+        "  Subs: PageUp/Down page R refresh h Shorts on/off i info D full channel C cancel";
     #[cfg(not(feature = "yt-dlp"))]
-    let subscription_help = "  Subscriptions: PageUp/Down page     R refresh videos     h Shorts on/off     i description";
+    let subscription_help =
+        "  Subs: PageUp/Down page     R refresh videos     h Shorts on/off     i description";
     let preferences_help = if view.channel_download_supported {
-        "  F4 playlists  F5 stats  p preferences (e hourly downloads, C check now)"
+        "  F4 lists  F5 stats  p preferences (e hourly downloads, C check now)"
     } else {
-        "  F4 playlists     F5 stats     p preferences"
+        "  F4 lists     F5 stats     p preferences"
     };
     let channel_actions_help = if view.channel_download_supported {
         "  y copy link  c channel info  s (un)subscribe  X channel auto-download"
@@ -7647,7 +7649,7 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
     };
     let help = [
         "Navigation",
-        "  / search     Tab next tab     Shift+Tab previous tab     S subscriptions",
+        "  / search     Tab next tab     Shift+Tab previous tab     S subs",
         "  Ctrl+Tab/Ctrl+Shift+Tab are aliases when the terminal distinguishes them.",
         history_navigation_help,
         preferences_help,
@@ -7658,7 +7660,7 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
         local_help.as_str(),
         "  Radio: B cycles name / high-bitrate / low-bitrate order",
         subscription_help,
-        "  Playlists: e edit selected playlist     Esc or Backspace up",
+        "  Lists: e edit selected playlist     Esc or Backspace up",
         "  F8 pointer: arrows move, Enter clicks, Esc/F8 exits.",
         "  Linux /dev/ttyN: physical mouse input requires a running GPM daemon.",
         "Playback",
@@ -17830,9 +17832,11 @@ for encoded, expected in json.load(sys.stdin):
             assert!(!rendered.contains("Local: Esc parent     PageUp/Down page"));
             assert!(!rendered.contains("V audio quality"));
         }
-        assert!(rendered.contains("Playlists: e edit selected playlist     Esc or Backspace up"));
+        assert!(rendered.contains("Lists: e edit selected playlist     Esc or Backspace up"));
+        assert!(rendered.contains("F4 lists"));
+        assert!(rendered.contains("S subs"));
         assert!(rendered.contains("h Shorts on/off"));
-        assert!(rendered.contains("Subscriptions: PageUp/Down page"));
+        assert!(rendered.contains("Subs: PageUp/Down page"));
         assert!(rendered.contains("l toggle todo"));
         assert!(rendered.contains("P choose playlist"));
         assert!(rendered.contains("t Details-only text selection"));
@@ -36357,6 +36361,22 @@ prose 07:25 remains clickable but is not a chapter";
                 Screen::Statistics,
             ]
         );
+        for (screen, label) in [
+            (Screen::Playlists, "Lists"),
+            (Screen::Downloaded, "Offline"),
+            (Screen::Subscriptions, "Subs"),
+        ] {
+            let (_, area) = hit_map
+                .tabs
+                .iter()
+                .find(|(candidate, _)| *candidate == screen)
+                .expect("collection tab");
+            let painted = (area.x..area.right())
+                .map(|column| terminal.backend().buffer()[(column, area.y)].symbol())
+                .collect::<String>();
+            assert_eq!(painted, label, "wide {screen:?} tab label");
+            assert_eq!(area.width, terminal_text_width(label));
+        }
         for (screen, area) in &hit_map.tabs {
             for column in [area.x, area.right().saturating_sub(1)] {
                 let click = MouseEvent {
@@ -36530,7 +36550,7 @@ prose 07:25 remains clickable but is not a chapter";
         let rendered = rendered_text(&terminal);
         assert!(!rendered.contains("F3 history"));
         assert!(rendered.contains("F2 offline"));
-        assert!(rendered.contains("F4 playlists"));
+        assert!(rendered.contains("F4 lists"));
     }
 
     #[test]
@@ -36599,6 +36619,9 @@ prose 07:25 remains clickable but is not a chapter";
             #[cfg(feature = "apple-podcasts")]
             Screen::ApplePodcasts,
             Screen::TrackerMusic,
+            Screen::Playlists,
+            Screen::Downloaded,
+            Screen::Subscriptions,
             Screen::Statistics,
         ];
         for active in active_screens {
