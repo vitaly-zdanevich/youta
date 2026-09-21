@@ -532,7 +532,7 @@ fn container_and_codec(file_type: lofty::file::FileType) -> (&'static str, Optio
 mod tests {
     use super::*;
     use std::io::{Read, Write};
-    use std::net::{Ipv4Addr, TcpListener};
+    use std::net::{Ipv4Addr, Shutdown, TcpListener, TcpStream};
     use std::sync::{Arc, Mutex};
 
     /// A stoppable mock server records bounded requests without hanging on failures.
@@ -544,6 +544,10 @@ mod tests {
     }
 
     impl RangeServer {
+        /// Uses blocking accepted streams and dispatches only complete HTTP headers.
+        ///
+        /// Windows inherits the listener's nonblocking mode; restoring blocking I/O
+        /// lets the existing read timeout bound a fragmented request on all platforms.
         fn new(handler: impl Fn(&str) -> Vec<u8> + Send + 'static) -> Self {
             let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
             listener.set_nonblocking(true).unwrap();
@@ -567,6 +571,9 @@ mod tests {
                         Err(error) => panic!("mock accept: {error}"),
                     };
                     stream
+                        .set_nonblocking(false)
+                        .expect("mock request stream should be blocking");
+                    stream
                         .set_read_timeout(Some(Duration::from_secs(1)))
                         .unwrap();
                     stream
@@ -580,6 +587,10 @@ mod tests {
                         }
                         request.push(byte[0]);
                         assert!(request.len() <= 64 * 1024);
+                    }
+                    // EOF, reset, or timeout cannot turn partial headers into a request.
+                    if !request.ends_with(b"\r\n\r\n") {
+                        continue;
                     }
                     let request = String::from_utf8(request).unwrap();
                     worker_requests.lock().unwrap().push(request.clone());
@@ -613,6 +624,76 @@ mod tests {
             .unwrap();
         let (start, end) = range.split_once('-').unwrap();
         (start.parse().unwrap(), end.parse().unwrap())
+    }
+
+    /// A cancelled connection must not reach handlers that require complete Range headers.
+    #[test]
+    fn range_server_discards_cancelled_headers_and_serves_the_next_request() {
+        let server = RangeServer::new(|_| response("200 OK", "Content-Length: 4\r\n", b"null"));
+        let address = server.url.socket_addrs(|| None).unwrap()[0];
+        for prefix in [
+            b"".as_slice(),
+            b"GET /track.opus HTTP/1.1\r\nHost: localhost\r\n",
+        ] {
+            let mut client = TcpStream::connect(address).unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            client.write_all(prefix).unwrap();
+            client.shutdown(Shutdown::Write).unwrap();
+            let mut reply = Vec::new();
+            client.read_to_end(&mut reply).unwrap();
+            assert!(
+                reply.is_empty(),
+                "incomplete headers must not invoke the fixture handler"
+            );
+        }
+
+        let metadata = WebMetadataClient::default().read(&server.url);
+        assert_eq!(metadata.size_bytes, Some(4));
+        assert_eq!(server.request_count(), 1);
+        assert_eq!(
+            requested_range(&server.requests.lock().unwrap()[0]),
+            (0, 65_535)
+        );
+    }
+
+    /// Accepted sockets must wait across header fragments even on nonblocking listeners.
+    #[test]
+    fn range_server_waits_for_header_fragments_before_responding() {
+        let server = RangeServer::new(|_| response("200 OK", "Content-Length: 4\r\n", b"null"));
+        let address = server.url.socket_addrs(|| None).unwrap()[0];
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        client
+            .write_all(b"GET /track.opus HTTP/1.1\r\nHost: localhost\r\n")
+            .unwrap();
+        let mut byte = [0];
+        // Signals may interrupt a Unix read without delivering a response or timing out.
+        let result = loop {
+            match client.read(&mut byte) {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                result => break result,
+            }
+        };
+        let error = result.expect_err("a partial request has no response");
+        assert!(matches!(
+            error.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+        ));
+        assert_eq!(server.request_count(), 0);
+
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        client.write_all(b"range: bytes=0-3\r\n\r\n").unwrap();
+        let mut reply = String::new();
+        client.read_to_string(&mut reply).unwrap();
+        assert!(reply.ends_with("\r\n\r\nnull"));
+        assert_eq!(server.request_count(), 1);
+        assert_eq!(requested_range(&server.requests.lock().unwrap()[0]), (0, 3));
     }
 
     /// Encodes real ID3 frames followed by a small valid MPEG frame sequence.
