@@ -187,6 +187,14 @@ trait ThumbnailRenderer {
     fn synchronize_local_video(&mut self, _source: &LocalVideoThumbnailView, _area: Rect) -> bool {
         false
     }
+    /// Fits a local frame to the fullscreen area without changing preview sizing.
+    fn synchronize_local_video_fullscreen(
+        &mut self,
+        source: &LocalVideoThumbnailView,
+        area: Rect,
+    ) -> bool {
+        self.synchronize_local_video(source, area)
+    }
     /// Replaces the cache-only backlog for artwork selected by the TUI.
     fn synchronize_prefetch(&mut self, _sources: &[url::Url]) -> bool {
         false
@@ -275,9 +283,18 @@ impl TerminalThumbnailRenderer {
     }
 
     /// Synchronizes one URL without changing enlarged-artwork fallback state.
-    fn synchronize_visible(&mut self, source: Option<&url::Url>, area: Rect) -> bool {
+    fn synchronize_visible(
+        &mut self,
+        source: Option<&url::Url>,
+        area: Rect,
+        fullscreen: bool,
+    ) -> bool {
         self.visible_source = source.cloned();
-        let changed = self.manager.synchronize(source, area);
+        let changed = if fullscreen {
+            self.manager.synchronize_fullscreen(source, area)
+        } else {
+            self.manager.synchronize(source, area)
+        };
         if changed {
             self.clear_before_ready = false;
             self.followup_frame_pending = false;
@@ -374,7 +391,7 @@ impl ThumbnailRenderer for TerminalThumbnailRenderer {
         if source != self.fallback_preview_source.as_ref() {
             self.reset_fallback();
         }
-        self.synchronize_visible(source, area)
+        self.synchronize_visible(source, area, false)
     }
 
     fn synchronize_with_fallback(
@@ -402,7 +419,7 @@ impl ThumbnailRenderer for TerminalThumbnailRenderer {
         } else {
             preferred
         };
-        let mut changed = self.synchronize_visible(source, area);
+        let mut changed = self.synchronize_visible(source, area, true);
         if !self.fallback_preferred_failed
             && fallback.is_some()
             && matches!(self.manager.state(), ThumbnailState::Failed(_))
@@ -411,7 +428,7 @@ impl ThumbnailRenderer for TerminalThumbnailRenderer {
             // synchronization. Start its fallback in this same frame instead
             // of waiting for the idle event loop to discover the failure.
             self.fallback_preferred_failed = true;
-            changed |= self.synchronize_visible(fallback, area);
+            changed |= self.synchronize_visible(fallback, area, true);
         }
         changed
     }
@@ -422,6 +439,25 @@ impl ThumbnailRenderer for TerminalThumbnailRenderer {
         let changed =
             self.manager
                 .synchronize_local_video(&source.path, source.midpoint_millis, area);
+        if changed {
+            self.clear_before_ready = false;
+            self.followup_frame_pending = false;
+        }
+        changed
+    }
+
+    fn synchronize_local_video_fullscreen(
+        &mut self,
+        source: &LocalVideoThumbnailView,
+        area: Rect,
+    ) -> bool {
+        self.reset_fallback();
+        self.visible_source = None;
+        let changed = self.manager.synchronize_local_video_fullscreen(
+            &source.path,
+            source.midpoint_millis,
+            area,
+        );
         if changed {
             self.clear_before_ready = false;
             self.followup_frame_pending = false;
@@ -2227,7 +2263,7 @@ fn render_fullscreen_thumbnail_overlay(
     let area = frame.area();
 
     if let Some(local_video) = visible_local_video {
-        renderer.synchronize_local_video(local_video, area);
+        renderer.synchronize_local_video_fullscreen(local_video, area);
     } else {
         renderer.synchronize_with_fallback(visible_thumbnail_url, fallback_thumbnail_url, area);
     }
@@ -30826,6 +30862,65 @@ for encoded, expected in json.load(sys.stdin):
                 warm_observed.is_empty(),
                 "the failed prefetch must not be retried"
             );
+        }
+    }
+
+    /// Fullscreen artwork grows to the terminal while native previews retain a separate cache entry.
+    #[cfg(feature = "images")]
+    #[test]
+    fn fullscreen_artwork_scales_to_fit_without_enlarging_the_preview() {
+        use std::io::Cursor;
+        use std::time::{Duration, Instant};
+
+        use crate::thumbnails::{ThumbnailState, tests as thumbnail_tests};
+
+        for (width, height, expected_width, expected_height) in
+            [(64, 32, 120, 30), (32, 64, 40, 40)]
+        {
+            let (manager, replies, observed) = thumbnail_tests::manager_with_mock_transport();
+            let mut renderer = TerminalThumbnailRenderer::new(manager);
+            let source = url::Url::parse("https://images.example/native-artwork.png").unwrap();
+            let area = Rect::new(0, 0, 120, 40);
+            let mut bytes = Cursor::new(Vec::new());
+            image::DynamicImage::new_rgb8(width, height)
+                .write_to(&mut bytes, image::ImageFormat::Png)
+                .unwrap();
+            let bytes = bytes.into_inner();
+            for expanded in [false, true, false, true] {
+                if expanded {
+                    renderer.synchronize_with_fallback(Some(&source), None, area);
+                } else {
+                    renderer.synchronize(Some(&source), area);
+                }
+                if renderer.is_pending() {
+                    assert_eq!(
+                        observed.recv_timeout(Duration::from_secs(1)).unwrap(),
+                        source
+                    );
+                    replies.send(Ok(bytes.clone())).unwrap();
+                    let deadline = Instant::now() + Duration::from_secs(3);
+                    while renderer.is_pending() {
+                        renderer.poll();
+                        assert!(Instant::now() < deadline, "artwork scaling did not finish");
+                        std::thread::yield_now();
+                    }
+                }
+                assert_eq!(renderer.manager.state(), &ThumbnailState::Ready);
+                assert_eq!(
+                    renderer.prepared_artwork_area(area),
+                    Some(if expanded {
+                        Rect::new(0, 0, expected_width, expected_height)
+                    } else {
+                        Rect::new(
+                            0,
+                            0,
+                            u16::try_from(width.div_ceil(10)).unwrap(),
+                            u16::try_from(height.div_ceil(20)).unwrap(),
+                        )
+                    }),
+                    "fullscreen must fit with aspect preserved, independently of native preview cache"
+                );
+            }
         }
     }
 

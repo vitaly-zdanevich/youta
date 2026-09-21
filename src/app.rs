@@ -4703,10 +4703,9 @@ pub struct AppController {
     youtube_results: Vec<SearchItem>,
     /// Track summaries returned by the independent `YouTube Music` search.
     youtube_music_results: Vec<SearchItem>,
-    /// Current terminal-window width used only by automatic thumbnail sizing.
+    /// Current terminal-window width used by source-specific artwork policies.
     terminal_window_width_pixels: Option<u16>,
-    /// Current terminal-window height used by adaptive Yandex artwork sizing.
-    #[cfg(feature = "yandex-music")]
+    /// Current terminal-window height used to bound enlarged artwork sources.
     terminal_window_height_pixels: Option<u16>,
     /// Query retained independently for the `Podcasts` tab.
     apple_podcasts_search_query: String,
@@ -6226,7 +6225,6 @@ impl AppController {
             youtube_results,
             youtube_music_results,
             terminal_window_width_pixels: None,
-            #[cfg(feature = "yandex-music")]
             terminal_window_height_pixels: None,
             apple_podcasts_search_query,
             #[cfg(feature = "apple-podcasts")]
@@ -10128,6 +10126,7 @@ impl AppController {
             &selected,
             &self.subscription_tree,
             self.effective_youtube_thumbnail_size(),
+            self.youtube_thumbnail_terminal_bounds(),
         );
         if self.view.screen == Screen::YouTubeMusic {
             detail.source = "YouTube Music".to_owned();
@@ -13787,6 +13786,7 @@ impl AppController {
                                 &details,
                                 &self.subscription_tree,
                                 self.effective_youtube_thumbnail_size(),
+                                self.youtube_thumbnail_terminal_bounds(),
                             );
                             if !linked_matches && self.view.screen == Screen::YouTubeMusic {
                                 detail.source = "YouTube Music".to_owned();
@@ -14341,6 +14341,12 @@ impl AppController {
             .resolve(self.terminal_window_width_pixels)
     }
 
+    /// Returns complete terminal bounds; missing pixel geometry must not be guessed.
+    fn youtube_thumbnail_terminal_bounds(&self) -> Option<(u16, u16)> {
+        self.terminal_window_width_pixels
+            .zip(self.terminal_window_height_pixels)
+    }
+
     /// Resolves the Yandex details-panel artwork preset for this terminal.
     #[cfg(feature = "yandex-music")]
     fn effective_yandex_music_artwork_size(&self) -> YandexMusicArtworkSize {
@@ -14367,8 +14373,13 @@ impl AppController {
             }
             _ => {}
         }
+        self.refresh_youtube_detail_thumbnail_projection();
+    }
 
+    /// Reprojects selected YouTube artwork without rebuilding rows or other providers' details.
+    fn refresh_youtube_detail_thumbnail_projection(&mut self) {
         let selected_size = self.effective_youtube_thumbnail_size();
+        let terminal_bounds = self.youtube_thumbnail_terminal_bounds();
         let existing_thumbnail = self
             .view
             .details
@@ -14411,7 +14422,9 @@ impl AppController {
                     });
                 let projected = cached.into_iter().chain(summary).find_map(|thumbnails| {
                     let thumbnail = youtube_thumbnail_for_size(thumbnails, selected_size)?.clone();
-                    Some((Some(thumbnail), largest_youtube_thumbnail_url(thumbnails)))
+                    let expanded =
+                        largest_youtube_thumbnail_url(thumbnails, &thumbnail, terminal_bounds);
+                    Some((Some(thumbnail), expanded))
                 });
                 projected
                     .or_else(|| {
@@ -14440,9 +14453,8 @@ impl AppController {
         {
             details.thumbnail_url = thumbnail.as_ref().map(|thumbnail| thumbnail.url.clone());
             details.expanded_thumbnail_url = expanded_thumbnail_url;
-            details.thumbnail_dimensions = thumbnail
-                .as_ref()
-                .and_then(|thumbnail| thumbnail.width.zip(thumbnail.height));
+            details.thumbnail_dimensions =
+                thumbnail.as_ref().and_then(youtube_thumbnail_dimensions);
             if details.expanded_thumbnail_url.is_none()
                 && details.thumbnail_url.is_none()
                 && details.local_video_thumbnail.is_none()
@@ -14464,20 +14476,24 @@ impl AppController {
 
     /// Applies attached-terminal pixel changes to source-specific artwork policies.
     fn set_terminal_window_pixels(&mut self, width: Option<u16>, height: Option<u16>) {
+        let width = width.filter(|width| *width > 0);
+        let height = height.filter(|height| *height > 0);
+        let changed = self.terminal_window_width_pixels != width
+            || self.terminal_window_height_pixels != height;
         let previous_youtube = self.effective_youtube_thumbnail_size();
         #[cfg(feature = "yandex-music")]
         let previous_yandex = self.effective_yandex_music_artwork_size();
         self.terminal_window_width_pixels = width;
-        #[cfg(feature = "yandex-music")]
-        {
-            self.terminal_window_height_pixels = height;
-        }
-        #[cfg(not(feature = "yandex-music"))]
-        let _ = height;
-        if previous_youtube != self.effective_youtube_thumbnail_size()
-            && self.config.ui.youtube_thumbnail_size == YouTubeThumbnailSize::Automatic
-        {
-            self.refresh_youtube_thumbnail_projection();
+        self.terminal_window_height_pixels = height;
+        if changed {
+            // Expanded sources depend on both axes even when an explicit
+            // preview, or Automatic's width bucket, stays unchanged. In that
+            // case leave list projections and unrelated Details untouched.
+            if previous_youtube != self.effective_youtube_thumbnail_size() {
+                self.refresh_youtube_thumbnail_projection();
+            } else {
+                self.refresh_youtube_detail_thumbnail_projection();
+            }
         }
         #[cfg(feature = "yandex-music")]
         if previous_yandex != self.effective_yandex_music_artwork_size() {
@@ -41611,15 +41627,19 @@ fn preliminary_detail_with_thumbnail_size(
     item: &SearchItem,
     subscriptions: &SubscriptionTree,
     youtube_thumbnail_size: YouTubeThumbnailSize,
+    terminal_bounds: Option<(u16, u16)>,
 ) -> DetailView {
     match item {
         SearchItem::Video(video) => {
             let description = normalize_description_chapter_lines(&video.description);
             let (thumbnail_url, thumbnail_dimensions) =
                 youtube_thumbnail_projection(&video.thumbnails, youtube_thumbnail_size);
-            let expanded_thumbnail_url = thumbnail_url
-                .as_ref()
-                .and_then(|_| largest_youtube_thumbnail_url(&video.thumbnails));
+            let expanded_thumbnail_url =
+                youtube_thumbnail_for_size(&video.thumbnails, youtube_thumbnail_size).and_then(
+                    |preview| {
+                        largest_youtube_thumbnail_url(&video.thumbnails, preview, terminal_bounds)
+                    },
+                );
             DetailView {
                 media_id: Some(MediaId::new(SourceKind::YouTube, &video.video_id)),
                 title: video.title.clone(),
@@ -41678,7 +41698,12 @@ fn preliminary_detail_with_thumbnail_size(
 /// Builds deterministic preliminary test details at the conservative size.
 #[cfg(test)]
 fn preliminary_detail(item: &SearchItem, subscriptions: &SubscriptionTree) -> DetailView {
-    preliminary_detail_with_thumbnail_size(item, subscriptions, YouTubeThumbnailSize::Standard)
+    preliminary_detail_with_thumbnail_size(
+        item,
+        subscriptions,
+        YouTubeThumbnailSize::Standard,
+        None,
+    )
 }
 
 /// Builds selected RSS episode details without issuing a YouTube metadata call.
@@ -41843,38 +41868,64 @@ fn preferred_thumbnail_url(thumbnails: &[Thumbnail]) -> Option<url::Url> {
     selected.map(|thumbnail| thumbnail.url.clone())
 }
 
-/// Chooses the largest image that a YouTube provider explicitly advertised.
+/// Chooses the largest advertised YouTube upgrade that fits known terminal pixels.
 ///
-/// Providers normally include pixel dimensions. Stable YouTube quality names
-/// supply a fallback rank when an alternate provider omits those dimensions;
-/// ties keep the provider's last entry.
-fn largest_youtube_thumbnail_url(thumbnails: &[Thumbnail]) -> Option<url::Url> {
+/// Unknown terminal geometry preserves the largest explicit-click target; the
+/// TUI independently skips speculative work without complete window metrics.
+/// Known geometry never selects an oversized or downgraded source, and an
+/// absent upgrade lets clicking reuse the ordinary configured preview. The
+/// provider's canonical candidate list is never filtered or rewritten.
+fn largest_youtube_thumbnail_url(
+    thumbnails: &[Thumbnail],
+    preview: &Thumbnail,
+    terminal_bounds: Option<(u16, u16)>,
+) -> Option<url::Url> {
     thumbnails
         .iter()
         .enumerate()
         .filter_map(|(index, thumbnail)| {
-            let area = thumbnail
-                .width
-                .zip(thumbnail.height)
-                .and_then(|(width, height)| {
-                    let area = u64::from(width) * u64::from(height);
-                    (area > 0).then_some(area)
-                })
-                .or_else(|| {
-                    let quality = thumbnail.quality.as_deref()?.to_ascii_lowercase();
-                    match quality.as_str() {
-                        "default" => Some(120_u64 * 90),
-                        "medium" => Some(320_u64 * 180),
-                        "high" => Some(480_u64 * 360),
-                        "standard" => Some(640_u64 * 480),
-                        "maxres" => Some(1_280_u64 * 720),
-                        _ => None,
-                    }
-                })?;
+            let (width, height) = youtube_thumbnail_dimensions(thumbnail)?;
+            if let Some((terminal_width, terminal_height)) = terminal_bounds {
+                let (preview_width, preview_height) = youtube_thumbnail_dimensions(preview)?;
+                if width > u32::from(terminal_width)
+                    || height > u32::from(terminal_height)
+                    || thumbnail.url == preview.url
+                    || width < preview_width
+                    || height < preview_height
+                    || (width == preview_width && height == preview_height)
+                {
+                    return None;
+                }
+            }
+            let area = u64::from(width) * u64::from(height);
             Some(((area, index), thumbnail))
         })
         .max_by_key(|((area, index), _)| (*area, *index))
         .map(|(_, thumbnail)| thumbnail.url.clone())
+}
+
+/// Resolves positive source pixels without discarding provider-reported axes.
+///
+/// Named YouTube qualities supply only missing dimensions. An explicit zero
+/// is invalid, not permission to replace contradictory metadata with a guess.
+fn youtube_thumbnail_dimensions(thumbnail: &Thumbnail) -> Option<(u32, u32)> {
+    let fallback = thumbnail.quality.as_deref().and_then(|quality| {
+        YouTubeThumbnailSize::ALL
+            .iter()
+            .copied()
+            .find(|size| {
+                size.quality()
+                    .is_some_and(|known| quality.eq_ignore_ascii_case(known))
+            })
+            .and_then(YouTubeThumbnailSize::dimensions)
+    });
+    let width = thumbnail
+        .width
+        .or_else(|| fallback.map(|(width, _)| width))?;
+    let height = thumbnail
+        .height
+        .or_else(|| fallback.map(|(_, height)| height))?;
+    (width > 0 && height > 0).then_some((width, height))
 }
 
 /// Chooses exactly one configured `YouTube` thumbnail size.
@@ -41900,7 +41951,7 @@ fn youtube_thumbnail_projection(
     };
     (
         Some(thumbnail.url.clone()),
-        thumbnail.width.zip(thumbnail.height),
+        youtube_thumbnail_dimensions(thumbnail),
     )
 }
 
@@ -42319,13 +42370,15 @@ fn detail_from_video_with_thumbnail_size(
     video: &VideoDetails,
     subscriptions: &SubscriptionTree,
     youtube_thumbnail_size: YouTubeThumbnailSize,
+    terminal_bounds: Option<(u16, u16)>,
 ) -> DetailView {
     let description = normalize_description_chapter_lines(&video.description);
     let (thumbnail_url, thumbnail_dimensions) =
         youtube_thumbnail_projection(&video.thumbnails, youtube_thumbnail_size);
-    let expanded_thumbnail_url = thumbnail_url
-        .as_ref()
-        .and_then(|_| largest_youtube_thumbnail_url(&video.thumbnails));
+    let expanded_thumbnail_url =
+        youtube_thumbnail_for_size(&video.thumbnails, youtube_thumbnail_size).and_then(|preview| {
+            largest_youtube_thumbnail_url(&video.thumbnails, preview, terminal_bounds)
+        });
     DetailView {
         media_id: Some(MediaId::new(SourceKind::YouTube, &video.video_id)),
         title: video.title.clone(),
@@ -42376,7 +42429,12 @@ fn detail_from_video_with_thumbnail_size(
 /// Builds deterministic complete test details at the conservative size.
 #[cfg(test)]
 fn detail_from_video(video: &VideoDetails, subscriptions: &SubscriptionTree) -> DetailView {
-    detail_from_video_with_thumbnail_size(video, subscriptions, YouTubeThumbnailSize::Standard)
+    detail_from_video_with_thumbnail_size(
+        video,
+        subscriptions,
+        YouTubeThumbnailSize::Standard,
+        None,
+    )
 }
 
 fn detail_from_media_item(
@@ -60465,6 +60523,111 @@ mod tests {
     }
 
     #[test]
+    fn youtube_expanded_thumbnail_projection_respects_both_terminal_pixel_axes() {
+        let thumbnail = |quality: &str, width, height| Thumbnail {
+            url: url::Url::parse(&format!("https://images.example/{quality}.jpg"))
+                .expect("fixture thumbnail URL"),
+            quality: Some(quality.to_owned()),
+            width: Some(width),
+            height: Some(height),
+        };
+        let mut config = Config::for_dir("/tmp/youta-thumbnail-terminal-bounds-test");
+        config.ui.youtube_thumbnail_size = YouTubeThumbnailSize::High;
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config, store, None, None);
+        let mut summary = subscription_video_summary();
+        summary.thumbnails = vec![
+            thumbnail("medium", 320, 180),
+            thumbnail("high", 480, 360),
+            thumbnail("standard", 640, 480),
+            thumbnail("maxres", 1_280, 720),
+        ];
+        controller.youtube_results = vec![SearchItem::Video(summary.clone())];
+        controller.view.details = Some(preliminary_detail_with_thumbnail_size(
+            &SearchItem::Video(summary),
+            &controller.subscription_tree,
+            YouTubeThumbnailSize::High,
+            None,
+        ));
+        controller.view.details.as_mut().unwrap().thumbnail_expanded = true;
+        controller.view.rows = vec![RowView {
+            title: "Retained row projection".to_owned(),
+            ..RowView::default()
+        }];
+        controller.view.status_line = "Retained status".to_owned();
+
+        for (width, height, expected) in [
+            (Some(1_280), Some(720), Some("maxres")),
+            (Some(1_280), Some(719), Some("standard")),
+            (Some(1_280), Some(479), None),
+            (Some(640), Some(480), Some("standard")),
+            (Some(639), Some(480), None),
+            (Some(400), Some(300), None),
+            (Some(1_280), None, Some("maxres")),
+            (None, Some(720), Some("maxres")),
+        ] {
+            controller.dispatch(UiAction::SetTerminalWindowPixels { width, height });
+            let details = controller.view.details.as_ref().expect("selected video");
+            let expected_url = expected.map(|quality| {
+                url::Url::parse(&format!("https://images.example/{quality}.jpg"))
+                    .expect("expected thumbnail URL")
+            });
+            assert_eq!(
+                details.expanded_thumbnail_url, expected_url,
+                "expanded source must obey both axes at {width:?} x {height:?}"
+            );
+            assert_eq!(
+                details.thumbnail_url.as_ref().map(url::Url::as_str),
+                Some("https://images.example/high.jpg"),
+                "terminal resize must not change an explicitly configured preview"
+            );
+            assert!(
+                details.thumbnail_expanded,
+                "resize preserves the open overlay"
+            );
+            assert_eq!(controller.view.rows[0].title, "Retained row projection");
+            assert_eq!(controller.view.status_line, "Retained status");
+        }
+
+        controller.config.ui.youtube_thumbnail_size = YouTubeThumbnailSize::Automatic;
+        for (width, height, expected) in [(1_300, 480, "standard"), (1_350, 720, "maxres")] {
+            controller.dispatch(UiAction::SetTerminalWindowPixels {
+                width: Some(width),
+                height: Some(height),
+            });
+            let details = controller.view.details.as_ref().expect("selected video");
+            assert_eq!(
+                details.thumbnail_url.as_ref().map(url::Url::as_str),
+                Some("https://images.example/high.jpg")
+            );
+            assert_eq!(
+                details.expanded_thumbnail_url,
+                Some(
+                    url::Url::parse(&format!("https://images.example/{expected}.jpg"))
+                        .expect("expected thumbnail URL")
+                ),
+                "bounds must update while Automatic remains in the same width bucket"
+            );
+        }
+
+        controller.config.ui.youtube_thumbnail_size = YouTubeThumbnailSize::Maxres;
+        controller.refresh_youtube_thumbnail_projection();
+        controller.dispatch(UiAction::SetTerminalWindowPixels {
+            width: Some(1_000),
+            height: Some(700),
+        });
+        let details = controller.view.details.as_ref().expect("selected video");
+        assert!(
+            details.expanded_thumbnail_url.is_none(),
+            "a smaller fitting source must not replace the already loaded maxres preview"
+        );
+        assert_eq!(
+            details.thumbnail_url.as_ref().map(url::Url::as_str),
+            Some("https://images.example/maxres.jpg")
+        );
+    }
+
+    #[test]
     fn automatic_youtube_thumbnail_projection_tracks_terminal_pixel_width() {
         let thumbnail = |quality: &str, width, height| Thumbnail {
             url: url::Url::parse(&format!("https://images.example/{quality}.jpg"))
@@ -60488,6 +60651,7 @@ mod tests {
             &SearchItem::Video(summary),
             &controller.subscription_tree,
             YouTubeThumbnailSize::Standard,
+            None,
         ));
         controller.refresh_youtube_rows();
 
@@ -68784,8 +68948,10 @@ mod tests {
                 &SearchItem::Video(summary.clone()),
                 &subscriptions,
                 size,
+                None,
             );
-            let complete = detail_from_video_with_thumbnail_size(&video, &subscriptions, size);
+            let complete =
+                detail_from_video_with_thumbnail_size(&video, &subscriptions, size, None);
             let queued = queue_item_from_video_with_thumbnail_size(&summary, None, size);
             assert_eq!(preliminary.thumbnail_dimensions, size.dimensions());
             assert_eq!(complete.thumbnail_dimensions, size.dimensions());
@@ -68829,6 +68995,7 @@ mod tests {
             &SearchItem::Video(summary.clone()),
             &subscriptions,
             YouTubeThumbnailSize::Disabled,
+            None,
         );
         assert!(
             disabled.expanded_thumbnail_url.is_none(),
@@ -68845,6 +69012,7 @@ mod tests {
             &SearchItem::Video(unavailable_summary),
             &subscriptions,
             YouTubeThumbnailSize::Maxres,
+            None,
         );
         assert!(
             unavailable.expanded_thumbnail_url.is_none(),
@@ -68902,6 +69070,115 @@ mod tests {
     }
 
     #[test]
+    fn youtube_expanded_thumbnail_projections_share_terminal_bounds() {
+        let thumbnails = [
+            ("high", 480, 360),
+            ("standard", 640, 480),
+            ("maxres", 1_280, 720),
+        ]
+        .map(|(quality, width, height)| Thumbnail {
+            url: url::Url::parse(&format!("https://images.example/{quality}.jpg"))
+                .expect("fixture thumbnail URL"),
+            quality: Some(quality.to_owned()),
+            width: Some(width),
+            height: Some(height),
+        });
+        let mut summary = subscription_video_summary();
+        summary.thumbnails = thumbnails.to_vec();
+        let mut complete = subscription_video_details("Bounded artwork fixture");
+        complete.thumbnails = thumbnails.to_vec();
+        let subscriptions = SubscriptionTree::default();
+        let bounds = Some((1_000, 700));
+        let preview_size = YouTubeThumbnailSize::High;
+
+        for details in [
+            preliminary_detail_with_thumbnail_size(
+                &SearchItem::Video(summary.clone()),
+                &subscriptions,
+                preview_size,
+                bounds,
+            ),
+            detail_from_video_with_thumbnail_size(&complete, &subscriptions, preview_size, bounds),
+        ] {
+            assert_eq!(
+                details
+                    .expanded_thumbnail_url
+                    .as_ref()
+                    .map(url::Url::as_str),
+                Some("https://images.example/standard.jpg")
+            );
+            assert_eq!(details.thumbnail_dimensions, Some((480, 360)));
+            assert_eq!(
+                details.thumbnail_url.as_ref().map(url::Url::as_str),
+                Some("https://images.example/high.jpg")
+            );
+        }
+        assert_eq!(summary.thumbnails, thumbnails);
+        assert_eq!(complete.thumbnails, thumbnails);
+    }
+
+    #[test]
+    fn bounded_youtube_thumbnail_quality_fallback_preserves_known_axes() {
+        let thumbnail = |quality: &str, width, height| Thumbnail {
+            url: url::Url::parse(&format!("https://images.example/{quality}.jpg"))
+                .expect("fixture thumbnail URL"),
+            quality: Some(quality.to_owned()),
+            width,
+            height,
+        };
+        let preview = thumbnail("high", None, None);
+        let standard = thumbnail("standard", None, None);
+        let mut maxres = thumbnail("maxres", None, None);
+        let bounded = Some((1_280, 720));
+        let selected = |candidates: &[Thumbnail], bounds| {
+            largest_youtube_thumbnail_url(candidates, &preview, bounds)
+        };
+
+        assert_eq!(
+            selected(&[standard.clone(), maxres.clone()], bounded),
+            Some(maxres.url.clone()),
+            "known quality dimensions may fill missing provider axes"
+        );
+        assert_eq!(
+            youtube_thumbnail_projection(
+                std::slice::from_ref(&preview),
+                YouTubeThumbnailSize::High
+            )
+            .1,
+            Some((480, 360)),
+            "the prefetch gate must receive the same resolved preview dimensions"
+        );
+        maxres.width = Some(2_000);
+        assert_eq!(
+            selected(&[standard.clone(), maxres.clone()], bounded),
+            Some(standard.url.clone()),
+            "a known oversized width must not be replaced by the quality-name fallback"
+        );
+        maxres.width = None;
+        maxres.height = Some(721);
+        assert_eq!(
+            selected(&[standard.clone(), maxres.clone()], bounded),
+            Some(standard.url.clone()),
+            "a known oversized height must not be replaced by the quality-name fallback"
+        );
+        maxres.width = Some(0);
+        maxres.height = Some(0);
+        assert!(selected(&[maxres], bounded).is_none());
+        assert!(selected(&[thumbnail("unknown", None, None)], bounded).is_none());
+
+        let provider_specific = thumbnail("provider-specific", Some(1_000), Some(700));
+        assert_eq!(
+            selected(&[standard.clone(), provider_specific.clone()], bounded),
+            Some(provider_specific.url),
+            "explicit provider pixels take priority over quality labels"
+        );
+        assert!(
+            selected(&[standard], Some((639, 480))).is_none(),
+            "no oversized source is selected when none fits"
+        );
+    }
+
+    #[test]
     fn largest_youtube_thumbnail_uses_quality_when_dimensions_are_absent() {
         let thumbnail = |quality: &str| Thumbnail {
             url: url::Url::parse(&format!("https://images.example/{quality}.jpg"))
@@ -68917,19 +69194,23 @@ mod tests {
         ];
 
         assert_eq!(
-            largest_youtube_thumbnail_url(&candidates)
+            largest_youtube_thumbnail_url(&candidates, &candidates[0], None)
                 .as_ref()
                 .map(url::Url::as_str),
             Some("https://images.example/maxres.jpg")
         );
         assert_eq!(
-            largest_youtube_thumbnail_url(&[Thumbnail {
-                url: url::Url::parse("https://images.example/unranked.jpg")
-                    .expect("unranked thumbnail URL"),
-                quality: Some("provider-specific".to_owned()),
-                width: None,
-                height: None,
-            }]),
+            largest_youtube_thumbnail_url(
+                &[Thumbnail {
+                    url: url::Url::parse("https://images.example/unranked.jpg")
+                        .expect("unranked thumbnail URL"),
+                    quality: Some("provider-specific".to_owned()),
+                    width: None,
+                    height: None,
+                }],
+                &candidates[0],
+                None,
+            ),
             None,
             "unknown provider order must not be misrepresented as an image-size guarantee"
         );

@@ -1751,12 +1751,19 @@ video-thumbnail entry used by the normal Details preview:
 
 Explicit sizes are strict: if a video does not expose the selected entry,
 Youta shows no video thumbnail and does not fetch another size as a fallback.
-After the selected preview is ready, Youta prepares the largest advertised
-image in the background only when the terminal reports enough pixels to
-benefit from enlargement and that image has a different URL. This preparation
+After the selected preview is ready, Youta prepares a higher-resolution image
+in the background only when the terminal reports enough pixels to benefit
+from enlargement. It chooses the largest advertised version that fits both
+the terminal's pixel width and height; it does not download a smaller version
+if the current preview already has more detail. This preparation
 uses the bounded RAM cache, including the fullscreen rendering, without a
 second disk-prefetch request. Small or unknown-size terminals skip speculative
-enlargement; clicking still opens the full image on demand.
+enlargement; clicking still opens artwork on demand.
+The expanded view fits the available terminal space without changing the
+image's proportions. It uses the selected higher-resolution source when
+available; scaling beyond that source's native size adds no detail. The
+prepared rendering stays in the bounded RAM cache, and normal previews keep
+their native-size limit.
 Reopening an unchanged image reuses its prepared rendering. If the larger
 image fails, Youta retains the preview fallback for that selection rather than
 retrying on every click. Selecting another item permits a fresh attempt.

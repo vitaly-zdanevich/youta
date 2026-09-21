@@ -886,11 +886,13 @@ pub struct DetailView {
     /// The URL is never rendered as text. Unsupported terminals omit the
     /// image without fetching it.
     pub thumbnail_url: Option<url::Url>,
-    /// Largest provider-advertised image reserved for full-terminal expansion.
+    /// Provider-advertised image reserved for full-terminal expansion.
     ///
     /// The normal Details preview continues to use [`Self::thumbnail_url`],
-    /// which follows the configured YouTube size. Image-enabled renderers may
-    /// warm this separate target before the user clicks the visible preview.
+    /// which follows the configured YouTube size. With known terminal pixels,
+    /// YouTube uses the largest upgrade that fits both window dimensions.
+    /// Image-enabled renderers may warm this separate target before the user
+    /// clicks the visible preview.
     pub expanded_thumbnail_url: Option<url::Url>,
     /// Source pixel dimensions used to reserve an aspect-correct preview area.
     pub thumbnail_dimensions: Option<(u32, u32)>,

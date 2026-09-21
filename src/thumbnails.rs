@@ -284,11 +284,19 @@ impl TerminalInfo {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct LocalVideoMidpoint(u64);
 
+/// Keeps native previews distinct from worker-scaled fullscreen artwork.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ThumbnailSizing {
+    Native,
+    Fullscreen,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ThumbnailTarget {
     source: Url,
     local_video_midpoint: Option<LocalVideoMidpoint>,
     area: Rect,
+    sizing: ThumbnailSizing,
 }
 
 #[derive(Clone, Debug)]
@@ -308,6 +316,7 @@ struct PreparedThumbnailKey {
     local_video_midpoint: Option<LocalVideoMidpoint>,
     width: u16,
     height: u16,
+    sizing: ThumbnailSizing,
     local_fingerprint: Option<LocalThumbnailFingerprint>,
 }
 
@@ -318,6 +327,7 @@ impl From<&ThumbnailTarget> for PreparedThumbnailKey {
             local_video_midpoint: target.local_video_midpoint,
             width: target.area.width,
             height: target.area.height,
+            sizing: target.sizing,
             local_fingerprint: None,
         }
     }
@@ -354,6 +364,7 @@ impl PreparedThumbnailKey {
             && self.local_video_midpoint == other.local_video_midpoint
             && self.width == other.width
             && self.height == other.height
+            && self.sizing == other.sizing
     }
 }
 
@@ -1054,6 +1065,21 @@ impl ThumbnailManager {
     /// Returns `true` when the visible target changed. Repeated calls with the
     /// same URL and area do no work.
     pub fn synchronize(&mut self, source: Option<&Url>, area: Rect) -> bool {
+        self.synchronize_with_sizing(source, area, ThumbnailSizing::Native)
+    }
+
+    /// Fits fullscreen artwork, including enlargement, on the background worker.
+    pub fn synchronize_fullscreen(&mut self, source: Option<&Url>, area: Rect) -> bool {
+        self.synchronize_with_sizing(source, area, ThumbnailSizing::Fullscreen)
+    }
+
+    /// Applies the visible URL with an explicit preparation/cache sizing identity.
+    fn synchronize_with_sizing(
+        &mut self,
+        source: Option<&Url>,
+        area: Rect,
+        sizing: ThumbnailSizing,
+    ) -> bool {
         if !self.is_enabled() {
             return false;
         }
@@ -1064,6 +1090,7 @@ impl ThumbnailManager {
             source: source.clone(),
             local_video_midpoint: None,
             area,
+            sizing,
         };
         self.synchronize_target(target)
     }
@@ -1093,6 +1120,7 @@ impl ThumbnailManager {
             source: source.clone(),
             local_video_midpoint: None,
             area,
+            sizing: ThumbnailSizing::Fullscreen,
         };
         if self.target.as_ref() == Some(&target)
             || self.expansion.target.as_ref() == Some(&target)
@@ -1226,6 +1254,32 @@ impl ThumbnailManager {
     /// decoding, and persistent-cache I/O all remain on the thumbnail worker.
     /// Repeated calls with the same path, midpoint, and area do no work.
     pub fn synchronize_local_video(&mut self, path: &Path, midpoint_ms: u64, area: Rect) -> bool {
+        self.synchronize_local_video_with_sizing(path, midpoint_ms, area, ThumbnailSizing::Native)
+    }
+
+    /// Enlarges the selected local-video frame only for its fullscreen rendering.
+    pub fn synchronize_local_video_fullscreen(
+        &mut self,
+        path: &Path,
+        midpoint_ms: u64,
+        area: Rect,
+    ) -> bool {
+        self.synchronize_local_video_with_sizing(
+            path,
+            midpoint_ms,
+            area,
+            ThumbnailSizing::Fullscreen,
+        )
+    }
+
+    /// Keeps native cached frame derivatives independent from fullscreen preparation.
+    fn synchronize_local_video_with_sizing(
+        &mut self,
+        path: &Path,
+        midpoint_ms: u64,
+        area: Rect,
+        sizing: ThumbnailSizing,
+    ) -> bool {
         if !self.is_enabled() {
             return false;
         }
@@ -1249,6 +1303,7 @@ impl ThumbnailManager {
             source,
             local_video_midpoint: Some(LocalVideoMidpoint(midpoint_ms)),
             area,
+            sizing,
         })
     }
 
@@ -2160,7 +2215,7 @@ fn load_local_thumbnail(
         if let Some(image) = decode_local_preview_record(&bytes)
             && fingerprint.is_current()
         {
-            let encoded = encode_thumbnail(picker, target.area, image)?;
+            let encoded = encode_target_thumbnail(picker, target, image)?;
             if !fingerprint.is_current() {
                 return Err(ThumbnailFailure::InvalidImage);
             }
@@ -2185,7 +2240,7 @@ fn load_local_thumbnail(
         .is_some()
         .then(|| encode_local_preview_record(&image))
         .flatten();
-    let encoded = encode_thumbnail(picker, target.area, image)?;
+    let encoded = encode_target_thumbnail(picker, target, image)?;
     if !fingerprint.is_current() {
         return Err(ThumbnailFailure::InvalidImage);
     }
@@ -2228,7 +2283,7 @@ fn load_local_video_thumbnail(
             && fingerprint.is_current()
             && !cancellation.is_cancelled()
         {
-            let encoded = encode_thumbnail(picker, target.area, image)?;
+            let encoded = encode_target_thumbnail(picker, target, image)?;
             if cancellation.is_cancelled() {
                 return Err(ThumbnailFailure::LocalVideoFrameExtractionFailed);
             }
@@ -2297,7 +2352,7 @@ fn load_local_video_thumbnail(
         .is_some()
         .then(|| encode_local_preview_record(&image))
         .flatten();
-    let encoded = encode_thumbnail(picker, target.area, image)?;
+    let encoded = encode_target_thumbnail(picker, target, image)?;
     if cancellation.is_cancelled() {
         return Err(ThumbnailFailure::LocalVideoFrameExtractionFailed);
     }
@@ -2460,11 +2515,88 @@ fn encode_remote_thumbnail(
     target: &ThumbnailTarget,
     image: DynamicImage,
 ) -> Result<EncodedThumbnail, ThumbnailFailure> {
-    encode_thumbnail(
+    encode_target_thumbnail(
         picker,
-        target.area,
+        target,
         crop_youtube_letterbox(&target.source, image),
     )
+}
+
+/// Scales only fullscreen sources before the ordinary native-fit protocol encoding.
+///
+/// All interpolation stays on a worker. The unchanged `Fit` renderer then sees
+/// already-sized pixels, so displaying a prepared image never rescales it on
+/// the TUI thread. Persistent local records are produced before this step.
+fn encode_target_thumbnail(
+    picker: &Picker,
+    target: &ThumbnailTarget,
+    image: DynamicImage,
+) -> Result<EncodedThumbnail, ThumbnailFailure> {
+    if target.sizing == ThumbnailSizing::Native {
+        return encode_thumbnail(picker, target.area, image);
+    }
+    let area = bounded_fullscreen_area(picker, target.area)?;
+    let pixels = local_preview_target(picker, area);
+    let image = DynamicImage::ImageRgba8(image.into_rgba8()).resize(
+        pixels.width,
+        pixels.height,
+        image::imageops::FilterType::Triangle,
+    );
+    encode_thumbnail(picker, area, image)
+}
+
+/// Bounds the cell-rounded RGBA allocation before any protocol-library arithmetic.
+///
+/// The library multiplies cell/font dimensions in `u16`. Restricting each
+/// padded dimension to 4096 pixels and their product to 32 MiB of RGBA avoids
+/// that overflow and bounds both retained source pixels and protocol padding.
+/// Temporary decoder/encoder buffers remain separate from this per-image bound.
+fn bounded_fullscreen_area(picker: &Picker, area: Rect) -> Result<Rect, ThumbnailFailure> {
+    let font = picker.font_size();
+    let font_width = u32::from(font.width);
+    let font_height = u32::from(font.height);
+    if area.is_empty()
+        || font_width == 0
+        || font_height == 0
+        || font_width > MAX_IMAGE_DIMENSION
+        || font_height > MAX_IMAGE_DIMENSION
+    {
+        return Err(ThumbnailFailure::EncodingFailed);
+    }
+    let columns = u32::from(area.width).min(MAX_IMAGE_DIMENSION / font_width);
+    let rows = u32::from(area.height).min(MAX_IMAGE_DIMENSION / font_height);
+    let maximum = columns.max(rows);
+    let dimensions = |extent: u32| {
+        (
+            (columns * extent / maximum).max(1),
+            (rows * extent / maximum).max(1),
+        )
+    };
+    let fits = |extent| {
+        let (columns, rows) = dimensions(extent);
+        u64::from(columns) * u64::from(font_width) * u64::from(rows) * u64::from(font_height) * 4
+            <= MAX_DECODE_ALLOC_BYTES
+    };
+    if !fits(1) {
+        return Err(ThumbnailFailure::EncodingFailed);
+    }
+    let mut lower = 1;
+    let mut upper = maximum;
+    while lower < upper {
+        let midpoint = lower + (upper - lower).div_ceil(2);
+        if fits(midpoint) {
+            lower = midpoint;
+        } else {
+            upper = midpoint - 1;
+        }
+    }
+    let (width, height) = dimensions(lower);
+    Ok(Rect::new(
+        area.x,
+        area.y,
+        u16::try_from(width).map_err(|_| ThumbnailFailure::EncodingFailed)?,
+        u16::try_from(height).map_err(|_| ThumbnailFailure::EncodingFailed)?,
+    ))
 }
 
 /// Aspect-fits and encodes a decoded image for its exact render area.
@@ -3614,6 +3746,7 @@ pub(crate) mod tests {
             source: Url::from_file_path(&path).expect("benchmark file URL"),
             local_video_midpoint: None,
             area: Rect::new(0, 0, 120, 40),
+            sizing: ThumbnailSizing::Native,
         };
 
         let cold_started = Instant::now();
@@ -3698,6 +3831,159 @@ pub(crate) mod tests {
         );
     }
 
+    /// Fullscreen scaling clamps even pathological terminal/font dimensions before encoding.
+    #[test]
+    fn fullscreen_pixel_bounds_include_cell_padding_and_rgba_allocation() {
+        for font in [(1, 1), (10, 20), (13, 27), (4096, 1)] {
+            let picker = picker_for_protocol(ThumbnailProtocol::Kitty, font);
+            let requested = Rect::new(0, 0, u16::MAX, u16::MAX);
+            let bounded = bounded_fullscreen_area(&picker, requested).unwrap();
+            let width = u64::from(bounded.width) * u64::from(font.0);
+            let height = u64::from(bounded.height) * u64::from(font.1);
+            assert!(width > 0 && width <= u64::from(MAX_IMAGE_DIMENSION));
+            assert!(height > 0 && height <= u64::from(MAX_IMAGE_DIMENSION));
+            assert!(width * height * 4 <= MAX_DECODE_ALLOC_BYTES);
+        }
+        let picker = picker_for_protocol(ThumbnailProtocol::Kitty, FALLBACK_FONT_SIZE);
+        let ordinary = Rect::new(0, 0, 160, 45);
+        assert_eq!(
+            bounded_fullscreen_area(&picker, ordinary).unwrap(),
+            ordinary
+        );
+        assert!(bounded_fullscreen_area(&picker, Rect::default()).is_err());
+        for font in [(4096, 4096), (u16::MAX, 1), (1, u16::MAX)] {
+            let picker = picker_for_protocol(ThumbnailProtocol::Kitty, font);
+            assert!(bounded_fullscreen_area(&picker, ordinary).is_err());
+        }
+    }
+
+    /// Sixteen-bit inputs become bounded RGBA8 and never re-encode during display.
+    #[test]
+    fn fullscreen_scaling_normalizes_rgba_and_prepares_the_rendered_fit() {
+        let picker = picker_for_protocol(ThumbnailProtocol::Kitty, FALLBACK_FONT_SIZE);
+        let target = ThumbnailTarget {
+            source: Url::parse("https://images.example/sixteen-bit.png").unwrap(),
+            local_video_midpoint: None,
+            area: Rect::new(0, 0, 40, 10),
+            sizing: ThumbnailSizing::Fullscreen,
+        };
+        let image = DynamicImage::ImageRgba16(image::ImageBuffer::new(16, 8));
+        let mut encoded = encode_target_thumbnail(&picker, &target, image).unwrap();
+        assert_eq!(encoded.render_size, Size::new(40, 10));
+        assert_eq!(encoded.decoded_bytes, 400 * 200 * 4);
+        let mut buffer = ratatui::buffer::Buffer::empty(target.area);
+        encoded
+            .protocol
+            .resize_encode_render(&Resize::Fit(None), target.area, &mut buffer);
+        assert!(encoded.protocol.last_encoding_result().is_none());
+    }
+
+    /// The larger downloaded original, not preview pixels, is scaled and cached for fullscreen.
+    #[test]
+    fn prefetched_maxres_source_scales_to_the_terminal_before_the_first_click() {
+        let (mut manager, replies, observed) = manager_with_mock_transport();
+        let (warm_replies, warm_observed) = install_mock_expansion_transport(&mut manager);
+        let preview = Url::parse("https://i.ytimg.com/vi/fixture/hqdefault.jpg").unwrap();
+        let expanded = Url::parse("https://i.ytimg.com/vi/fixture/maxresdefault.jpg").unwrap();
+        let preview_area = Rect::new(70, 2, 48, 18);
+        let fullscreen = Rect::new(0, 0, 160, 45);
+        let jpeg = |width, height, color| {
+            let mut bytes = Cursor::new(Vec::new());
+            DynamicImage::ImageRgb8(image::ImageBuffer::from_pixel(
+                width,
+                height,
+                image::Rgb(color),
+            ))
+            .write_to(&mut bytes, ImageFormat::Jpeg)
+            .unwrap();
+            bytes.into_inner()
+        };
+        manager.synchronize(Some(&preview), preview_area);
+        assert_eq!(
+            observed.recv_timeout(Duration::from_secs(1)).unwrap(),
+            preview
+        );
+        replies.send(Ok(jpeg(480, 360, [200, 10, 10]))).unwrap();
+        assert_eq!(wait_for_terminal_state(&mut manager), ThumbnailState::Ready);
+        assert!(manager.synchronize_expansion(Some(&expanded), fullscreen));
+        assert_eq!(
+            warm_observed.recv_timeout(Duration::from_secs(1)).unwrap(),
+            expanded
+        );
+        warm_replies
+            .send(Ok(jpeg(1280, 720, [10, 200, 10])))
+            .unwrap();
+        wait_for_mock_expansion(&mut manager);
+        assert_eq!(manager.state(), &ThumbnailState::Ready);
+        assert!(manager.synchronize_fullscreen(Some(&expanded), fullscreen));
+        assert_eq!(manager.state(), &ThumbnailState::Ready);
+        assert_eq!(manager.render_size(), Some(Size::new(160, 45)));
+        assert_eq!(manager.protocol_decoded_bytes, 1600 * 900 * 4);
+        let mut buffer = ratatui::buffer::Buffer::empty(fullscreen);
+        manager.protocol_mut().unwrap().resize_encode_render(
+            &Resize::Fit(None),
+            fullscreen,
+            &mut buffer,
+        );
+        assert!(
+            manager
+                .protocol_mut()
+                .unwrap()
+                .last_encoding_result()
+                .is_none()
+        );
+        assert!(observed.is_empty());
+        assert!(warm_observed.is_empty());
+        for _ in 0..2 {
+            manager.synchronize(Some(&preview), preview_area);
+            assert_eq!(manager.state(), &ThumbnailState::Ready);
+            assert_eq!(manager.render_size(), Some(Size::new(48, 18)));
+            manager.synchronize_fullscreen(Some(&expanded), fullscreen);
+            assert_eq!(manager.state(), &ThumbnailState::Ready);
+            assert_eq!(manager.render_size(), Some(Size::new(160, 45)));
+            assert!(observed.is_empty());
+            assert!(warm_observed.is_empty());
+        }
+    }
+
+    /// Fullscreen preparation must not persist scaled pixels as a native local derivative.
+    #[test]
+    fn fullscreen_local_artwork_keeps_persisted_native_pixels_unchanged() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("small-original.jpg");
+        write_jpeg_fixture(&path, 64, 32);
+        let source = Url::from_file_path(&path).unwrap();
+        let cache_directory = directory.path().join("thumbnail-cache");
+        let area = Rect::new(0, 0, 120, 40);
+        let cache_key = local_preview_cache_key(&path, area);
+        let mut manager = local_thumbnail_manager(cache_directory.clone());
+        manager.synchronize_fullscreen(Some(&source), area);
+        assert_eq!(wait_for_terminal_state(&mut manager), ThumbnailState::Ready);
+        assert_eq!(manager.render_size(), Some(Size::new(120, 30)));
+        wait_for_local_preview(&cache_directory, &cache_key);
+        let record = ThumbnailCache::new(cache_directory.clone())
+            .read_key(&cache_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            decode_local_preview_record(&record).unwrap().dimensions(),
+            (64, 32)
+        );
+        manager.synchronize(Some(&source), area);
+        assert_eq!(wait_for_terminal_state(&mut manager), ThumbnailState::Ready);
+        assert_eq!(manager.render_size(), Some(Size::new(8, 2)));
+        assert_eq!(
+            ThumbnailCache::new(cache_directory)
+                .read_key(&cache_key)
+                .unwrap()
+                .unwrap(),
+            record
+        );
+        manager.synchronize_fullscreen(Some(&source), area);
+        assert_eq!(manager.state(), &ThumbnailState::Ready);
+        assert_eq!(manager.render_size(), Some(Size::new(120, 30)));
+    }
+
     /// Ready expansions are synchronous RAM hits; early clicks reuse the pending transfer.
     #[test]
     fn expansion_prefetch_waits_for_preview_and_reuses_prepared_or_pending_artwork() {
@@ -3729,15 +4015,15 @@ pub(crate) mod tests {
             assert_eq!(manager.target.as_ref().unwrap().source, preview);
 
             if click_before_ready {
-                manager.synchronize(Some(&expanded), fullscreen);
+                manager.synchronize_fullscreen(Some(&expanded), fullscreen);
                 assert_eq!(manager.state(), &ThumbnailState::Loading);
             }
             results
                 .send(WorkerResult {
                     generation: request.generation,
-                    result: encode_thumbnail(
+                    result: encode_target_thumbnail(
                         &picker_for_protocol(ThumbnailProtocol::Kitty, FALLBACK_FONT_SIZE),
-                        fullscreen,
+                        &request.target,
                         DynamicImage::new_rgb8(640, 640),
                     )
                     .map(|mut encoded| {
@@ -3754,7 +4040,7 @@ pub(crate) mod tests {
                 click_before_ready,
                 "warming alone must not redraw"
             );
-            manager.synchronize(Some(&expanded), fullscreen);
+            manager.synchronize_fullscreen(Some(&expanded), fullscreen);
             assert_eq!(
                 manager.state(),
                 &ThumbnailState::Ready,
@@ -3803,7 +4089,7 @@ pub(crate) mod tests {
         assert_eq!(manager.state(), &ThumbnailState::Ready);
         assert!(!manager.synchronize_expansion(Some(&expanded), fullscreen));
         assert!(requests.is_empty());
-        manager.synchronize(Some(&expanded), fullscreen);
+        manager.synchronize_fullscreen(Some(&expanded), fullscreen);
         assert_eq!(
             manager.state(),
             &ThumbnailState::Failed(ThumbnailFailure::DownloadFailed)
@@ -3827,9 +4113,9 @@ pub(crate) mod tests {
         assert_eq!(wait_for_terminal_state(&mut manager), ThumbnailState::Ready);
         manager.synchronize_expansion(Some(&expanded), fullscreen);
         let request = requests.try_recv().unwrap();
-        manager.synchronize(Some(&expanded), fullscreen);
+        manager.synchronize_fullscreen(Some(&expanded), fullscreen);
         let resized = Rect::new(0, 0, 100, 30);
-        manager.synchronize(Some(&expanded), resized);
+        manager.synchronize_fullscreen(Some(&expanded), resized);
         let resized_request = requests
             .try_recv()
             .expect("fullscreen resize reuses RAM worker");
@@ -3844,7 +4130,7 @@ pub(crate) mod tests {
             .unwrap();
         assert!(!manager.poll());
         assert_eq!(manager.state(), &ThumbnailState::Loading);
-        manager.synchronize(Some(&expanded), fullscreen);
+        manager.synchronize_fullscreen(Some(&expanded), fullscreen);
         assert!(!requests.is_empty());
         manager.clear();
         assert!(
@@ -3963,7 +4249,7 @@ pub(crate) mod tests {
             assert!(Instant::now() < deadline);
             thread::sleep(Duration::from_millis(5));
         }
-        manager.synchronize(Some(&expanded), fullscreen);
+        manager.synchronize_fullscreen(Some(&expanded), fullscreen);
         assert_eq!(manager.state(), &ThumbnailState::Ready);
         assert!(observed.is_empty());
         assert!(warm_observed.is_empty());
@@ -4037,7 +4323,7 @@ pub(crate) mod tests {
             })
             .unwrap();
         assert!(!manager.poll());
-        manager.synchronize(latest_expanded.as_ref(), fullscreen);
+        manager.synchronize_fullscreen(latest_expanded.as_ref(), fullscreen);
         assert_eq!(manager.state(), &ThumbnailState::Ready);
         assert!(
             observed.is_empty(),
@@ -4774,6 +5060,7 @@ pub(crate) mod tests {
             local_video_midpoint: None,
             width: area.width,
             height: area.height,
+            sizing: ThumbnailSizing::Native,
             local_fingerprint: None,
         };
         let second = PreparedThumbnailKey {
@@ -4781,6 +5068,7 @@ pub(crate) mod tests {
             local_video_midpoint: None,
             width: area.width,
             height: area.height,
+            sizing: ThumbnailSizing::Native,
             local_fingerprint: None,
         };
         let oversized = PreparedThumbnailKey {
@@ -4789,6 +5077,7 @@ pub(crate) mod tests {
             local_video_midpoint: None,
             width: area.width,
             height: area.height,
+            sizing: ThumbnailSizing::Native,
             local_fingerprint: None,
         };
         let more_than_half = PREPARED_THUMBNAIL_CACHE_MAX_DECODED_BYTES / 2 + 1;
@@ -5249,6 +5538,7 @@ pub(crate) mod tests {
                 source,
                 local_video_midpoint: None,
                 area: Rect::new(0, 0, 20, 8),
+                sizing: ThumbnailSizing::Native,
             }),
             protocol: None,
             protocol_render_size: None,
