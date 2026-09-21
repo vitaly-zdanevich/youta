@@ -21562,8 +21562,8 @@ impl AppController {
     }
 
     /// Mutates the selected channel's local subscription after reloading OPML.
-    /// Episode details retain channel metadata, but stale frontend actions must
-    /// not use that metadata to subscribe or unsubscribe the parent channel.
+    /// Search-video details may subscribe their parent channel, but cannot
+    /// unsubscribe it, including through repeated or stale frontend actions.
     fn toggle_local_subscription(&mut self) {
         let Some(details) = self.view.details.as_ref() else {
             self.view.status_line = "No channel is selected".to_owned();
@@ -54665,10 +54665,58 @@ mod tests {
         );
     }
 
-    /// A stale frontend action on episode details must not change channel OPML.
+    /// A search video can subscribe its channel without opening the channel panel.
+    #[test]
+    fn youtube_video_search_subscription_persists_and_cannot_unsubscribe() {
+        let temporary = crate::test_support::canonical_tempdir("video search subscription");
+        let config = Config::for_dir(temporary.path().join("youta"));
+        let mut tree = SubscriptionTree::default();
+        assert!(tree.subscribe_youtube_channel("Unrelated channel", "UCother"));
+        subscriptions::save(&config, &tree).expect("existing OPML");
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let mut controller = AppController::new(config.clone(), store, None, None);
+        controller.view.screen = Screen::Search;
+        let video = subscription_video_summary();
+        controller.youtube_results = vec![SearchItem::Video(video.clone())];
+        controller.view.details = Some(preliminary_detail(
+            &SearchItem::Video(video),
+            &controller.subscription_tree,
+        ));
+        controller.refresh_youtube_rows();
+
+        controller.dispatch(UiAction::ToggleSubscription);
+
+        let saved = subscriptions::load(&config).expect("saved subscriptions");
+        assert!(saved.contains_youtube_channel("UCfixture"));
+        assert!(saved.contains_youtube_channel("UCother"));
+        assert!(
+            controller
+                .subscription_tree
+                .contains_youtube_channel("UCfixture")
+        );
+        assert!(controller.view.details.as_ref().unwrap().channel_subscribed);
+        assert!(controller.view.rows[0].subscribed);
+        assert!(!controller.view.youtube_channel_subscription_available());
+
+        // A repeated or stale action must not turn Subscribe into Unsubscribe.
+        let before = std::fs::read(config.subscriptions_file()).expect("OPML before repeat");
+        controller.dispatch(UiAction::ToggleSubscription);
+        assert_eq!(
+            std::fs::read(config.subscriptions_file()).expect("OPML after repeat"),
+            before
+        );
+        assert!(controller.view.details.as_ref().unwrap().channel_subscribed);
+        assert!(controller.view.rows[0].subscribed);
+    }
+
+    /// Video actions cannot unsubscribe or mutate channels outside search results.
     #[test]
     fn video_subscription_dispatch_preserves_existing_opml_and_view() {
-        for subscribed in [false, true] {
+        for (screen, subscribed) in [
+            (Screen::Search, true),
+            (Screen::Subscriptions, false),
+            (Screen::Subscriptions, true),
+        ] {
             let temporary = crate::test_support::canonical_tempdir("video subscription guard");
             let config = Config::for_dir(temporary.path().join("youta"));
             let mut tree = SubscriptionTree::default();
@@ -54680,6 +54728,7 @@ mod tests {
             let before = std::fs::read(config.subscriptions_file()).expect("OPML before dispatch");
             let store = StateStore::open_in_memory().expect("in-memory state");
             let mut controller = AppController::new(config.clone(), store, None, None);
+            controller.view.screen = screen;
             let video = subscription_video_summary();
             controller.youtube_results = vec![SearchItem::Video(video.clone())];
             controller.view.details = Some(preliminary_detail(

@@ -24275,8 +24275,9 @@ for encoded, expected in json.load(sys.stdin):
         assert!(rendered.contains("[s] Unsubscribe (locally)"));
     }
 
+    /// Search-video Subscribe works with the mouse and keyboard; Unsubscribe stays channel-only.
     #[test]
-    fn youtube_subscription_controls_require_channel_items() {
+    fn youtube_video_search_subscription_controls_keep_unsubscribe_channel_only() {
         for screen in [Screen::Search, Screen::Subscriptions] {
             for subscribed in [false, true] {
                 let mut view = ViewModel {
@@ -24296,20 +24297,40 @@ for encoded, expected in json.load(sys.stdin):
                 terminal
                     .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
                     .expect("render video");
-                assert!(
-                    hit_map
-                        .detail_buttons
-                        .iter()
-                        .all(|(action, _)| *action != UiAction::ToggleSubscription),
-                    "video items must not expose subscription controls: {screen:?}, subscribed={subscribed}"
+                let can_subscribe = screen == Screen::Search && !subscribed;
+                let video_button = hit_map.detail_buttons.iter().find_map(|(action, area)| {
+                    (*action == UiAction::ToggleSubscription).then_some(*area)
+                });
+                assert_eq!(
+                    video_button.is_some(),
+                    can_subscribe,
+                    "only unsubscribed search videos expose Subscribe: {screen:?}, subscribed={subscribed}"
                 );
-                assert!(!rendered_text(&terminal).contains("Subscribe (locally)"));
+                assert_eq!(
+                    rendered_text(&terminal).contains("Subscribe (locally)"),
+                    can_subscribe
+                );
                 assert!(!rendered_text(&terminal).contains("Unsubscribe (locally)"));
                 assert_eq!(
                     key_action(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE), &view),
-                    None,
-                    "a hidden subscription action must not remain keyboard-active"
+                    can_subscribe.then_some(UiAction::ToggleSubscription),
+                    "keyboard availability must match the visible action"
                 );
+                if let Some(area) = video_button {
+                    assert_eq!(
+                        mouse_action(
+                            MouseEvent {
+                                kind: MouseEventKind::Down(MouseButton::Left),
+                                column: area.x,
+                                row: area.y,
+                                modifiers: KeyModifiers::NONE,
+                            },
+                            &hit_map,
+                            &view
+                        ),
+                        Some(UiAction::ToggleSubscription)
+                    );
+                }
 
                 view.details.as_mut().expect("details").media_id = None;
                 terminal
@@ -24735,12 +24756,16 @@ for encoded, expected in json.load(sys.stdin):
             area_for(&UiAction::OpenCommonsUpload).bottom(),
             "preservation buttons must stay grouped"
         );
-        assert!(
+        assert!(rendered_text(&terminal).contains("[s] Subscribe (locally)"));
+        assert_eq!(
+            Some(area_for(&UiAction::ToggleSubscription).y),
             hit_map
                 .detail_buttons
                 .iter()
-                .all(|(action, _)| *action != UiAction::ToggleSubscription),
-            "video items must not reserve a subscription row"
+                .filter(|(action, _)| *action != UiAction::ToggleSubscription)
+                .map(|(_, area)| area.bottom())
+                .max(),
+            "Subscribe must follow both action columns without an extra blank row"
         );
         for (action, area) in &hit_map.detail_buttons {
             assert_eq!(
@@ -24970,6 +24995,7 @@ for encoded, expected in json.load(sys.stdin):
             UiAction::OpenInBrowser,
             UiAction::OpenPlaylistPopup,
             UiAction::EditPrivateNote,
+            UiAction::ToggleSubscription,
         ];
         let mut action_areas = expected_actions
             .iter()
@@ -25017,6 +25043,7 @@ for encoded, expected in json.load(sys.stdin):
             "[o] open video".to_owned(),
             "[P] Playlist…".to_owned(),
             "[n] Add private note".to_owned(),
+            "[s] Subscribe (locally)".to_owned(),
         ];
         for ((expected, expected_label), area) in expected_actions
             .iter()

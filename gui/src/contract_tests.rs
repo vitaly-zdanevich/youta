@@ -879,9 +879,9 @@ fn the_window_limits_auto_download_to_channel_entities() {
     );
 }
 
-/// Both subscription labels belong to channel entities, never episode details.
+/// Search videos may subscribe; unsubscribing still requires a channel entity.
 #[test]
-fn the_window_limits_subscription_actions_to_channel_entities() {
+fn the_window_exposes_subscription_actions_for_channels_and_unsubscribed_search_videos() {
     let details = window_source("components/Details.tsx");
     let before_action = details
         .split_once("active={details.channel_subscribed}")
@@ -889,12 +889,18 @@ fn the_window_limits_subscription_actions_to_channel_entities() {
         .0;
     let guard = before_action
         .rsplit_once("{details.")
-        .expect("channel entity guard")
+        .expect("channel subscription guard")
         .1;
 
     assert!(
-        guard.starts_with("media_id === null && details.channel_id !== '' ? ("),
-        "Subscribe and Unsubscribe must require a channel entity with no media ID"
+        guard.starts_with("channel_id !== '' &&"),
+        "subscription actions must require a channel ID"
+    );
+    assert!(
+        guard.contains("details.media_id === null ||")
+            && guard
+                .contains("view.screen === 'Search' && isYouTube && !details.channel_subscribed"),
+        "only unsubscribed YouTube search videos may extend the channel entity subscription actions"
     );
     assert!(
         !guard.contains("kind ==="),

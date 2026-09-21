@@ -386,9 +386,11 @@ export function Details({ view, kind }: { view: ViewModel; kind: InformationPane
 				Auto-download
 			</label>
 		) : null}
-		{/* Episode metadata also has a channel ID; subscription actions belong
-		    only to channel entities, including search channels in the Video layout. */}
-		{details.media_id === null && details.channel_id !== '' ? (
+		{/* Search videos can subscribe to their parent channel. Unsubscribe remains
+		    on channel entities, including search channels in the Video layout. */}
+		{details.channel_id !== '' &&
+		(details.media_id === null ||
+			(view.screen === 'Search' && isYouTube && !details.channel_subscribed)) ? (
 			<Action
 				active={details.channel_subscribed}
 				onClick={() => void dispatch('ToggleSubscription')}

@@ -2971,15 +2971,23 @@ impl ViewModel {
             })
     }
 
-    /// Allows local subscription changes only for channel entities.
+    /// Allows channel subscription changes and Subscribe on `YouTube` search videos.
     ///
-    /// Videos carry their parent's channel ID too, but their media ID
-    /// distinguishes them from channel results and channel panels.
+    /// Search videos expose their uploader's channel without requiring a panel
+    /// switch. Unsubscribe remains channel-only, including for repeated actions
+    /// after subscribing from a video.
     #[must_use]
     pub fn youtube_channel_subscription_available(&self) -> bool {
-        self.details
-            .as_ref()
-            .is_some_and(|details| !details.channel_id.is_empty() && details.media_id.is_none())
+        self.details.as_ref().is_some_and(|details| {
+            !details.channel_id.is_empty()
+                && (details.media_id.is_none()
+                    || (self.screen == Screen::Search
+                        && !details.channel_subscribed
+                        && details
+                            .media_id
+                            .as_ref()
+                            .is_some_and(|media_id| media_id.source == SourceKind::YouTube)))
+        })
     }
 
     /// Reports whether the current details or channel panel can create a `YouTube` feed.
@@ -4168,6 +4176,36 @@ mod tests {
             serde_json::to_value(Screen::YandexMusic).expect("serialize Yandex screen"),
             serde_json::json!("YandexMusic")
         );
+    }
+
+    /// Search videos may subscribe their channel, but never unsubscribe it.
+    #[test]
+    fn youtube_video_search_subscription_is_subscribe_only() {
+        let mut view = ViewModel {
+            screen: Screen::Search,
+            details: Some(DetailView {
+                media_id: Some(MediaId::new(SourceKind::YouTube, "fixture-video")),
+                channel_id: "UCfixture".to_owned(),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        assert!(view.youtube_channel_subscription_available());
+        view.details.as_mut().unwrap().channel_subscribed = true;
+        assert!(!view.youtube_channel_subscription_available());
+        view.details.as_mut().unwrap().channel_subscribed = false;
+        view.screen = Screen::Subscriptions;
+        assert!(!view.youtube_channel_subscription_available());
+        view.screen = Screen::Search;
+        view.details.as_mut().unwrap().media_id =
+            Some(MediaId::new(SourceKind::Local, "fixture-audio"));
+        assert!(!view.youtube_channel_subscription_available());
+        view.details.as_mut().unwrap().media_id =
+            Some(MediaId::new(SourceKind::YouTube, "fixture-video"));
+        view.details.as_mut().unwrap().channel_id.clear();
+        assert!(!view.youtube_channel_subscription_available());
+        view.details = None;
+        assert!(!view.youtube_channel_subscription_available());
     }
 
     #[test]

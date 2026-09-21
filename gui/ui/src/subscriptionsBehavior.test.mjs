@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
+import { createRequire } from 'node:module';
 import test from 'node:test';
 
 const source = await readFile(
@@ -78,4 +79,86 @@ test('YouTube podcast buttons are limited to channel entities, including search 
 	assert.match(guard, /details\.channel_id !== ''/);
 	assert.doesNotMatch(guard, /kind === 'Channel'/);
 	assert.doesNotMatch(guard, /kind === 'Video'/);
+});
+
+const require = createRequire(import.meta.url);
+const React = require('react');
+const ts = require('typescript');
+const actions = [];
+const detailsSource = await readFile(new URL('./components/Details.tsx', import.meta.url), 'utf8');
+const compiledDetails = ts.transpileModule(detailsSource, {
+	compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX },
+}).outputText;
+const detailsModule = { exports: {} };
+
+/** Render the real Details actions with inert effects and a deterministic IPC bridge. */
+function detailsRequire(name) {
+	if (name === 'react') return { ...React, useEffect: () => {}, useRef: (current) => ({ current }) };
+	if (name === '../ipc') return { dispatch: (action) => actions.push(action) };
+	if (name === '../searchHighlights') return { highlightRanges: () => [] };
+	if (name === './Artwork') return { Artwork: () => null };
+	if (name === './Description') return { Description: () => null, WikidataSpoiler: () => null };
+	if (name === './SearchHighlight') return { SearchHighlight: ({ text }) => text };
+	return require(name);
+}
+
+new Function('require', 'module', 'exports', compiledDetails)(detailsRequire, detailsModule, detailsModule.exports);
+
+/** Expand function components so checks exercise rendered buttons and their handlers. */
+function elements(element) {
+	if (!React.isValidElement(element)) return [];
+	if (typeof element.type === 'function') return elements(element.type(element.props));
+	return [element, ...React.Children.toArray(element.props.children).flatMap(elements)];
+}
+
+/** Minimal provider fixture keeps unrelated panels and optional capabilities inactive. */
+function subscriptionButtons(screen, subscribed, mediaSource = 'you-tube', channelId = 'UCfixture', kind = 'Video') {
+	const view = {
+		screen, playlist_item: null,
+		details: {
+			title: 'Fixture video', source: 'YouTube', channel_id: channelId,
+			channel_subscribed: subscribed,
+			media_id: mediaSource === null ? null : { source: mediaSource, external_id: 'fixture-video' },
+			playlist_names: [], links: [], dearrow_title: null,
+			channel_subscriber_count: null, channel_video_count: null, channel_total_view_count: null,
+		},
+	};
+	return elements(detailsModule.exports.Details({ view, kind }))
+		.filter((node) => node.type === 'button' && ['Subscribe', 'Unsubscribe'].includes(node.props.children));
+}
+
+test('unsubscribed YouTube search videos expose Subscribe and dispatch its action', () => {
+	const buttons = subscriptionButtons('Search', false);
+	assert.deepEqual(buttons.map((node) => node.props.children), ['Subscribe']);
+	actions.length = 0;
+	buttons[0].props.onClick();
+	assert.deepEqual(actions, ['ToggleSubscription']);
+});
+
+test('video subscription controls reject subscribed channels, other screens and other providers', () => {
+	for (const [screen, subscribed, source, channelId] of [
+		['Search', true, 'you-tube', 'UCfixture'],
+		['Search', false, 'you-tube', ''],
+		['Search', false, 'archive-org', 'UCfixture'],
+		['Subscriptions', false, 'you-tube', 'UCfixture'],
+		['Subscriptions', true, 'you-tube', 'UCfixture'],
+		['Playlists', false, 'you-tube', 'UCfixture'],
+		['Downloaded', false, 'you-tube', 'UCfixture'],
+	]) {
+		assert.deepEqual(subscriptionButtons(screen, subscribed, source, channelId), [],
+			`${screen}, subscribed=${subscribed}, source=${source}, channel=${channelId}`);
+	}
+});
+
+test('channel entities retain both subscription actions in search and channel layouts', () => {
+	for (const [screen, kind] of [['Search', 'Video'], ['Subscriptions', 'Channel']]) {
+		for (const subscribed of [false, true]) {
+			const buttons = subscriptionButtons(screen, subscribed, null, 'UCfixture', kind);
+			assert.deepEqual(buttons.map((node) => node.props.children), [subscribed ? 'Unsubscribe' : 'Subscribe']);
+			actions.length = 0;
+			buttons[0].props.onClick();
+			assert.deepEqual(actions, ['ToggleSubscription']);
+			assert.deepEqual(subscriptionButtons(screen, subscribed, null, '', kind), []);
+		}
+	}
 });
