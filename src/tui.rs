@@ -402,7 +402,18 @@ impl ThumbnailRenderer for TerminalThumbnailRenderer {
         } else {
             preferred
         };
-        self.synchronize_visible(source, area)
+        let mut changed = self.synchronize_visible(source, area);
+        if !self.fallback_preferred_failed
+            && fallback.is_some()
+            && matches!(self.manager.state(), ThumbnailState::Failed(_))
+        {
+            // A failed background preparation becomes visible only during
+            // synchronization. Start its fallback in this same frame instead
+            // of waiting for the idle event loop to discover the failure.
+            self.fallback_preferred_failed = true;
+            changed |= self.synchronize_visible(fallback, area);
+        }
+        changed
     }
 
     fn synchronize_local_video(&mut self, source: &LocalVideoThumbnailView, area: Rect) -> bool {
@@ -431,6 +442,11 @@ impl ThumbnailRenderer for TerminalThumbnailRenderer {
     }
 
     fn synchronize_expansion(&mut self, source: Option<&url::Url>, area: Rect) -> bool {
+        if self.fallback_preferred_failed && source == self.fallback_preferred_source.as_ref() {
+            // Closing a working fallback must not restart speculative work for
+            // the same failed large image; a new selected pair resets this state.
+            return false;
+        }
         self.manager.synchronize_expansion(source, area)
     }
 
@@ -993,9 +1009,10 @@ pub fn run(controller: &mut impl UiController, settings: &UiSettings) -> io::Res
         }
         if let Some(renderer) = renderer.as_deref_mut() {
             synchronize_thumbnail_prefetch(controller.view(), settings, renderer);
-            synchronize_podcast_artwork_prefetch(
+            synchronize_selected_artwork_prefetch(
                 controller.view(),
                 fullscreen_artwork_area,
+                current_terminal_window_metrics(),
                 renderer,
             );
         }
@@ -1418,7 +1435,7 @@ fn synchronize_thumbnail_prefetch(
     if let Some(source) = view
         .details
         .as_ref()
-        .filter(|details| !is_apple_podcast_artwork(details))
+        .filter(|details| !is_apple_podcast_artwork(details) && !is_youtube_video_artwork(details))
         .and_then(|details| details.expanded_thumbnail_url.as_ref())
     {
         sources.push(source.clone());
@@ -1438,10 +1455,16 @@ fn synchronize_thumbnail_prefetch(
     renderer.synchronize_prefetch(&sources)
 }
 
-/// Keeps podcast enlargement RAM-only and separate from disk-backed search warming.
-fn synchronize_podcast_artwork_prefetch(
+/// Warms selected artwork in RAM, independently from disk-backed list thumbnails.
+///
+/// Podcasts retain their existing policy. YouTube videos need a distinct,
+/// advertised larger source and known fullscreen pixels that exceed the
+/// selected preview's native fit. The manager defers either source until its
+/// visible preview is ready and cancels stale generations during navigation.
+fn synchronize_selected_artwork_prefetch(
     view: &ViewModel,
     fullscreen: Rect,
+    terminal_window: Option<TerminalWindowMetrics>,
     renderer: &mut dyn ThumbnailRenderer,
 ) -> bool {
     // Keep pending early-click work alive, but do not retry a failed preferred
@@ -1456,9 +1479,56 @@ fn synchronize_podcast_artwork_prefetch(
     let source = view
         .details
         .as_ref()
-        .filter(|details| is_apple_podcast_artwork(details))
+        .filter(|details| {
+            is_apple_podcast_artwork(details)
+                || (renderer.is_enabled()
+                    && youtube_expansion_benefits_from_fullscreen(
+                        details,
+                        fullscreen,
+                        terminal_window,
+                    ))
+        })
         .and_then(|details| details.expanded_thumbnail_url.as_ref());
     renderer.synchronize_expansion(source, fullscreen)
+}
+
+/// Identifies a selected YouTube video across search, subscriptions and history.
+fn is_youtube_video_artwork(details: &DetailView) -> bool {
+    details
+        .media_id
+        .as_ref()
+        .is_some_and(|id| id.source == crate::domain::SourceKind::YouTube)
+}
+
+/// Requires an aspect-preserving fullscreen fit larger than the preview's source pixels.
+///
+/// Both fullscreen pixel dimensions must exceed their corresponding source
+/// dimensions: the smaller axis ratio controls an aspect fit. Missing geometry
+/// is intentionally not guessed for speculative HTTP requests; clicking can
+/// still explicitly request enlargement in those terminals.
+fn youtube_expansion_benefits_from_fullscreen(
+    details: &DetailView,
+    fullscreen: Rect,
+    terminal_window: Option<TerminalWindowMetrics>,
+) -> bool {
+    if !is_youtube_video_artwork(details) {
+        return false;
+    }
+    let (Some(preview), Some(expanded), Some((width, height)), Some(window)) = (
+        details.thumbnail_url.as_ref(),
+        details.expanded_thumbnail_url.as_ref(),
+        details.thumbnail_dimensions,
+        terminal_window,
+    ) else {
+        return false;
+    };
+    preview != expanded
+        && width > 0
+        && height > 0
+        && u64::from(fullscreen.width) * u64::from(window.width_pixels)
+            > u64::from(width) * u64::from(window.columns)
+        && u64::from(fullscreen.height) * u64::from(window.height_pixels)
+            > u64::from(height) * u64::from(window.rows)
 }
 
 /// Recognizes provider artwork even when selected outside the Podcasts tab.
@@ -28776,11 +28846,11 @@ for encoded, expected in json.load(sys.stdin):
         let area = Rect::new(0, 0, 160, 60);
         let mut renderer = MockThumbnailRenderer::default();
         synchronize_thumbnail_prefetch(&view, &UiSettings::default(), &mut renderer);
-        synchronize_podcast_artwork_prefetch(&view, area, &mut renderer);
+        synchronize_selected_artwork_prefetch(&view, area, None, &mut renderer);
         assert_eq!(renderer.prefetch_batches, [Vec::<url::Url>::new()]);
         assert_eq!(renderer.expansion_prefetches, [(Some(expanded), area)]);
         view.details = None;
-        synchronize_podcast_artwork_prefetch(&view, area, &mut renderer);
+        synchronize_selected_artwork_prefetch(&view, area, None, &mut renderer);
         assert_eq!(renderer.expansion_prefetches.last(), Some(&(None, area)));
     }
 
@@ -28803,9 +28873,10 @@ for encoded, expected in json.load(sys.stdin):
                 ..ViewModel::default()
             };
             let mut renderer = MockThumbnailRenderer::default();
-            assert!(synchronize_podcast_artwork_prefetch(
+            assert!(synchronize_selected_artwork_prefetch(
                 &view,
                 area,
+                None,
                 &mut renderer
             ));
             assert_eq!(
@@ -28817,9 +28888,10 @@ for encoded, expected in json.load(sys.stdin):
             renderer.pending = pending;
             renderer.rendered_artwork = !pending;
             for _ in 0..3 {
-                assert!(!synchronize_podcast_artwork_prefetch(
+                assert!(!synchronize_selected_artwork_prefetch(
                     &view,
                     area,
+                    None,
                     &mut renderer
                 ));
             }
@@ -28830,6 +28902,112 @@ for encoded, expected in json.load(sys.stdin):
             );
             assert_eq!(renderer.is_pending(), pending);
         }
+    }
+
+    /// YouTube warming needs a selected video and enough known fullscreen pixels to help.
+    #[test]
+    fn youtube_expansion_prefetch_requires_useful_known_pixels_and_selected_video() {
+        let preview = url::Url::parse("https://i.ytimg.com/vi/selected/sddefault.jpg").unwrap();
+        let expanded =
+            url::Url::parse("https://i.ytimg.com/vi/selected/maxresdefault.jpg").unwrap();
+        let area = Rect::new(0, 0, 160, 60);
+        let large = TerminalWindowMetrics::new(160, 60, 1600, 1200);
+        let base = ViewModel {
+            screen: Screen::Search,
+            details: Some(DetailView {
+                media_id: Some(MediaId::new(SourceKind::YouTube, "selected")),
+                thumbnail_url: Some(preview.clone()),
+                expanded_thumbnail_url: Some(expanded.clone()),
+                thumbnail_dimensions: Some((640, 480)),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        for (name, metrics, dimensions, expected) in [
+            ("large", large, Some((640, 480)), true),
+            (
+                "compact",
+                TerminalWindowMetrics::new(160, 60, 640, 480),
+                Some((640, 480)),
+                false,
+            ),
+            (
+                "short",
+                TerminalWindowMetrics::new(160, 60, 1600, 400),
+                Some((640, 480)),
+                false,
+            ),
+            (
+                "narrow",
+                TerminalWindowMetrics::new(160, 60, 600, 1200),
+                Some((640, 480)),
+                false,
+            ),
+            ("unknown terminal", None, Some((640, 480)), false),
+            ("unknown source", large, None, false),
+            ("invalid source", large, Some((0, 480)), false),
+        ] {
+            let mut view = base.clone();
+            view.details.as_mut().unwrap().thumbnail_dimensions = dimensions;
+            let mut renderer = MockThumbnailRenderer {
+                enabled: true,
+                ..Default::default()
+            };
+            synchronize_selected_artwork_prefetch(&view, area, metrics, &mut renderer);
+            assert_eq!(
+                renderer.expansion_prefetches,
+                [(expected.then(|| expanded.clone()), area)],
+                "{name}"
+            );
+        }
+        for reason in [
+            "channel",
+            "different provider",
+            "same URL",
+            "no preview",
+            "disabled",
+        ] {
+            let mut view = base.clone();
+            let details = view.details.as_mut().unwrap();
+            match reason {
+                "channel" => details.media_id = None,
+                "different provider" => {
+                    details.media_id = Some(MediaId::new(SourceKind::ArchiveOrg, "selected"))
+                }
+                "same URL" => details.expanded_thumbnail_url = Some(preview.clone()),
+                "no preview" => details.thumbnail_url = None,
+                _ => {}
+            }
+            let mut renderer = MockThumbnailRenderer {
+                enabled: reason != "disabled",
+                ..Default::default()
+            };
+            synchronize_selected_artwork_prefetch(&view, area, large, &mut renderer);
+            assert_eq!(renderer.expansion_prefetches, [(None, area)], "{reason}");
+        }
+        let mut view = base;
+        view.screen = Screen::Subscriptions;
+        let mut renderer = MockThumbnailRenderer {
+            enabled: true,
+            ..Default::default()
+        };
+        synchronize_selected_artwork_prefetch(&view, area, large, &mut renderer);
+        assert_eq!(renderer.expansion_prefetches, [(Some(expanded), area)]);
+        view.details.as_mut().unwrap().thumbnail_expanded = true;
+        assert!(!synchronize_selected_artwork_prefetch(
+            &view,
+            area,
+            large,
+            &mut renderer
+        ));
+        assert_eq!(
+            renderer.expansion_prefetches.len(),
+            1,
+            "an early click must keep pending work"
+        );
+        view.details = None;
+        synchronize_selected_artwork_prefetch(&view, area, large, &mut renderer);
+        assert_eq!(renderer.expansion_prefetches.last(), Some(&(None, area)));
     }
 
     #[test]
@@ -28908,7 +29086,7 @@ for encoded, expected in json.load(sys.stdin):
     }
 
     #[test]
-    fn thumbnail_prefetch_prioritizes_the_selected_expansion_image() {
+    fn youtube_expanded_artwork_is_excluded_from_disk_prefetch_backlog() {
         let expanded = url::Url::parse("https://i.ytimg.com/vi/selected/maxresdefault.jpg")
             .expect("expanded thumbnail URL");
         let selected = url::Url::parse("https://i.ytimg.com/vi/selected/sddefault.jpg")
@@ -28928,6 +29106,7 @@ for encoded, expected in json.load(sys.stdin):
                 },
             ],
             details: Some(DetailView {
+                media_id: Some(MediaId::new(SourceKind::YouTube, "selected")),
                 thumbnail_url: Some(selected),
                 expanded_thumbnail_url: Some(expanded.clone()),
                 ..DetailView::default()
@@ -28944,14 +29123,13 @@ for encoded, expected in json.load(sys.stdin):
         assert_eq!(
             renderer.prefetch_batches,
             [vec![
-                expanded.clone(),
                 view.rows[0]
                     .thumbnail_url
                     .clone()
                     .expect("selected thumbnail"),
                 next.clone()
             ]],
-            "the click target must warm before list thumbnails without replacing their configured size"
+            "enlargement belongs to ready-preview RAM warming, not an unconditional disk download"
         );
 
         let no_list_warming = UiSettings {
@@ -28965,8 +29143,8 @@ for encoded, expected in json.load(sys.stdin):
         ));
         assert_eq!(
             renderer.prefetch_batches.last(),
-            Some(&vec![expanded.clone()]),
-            "selected expansion warming is independent from the list-prefetch preference"
+            Some(&Vec::new()),
+            "disabling list warming must not trigger an expanded image download"
         );
 
         let mut same_source = view;
@@ -30408,7 +30586,9 @@ for encoded, expected in json.load(sys.stdin):
         };
         let settings = UiSettings::default();
         let mut hit_map = HitMap::default();
-        let (manager, replies, observed) = thumbnail_tests::manager_with_mock_transport();
+        let (mut manager, replies, observed) = thumbnail_tests::manager_with_mock_transport();
+        let (_warm_replies, warm_observed) =
+            thumbnail_tests::install_mock_expansion_transport(&mut manager);
         let mut thumbnails = TerminalThumbnailRenderer::new(manager);
 
         terminal
@@ -30511,6 +30691,16 @@ for encoded, expected in json.load(sys.stdin):
                     render_frame(frame, &view, &settings, &mut hit_map, Some(&mut thumbnails));
                 })
                 .expect("restore the preview or its ready enlarged fallback");
+            if !expanded {
+                assert!(
+                    !thumbnails.synchronize_expansion(
+                        Some(&expanded_thumbnail_url),
+                        Rect::new(0, 0, 120, 32)
+                    ),
+                    "collapsed fallback must not restart failed background enlargement"
+                );
+                assert!(warm_observed.is_empty());
+            }
             assert_eq!(
                 thumbnails.manager.state(),
                 &ThumbnailState::Ready,
@@ -30530,6 +30720,217 @@ for encoded, expected in json.load(sys.stdin):
                     .is_none(),
                 "the cached fallback must not be encoded again on reopening"
             );
+        }
+    }
+
+    /// A speculative failure starts the preview fallback in the first clicked frame.
+    #[cfg(feature = "images")]
+    #[test]
+    fn failed_prefetched_enlargement_starts_fallback_on_the_first_click() {
+        use std::time::{Duration, Instant};
+
+        use crate::thumbnails::{ThumbnailFailure, ThumbnailState, tests as thumbnail_tests};
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 32)).unwrap();
+        let preview = url::Url::parse("https://images.example/preview.png").unwrap();
+        let expanded = url::Url::parse("https://images.example/missing-large.png").unwrap();
+        let fullscreen = Rect::new(0, 0, 120, 32);
+        let mut view = ViewModel {
+            details: Some(DetailView {
+                thumbnail_url: Some(preview.clone()),
+                expanded_thumbnail_url: Some(expanded.clone()),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let settings = UiSettings::default();
+        let mut hit_map = HitMap::default();
+        let (mut manager, replies, observed) = thumbnail_tests::manager_with_mock_transport();
+        let (warm_replies, warm_observed) =
+            thumbnail_tests::install_mock_expansion_transport(&mut manager);
+        let mut renderer = TerminalThumbnailRenderer::new(manager);
+        terminal
+            .draw(|frame| render_frame(frame, &view, &settings, &mut hit_map, Some(&mut renderer)))
+            .unwrap();
+        assert_eq!(
+            observed.recv_timeout(Duration::from_secs(1)).unwrap(),
+            preview
+        );
+        replies
+            .send(Ok(thumbnail_tests::fixture_thumbnail_png()))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while renderer.manager.state() == &ThumbnailState::Loading {
+            renderer.poll();
+            assert!(Instant::now() < deadline, "preview did not become ready");
+            std::thread::yield_now();
+        }
+        assert_eq!(renderer.manager.state(), &ThumbnailState::Ready);
+        assert!(renderer.synchronize_expansion(Some(&expanded), fullscreen));
+        assert_eq!(
+            warm_observed.recv_timeout(Duration::from_secs(1)).unwrap(),
+            expanded
+        );
+        warm_replies
+            .send(Err(ThumbnailFailure::DownloadFailed))
+            .unwrap();
+        thumbnail_tests::wait_for_mock_expansion(&mut renderer.manager);
+        assert_eq!(renderer.manager.state(), &ThumbnailState::Ready);
+
+        view.details.as_mut().unwrap().thumbnail_expanded = true;
+        terminal
+            .draw(|frame| render_frame(frame, &view, &settings, &mut hit_map, Some(&mut renderer)))
+            .unwrap();
+        assert_eq!(
+            renderer.manager.state(),
+            &ThumbnailState::Loading,
+            "a known failed enlargement must start fallback immediately, not wait an idle tick"
+        );
+        assert_eq!(renderer.visible_source.as_ref(), Some(&preview));
+        assert!(
+            renderer.is_pending(),
+            "the event loop must keep polling the fallback"
+        );
+        assert!(!rendered_text(&terminal).contains("Thumbnail unavailable"));
+        assert_eq!(
+            observed.recv_timeout(Duration::from_secs(1)).unwrap(),
+            preview
+        );
+        assert!(
+            warm_observed.is_empty(),
+            "the failed preferred image must not be retried"
+        );
+        replies
+            .send(Ok(thumbnail_tests::fixture_thumbnail_png()))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while renderer.manager.state() == &ThumbnailState::Loading {
+            renderer.poll();
+            assert!(Instant::now() < deadline, "fallback did not become ready");
+            std::thread::yield_now();
+        }
+        for fullscreen in [true, true, false, true, false, true] {
+            view.details.as_mut().unwrap().thumbnail_expanded = fullscreen;
+            terminal
+                .draw(|frame| {
+                    render_frame(frame, &view, &settings, &mut hit_map, Some(&mut renderer))
+                })
+                .unwrap();
+            if !fullscreen {
+                assert!(!renderer.synchronize_expansion(Some(&expanded), Rect::new(0, 0, 120, 32)));
+            }
+            assert_eq!(renderer.manager.state(), &ThumbnailState::Ready);
+            assert_eq!(renderer.visible_source.as_ref(), Some(&preview));
+            assert!(observed.is_empty(), "the prepared fallback must be reused");
+            assert!(
+                warm_observed.is_empty(),
+                "the failed prefetch must not be retried"
+            );
+        }
+    }
+
+    /// Advertised YouTube sizes reuse their rendered Kitty protocol even in a large terminal.
+    /// Automatic maxres previews also cover one URL rendered at two different geometries.
+    #[cfg(feature = "images")]
+    #[test]
+    fn youtube_large_geometry_reopen_keeps_prepared_protocol_without_new_work() {
+        use std::io::Cursor;
+        use std::time::{Duration, Instant};
+
+        use crate::thumbnails::{ThumbnailState, tests as thumbnail_tests};
+
+        for same_source in [false, true] {
+            let mut terminal = Terminal::new(TestBackend::new(320, 90)).unwrap();
+            let expanded =
+                url::Url::parse("https://i.ytimg.com/vi/fixture/maxresdefault.jpg").unwrap();
+            let preview = if same_source {
+                expanded.clone()
+            } else {
+                url::Url::parse("https://i.ytimg.com/vi/fixture/sddefault.jpg").unwrap()
+            };
+            let mut view = ViewModel {
+                details: Some(DetailView {
+                    media_id: Some(MediaId::new(SourceKind::YouTube, "fixture")),
+                    source: "YouTube".to_owned(),
+                    thumbnail_url: Some(preview.clone()),
+                    expanded_thumbnail_url: Some(expanded.clone()),
+                    thumbnail_dimensions: Some(if same_source { (1280, 720) } else { (640, 480) }),
+                    ..DetailView::default()
+                }),
+                ..ViewModel::default()
+            };
+            let settings = UiSettings::default();
+            let mut hit_map = HitMap::default();
+            let (manager, replies, observed) = thumbnail_tests::manager_with_mock_transport();
+            let mut renderer = TerminalThumbnailRenderer::new(manager);
+            for (index, fullscreen) in [false, true, false, true, false, true]
+                .into_iter()
+                .enumerate()
+            {
+                view.details.as_mut().unwrap().thumbnail_expanded = fullscreen;
+                terminal
+                    .draw(|frame| {
+                        render_frame(frame, &view, &settings, &mut hit_map, Some(&mut renderer))
+                    })
+                    .unwrap();
+                if index < 2 {
+                    assert_eq!(
+                        observed.recv_timeout(Duration::from_secs(1)).unwrap(),
+                        if fullscreen {
+                            expanded.clone()
+                        } else {
+                            preview.clone()
+                        }
+                    );
+                    let (width, height) = if fullscreen || same_source {
+                        (1280, 720)
+                    } else {
+                        (640, 480)
+                    };
+                    let mut bytes = Cursor::new(Vec::new());
+                    image::DynamicImage::new_rgb8(width, height)
+                        .write_to(&mut bytes, image::ImageFormat::Jpeg)
+                        .unwrap();
+                    replies.send(Ok(bytes.into_inner())).unwrap();
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while renderer.manager.state() == &ThumbnailState::Loading {
+                        renderer.poll();
+                        assert!(
+                            Instant::now() < deadline,
+                            "large fixture encoding did not finish"
+                        );
+                        std::thread::yield_now();
+                    }
+                    for _ in 0..2 {
+                        terminal
+                            .draw(|frame| {
+                                render_frame(
+                                    frame,
+                                    &view,
+                                    &settings,
+                                    &mut hit_map,
+                                    Some(&mut renderer),
+                                )
+                            })
+                            .unwrap();
+                    }
+                }
+                assert_eq!(renderer.manager.state(), &ThumbnailState::Ready);
+                assert!(renderer.has_rendered_artwork());
+                assert!(
+                    observed.is_empty(),
+                    "reopening must not fetch or decode the JPEG again"
+                );
+                assert!(
+                    renderer
+                        .manager
+                        .protocol_mut()
+                        .unwrap()
+                        .last_encoding_result()
+                        .is_none(),
+                    "rendered cached geometry must not encode again"
+                );
+            }
         }
     }
 

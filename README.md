@@ -1751,12 +1751,18 @@ video-thumbnail entry used by the normal Details preview:
 
 Explicit sizes are strict: if a video does not expose the selected entry,
 Youta shows no video thumbnail and does not fetch another size as a fallback.
-When that preview exists and terminal images are enabled, Youta also warms the
-largest image explicitly advertised for the selected video. Clicking the
-preview opens that cached or in-flight image across the terminal; it does not
-replace the configured preview or prefetch maximum-resolution images for every
-list row. Selecting `disabled` suppresses both the preview and expansion
-request.
+After the selected preview is ready, Youta prepares the largest advertised
+image in the background only when the terminal reports enough pixels to
+benefit from enlargement and that image has a different URL. This preparation
+uses the bounded RAM cache, including the fullscreen rendering, without a
+second disk-prefetch request. Small or unknown-size terminals skip speculative
+enlargement; clicking still opens the full image on demand.
+Reopening an unchanged image reuses its prepared rendering. If the larger
+image fails, Youta retains the preview fallback for that selection rather than
+retrying on every click. Selecting another item permits a fresh attempt.
+Neither path replaces the configured preview or warms maximum-resolution
+images for every list row. Selecting `disabled` suppresses both the preview
+and expansion request.
 YouTube's 4:3 `default`, `high`, and `standard` JPEG canvases can contain
 symmetric black bands around 16:9 artwork. Youta removes those bands only when
 both expected edge regions are near-black; non-dark 4:3 images and non-YouTube

@@ -3970,6 +3970,89 @@ pub(crate) mod tests {
         assert!(manager.cache_directory.is_none());
     }
 
+    /// Ready previews coalesce speculative work and stale results cannot affect the newest item.
+    #[test]
+    fn youtube_expansion_coalesces_unstarted_requests_after_each_preview_is_ready() {
+        let (mut manager, replies, observed) = manager_with_mock_transport();
+        let (requests, results) = mock_expansion_worker(&mut manager);
+        let preview_area = Rect::new(80, 3, 60, 24);
+        let fullscreen = Rect::new(0, 0, 160, 60);
+        let mut oldest_generation = 0;
+        let mut latest_expanded = None;
+        for index in 0..3 {
+            let preview = Url::parse(&format!(
+                "https://i.ytimg.com/vi/fixture-{index}/sddefault.jpg"
+            ))
+            .unwrap();
+            let expanded = Url::parse(&format!(
+                "https://i.ytimg.com/vi/fixture-{index}/maxresdefault.jpg"
+            ))
+            .unwrap();
+            manager.synchronize(Some(&preview), preview_area);
+            assert_eq!(
+                observed.recv_timeout(Duration::from_secs(1)).unwrap(),
+                preview
+            );
+            assert!(!manager.synchronize_expansion(Some(&expanded), fullscreen));
+            assert!(
+                requests.is_empty(),
+                "unfinished previews must not enqueue large artwork"
+            );
+            replies.send(Ok(fixture_thumbnail_png())).unwrap();
+            assert_eq!(wait_for_terminal_state(&mut manager), ThumbnailState::Ready);
+            assert!(manager.synchronize_expansion(Some(&expanded), fullscreen));
+            assert_eq!(
+                requests.len(),
+                1,
+                "only the newest unstarted expansion may remain queued"
+            );
+            if index == 0 {
+                oldest_generation = manager.expansion.generation;
+            }
+            latest_expanded = Some(expanded);
+        }
+        results
+            .send(WorkerResult {
+                generation: oldest_generation,
+                result: Err(ThumbnailFailure::DownloadFailed),
+            })
+            .unwrap();
+        assert!(
+            !manager.poll(),
+            "a stale expansion must not change the visible preview"
+        );
+        assert_eq!(manager.state(), &ThumbnailState::Ready);
+        assert!(manager.expansion.failure.is_none());
+        let request = requests.try_recv().unwrap();
+        assert_eq!(Some(&request.target.source), latest_expanded.as_ref());
+        assert!(requests.is_empty());
+        results
+            .send(WorkerResult {
+                generation: request.generation,
+                result: encode_remote_thumbnail(
+                    &picker_for_protocol(ThumbnailProtocol::Kitty, FALLBACK_FONT_SIZE),
+                    &request.target,
+                    DynamicImage::new_rgb8(1280, 720),
+                ),
+            })
+            .unwrap();
+        assert!(!manager.poll());
+        manager.synchronize(latest_expanded.as_ref(), fullscreen);
+        assert_eq!(manager.state(), &ThumbnailState::Ready);
+        assert!(
+            observed.is_empty(),
+            "opening the warmed image must not request visible-worker work"
+        );
+        assert!(
+            requests.is_empty(),
+            "opening the warmed image must not enqueue it again"
+        );
+        assert!(
+            manager.cache_directory.is_none(),
+            "speculative expansion is RAM-only"
+        );
+    }
+
     /// Injects the independent expansion worker's bounded channels without network I/O.
     fn mock_expansion_worker(
         manager: &mut ThumbnailManager,
@@ -5245,6 +5328,40 @@ pub(crate) mod tests {
 
     pub(crate) fn manager_with_mock_transport() -> MockManagerParts {
         manager_with_mock_transport_in_cache(None)
+    }
+
+    /// Attaches an independently observable RAM worker for cross-layer fallback regressions.
+    pub(crate) fn install_mock_expansion_transport(
+        manager: &mut ThumbnailManager,
+    ) -> (Sender<Result<Vec<u8>, ThumbnailFailure>>, Receiver<Url>) {
+        let (requests, request_receiver) = bounded(1);
+        let (results, result_receiver) = bounded(1);
+        let (observed_sender, observed) = bounded(1);
+        let (replies, reply_receiver) = bounded(1);
+        manager.expansion.request_discarder = Some(request_receiver.clone());
+        assert!(spawn_expansion_worker_with_transport(
+            picker_for_protocol(ThumbnailProtocol::Kitty, FALLBACK_FONT_SIZE),
+            request_receiver,
+            results,
+            MockTransport {
+                observed: observed_sender,
+                replies: reply_receiver
+            },
+            Arc::clone(&manager.expansion.current_generation),
+        ));
+        manager.expansion.request_sender = Some(requests);
+        manager.expansion.result_receiver = Some(result_receiver);
+        (replies, observed)
+    }
+
+    /// Waits for a fixture's speculative worker without exposing private manager state to the TUI.
+    pub(crate) fn wait_for_mock_expansion(manager: &mut ThumbnailManager) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while manager.expansion.pending {
+            assert!(!manager.poll(), "background completion must stay silent");
+            assert!(Instant::now() < deadline, "mock expansion did not finish");
+            thread::yield_now();
+        }
     }
 
     /// Builds an idle half-block manager without consulting the host terminal.
