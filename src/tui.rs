@@ -30987,14 +30987,20 @@ for encoded, expected in json.load(sys.stdin):
                         .write_to(&mut bytes, image::ImageFormat::Jpeg)
                         .unwrap();
                     replies.send(Ok(bytes.into_inner())).unwrap();
-                    let deadline = Instant::now() + Duration::from_secs(5);
+                    // Cold fullscreen scaling/Kitty encoding is not a latency
+                    // assertion: loaded debug CI workers need time for these
+                    // 3200x1800 pixels. Reopening below must still be immediate.
+                    let deadline = Instant::now() + Duration::from_secs(30);
                     while renderer.manager.state() == &ThumbnailState::Loading {
                         renderer.poll();
                         assert!(
-                            Instant::now() < deadline,
+                            renderer.manager.state() != &ThumbnailState::Loading
+                                || Instant::now() < deadline,
                             "large fixture encoding did not finish"
                         );
-                        std::thread::yield_now();
+                        if renderer.manager.state() == &ThumbnailState::Loading {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
                     }
                     for _ in 0..2 {
                         terminal
