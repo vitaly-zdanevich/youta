@@ -51,11 +51,11 @@ const MAX_ARTWORK_REDIRECT_URL_BYTES: usize = 4 * 1024;
 /// Age after which a cached entry is discarded.
 const CACHE_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 /// Byte budget for the whole cache directory.
-const CACHE_MAX_BYTES: u64 = 64 * 1024 * 1024;
-// Retain a complete maximum search prefetch unless the independent 64 MiB
+const CACHE_MAX_BYTES: u64 = 200 * 1024 * 1024;
+// Retain a complete maximum search prefetch unless the independent 200 MiB
 // budget requires byte-based eviction.
 /// Entry-count budget for the cache directory.
-const CACHE_MAX_ENTRIES: usize = 512;
+const CACHE_MAX_ENTRIES: usize = 1_000;
 /// Extension given to every cache entry.
 const CACHE_FILE_EXTENSION: &str = "image";
 

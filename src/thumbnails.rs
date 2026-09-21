@@ -65,8 +65,8 @@ const REQUEST_DEBOUNCE: Duration = Duration::from_millis(150);
 const FALLBACK_FONT_SIZE: (u16, u16) = (10, 20);
 const MAX_PREFETCH_SOURCES: usize = 512;
 const MAX_PREFETCH_URL_BYTES: usize = 4 * 1024;
-const PREPARED_THUMBNAIL_CACHE_ENTRIES: usize = 16;
-const PREPARED_THUMBNAIL_CACHE_MAX_DECODED_BYTES: usize = 16 * 1024 * 1024;
+const PREPARED_THUMBNAIL_CACHE_ENTRIES: usize = 100;
+const PREPARED_THUMBNAIL_CACHE_MAX_DECODED_BYTES: usize = 100 * 1024 * 1024;
 const LOCAL_PREVIEW_CACHE_KEY_VERSION: &[u8] = b"youta-local-preview-v1\0";
 const LOCAL_PREVIEW_MAGIC: &[u8; 8] = b"YTPRV001";
 const LOCAL_PREVIEW_HEADER_BYTES: usize = LOCAL_PREVIEW_MAGIC.len() + 4 + 4 + 1;
@@ -4617,6 +4617,7 @@ pub(crate) mod tests {
 
     #[test]
     fn prepared_thumbnail_cache_is_bounded_and_evicts_least_recently_used() {
+        assert_eq!(PREPARED_THUMBNAIL_CACHE_ENTRIES, 100);
         let (mut manager, replies, observed) = manager_with_mock_transport();
         let area = Rect::new(1, 1, 20, 8);
         let sources = (0..PREPARED_THUMBNAIL_CACHE_ENTRIES + 2)
@@ -4661,6 +4662,10 @@ pub(crate) mod tests {
 
     #[test]
     fn prepared_thumbnail_cache_evicts_by_decoded_bytes_and_rejects_one_oversized_entry() {
+        assert_eq!(
+            PREPARED_THUMBNAIL_CACHE_MAX_DECODED_BYTES,
+            100 * 1024 * 1024
+        );
         let mut manager =
             ThumbnailManager::from_terminal_info(ThumbnailMode::Auto, &graphical_terminal());
         let area = Rect::new(0, 0, 1, 1);
@@ -5035,6 +5040,9 @@ pub(crate) mod tests {
 
     #[test]
     fn cache_evicts_expired_excess_count_and_excess_bytes() {
+        let defaults = ThumbnailCachePolicy::default();
+        assert_eq!(defaults.max_entries, 1_000);
+        assert_eq!(defaults.max_bytes, 200 * 1024 * 1024);
         let directory = tempfile::tempdir().expect("temporary cache roots");
         let image = fixture_png();
         let roomy = ThumbnailCachePolicy {

@@ -1655,10 +1655,10 @@ Search rows; it does not load unseen pagination or subscription feeds.
 Validated original image bytes are cached across restarts in
 `~/.config/youta/thumbnail-cache` (or the selected Youta configuration
 directory). The private cache expires entries after 30 days and evicts its
-oldest files above 512 entries or 64 MiB. Corrupt entries are discarded and
+oldest files above 1,000 entries or 200 MiB. Corrupt entries are discarded and
 fetched again. The image URL is never printed as detail-panel text or stored as
-a filename. Within one run, Youta also keeps up to 16 recently prepared
-terminal images within a 16 MiB decoded-pixel budget. Returning from one local
+a filename. Within one run, Youta also keeps up to 100 recently prepared
+terminal images within a 100 MiB decoded-pixel budget. Returning from one local
 file to an unchanged JPEG therefore reuses its encoded terminal image without
 another decode or protocol-encoding pass. Local entries include a filesystem
 fingerprint in that RAM key, so replacing an image at the same path invalidates
