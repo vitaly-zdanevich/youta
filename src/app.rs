@@ -181,6 +181,7 @@ use crate::providers::PodcastEpisodeSummary;
 use crate::providers::apple_podcasts::{
     ApplePodcastEpisodeMetadata, ApplePodcastMetadata, ApplePodcastsResolver,
     ApplePodcastsSearchClient, ApplePodcastsSearchRequest, ResolvedApplePodcastShow,
+    expanded_artwork_url,
 };
 #[cfg(feature = "bandcamp")]
 use crate::providers::bandcamp::{
@@ -14579,6 +14580,8 @@ impl AppController {
             webpage_url: show.webpage_url.clone(),
             description: description.join("\n"),
             thumbnail_url: show.artwork_url.clone(),
+            #[cfg(feature = "apple-podcasts")]
+            expanded_thumbnail_url: show.artwork_url.as_ref().and_then(expanded_artwork_url),
             links,
             ..DetailView::default()
         });
@@ -14721,6 +14724,13 @@ impl AppController {
         let description = episode.description.clone().unwrap_or_default();
         let webpage_url =
             canonical_apple_episode_url(episode, self.active_apple_podcast_show.as_ref());
+        // Match direct-link resolution: episodes without artwork inherit the show's cover.
+        let thumbnail_url = episode.artwork_url.clone().or_else(|| {
+            self.active_apple_podcast_show
+                .as_ref()
+                .and_then(|show| show.artwork_url.clone())
+        });
+        let expanded_thumbnail_url = thumbnail_url.as_ref().and_then(expanded_artwork_url);
         self.view.details = Some(DetailView {
             media_id: Some(MediaId::new(
                 SourceKind::ApplePodcasts,
@@ -14743,7 +14753,8 @@ impl AppController {
                 })
                 .or_else(|| episode.published_at.clone())
                 .unwrap_or_default(),
-            thumbnail_url: episode.artwork_url.clone(),
+            thumbnail_url,
+            expanded_thumbnail_url,
             links,
             ..DetailView::default()
         });
@@ -40015,6 +40026,12 @@ fn apply_resolved_direct_view(
         license: media.license.clone(),
         wikidata: "not loaded".to_owned(),
         thumbnail_url: media.artwork_url.clone(),
+        #[cfg(feature = "apple-podcasts")]
+        expanded_thumbnail_url: media
+            .artwork_url
+            .as_ref()
+            .filter(|_| media.source == SourceKind::ApplePodcasts)
+            .and_then(expanded_artwork_url),
         ..DetailView::default()
     });
     view.status_line.clone_from(&media.status_line);
@@ -81316,6 +81333,96 @@ mod tests {
             },
             episodes,
         }
+    }
+
+    /// Every Apple route retains its preview and exposes a distinct bounded cover variant.
+    #[cfg(feature = "apple-podcasts")]
+    #[test]
+    fn apple_artwork_details_keep_preview_and_expand_show_episode_and_direct_routes() {
+        let show_preview = url::Url::parse(
+            "https://is1-ssl.mzstatic.com/image/thumb/Podcasts211/fixture/show.jpg/600x600bb.jpg",
+        )
+        .unwrap();
+        let show_expanded = url::Url::parse(
+            "https://is1-ssl.mzstatic.com/image/thumb/Podcasts211/fixture/show.jpg/2048x2048bb.jpg",
+        )
+        .unwrap();
+        let episode_preview = url::Url::parse(
+            "https://is2-ssl.mzstatic.com/image/thumb/Podcasts211/fixture/episode.jpg/100x100bb.jpg",
+        )
+        .unwrap();
+        let episode_expanded = url::Url::parse(
+            "https://is2-ssl.mzstatic.com/image/thumb/Podcasts211/fixture/episode.jpg/2048x2048bb.jpg",
+        )
+        .unwrap();
+        let (mut controller, _) = controller_with_mock_statuses([]);
+        controller.view.screen = Screen::ApplePodcasts;
+        let mut show = apple_podcast_show_fixture(1_001, "Artwork fixture show");
+        show.artwork_url = Some(show_preview.clone());
+        controller.apple_podcasts_results = vec![show.clone()];
+        controller.update_apple_podcasts_detail();
+        let details = controller.view.details.as_ref().unwrap();
+        assert_eq!(details.thumbnail_url.as_ref(), Some(&show_preview));
+        assert_eq!(
+            details.expanded_thumbnail_url.as_ref(),
+            Some(&show_expanded)
+        );
+
+        let mut episode = apple_podcast_episode_fixture(1_001, 2_002, "Artwork episode", None);
+        episode.artwork_url = Some(episode_preview.clone());
+        controller.active_apple_podcast_show = Some(show.clone());
+        controller.apple_podcast_episodes = vec![episode];
+        controller.update_apple_podcast_episode_detail();
+        let details = controller.view.details.as_ref().unwrap();
+        assert_eq!(details.thumbnail_url.as_ref(), Some(&episode_preview));
+        assert_eq!(
+            details.expanded_thumbnail_url.as_ref(),
+            Some(&episode_expanded)
+        );
+
+        // An episode without its own cover keeps the parent show's complete artwork pair.
+        controller.apple_podcast_episodes[0].artwork_url = None;
+        controller.update_apple_podcast_episode_detail();
+        let details = controller.view.details.as_ref().unwrap();
+        assert_eq!(details.thumbnail_url.as_ref(), Some(&show_preview));
+        assert_eq!(
+            details.expanded_thumbnail_url.as_ref(),
+            Some(&show_expanded)
+        );
+
+        let metadata = apple_podcast_resolution_fixture(&show, Vec::new());
+        for episode in [None, Some(controller.apple_podcast_episodes[0].clone())] {
+            let mut media =
+                resolved_apple_media(crate::providers::apple_podcasts::ResolvedApplePodcast {
+                    link: metadata.link.clone(),
+                    podcast: metadata.podcast.clone(),
+                    episode,
+                });
+            apply_resolved_direct_view(&controller.store, &mut controller.view, &media);
+            let details = controller.view.details.as_ref().unwrap();
+            assert_eq!(details.thumbnail_url.as_ref(), Some(&show_preview));
+            assert_eq!(
+                details.expanded_thumbnail_url.as_ref(),
+                Some(&show_expanded)
+            );
+            media.source = SourceKind::SoundStream;
+            apply_resolved_direct_view(&controller.store, &mut controller.view, &media);
+            assert!(
+                controller
+                    .view
+                    .details
+                    .as_ref()
+                    .unwrap()
+                    .expanded_thumbnail_url
+                    .is_none()
+            );
+        }
+
+        controller.active_apple_podcast_show = None;
+        controller.update_apple_podcast_episode_detail();
+        let details = controller.view.details.as_ref().unwrap();
+        assert!(details.thumbnail_url.is_none());
+        assert!(details.expanded_thumbnail_url.is_none());
     }
 
     /// Persisted Archive files keep their validation even without the API adapter.

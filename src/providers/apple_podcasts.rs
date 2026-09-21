@@ -43,6 +43,7 @@ const MAX_SEARCH_GENRES: usize = 64;
 const MAX_SEARCH_GENRE_BYTES: usize = 512;
 const MAX_REMOTE_URL_BYTES: usize = 16 * 1024;
 const MAX_API_REDIRECTS: usize = 3;
+const EXPANDED_ARTWORK_EDGE: u16 = 2048;
 
 /// One bounded Apple Podcasts show-search request.
 ///
@@ -1011,6 +1012,68 @@ fn parse_artwork_url(item: &RawLookupItem) -> Result<Option<Url>, ProviderError>
     )
 }
 
+/// Derives a bounded, best-effort larger cover from Apple's image CDN only.
+///
+/// Apple's [artwork URL templates](https://developer.apple.com/documentation/applemusicapi/artwork)
+/// use a final width-by-height component. A 2048-pixel square remains below
+/// Apple's [podcast cover limit](https://podcasters.apple.com/support/5514-show-cover-template)
+/// while keeping decoded RGBA data to 16 MiB. The Search API does not guarantee
+/// arbitrary resized variants, so callers must retain the advertised preview
+/// as their fallback. Unknown URL shapes and already-large previews return `None`.
+#[must_use]
+pub fn expanded_artwork_url(preview: &Url) -> Option<Url> {
+    if preview.as_str().len() > MAX_REMOTE_URL_BYTES
+        || preview.scheme() != "https"
+        || !preview
+            .host_str()
+            .is_some_and(|host| host.ends_with(".mzstatic.com"))
+        || !preview.username().is_empty()
+        || preview.password().is_some()
+        || preview.port().is_some()
+        || preview.query().is_some()
+        || preview.fragment().is_some()
+    {
+        return None;
+    }
+    let (asset_path, filename) = preview.path().rsplit_once('/')?;
+    if asset_path.strip_prefix("/image/thumb/")?.is_empty() {
+        return None;
+    }
+    let (dimensions, extension) = filename.rsplit_once('.')?;
+    if !matches!(extension, "jpg" | "jpeg" | "png" | "webp") {
+        return None;
+    }
+    let (width, height_and_options) = dimensions.split_once('x')?;
+    if !width.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let width = width.parse::<u16>().ok()?;
+    let height_end = height_and_options
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(height_and_options.len());
+    let height = height_and_options[..height_end].parse::<u16>().ok()?;
+    if width == 0 || width != height || width >= EXPANDED_ARTWORK_EDGE {
+        return None;
+    }
+    let options = &height_and_options[height_end..];
+    let quality = options.strip_prefix("bb").unwrap_or(options);
+    if !quality.is_empty() {
+        let quality = quality.strip_prefix('-')?;
+        if !quality.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        let quality = quality.parse::<u8>().ok()?;
+        if !(1..=100).contains(&quality) {
+            return None;
+        }
+    }
+    let mut expanded = preview.clone();
+    expanded.path_segments_mut().ok()?.pop().push(&format!(
+        "{EXPANDED_ARTWORK_EDGE}x{EXPANDED_ARTWORK_EDGE}{options}.{extension}"
+    ));
+    (expanded.as_str().len() <= MAX_REMOTE_URL_BYTES).then_some(expanded)
+}
+
 /// Parses a provider-returned Apple Podcasts page with an exact official host.
 fn parse_optional_apple_page_url(
     raw: Option<&str>,
@@ -1864,6 +1927,53 @@ mod tests {
             episode.media_url.expect("fixture has episodeUrl").as_str(),
             "https://cdn.example.test/episode.mp3"
         );
+    }
+
+    /// Larger covers alter only a recognized final size component, never the preview.
+    #[test]
+    fn expanded_artwork_retains_apple_asset_identity_and_image_options() {
+        for (size, expanded_size) in [
+            ("600x600bb.jpg", "2048x2048bb.jpg"),
+            ("100x100bb-85.jpg", "2048x2048bb-85.jpg"),
+            ("60x60.png", "2048x2048.png"),
+            ("600x600bb.webp", "2048x2048bb.webp"),
+        ] {
+            let prefix = "https://is1-ssl.mzstatic.com/image/thumb/Podcasts211/cover-600x600.jpg/";
+            let preview = Url::parse(&format!("{prefix}{size}")).unwrap();
+            let expanded = expanded_artwork_url(&preview).expect("recognized Apple cover");
+            assert_eq!(expanded.as_str(), format!("{prefix}{expanded_size}"));
+            assert_eq!(preview.as_str(), format!("{prefix}{size}"));
+        }
+    }
+
+    /// Never guess variants on other hosts, signed URLs, unknown shapes, or larger covers.
+    #[test]
+    fn expanded_artwork_rejects_untrusted_or_unnecessary_url_rewrites() {
+        for raw in [
+            "https://artwork.example.test/image/thumb/cover/600x600bb.jpg",
+            "https://mzstatic.com.example.test/image/thumb/cover/600x600bb.jpg",
+            "https://evilmzstatic.com/image/thumb/cover/600x600bb.jpg",
+            "http://is1-ssl.mzstatic.com/image/thumb/cover/600x600bb.jpg",
+            "https://user:password@is1-ssl.mzstatic.com/image/thumb/cover/600x600bb.jpg",
+            "https://is1-ssl.mzstatic.com:8443/image/thumb/cover/600x600bb.jpg",
+            "https://is1-ssl.mzstatic.com/image/thumb/cover/600x600bb.jpg?signature=fixture",
+            "https://is1-ssl.mzstatic.com/image/thumb/cover/600x600bb.jpg#fragment",
+            "https://is1-ssl.mzstatic.com/other/cover/600x600bb.jpg",
+            "https://is1-ssl.mzstatic.com/image/thumb/600x600bb.jpg",
+            "https://is1-ssl.mzstatic.com/image/thumb/cover/original.jpg",
+            "https://is1-ssl.mzstatic.com/image/thumb/cover/600x600cc.jpg",
+            "https://is1-ssl.mzstatic.com/image/thumb/cover/+600x600bb.jpg",
+            "https://is1-ssl.mzstatic.com/image/thumb/cover/600x600bb-101.jpg",
+            "https://is1-ssl.mzstatic.com/image/thumb/cover/600x600bb-+85.jpg",
+            "https://is1-ssl.mzstatic.com/image/thumb/cover/600x600bb.svg",
+            "https://is1-ssl.mzstatic.com/image/thumb/cover/600x400bb.jpg",
+            "https://is1-ssl.mzstatic.com/image/thumb/cover/0x0bb.jpg",
+            "https://is1-ssl.mzstatic.com/image/thumb/cover/2048x2048bb.jpg",
+            "https://is1-ssl.mzstatic.com/image/thumb/cover/3000x3000bb.jpg",
+        ] {
+            let preview = Url::parse(raw).unwrap();
+            assert!(expanded_artwork_url(&preview).is_none(), "{raw}");
+        }
     }
 
     /// Missing publication metadata must remain absent rather than inventing a date.

@@ -191,6 +191,10 @@ trait ThumbnailRenderer {
     fn synchronize_prefetch(&mut self, _sources: &[url::Url]) -> bool {
         false
     }
+    /// Warms one fullscreen target in RAM without replacing the visible preview.
+    fn synchronize_expansion(&mut self, _source: Option<&url::Url>, _area: Rect) -> bool {
+        false
+    }
     /// Temporarily hides artwork behind a modal without invalidating its work.
     ///
     /// Implementations retain the selected target, ready protocol, and
@@ -412,6 +416,10 @@ impl ThumbnailRenderer for TerminalThumbnailRenderer {
         self.prefetched_visible_source
             .clone_from(&self.visible_source);
         self.manager.synchronize_prefetch(&self.prefetch_sources)
+    }
+
+    fn synchronize_expansion(&mut self, source: Option<&url::Url>, area: Rect) -> bool {
+        self.manager.synchronize_expansion(source, area)
     }
 
     fn obscure(&mut self) -> bool {
@@ -946,10 +954,12 @@ pub fn run(controller: &mut impl UiController, settings: &UiSettings) -> io::Res
     let clipboard = SystemReportActions::new();
     loop {
         let mut renderer = thumbnail_renderer.take();
+        let mut fullscreen_artwork_area = Rect::default();
         if let Some(renderer) = renderer.as_mut() {
             synchronize_tty_image_preference(controller.view(), renderer.as_mut());
             renderer.poll();
             session.terminal.draw(|frame| {
+                fullscreen_artwork_area = frame.area();
                 render_frame(
                     frame,
                     controller.view(),
@@ -971,6 +981,11 @@ pub fn run(controller: &mut impl UiController, settings: &UiSettings) -> io::Res
         }
         if let Some(renderer) = renderer.as_deref_mut() {
             synchronize_thumbnail_prefetch(controller.view(), settings, renderer);
+            synchronize_podcast_artwork_prefetch(
+                controller.view(),
+                fullscreen_artwork_area,
+                renderer,
+            );
         }
         if controller.view().quitting {
             break;
@@ -1391,6 +1406,7 @@ fn synchronize_thumbnail_prefetch(
     if let Some(source) = view
         .details
         .as_ref()
+        .filter(|details| !is_apple_podcast_artwork(details))
         .and_then(|details| details.expanded_thumbnail_url.as_ref())
     {
         sources.push(source.clone());
@@ -1408,6 +1424,37 @@ fn synchronize_thumbnail_prefetch(
         }
     }
     renderer.synchronize_prefetch(&sources)
+}
+
+/// Keeps podcast enlargement RAM-only and separate from disk-backed search warming.
+fn synchronize_podcast_artwork_prefetch(
+    view: &ViewModel,
+    fullscreen: Rect,
+    renderer: &mut dyn ThumbnailRenderer,
+) -> bool {
+    // Keep pending early-click work alive, but do not retry a failed preferred
+    // image while the fullscreen renderer is displaying its preview fallback.
+    if view
+        .details
+        .as_ref()
+        .is_some_and(|details| details.thumbnail_expanded)
+    {
+        return false;
+    }
+    let source = view
+        .details
+        .as_ref()
+        .filter(|details| is_apple_podcast_artwork(details))
+        .and_then(|details| details.expanded_thumbnail_url.as_ref());
+    renderer.synchronize_expansion(source, fullscreen)
+}
+
+/// Recognizes provider artwork even when selected outside the Podcasts tab.
+fn is_apple_podcast_artwork(details: &DetailView) -> bool {
+    details
+        .media_id
+        .as_ref()
+        .is_some_and(|id| id.source == crate::domain::SourceKind::ApplePodcasts)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -14801,6 +14848,7 @@ mod tests {
         synchronized: Vec<(Option<url::Url>, Rect)>,
         synchronized_local_videos: Vec<(LocalVideoThumbnailView, Rect)>,
         prefetch_batches: Vec<Vec<url::Url>>,
+        expansion_prefetches: Vec<(Option<url::Url>, Rect)>,
         obscure_count: usize,
         clear_count: usize,
         pending: bool,
@@ -14871,6 +14919,11 @@ mod tests {
 
         fn synchronize_prefetch(&mut self, sources: &[url::Url]) -> bool {
             self.prefetch_batches.push(sources.to_vec());
+            true
+        }
+
+        fn synchronize_expansion(&mut self, source: Option<&url::Url>, area: Rect) -> bool {
+            self.expansion_prefetches.push((source.cloned(), area));
             true
         }
 
@@ -28273,6 +28326,80 @@ for encoded, expected in json.load(sys.stdin):
         assert!(!rendered.contains("⏸ Spoken fixture.opus"));
         assert!(rendered.contains("▶ Spoken fixture.opus"));
         assert!(rendered.contains("▶ Video fixture.webm"));
+    }
+
+    /// Podcast enlargement uses the full terminal and RAM, never the disk-warming backlog.
+    #[test]
+    fn podcast_expansion_prefetch_is_ram_only_and_clears_when_leaving_the_item() {
+        let expanded =
+            url::Url::parse("https://is1-ssl.mzstatic.com/image/thumb/cover/2048x2048bb.jpg")
+                .unwrap();
+        let mut view = ViewModel {
+            screen: Screen::ApplePodcasts,
+            details: Some(DetailView {
+                media_id: Some(MediaId::new(SourceKind::ApplePodcasts, "123")),
+                expanded_thumbnail_url: Some(expanded.clone()),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let area = Rect::new(0, 0, 160, 60);
+        let mut renderer = MockThumbnailRenderer::default();
+        synchronize_thumbnail_prefetch(&view, &UiSettings::default(), &mut renderer);
+        synchronize_podcast_artwork_prefetch(&view, area, &mut renderer);
+        assert_eq!(renderer.prefetch_batches, [Vec::<url::Url>::new()]);
+        assert_eq!(renderer.expansion_prefetches, [(Some(expanded), area)]);
+        view.details = None;
+        synchronize_podcast_artwork_prefetch(&view, area, &mut renderer);
+        assert_eq!(renderer.expansion_prefetches.last(), Some(&(None, area)));
+    }
+
+    /// Fullscreen frames keep an early click's request alive and never schedule
+    /// another preferred-image transfer after a fallback becomes visible.
+    #[test]
+    fn podcast_fullscreen_frames_preserve_pending_work_without_restarting_prefetch() {
+        let expanded =
+            url::Url::parse("https://is1-ssl.mzstatic.com/image/thumb/cover/2048x2048bb.jpg")
+                .unwrap();
+        let area = Rect::new(0, 0, 160, 60);
+        for pending in [true, false] {
+            let mut view = ViewModel {
+                screen: Screen::ApplePodcasts,
+                details: Some(DetailView {
+                    media_id: Some(MediaId::new(SourceKind::ApplePodcasts, "123")),
+                    expanded_thumbnail_url: Some(expanded.clone()),
+                    ..DetailView::default()
+                }),
+                ..ViewModel::default()
+            };
+            let mut renderer = MockThumbnailRenderer::default();
+            assert!(synchronize_podcast_artwork_prefetch(
+                &view,
+                area,
+                &mut renderer
+            ));
+            assert_eq!(
+                renderer.expansion_prefetches,
+                [(Some(expanded.clone()), area)]
+            );
+
+            view.details.as_mut().unwrap().thumbnail_expanded = true;
+            renderer.pending = pending;
+            renderer.rendered_artwork = !pending;
+            for _ in 0..3 {
+                assert!(!synchronize_podcast_artwork_prefetch(
+                    &view,
+                    area,
+                    &mut renderer
+                ));
+            }
+            assert_eq!(
+                renderer.expansion_prefetches,
+                [(Some(expanded.clone()), area)],
+                "fullscreen must neither cancel a pending request nor retry a failed preferred image"
+            );
+            assert_eq!(renderer.is_pending(), pending);
+        }
     }
 
     #[test]

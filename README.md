@@ -1365,7 +1365,11 @@ These are distinct integration modes:
   also require public DNS results and reject redirects. Enclosures are handed
   to the external playback backend, which owns later media DNS and redirects.
   In the terminal, catalogue links below artwork use normal text color and
-  show only the URL.
+  show only the URL. After a preview loads, recognized Apple CDN covers warm a
+  best-effort 2048-pixel version in the background, already fitted and encoded
+  for fullscreen display. These enlarged images stay in the bounded RAM cache;
+  clicking is immediate once preparation finishes, and early clicks reuse the
+  pending request. Unavailable larger variants fall back to the preview.
 - The separate **Bandcamp** tab performs bounded, best-effort searches of
   Bandcamp's public HTTPS search page and accepts only canonical track and
   album pages on artist or label subdomains. Search persists the query, current

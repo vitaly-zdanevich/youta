@@ -10,6 +10,8 @@
 //! images remain in an entry- and decoded-byte-bounded in-memory cache so
 //! revisiting media is immediate. Local images always revalidate their
 //! filesystem fingerprint before reuse.
+//! Selected fullscreen artwork can also be prepared independently after its
+//! preview is ready; that pipeline uses RAM only and shares the prepared LRU.
 
 use std::collections::{HashSet, VecDeque};
 use std::fs;
@@ -830,6 +832,7 @@ pub struct ThumbnailManager {
     protocol_key: Option<PreparedThumbnailKey>,
     prepared: VecDeque<PreparedThumbnail>,
     prepared_decoded_bytes: usize,
+    expansion: ExpansionPrefetch,
     picker: Option<Picker>,
     cache_directory: Option<PathBuf>,
     video_frame_program: PathBuf,
@@ -838,6 +841,21 @@ pub struct ThumbnailManager {
     prefetch_sender: Option<Sender<Vec<Url>>>,
     prefetch_discarder: Option<Receiver<Vec<Url>>>,
     prefetch_sources: Vec<Url>,
+    result_receiver: Option<Receiver<WorkerResult>>,
+}
+
+/// One independently prepared fullscreen target; results enter the shared RAM LRU.
+#[derive(Default)]
+struct ExpansionPrefetch {
+    picker: Option<Picker>,
+    source: Option<Url>,
+    target: Option<ThumbnailTarget>,
+    generation: u64,
+    current_generation: Arc<AtomicU64>,
+    pending: bool,
+    failure: Option<ThumbnailFailure>,
+    request_sender: Option<Sender<WorkerRequest>>,
+    request_discarder: Option<Receiver<WorkerRequest>>,
     result_receiver: Option<Receiver<WorkerResult>>,
 }
 
@@ -964,6 +982,10 @@ impl ThumbnailManager {
             protocol_key: None,
             prepared: VecDeque::new(),
             prepared_decoded_bytes: 0,
+            expansion: ExpansionPrefetch {
+                picker: Some(picker.clone()),
+                ..ExpansionPrefetch::default()
+            },
             picker: Some(picker),
             cache_directory,
             video_frame_program: PathBuf::from("ffmpeg"),
@@ -994,6 +1016,7 @@ impl ThumbnailManager {
             protocol_key: None,
             prepared: VecDeque::new(),
             prepared_decoded_bytes: 0,
+            expansion: ExpansionPrefetch::default(),
             picker: None,
             cache_directory: None,
             video_frame_program: PathBuf::from("ffmpeg"),
@@ -1037,6 +1060,157 @@ impl ThumbnailManager {
         self.synchronize_target(target)
     }
 
+    /// Prepares a fullscreen remote target in RAM after the visible preview is ready.
+    ///
+    /// Uses an independent worker and the existing bounded prepared-image cache;
+    /// no persistent cache is read or written and background failures stay silent.
+    pub fn synchronize_expansion(&mut self, source: Option<&Url>, area: Rect) -> bool {
+        if !self.is_enabled() {
+            return false;
+        }
+        let Some(source) = source.filter(|source| {
+            !area.is_empty()
+                && matches!(source.scheme(), "https" | "http")
+                && source.as_str().len() <= MAX_PREFETCH_URL_BYTES
+                && is_safe_thumbnail_source(source)
+        }) else {
+            self.expansion.source = None;
+            return self.cancel_expansion();
+        };
+        self.expansion.source = Some(source.clone());
+        if self.state != ThumbnailState::Ready {
+            return false;
+        }
+        let target = ThumbnailTarget {
+            source: source.clone(),
+            local_video_midpoint: None,
+            area,
+        };
+        if self.target.as_ref() == Some(&target)
+            || self.expansion.target.as_ref() == Some(&target)
+            || self
+                .prepared
+                .iter()
+                .any(|entry| entry.key.same_target(&PreparedThumbnailKey::from(&target)))
+        {
+            return false;
+        }
+        self.request_expansion(target)
+    }
+
+    /// Sends the newest RAM-only target, including an early click or terminal resize.
+    fn request_expansion(&mut self, target: ThumbnailTarget) -> bool {
+        self.cancel_expansion();
+        if !self.ensure_expansion_worker() {
+            return false;
+        }
+        self.expansion.target = Some(target.clone());
+        let request = WorkerRequest {
+            generation: self.expansion.generation,
+            target,
+        };
+        self.expansion.pending = self
+            .expansion
+            .request_sender
+            .as_ref()
+            .is_some_and(|sender| sender.try_send(request).is_ok());
+        self.expansion.pending
+    }
+
+    /// Starts a separate RAM-only encoder so warming cannot block visible selections.
+    fn ensure_expansion_worker(&mut self) -> bool {
+        if self.expansion.request_sender.is_some() {
+            return true;
+        }
+        let Some(picker) = self.expansion.picker.clone() else {
+            return false;
+        };
+        let (sender, receiver) = bounded(1);
+        let discarder = receiver.clone();
+        let (results, result_receiver) = bounded(1);
+        if !spawn_expansion_worker_with_transport(
+            picker,
+            receiver,
+            results,
+            HttpThumbnailTransport::new(),
+            Arc::clone(&self.expansion.current_generation),
+        ) {
+            return false;
+        }
+        self.expansion.request_sender = Some(sender);
+        self.expansion.request_discarder = Some(discarder);
+        self.expansion.result_receiver = Some(result_receiver);
+        true
+    }
+
+    /// Invalidates stale warming and removes queued work; one HTTP request may finish.
+    fn cancel_expansion(&mut self) -> bool {
+        let changed = self.expansion.target.take().is_some();
+        self.expansion.generation = self.expansion.generation.wrapping_add(1);
+        self.expansion
+            .current_generation
+            .store(self.expansion.generation, Ordering::Release);
+        self.expansion.pending = false;
+        self.expansion.failure = None;
+        if let Some(discarder) = &self.expansion.request_discarder {
+            while discarder.try_recv().is_ok() {}
+        }
+        changed
+    }
+
+    /// Collects background pixels silently unless an early click is awaiting this target.
+    fn poll_expansion(&mut self) -> bool {
+        let mut changed = false;
+        while let Some(receiver) = self.expansion.result_receiver.as_ref() {
+            let result = match receiver.try_recv() {
+                Ok(result) if result.generation == self.expansion.generation => result.result,
+                Ok(_) => continue,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.expansion.result_receiver = None;
+                    self.expansion.request_sender = None;
+                    self.expansion.request_discarder = None;
+                    if !self.expansion.pending {
+                        break;
+                    }
+                    Err(ThumbnailFailure::WorkerStopped)
+                }
+            };
+            self.expansion.pending = false;
+            let Some(target) = self.expansion.target.as_ref() else {
+                continue;
+            };
+            let visible = self.target.as_ref() == Some(target);
+            match result {
+                Ok(encoded) => {
+                    let key = PreparedThumbnailKey::from(target);
+                    if visible {
+                        self.protocol_key = Some(key);
+                        self.protocol = Some(encoded.protocol);
+                        self.protocol_render_size = Some(encoded.render_size);
+                        self.protocol_decoded_bytes = encoded.decoded_bytes;
+                        self.state = ThumbnailState::Ready;
+                    } else {
+                        self.cache_prepared_protocol(
+                            key,
+                            encoded.protocol,
+                            encoded.render_size,
+                            encoded.decoded_bytes,
+                        );
+                    }
+                }
+                Err(error) => {
+                    self.expansion.failure = Some(error);
+                    if visible {
+                        self.state = ThumbnailState::Failed(error);
+                    }
+                }
+            }
+            changed |= visible;
+        }
+        changed
+    }
+
     /// Synchronizes one local video with a lazily extracted midpoint frame.
     ///
     /// `midpoint_ms` is the caller-computed half-duration offset. The source
@@ -1072,20 +1246,30 @@ impl ThumbnailManager {
 
     /// Applies a normalized visible target to the bounded worker pipeline.
     fn synchronize_target(&mut self, target: ThumbnailTarget) -> bool {
+        let warmed = self.poll_expansion();
         if self.target.as_ref() == Some(&target) {
-            return false;
+            return warmed;
+        }
+        if self.expansion.target.as_ref() != Some(&target) {
+            self.cancel_expansion();
         }
 
+        // Pin the requested entry before retaining the preview: inserting the
+        // preview into a full LRU must not evict the image about to be displayed.
+        let safe_source = is_safe_thumbnail_source(&target.source);
+        let prepared = safe_source
+            .then(|| self.take_prepared_thumbnail(&target))
+            .flatten();
         self.retain_current_protocol();
         self.generation = self.generation.wrapping_add(1);
         self.current_generation
             .store(self.generation, Ordering::Release);
         self.target = Some(target.clone());
-        if !is_safe_thumbnail_source(&target.source) {
+        if !safe_source {
             self.state = ThumbnailState::Failed(ThumbnailFailure::InvalidSource);
             return true;
         }
-        if let Some(prepared) = self.take_prepared_thumbnail(&target) {
+        if let Some(prepared) = prepared {
             self.protocol_key = Some(prepared.key);
             self.protocol = Some(prepared.protocol);
             self.protocol_render_size = Some(prepared.render_size);
@@ -1094,6 +1278,21 @@ impl ThumbnailManager {
             return true;
         }
         self.state = ThumbnailState::Loading;
+        if self.expansion.target.as_ref() == Some(&target) {
+            if let Some(error) = &self.expansion.failure {
+                self.state = ThumbnailState::Failed(*error);
+                return true;
+            }
+            if self.expansion.pending {
+                return true;
+            }
+        }
+        if self.expansion.source.as_ref() == Some(&target.source) {
+            if !self.request_expansion(target) {
+                self.state = ThumbnailState::Failed(ThumbnailFailure::WorkerStopped);
+            }
+            return true;
+        }
         let request = WorkerRequest {
             generation: self.generation,
             target,
@@ -1244,17 +1443,17 @@ impl ThumbnailManager {
     ///
     /// Returns `true` when the visible state changed.
     pub fn poll(&mut self) -> bool {
+        let mut changed = self.poll_expansion();
         if self.result_receiver.is_none() {
-            if self.state == ThumbnailState::Loading {
+            if self.state == ThumbnailState::Loading && !self.expansion.pending {
                 self.protocol = None;
                 self.protocol_render_size = None;
                 self.protocol_decoded_bytes = 0;
                 self.state = ThumbnailState::Failed(ThumbnailFailure::WorkerStopped);
                 return true;
             }
-            return false;
+            return changed;
         }
-        let mut changed = false;
         let mut disconnected = false;
         while let Some(result_receiver) = self.result_receiver.as_ref() {
             let result = result_receiver.try_recv();
@@ -1292,7 +1491,7 @@ impl ThumbnailManager {
             self.request_sender = None;
             self.request_discarder = None;
             self.result_receiver = None;
-            if self.state == ThumbnailState::Loading {
+            if self.state == ThumbnailState::Loading && !self.expansion.pending {
                 self.protocol = None;
                 self.protocol_render_size = None;
                 self.protocol_decoded_bytes = 0;
@@ -1336,6 +1535,8 @@ impl ThumbnailManager {
     ///
     /// Returns `true` when visible state was cleared.
     pub fn clear(&mut self) -> bool {
+        self.expansion.source = None;
+        self.cancel_expansion();
         let changed = self.target.is_some()
             || self.protocol.is_some()
             || self.state == ThumbnailState::Loading
@@ -1434,6 +1635,53 @@ impl ThumbnailManager {
             .saturating_sub(prepared.decoded_bytes);
         Some(prepared)
     }
+}
+
+/// Prepares one bounded remote expansion at a time, without any disk-cache handle.
+fn spawn_expansion_worker_with_transport<T: ThumbnailTransport>(
+    picker: Picker,
+    requests: Receiver<WorkerRequest>,
+    results: Sender<WorkerResult>,
+    mut transport: T,
+    current_generation: Arc<AtomicU64>,
+) -> bool {
+    thread::Builder::new()
+        .name("youta-artwork-expansion".to_owned())
+        .spawn(move || {
+            while let Ok(mut request) = requests.recv() {
+                for newer in requests.try_iter() {
+                    request = newer;
+                }
+                let cancellation = RequestCancellation {
+                    generation: request.generation,
+                    current_generation: Arc::clone(&current_generation),
+                };
+                if cancellation.is_cancelled() {
+                    continue;
+                }
+                let bytes = transport.fetch(&request.target.source);
+                if cancellation.is_cancelled() {
+                    continue;
+                }
+                let image = bytes.and_then(|bytes| decode_thumbnail(&bytes));
+                if cancellation.is_cancelled() {
+                    continue;
+                }
+                let result = image
+                    .and_then(|image| encode_remote_thumbnail(&picker, &request.target, image));
+                if !cancellation.is_cancelled()
+                    && results
+                        .send(WorkerResult {
+                            generation: request.generation,
+                            result,
+                        })
+                        .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .is_ok()
 }
 
 fn spawn_visible_worker(
@@ -3442,6 +3690,290 @@ pub(crate) mod tests {
         );
     }
 
+    /// Ready expansions are synchronous RAM hits; early clicks reuse the pending transfer.
+    #[test]
+    fn expansion_prefetch_waits_for_preview_and_reuses_prepared_or_pending_artwork() {
+        for (click_before_ready, fills_cache) in [(false, false), (true, false), (false, true)] {
+            let (mut manager, replies, observed) = manager_with_mock_transport();
+            let preview = Url::parse("https://images.example/600.png").unwrap();
+            let expanded = Url::parse("https://images.example/2048.png").unwrap();
+            let preview_area = Rect::new(50, 3, 20, 10);
+            let fullscreen = Rect::new(0, 0, 120, 40);
+            let (requests, results) = mock_expansion_worker(&mut manager);
+
+            assert!(!manager.synchronize_expansion(Some(&expanded), fullscreen));
+            manager.synchronize(Some(&preview), preview_area);
+            assert_eq!(
+                observed.recv_timeout(Duration::from_secs(1)).unwrap(),
+                preview
+            );
+            assert!(!manager.synchronize_expansion(Some(&expanded), fullscreen));
+            assert!(requests.is_empty(), "prefetch must wait for the preview");
+            replies.send(Ok(fixture_thumbnail_png())).unwrap();
+            assert_eq!(wait_for_terminal_state(&mut manager), ThumbnailState::Ready);
+
+            assert!(manager.synchronize_expansion(Some(&expanded), fullscreen));
+            let request = requests.try_recv().expect("one fullscreen preparation");
+            assert_eq!(request.target.source, expanded);
+            assert_eq!(request.target.area, fullscreen);
+            assert!(!manager.synchronize_expansion(Some(&expanded), fullscreen));
+            assert_eq!(manager.state(), &ThumbnailState::Ready);
+            assert_eq!(manager.target.as_ref().unwrap().source, preview);
+
+            if click_before_ready {
+                manager.synchronize(Some(&expanded), fullscreen);
+                assert_eq!(manager.state(), &ThumbnailState::Loading);
+            }
+            results
+                .send(WorkerResult {
+                    generation: request.generation,
+                    result: encode_thumbnail(
+                        &picker_for_protocol(ThumbnailProtocol::Kitty, FALLBACK_FONT_SIZE),
+                        fullscreen,
+                        DynamicImage::new_rgb8(640, 640),
+                    )
+                    .map(|mut encoded| {
+                        if fills_cache {
+                            // Model a full-size RGBA image without a costly test allocation.
+                            encoded.decoded_bytes = PREPARED_THUMBNAIL_CACHE_MAX_DECODED_BYTES;
+                        }
+                        encoded
+                    }),
+                })
+                .unwrap();
+            assert_eq!(
+                manager.poll(),
+                click_before_ready,
+                "warming alone must not redraw"
+            );
+            manager.synchronize(Some(&expanded), fullscreen);
+            assert_eq!(
+                manager.state(),
+                &ThumbnailState::Ready,
+                "enlargement must be ready immediately"
+            );
+            assert_eq!(manager.target.as_ref().unwrap().source, expanded);
+            assert!(manager.protocol().is_some());
+            assert!(
+                observed.is_empty(),
+                "clicks must not download the image a second time"
+            );
+            assert!(requests.is_empty());
+
+            manager.synchronize(Some(&preview), preview_area);
+            assert_eq!(
+                manager.state(),
+                &ThumbnailState::Ready,
+                "collapsing restores cached preview"
+            );
+            assert!(manager.prepared_decoded_bytes <= PREPARED_THUMBNAIL_CACHE_MAX_DECODED_BYTES);
+        }
+    }
+
+    /// Failed speculative artwork never replaces a good preview; collapsing reuses RAM.
+    #[test]
+    fn expansion_prefetch_failure_is_silent_until_clicked_and_collapse_reuses_ram() {
+        let (mut manager, replies, observed) = manager_with_mock_transport();
+        let preview = Url::parse("https://images.example/preview.png").unwrap();
+        let expanded = Url::parse("https://images.example/expanded.png").unwrap();
+        let preview_area = Rect::new(50, 2, 20, 10);
+        let fullscreen = Rect::new(0, 0, 120, 40);
+        let (requests, results) = mock_expansion_worker(&mut manager);
+        manager.synchronize(Some(&preview), preview_area);
+        observed.recv_timeout(Duration::from_secs(1)).unwrap();
+        replies.send(Ok(fixture_thumbnail_png())).unwrap();
+        assert_eq!(wait_for_terminal_state(&mut manager), ThumbnailState::Ready);
+        manager.synchronize_expansion(Some(&expanded), fullscreen);
+        let request = requests.try_recv().unwrap();
+        results
+            .send(WorkerResult {
+                generation: request.generation,
+                result: Err(ThumbnailFailure::DownloadFailed),
+            })
+            .unwrap();
+        assert!(!manager.poll());
+        assert_eq!(manager.state(), &ThumbnailState::Ready);
+        assert!(!manager.synchronize_expansion(Some(&expanded), fullscreen));
+        assert!(requests.is_empty());
+        manager.synchronize(Some(&expanded), fullscreen);
+        assert_eq!(
+            manager.state(),
+            &ThumbnailState::Failed(ThumbnailFailure::DownloadFailed)
+        );
+        manager.synchronize(Some(&preview), preview_area);
+        assert_eq!(manager.state(), &ThumbnailState::Ready);
+        assert!(observed.is_empty());
+    }
+
+    /// Resizing fullscreen artwork must stay on the RAM-only worker, not persistent I/O.
+    #[test]
+    fn expansion_prefetch_resize_uses_ram_worker_and_clear_discards_queued_targets() {
+        let (mut manager, replies, observed) = manager_with_mock_transport();
+        let preview = Url::parse("https://images.example/preview.png").unwrap();
+        let expanded = Url::parse("https://images.example/expanded.png").unwrap();
+        let fullscreen = Rect::new(0, 0, 120, 40);
+        let (requests, results) = mock_expansion_worker(&mut manager);
+        manager.synchronize(Some(&preview), Rect::new(50, 2, 20, 10));
+        observed.recv_timeout(Duration::from_secs(1)).unwrap();
+        replies.send(Ok(fixture_thumbnail_png())).unwrap();
+        assert_eq!(wait_for_terminal_state(&mut manager), ThumbnailState::Ready);
+        manager.synchronize_expansion(Some(&expanded), fullscreen);
+        let request = requests.try_recv().unwrap();
+        manager.synchronize(Some(&expanded), fullscreen);
+        let resized = Rect::new(0, 0, 100, 30);
+        manager.synchronize(Some(&expanded), resized);
+        let resized_request = requests
+            .try_recv()
+            .expect("fullscreen resize reuses RAM worker");
+        assert_eq!(resized_request.target.area, resized);
+        assert_ne!(resized_request.generation, request.generation);
+        assert!(observed.is_empty());
+        results
+            .send(WorkerResult {
+                generation: request.generation,
+                result: Err(ThumbnailFailure::DownloadFailed),
+            })
+            .unwrap();
+        assert!(!manager.poll());
+        assert_eq!(manager.state(), &ThumbnailState::Loading);
+        manager.synchronize(Some(&expanded), fullscreen);
+        assert!(!requests.is_empty());
+        manager.clear();
+        assert!(
+            requests.is_empty(),
+            "clearing discards queued speculative work"
+        );
+    }
+
+    /// Old responses cannot change a newer visible selection, including after clearing it.
+    #[test]
+    fn expansion_prefetch_discards_stale_results_and_rejects_unsafe_targets() {
+        let (mut manager, replies, observed) = manager_with_mock_transport();
+        let preview = Url::parse("https://images.example/preview.png").unwrap();
+        let expanded = Url::parse("https://images.example/expanded.png").unwrap();
+        let replacement = Url::parse("https://images.example/replacement.png").unwrap();
+        let area = Rect::new(0, 0, 20, 10);
+        let fullscreen = Rect::new(0, 0, 120, 40);
+        let (requests, results) = mock_expansion_worker(&mut manager);
+        manager.synchronize(Some(&preview), area);
+        observed.recv_timeout(Duration::from_secs(1)).unwrap();
+        replies.send(Ok(fixture_thumbnail_png())).unwrap();
+        assert_eq!(wait_for_terminal_state(&mut manager), ThumbnailState::Ready);
+        for invalid in [
+            "http://127.0.0.1/a.png",
+            "https://user:secret@images.example/a.png",
+            "file:///tmp/a.png",
+        ] {
+            assert!(
+                !manager.synchronize_expansion(Some(&Url::parse(invalid).unwrap()), fullscreen)
+            );
+        }
+        assert!(requests.is_empty());
+        manager.synchronize_expansion(Some(&expanded), fullscreen);
+        let request = requests.try_recv().unwrap();
+        manager.synchronize(Some(&replacement), area);
+        assert_eq!(
+            observed.recv_timeout(Duration::from_secs(1)).unwrap(),
+            replacement
+        );
+        results
+            .send(WorkerResult {
+                generation: request.generation,
+                result: Err(ThumbnailFailure::DownloadFailed),
+            })
+            .unwrap();
+        assert!(!manager.poll());
+        assert_eq!(manager.state(), &ThumbnailState::Loading);
+        assert_eq!(manager.target.as_ref().unwrap().source, replacement);
+        replies.send(Ok(fixture_thumbnail_png())).unwrap();
+        assert_eq!(wait_for_terminal_state(&mut manager), ThumbnailState::Ready);
+        manager.synchronize_expansion(Some(&expanded), fullscreen);
+        let request = requests.try_recv().unwrap();
+        manager.clear();
+        results
+            .send(WorkerResult {
+                generation: request.generation,
+                result: Err(ThumbnailFailure::DownloadFailed),
+            })
+            .unwrap();
+        assert!(!manager.poll());
+        assert_eq!(manager.state(), &ThumbnailState::Idle);
+        assert!(manager.expansion.target.is_none());
+    }
+
+    /// A blocked full-size transfer cannot hold up the independent preview worker.
+    #[test]
+    fn expansion_prefetch_worker_encodes_in_background_without_delaying_navigation() {
+        let (mut manager, replies, observed) = manager_with_mock_transport();
+        let (requests, request_receiver) = bounded(1);
+        let (results, result_receiver) = bounded(1);
+        let (warm_observed_sender, warm_observed) = bounded(1);
+        let (warm_replies, warm_reply_receiver) = bounded(1);
+        manager.expansion.request_discarder = Some(request_receiver.clone());
+        assert!(spawn_expansion_worker_with_transport(
+            picker_for_protocol(ThumbnailProtocol::Kitty, FALLBACK_FONT_SIZE),
+            request_receiver,
+            results,
+            MockTransport {
+                observed: warm_observed_sender,
+                replies: warm_reply_receiver
+            },
+            Arc::clone(&manager.expansion.current_generation),
+        ));
+        manager.expansion.request_sender = Some(requests);
+        manager.expansion.result_receiver = Some(result_receiver);
+        let preview = Url::parse("https://images.example/preview.png").unwrap();
+        let expanded = Url::parse("https://images.example/expanded.png").unwrap();
+        let next = Url::parse("https://images.example/next.png").unwrap();
+        let area = Rect::new(20, 2, 20, 10);
+        let fullscreen = Rect::new(0, 0, 120, 40);
+        manager.synchronize(Some(&preview), area);
+        observed.recv_timeout(Duration::from_secs(1)).unwrap();
+        replies.send(Ok(fixture_thumbnail_png())).unwrap();
+        assert_eq!(wait_for_terminal_state(&mut manager), ThumbnailState::Ready);
+        manager.synchronize_expansion(Some(&expanded), fullscreen);
+        assert_eq!(
+            warm_observed.recv_timeout(Duration::from_secs(1)).unwrap(),
+            expanded
+        );
+        manager.synchronize(Some(&next), area);
+        assert_eq!(observed.recv_timeout(Duration::from_secs(1)).unwrap(), next);
+        replies.send(Ok(fixture_thumbnail_png())).unwrap();
+        assert_eq!(wait_for_terminal_state(&mut manager), ThumbnailState::Ready);
+        warm_replies.send(Ok(fixture_thumbnail_png())).unwrap();
+
+        // A second request supersedes the old result while keeping the same bounded worker.
+        manager.synchronize_expansion(Some(&expanded), fullscreen);
+        assert_eq!(
+            warm_observed.recv_timeout(Duration::from_secs(1)).unwrap(),
+            expanded
+        );
+        warm_replies.send(Ok(fixture_thumbnail_png())).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while manager.expansion.pending {
+            assert!(!manager.poll(), "background completion must not redraw");
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        manager.synchronize(Some(&expanded), fullscreen);
+        assert_eq!(manager.state(), &ThumbnailState::Ready);
+        assert!(observed.is_empty());
+        assert!(warm_observed.is_empty());
+        assert!(manager.cache_directory.is_none());
+    }
+
+    /// Injects the independent expansion worker's bounded channels without network I/O.
+    fn mock_expansion_worker(
+        manager: &mut ThumbnailManager,
+    ) -> (Receiver<WorkerRequest>, Sender<WorkerResult>) {
+        let (requests, request_receiver) = bounded(1);
+        let (results, result_receiver) = bounded(1);
+        manager.expansion.request_sender = Some(requests);
+        manager.expansion.request_discarder = Some(request_receiver.clone());
+        manager.expansion.result_receiver = Some(result_receiver);
+        (request_receiver, results)
+    }
+
     #[test]
     fn youtube_standard_letterbox_does_not_reserve_blank_terminal_rows() {
         let (mut manager, replies, observed) = manager_with_mock_transport();
@@ -3594,6 +4126,7 @@ pub(crate) mod tests {
             protocol_key: None,
             prepared: VecDeque::new(),
             prepared_decoded_bytes: 0,
+            expansion: ExpansionPrefetch::default(),
             picker: None,
             cache_directory: None,
             video_frame_program: PathBuf::from("ffmpeg"),
@@ -4316,6 +4849,7 @@ pub(crate) mod tests {
             protocol_key: None,
             prepared: VecDeque::new(),
             prepared_decoded_bytes: 0,
+            expansion: ExpansionPrefetch::default(),
             picker: None,
             cache_directory: Some(cache_directory),
             video_frame_program: PathBuf::from("ffmpeg"),
@@ -4623,6 +5157,7 @@ pub(crate) mod tests {
             protocol_key: None,
             prepared: VecDeque::new(),
             prepared_decoded_bytes: 0,
+            expansion: ExpansionPrefetch::default(),
             picker: None,
             cache_directory: None,
             video_frame_program: PathBuf::from("ffmpeg"),
@@ -4754,6 +5289,7 @@ pub(crate) mod tests {
                 protocol_key: None,
                 prepared: VecDeque::new(),
                 prepared_decoded_bytes: 0,
+                expansion: ExpansionPrefetch::default(),
                 picker: None,
                 cache_directory,
                 video_frame_program: PathBuf::from("ffmpeg"),
@@ -4813,6 +5349,7 @@ pub(crate) mod tests {
                 protocol_key: None,
                 prepared: VecDeque::new(),
                 prepared_decoded_bytes: 0,
+                expansion: ExpansionPrefetch::default(),
                 picker: None,
                 cache_directory,
                 video_frame_program: PathBuf::from("ffmpeg"),
