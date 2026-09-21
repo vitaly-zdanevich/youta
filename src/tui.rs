@@ -30306,7 +30306,7 @@ for encoded, expected in json.load(sys.stdin):
     #[test]
     fn repeated_tui_frames_replace_loading_with_the_real_thumbnail_protocol() {
         use std::collections::BTreeSet;
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
 
         use crate::thumbnails::{ThumbnailFailure, ThumbnailState, tests as thumbnail_tests};
 
@@ -30349,23 +30349,18 @@ for encoded, expected in json.load(sys.stdin):
         replies
             .send(Ok(thumbnail_tests::fixture_thumbnail_png()))
             .expect("release successful mock thumbnail");
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            thumbnails.poll();
-            terminal
-                .draw(|frame| {
-                    render_frame(frame, &view, &settings, &mut hit_map, Some(&mut thumbnails));
-                })
-                .expect("draw subsequent thumbnail frame");
-            if thumbnails.manager.state() != &ThumbnailState::Loading {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "repeated TUI frames left the completed thumbnail in Loading"
-            );
-            std::thread::yield_now();
-        }
+        thumbnail_tests::wait_for_image_work(
+            || {
+                thumbnails.poll();
+                terminal
+                    .draw(|frame| {
+                        render_frame(frame, &view, &settings, &mut hit_map, Some(&mut thumbnails));
+                    })
+                    .expect("draw subsequent thumbnail frame");
+                thumbnails.manager.state() != &ThumbnailState::Loading
+            },
+            "repeated TUI frames left the completed thumbnail in Loading",
+        );
 
         assert_eq!(thumbnails.manager.state(), &ThumbnailState::Ready);
         let rendered = rendered_text(&terminal);
@@ -30419,23 +30414,18 @@ for encoded, expected in json.load(sys.stdin):
         replies
             .send(Err(ThumbnailFailure::DownloadFailed))
             .expect("release failed mock thumbnail");
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            thumbnails.poll();
-            terminal
-                .draw(|frame| {
-                    render_frame(frame, &view, &settings, &mut hit_map, Some(&mut thumbnails));
-                })
-                .expect("draw failed thumbnail frame");
-            if thumbnails.manager.state() != &ThumbnailState::Loading {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "replacement thumbnail remained Loading after a failed response"
-            );
-            std::thread::yield_now();
-        }
+        thumbnail_tests::wait_for_image_work(
+            || {
+                thumbnails.poll();
+                terminal
+                    .draw(|frame| {
+                        render_frame(frame, &view, &settings, &mut hit_map, Some(&mut thumbnails));
+                    })
+                    .expect("draw failed thumbnail frame");
+                thumbnails.manager.state() != &ThumbnailState::Loading
+            },
+            "replacement thumbnail remained Loading after a failed response",
+        );
         assert_eq!(
             thumbnails.manager.state(),
             &ThumbnailState::Failed(ThumbnailFailure::DownloadFailed)
@@ -30448,7 +30438,7 @@ for encoded, expected in json.load(sys.stdin):
     #[cfg(feature = "images")]
     #[test]
     fn first_ready_expanded_thumbnail_frame_is_never_a_blank_modal() {
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
 
         use crate::thumbnails::{ThumbnailState, tests as thumbnail_tests};
 
@@ -30488,15 +30478,13 @@ for encoded, expected in json.load(sys.stdin):
         replies
             .send(Ok(thumbnail_tests::fixture_thumbnail_png()))
             .expect("release selected mock thumbnail");
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while thumbnails.manager.state() == &ThumbnailState::Loading {
-            thumbnails.poll();
-            assert!(
-                Instant::now() < deadline,
-                "selected thumbnail remained Loading after its mock response"
-            );
-            std::thread::yield_now();
-        }
+        thumbnail_tests::wait_for_image_work(
+            || {
+                thumbnails.poll();
+                thumbnails.manager.state() != &ThumbnailState::Loading
+            },
+            "selected thumbnail remained Loading after its mock response",
+        );
         for _ in 0..2 {
             terminal
                 .draw(|frame| {
@@ -30530,15 +30518,13 @@ for encoded, expected in json.load(sys.stdin):
         replies
             .send(Ok(thumbnail_tests::fixture_thumbnail_png()))
             .expect("release successful mock thumbnail");
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while thumbnails.manager.state() == &ThumbnailState::Loading {
-            thumbnails.poll();
-            assert!(
-                Instant::now() < deadline,
-                "expanded thumbnail remained Loading after its mock response"
-            );
-            std::thread::yield_now();
-        }
+        thumbnail_tests::wait_for_image_work(
+            || {
+                thumbnails.poll();
+                thumbnails.manager.state() != &ThumbnailState::Loading
+            },
+            "expanded thumbnail remained Loading after its mock response",
+        );
         assert_eq!(thumbnails.manager.state(), &ThumbnailState::Ready);
 
         terminal
@@ -30600,7 +30586,7 @@ for encoded, expected in json.load(sys.stdin):
     #[cfg(feature = "images")]
     #[test]
     fn failed_enlarged_thumbnail_falls_back_to_the_selected_preview() {
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
 
         use crate::thumbnails::{ThumbnailFailure, ThumbnailState, tests as thumbnail_tests};
 
@@ -30641,15 +30627,13 @@ for encoded, expected in json.load(sys.stdin):
         replies
             .send(Ok(thumbnail_tests::fixture_thumbnail_png()))
             .expect("release selected thumbnail");
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while thumbnails.manager.state() == &ThumbnailState::Loading {
-            thumbnails.poll();
-            assert!(
-                Instant::now() < deadline,
-                "selected thumbnail remained Loading"
-            );
-            std::thread::yield_now();
-        }
+        thumbnail_tests::wait_for_image_work(
+            || {
+                thumbnails.poll();
+                thumbnails.manager.state() != &ThumbnailState::Loading
+            },
+            "selected thumbnail remained Loading",
+        );
 
         view.details
             .as_mut()
@@ -30669,15 +30653,13 @@ for encoded, expected in json.load(sys.stdin):
         replies
             .send(Err(ThumbnailFailure::DownloadFailed))
             .expect("fail enlarged thumbnail");
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while thumbnails.manager.state() == &ThumbnailState::Loading {
-            thumbnails.poll();
-            assert!(
-                Instant::now() < deadline,
-                "enlarged thumbnail remained Loading"
-            );
-            std::thread::yield_now();
-        }
+        thumbnail_tests::wait_for_image_work(
+            || {
+                thumbnails.poll();
+                thumbnails.manager.state() != &ThumbnailState::Loading
+            },
+            "enlarged thumbnail remained Loading",
+        );
         assert_eq!(
             thumbnails.manager.state(),
             &ThumbnailState::Failed(ThumbnailFailure::DownloadFailed)
@@ -30698,15 +30680,13 @@ for encoded, expected in json.load(sys.stdin):
         replies
             .send(Ok(thumbnail_tests::fixture_thumbnail_png()))
             .expect("release fallback thumbnail");
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while thumbnails.manager.state() == &ThumbnailState::Loading {
-            thumbnails.poll();
-            assert!(
-                Instant::now() < deadline,
-                "fallback thumbnail remained Loading"
-            );
-            std::thread::yield_now();
-        }
+        thumbnail_tests::wait_for_image_work(
+            || {
+                thumbnails.poll();
+                thumbnails.manager.state() != &ThumbnailState::Loading
+            },
+            "fallback thumbnail remained Loading",
+        );
         assert_eq!(thumbnails.manager.state(), &ThumbnailState::Ready);
         for _ in 0..2 {
             terminal
@@ -30763,7 +30743,7 @@ for encoded, expected in json.load(sys.stdin):
     #[cfg(feature = "images")]
     #[test]
     fn failed_prefetched_enlargement_starts_fallback_on_the_first_click() {
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
 
         use crate::thumbnails::{ThumbnailFailure, ThumbnailState, tests as thumbnail_tests};
 
@@ -30795,12 +30775,13 @@ for encoded, expected in json.load(sys.stdin):
         replies
             .send(Ok(thumbnail_tests::fixture_thumbnail_png()))
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while renderer.manager.state() == &ThumbnailState::Loading {
-            renderer.poll();
-            assert!(Instant::now() < deadline, "preview did not become ready");
-            std::thread::yield_now();
-        }
+        thumbnail_tests::wait_for_image_work(
+            || {
+                renderer.poll();
+                renderer.manager.state() != &ThumbnailState::Loading
+            },
+            "preview did not become ready",
+        );
         assert_eq!(renderer.manager.state(), &ThumbnailState::Ready);
         assert!(renderer.synchronize_expansion(Some(&expanded), fullscreen));
         assert_eq!(
@@ -30839,12 +30820,13 @@ for encoded, expected in json.load(sys.stdin):
         replies
             .send(Ok(thumbnail_tests::fixture_thumbnail_png()))
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while renderer.manager.state() == &ThumbnailState::Loading {
-            renderer.poll();
-            assert!(Instant::now() < deadline, "fallback did not become ready");
-            std::thread::yield_now();
-        }
+        thumbnail_tests::wait_for_image_work(
+            || {
+                renderer.poll();
+                renderer.manager.state() != &ThumbnailState::Loading
+            },
+            "fallback did not become ready",
+        );
         for fullscreen in [true, true, false, true, false, true] {
             view.details.as_mut().unwrap().thumbnail_expanded = fullscreen;
             terminal
@@ -30870,7 +30852,7 @@ for encoded, expected in json.load(sys.stdin):
     #[test]
     fn fullscreen_artwork_scales_to_fit_without_enlarging_the_preview() {
         use std::io::Cursor;
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
 
         use crate::thumbnails::{ThumbnailState, tests as thumbnail_tests};
 
@@ -30898,12 +30880,13 @@ for encoded, expected in json.load(sys.stdin):
                         source
                     );
                     replies.send(Ok(bytes.clone())).unwrap();
-                    let deadline = Instant::now() + Duration::from_secs(3);
-                    while renderer.is_pending() {
-                        renderer.poll();
-                        assert!(Instant::now() < deadline, "artwork scaling did not finish");
-                        std::thread::yield_now();
-                    }
+                    thumbnail_tests::wait_for_image_work(
+                        || {
+                            renderer.poll();
+                            !renderer.is_pending()
+                        },
+                        "artwork scaling did not finish",
+                    );
                 }
                 assert_eq!(renderer.manager.state(), &ThumbnailState::Ready);
                 assert_eq!(
@@ -30930,10 +30913,20 @@ for encoded, expected in json.load(sys.stdin):
     #[test]
     fn youtube_large_geometry_reopen_keeps_prepared_protocol_without_new_work() {
         use std::io::Cursor;
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
 
         use crate::thumbnails::{ThumbnailState, tests as thumbnail_tests};
 
+        // Build real-size replies before a worker starts its mock-response wait.
+        let jpeg = |width, height| {
+            let mut bytes = Cursor::new(Vec::new());
+            image::DynamicImage::new_rgb8(width, height)
+                .write_to(&mut bytes, image::ImageFormat::Jpeg)
+                .unwrap();
+            bytes.into_inner()
+        };
+        let preview_bytes = jpeg(640, 480);
+        let expanded_bytes = jpeg(1280, 720);
         for same_source in [false, true] {
             let mut terminal = Terminal::new(TestBackend::new(320, 90)).unwrap();
             let expanded =
@@ -30977,31 +30970,19 @@ for encoded, expected in json.load(sys.stdin):
                             preview.clone()
                         }
                     );
-                    let (width, height) = if fullscreen || same_source {
-                        (1280, 720)
+                    let bytes = if fullscreen || same_source {
+                        &expanded_bytes
                     } else {
-                        (640, 480)
+                        &preview_bytes
                     };
-                    let mut bytes = Cursor::new(Vec::new());
-                    image::DynamicImage::new_rgb8(width, height)
-                        .write_to(&mut bytes, image::ImageFormat::Jpeg)
-                        .unwrap();
-                    replies.send(Ok(bytes.into_inner())).unwrap();
-                    // Cold fullscreen scaling/Kitty encoding is not a latency
-                    // assertion: loaded debug CI workers need time for these
-                    // 3200x1800 pixels. Reopening below must still be immediate.
-                    let deadline = Instant::now() + Duration::from_secs(30);
-                    while renderer.manager.state() == &ThumbnailState::Loading {
-                        renderer.poll();
-                        assert!(
+                    replies.send(Ok(bytes.clone())).unwrap();
+                    thumbnail_tests::wait_for_image_work(
+                        || {
+                            renderer.poll();
                             renderer.manager.state() != &ThumbnailState::Loading
-                                || Instant::now() < deadline,
-                            "large fixture encoding did not finish"
-                        );
-                        if renderer.manager.state() == &ThumbnailState::Loading {
-                            std::thread::sleep(Duration::from_millis(5));
-                        }
-                    }
+                        },
+                        "large fixture encoding did not finish",
+                    );
                     for _ in 0..2 {
                         terminal
                             .draw(|frame| {
@@ -31039,18 +31020,19 @@ for encoded, expected in json.load(sys.stdin):
     #[cfg(feature = "images")]
     #[test]
     fn enlarged_thumbnail_failure_memory_is_scoped_to_the_preview_preferred_pair() {
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
 
         use crate::thumbnails::{ThumbnailFailure, ThumbnailState, tests as thumbnail_tests};
 
         /// Polls only the fixture's pending request, with a bounded failure deadline.
         fn finish(renderer: &mut TerminalThumbnailRenderer) {
-            let deadline = Instant::now() + Duration::from_secs(2);
-            while renderer.manager.state() == &ThumbnailState::Loading {
-                renderer.poll();
-                assert!(Instant::now() < deadline, "mock artwork did not finish");
-                std::thread::yield_now();
-            }
+            thumbnail_tests::wait_for_image_work(
+                || {
+                    renderer.poll();
+                    renderer.manager.state() != &ThumbnailState::Loading
+                },
+                "mock artwork did not finish",
+            );
         }
 
         for change in ["preferred", "preview", "selection", "clear"] {
@@ -31120,7 +31102,7 @@ for encoded, expected in json.load(sys.stdin):
     #[cfg(feature = "images")]
     #[test]
     fn thumbnail_finishing_behind_note_popup_resumes_without_a_second_request() {
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
 
         use crossbeam_channel::TryRecvError;
 
@@ -31173,15 +31155,13 @@ for encoded, expected in json.load(sys.stdin):
         replies
             .send(Ok(thumbnail_tests::fixture_thumbnail_png()))
             .expect("finish thumbnail behind popup");
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while thumbnails.manager.state() == &ThumbnailState::Loading {
-            thumbnails.poll();
-            assert!(
-                Instant::now() < deadline,
-                "thumbnail remained Loading behind the note popup"
-            );
-            std::thread::yield_now();
-        }
+        thumbnail_tests::wait_for_image_work(
+            || {
+                thumbnails.poll();
+                thumbnails.manager.state() != &ThumbnailState::Loading
+            },
+            "thumbnail remained Loading behind the note popup",
+        );
         assert_eq!(thumbnails.manager.state(), &ThumbnailState::Ready);
 
         view.private_note_popup = None;
@@ -31203,7 +31183,7 @@ for encoded, expected in json.load(sys.stdin):
     #[cfg(feature = "images")]
     #[test]
     fn revisited_subscription_artwork_is_ready_without_another_worker_request() {
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
 
         use crossbeam_channel::TryRecvError;
 
@@ -31254,15 +31234,13 @@ for encoded, expected in json.load(sys.stdin):
             replies
                 .send(Ok(thumbnail_tests::fixture_thumbnail_png()))
                 .expect("release cold artwork response");
-            let deadline = Instant::now() + Duration::from_secs(2);
-            while thumbnails.manager.state() == &ThumbnailState::Loading {
-                thumbnails.poll();
-                assert!(
-                    Instant::now() < deadline,
-                    "subscription artwork remained Loading after its mock response"
-                );
-                std::thread::yield_now();
-            }
+            thumbnail_tests::wait_for_image_work(
+                || {
+                    thumbnails.poll();
+                    thumbnails.manager.state() != &ThumbnailState::Loading
+                },
+                "subscription artwork remained Loading after its mock response",
+            );
             assert_eq!(thumbnails.manager.state(), &ThumbnailState::Ready);
         }
 

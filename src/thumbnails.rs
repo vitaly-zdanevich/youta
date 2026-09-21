@@ -2882,6 +2882,22 @@ pub(crate) mod tests {
 
     use super::*;
 
+    /// Cold decoding, fullscreen scaling, and protocol encoding are not latency assertions.
+    ///
+    /// Real-size fixtures share this generous bounded guard on loaded debug CI
+    /// runners. Synchronous cache-hit assertions and intentional timing tests
+    /// remain separate; checking completion first also accepts the final poll.
+    pub(crate) fn wait_for_image_work(mut complete: impl FnMut() -> bool, message: &str) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if complete() {
+                return;
+            }
+            assert!(Instant::now() < deadline, "{message}");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     pub(crate) type MockManagerParts = (
         ThumbnailManager,
         Sender<Result<Vec<u8>, ThumbnailFailure>>,
@@ -3898,21 +3914,23 @@ pub(crate) mod tests {
             .unwrap();
             bytes.into_inner()
         };
+        // Prepare replies before requesting work so JPEG construction cannot
+        // consume the mock transport's independent response deadline.
+        let preview_bytes = jpeg(480, 360, [200, 10, 10]);
+        let expanded_bytes = jpeg(1280, 720, [10, 200, 10]);
         manager.synchronize(Some(&preview), preview_area);
         assert_eq!(
             observed.recv_timeout(Duration::from_secs(1)).unwrap(),
             preview
         );
-        replies.send(Ok(jpeg(480, 360, [200, 10, 10]))).unwrap();
+        replies.send(Ok(preview_bytes)).unwrap();
         assert_eq!(wait_for_terminal_state(&mut manager), ThumbnailState::Ready);
         assert!(manager.synchronize_expansion(Some(&expanded), fullscreen));
         assert_eq!(
             warm_observed.recv_timeout(Duration::from_secs(1)).unwrap(),
             expanded
         );
-        warm_replies
-            .send(Ok(jpeg(1280, 720, [10, 200, 10])))
-            .unwrap();
+        warm_replies.send(Ok(expanded_bytes)).unwrap();
         wait_for_mock_expansion(&mut manager);
         assert_eq!(manager.state(), &ThumbnailState::Ready);
         assert!(manager.synchronize_fullscreen(Some(&expanded), fullscreen));
@@ -4243,12 +4261,7 @@ pub(crate) mod tests {
             expanded
         );
         warm_replies.send(Ok(fixture_thumbnail_png())).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while manager.expansion.pending {
-            assert!(!manager.poll(), "background completion must not redraw");
-            assert!(Instant::now() < deadline);
-            thread::sleep(Duration::from_millis(5));
-        }
+        wait_for_mock_expansion(&mut manager);
         manager.synchronize_fullscreen(Some(&expanded), fullscreen);
         assert_eq!(manager.state(), &ThumbnailState::Ready);
         assert!(observed.is_empty());
@@ -5646,12 +5659,13 @@ pub(crate) mod tests {
 
     /// Waits for a fixture's speculative worker without exposing private manager state to the TUI.
     pub(crate) fn wait_for_mock_expansion(manager: &mut ThumbnailManager) {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while manager.expansion.pending {
-            assert!(!manager.poll(), "background completion must stay silent");
-            assert!(Instant::now() < deadline, "mock expansion did not finish");
-            thread::yield_now();
-        }
+        wait_for_image_work(
+            || {
+                assert!(!manager.poll(), "background completion must stay silent");
+                !manager.expansion.pending
+            },
+            "mock expansion did not finish",
+        );
     }
 
     /// Builds an idle half-block manager without consulting the host terminal.
@@ -6002,18 +6016,14 @@ pub(crate) mod tests {
     }
 
     fn wait_for_terminal_state(manager: &mut ThumbnailManager) -> ThumbnailState {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            manager.poll();
-            if manager.state() != &ThumbnailState::Loading {
-                return manager.state().clone();
-            }
-            assert!(
-                Instant::now() < deadline,
-                "thumbnail remained Loading after the worker deadline"
-            );
-            thread::sleep(Duration::from_millis(5));
-        }
+        wait_for_image_work(
+            || {
+                manager.poll();
+                manager.state() != &ThumbnailState::Loading
+            },
+            "thumbnail remained Loading after the worker deadline",
+        );
+        manager.state().clone()
     }
 
     fn wait_for_queued_result(manager: &ThumbnailManager) {
