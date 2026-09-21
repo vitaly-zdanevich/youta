@@ -219,7 +219,9 @@ struct TerminalThumbnailRenderer {
     clear_before_ready: bool,
     followup_frame_pending: bool,
     visible_source: Option<url::Url>,
+    /// The active enlargement pair survives collapse, but not a different selection.
     fallback_preferred_source: Option<url::Url>,
+    fallback_preview_source: Option<url::Url>,
     fallback_preferred_failed: bool,
     prefetched_visible_source: Option<url::Url>,
     prefetch_sources: Vec<url::Url>,
@@ -265,6 +267,7 @@ impl TerminalThumbnailRenderer {
             followup_frame_pending: false,
             visible_source: None,
             fallback_preferred_source: None,
+            fallback_preview_source: None,
             fallback_preferred_failed: false,
             prefetched_visible_source: None,
             prefetch_sources: Vec::new(),
@@ -282,9 +285,10 @@ impl TerminalThumbnailRenderer {
         changed
     }
 
-    /// Clears failure memory when leaving or replacing an enlarged-artwork request.
+    /// Clears failure memory when leaving or replacing the selected artwork pair.
     fn reset_fallback(&mut self) {
         self.fallback_preferred_source = None;
+        self.fallback_preview_source = None;
         self.fallback_preferred_failed = false;
     }
 }
@@ -364,7 +368,12 @@ impl ThumbnailRenderer for TerminalThumbnailRenderer {
     }
 
     fn synchronize(&mut self, source: Option<&url::Url>, area: Rect) -> bool {
-        self.reset_fallback();
+        // Collapsing returns to this exact preview. Retain the pair's failure
+        // so reopening uses its ready fallback instead of retrying a missing
+        // large image. A different selection must get a fresh attempt.
+        if source != self.fallback_preview_source.as_ref() {
+            self.reset_fallback();
+        }
         self.synchronize_visible(source, area)
     }
 
@@ -374,8 +383,12 @@ impl ThumbnailRenderer for TerminalThumbnailRenderer {
         fallback: Option<&url::Url>,
         area: Rect,
     ) -> bool {
-        if self.fallback_preferred_source.as_ref() != preferred {
+        let fallback = fallback.filter(|fallback| Some(*fallback) != preferred);
+        if self.fallback_preferred_source.as_ref() != preferred
+            || self.fallback_preview_source.as_ref() != fallback
+        {
             self.fallback_preferred_source = preferred.cloned();
+            self.fallback_preview_source = fallback.cloned();
             self.fallback_preferred_failed = false;
         }
         if !self.fallback_preferred_failed
@@ -384,7 +397,6 @@ impl ThumbnailRenderer for TerminalThumbnailRenderer {
         {
             self.fallback_preferred_failed = true;
         }
-        let fallback = fallback.filter(|fallback| Some(*fallback) != preferred);
         let source = if self.fallback_preferred_failed {
             fallback.or(preferred)
         } else {
@@ -30340,6 +30352,35 @@ for encoded, expected in json.load(sys.stdin):
             rendered.contains('\u{10EEEE}') || rendered.contains("\u{1b}_G"),
             "the immediate follow-up frame must contain the enlarged terminal image"
         );
+
+        for expanded in [false, true, false, true] {
+            view.details.as_mut().unwrap().thumbnail_expanded = expanded;
+            terminal
+                .draw(|frame| {
+                    render_frame(frame, &view, &settings, &mut hit_map, Some(&mut thumbnails));
+                })
+                .expect("restore the already-rendered preview or fullscreen artwork");
+            assert_eq!(
+                thumbnails.manager.state(),
+                &ThumbnailState::Ready,
+                "closing and reopening must restore a ready protocol in the same draw"
+            );
+            assert!(thumbnails.has_rendered_artwork());
+            assert!(
+                observed.is_empty(),
+                "cached artwork must not request worker work"
+            );
+            assert!(
+                thumbnails
+                    .manager
+                    .protocol_mut()
+                    .unwrap()
+                    .last_encoding_result()
+                    .is_none(),
+                "restoring actual rendered artwork must not resize or encode it again"
+            );
+            assert!(!rendered_text(&terminal).contains("Loading enlarged thumbnail"));
+        }
     }
 
     #[cfg(feature = "images")]
@@ -30462,6 +30503,116 @@ for encoded, expected in json.load(sys.stdin):
             !rendered_text(&terminal).contains("Thumbnail unavailable"),
             "the working preview must replace the failed enlarged image"
         );
+
+        for expanded in [false, true, false, true] {
+            view.details.as_mut().unwrap().thumbnail_expanded = expanded;
+            terminal
+                .draw(|frame| {
+                    render_frame(frame, &view, &settings, &mut hit_map, Some(&mut thumbnails));
+                })
+                .expect("restore the preview or its ready enlarged fallback");
+            assert_eq!(
+                thumbnails.manager.state(),
+                &ThumbnailState::Ready,
+                "reopening the same pair must not retry its failed preferred URL"
+            );
+            assert!(thumbnails.has_rendered_artwork());
+            assert!(
+                observed.is_empty(),
+                "fallback reuse must not repeat a network request"
+            );
+            assert!(
+                thumbnails
+                    .manager
+                    .protocol_mut()
+                    .unwrap()
+                    .last_encoding_result()
+                    .is_none(),
+                "the cached fallback must not be encoded again on reopening"
+            );
+        }
+    }
+
+    /// A failed enlargement is remembered only while its selected artwork pair remains active.
+    #[cfg(feature = "images")]
+    #[test]
+    fn enlarged_thumbnail_failure_memory_is_scoped_to_the_preview_preferred_pair() {
+        use std::time::{Duration, Instant};
+
+        use crate::thumbnails::{ThumbnailFailure, ThumbnailState, tests as thumbnail_tests};
+
+        /// Polls only the fixture's pending request, with a bounded failure deadline.
+        fn finish(renderer: &mut TerminalThumbnailRenderer) {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while renderer.manager.state() == &ThumbnailState::Loading {
+                renderer.poll();
+                assert!(Instant::now() < deadline, "mock artwork did not finish");
+                std::thread::yield_now();
+            }
+        }
+
+        for change in ["preferred", "preview", "selection", "clear"] {
+            let (manager, replies, observed) = thumbnail_tests::manager_with_mock_transport();
+            let mut renderer = TerminalThumbnailRenderer::new(manager);
+            let preferred = url::Url::parse("https://images.example/missing-large.png").unwrap();
+            let preview = url::Url::parse("https://images.example/preview.png").unwrap();
+            let replacement = url::Url::parse("https://images.example/replacement.png").unwrap();
+            let area = Rect::new(0, 0, 120, 32);
+
+            renderer.synchronize_with_fallback(Some(&preferred), Some(&preview), area);
+            assert_eq!(
+                observed.recv_timeout(Duration::from_secs(1)).unwrap(),
+                preferred
+            );
+            replies.send(Err(ThumbnailFailure::DownloadFailed)).unwrap();
+            finish(&mut renderer);
+            renderer.synchronize_with_fallback(Some(&preferred), Some(&preview), area);
+            assert_eq!(
+                observed.recv_timeout(Duration::from_secs(1)).unwrap(),
+                preview
+            );
+            replies
+                .send(Ok(thumbnail_tests::fixture_thumbnail_png()))
+                .unwrap();
+            finish(&mut renderer);
+            assert_eq!(renderer.manager.state(), &ThumbnailState::Ready);
+
+            if change == "selection" {
+                renderer.synchronize(Some(&replacement), Rect::new(0, 0, 20, 10));
+                assert_eq!(
+                    observed.recv_timeout(Duration::from_secs(1)).unwrap(),
+                    replacement
+                );
+                replies
+                    .send(Ok(thumbnail_tests::fixture_thumbnail_png()))
+                    .unwrap();
+                finish(&mut renderer);
+            } else if change == "clear" {
+                renderer.clear();
+            }
+            let next_preferred = if change == "preferred" {
+                &replacement
+            } else {
+                &preferred
+            };
+            let next_preview = if change == "preview" {
+                &replacement
+            } else {
+                &preview
+            };
+            renderer.synchronize_with_fallback(Some(next_preferred), Some(next_preview), area);
+            assert_eq!(renderer.manager.state(), &ThumbnailState::Loading);
+            assert_eq!(
+                observed.recv_timeout(Duration::from_secs(1)).unwrap(),
+                *next_preferred,
+                "changing {change} must permit the preferred artwork to be tried again"
+            );
+            replies
+                .send(Ok(thumbnail_tests::fixture_thumbnail_png()))
+                .unwrap();
+            finish(&mut renderer);
+            assert_eq!(renderer.manager.state(), &ThumbnailState::Ready);
+        }
     }
 
     #[cfg(feature = "images")]
