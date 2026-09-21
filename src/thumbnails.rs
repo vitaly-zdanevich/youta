@@ -426,6 +426,8 @@ trait LocalVideoFrameExtractor: Send + 'static {
 
 /// Shell-free FFmpeg process used by the production local-video worker.
 struct FfmpegVideoFrameExtractor {
+    /// Retained only when this build can invoke the frame-extraction helper.
+    #[cfg(feature = "local-video-thumbnails")]
     program: PathBuf,
 }
 
@@ -437,8 +439,14 @@ impl Default for FfmpegVideoFrameExtractor {
 
 impl FfmpegVideoFrameExtractor {
     /// Extracts frames with a specific `FFmpeg` build.
-    const fn new(program: PathBuf) -> Self {
-        Self { program }
+    /// Builds without local-video support discard the unused executable path.
+    fn new(program: PathBuf) -> Self {
+        #[cfg(not(feature = "local-video-thumbnails"))]
+        drop(program);
+        Self {
+            #[cfg(feature = "local-video-thumbnails")]
+            program,
+        }
     }
 }
 
