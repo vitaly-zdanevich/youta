@@ -1364,6 +1364,8 @@ These are distinct integration modes:
   local-only names; Youta does not fetch the returned feed. Thumbnail fetches
   also require public DNS results and reject redirects. Enclosures are handed
   to the external playback backend, which owns later media DNS and redirects.
+  In the terminal, catalogue links below artwork use normal text color and
+  show only the URL.
 - The separate **Bandcamp** tab performs bounded, best-effort searches of
   Bandcamp's public HTTPS search page and accepts only canonical track and
   album pages on artist or label subdomains. Search persists the query, current

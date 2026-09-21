@@ -5486,6 +5486,22 @@ fn render_information_panel(
                     Some(DetailLinkInternalTarget::ArchiveUploader(_))
                 );
                 let external_width = match link.presentation {
+                    _ if view.screen == Screen::ApplePodcasts
+                        && matches!(
+                            link.label.as_str(),
+                            "Apple Podcasts" | "Apple Podcasts episode" | "Apple Podcasts show"
+                        ) =>
+                    {
+                        // Catalogue URLs already identify their provider; keep
+                        // the artwork caption concise and use ordinary text.
+                        spans.extend(highlighted_detail_text(
+                            details,
+                            DetailHighlightField::LinkUrl(*index),
+                            &link.url,
+                            theme.base,
+                        ));
+                        terminal_text_width(&link.url)
+                    }
                     DetailLinkPresentation::LabelAndUrl
                     | DetailLinkPresentation::LabelAndUrlSpaced => {
                         spans.extend(highlighted_detail_text(
@@ -25846,6 +25862,123 @@ for encoded, expected in json.load(sys.stdin):
             !rendered_text(&terminal).contains('▶'),
             "stopped Radio rows must not retain a stale playing marker"
         );
+    }
+
+    /// Catalogue links below podcast artwork use ordinary text and retain
+    /// their original URL for clicking and selecting text.
+    #[cfg(feature = "apple-podcasts")]
+    #[test]
+    fn podcast_artwork_links_show_only_the_url_in_normal_text() {
+        let webpage = "https://podcasts.apple.com/us/podcast/fixture/id123";
+        for label in [
+            "Apple Podcasts",
+            "Apple Podcasts episode",
+            "Apple Podcasts show",
+        ] {
+            for funny_mode in [false, true] {
+                for external_opener_available in [false, true] {
+                    let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+                    let view = ViewModel {
+                        screen: Screen::ApplePodcasts,
+                        external_opener_available,
+                        details: Some(DetailView {
+                            title: "Fixture podcast".to_owned(),
+                            source: "Apple Podcasts".to_owned(),
+                            thumbnail_url: Some(
+                                url::Url::parse("https://images.example/podcast.jpg").unwrap(),
+                            ),
+                            links: vec![DetailLinkView {
+                                label: label.to_owned(),
+                                url: webpage.to_owned(),
+                                ..DetailLinkView::default()
+                            }],
+                            ..DetailView::default()
+                        }),
+                        ..ViewModel::default()
+                    };
+                    let theme = Theme::new(funny_mode);
+                    let mut hit_map = HitMap::default();
+                    let mut thumbnails = MockThumbnailRenderer {
+                        enabled: true,
+                        rendered_artwork: true,
+                        prepared_artwork_size: Some(Size::new(20, 8)),
+                        ..MockThumbnailRenderer::default()
+                    };
+                    terminal
+                        .draw(|frame| {
+                            render_details(
+                                frame,
+                                frame.area(),
+                                &view,
+                                true,
+                                8,
+                                &theme,
+                                &mut hit_map,
+                                Some(&mut thumbnails),
+                            );
+                        })
+                        .unwrap();
+                    let artwork = hit_map.thumbnail_area.expect("podcast artwork");
+                    let buffer = terminal.backend().buffer();
+                    let (link_y, rendered) = (artwork.bottom()..buffer.area.bottom())
+                        .map(|y| {
+                            let text = (0..buffer.area.width)
+                                .map(|x| buffer[(x, y)].symbol())
+                                .collect::<String>();
+                            (y, text)
+                        })
+                        .find(|(_, text)| !text.trim().is_empty())
+                        .expect("first text below artwork");
+                    assert_eq!(rendered.trim(), webpage);
+                    for column in 0..terminal_text_width(webpage) {
+                        assert_eq!(
+                            buffer[(column, link_y)].fg,
+                            theme.base.fg.unwrap_or(Color::Reset)
+                        );
+                        assert!(!buffer[(column, link_y)].modifier.contains(Modifier::DIM));
+                    }
+                    let selected_row = hit_map
+                        .detail_text_rows
+                        .iter()
+                        .position(|row| row.y == link_y)
+                        .expect("selectable URL");
+                    assert_eq!(
+                        hit_map.selected_details_text(DetailsTextSelection {
+                            dragging: false,
+                            anchor: DetailsTextPosition {
+                                row: selected_row,
+                                column: 0
+                            },
+                            focus: DetailsTextPosition {
+                                row: selected_row,
+                                column: webpage.len() - 1
+                            },
+                        }),
+                        webpage
+                    );
+                    if external_opener_available {
+                        let (_, target) = hit_map.detail_links[0];
+                        assert_eq!(target.width, terminal_text_width(webpage));
+                        assert_eq!(target.y, link_y);
+                        assert_eq!(
+                            mouse_action(
+                                MouseEvent {
+                                    kind: MouseEventKind::Down(MouseButton::Left),
+                                    column: target.right() - 1,
+                                    row: target.y,
+                                    modifiers: KeyModifiers::NONE,
+                                },
+                                &hit_map,
+                                &view
+                            ),
+                            Some(UiAction::ActivateDetailLink(0))
+                        );
+                    } else {
+                        assert!(hit_map.detail_links.is_empty());
+                    }
+                }
+            }
+        }
     }
 
     #[cfg(feature = "apple-podcasts")]
