@@ -3803,6 +3803,12 @@ enum AutoplayOrigin {
         items: Arc<[QueueItem]>,
         index: usize,
     },
+    #[cfg(feature = "apple-podcasts")]
+    ApplePodcasts {
+        /// Playable episodes from the bounded lookup, retained across navigation.
+        items: Arc<[QueueItem]>,
+        index: usize,
+    },
     #[cfg(feature = "web-browser")]
     Web {
         /// Ephemeral direct links captured independently of later navigation.
@@ -24862,6 +24868,34 @@ impl AppController {
                     });
                 }
             }
+            #[cfg(feature = "apple-podcasts")]
+            Screen::ApplePodcasts if self.apple_podcasts_route == ApplePodcastsRoute::Episodes => {
+                if self
+                    .apple_podcast_episodes
+                    .get(self.view.selected)
+                    .is_some_and(|episode| {
+                        media_id.source == SourceKind::ApplePodcasts
+                            && episode.episode_id.to_string() == media_id.external_id
+                    })
+                {
+                    let items = self
+                        .apple_podcast_episodes
+                        .iter()
+                        .filter_map(|episode| {
+                            queue_item_from_apple_episode(
+                                episode,
+                                self.active_apple_podcast_show.as_ref(),
+                            )
+                            .ok()
+                        })
+                        .collect::<Vec<_>>();
+                    let index = items.iter().position(|item| item.media.id == *media_id)?;
+                    return Some(AutoplayOrigin::ApplePodcasts {
+                        items: items.into(),
+                        index,
+                    });
+                }
+            }
             // Async playlist replays (Bandcamp, Apple, BBC, …) only complete
             // while their entry is still selected on this screen, so matching
             // the selection here captures the origin for every replay branch.
@@ -25129,6 +25163,18 @@ impl AppController {
                     Some(AutoplayStep::Play {
                         item: Box::new(item.clone()),
                         origin: AutoplayOrigin::Librivox {
+                            items: Arc::clone(items),
+                            index,
+                        },
+                    })
+                })
+            }
+            #[cfg(feature = "apple-podcasts")]
+            AutoplayOrigin::ApplePodcasts { items, index } => {
+                neighbour_list_step(items, *index, direction, |index, item: &QueueItem| {
+                    Some(AutoplayStep::Play {
+                        item: Box::new(item.clone()),
+                        origin: AutoplayOrigin::ApplePodcasts {
                             items: Arc::clone(items),
                             index,
                         },
@@ -74672,6 +74718,129 @@ mod tests {
                 .status_line
                 .contains("not in the current list")
         );
+    }
+
+    /// Podcast continuation keeps its original playable episodes across navigation,
+    /// honors the global toggle, and yields to repeat and explicitly queued items.
+    #[cfg(feature = "apple-podcasts")]
+    #[test]
+    fn apple_podcasts_autoplay_preserves_snapshot_and_queue_precedence() {
+        for (autoplay, enable_after_navigation, repeat_and_queue) in [
+            (true, false, false),
+            (false, false, false),
+            (false, true, false),
+            (true, false, true),
+        ] {
+            let temporary = crate::test_support::canonical_tempdir("podcast autoplay");
+            let (factory, playback, statuses, events) = mock_playback_factory([], []);
+            let config = Config::for_dir(temporary.path().join("youta"));
+            let store = StateStore::open_in_memory().expect("in-memory state");
+            let mut controller = AppController::new(config, store, None, Some(factory));
+            controller.config.playback.autoplay = autoplay;
+            controller.view.autoplay = autoplay;
+            controller.view.screen = Screen::ApplePodcasts;
+            controller.apple_podcasts_route = ApplePodcastsRoute::Episodes;
+            controller.active_apple_podcast_show =
+                Some(apple_podcast_show_fixture(1_001, "Original show"));
+            controller.apple_podcast_episodes = vec![
+                apple_podcast_episode_fixture(1_001, 100, "Earlier metadata-only episode", None),
+                apple_podcast_episode_fixture(
+                    1_001,
+                    101,
+                    "First episode",
+                    Some("https://media.example/first.opus"),
+                ),
+                apple_podcast_episode_fixture(1_001, 102, "Metadata-only episode", None),
+                apple_podcast_episode_fixture(
+                    1_001,
+                    103,
+                    "Second episode",
+                    Some("https://media.example/second.opus"),
+                ),
+            ];
+            controller.view.selected = 1;
+            controller.dispatch(UiAction::ActivateSelection);
+            assert_eq!(playback.lock().unwrap().played.len(), 1);
+
+            if repeat_and_queue {
+                controller
+                    .playback_queue
+                    .push(fixture_direct_item("Explicit queue"));
+                controller.dispatch(UiAction::ToggleRepeat);
+            }
+            controller.view.screen = Screen::History;
+            controller.apple_podcasts_route = ApplePodcastsRoute::Shows;
+            controller.apple_podcast_episodes.clear();
+            controller.active_apple_podcast_show = None;
+            controller.search_generation = controller.search_generation.wrapping_add(1);
+            if enable_after_navigation {
+                controller.dispatch(UiAction::ToggleAutoplay);
+                assert!(controller.view.autoplay);
+            }
+
+            let finish_current = |controller: &mut AppController| {
+                statuses.lock().unwrap().push_back(PlaybackStatus {
+                    idle: false,
+                    position: Duration::from_secs(1_805),
+                    duration: Some(Duration::from_secs(1_805)),
+                    paused: false,
+                    ..PlaybackStatus::default()
+                });
+                events
+                    .lock()
+                    .unwrap()
+                    .extend([PlaybackEvent::MediaLoaded, PlaybackEvent::PlaybackStarted]);
+                controller.update_player();
+                events
+                    .lock()
+                    .unwrap()
+                    .push_back(PlaybackEvent::Ended(PlaybackEnd {
+                        reason: PlaybackEndReason::Eof,
+                        error: None,
+                        file_error: None,
+                        diagnostic: None,
+                    }));
+                controller.update_player();
+            };
+            let expected_next = if repeat_and_queue {
+                vec!["First episode", "Explicit queue", "Second episode"]
+            } else if autoplay || enable_after_navigation {
+                vec!["Second episode"]
+            } else {
+                Vec::new()
+            };
+            for (index, expected) in expected_next.iter().enumerate() {
+                finish_current(&mut controller);
+                let playback = playback.lock().unwrap();
+                assert_eq!(
+                    playback.played.len(),
+                    index + 2,
+                    "autoplay={autoplay}, enable later={enable_after_navigation}, repeat/queue={repeat_and_queue}"
+                );
+                assert_eq!(
+                    playback.played.last().unwrap().title.as_deref(),
+                    Some(*expected)
+                );
+                drop(playback);
+                if repeat_and_queue && index == 0 {
+                    controller.dispatch(UiAction::ToggleRepeat);
+                }
+            }
+            finish_current(&mut controller);
+            assert_eq!(
+                playback.lock().unwrap().played.len(),
+                1 + expected_next.len()
+            );
+            assert!(controller.view.playback.idle);
+            assert_eq!(
+                controller.view.status_line,
+                if autoplay || enable_after_navigation {
+                    "Autoplay reached the end of this list"
+                } else {
+                    "Playback queue finished"
+                }
+            );
+        }
     }
 
     #[test]

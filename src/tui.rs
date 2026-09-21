@@ -3020,7 +3020,10 @@ fn render_body(
             controls_height,
         );
         render_web_controls(frame, controls, show_hotkeys, view.autoplay, theme, hit_map);
-    } else if view.screen == Screen::ArchiveOrg {
+    } else if matches!(
+        view.screen,
+        Screen::ArchiveOrg | Screen::ApplePodcasts | Screen::TrackerMusic
+    ) {
         let controls_height = list_area.height.min(1);
         list_area.height = list_area.height.saturating_sub(controls_height);
         let controls = Rect::new(
@@ -3029,7 +3032,7 @@ fn render_body(
             list_area.width,
             controls_height,
         );
-        render_archive_org_controls(frame, controls, view, show_hotkeys, theme, hit_map);
+        render_catalog_playback_controls(frame, controls, view, show_hotkeys, theme, hit_map);
     }
     hit_map.rows_row_height = row_list_height(&view.rows);
     (hit_map.rows, hit_map.rows_first_index) = render_row_list(
@@ -3077,8 +3080,8 @@ fn render_body(
     }
 }
 
-/// Exposes playback toggles and actionable Back below Archive item and track lists.
-fn render_archive_org_controls(
+/// Shares playback toggles below catalogue lists, with Back limited to Archive.
+fn render_catalog_playback_controls(
     frame: &mut Frame<'_>,
     area: Rect,
     view: &ViewModel,
@@ -3091,8 +3094,8 @@ fn render_archive_org_controls(
     }
     let mut x = area.x;
     // Back has priority in narrow catalogue panes; the playback hotkeys remain global.
-    for (key, label, action) in view
-        .archive_org_back_available
+    for (key, label, action) in (view.screen == Screen::ArchiveOrg
+        && view.archive_org_back_available)
         .then_some(("Esc", "Back", UiAction::GoBack))
         .into_iter()
         .chain([
@@ -26244,7 +26247,7 @@ for encoded, expected in json.load(sys.stdin):
             let mut hit_map = HitMap::default();
             terminal
                 .draw(|frame| {
-                    render_archive_org_controls(
+                    render_catalog_playback_controls(
                         frame,
                         frame.area(),
                         &view,
@@ -26294,19 +26297,29 @@ for encoded, expected in json.load(sys.stdin):
         );
     }
 
+    /// Catalogue footers reflect live toggle state and share keyboard/mouse actions.
     #[test]
-    fn archive_org_footer_shows_autoplay_repeat_and_working_controls() {
-        for width in [160, 79] {
+    fn catalog_playback_footers_show_autoplay_repeat_and_working_controls() {
+        for (screen, width) in [
+            Screen::ArchiveOrg,
+            Screen::ApplePodcasts,
+            Screen::TrackerMusic,
+        ]
+        .into_iter()
+        .flat_map(|screen| [160, 79].map(|width| (screen, width)))
+        {
             for show_hotkeys in [true, false] {
                 for autoplay in [false, true] {
                     for repeating in [false, true] {
                         let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
                         let view = ViewModel {
-                            screen: Screen::ArchiveOrg,
+                            screen,
+                            // Leaving Archive must not leak its Back control into another tab.
+                            archive_org_back_available: screen != Screen::ArchiveOrg,
                             autoplay,
                             repeating,
                             rows: vec![RowView {
-                                title: "Archive item or track".to_owned(),
+                                title: "Catalogue episode or track".to_owned(),
                                 ..RowView::default()
                             }],
                             ..ViewModel::default()
@@ -26347,6 +26360,13 @@ for encoded, expected in json.load(sys.stdin):
                         assert!(
                             rendered_text(&terminal)
                                 .contains(&format!("{autoplay_label}  {repeat_label}"))
+                        );
+                        assert!(
+                            hit_map
+                                .detail_buttons
+                                .iter()
+                                .all(|(action, _)| *action != UiAction::GoBack),
+                            "{screen:?} must not expose an unrelated Archive Back action"
                         );
                         let mut previous: Option<Rect> = None;
                         for (key, label, expected) in [
@@ -26396,13 +26416,20 @@ for encoded, expected in json.load(sys.stdin):
         }
     }
 
-    /// Clipped Archive controls never claim cells outside their one-row footer.
+    /// Clipped catalogue controls never claim cells outside their one-row footer.
     #[test]
-    fn archive_org_footer_stays_bounded_in_small_terminals() {
-        for (width, height) in [(1, 1), (12, 2), (30, 3), (80, 1), (80, 2)] {
+    fn catalog_playback_footers_stay_bounded_in_small_terminals() {
+        for (screen, (width, height)) in [
+            Screen::ArchiveOrg,
+            Screen::ApplePodcasts,
+            Screen::TrackerMusic,
+        ]
+        .into_iter()
+        .flat_map(|screen| [(1, 1), (12, 2), (30, 3), (80, 1), (80, 2)].map(|size| (screen, size)))
+        {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             let view = ViewModel {
-                screen: Screen::ArchiveOrg,
+                screen,
                 ..ViewModel::default()
             };
             let mut hit_map = HitMap::default();
@@ -26430,7 +26457,7 @@ for encoded, expected in json.load(sys.stdin):
             if width >= 80 || height > 1 {
                 assert!(
                     !targets.is_empty(),
-                    "{width}x{height}: visible Archive controls"
+                    "{screen:?} {width}x{height}: visible playback controls"
                 );
             }
             for (_, target) in targets {

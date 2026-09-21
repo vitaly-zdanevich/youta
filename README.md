@@ -246,9 +246,9 @@ Preferences, or `YOUTA_PLAYBACK__YOUTUBE_PREWARM=false`.
 
 `[A] Autoplay` is off by default and persists its state in
 `playback.autoplay`. When enabled, EOF advances through the same YouTube,
-YouTube Music, archive.org, subscription-channel, Local, Downloaded, playlist, or
-MOD/tracker list. Items added with **Play next** or **Add to queue** always run
-first; Youta then resumes the original source list. Replacing a live search
+YouTube Music, Podcasts, archive.org, subscription-channel, Local, Downloaded,
+playlist, or MOD/tracker list. Items added with **Play next** or **Add to queue**
+always run first; Youta then resumes the original source list. Replacing a live search
 stops that list's continuation instead of accidentally playing an unrelated
 new result. Playlist entries whose replay needs a provider round-trip
 (Bandcamp, Apple Podcasts, BBC, SoundStream, LitRes, Jamendo) are skipped by
@@ -279,8 +279,10 @@ For example, a YouTube channel's item footer is:
 [R] Refresh  [h] Shorts: off  [A] Autoplay: off  [r] Repeat: off
 ```
 
-The archive.org footer also offers `[A] Autoplay: off` followed by
-`[r] Repeat: off`, using the same preferences and end-of-file behavior.
+The archive.org, MOD, and Podcasts footers also offer `[A] Autoplay: off`
+followed by `[r] Repeat: off`. Both controls show their current state and accept
+mouse clicks or the displayed hotkeys. Podcast continuation follows the loaded
+episode order, stops at the last episode, and survives browsing another show.
 
 The shared `r` shortcut toggles Repeat outside contexts that assign it another
 action: in Radio it records, and in Local it opens Rename.
