@@ -187,6 +187,80 @@
 		snapshot({ preferences_popup: null });
 		await until(() => !dialog(), 'closed provider fixtures');
 	}
+	/** Playback choices are display-only snapshots; only explicit actions reach the native reducer. */
+	async function checkArchivePlaybackChoices() {
+		const popup = {
+			generation: 27, title: 'Fixture video <original>', explanation: 'Choose a playable version.',
+			options: ['Original MPEG4 · 42 MiB', 'Audio only: Ogg Vorbis · 4 MiB'], selected: 1,
+		};
+		snapshot({ archive_playback_choice_popup: popup, preferences_popup: clone(defaults.PreferencesPopupView) });
+		await until(() => button(popup.options[1], dialog()), 'Archive playback format chooser');
+		const stacked = [...document.querySelectorAll('[role=dialog]')];
+		const preferenceLayer = Number.parseInt(getComputedStyle(stacked[0].parentElement).zIndex, 10);
+		const playbackLayer = Number.parseInt(getComputedStyle(dialog().parentElement).zIndex, 10);
+		assert(Number.isInteger(playbackLayer) && playbackLayer > preferenceLayer,
+			'The playback chooser has a valid integer CSS layer above Preferences');
+		snapshot({ preferences_popup: null });
+		await until(() => document.querySelectorAll('[role=dialog]').length === 1, 'lower Preferences closed');
+		assert(dialog().textContent.includes(popup.explanation), 'Playback explanation comes from the controller');
+		assert(!dialog().querySelector('video, audio, a'), 'The chooser receives labels, not media sources to fetch');
+		await action({ SelectArchivePlaybackChoice: { generation: 27, index: 0 } },
+			() => button(popup.options[0], dialog()).click(), 'Choosing the original sends its generation and index');
+		await action({ ConfirmArchivePlaybackChoice: 27 }, () => button('Play', dialog()).click(), 'Play explicitly confirms the current playback stage');
+		/** Focused native controls own Enter/Space, while list navigation still uses Rust. */
+		const focusedKey = async (label, keyName, expected, control = button(label, dialog())) => {
+			control.focus();
+			const start = calls.length;
+			const event = new KeyboardEvent('keydown', { key: keyName, bubbles: true, cancelable: true });
+			await action(expected, () => control.dispatchEvent(event), `Focused ${label} activates with ${JSON.stringify(keyName)}`);
+			assert(event.defaultPrevented, 'Focused activation suppresses a duplicate native click');
+			assert(calls.slice(start).filter((call) => call.command === 'dispatch').length === 1,
+				'Focused playback control sends exactly one semantic action');
+			assert(!calls.slice(start).some((call) => call.command === 'key'),
+				'Focused activation cannot bubble into the shared confirm/play shortcut');
+		};
+		await focusedKey('Cancel', 'Enter', 'DismissArchivePlaybackChoice');
+		await focusedKey('Cancel', ' ', 'DismissArchivePlaybackChoice');
+		await focusedKey('footer Cancel', 'Enter', 'DismissArchivePlaybackChoice', button('Cancel', dialog().querySelector('footer')));
+		await focusedKey(popup.options[1], 'Enter', { SelectArchivePlaybackChoice: { generation: 27, index: 1 } });
+		await focusedKey('Play', ' ', { ConfirmArchivePlaybackChoice: 27 });
+		await key('ArrowDown', 'Down');
+		await key('Escape', 'Esc');
+		snapshot({ archive_playback_choice_popup: { ...popup, generation: 28, selected: 0 } });
+		await until(() => button(popup.options[0], dialog())?.className.includes('border-accent'), 'updated playback selection');
+		await action({ ConfirmArchivePlaybackChoice: 28 }, () => button('Play', dialog()).click(), 'A replacement chooser confirms only its new generation');
+		snapshot({ archive_playback_choice_popup: { ...popup, options: [], selected: 0 } });
+		await until(() => button('Play', dialog())?.disabled, 'empty playback stage');
+		const start = calls.length;
+		button('Play', dialog()).click();
+		assert(calls.length === start, 'An empty playback stage cannot dispatch Play');
+		const coveredCancel = button('Cancel', dialog());
+		snapshot({ error_popup: {
+			title: 'Fixture error above playback chooser', report: 'Mock failure', scroll_offset: 0,
+			gh_available: false, reportable: false, action_status: null,
+			yt_dlp_forbidden: null, github_issue_submission: 'Idle',
+		} });
+		await until(() => dialog()?.textContent.includes('Fixture error above playback chooser'), 'covering error popup');
+		assert(Number.parseInt(getComputedStyle(dialog().parentElement).zIndex, 10) > playbackLayer,
+			'The error dialog has a higher computed CSS layer than the playback chooser');
+		const beforeCovered = calls.length;
+		coveredCancel.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+		await until(() => calls.slice(beforeCovered).some((call) => call.command === 'key' && call.args.press.key === 'Enter'), 'topmost modal keyboard routing');
+		assert(!calls.slice(beforeCovered).some((call) => call.command === 'dispatch'),
+			'A covered playback button cannot intercept the topmost modal keyboard action');
+		snapshot({ archive_playback_choice_popup: null, error_popup: null, preferences_popup: {
+			...clone(defaults.PreferencesPopupView), archive_playback_supported: true,
+			archive_playback_preference: 'audio-only', auto_download_supported: false,
+		} });
+		await until(() => dialog()?.textContent.includes('archive.org playback'), 'Archive playback Preferences row');
+		await action('CycleArchivePlaybackPreference', () => button('Audio only', dialog()).click(),
+			'Archive playback preference remains editable without the downloader feature');
+		snapshot({ preferences_popup: { ...view.preferences_popup, archive_playback_supported: false } });
+		await until(() => !dialog()?.textContent.includes('archive.org playback'), 'feature-disabled playback preference');
+		assert(!button('Audio only', dialog()), 'Builds without Archive playback hide its preference');
+		snapshot({ preferences_popup: null });
+		await until(() => !dialog(), 'closed playback fixtures');
+	}
 	/** SoundCloud stays on the shared tab, search-editor, and playback-action paths. */
 	async function checkSoundCloudTab() {
 		const previous = clone(view);
@@ -212,6 +286,7 @@
 		await until(() => document.querySelector('[title="Search archive.org"]'), 'Archive search');
 		await checkSoundCloudTab();
 		await checkProviderSettings();
+		await checkArchivePlaybackChoices();
 		assert(!button('[Esc] Back'), 'Archive root hides Back when no return route exists');
 		const tabs = [...document.querySelectorAll('[aria-label=Sources] button')].map((node) => node.textContent);
 		assert(tabs.indexOf('archive.org') < tabs.indexOf('LibriVox'), 'Archive tab preserves source catalogue order');

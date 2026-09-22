@@ -5,10 +5,22 @@
 mod worker_tests;
 
 mod history;
+mod playback_choice;
+
+pub(super) use playback_choice::{ArchivePlaybackOwner, playback_step};
+
+/// Installs bounded metadata without a worker for playback-controller regressions.
+#[cfg(test)]
+pub(super) fn set_playback_test_details(
+    controller: &mut AppController,
+    details: Option<Arc<ArchiveOrgItemDetails>>,
+) {
+    controller.archive_org.active = details;
+    controller.archive_org.initialized = true;
+}
 
 use super::*;
 use crate::domain::ArchiveOrgSearchScope;
-#[cfg(any(feature = "yt-dlp", test))]
 use crate::providers::archive_org::ArchiveOrgDownloadVariant;
 use crate::providers::archive_org::{
     ArchiveOrgClient, ArchiveOrgItem, ArchiveOrgItemDetails, ArchiveOrgSearchPage,
@@ -36,6 +48,8 @@ pub(super) struct ArchiveOrgState {
     worker: Option<ArchiveWorker>,
     initialized: bool,
     download_lookup: Option<ArchiveDownloadLookup>,
+    playback_choice_generation: u64,
+    playback_choice: Option<playback_choice::PendingArchivePlaybackChoice>,
     search_selected: usize,
     message: String,
     history: VecDeque<history::ArchiveLocation>,
@@ -750,15 +764,12 @@ impl AppController {
         self.cancel_archive_restore_for_selection();
         if let Some(details) = &self.archive_org.active {
             let index = self.view.selected;
-            if let Some(track) = details.tracks.get(index) {
-                let item = queue_item(&details.item, track);
-                let details = Arc::clone(details);
-                self.play_queue_item_with_origin(
-                    item,
-                    false,
-                    Some(AutoplayOrigin::ArchiveOrg { details, index }),
-                );
-            }
+            self.begin_archive_playback(
+                Arc::clone(details),
+                index,
+                self.config.playback.archive_format,
+                ArchivePlaybackOwner::Append,
+            );
             return;
         }
         if let Some(item) = self.archive_org.items.get(self.view.selected).cloned() {

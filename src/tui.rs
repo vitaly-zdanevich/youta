@@ -2049,6 +2049,7 @@ struct HitMap {
     local_file_buttons: Vec<(UiAction, Rect)>,
     /// Exact modal choices and confirmation controls for one download request.
     download_choice_buttons: Vec<(UiAction, Rect)>,
+    archive_playback_choice_buttons: Vec<(UiAction, Rect)>,
     /// Stable-job controls inside the persistent download queue.
     download_queue_buttons: Vec<(UiAction, Rect)>,
     #[cfg(feature = "yt-dlp")]
@@ -2403,6 +2404,7 @@ fn render_frame(
         || view.private_note_popup.is_some()
         || view.local_file_popup.is_some()
         || view.download_choice_popup.is_some()
+        || view.archive_playback_choice_popup.is_some()
         || view.download_queue_popup.is_some()
         || view.video_comments_popup.is_some()
         || view.error_popup.is_some();
@@ -2628,7 +2630,25 @@ fn render_frame(
     }
     hit_map.download_choice_buttons.clear();
     if let Some(popup) = view.download_choice_popup.as_ref() {
-        render_download_choice_popup(frame, popup, settings.show_hotkeys, &theme, hit_map);
+        render_media_choice_popup(
+            frame,
+            popup,
+            MediaChoiceKind::Download,
+            settings.show_hotkeys,
+            &theme,
+            hit_map,
+        );
+    }
+    hit_map.archive_playback_choice_buttons.clear();
+    if let Some(popup) = view.archive_playback_choice_popup.as_ref() {
+        render_media_choice_popup(
+            frame,
+            popup,
+            MediaChoiceKind::ArchivePlayback,
+            settings.show_hotkeys,
+            &theme,
+            hit_map,
+        );
     }
     hit_map.playlist_popup_rows = Rect::default();
     hit_map.playlist_popup_first_index = 0;
@@ -12301,8 +12321,8 @@ fn render_preferences_popup(
             Constraint::Length(1),
             Constraint::Length(2),
             Constraint::Length(2),
-            // Reuse the two formerly blank rows below TTY/Bandcamp preferences.
-            Constraint::Length(4),
+            // Download and playback source policies remain independent controls.
+            Constraint::Length(5),
             Constraint::Length(2),
             Constraint::Length(1),
             Constraint::Length(1),
@@ -12550,7 +12570,7 @@ fn render_preferences_popup(
             false,
         ),
     ] {
-        if row == 1 && !preferences.auto_download_supported {
+        if row >= sections[5].height || (row == 1 && !preferences.auto_download_supported) {
             continue;
         }
         let control_area = Rect::new(
@@ -12602,11 +12622,28 @@ fn render_preferences_popup(
             cfg!(feature = "archive-org") && preferences.auto_download_supported,
             UiAction::CycleArchiveDownloadPreference,
         ),
+        (
+            4,
+            "V",
+            format!(
+                "archive.org playback: {}",
+                preferences.archive_playback_preference.label()
+            ),
+            preferences.archive_playback_supported,
+            UiAction::CycleArchivePlaybackPreference,
+        ),
     ] {
+        // Fixed section lengths can shrink on short terminals; never leave a
+        // selectable row underneath the following preference section.
+        if row >= sections[5].height {
+            continue;
+        }
         let label = if supported {
             button(key, &label, show_hotkeys)
         } else if row == 2 {
             "Download mode: unavailable in this build".to_owned()
+        } else if row == 4 {
+            "archive.org playback: unavailable in this build".to_owned()
         } else {
             "archive.org format: unavailable in this build".to_owned()
         };
@@ -13105,10 +13142,18 @@ fn render_download_queue_popup(
     }
 }
 
+/// Keeps shared media-choice geometry independent from the action's side effects.
+#[derive(Clone, Copy)]
+enum MediaChoiceKind {
+    Download,
+    ArchivePlayback,
+}
+
 /// Renders exact controller choices and keeps every action inside its modal area.
-fn render_download_choice_popup(
+fn render_media_choice_popup(
     frame: &mut Frame<'_>,
-    popup: &DownloadChoicePopupView,
+    popup: &MediaChoicePopupView,
+    kind: MediaChoiceKind,
     show_hotkeys: bool,
     theme: &Theme,
     hit_map: &mut HitMap,
@@ -13126,7 +13171,23 @@ fn render_download_choice_popup(
     .min(frame.area().height.saturating_sub(2).max(1));
     let area = centered_sized_rect(width, height, frame.area());
     frame.render_widget(Clear, area);
-    frame.render_widget(panel_block(" Download format ", theme), area);
+    let (title, confirm_label, confirm, dismiss, buttons) = match kind {
+        MediaChoiceKind::Download => (
+            " Download format ",
+            "Download",
+            UiAction::ConfirmDownloadChoice(popup.generation),
+            UiAction::DismissDownloadChoice,
+            &mut hit_map.download_choice_buttons,
+        ),
+        MediaChoiceKind::ArchivePlayback => (
+            " Playback source ",
+            "Play",
+            UiAction::ConfirmArchivePlaybackChoice(popup.generation),
+            UiAction::DismissArchivePlaybackChoice,
+            &mut hit_map.archive_playback_choice_buttons,
+        ),
+    };
+    frame.render_widget(panel_block(title, theme), area);
     let inner = area.inner(ratatui::layout::Margin {
         horizontal: 2,
         vertical: 1,
@@ -13176,26 +13237,26 @@ fn render_download_choice_popup(
             }),
             target,
         );
-        hit_map.download_choice_buttons.push((
-            UiAction::SelectDownloadChoice {
-                generation: popup.generation,
-                index,
+        buttons.push((
+            match kind {
+                MediaChoiceKind::Download => UiAction::SelectDownloadChoice {
+                    generation: popup.generation,
+                    index,
+                },
+                MediaChoiceKind::ArchivePlayback => UiAction::SelectArchivePlaybackChoice {
+                    generation: popup.generation,
+                    index,
+                },
             },
             target,
         ));
     }
     let mut x = footer.x;
     for (key, label, action) in [
-        (
-            "Enter",
-            "Download",
-            UiAction::ConfirmDownloadChoice(popup.generation),
-        ),
-        ("Esc", "Cancel", UiAction::DismissDownloadChoice),
+        ("Enter", confirm_label, confirm),
+        ("Esc", "Cancel", dismiss),
     ] {
-        if matches!(action, UiAction::ConfirmDownloadChoice(_))
-            && popup.selected >= popup.options.len()
-        {
+        if key == "Enter" && popup.selected >= popup.options.len() {
             continue;
         }
         let label = button(key, label, show_hotkeys);
@@ -13205,7 +13266,7 @@ fn render_download_choice_popup(
         }
         let target = Rect::new(x, footer.y, width, 1);
         frame.render_widget(Paragraph::new(label).style(theme.accent), target);
-        hit_map.download_choice_buttons.push((action, target));
+        buttons.push((action, target));
         x = x.saturating_add(width).saturating_add(2);
     }
 }
@@ -14460,6 +14521,18 @@ fn mouse_action_unfiltered(
             MouseEventKind::ScrollUp if popup.mode == PlaylistPopupMode::Choose => {
                 Some(UiAction::MovePlaylistPopupSelection(-1))
             }
+            _ => None,
+        };
+    }
+    if view.archive_playback_choice_popup.is_some() {
+        return match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => hit_map
+                .archive_playback_choice_buttons
+                .iter()
+                .find(|(_, area)| contains(*area, mouse.column, mouse.row))
+                .map(|(action, _)| action.clone()),
+            MouseEventKind::ScrollDown => Some(UiAction::MoveArchivePlaybackChoice(1)),
+            MouseEventKind::ScrollUp => Some(UiAction::MoveArchivePlaybackChoice(-1)),
             _ => None,
         };
     }
@@ -22670,6 +22743,99 @@ for encoded, expected in json.load(sys.stdin):
         }
     }
 
+    /// Playback choices expose exact sources without leaking clicks into the underlying screen.
+    #[test]
+    fn archive_playback_choice_popup_is_modal_bounded_and_clears_stale_targets() {
+        for (width, height) in [(120, 32), (40, 10), (12, 5)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let mut view = ViewModel {
+                archive_playback_choice_popup: Some(ArchivePlaybackChoicePopupView {
+                    generation: 19,
+                    title: "Play from archive.org".to_owned(),
+                    explanation: "Original audio quality or an existing audio-only file."
+                        .to_owned(),
+                    options: vec![
+                        "Original video: MPEG4 · 90 MiB".to_owned(),
+                        "Audio only: Ogg Vorbis · 8 MiB".to_owned(),
+                    ],
+                    selected: 1,
+                }),
+                ..ViewModel::default()
+            };
+            let mut hit_map = HitMap::default();
+            terminal
+                .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+                .unwrap();
+            for (_, target) in &hit_map.archive_playback_choice_buttons {
+                assert!(target.right() <= width && target.bottom() <= height);
+                assert!(target.width > 0 && target.height == 1);
+            }
+            if width == 120 {
+                let text = rendered_text(&terminal);
+                assert!(text.contains("Playback source"));
+                assert!(text.contains("Ogg Vorbis · 8 MiB"));
+                for expected in [
+                    UiAction::SelectArchivePlaybackChoice {
+                        generation: 19,
+                        index: 1,
+                    },
+                    UiAction::ConfirmArchivePlaybackChoice(19),
+                    UiAction::DismissArchivePlaybackChoice,
+                ] {
+                    let (_, target) = hit_map
+                        .archive_playback_choice_buttons
+                        .iter()
+                        .find(|(action, _)| *action == expected)
+                        .expect("playback action rendered");
+                    assert_eq!(
+                        mouse_action(
+                            MouseEvent {
+                                kind: MouseEventKind::Down(MouseButton::Left),
+                                column: target.x,
+                                row: target.y,
+                                modifiers: KeyModifiers::NONE
+                            },
+                            &hit_map,
+                            &view
+                        ),
+                        Some(expected)
+                    );
+                }
+            }
+            assert_eq!(
+                mouse_action(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: 0,
+                        row: 0,
+                        modifiers: KeyModifiers::NONE
+                    },
+                    &hit_map,
+                    &view
+                ),
+                None
+            );
+            assert_eq!(
+                mouse_action(
+                    MouseEvent {
+                        kind: MouseEventKind::ScrollDown,
+                        column: 0,
+                        row: 0,
+                        modifiers: KeyModifiers::NONE
+                    },
+                    &hit_map,
+                    &view
+                ),
+                Some(UiAction::MoveArchivePlaybackChoice(1))
+            );
+            view.archive_playback_choice_popup = None;
+            terminal
+                .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+                .unwrap();
+            assert!(hit_map.archive_playback_choice_buttons.is_empty());
+        }
+    }
+
     #[test]
     fn preferences_popup_is_modal_selectable_and_clickable() {
         let backend = TestBackend::new(120, 32);
@@ -22691,6 +22857,8 @@ for encoded, expected in json.load(sys.stdin):
                 download_new_episodes_every_hour: true,
                 download_mode: crate::config::DownloadMode::AskEachTime,
                 archive_download_preference: crate::config::ArchiveDownloadPreference::AskEachTime,
+                archive_playback_preference: crate::config::ArchivePlaybackPreference::AskEachTime,
+                archive_playback_supported: cfg!(feature = "archive-org"),
                 auto_download_supported: true,
                 auto_download_status: Some("Checking 2 opted-in YouTube channel(s)".to_owned()),
                 youtube_thumbnail_size: YouTubeThumbnailSize::Standard,
@@ -22720,6 +22888,17 @@ for encoded, expected in json.load(sys.stdin):
         assert!(rendered.contains("[e] Download new episodes every hour: on"));
         assert!(rendered.contains("[C] Check and download new episodes"));
         assert!(rendered.contains("[m] Download mode: Ask each time"));
+        assert_eq!(
+            rendered.contains("[V] archive.org playback: Ask each time"),
+            cfg!(feature = "archive-org")
+        );
+        assert_eq!(
+            key_action(
+                KeyEvent::new(KeyCode::Char('V'), KeyModifiers::SHIFT),
+                &view
+            ),
+            cfg!(feature = "archive-org").then_some(UiAction::CycleArchivePlaybackPreference)
+        );
         #[cfg(feature = "archive-org")]
         assert!(rendered.contains("[F] archive.org format: Ask each time"));
         assert_eq!(
@@ -23065,6 +23244,11 @@ for encoded, expected in json.load(sys.stdin):
                 UiAction::CycleArchiveDownloadPreference,
                 "[F] archive.org format: Ask each time",
             ),
+            #[cfg(feature = "archive-org")]
+            (
+                UiAction::CycleArchivePlaybackPreference,
+                "[V] archive.org playback: Ask each time",
+            ),
             #[cfg(any(feature = "youtube-official", feature = "invidious"))]
             (
                 UiAction::OpenYouTubeProviderSettings,
@@ -23157,6 +23341,35 @@ for encoded, expected in json.load(sys.stdin):
         let rendered = rendered_text(&terminal);
         assert!(rendered.contains("Automatic downloads: unavailable in this build"));
         assert!(!rendered.contains("Check and download new episodes"));
+        assert_eq!(
+            rendered.contains("[V] archive.org playback: Ask each time"),
+            cfg!(feature = "archive-org")
+        );
+        assert_eq!(
+            key_action(
+                KeyEvent::new(KeyCode::Char('V'), KeyModifiers::SHIFT),
+                &view
+            ),
+            cfg!(feature = "archive-org").then_some(UiAction::CycleArchivePlaybackPreference)
+        );
+        for height in [24, 18, 12] {
+            let mut small = Terminal::new(TestBackend::new(120, height)).unwrap();
+            small
+                .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+                .unwrap();
+            for (action, target) in &hit_map.preferences_buttons {
+                if *action == UiAction::CycleArchivePlaybackPreference {
+                    assert!(target.right() <= 120 && target.bottom() <= height);
+                    let label = (target.x..target.right())
+                        .map(|x| small.backend().buffer()[(x, target.y)].symbol())
+                        .collect::<String>();
+                    assert_eq!(
+                        label, "[V] archive.org playback: Ask each time",
+                        "an invisible or overwritten playback preference must not retain a mouse target at height {height}"
+                    );
+                }
+            }
+        }
         for key in ['e', 'C', 'm', 'F'] {
             assert_eq!(
                 key_action(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE), &view),
@@ -23194,6 +23407,8 @@ for encoded, expected in json.load(sys.stdin):
                 download_new_episodes_every_hour: true,
                 download_mode: crate::config::DownloadMode::AskEachTime,
                 archive_download_preference: crate::config::ArchiveDownloadPreference::AskEachTime,
+                archive_playback_preference: crate::config::ArchivePlaybackPreference::AskEachTime,
+                archive_playback_supported: cfg!(feature = "archive-org"),
                 auto_download_supported: true,
                 auto_download_status: None,
                 youtube_thumbnail_size: YouTubeThumbnailSize::Standard,
@@ -23249,6 +23464,8 @@ for encoded, expected in json.load(sys.stdin):
                 download_new_episodes_every_hour: true,
                 download_mode: crate::config::DownloadMode::AskEachTime,
                 archive_download_preference: crate::config::ArchiveDownloadPreference::AskEachTime,
+                archive_playback_preference: crate::config::ArchivePlaybackPreference::AskEachTime,
+                archive_playback_supported: cfg!(feature = "archive-org"),
                 auto_download_supported: true,
                 auto_download_status: None,
                 youtube_thumbnail_size: YouTubeThumbnailSize::Standard,

@@ -74,6 +74,9 @@ pub const DOWNLOAD_MODE_ENV: &str = "YOUTA_DOWNLOADS__MODE";
 /// Environment variable that overrides the Archive original/MP3 choice.
 pub const ARCHIVE_DOWNLOAD_FORMAT_ENV: &str = "YOUTA_DOWNLOADS__ARCHIVE_FORMAT";
 
+/// Environment variable that overrides the Archive original/audio-only playback choice.
+pub const ARCHIVE_PLAYBACK_FORMAT_ENV: &str = "YOUTA_PLAYBACK__ARCHIVE_FORMAT";
+
 /// Environment variable that overrides the selected video-summary backend.
 pub const VIDEO_SUMMARY_BACKEND_ENV: &str = "YOUTA_VIDEO_SUMMARY__BACKEND";
 
@@ -92,6 +95,7 @@ pub(crate) fn tui_preference_environment_variable_is_relevant(variable: &str) ->
         && (cfg!(feature = "yt-dlp") || variable != DOWNLOAD_MODE_ENV)
         && (cfg!(all(feature = "archive-org", feature = "yt-dlp"))
             || variable != ARCHIVE_DOWNLOAD_FORMAT_ENV)
+        && (cfg!(feature = "archive-org") || variable != ARCHIVE_PLAYBACK_FORMAT_ENV)
 }
 
 /// Environment variable that overrides the preferred Bandcamp audio format.
@@ -762,6 +766,8 @@ impl Config {
     /// draft. [`VIDEO_SUMMARY_BACKEND_ENV`] and [`SUBSCRIPTIONS_AUTO_DOWNLOAD_ENV`]
     /// do the same when their corresponding capabilities are compiled, as do
     /// [`DOWNLOAD_MODE_ENV`] and [`ARCHIVE_DOWNLOAD_FORMAT_ENV`] for download choices.
+    /// [`ARCHIVE_PLAYBACK_FORMAT_ENV`] likewise protects the independent Archive
+    /// playback choice when Archive support is compiled, without requiring downloads.
     ///
     /// The layout-only [`Self::save_subscriptions_layout`] method remains
     /// available for callers that do not edit the complete preference draft.
@@ -791,6 +797,7 @@ impl Config {
         video_summary_backend: VideoSummaryBackend,
         download_mode: DownloadMode,
         archive_download_preference: ArchiveDownloadPreference,
+        archive_playback_preference: ArchivePlaybackPreference,
     ) -> Result<(), ConfigError> {
         for variable in [
             SUBSCRIPTIONS_LAYOUT_ENV,
@@ -806,6 +813,7 @@ impl Config {
             VIDEO_SUMMARY_BACKEND_ENV,
             DOWNLOAD_MODE_ENV,
             ARCHIVE_DOWNLOAD_FORMAT_ENV,
+            ARCHIVE_PLAYBACK_FORMAT_ENV,
         ]
         .into_iter()
         .filter(|variable| tui_preference_environment_variable_is_relevant(variable))
@@ -860,6 +868,10 @@ impl Config {
                 playback["sponsorblock_enabled"] = value(sponsorblock_enabled);
             }
             playback["youtube_prewarm"] = value(youtube_prewarm);
+            #[cfg(feature = "archive-org")]
+            {
+                playback["archive_format"] = value(archive_playback_preference.as_config_value());
+            }
         }
         {
             let persistence = document
@@ -941,6 +953,12 @@ impl Config {
         }
         #[cfg(not(all(feature = "archive-org", feature = "yt-dlp")))]
         let _ = archive_download_preference;
+        #[cfg(feature = "archive-org")]
+        {
+            self.playback.archive_format = archive_playback_preference;
+        }
+        #[cfg(not(feature = "archive-org"))]
+        let _ = archive_playback_preference;
         self.ui.subscriptions_layout = layout;
         self.ui.show_local_folder_sizes = show_local_folder_sizes;
         #[cfg(feature = "nyan-cat")]
@@ -1304,6 +1322,57 @@ impl fmt::Display for ArchiveDownloadPreference {
     }
 }
 
+/// Closed set of Archive playback preferences, independent of explicit downloads.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ArchivePlaybackPreference {
+    /// Ask before choosing an original file or an available audio-only alternative.
+    #[default]
+    AskEachTime,
+    /// Prefer the original uploaded file for playback.
+    OriginalFile,
+    /// Prefer an existing audio-only file without converting the original.
+    AudioOnly,
+}
+
+impl ArchivePlaybackPreference {
+    /// Stable value written to TOML and environment overrides.
+    #[must_use]
+    pub const fn as_config_value(self) -> &'static str {
+        match self {
+            Self::AskEachTime => "ask-each-time",
+            Self::OriginalFile => "original-file",
+            Self::AudioOnly => "audio-only",
+        }
+    }
+
+    /// Human-readable preference value.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::AskEachTime => "Ask each time",
+            Self::OriginalFile => "Original file",
+            Self::AudioOnly => "Audio only",
+        }
+    }
+
+    /// Advances the closed preference selector in its stable display order.
+    #[must_use]
+    pub const fn next(self) -> Self {
+        match self {
+            Self::AskEachTime => Self::OriginalFile,
+            Self::OriginalFile => Self::AudioOnly,
+            Self::AudioOnly => Self::AskEachTime,
+        }
+    }
+}
+
+impl fmt::Display for ArchivePlaybackPreference {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_config_value())
+    }
+}
+
 /// Player and audio-output settings.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default)]
@@ -1328,6 +1397,8 @@ pub struct PlaybackConfig {
     pub skip_advertisement_chapters: bool,
     /// Fetch and skip crowdsourced `SponsorBlock` sponsorship segments.
     pub sponsorblock_enabled: bool,
+    /// Whether Archive playback asks, prefers the original, or uses an audio-only file.
+    pub archive_format: ArchivePlaybackPreference,
     /// Settings that favor stable direct-device playback.
     pub audiophile: AudiophileConfig,
 }
@@ -1345,6 +1416,7 @@ impl Default for PlaybackConfig {
             youtube_prewarm: true,
             skip_advertisement_chapters: true,
             sponsorblock_enabled: true,
+            archive_format: ArchivePlaybackPreference::default(),
             audiophile: AudiophileConfig::default(),
         }
     }
@@ -2482,6 +2554,172 @@ mod tests {
         assert!(tui_preference_environment_variable_is_relevant(
             SAVE_PLAYBACK_HISTORY_ENV
         ));
+        assert_eq!(
+            tui_preference_environment_variable_is_relevant(ARCHIVE_PLAYBACK_FORMAT_ENV),
+            cfg!(feature = "archive-org")
+        );
+    }
+
+    /// Legacy configurations acquire an ask-first playback choice without changing other values.
+    #[test]
+    fn archive_playback_preference_defaults_and_serde_values_are_stable() {
+        let directory = tempdir().expect("temporary directory");
+        fs::write(
+            directory.path().join("config.toml"),
+            "[playback]\nvolume_percent = 35\n",
+        )
+        .unwrap();
+        let config = Config::load_from_dir_with_environment(directory.path().to_owned(), false)
+            .expect("load legacy configuration");
+        assert_eq!(
+            config.playback.archive_format,
+            ArchivePlaybackPreference::AskEachTime
+        );
+        assert_eq!(config.playback.volume_percent, 35);
+        let partial: PlaybackConfig = serde_json::from_value(serde_json::json!({
+            "volume_percent": 45
+        }))
+        .unwrap();
+        assert_eq!(
+            partial.archive_format,
+            ArchivePlaybackPreference::AskEachTime
+        );
+        for (preference, value, label, next) in [
+            (
+                ArchivePlaybackPreference::AskEachTime,
+                "ask-each-time",
+                "Ask each time",
+                ArchivePlaybackPreference::OriginalFile,
+            ),
+            (
+                ArchivePlaybackPreference::OriginalFile,
+                "original-file",
+                "Original file",
+                ArchivePlaybackPreference::AudioOnly,
+            ),
+            (
+                ArchivePlaybackPreference::AudioOnly,
+                "audio-only",
+                "Audio only",
+                ArchivePlaybackPreference::AskEachTime,
+            ),
+        ] {
+            let json = serde_json::to_string(&preference).unwrap();
+            assert_eq!(json, format!("{value:?}"));
+            assert_eq!(
+                serde_json::from_str::<ArchivePlaybackPreference>(&json).unwrap(),
+                preference
+            );
+            assert_eq!(preference.as_config_value(), value);
+            assert_eq!(preference.to_string(), value);
+            assert_eq!(preference.label(), label);
+            assert_eq!(preference.next(), next);
+        }
+        assert!(serde_json::from_str::<ArchivePlaybackPreference>("\"archive-mp3\"").is_err());
+    }
+
+    /// Saves only the Archive playback draft through the atomic preference writer.
+    #[cfg(feature = "controller")]
+    fn save_archive_playback_draft(
+        config: &mut Config,
+        preference: ArchivePlaybackPreference,
+    ) -> Result<(), ConfigError> {
+        config.save_tui_preferences(
+            config.ui.subscriptions_layout,
+            config.playback.skip_advertisement_chapters,
+            config.playback.sponsorblock_enabled,
+            config.ui.nyan_cat_seekbar,
+            config.playback.youtube_prewarm,
+            config.ui.show_local_folder_sizes,
+            config.ui.show_images_in_tty,
+            config.ui.youtube_thumbnail_size,
+            config.persistence.save_playback_history,
+            config.subscriptions.auto_download,
+            config.video_summary.backend,
+            config.downloads.mode,
+            config.downloads.archive_format,
+            preference,
+        )
+    }
+
+    /// Playback choices never overwrite the independent download choice or secret bytes.
+    #[cfg(feature = "controller")]
+    #[test]
+    fn archive_playback_preferences_round_trip_and_preserve_disabled_values_and_secrets() {
+        for preference in [
+            ArchivePlaybackPreference::AskEachTime,
+            ArchivePlaybackPreference::OriginalFile,
+            ArchivePlaybackPreference::AudioOnly,
+        ] {
+            let directory = tempdir().unwrap();
+            let mut config = Config::for_dir(directory.path());
+            config.ensure_directories().unwrap();
+            let path = config.config_file();
+            fs::write(&path, "# keep playback notes\n[playback]\narchive_format = 'original-file'\nvolume_percent = 35 # keep volume notes\n[downloads]\narchive_format = 'archive-mp3'\n").unwrap();
+            let credentials = b"# keep secret notes\n[providers]\nyoutube_api_key = 'keep-this-existing-secret'\n";
+            write_private_config(&config.credentials_file(), credentials).unwrap();
+            config =
+                Config::load_from_dir_with_environment(directory.path().to_owned(), false).unwrap();
+            save_archive_playback_draft(&mut config, preference).unwrap();
+            let expected = if cfg!(feature = "archive-org") {
+                preference
+            } else {
+                ArchivePlaybackPreference::OriginalFile
+            };
+            assert_eq!(config.playback.archive_format, expected);
+            let reloaded =
+                Config::load_from_dir_with_environment(directory.path().to_owned(), false).unwrap();
+            assert_eq!(reloaded.playback.archive_format, expected);
+            assert_eq!(reloaded.playback.volume_percent, 35);
+            assert_eq!(
+                reloaded.downloads.archive_format,
+                ArchiveDownloadPreference::ArchiveMp3
+            );
+            assert_eq!(fs::read(config.credentials_file()).unwrap(), credentials);
+            let contents = fs::read_to_string(path).unwrap();
+            assert!(contents.contains("# keep playback notes"));
+            assert!(contents.contains("volume_percent = 35 # keep volume notes"));
+            assert!(!contents.contains("keep-this-existing-secret"));
+            #[cfg(not(feature = "archive-org"))]
+            assert!(contents.contains("archive_format = 'original-file'"));
+        }
+    }
+
+    /// Omitted Archive support must not let its environment override lock unrelated settings.
+    #[cfg(all(feature = "controller", not(feature = "archive-org")))]
+    #[test]
+    fn archive_playback_environment_override_does_not_lock_a_build_without_archive() {
+        const CHILD_MARKER: &str = "YOUTA_INACTIVE_ARCHIVE_PLAYBACK_TEST_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let mut config = Config::load().unwrap();
+            assert_eq!(
+                config.playback.archive_format,
+                ArchivePlaybackPreference::OriginalFile
+            );
+            save_archive_playback_draft(&mut config, ArchivePlaybackPreference::AudioOnly).unwrap();
+            assert_eq!(
+                config.playback.archive_format,
+                ArchivePlaybackPreference::OriginalFile
+            );
+            assert!(
+                !fs::read_to_string(config.config_file())
+                    .unwrap()
+                    .contains("archive_format")
+            );
+            return;
+        }
+        let directory = tempdir().unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+			.args(["--exact", "config::tests::archive_playback_environment_override_does_not_lock_a_build_without_archive", "--nocapture"])
+			.env(CHILD_MARKER, "1")
+			.env(CONFIG_DIR_ENV, directory.path())
+			.env(ARCHIVE_PLAYBACK_FORMAT_ENV, "original-file")
+			.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     /// Old configurations must acquire explicit ask-first download defaults.
@@ -2523,6 +2761,7 @@ mod tests {
             config.video_summary.backend,
             DownloadMode::AudioOnly,
             ArchiveDownloadPreference::ArchiveMp3,
+            config.playback.archive_format,
         )
     }
 
@@ -3035,6 +3274,7 @@ youtube_api_key = "keep-this-existing-secret"
                 VideoSummaryBackend::Codex,
                 DownloadMode::AudioOnly,
                 ArchiveDownloadPreference::ArchiveMp3,
+                ArchivePlaybackPreference::AudioOnly,
             )
             .expect("save TUI preferences");
 
@@ -3118,6 +3358,18 @@ youtube_api_key = "keep-this-existing-secret"
         let reloaded = Config::load_from_dir_with_environment(directory.path().to_owned(), false)
             .expect("reload configuration");
         assert_eq!(reloaded.downloads, config.downloads);
+        assert_eq!(
+            config.playback.archive_format,
+            if cfg!(feature = "archive-org") {
+                ArchivePlaybackPreference::AudioOnly
+            } else {
+                ArchivePlaybackPreference::AskEachTime
+            }
+        );
+        assert_eq!(
+            reloaded.playback.archive_format,
+            config.playback.archive_format
+        );
         assert_eq!(reloaded.ui.subscriptions_layout, SubscriptionsLayout::Split);
         assert!(!reloaded.ui.show_local_folder_sizes);
         #[cfg(feature = "images")]
@@ -3173,6 +3425,7 @@ youtube_api_key = "keep-this-existing-secret"
                 VideoSummaryBackend::Off,
                 DownloadMode::AudioOnly,
                 ArchiveDownloadPreference::ArchiveMp3,
+                ArchivePlaybackPreference::AskEachTime,
             )
             .expect("save supported preferences");
 
@@ -3211,6 +3464,7 @@ youtube_api_key = "keep-this-existing-secret"
                 VideoSummaryBackend::Off,
                 DownloadMode::AudioOnly,
                 ArchiveDownloadPreference::ArchiveMp3,
+                ArchivePlaybackPreference::AskEachTime,
             )
             .expect("save supported preferences");
 
@@ -3411,6 +3665,7 @@ youtube_api_key = "keep-this-existing-secret"
                 Config::load_from_dir(directory.clone()).expect("load overridden configuration");
             let original_thumbnail_size = config.ui.youtube_thumbnail_size;
             let original_downloads = config.downloads.clone();
+            let original_archive_playback = config.playback.archive_format;
             if override_name == SAVE_PLAYBACK_HISTORY_ENV {
                 assert!(!config.persistence.save_playback_history);
             }
@@ -3429,12 +3684,14 @@ youtube_api_key = "keep-this-existing-secret"
                     VideoSummaryBackend::Codex,
                     DownloadMode::AudioOnly,
                     ArchiveDownloadPreference::ArchiveMp3,
+                    ArchivePlaybackPreference::AudioOnly,
                 )
                 .expect_err("an environment override must lock the atomic writer");
             assert!(error.to_string().contains(&override_name));
             assert!(!directory.join("config.toml").exists());
             assert_eq!(config.ui.youtube_thumbnail_size, original_thumbnail_size);
             assert_eq!(config.downloads, original_downloads);
+            assert_eq!(config.playback.archive_format, original_archive_playback);
             if override_name == SAVE_PLAYBACK_HISTORY_ENV {
                 assert!(!config.persistence.save_playback_history);
             }
@@ -3452,6 +3709,7 @@ youtube_api_key = "keep-this-existing-secret"
             (YOUTUBE_THUMBNAIL_SIZE_ENV, "high"),
             (DOWNLOAD_MODE_ENV, "video"),
             (ARCHIVE_DOWNLOAD_FORMAT_ENV, "original-file"),
+            (ARCHIVE_PLAYBACK_FORMAT_ENV, "original-file"),
             (SAVE_PLAYBACK_HISTORY_ENV, "false"),
             (SUBSCRIPTIONS_AUTO_DOWNLOAD_ENV, "false"),
             (VIDEO_SUMMARY_BACKEND_ENV, "codex"),

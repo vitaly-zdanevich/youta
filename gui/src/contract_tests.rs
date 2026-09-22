@@ -47,14 +47,14 @@ use youta::view::EvernoteNotePopupView;
 #[cfg(feature = "archive-upload")]
 use youta::view::{ArchiveCredentialsPopupView, ArchiveUploadPopupView};
 use youta::view::{
-    AudioQualityPopupView, DetailHighlightField, DetailHighlightRange, DetailHighlightView,
-    DetailLinkView, DetailTimecodeView, DetailUrlEscapeView, DetailVideoLinkView, DetailView,
-    DetailWikidataEntityView, DownloadChoicePopupView, DownloadView, ErrorPopupView,
-    GitHubIssueSubmissionView, LocalMoveDestinationView, NowPlayingView, PlaylistChoiceView,
-    PlaylistPopupView, PreferencesPopupView, ProjectCommitView, ProjectHistoryPopupView,
-    QueuePopupView, QueueRowView, RowView, SubscriptionsView, VideoCommentView,
-    VideoCommentsPopupView, VideoSummaryPopupView, ViewModel, WaveformView, YtDlpForbiddenView,
-    YtDlpGentooVersionView, YtDlpVersionLookupView,
+    ArchivePlaybackChoicePopupView, AudioQualityPopupView, DetailHighlightField,
+    DetailHighlightRange, DetailHighlightView, DetailLinkView, DetailTimecodeView,
+    DetailUrlEscapeView, DetailVideoLinkView, DetailView, DetailWikidataEntityView,
+    DownloadChoicePopupView, DownloadView, ErrorPopupView, GitHubIssueSubmissionView,
+    LocalMoveDestinationView, NowPlayingView, PlaylistChoiceView, PlaylistPopupView,
+    PreferencesPopupView, ProjectCommitView, ProjectHistoryPopupView, QueuePopupView, QueueRowView,
+    RowView, SubscriptionsView, VideoCommentView, VideoCommentsPopupView, VideoSummaryPopupView,
+    ViewModel, WaveformView, YtDlpForbiddenView, YtDlpGentooVersionView, YtDlpVersionLookupView,
 };
 use youta::view::{ChannelDownloadOption, ChannelDownloadPopupView};
 #[cfg(feature = "lan-sharing")]
@@ -320,6 +320,8 @@ fn preferences() -> PreferencesPopupView {
         download_new_episodes_every_hour: true,
         download_mode: youta::config::DownloadMode::AskEachTime,
         archive_download_preference: youta::config::ArchiveDownloadPreference::AskEachTime,
+        archive_playback_preference: youta::config::ArchivePlaybackPreference::AskEachTime,
+        archive_playback_supported: true,
         auto_download_supported: true,
         auto_download_status: None,
         youtube_thumbnail_size: youta::config::YouTubeThumbnailSize::default(),
@@ -330,6 +332,35 @@ fn preferences() -> PreferencesPopupView {
         environment_override: None,
         validation_error: None,
     }
+}
+
+/// Playback policy values must remain identical across the persisted and GUI contracts.
+#[test]
+fn archive_playback_preference_values_match_the_window_union() {
+    use youta::config::ArchivePlaybackPreference::{AskEachTime, AudioOnly, OriginalFile};
+
+    let source = contract_source();
+    let declaration = source
+        .lines()
+        .find(|line| line.starts_with("export type ArchivePlaybackPreference = "))
+        .expect("Archive playback preference union");
+    let declared = declaration
+        .split('\'')
+        .skip(1)
+        .step_by(2)
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    let emitted = [AskEachTime, OriginalFile, AudioOnly]
+        .into_iter()
+        .map(|mode| {
+            serde_json::to_value(mode)
+                .expect("serialize playback preference")
+                .as_str()
+                .expect("playback preference string")
+                .to_owned()
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(declared, emitted);
 }
 
 #[test]
@@ -525,6 +556,19 @@ fn the_typescript_contract_names_only_fields_the_reducer_emits() {
             explanation: "Choose an existing format".to_owned(),
             options: vec!["Original file".to_owned(), "Archive MP3".to_owned()],
             selected: 0,
+        }),
+    );
+    emitted.insert(
+        "ArchivePlaybackChoicePopupView",
+        emitted_keys(&ArchivePlaybackChoicePopupView {
+            generation: 11,
+            title: "Exact playback target".to_owned(),
+            explanation: "Choose a playable version".to_owned(),
+            options: vec![
+                "Original MPEG4 · 42 MiB".to_owned(),
+                "Ogg Vorbis · 4 MiB".to_owned(),
+            ],
+            selected: 1,
         }),
     );
     emitted.insert(
@@ -780,6 +824,7 @@ fn every_checked_interface_is_actually_declared() {
         "ProjectCommitView",
         "PreferencesPopupView",
         "DownloadChoicePopupView",
+        "ArchivePlaybackChoicePopupView",
         "PlaylistPopupView",
         "DownloadQueueEntryView",
         "DownloadQueuePopupView",

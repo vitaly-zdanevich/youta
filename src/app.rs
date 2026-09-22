@@ -3808,6 +3808,8 @@ enum AutoplayOrigin {
         /// Shared item metadata avoids copying its description once per track.
         details: Arc<crate::providers::archive_org::ArchiveOrgItemDetails>,
         index: usize,
+        /// Captured source mode survives later preference edits and list continuation.
+        preference: crate::config::ArchivePlaybackPreference,
     },
     #[cfg(feature = "librivox")]
     Librivox {
@@ -3857,6 +3859,13 @@ enum AutoplayStep {
         item: Box<QueueItem>,
         origin: AutoplayOrigin,
     },
+    #[cfg(feature = "archive-org")]
+    ChooseArchivePlayback {
+        details: Arc<crate::providers::archive_org::ArchiveOrgItemDetails>,
+        index: usize,
+    },
+    #[cfg(feature = "archive-org")]
+    ArchiveAudioUnavailable,
     #[cfg(feature = "tracker-music")]
     PrepareTracker {
         index: usize,
@@ -9959,6 +9968,10 @@ impl AppController {
             }
             #[cfg(feature = "tracker-music")]
             AutoplayStep::PrepareTracker { .. } => None,
+            #[cfg(feature = "archive-org")]
+            AutoplayStep::ChooseArchivePlayback { .. } | AutoplayStep::ArchiveAudioUnavailable => {
+                None
+            }
         }
     }
 
@@ -18725,6 +18738,21 @@ impl AppController {
                 self.playback_queue.current_index = Some(insert_at);
                 self.play_queue_item_with_origin(*item, true, Some(origin));
             }
+            #[cfg(feature = "archive-org")]
+            AutoplayStep::ChooseArchivePlayback { details, index } => {
+                let insert_at = if backward {
+                    self.playback_queue.current_index.unwrap_or(0)
+                } else {
+                    self.playback_queue.items.len()
+                };
+                self.open_archive_playback_choices(
+                    details,
+                    index,
+                    archive_org::ArchivePlaybackOwner::ManualStep { insert_at },
+                );
+            }
+            #[cfg(feature = "archive-org")]
+            AutoplayStep::ArchiveAudioUnavailable => self.archive_audio_unavailable(),
             #[cfg(feature = "tracker-music")]
             AutoplayStep::PrepareTracker { index, origin: _ } => {
                 // The parked resume position survives until the preparation
@@ -25330,17 +25358,13 @@ impl AppController {
                 })
             }
             #[cfg(feature = "archive-org")]
-            AutoplayOrigin::ArchiveOrg { details, index } => {
-                neighbour_list_step(&details.tracks, *index, direction, |index, track| {
-                    Some(AutoplayStep::Play {
-                        item: Box::new(archive_org::queue_item(&details.item, track)),
-                        origin: AutoplayOrigin::ArchiveOrg {
-                            details: Arc::clone(details),
-                            index,
-                        },
-                    })
-                })
-            }
+            AutoplayOrigin::ArchiveOrg {
+                details,
+                index,
+                preference,
+            } => neighbour_list_step(&details.tracks, *index, direction, |index, _| {
+                Some(archive_org::playback_step(details, index, *preference))
+            }),
             #[cfg(feature = "librivox")]
             AutoplayOrigin::Librivox { items, index } => {
                 neighbour_list_step(items, *index, direction, |index, item: &QueueItem| {
@@ -25490,6 +25514,16 @@ impl AppController {
             AutoplayStep::Play { item, origin } => {
                 self.play_queue_item_with_origin(*item, false, Some(origin));
             }
+            #[cfg(feature = "archive-org")]
+            AutoplayStep::ChooseArchivePlayback { details, index } => {
+                self.open_archive_playback_choices(
+                    details,
+                    index,
+                    archive_org::ArchivePlaybackOwner::Append,
+                );
+            }
+            #[cfg(feature = "archive-org")]
+            AutoplayStep::ArchiveAudioUnavailable => self.archive_audio_unavailable(),
             #[cfg(feature = "tracker-music")]
             AutoplayStep::PrepareTracker { index, origin } => {
                 self.prepare_tracker_item(index, TrackerPreparationOwner::Autoplay(origin));
@@ -25567,6 +25601,8 @@ impl AppController {
             self.view.status_line = "This build omits the `soundcloud` feature".to_owned();
             return;
         }
+        #[cfg(feature = "archive-org")]
+        self.cancel_archive_playback_choice();
         #[cfg(not(feature = "yandex-music"))]
         if item.media.id.source == SourceKind::YandexMusic {
             self.view.status_line =
@@ -26336,6 +26372,24 @@ impl AppController {
                 #[cfg(feature = "waveform")]
                 {
                     self.local_waveform_follow_from = local_waveform_follow_from;
+                }
+                #[cfg(feature = "archive-org")]
+                if self.view.archive_playback_choice_popup.is_some() {
+                    // An explicit source choice made during the previous track
+                    // owns the next start. Consume only the ended queue slot,
+                    // without starting queued rows or repeating that old slot.
+                    // Confirmation then inserts before any still-unplayed row.
+                    self.playback_queue.current_index = self
+                        .playback_queue
+                        .current_index
+                        .and_then(|index| index.checked_add(1))
+                        .filter(|index| *index < self.playback_queue.items.len());
+                    #[cfg(feature = "waveform")]
+                    {
+                        self.local_waveform_follow_from = None;
+                    }
+                    self.view.status_line = "Choose an archive.org playback file".to_owned();
+                    return;
                 }
                 match self.playback_queue.advance().cloned() {
                     Some(mut next) => {
@@ -32664,6 +32718,7 @@ impl AppController {
             VIDEO_SUMMARY_BACKEND_ENV,
             crate::config::DOWNLOAD_MODE_ENV,
             crate::config::ARCHIVE_DOWNLOAD_FORMAT_ENV,
+            crate::config::ARCHIVE_PLAYBACK_FORMAT_ENV,
         ]
         .into_iter()
         .filter(|variable| tui_preference_environment_variable_is_relevant(variable))
@@ -32693,6 +32748,8 @@ impl AppController {
             video_summary_backend: self.config.video_summary.backend,
             download_mode: self.config.downloads.mode,
             archive_download_preference: self.config.downloads.archive_format,
+            archive_playback_preference: self.config.playback.archive_format,
+            archive_playback_supported: cfg!(feature = "archive-org"),
             video_summary_supported: cfg!(feature = "summary"),
             config_path: self.config.config_file().display().to_string(),
             environment_override: (!environment_override.is_empty())
@@ -33864,6 +33921,7 @@ impl AppController {
         let video_summary_backend = preferences.video_summary_backend;
         let download_mode = preferences.download_mode;
         let archive_download_preference = preferences.archive_download_preference;
+        let archive_playback_preference = preferences.archive_playback_preference;
         let video_summary_backend_changed =
             self.config.video_summary.backend != video_summary_backend;
         #[cfg(feature = "sponsorblock")]
@@ -33890,6 +33948,7 @@ impl AppController {
             video_summary_backend,
             download_mode,
             archive_download_preference,
+            archive_playback_preference,
         ) {
             if let Some(preferences) = self.view.preferences_popup.as_mut() {
                 preferences.validation_error = Some(error.to_string());
@@ -35840,6 +35899,34 @@ impl UiController for AppController {
             | UiAction::ConfirmDownloadChoice(_)
             | UiAction::DismissDownloadChoice
             | UiAction::SelectDownloadChoice { .. } => {}
+            #[cfg(feature = "archive-org")]
+            UiAction::MoveArchivePlaybackChoice(direction) => {
+                self.move_archive_playback_choice(direction)
+            }
+            #[cfg(feature = "archive-org")]
+            UiAction::ConfirmArchivePlaybackChoice(generation) => {
+                self.confirm_archive_playback_choice(generation, None)
+            }
+            #[cfg(feature = "archive-org")]
+            UiAction::SelectArchivePlaybackChoice { generation, index } => {
+                self.confirm_archive_playback_choice(generation, Some(index))
+            }
+            #[cfg(feature = "archive-org")]
+            UiAction::DismissArchivePlaybackChoice => self.dismiss_archive_playback_choice(),
+            #[cfg(not(feature = "archive-org"))]
+            UiAction::MoveArchivePlaybackChoice(_)
+            | UiAction::ConfirmArchivePlaybackChoice(_)
+            | UiAction::SelectArchivePlaybackChoice { .. }
+            | UiAction::DismissArchivePlaybackChoice => {}
+            UiAction::CycleArchivePlaybackPreference => {
+                if let Some(popup) = self.view.preferences_popup.as_mut()
+                    && popup.environment_override.is_none()
+                    && cfg!(feature = "archive-org")
+                {
+                    popup.archive_playback_preference = popup.archive_playback_preference.next();
+                    popup.validation_error = None;
+                }
+            }
             UiAction::CycleDownloadModePreference => {
                 if let Some(popup) = self.view.preferences_popup.as_mut()
                     && popup.environment_override.is_none()
@@ -45954,6 +46041,9 @@ pub fn is_confined_path(root: &Path, candidate: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "archive-org")]
+    #[path = "archive_playback_choice.rs"]
+    mod archive_playback_choice_tests;
     #[cfg(feature = "archive-upload")]
     #[path = "archive_upload.rs"]
     mod archive_upload_tests;
@@ -82719,6 +82809,7 @@ mod tests {
         let origin = AutoplayOrigin::ArchiveOrg {
             details: Arc::clone(&details),
             index: 0,
+            preference: crate::config::ArchivePlaybackPreference::OriginalFile,
         };
         let AutoplayStep::Play { item, origin } = controller.next_autoplay_step(&origin) else {
             panic!("Archive autoplay must advance to its next track");
@@ -82731,6 +82822,7 @@ mod tests {
         let AutoplayOrigin::ArchiveOrg {
             details: retained,
             index,
+            ..
         } = &origin
         else {
             panic!("Archive autoplay must retain its original item");

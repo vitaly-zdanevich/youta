@@ -96,6 +96,7 @@ export type UnitUiAction =
 	| 'CopyVideoSummary'
 	| 'CreatePlaylistAndAdd'
 	| 'CycleArchiveDownloadPreference'
+	| 'CycleArchivePlaybackPreference'
 	| 'CycleBandcampAudioFormat'
 	| 'CycleCommonsAuthMethod'
 	| 'CycleCommonsUploadLicense'
@@ -103,6 +104,7 @@ export type UnitUiAction =
 	| 'CycleVideoSummaryBackend'
 	| 'CycleYouTubeThumbnailSize'
 	| 'DismissArchiveCredentials'
+	| 'DismissArchivePlaybackChoice'
 	| 'DismissArchiveUpload'
 	| 'DismissAsciiVisualizer'
 	| 'DismissAudioQualityPopup'
@@ -233,8 +235,10 @@ export interface UiActionPayloads {
 	ChangeChapter: number;
 	ChangeSpeed: number;
 	ChangeVolume: number;
+	ConfirmArchivePlaybackChoice: number;
 	ConfirmDownloadChoice: number;
 	FocusSubscriptionPane: SubscriptionPane;
+	MoveArchivePlaybackChoice: number;
 	MoveInvidiousInstance: number;
 	OpenCommonsCategorySuggestionAt: number;
 	OpenWikidataValue: string;
@@ -248,6 +252,7 @@ export interface UiActionPayloads {
 	SeekPercent: number;
 	SeekRelative: number;
 	SelectArchiveCredentialField: boolean;
+	SelectArchivePlaybackChoice: { generation: number; index: number; };
 	SelectArchiveUploadField: ArchiveUploadField;
 	SelectCommonsCredentialField: boolean;
 	SelectCommonsUploadField: CommonsUploadField;

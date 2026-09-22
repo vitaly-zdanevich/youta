@@ -24,6 +24,11 @@ volume_percent = 80
 speed_percent = 100
 resume_rewind_seconds = 30
 
+# Archive playback: `ask-each-time`, `original-file`, or `audio-only`.
+# Audio-only uses an existing audio file, not local extraction from a video.
+# Independent of downloads.archive_format; YOUTA_PLAYBACK__ARCHIVE_FORMAT overrides it.
+archive_format = 'ask-each-time'
+
 # Continue with the next playable item from the same YouTube, local, or
 # MOD/tracker list after explicitly queued items.
 # YOUTA_PLAYBACK__AUTOPLAY has higher precedence.

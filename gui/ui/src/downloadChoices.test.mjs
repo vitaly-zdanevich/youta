@@ -67,6 +67,66 @@ test('download chooser renders reducer labels and confirms exact option indices'
 	assert.ok(nodes(tree).every((node) => !node.props.dangerouslySetInnerHTML));
 });
 
+test('Archive playback chooser selects controller-owned formats and confirms only an explicit Play', () => {
+	assert.equal(typeof module.exports.ArchivePlaybackChoicePopup, 'function');
+	actions.length = 0;
+	const popup = {
+		generation: 23, title: 'Fixture <video>', explanation: 'Choose a playable file.',
+		options: ['Original MPEG4 · 42 MiB', 'Audio only: Ogg Vorbis · 4 MiB'], selected: 1,
+	};
+	const tree = module.exports.ArchivePlaybackChoicePopup({ popup });
+	const buttons = nodes(tree).filter((node) => node.type === 'button');
+	for (const [index, label] of popup.options.entries()) {
+		const button = buttons.find((node) => text(node) === label);
+		assert.ok(button, label);
+		assert.equal(button.props.emphasis, index === popup.selected);
+		button.props.onClick();
+		assert.deepEqual(actions.pop(), [{ SelectArchivePlaybackChoice: { generation: popup.generation, index } }]);
+		assert.equal(actions.length, 0, 'Selecting a format must not start playback');
+	}
+	const play = buttons.find((node) => text(node) === 'Play');
+	assert.equal(play.props.disabled, false);
+	play.props.onClick();
+	assert.deepEqual(actions.pop(), [{ ConfirmArchivePlaybackChoice: popup.generation }]);
+	for (const label of ['Cancel', 'Dismiss']) {
+		buttons.find((node) => text(node) === label).props.onClick();
+		assert.deepEqual(actions.pop(), ['DismissArchivePlaybackChoice']);
+	}
+	assert.ok(nodes(tree).every((node) => !node.props.dangerouslySetInnerHTML));
+	for (const invalid of [{ options: [], selected: 0 }, { selected: -1 }, { selected: 2 }]) {
+		const rendered = nodes(module.exports.ArchivePlaybackChoicePopup({ popup: { ...popup, ...invalid } }));
+		assert.equal(rendered.find((node) => node.type === 'button' && text(node) === 'Play').props.disabled, true);
+	}
+});
+
+test('Archive playback preference is independent of downloader availability and uses exact saved modes', () => {
+	for (const supported of [false, true]) {
+		for (const [mode, label] of [['ask-each-time', 'Ask each time'], ['original-file', 'Original file'], ['audio-only', 'Audio only']]) {
+			const popup = {
+				auto_download_supported: false, archive_playback_supported: supported,
+				archive_playback_preference: mode, subscriptions_layout: 'split',
+				video_summary_supported: false, sponsorblock_supported: false, nyan_cat_supported: false,
+			};
+			const rendered = nodes(module.exports.PreferencesPopup({ popup, archiveSupported: true }));
+			const button = rendered.find((node) => node.type === 'button' && text(node) === label);
+			assert.equal(Boolean(button), supported, `${mode}: Archive capability, not yt-dlp, controls playback preferences`);
+			if (button) {
+				button.props.onClick();
+				assert.deepEqual(actions.pop(), ['CycleArchivePlaybackPreference']);
+				assert.ok(rendered.some((node) => text(node).includes('archive.org playback')));
+			}
+		}
+	}
+});
+
+test('window mounts the generation-bound Archive playback chooser and declares its exact contract', () => {
+	assert.match(contract, /export interface ArchivePlaybackChoicePopupView/);
+	assert.match(contract, /archive_playback_choice_popup: ArchivePlaybackChoicePopupView \| null/);
+	assert.match(contract, /archive_playback_preference: ArchivePlaybackPreference/);
+	assert.match(contract, /archive_playback_supported: boolean/);
+	assert.match(app, /<ArchivePlaybackChoicePopup popup=\{view\.archive_playback_choice_popup\}/);
+});
+
 test('persistent download queue selects, retries and cancels exact stable entries', () => {
 	assert.equal(typeof module.exports.DownloadQueuePopup, 'function');
 	actions.length = 0;

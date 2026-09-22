@@ -52,7 +52,9 @@ export function Popup({
       <Dialog.Portal>
         <div
           className="fixed inset-0 grid place-items-center bg-black/55 p-6"
-          style={{ zIndex: 50 + layer }}
+          // Logical layers include fractions between existing dialogs. CSS
+          // z-index accepts integers only, so preserve their order in hundredths.
+          style={{ zIndex: 50 + Math.round(layer * 100) }}
         >
           <Dialog.Content
             onOpenAutoFocus={(event) => event.preventDefault()}

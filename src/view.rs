@@ -41,8 +41,8 @@ use crate::commons_upload::{CommonsCategorySuggestion, CommonsUploadDraft};
 #[cfg(feature = "commons-upload")]
 use crate::config::WikimediaCommonsAuthMethod;
 use crate::config::{
-    ArchiveDownloadPreference, BandcampAudioFormat, DownloadMode, SubscriptionsLayout,
-    VideoSummaryBackend, YouTubeThumbnailSize,
+    ArchiveDownloadPreference, ArchivePlaybackPreference, BandcampAudioFormat, DownloadMode,
+    SubscriptionsLayout, VideoSummaryBackend, YouTubeThumbnailSize,
 };
 use crate::domain::{Chapter, MediaId, MediaKind, SourceKind};
 #[cfg(feature = "evernote")]
@@ -1060,13 +1060,13 @@ impl std::fmt::Debug for RssSubscriptionPopupView {
     }
 }
 
-/// Display-only choices for one controller-owned, exact download target.
+/// Display-only choices for one controller-owned, exact media target.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct DownloadChoicePopupView {
+pub struct MediaChoicePopupView {
     /// Opaque controller epoch binding confirmations to this exact chooser stage.
     #[serde(default)]
     pub generation: u64,
-    /// Human-readable item title; the download target stays in the controller.
+    /// Human-readable item title; the media target stays in the controller.
     pub title: String,
     /// Explanation of the choice being requested.
     pub explanation: String,
@@ -1075,6 +1075,12 @@ pub struct DownloadChoicePopupView {
     /// Currently highlighted choice; confirmation is always explicit.
     pub selected: usize,
 }
+
+/// Exact download choices, independent of playback policy.
+pub type DownloadChoicePopupView = MediaChoicePopupView;
+
+/// Exact original-video or audio-only playback choices, independent of downloads.
+pub type ArchivePlaybackChoicePopupView = MediaChoicePopupView;
 
 /// One durable download job projected without transport details or credentials.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -1127,6 +1133,10 @@ pub struct PreferencesPopupView {
     pub download_mode: DownloadMode,
     /// Draft original/Archive-MP3 choice saved only on confirmation.
     pub archive_download_preference: ArchiveDownloadPreference,
+    /// Draft original/audio-only playback choice saved only on confirmation.
+    pub archive_playback_preference: ArchivePlaybackPreference,
+    /// Whether this build can choose Archive playback sources without a download helper.
+    pub archive_playback_supported: bool,
     /// Whether this binary contains the yt-dlp download helper integration.
     pub auto_download_supported: bool,
     /// Immediate manual-check feedback retained alongside unsaved preferences.
@@ -3032,6 +3042,8 @@ pub struct ViewModel {
     pub channel_download_popup: Option<ChannelDownloadPopupView>,
     /// Modal format choice for one explicit download request.
     pub download_choice_popup: Option<DownloadChoicePopupView>,
+    /// Modal original-video or audio-only choice before Archive playback starts.
+    pub archive_playback_choice_popup: Option<ArchivePlaybackChoicePopupView>,
     /// Durable download jobs and their retry/cancellation controls.
     pub download_queue_popup: Option<DownloadQueuePopupView>,
     /// Active or most recently completed supervised download.
@@ -3314,6 +3326,7 @@ impl Default for ViewModel {
             #[cfg(feature = "yt-dlp")]
             channel_download_popup: None,
             download_choice_popup: None,
+            archive_playback_choice_popup: None,
             download_queue_popup: None,
             download: None,
             quitting: false,
@@ -3619,6 +3632,19 @@ pub enum UiAction {
         /// Exact chooser stage that rendered the clicked choice.
         generation: u64,
         /// Index in that stage's controller-owned option list.
+        index: usize,
+    },
+    /// Move within available Archive playback sources without starting playback.
+    MoveArchivePlaybackChoice(i32),
+    /// Play the highlighted controller-owned source for this exact chooser stage.
+    ConfirmArchivePlaybackChoice(u64),
+    /// Cancel the pending source choice without starting playback.
+    DismissArchivePlaybackChoice,
+    /// Play an exact clicked source from this chooser stage.
+    SelectArchivePlaybackChoice {
+        /// Controller epoch that rendered these choices.
+        generation: u64,
+        /// Index in the controller-owned source list.
         index: usize,
     },
     /// Review a full-channel audio download before starting yt-dlp.
@@ -4086,6 +4112,8 @@ pub enum UiAction {
     CycleDownloadModePreference,
     /// Cycle the draft original/Archive-MP3 download preference.
     CycleArchiveDownloadPreference,
+    /// Cycle Ask / original / audio-only playback independently of downloads.
+    CycleArchivePlaybackPreference,
     /// Check every opted-in YouTube channel immediately.
     CheckAndDownloadNewEpisodes,
     /// Cycle the exact YouTube thumbnail size in the draft.

@@ -452,6 +452,9 @@ export interface ProjectHistoryPopupView {
 export type DownloadMode = 'ask-each-time' | 'video' | 'audio-only';
 export type ArchiveDownloadPreference = 'ask-each-time' | 'original-file' | 'archive-mp3';
 
+/** Playback policy is independent of the preferred file format for downloads. */
+export type ArchivePlaybackPreference = 'ask-each-time' | 'original-file' | 'audio-only';
+
 /** One persisted job projected without transport or credential details. */
 export interface DownloadQueueEntryView {
 	id: number;
@@ -468,6 +471,16 @@ export interface DownloadQueuePopupView {
 /** Display-only options for one exact download target retained in the reducer. */
 export interface DownloadChoicePopupView {
 	/** Opaque stage token echoed with every confirmation; never computed by the UI. */
+	generation: number;
+	title: string;
+	explanation: string;
+	options: string[];
+	selected: number;
+}
+
+/** Display-only formats for one playback target held exclusively by the reducer. */
+export interface ArchivePlaybackChoicePopupView {
+	/** Opaque stage token echoed with selection and Play to reject stale clicks. */
 	generation: number;
 	title: string;
 	explanation: string;
@@ -494,6 +507,9 @@ export interface PreferencesPopupView {
 	/** Draft choices saved only by the existing Preferences confirmation. */
 	download_mode: DownloadMode;
 	archive_download_preference: ArchiveDownloadPreference;
+	archive_playback_preference: ArchivePlaybackPreference;
+	/** Whether this build supports Archive playback, independently of downloads. */
+	archive_playback_supported: boolean;
 	/** Whether this build can download new channel uploads. */
 	auto_download_supported: boolean;
 	/** Immediate manual-check feedback without discarding preference edits. */
@@ -909,6 +925,7 @@ export interface ViewModel {
   channel_download_popup: ChannelDownloadPopupView | null;
   download: DownloadView | null;
 	download_choice_popup: DownloadChoicePopupView | null;
+	archive_playback_choice_popup: ArchivePlaybackChoicePopupView | null;
 	download_queue_popup: DownloadQueuePopupView | null;
   help_open: boolean;
   project_history_popup: ProjectHistoryPopupView | null;

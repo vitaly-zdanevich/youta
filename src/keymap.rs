@@ -455,6 +455,56 @@ mod wire_tests {
         );
     }
 
+    /// Playback format choices block background playback and bind Enter to the visible epoch.
+    #[test]
+    fn archive_playback_choice_keys_are_modal_and_generation_bound() {
+        let mut view = ViewModel {
+            search_editing: true,
+            archive_playback_choice_popup: Some(crate::view::ArchivePlaybackChoicePopupView {
+                generation: 9,
+                title: "Play from archive.org".to_owned(),
+                explanation: "Choose an existing source".to_owned(),
+                options: vec![
+                    "Original video · 90 MiB".to_owned(),
+                    "Audio only: Ogg · 8 MiB".to_owned(),
+                ],
+                selected: 0,
+            }),
+            ..ViewModel::default()
+        };
+        for (key, expected) in [
+            (Key::Up, Some(UiAction::MoveArchivePlaybackChoice(-1))),
+            (Key::Down, Some(UiAction::MoveArchivePlaybackChoice(1))),
+            (Key::Tab, Some(UiAction::MoveArchivePlaybackChoice(1))),
+            (Key::BackTab, Some(UiAction::MoveArchivePlaybackChoice(-1))),
+            (Key::Enter, Some(UiAction::ConfirmArchivePlaybackChoice(9))),
+            (Key::Esc, Some(UiAction::DismissArchivePlaybackChoice)),
+            (Key::Char(' '), None),
+            (Key::Char('q'), None),
+            (Key::Char('d'), None),
+            (Key::F(7), None),
+        ] {
+            assert_eq!(key_action(KeyPress::new(key), &view, None, None), expected);
+        }
+        view.archive_playback_choice_popup
+            .as_mut()
+            .unwrap()
+            .generation = 10;
+        assert_eq!(
+            key_action(KeyPress::new(Key::Enter), &view, None, None),
+            Some(UiAction::ConfirmArchivePlaybackChoice(10))
+        );
+        view.archive_playback_choice_popup
+            .as_mut()
+            .unwrap()
+            .options
+            .clear();
+        assert_eq!(
+            key_action(KeyPress::new(Key::Enter), &view, None, None),
+            None
+        );
+    }
+
     /// Every confirmation echoes its displayed review; closed feature builds expose no upload key.
     #[cfg(feature = "s3-upload")]
     #[test]
@@ -1943,6 +1993,19 @@ fn unfiltered_key_action(
             _ => None,
         };
     }
+    if let Some(popup) = view.archive_playback_choice_popup.as_ref() {
+        return match key.key {
+            Key::Up | Key::Char('k') | Key::BackTab => {
+                Some(UiAction::MoveArchivePlaybackChoice(-1))
+            }
+            Key::Down | Key::Char('j') | Key::Tab => Some(UiAction::MoveArchivePlaybackChoice(1)),
+            Key::Enter if popup.selected < popup.options.len() => {
+                Some(UiAction::ConfirmArchivePlaybackChoice(popup.generation))
+            }
+            Key::Esc => Some(UiAction::DismissArchivePlaybackChoice),
+            _ => None,
+        };
+    }
     if let Some(popup) = view.download_choice_popup.as_ref() {
         return match key.key {
             Key::Up | Key::Char('k') | Key::BackTab => Some(UiAction::MoveDownloadChoice(-1)),
@@ -2080,6 +2143,9 @@ fn unfiltered_key_action(
             }
             Key::Char('C') if preferences.auto_download_supported => {
                 Some(UiAction::CheckAndDownloadNewEpisodes)
+            }
+            Key::Char('V') if preferences.archive_playback_supported && !key.chorded() => {
+                Some(UiAction::CycleArchivePlaybackPreference)
             }
             Key::Char('t') if cfg!(feature = "images") => Some(UiAction::CycleYouTubeThumbnailSize),
             Key::Char('f') => Some(UiAction::ToggleLocalFolderSizes),

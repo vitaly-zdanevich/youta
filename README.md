@@ -457,6 +457,14 @@ resolver:
   the item's track order. Large searches use explicit 50-item continuation
   pages, with at most 1,000 results retained per search.
 
+  Playback prefers supported uploaded originals. When an audio track comes
+  from an original video and separate audio files exist, the default chooser
+  shows the available formats and sizes before playback. Preferences can instead
+  always select the original or an existing audio-only file. Video display stays
+  disabled, but playing a combined audio/video file can still transfer video data;
+  audio-only mode never downloads a video merely to extract its audio locally.
+  Playback and download format preferences are independent.
+
   Details show artwork, description, uploader/profile, upload date, topics,
   language, whole-item size, license, favourites, and links to the original
   item and its collections when supplied by Archive.org. Click artwork or a
@@ -1999,6 +2007,7 @@ the desired options, then press `Enter` to save. It includes:
 - Local folder-size measurement and YouTube video-thumbnail size;
 - playback History recording and hourly channel-download checks;
 - manual video/audio download mode and archive.org original/MP3 selection;
+- archive.org playback: ask, prefer the original, or use an existing audio-only file;
 - the explicit video-summary backend.
 
 These preferences can also be configured directly:
@@ -2006,6 +2015,7 @@ These preferences can also be configured directly:
 ```toml
 [playback]
 autoplay = false
+archive_format = 'ask-each-time' # ask-each-time, original-file, or audio-only
 youtube_prewarm = true
 skip_advertisement_chapters = true
 sponsorblock_enabled = true

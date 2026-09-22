@@ -22,6 +22,8 @@ import type {
 	ArchiveUploadField,
 	ArchiveUploadPopupView,
 	ArchiveCredentialsEditorView,
+	ArchivePlaybackChoicePopupView,
+	ArchivePlaybackPreference,
   ChannelDownloadPopupView,
 	DownloadChoicePopupView,
 	DownloadQueuePopupView,
@@ -71,6 +73,7 @@ export const LAYER = {
   channelDownload: 6,
 	downloadQueue: 6.25,
 	downloadChoice: 6.5,
+	archivePlaybackChoice: 6.75,
   playlist: 7,
   queue: 8,
   videoComments: 9,
@@ -1627,12 +1630,70 @@ export function LanSharePopup({ popup }: { popup: LanSharePopupView }) {
 	);
 }
 
+/** Display controller-owned playback formats without interpreting labels or fetching media. */
+export function ArchivePlaybackChoicePopup({ popup }: { popup: ArchivePlaybackChoicePopupView }) {
+	return (
+		<div onKeyDown={(event) => {
+			// React portal events reach this parent, including the header's Cancel.
+			// Focused button activation must not become the global Enter=Play binding.
+			if ((event.key !== 'Enter' && event.key !== ' ') || event.ctrlKey || event.altKey || event.metaKey
+				|| !(event.target instanceof HTMLButtonElement)) return;
+			// An error or another higher popup still owns the shared keyboard map,
+			// even if a covered format button retained browser focus.
+			const dialog = event.target.closest('[role="dialog"]');
+			if (!dialog || [...document.querySelectorAll('[role="dialog"]')].some((other) =>
+				Number(other.parentElement?.style.zIndex) > Number(dialog.parentElement?.style.zIndex))) return;
+			event.preventDefault();
+			event.stopPropagation();
+			if (!event.repeat) event.target.click();
+		}}>
+			<Popup
+				title='archive.org playback'
+				subtitle={popup.title}
+				layer={LAYER.archivePlaybackChoice}
+				onDismiss={() => void dispatch('DismissArchivePlaybackChoice')}
+				dismissLabel='Cancel'
+				footer={
+					<>
+						<PopupButton
+							emphasis
+							disabled={!Number.isInteger(popup.selected) || popup.selected < 0 || popup.selected >= popup.options.length}
+							onClick={() => void dispatch({ ConfirmArchivePlaybackChoice: popup.generation })}
+						>
+							Play
+						</PopupButton>
+						<PopupButton onClick={() => void dispatch('DismissArchivePlaybackChoice')}>Cancel</PopupButton>
+					</>
+				}
+			>
+				<Body>
+					<p className='mb-3 whitespace-pre-wrap text-ink-dim'>{popup.explanation}</p>
+					<div className='grid gap-2'>
+						{popup.options.map((label, index) => (
+							<PopupButton
+								key={index}
+								emphasis={index === popup.selected}
+								onClick={() => void dispatch({ SelectArchivePlaybackChoice: { generation: popup.generation, index } })}
+							>
+								{label}
+							</PopupButton>
+						))}
+					</div>
+				</Body>
+			</Popup>
+		</div>
+	);
+}
+
 /** Display labels do not determine the controller's format policy. */
 const DOWNLOAD_MODE_LABELS: Record<DownloadMode, string> = {
 	'ask-each-time': 'Ask each time', video: 'Video', 'audio-only': 'Audio only',
 };
 const ARCHIVE_DOWNLOAD_LABELS: Record<ArchiveDownloadPreference, string> = {
 	'ask-each-time': 'Ask each time', 'original-file': 'Original file', 'archive-mp3': 'Archive MP3',
+};
+const ARCHIVE_PLAYBACK_LABELS: Record<ArchivePlaybackPreference, string> = {
+	'ask-each-time': 'Ask each time', 'original-file': 'Original file', 'audio-only': 'Audio only',
 };
 
 /** Preference values are drafts until Save; a manual download check runs immediately. */
@@ -1656,6 +1717,9 @@ export function PreferencesPopup({ popup, archiveSupported }: {
 	}
 	if (archiveSupported && popup.auto_download_supported) {
 		cycles.push(['archive.org format', ARCHIVE_DOWNLOAD_LABELS[popup.archive_download_preference], 'CycleArchiveDownloadPreference']);
+	}
+	if (popup.archive_playback_supported) {
+		cycles.push(['archive.org playback', ARCHIVE_PLAYBACK_LABELS[popup.archive_playback_preference], 'CycleArchivePlaybackPreference']);
 	}
   return (
     <Popup
