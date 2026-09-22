@@ -17,6 +17,8 @@
 mod contract_tests;
 mod desktop;
 mod media_keys;
+#[cfg(target_os = "linux")]
+mod native_menu_style;
 mod reducer;
 
 use std::ffi::OsStr;
@@ -340,6 +342,8 @@ fn main() {
         })
         .setup(move |app| {
             app.manage(AudioOutputView::from_config(&config));
+            #[cfg(target_os = "linux")]
+            desktop::install_menu_style(app.handle());
             desktop::install_tray(app.handle());
             match reducer::start(app.handle().clone(), config.clone(), focus.clone()) {
                 Ok(handle) => {

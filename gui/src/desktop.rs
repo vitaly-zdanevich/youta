@@ -387,6 +387,38 @@ fn about_metadata(version: String) -> AboutMetadata<'static> {
     }
 }
 
+/// Styles the Linux window's existing native menu without changing the desktop theme.
+///
+/// Tauri attaches its menu bar to the default window box before `setup` runs.
+/// This function must run on that GTK main thread; shortcuts and menu actions
+/// remain owned by the same native widgets. A styling failure is non-fatal.
+#[cfg(target_os = "linux")]
+pub fn install_menu_style<R: Runtime>(app: &AppHandle<R>) {
+    use gtk::prelude::*;
+
+    let Some(window) = app.get_webview_window(MAIN_WINDOW) else {
+        return;
+    };
+    let container = match window.default_vbox() {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!("could not access the Youta native menu bar: {error}");
+            return;
+        }
+    };
+    let Some(menu_bar) = container
+        .children()
+        .into_iter()
+        .find_map(|child| child.downcast::<gtk::MenuBar>().ok())
+    else {
+        eprintln!("the Youta window has no native menu bar to style");
+        return;
+    };
+    if let Err(error) = crate::native_menu_style::apply(&menu_bar) {
+        eprintln!("could not style the Youta native menu bar: {error}");
+    }
+}
+
 /// Adds the tray icon, or explains why the desktop refused it.
 ///
 /// The tray does not keep Youta alive: closing the window still ends the

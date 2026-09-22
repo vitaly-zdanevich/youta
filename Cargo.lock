@@ -7971,6 +7971,7 @@ dependencies = [
 name = "youta-gui"
 version = "0.77.3"
 dependencies = [
+ "gtk",
  "percent-encoding",
  "serde",
  "serde_json",

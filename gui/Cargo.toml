@@ -79,6 +79,10 @@ tauri-plugin-notification = "2"
 # project does not otherwise have.
 souvlaki = "0.8"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# Tauri already uses this GTK generation; style only its native menu widgets.
+gtk = "0.18"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
