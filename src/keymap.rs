@@ -2119,6 +2119,9 @@ fn unfiltered_key_action(
         return match key.key {
             Key::Esc | Key::Char('p') => Some(UiAction::DismissPreferences),
             Key::Enter => Some(UiAction::SubmitPreferences),
+            Key::Up if !key.chorded() => Some(UiAction::MovePreferencesFocus(-1)),
+            Key::Down if !key.chorded() => Some(UiAction::MovePreferencesFocus(1)),
+            Key::Char(' ') if !key.chorded() => preferences.focused_action(),
             Key::Char('a') => Some(UiAction::ToggleSkipAdvertisementChapters),
             Key::Char('S') if preferences.sponsorblock_supported => {
                 Some(UiAction::ToggleSponsorBlock)
@@ -2160,7 +2163,11 @@ fn unfiltered_key_action(
                 SubscriptionsLayout::DrillDown,
             )),
             Key::Char('s') => Some(UiAction::SetSubscriptionsLayout(SubscriptionsLayout::Split)),
-            Key::Left | Key::Right | Key::Up | Key::Down | Key::Char(' ') => {
+            Key::Left | Key::Right
+                if preferences.selected_field
+                    == crate::view::PreferencesField::SubscriptionsLayout
+                    && !key.chorded() =>
+            {
                 Some(UiAction::SetSubscriptionsLayout(alternative))
             }
             _ => None,

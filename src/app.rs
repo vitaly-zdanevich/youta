@@ -26,6 +26,7 @@ mod invidious_instances;
 mod manual_downloads;
 #[cfg(all(feature = "archive-org", feature = "yt-dlp", feature = "backend-mpv"))]
 mod original_download;
+mod preferences_focus;
 #[cfg(feature = "yandex-music")]
 mod queued_yandex_download;
 #[cfg(feature = "s3-upload")]
@@ -32730,6 +32731,7 @@ impl AppController {
         .collect::<Vec<_>>()
         .join(", ");
         self.view.preferences_popup = Some(PreferencesPopupView {
+            selected_field: crate::view::PreferencesField::SubscriptionsLayout,
             youtube_provider_settings_supported: cfg!(any(
                 feature = "youtube-official",
                 feature = "invidious"
@@ -34667,6 +34669,7 @@ impl UiController for AppController {
     }
 
     fn dispatch(&mut self, action: UiAction) {
+        self.synchronize_preferences_action_focus(&action);
         if !self.view.external_opener_available
             && self.view.action_requires_external_opener(&action)
         {
@@ -35799,6 +35802,8 @@ impl UiController for AppController {
                 self.view.status_line = "RSS subscription canceled".to_owned();
             }
             UiAction::OpenPreferences => self.open_preferences(),
+            UiAction::MovePreferencesFocus(direction) => self.move_preferences_focus(direction),
+            UiAction::SelectPreferencesField(field) => self.select_preferences_field(field),
             #[cfg(feature = "s3-upload")]
             UiAction::OpenS3Upload => self.open_s3_upload(),
             #[cfg(feature = "s3-upload")]
@@ -71686,7 +71691,8 @@ mod tests {
         controller.view.search_query = "preserve unrelated query".to_owned();
         controller.dispatch(UiAction::OpenPreferences);
         controller.dispatch(UiAction::ToggleSkipAdvertisementChapters);
-        let draft = controller.view.preferences_popup.clone().unwrap();
+        let mut draft = controller.view.preferences_popup.clone().unwrap();
+        draft.selected_field = crate::view::PreferencesField::YouTubeProvider;
 
         controller.dispatch(UiAction::OpenYouTubeProviderSettings);
 
@@ -71768,7 +71774,8 @@ mod tests {
             let saved_skip_advertisements = controller.config.playback.skip_advertisement_chapters;
             controller.dispatch(UiAction::OpenPreferences);
             controller.dispatch(UiAction::ToggleSkipAdvertisementChapters);
-            let draft = controller.view.preferences_popup.clone().unwrap();
+            let mut draft = controller.view.preferences_popup.clone().unwrap();
+            draft.selected_field = crate::view::PreferencesField::YouTubeProvider;
             controller.dispatch(UiAction::OpenYouTubeProviderSettings);
             let popup = controller
                 .view
@@ -72177,7 +72184,8 @@ mod tests {
         controller.provider_requests = Some(sender);
         controller.dispatch(UiAction::OpenPreferences);
         controller.dispatch(UiAction::ToggleSkipAdvertisementChapters);
-        let draft = controller.view.preferences_popup.clone().unwrap();
+        let mut draft = controller.view.preferences_popup.clone().unwrap();
+        draft.selected_field = crate::view::PreferencesField::YouTubeProvider;
         controller.dispatch(UiAction::OpenYouTubeProviderSettings);
         controller
             .view

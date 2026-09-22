@@ -9,6 +9,7 @@ import type {
 	EvernoteNoteField,
 	MediaId,
 	PlaylistEditorField,
+	PreferencesField,
 	S3CredentialField,
 	S3UploadField,
 	SubscriptionPane,
@@ -223,6 +224,8 @@ export type UnitUiAction =
  * generations, and explicit null values are part of the wire contract.
  */
 export interface UiActionPayloads {
+	MovePreferencesFocus: number;
+	SelectPreferencesField: PreferencesField;
 	ActivateDescriptionVideo: { video_id: string; start_seconds: number | null; };
 	ActivateDetailLink: number;
 	ActivateQueuePopupRow: number;

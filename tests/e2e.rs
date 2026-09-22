@@ -501,6 +501,11 @@ fn tui_subscriptions_openers_and_preferences_persist_end_to_end() {
             (b"o", 100),
             (b"O", 1_200),
             (b"p", 300),
+            // Focus movement alone preserves the draft; Space changes the
+            // focused History setting, and Up returns to the layout control.
+            (b"\x1b[B", 200),
+            (b" ", 200),
+            (b"\x1b[A", 200),
             (b"s", 200),
             (b"y", 200),
             (b"\r", 400),
@@ -528,6 +533,7 @@ fn tui_subscriptions_openers_and_preferences_persist_end_to_end() {
         "Sources",
         "Fixture channel",
         "Save playback history: on",
+        "Save playback history: off",
         "Split",
         "Prepare selected YouTube audio: off",
     ] {
@@ -554,6 +560,7 @@ fn tui_subscriptions_openers_and_preferences_persist_end_to_end() {
     assert!(saved_config.contains("subscriptions_layout = \"split\""));
     assert!(saved_config.contains("[playback]"));
     assert!(saved_config.contains("youtube_prewarm = false"));
+    assert!(saved_config.contains("save_playback_history = false"));
 
     let output = run_tui_session(
         &launcher,

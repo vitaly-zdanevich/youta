@@ -38,11 +38,12 @@ use ratatui::{Terminal, TerminalOptions, Viewport};
 use ratatui_image::StatefulImage as TerminalImage;
 use unicode_segmentation::UnicodeSegmentation;
 
+#[cfg(test)]
+use crate::config::VideoSummaryBackend;
 #[cfg(feature = "commons-upload")]
 use crate::config::WikimediaCommonsAuthMethod;
 use crate::config::{
     DEFAULT_THUMBNAIL_HEIGHT, MIN_THUMBNAIL_HEIGHT, SubscriptionsLayout, ThumbnailMode,
-    VideoSummaryBackend,
 };
 use crate::domain::{Chapter, MediaId, SourceKind};
 #[cfg(all(feature = "gpm", target_os = "linux"))]
@@ -12333,6 +12334,19 @@ fn render_private_note_popup(
     }
 }
 
+/// Renders ordinary Ratatui widgets into a bounded offscreen preferences page.
+struct PreferencesCanvas<'a> {
+    buffer: &'a mut ratatui::buffer::Buffer,
+}
+
+impl PreferencesCanvas<'_> {
+    /// Keeps the content renderer independent of the visible terminal height.
+    fn render_widget(&mut self, widget: impl ratatui::widgets::Widget, area: Rect) {
+        widget.render(area, self.buffer);
+    }
+}
+
+/// Keeps keyboard-focused preferences visible without moving the Save/Cancel footer.
 fn render_preferences_popup(
     frame: &mut Frame<'_>,
     preferences: &PreferencesPopupView,
@@ -12341,6 +12355,102 @@ fn render_preferences_popup(
     hit_map: &mut HitMap,
 ) {
     let area = centered_rect(76, 98, frame.area());
+    frame.render_widget(Clear, area);
+    frame.render_widget(panel_block(" Youta preferences ", theme), area);
+    let inner = area.inner(ratatui::layout::Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+    if inner.width == 0 || inner.height < 2 {
+        return;
+    }
+    let page = Rect::new(0, 0, area.width, area.height.max(40));
+    let mut buffer = ratatui::buffer::Buffer::empty(page);
+    let mut controls = HitMap::default();
+    render_preferences_content(
+        &mut PreferencesCanvas {
+            buffer: &mut buffer,
+        },
+        page,
+        preferences,
+        show_hotkeys,
+        theme,
+        &mut controls,
+    );
+    let focus = controls
+        .preferences_buttons
+        .iter()
+        .find(|(action, _)| {
+            PreferencesField::from_action(action) == Some(preferences.selected_field)
+                && match action {
+                    UiAction::SetSubscriptionsLayout(layout) => {
+                        *layout == preferences.subscriptions_layout
+                    }
+                    _ => true,
+                }
+        })
+        .map(|(_, target)| *target);
+    if let Some(target) = focus {
+        // Layout cards retain their own selected background and border; other
+        // controls receive exactly the same focused style on their text cells.
+        if preferences.selected_field != PreferencesField::SubscriptionsLayout {
+            for y in target.y..target.bottom() {
+                for x in target.x..target.right() {
+                    buffer[(x, y)].set_style(theme.selected);
+                }
+            }
+        }
+    }
+    let visible_rows = inner.height - 1;
+    let content_end = page.height - 2;
+    let offset = focus
+        .map_or(0, |target| target.bottom().saturating_sub(1 + visible_rows))
+        .min(content_end.saturating_sub(1 + visible_rows));
+    let first = 1 + offset;
+    for row in 0..visible_rows {
+        for column in 0..inner.width {
+            frame.buffer_mut()[(inner.x + column, inner.y + row)] =
+                buffer[(2 + column, first + row)].clone();
+        }
+    }
+    let footer_y = inner.bottom() - 1;
+    for column in 0..inner.width {
+        frame.buffer_mut()[(inner.x + column, footer_y)] =
+            buffer[(2 + column, content_end)].clone();
+    }
+    for (action, target) in controls.preferences_buttons {
+        let footer = matches!(
+            action,
+            UiAction::SubmitPreferences | UiAction::DismissPreferences
+        );
+        if !footer && (target.y < first || target.bottom() > first + visible_rows) {
+            continue;
+        }
+        hit_map.preferences_buttons.push((
+            action,
+            Rect::new(
+                area.x + target.x,
+                if footer {
+                    footer_y
+                } else {
+                    inner.y + target.y - first
+                },
+                target.width,
+                target.height,
+            ),
+        ));
+    }
+}
+
+/// Draws the full preferences page before its focused viewport is selected.
+fn render_preferences_content(
+    frame: &mut PreferencesCanvas<'_>,
+    area: Rect,
+    preferences: &PreferencesPopupView,
+    show_hotkeys: bool,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+) {
     frame.render_widget(Clear, area);
     frame.render_widget(panel_block(" Youta preferences ", theme), area);
     let inner = area.inner(ratatui::layout::Margin {
@@ -12369,7 +12479,7 @@ fn render_preferences_popup(
         ])
         .split(inner);
     frame.render_widget(
-        Paragraph::new("Subscriptions layout. Choose with d/s or ←/→, then press Enter to save.")
+        Paragraph::new("↑/↓ moves focus; Space changes it. Enter to save.\nSubscriptions layout. d/s or ←/→ when focused.")
             .style(theme.base)
             .wrap(Wrap { trim: false }),
         sections[0],
@@ -12391,11 +12501,20 @@ fn render_preferences_popup(
             "sources and videos together",
         ),
     ];
+    // Preserve the familiar selected style, now only while this control owns focus.
     for ((layout, label, description), choice_area) in options.into_iter().zip(choices.iter()) {
         let selected = layout == preferences.subscriptions_layout;
         frame.render_widget(
             Paragraph::new(format!("{label}\n{description}"))
-                .style(if selected { theme.selected } else { theme.base })
+                .style(
+                    if selected
+                        && preferences.selected_field == PreferencesField::SubscriptionsLayout
+                    {
+                        theme.selected
+                    } else {
+                        theme.base
+                    },
+                )
                 .alignment(Alignment::Center)
                 .block(
                     Block::default()
@@ -12419,11 +12538,7 @@ fn render_preferences_popup(
     );
     frame.render_widget(
         Paragraph::new(playback_history_label.clone())
-            .style(if preferences.save_playback_history {
-                theme.selected
-            } else {
-                theme.base
-            })
+            .style(theme.base)
             .alignment(Alignment::Center),
         sections[2],
     );
@@ -12447,11 +12562,7 @@ fn render_preferences_popup(
     );
     frame.render_widget(
         Paragraph::new(advertisement_label.clone())
-            .style(if preferences.skip_advertisement_chapters {
-                theme.selected
-            } else {
-                theme.base
-            })
+            .style(theme.base)
             .alignment(Alignment::Center),
         sections[3],
     );
@@ -12487,8 +12598,6 @@ fn render_preferences_popup(
         Paragraph::new(sponsorblock_label.clone())
             .style(if !preferences.sponsorblock_supported {
                 theme.muted
-            } else if preferences.sponsorblock_enabled {
-                theme.selected
             } else {
                 theme.base
             })
@@ -12517,11 +12626,7 @@ fn render_preferences_popup(
     );
     frame.render_widget(
         Paragraph::new(youtube_prewarm_label.clone())
-            .style(if preferences.youtube_prewarm {
-                theme.selected
-            } else {
-                theme.base
-            })
+            .style(theme.base)
             .alignment(Alignment::Center),
         sections[4],
     );
@@ -12557,8 +12662,6 @@ fn render_preferences_popup(
         Paragraph::new(nyan_cat_label.clone())
             .style(if !preferences.nyan_cat_supported {
                 theme.muted
-            } else if preferences.nyan_cat_seekbar {
-                theme.selected
             } else {
                 theme.base
             })
@@ -12593,18 +12696,12 @@ fn render_preferences_popup(
     } else {
         "Automatic downloads: unavailable in this build".to_owned()
     };
-    for (row, label, action, selected) in [
-        (
-            0,
-            auto_download_label,
-            UiAction::ToggleHourlyAutoDownload,
-            preferences.download_new_episodes_every_hour,
-        ),
+    for (row, label, action) in [
+        (0, auto_download_label, UiAction::ToggleHourlyAutoDownload),
         (
             1,
             button("C", "Check and download new episodes", show_hotkeys),
             UiAction::CheckAndDownloadNewEpisodes,
-            false,
         ),
     ] {
         if row >= sections[5].height || (row == 1 && !preferences.auto_download_supported) {
@@ -12620,8 +12717,6 @@ fn render_preferences_popup(
             Paragraph::new(label.clone())
                 .style(if !preferences.auto_download_supported {
                     theme.muted
-                } else if selected {
-                    theme.selected
                 } else {
                     theme.base
                 })
@@ -12720,12 +12815,14 @@ fn render_preferences_popup(
     frame.render_widget(
         Paragraph::new(youtube_thumbnail_label.clone())
             .style(if cfg!(feature = "images") {
-                theme.selected
+                theme.base
             } else {
                 theme.muted
             })
             .alignment(Alignment::Center),
-        sections[6],
+        // The next line belongs to Local folder sizes, not this control's
+        // disabled style in builds without images.
+        Rect::new(sections[6].x, sections[6].y, sections[6].width, 1),
     );
     if cfg!(feature = "images") {
         hit_map.preferences_buttons.push((
@@ -12755,11 +12852,7 @@ fn render_preferences_popup(
     );
     frame.render_widget(
         Paragraph::new(folder_size_label.clone())
-            .style(if preferences.show_local_folder_sizes {
-                theme.selected
-            } else {
-                theme.base
-            })
+            .style(theme.base)
             .alignment(Alignment::Center),
         folder_size_area,
     );
@@ -12789,8 +12882,6 @@ fn render_preferences_popup(
         Paragraph::new(tty_images_label.clone())
             .style(if !cfg!(feature = "images") {
                 theme.muted
-            } else if preferences.show_images_in_tty {
-                theme.selected
             } else {
                 theme.base
             })
@@ -12820,7 +12911,7 @@ fn render_preferences_popup(
     frame.render_widget(
         Paragraph::new(bandcamp_format_label.clone())
             .style(if cfg!(feature = "bandcamp") {
-                theme.selected
+                theme.base
             } else {
                 theme.muted
             })
@@ -12847,19 +12938,23 @@ fn render_preferences_popup(
     } else {
         "Video summaries: unavailable in this build".to_owned()
     };
+    // The second allocated row belongs to provider settings, so the summary's
+    // style must not paint behind that separate action.
+    let video_summary_area = Rect::new(
+        sections[9].x,
+        sections[9].y,
+        sections[9].width,
+        sections[9].height.min(1),
+    );
     frame.render_widget(
         Paragraph::new(video_summary_label.clone())
             .style(if preferences.video_summary_supported {
-                if preferences.video_summary_backend == VideoSummaryBackend::Codex {
-                    theme.selected
-                } else {
-                    theme.base
-                }
+                theme.base
             } else {
                 theme.muted
             })
             .alignment(Alignment::Center),
-        sections[9],
+        video_summary_area,
     );
     if preferences.video_summary_supported {
         hit_map.preferences_buttons.push((
@@ -12877,7 +12972,7 @@ fn render_preferences_popup(
         // The summary row already reserves a blank line, so provider settings
         // remain visible without taking space from narrow-terminal notes.
         let provider_area = Rect::new(sections[9].x, sections[9].y + 1, sections[9].width, 1);
-        let label = button("Y", "YouTube provider", show_hotkeys);
+        let label = button("Y", "YouTube API / Invidious…", show_hotkeys);
         frame.render_widget(
             Paragraph::new(label.clone())
                 .style(theme.accent)
@@ -23031,6 +23126,7 @@ for encoded, expected in json.load(sys.stdin):
         let mut terminal = Terminal::new(backend).expect("terminal");
         let view = ViewModel {
             preferences_popup: Some(PreferencesPopupView {
+                selected_field: PreferencesField::SubscriptionsLayout,
                 youtube_provider_settings_supported: cfg!(any(
                     feature = "youtube-official",
                     feature = "invidious"
@@ -23114,7 +23210,7 @@ for encoded, expected in json.load(sys.stdin):
         assert!(rendered.contains("[b] Bandcamp audio: Best available"));
         assert!(rendered.contains("[c] Video summaries: Codex CLI"));
         assert_eq!(
-            rendered.contains("[Y] YouTube provider"),
+            rendered.contains("[Y] YouTube API / Invidious…"),
             cfg!(any(feature = "youtube-official", feature = "invidious"))
         );
         assert_eq!(
@@ -23402,6 +23498,13 @@ for encoded, expected in json.load(sys.stdin):
             .iter()
             .find(|(action, _)| action == &UiAction::CycleVideoSummaryBackend)
             .expect("video-summary backend target");
+        let summary_cell =
+            &terminal.backend().buffer()[(video_summary_target.x, video_summary_target.y)];
+        assert_eq!(
+            (summary_cell.fg, summary_cell.bg),
+            (Color::Reset, Color::Reset),
+            "enabled Codex summaries are a value, not the active keyboard choice"
+        );
         assert_eq!(
             mouse_action(
                 MouseEvent {
@@ -23441,7 +23544,7 @@ for encoded, expected in json.load(sys.stdin):
             #[cfg(any(feature = "youtube-official", feature = "invidious"))]
             (
                 UiAction::OpenYouTubeProviderSettings,
-                "[Y] YouTube provider",
+                "[Y] YouTube API / Invidious…",
             ),
             (UiAction::SubmitPreferences, "[Enter] Save"),
             (UiAction::DismissPreferences, "[Esc] Cancel"),
@@ -23462,6 +23565,22 @@ for encoded, expected in json.load(sys.stdin):
                 visible_label, label,
                 "Preferences footer target must cover its rendered label"
             );
+            if matches!(
+                action,
+                UiAction::OpenYouTubeProviderSettings
+                    | UiAction::SubmitPreferences
+                    | UiAction::DismissPreferences
+            ) {
+                for column in target.x..target.right() {
+                    let cell = &terminal.backend().buffer()[(column, target.y)];
+                    assert_eq!(
+                        (cell.fg, cell.bg),
+                        (Color::Cyan, Color::Reset),
+                        "Preferences action {action:?} must retain contrasting accent text without a selected background"
+                    );
+                    assert!(!cell.modifier.contains(Modifier::BOLD));
+                }
+            }
             assert_eq!(
                 mouse_action(
                     MouseEvent {
@@ -23475,6 +23594,34 @@ for encoded, expected in json.load(sys.stdin):
                 ),
                 Some(action)
             );
+        }
+        for (action, target) in &hit_map.preferences_buttons {
+            if let UiAction::SetSubscriptionsLayout(layout) = action {
+                let cell = &terminal.backend().buffer()[(target.x + 1, target.y + 1)];
+                assert_eq!(
+                    cell.bg,
+                    if *layout == SubscriptionsLayout::DrillDown {
+                        Color::Cyan
+                    } else {
+                        Color::Reset
+                    },
+                    "only the layout choice controlled by arrow keys retains selection fill"
+                );
+            } else if !matches!(
+                action,
+                UiAction::OpenYouTubeProviderSettings
+                    | UiAction::SubmitPreferences
+                    | UiAction::DismissPreferences
+            ) {
+                for column in target.x..target.right() {
+                    let cell = &terminal.backend().buffer()[(column, target.y)];
+                    assert_eq!(
+                        (cell.fg, cell.bg),
+                        (Color::Reset, Color::Reset),
+                        "Preferences value {action:?} must not look keyboard-selected"
+                    );
+                }
+            }
         }
         let settings = UiSettings {
             show_hotkeys: false,
@@ -23493,11 +23640,18 @@ for encoded, expected in json.load(sys.stdin):
         #[cfg(feature = "archive-org")]
         assert!(!rendered.contains("[F] archive.org format"));
         assert_eq!(
-            rendered.contains("YouTube provider"),
+            rendered.contains("YouTube API / Invidious…"),
             cfg!(any(feature = "youtube-official", feature = "invidious"))
         );
-        assert!(!rendered.contains("[Y] YouTube provider"));
+        assert!(!rendered.contains("[Y] YouTube API / Invidious…"));
 
+        let auto_download_target = hit_map
+            .preferences_buttons
+            .iter()
+            .find_map(|(action, area)| {
+                (*action == UiAction::ToggleHourlyAutoDownload).then_some(*area)
+            })
+            .expect("enabled automatic-download target");
         let mut view = view;
         view.preferences_popup
             .as_mut()
@@ -23506,7 +23660,7 @@ for encoded, expected in json.load(sys.stdin):
         terminal
             .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
             .expect("draw preferences without a YouTube metadata provider");
-        assert!(!rendered_text(&terminal).contains("YouTube provider"));
+        assert!(!rendered_text(&terminal).contains("YouTube API / Invidious…"));
         assert_eq!(
             key_action(
                 KeyEvent::new(KeyCode::Char('Y'), KeyModifiers::SHIFT),
@@ -23529,6 +23683,13 @@ for encoded, expected in json.load(sys.stdin):
             .expect("draw preferences without automatic-download build support");
         let rendered = rendered_text(&terminal);
         assert!(rendered.contains("Automatic downloads: unavailable in this build"));
+        let unavailable_cell =
+            &terminal.backend().buffer()[(auto_download_target.x, auto_download_target.y)];
+        assert_eq!(
+            (unavailable_cell.fg, unavailable_cell.bg),
+            (Color::DarkGray, Color::Reset),
+            "unavailable preferences retain muted text on the ordinary background"
+        );
         assert!(!rendered.contains("Check and download new episodes"));
         assert_eq!(
             rendered.contains("[V] archive.org playback: Ask each time"),
@@ -23576,11 +23737,62 @@ for encoded, expected in json.load(sys.stdin):
     }
 
     #[test]
+    fn preferences_focus_remains_visible_and_clickable_on_short_terminals() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut controller = crate::app::AppController::new(
+            crate::config::Config::for_dir(directory.path().join("youta")),
+            crate::persistence::StateStore::open_in_memory().unwrap(),
+            None,
+            None,
+        );
+        controller.dispatch(UiAction::OpenPreferences);
+        let mut view = controller.view().clone();
+        let fields = view.preferences_popup.as_ref().unwrap().available_fields();
+        for (width, height) in [(80, 16), (120, 24), (120, 40)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            for field in &fields {
+                view.preferences_popup.as_mut().unwrap().selected_field = *field;
+                let mut hit_map = HitMap::default();
+                terminal
+                    .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+                    .unwrap();
+                let (action, target) = hit_map
+                    .preferences_buttons
+                    .iter()
+                    .find(|(action, _)| PreferencesField::from_action(action) == Some(*field))
+                    .unwrap_or_else(|| panic!("{field:?} hidden at {width}×{height}"));
+                assert!(target.bottom() <= height);
+                assert_eq!(
+                    mouse_action(
+                        MouseEvent {
+                            kind: MouseEventKind::Down(MouseButton::Left),
+                            column: target.x,
+                            row: target.y,
+                            modifiers: KeyModifiers::NONE,
+                        },
+                        &hit_map,
+                        &view
+                    ),
+                    Some(action.clone())
+                );
+                assert!(rendered_text(&terminal).contains("[Enter] Save   [Esc] Cancel"));
+                if *field != PreferencesField::SubscriptionsLayout {
+                    assert_eq!(
+                        terminal.backend().buffer()[(target.x, target.y)].bg,
+                        Color::Cyan
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn narrow_preferences_popup_keeps_wrapped_intro_history_and_footer_visible() {
         let backend = TestBackend::new(80, 32);
         let mut terminal = Terminal::new(backend).expect("terminal");
         let view = ViewModel {
             preferences_popup: Some(PreferencesPopupView {
+                selected_field: PreferencesField::SubscriptionsLayout,
                 youtube_provider_settings_supported: cfg!(any(
                     feature = "youtube-official",
                     feature = "invidious"
@@ -23623,7 +23835,7 @@ for encoded, expected in json.load(sys.stdin):
             "Enter to save.",
             "Save playback history: off",
             #[cfg(any(feature = "youtube-official", feature = "invidious"))]
-            "[Y] YouTube provider",
+            "[Y] YouTube API / Invidious…",
             "[Enter] Save   [Esc] Cancel",
         ] {
             assert!(
@@ -23638,6 +23850,7 @@ for encoded, expected in json.load(sys.stdin):
         let view = ViewModel {
             text_selection_mode: true,
             preferences_popup: Some(PreferencesPopupView {
+                selected_field: PreferencesField::SubscriptionsLayout,
                 youtube_provider_settings_supported: cfg!(any(
                     feature = "youtube-official",
                     feature = "invidious"

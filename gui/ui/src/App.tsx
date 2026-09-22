@@ -74,7 +74,8 @@ export function App() {
       const target = event.target;
       if (
         target instanceof HTMLTextAreaElement ||
-        (target instanceof HTMLInputElement && target.dataset.youtaCaptionSearch !== 'true')
+        (target instanceof HTMLInputElement && target.dataset.youtaCaptionSearch !== 'true'
+			&& target.dataset.youtaPreferences !== 'true')
       ) {
         return;
       }

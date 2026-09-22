@@ -306,6 +306,7 @@ fn ready_waveform() -> WaveformView {
 /// A `PreferencesPopupView` has no `Default`, so the editor is spelled out.
 fn preferences() -> PreferencesPopupView {
     PreferencesPopupView {
+        selected_field: youta::view::PreferencesField::SubscriptionsLayout,
         subscriptions_layout: youta::config::SubscriptionsLayout::default(),
         save_playback_history: true,
         video_summary_backend: youta::config::VideoSummaryBackend::default(),

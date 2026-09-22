@@ -221,6 +221,33 @@ test('download preferences show typed values and gate unsupported source capabil
 	}
 });
 
+test('preferences preserve shared navigation order and distinguish focus from activation', () => {
+	const popup = {
+		selected_field: 'PlaybackHistory', subscriptions_layout: 'drill-down',
+		auto_download_supported: true, download_mode: 'ask-each-time',
+		archive_download_preference: 'original-file', archive_playback_supported: true,
+		archive_playback_preference: 'audio-only', video_summary_supported: true,
+		sponsorblock_supported: true, nyan_cat_supported: true,
+		youtube_provider_settings_supported: true,
+	};
+	const rendered = nodes(module.exports.PreferencesPopup({ popup, archiveSupported: true }));
+	const controls = rendered.filter((node) => node.props['data-preferences-field']);
+	assert.deepEqual(controls.map((node) => node.props['data-preferences-field']), [
+		'SubscriptionsLayout', 'PlaybackHistory', 'AdvertisementChapters', 'SponsorBlock',
+		'YouTubePrewarm', 'NyanCat', 'HourlyDownloads', 'CheckDownloads', 'DownloadMode',
+		'ArchiveDownload', 'ArchivePlayback', 'YouTubeThumbnails', 'LocalFolderSizes',
+		'TtyImages', 'BandcampAudio', 'VideoSummaries', 'YouTubeProvider',
+	]);
+	assert.equal(controls.filter((node) => node.props['data-preferences-focused'] === 'true').length, 1);
+	actions.length = 0;
+	controls.find((node) => node.props['data-preferences-field'] === 'PlaybackHistory').props.onFocusCapture();
+	assert.equal(actions.length, 0, 'existing focus is not dispatched again');
+	controls.find((node) => node.props['data-preferences-field'] === 'LocalFolderSizes').props.onFocusCapture();
+	assert.deepEqual(actions, [[{ SelectPreferencesField: 'LocalFolderSizes' }]], 'focus alone cannot mutate a draft');
+	const checkbox = rendered.find((node) => node.type === 'input');
+	assert.equal(checkbox.props['data-youta-preferences'], 'true', 'checkbox keys reach the shared preferences keymap');
+});
+
 test('window mounts the shared download chooser and declares the exact snapshot contract', () => {
 	assert.match(contract, /export interface DownloadChoicePopupView/);
 	assert.match(contract, /download_choice_popup: DownloadChoicePopupView \| null/);

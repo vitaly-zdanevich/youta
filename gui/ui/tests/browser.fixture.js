@@ -126,8 +126,8 @@
 	async function checkProviderSettings() {
 		const preferences = { ...clone(defaults.PreferencesPopupView), youtube_provider_settings_supported: true };
 		snapshot({ preferences_popup: preferences });
-		await until(() => button('YouTube provider settings', dialog()), 'provider settings in Preferences');
-		await action('OpenYouTubeProviderSettings', () => button('YouTube provider settings', dialog()).click(), 'Preferences opens the shared provider editor');
+		await until(() => button('YouTube API / Invidious…', dialog()), 'provider settings in Preferences');
+		await action('OpenYouTubeProviderSettings', () => button('YouTube API / Invidious…', dialog()).click(), 'Preferences opens the shared provider editor');
 		const editor = { selected_field: 'ApiKey', api_key_length: 23, invidious_url_length: 0,
 			invidious_url: null, invidious_instances: null, validation_failed: false, from_preferences: true,
 			official_supported: true, invidious_supported: true };
@@ -183,7 +183,7 @@
 		assert(!button('Invidious instance URL', dialog()), 'Builds without Invidious hide its manual field and directory');
 		snapshot({ youtube_provider_editor: null, preferences_popup: { ...preferences, youtube_provider_settings_supported: false } });
 		await until(() => dialog()?.textContent.includes('Preferences'), 'restored preferences');
-		assert(!button('YouTube provider settings', dialog()), 'Unsupported builds hide provider settings in Preferences');
+		assert(!button('YouTube API / Invidious…', dialog()), 'Unsupported builds hide provider settings in Preferences');
 		snapshot({ preferences_popup: null });
 		await until(() => !dialog(), 'closed provider fixtures');
 	}
@@ -282,9 +282,40 @@
 		snapshot(previous);
 		await until(() => document.querySelector('[title="Search archive.org"]'), 'restored Archive fixture');
 	}
+	/** Focus snapshots and native checkbox/button keys must agree with the shared keymap. */
+	async function checkPreferencesFocus() {
+		const preferences = { ...clone(defaults.PreferencesPopupView), selected_field: 'SubscriptionsLayout',
+			subscriptions_layout: 'drill-down', auto_download_supported: true, youtube_provider_settings_supported: true };
+		snapshot({ preferences_popup: preferences });
+		await until(() => dialog()?.querySelector('[data-preferences-focused=true]')?.dataset.preferencesField === 'SubscriptionsLayout', 'initial Preferences focus');
+		await key('ArrowDown', 'Down');
+		snapshot({ preferences_popup: { ...preferences, selected_field: 'PlaybackHistory' } });
+		await until(() => dialog()?.querySelector('[data-preferences-focused=true]')?.dataset.preferencesField === 'PlaybackHistory', 'moved Preferences focus');
+		const checkbox = dialog().querySelector('input[type=checkbox]');
+		await action({ SelectPreferencesField: 'HourlyDownloads' }, () => checkbox.focus(), 'Focusing a Preferences checkbox selects its shared control without toggling');
+		snapshot({ preferences_popup: { ...preferences, selected_field: 'HourlyDownloads' } });
+		await until(() => dialog()?.querySelector('[data-preferences-focused=true]')?.dataset.preferencesField === 'HourlyDownloads', 'checkbox Preferences focus');
+		for (const [name, wire] of [['ArrowDown', 'Down'], ['ArrowUp', 'Up'], [' ', { Char: ' ' }], ['Enter', 'Enter']]) {
+			const before = calls.length;
+			const event = new KeyboardEvent('keydown', { key: name, bubbles: true, cancelable: true });
+			checkbox.dispatchEvent(event);
+			await until(() => calls.slice(before).some((call) => call.command === 'key' && JSON.stringify(call.args.press.key) === JSON.stringify(wire)), `Preferences checkbox forwards ${name}`);
+			assert(event.defaultPrevented, `Preferences ${name} suppresses native duplicate activation`);
+			assert(calls.slice(before).filter((call) => call.command === 'key').length === 1, `Preferences ${name} reaches the reducer once`);
+			assert(!calls.slice(before).some((call) => call.command === 'dispatch'), `Preferences ${name} does not also toggle the checkbox`);
+		}
+		snapshot({ preferences_popup: { ...preferences, selected_field: 'YouTubeProvider' } });
+		const provider = await until(() => dialog()?.querySelector('[data-preferences-focused=true]')?.dataset.preferencesField === 'YouTubeProvider'
+			&& dialog().querySelector('[data-preferences-focused=true]'), 'last Preferences focus');
+		const bounds = provider.getBoundingClientRect();
+		assert(bounds.top >= 0 && bounds.bottom <= window.innerHeight, 'Last Preferences control scrolls into the window');
+		snapshot({ preferences_popup: null });
+		await until(() => !dialog(), 'closed Preferences focus fixture');
+	}
 	async function run() {
 		await until(() => document.querySelector('[title="Search archive.org"]'), 'Archive search');
 		await checkSoundCloudTab();
+		await checkPreferencesFocus();
 		await checkProviderSettings();
 		await checkArchivePlaybackChoices();
 		assert(!button('[Esc] Back'), 'Archive root hides Back when no return route exists');

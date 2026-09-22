@@ -11,7 +11,7 @@
 // `whitespace-pre-wrap` is what preserves their shape — never markup.
 
 import { useEffect, useRef } from 'react';
-import type { UnitUiAction } from '../actions';
+import type { UiAction, UnitUiAction } from '../actions';
 
 import type {
   AudioQualityPopupView,
@@ -42,6 +42,7 @@ import type {
 	PodcastFeedOptionsPopupView,
   PlaylistPopupView,
   PreferencesPopupView,
+	PreferencesField,
   ProjectHistoryPopupView,
   QueuePopupView,
   VideoCommentsPopupView,
@@ -1701,176 +1702,101 @@ export function PreferencesPopup({ popup, archiveSupported }: {
 	popup: PreferencesPopupView;
 	archiveSupported: boolean;
 }) {
-	const toggles: Array<[string, boolean, UnitUiAction]> = [
-    ["Skip advertisement chapters", popup.skip_advertisement_chapters, "ToggleSkipAdvertisementChapters"],
-    ["Prewarm the selected YouTube video", popup.youtube_prewarm, "ToggleYouTubePrewarm"],
-    ["Show Local folder sizes", popup.show_local_folder_sizes, "ToggleLocalFolderSizes"],
-    ["Show artwork on a Linux console", popup.show_images_in_tty, "ToggleTtyImages"],
-  ];
-	const cycles: Array<[string, string, UnitUiAction | 'SetSubscriptionsLayout']> = [
-    ["Subscriptions layout", popup.subscriptions_layout, "SetSubscriptionsLayout"],
-    ["YouTube thumbnail size", popup.youtube_thumbnail_size, "CycleYouTubeThumbnailSize"],
-    ["Bandcamp audio format", popup.bandcamp_audio_format, "CycleBandcampAudioFormat"],
-  ];
-	if (popup.auto_download_supported) {
-		cycles.push(['Download mode', DOWNLOAD_MODE_LABELS[popup.download_mode], 'CycleDownloadModePreference']);
-	}
-	if (archiveSupported && popup.auto_download_supported) {
-		cycles.push(['archive.org format', ARCHIVE_DOWNLOAD_LABELS[popup.archive_download_preference], 'CycleArchiveDownloadPreference']);
-	}
-	if (popup.archive_playback_supported) {
-		cycles.push(['archive.org playback', ARCHIVE_PLAYBACK_LABELS[popup.archive_playback_preference], 'CycleArchivePlaybackPreference']);
-	}
-  return (
-    <Popup
-      title="Preferences"
-      subtitle={popup.config_path}
-      layer={LAYER.preferences}
-      width="620px"
-      onDismiss={() => void dispatch("DismissPreferences")}
-      footer={
-        <>
-          <PopupButton emphasis onClick={() => void dispatch("SubmitPreferences")}>
-            Save
-          </PopupButton>
-          <PopupButton onClick={() => void dispatch("DismissPreferences")}>Cancel</PopupButton>
-          {popup.environment_override ? (
-            // An environment variable wins over the file, so saving this key
-            // would write a value the running process would keep ignoring.
-            <span className="text-accent">
-              {popup.environment_override} overrides the file; that setting cannot be saved here.
-            </span>
-          ) : null}
-        </>
-      }
-    >
-      <Body>
-        <div className="grid gap-[7px]">
-					{popup.youtube_provider_settings_supported ? (
-						<PopupButton onClick={() => void dispatch('OpenYouTubeProviderSettings')}>
-							YouTube provider settings
-						</PopupButton>
+	/** Controls share the terminal's order; values and actions remain reducer-owned. */
+	const controls: Array<{ field: PreferencesField; label: string; value: string; action: UiAction; on?: boolean }> = [];
+	const add = (field: PreferencesField, label: string, value: string, action: UiAction, supported = true, on?: boolean) => {
+		if (supported) controls.push({ field, label, value, action, ...(on === undefined ? {} : { on }) });
+	};
+	const toggle = (field: PreferencesField, label: string, value: boolean, action: UiAction, supported = true) =>
+		add(field, label, value ? 'on' : 'off', action, supported, value);
+	add('SubscriptionsLayout', 'Subscriptions layout', popup.subscriptions_layout,
+		{ SetSubscriptionsLayout: popup.subscriptions_layout === 'drill-down' ? 'split' : 'drill-down' });
+	toggle('PlaybackHistory', 'Save playback history', popup.save_playback_history, 'TogglePlaybackHistorySaving');
+	toggle('AdvertisementChapters', 'Skip advertisement chapters', popup.skip_advertisement_chapters, 'ToggleSkipAdvertisementChapters');
+	toggle('SponsorBlock', 'Skip SponsorBlock sponsored segments', popup.sponsorblock_enabled, 'ToggleSponsorBlock', popup.sponsorblock_supported);
+	toggle('YouTubePrewarm', 'Prewarm the selected YouTube video', popup.youtube_prewarm, 'ToggleYouTubePrewarm');
+	toggle('NyanCat', 'Rainbow Nyan Cat seek bar', popup.nyan_cat_seekbar, 'ToggleNyanCatSeekbar', popup.nyan_cat_supported);
+	toggle('HourlyDownloads', 'Download new episodes every hour', popup.download_new_episodes_every_hour, 'ToggleHourlyAutoDownload', popup.auto_download_supported);
+	add('CheckDownloads', '', 'Check and download new episodes', 'CheckAndDownloadNewEpisodes', popup.auto_download_supported);
+	add('DownloadMode', 'Download mode', DOWNLOAD_MODE_LABELS[popup.download_mode], 'CycleDownloadModePreference', popup.auto_download_supported);
+	add('ArchiveDownload', 'archive.org format', ARCHIVE_DOWNLOAD_LABELS[popup.archive_download_preference], 'CycleArchiveDownloadPreference', archiveSupported && popup.auto_download_supported);
+	add('ArchivePlayback', 'archive.org playback', ARCHIVE_PLAYBACK_LABELS[popup.archive_playback_preference], 'CycleArchivePlaybackPreference', popup.archive_playback_supported);
+	add('YouTubeThumbnails', 'YouTube thumbnail size', popup.youtube_thumbnail_size, 'CycleYouTubeThumbnailSize');
+	toggle('LocalFolderSizes', 'Show Local folder sizes', popup.show_local_folder_sizes, 'ToggleLocalFolderSizes');
+	toggle('TtyImages', 'Show artwork on a Linux console', popup.show_images_in_tty, 'ToggleTtyImages');
+	add('BandcampAudio', 'Bandcamp audio format', popup.bandcamp_audio_format, 'CycleBandcampAudioFormat');
+	add('VideoSummaries', 'Video summaries', popup.video_summary_backend === 'codex' ? 'Codex CLI' : 'off',
+		'CycleVideoSummaryBackend', popup.video_summary_supported, popup.video_summary_backend === 'codex');
+	add('YouTubeProvider', '', 'YouTube API / Invidious…', 'OpenYouTubeProviderSettings', popup.youtube_provider_settings_supported);
+	return (
+		<Popup
+			title='Preferences'
+			subtitle={popup.config_path}
+			layer={LAYER.preferences}
+			width='620px'
+			onDismiss={() => void dispatch('DismissPreferences')}
+			footer={
+				<>
+					<PopupButton emphasis onClick={() => void dispatch('SubmitPreferences')}>Save</PopupButton>
+					<PopupButton onClick={() => void dispatch('DismissPreferences')}>Cancel</PopupButton>
+					{popup.environment_override ? (
+						<span className='text-accent'>{popup.environment_override} overrides the file; that setting cannot be saved here.</span>
 					) : null}
-          <label className="flex items-center justify-between gap-4">
-            <span className="text-ink-dim">Save playback history</span>
-            <PopupButton
-              emphasis={popup.save_playback_history}
-              onClick={() => void dispatch("TogglePlaybackHistorySaving")}
-            >
-              {popup.save_playback_history ? "on" : "off"}
-            </PopupButton>
-          </label>
-					{popup.auto_download_supported ? (
-						<section className='grid gap-[7px] border-y border-line py-[7px]'>
-							<label className='flex items-center justify-between gap-4'>
-								<span className='text-ink-dim'>Download new episodes every hour</span>
-								<input
-									type='checkbox'
-									checked={popup.download_new_episodes_every_hour}
-									onChange={() => void dispatch('ToggleHourlyAutoDownload')}
-									className='accent-accent'
-								/>
-							</label>
-							<PopupButton onClick={() => void dispatch('CheckAndDownloadNewEpisodes')}>
-								Check and download new episodes
-							</PopupButton>
-							{popup.auto_download_status ? (
-								<p role='status' className='m-0 text-[11px] leading-[16px] text-accent'>
-									{popup.auto_download_status}
-								</p>
-							) : null}
-							<p className='m-0 text-[11px] leading-[16px] text-ink-faint'>
-								Checks channels with Auto-download enabled while Youta is open.
-							</p>
-						</section>
-					) : (
-						<p className='m-0 text-[11px] text-ink-faint'>
-							Automatic downloads are not included in this build.
-						</p>
-					)}
-          {popup.video_summary_supported ? (
-            <section className="grid gap-[4px] border-y border-line py-[7px]">
-              <div className="flex items-center justify-between gap-4">
-                <span className="text-ink-dim">Video summaries</span>
-                <PopupButton
-                  emphasis={popup.video_summary_backend === "codex"}
-                  onClick={() => void dispatch("CycleVideoSummaryBackend")}
-                >
-                  {popup.video_summary_backend === "codex" ? "Codex CLI" : "off"}
-                </PopupButton>
-              </div>
-              <p className="m-0 text-[11px] leading-[16px] text-ink-faint">
-                When enabled, Youta sends bounded video captions to your authenticated Codex CLI
-                only when you request a summary; it does not store an API key.
-              </p>
-            </section>
-          ) : (
-            <p className="m-0 border-y border-line py-[7px] text-[11px] text-ink-faint">
-              Video summaries are not included in this build.
-            </p>
-          )}
-          {popup.sponsorblock_supported ? (
-            <label className="flex items-center justify-between gap-4">
-              <span className="text-ink-dim">Skip SponsorBlock sponsored segments</span>
-              <PopupButton
-                emphasis={popup.sponsorblock_enabled}
-                onClick={() => void dispatch('ToggleSponsorBlock')}
-              >
-                {popup.sponsorblock_enabled ? 'on' : 'off'}
-              </PopupButton>
-            </label>
-          ) : (
-            <p className="m-0 text-[11px] text-ink-faint">
-              SponsorBlock is not included in this build.
-            </p>
-          )}
-          {popup.nyan_cat_supported ? (
-            <label className="flex items-center justify-between gap-4">
-              <span className="text-ink-dim">Rainbow Nyan Cat seek bar</span>
-              <PopupButton
-                emphasis={popup.nyan_cat_seekbar}
-                onClick={() => void dispatch('ToggleNyanCatSeekbar')}
-              >
-                {popup.nyan_cat_seekbar ? 'on' : 'off'}
-              </PopupButton>
-            </label>
-          ) : (
-            <p className="m-0 text-[11px] text-ink-faint">
-              Nyan Cat seek bar is not included in this build.
-            </p>
-          )}
-          {toggles.map(([label, value, action]) => (
-            <label key={label} className="flex items-center justify-between gap-4">
-              <span className="text-ink-dim">{label}</span>
-              <PopupButton emphasis={value} onClick={() => void dispatch(action)}>
-                {value ? "on" : "off"}
-              </PopupButton>
-            </label>
-          ))}
-          {cycles.map(([label, value, action]) => (
-            <label key={label} className="flex items-center justify-between gap-4">
-              <span className="text-ink-dim">{label}</span>
-              <PopupButton
-                onClick={() =>
-                  void dispatch(
-                    // One of these takes an explicit value and the rest cycle;
-                    // the reducer decides the next value in every case, so the
-                    // window never computes one.
-                    action === "SetSubscriptionsLayout"
-                      ? { SetSubscriptionsLayout: value === "drill-down" ? "split" : "drill-down" }
-                      : action,
-                  )
-                }
-              >
-                {value}
-              </PopupButton>
-            </label>
-          ))}
-        </div>
-      </Body>
-      <PopupError message={popup.validation_error} />
-    </Popup>
-  );
+				</>
+			}
+		>
+			<Body>
+				<p className='mt-0 text-[11px] text-ink-faint'>↑/↓ Move · Space Change · Enter Save</p>
+				<div className='grid gap-[7px]'>
+					{controls.map(({ field, label, value, action, on }) => {
+						const focused = popup.selected_field === field;
+						return (
+							<div
+								key={field}
+								data-preferences-field={field}
+								data-preferences-focused={focused ? 'true' : undefined}
+								className={`flex items-center justify-between gap-4 rounded-[5px] px-2 py-1 ${focused ? 'bg-raised outline outline-1 outline-accent' : ''}`}
+								onFocusCapture={() => {
+									if (!focused) void dispatch({ SelectPreferencesField: field });
+								}}
+								ref={(node) => {
+									// Never scroll a Preferences draft hidden behind a child/error popup.
+									if (node && focused && [...document.querySelectorAll('[role=dialog]')].at(-1) === node.closest('[role=dialog]')) {
+										node.scrollIntoView({ block: 'nearest' });
+									}
+								}}
+							>
+								{label ? <span className='text-ink-dim'>{label}</span> : null}
+								{field === 'HourlyDownloads' ? (
+									<input type='checkbox' data-youta-preferences='true'
+										aria-label={label} checked={popup.download_new_episodes_every_hour}
+										onChange={() => void dispatch(action)} className='accent-accent' />
+								) : (
+									<PopupButton emphasis={on ?? false} onClick={() => void dispatch(action)}>{value}</PopupButton>
+								)}
+							</div>
+						);
+					})}
+					{popup.auto_download_status ? <p role='status' className='m-0 text-[11px] text-accent'>{popup.auto_download_status}</p> : null}
+				</div>
+				{popup.auto_download_supported ? (
+					<p className='mb-0 text-[11px] leading-[16px] text-ink-faint'>Checks channels with Auto-download enabled while Youta is open.</p>
+				) : null}
+				{popup.video_summary_supported ? (
+					<p className='mb-0 text-[11px] leading-[16px] text-ink-faint'>When enabled, Youta sends bounded video captions to your authenticated Codex CLI only when you request a summary; it does not store an API key.</p>
+				) : null}
+				{[
+					[popup.auto_download_supported, 'Automatic downloads'],
+					[popup.video_summary_supported, 'Video summaries'],
+					[popup.sponsorblock_supported, 'SponsorBlock'],
+					[popup.nyan_cat_supported, 'Nyan Cat seek bar'],
+				].map(([supported, label]) => supported ? null : (
+					<p key={String(label)} className='mb-0 text-[11px] text-ink-faint'>{label} is not included in this build.</p>
+				))}
+			</Body>
+			<PopupError message={popup.validation_error} />
+		</Popup>
+	);
 }
 
 /** The local-playlist chooser and its create/edit form. */

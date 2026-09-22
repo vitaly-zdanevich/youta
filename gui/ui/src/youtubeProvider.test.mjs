@@ -121,9 +121,9 @@ test('provider feature gates omit unsupported fields and do not expose a disable
 	assert.equal(button(render({ official_supported: false, invidious_supported: false }), 'Save').props.disabled, true);
 	for (const youtube_provider_settings_supported of [false, true]) {
 		const tree = module.exports.PreferencesPopup({ popup: { youtube_provider_settings_supported }, archiveSupported: false });
-		assert.equal(Boolean(button(tree, 'YouTube provider settings')), youtube_provider_settings_supported);
+		assert.equal(Boolean(button(tree, 'YouTube API / Invidious…')), youtube_provider_settings_supported);
 		if (youtube_provider_settings_supported) {
-			button(tree, 'YouTube provider settings').props.onClick();
+			button(tree, 'YouTube API / Invidious…').props.onClick();
 			assert.equal(actions.pop(), 'OpenYouTubeProviderSettings');
 		}
 	}

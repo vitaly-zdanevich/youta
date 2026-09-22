@@ -895,8 +895,8 @@ failed request. No directory request runs at startup. An empty list or network
 failure still leaves manual URLs available, including self-hosted instances.
 
 To replace an existing key or switch instances, open Preferences with `p` or
-`F7`, then choose **YouTube provider** (`Y` in the terminal). The same editor and
-on-demand instance dropdown are available in the desktop window. The API-key
+`F7`, then choose **YouTube API / Invidious…** (`Y` in the terminal). The same editor
+and on-demand instance dropdown are available in the desktop window. The API-key
 field starts empty and stays masked; the existing key is never copied into it.
 Selecting a directory entry changes only the draft. **Save** applies the chosen
 provider and returns to the unchanged Preferences draft without starting a
@@ -2001,8 +2001,9 @@ request runs, and Youta restores the selected item by its stable source identity
 when it is still in the refreshed result; a refresh failure also leaves the
 existing rows intact.
 
-Open the current in-app preferences with `[p] Preferences` or `F7`, choose
-the desired options, then press `Enter` to save. It includes:
+Open the current in-app preferences with `[p] Preferences` or `F7`. Use ↑/↓ to
+focus a setting and Space to change it, or use its displayed shortcut; press
+`Enter` to save. It includes:
 
 - Drill-down or Split subscription layout;
 - exact `Реклама` chapter skipping and independent SponsorBlock skipping;

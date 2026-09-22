@@ -488,8 +488,29 @@ export interface ArchivePlaybackChoicePopupView {
 	selected: number;
 }
 
+/** Runtime preference focus targets in the shared renderer/navigation order. */
+export type PreferencesField =
+	| 'SubscriptionsLayout'
+	| 'PlaybackHistory'
+	| 'AdvertisementChapters'
+	| 'SponsorBlock'
+	| 'YouTubePrewarm'
+	| 'NyanCat'
+	| 'HourlyDownloads'
+	| 'CheckDownloads'
+	| 'DownloadMode'
+	| 'ArchiveDownload'
+	| 'ArchivePlayback'
+	| 'YouTubeThumbnails'
+	| 'LocalFolderSizes'
+	| 'TtyImages'
+	| 'BandcampAudio'
+	| 'VideoSummaries'
+	| 'YouTubeProvider';
+
 /** The runtime preferences editor. Values are drafts until it is submitted. */
 export interface PreferencesPopupView {
+	selected_field: PreferencesField;
 	/** Whether either configurable YouTube provider is compiled into this build. */
 	youtube_provider_settings_supported: boolean;
   subscriptions_layout: string;

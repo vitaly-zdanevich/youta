@@ -1102,9 +1102,104 @@ pub struct DownloadQueuePopupView {
     pub selected: usize,
 }
 
+/// One keyboard-focus target in the runtime preferences editor.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub enum PreferencesField {
+    /// The mutually exclusive Subscriptions layout choices.
+    #[default]
+    SubscriptionsLayout,
+    /// Whether playback creates History entries.
+    PlaybackHistory,
+    /// Skip chapters explicitly named as advertisements.
+    AdvertisementChapters,
+    /// Skip remotely identified sponsorship segments.
+    SponsorBlock,
+    /// Prepare selected YouTube audio in advance.
+    YouTubePrewarm,
+    /// Use the Nyan Cat seek bar.
+    NyanCat,
+    /// Check subscribed channels on the hourly schedule.
+    HourlyDownloads,
+    /// Run the opted-in channel check immediately.
+    CheckDownloads,
+    /// Choose video or audio-only downloads.
+    DownloadMode,
+    /// Choose an Archive download format.
+    ArchiveDownload,
+    /// Choose an Archive playback format.
+    ArchivePlayback,
+    /// Choose a YouTube thumbnail resolution.
+    YouTubeThumbnails,
+    /// Display sizes in the Local folder browser.
+    LocalFolderSizes,
+    /// Render artwork on a Linux virtual console.
+    TtyImages,
+    /// Choose a Bandcamp audio encoding.
+    BandcampAudio,
+    /// Choose the optional video-summary backend.
+    VideoSummaries,
+    /// Open the child YouTube provider editor.
+    YouTubeProvider,
+}
+
+impl PreferencesField {
+    /// Returns the existing semantic action that edits this focused control.
+    #[must_use]
+    pub fn action(self, popup: &PreferencesPopupView) -> UiAction {
+        match self {
+            Self::SubscriptionsLayout => {
+                UiAction::SetSubscriptionsLayout(popup.subscriptions_layout.toggled())
+            }
+            Self::PlaybackHistory => UiAction::TogglePlaybackHistorySaving,
+            Self::AdvertisementChapters => UiAction::ToggleSkipAdvertisementChapters,
+            Self::SponsorBlock => UiAction::ToggleSponsorBlock,
+            Self::YouTubePrewarm => UiAction::ToggleYouTubePrewarm,
+            Self::NyanCat => UiAction::ToggleNyanCatSeekbar,
+            Self::HourlyDownloads => UiAction::ToggleHourlyAutoDownload,
+            Self::CheckDownloads => UiAction::CheckAndDownloadNewEpisodes,
+            Self::DownloadMode => UiAction::CycleDownloadModePreference,
+            Self::ArchiveDownload => UiAction::CycleArchiveDownloadPreference,
+            Self::ArchivePlayback => UiAction::CycleArchivePlaybackPreference,
+            Self::YouTubeThumbnails => UiAction::CycleYouTubeThumbnailSize,
+            Self::LocalFolderSizes => UiAction::ToggleLocalFolderSizes,
+            Self::TtyImages => UiAction::ToggleTtyImages,
+            Self::BandcampAudio => UiAction::CycleBandcampAudioFormat,
+            Self::VideoSummaries => UiAction::CycleVideoSummaryBackend,
+            Self::YouTubeProvider => UiAction::OpenYouTubeProviderSettings,
+        }
+    }
+
+    /// Identifies mouse and mnemonic actions that must also move keyboard focus.
+    #[must_use]
+    pub fn from_action(action: &UiAction) -> Option<Self> {
+        Some(match action {
+            UiAction::SetSubscriptionsLayout(_) => Self::SubscriptionsLayout,
+            UiAction::TogglePlaybackHistorySaving => Self::PlaybackHistory,
+            UiAction::ToggleSkipAdvertisementChapters => Self::AdvertisementChapters,
+            UiAction::ToggleSponsorBlock => Self::SponsorBlock,
+            UiAction::ToggleYouTubePrewarm => Self::YouTubePrewarm,
+            UiAction::ToggleNyanCatSeekbar => Self::NyanCat,
+            UiAction::ToggleHourlyAutoDownload => Self::HourlyDownloads,
+            UiAction::CheckAndDownloadNewEpisodes => Self::CheckDownloads,
+            UiAction::CycleDownloadModePreference => Self::DownloadMode,
+            UiAction::CycleArchiveDownloadPreference => Self::ArchiveDownload,
+            UiAction::CycleArchivePlaybackPreference => Self::ArchivePlayback,
+            UiAction::CycleYouTubeThumbnailSize => Self::YouTubeThumbnails,
+            UiAction::ToggleLocalFolderSizes => Self::LocalFolderSizes,
+            UiAction::ToggleTtyImages => Self::TtyImages,
+            UiAction::CycleBandcampAudioFormat => Self::BandcampAudio,
+            UiAction::CycleVideoSummaryBackend => Self::VideoSummaries,
+            UiAction::OpenYouTubeProviderSettings => Self::YouTubeProvider,
+            _ => return None,
+        })
+    }
+}
+
 /// Focused in-app editor for preferences that are implemented at runtime.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct PreferencesPopupView {
+    /// Current keyboard target; changing it never changes a draft preference.
+    pub selected_field: PreferencesField,
     /// Whether this build can edit an official YouTube or Invidious provider.
     pub youtube_provider_settings_supported: bool,
     /// Draft Subscriptions layout saved only when the user confirms.
@@ -1155,6 +1250,50 @@ pub struct PreferencesPopupView {
     pub environment_override: Option<String>,
     /// Save or validation failure kept inside the popup.
     pub validation_error: Option<String>,
+}
+
+impl PreferencesPopupView {
+    /// Returns supported controls in their shared visual and keyboard order.
+    #[must_use]
+    pub fn available_fields(&self) -> Vec<PreferencesField> {
+        use PreferencesField as Field;
+        [
+            (Field::SubscriptionsLayout, true),
+            (Field::PlaybackHistory, true),
+            (Field::AdvertisementChapters, true),
+            (Field::SponsorBlock, self.sponsorblock_supported),
+            (Field::YouTubePrewarm, true),
+            (Field::NyanCat, self.nyan_cat_supported),
+            (Field::HourlyDownloads, self.auto_download_supported),
+            (Field::CheckDownloads, self.auto_download_supported),
+            (Field::DownloadMode, self.auto_download_supported),
+            (
+                Field::ArchiveDownload,
+                self.auto_download_supported && cfg!(feature = "archive-org"),
+            ),
+            (Field::ArchivePlayback, self.archive_playback_supported),
+            (Field::YouTubeThumbnails, cfg!(feature = "images")),
+            (Field::LocalFolderSizes, true),
+            (Field::TtyImages, cfg!(feature = "images")),
+            (Field::BandcampAudio, cfg!(feature = "bandcamp")),
+            (Field::VideoSummaries, self.video_summary_supported),
+            (
+                Field::YouTubeProvider,
+                self.youtube_provider_settings_supported,
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(field, supported)| supported.then_some(field))
+        .collect()
+    }
+
+    /// Returns the focused control's action only while that control is available.
+    #[must_use]
+    pub fn focused_action(&self) -> Option<UiAction> {
+        self.available_fields()
+            .contains(&self.selected_field)
+            .then(|| self.selected_field.action(self))
+    }
 }
 
 /// Playable selected item for which playlist actions are available.
@@ -4094,6 +4233,10 @@ pub enum UiAction {
     DismissRssSubscriptionPopup,
     /// Open the focused runtime preferences editor.
     OpenPreferences,
+    /// Move keyboard focus among supported preference controls without changing values.
+    MovePreferencesFocus(i32),
+    /// Synchronize a frontend's directly focused preference control.
+    SelectPreferencesField(PreferencesField),
     /// Select one draft Subscriptions layout in the preferences editor.
     SetSubscriptionsLayout(SubscriptionsLayout),
     /// Toggle playback-history saving in the draft.
