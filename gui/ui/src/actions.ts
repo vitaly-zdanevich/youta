@@ -159,6 +159,7 @@ export type UnitUiAction =
 	| 'OpenGentooYtDlpPackage'
 	| 'OpenGitHubIssueSubmissionTarget'
 	| 'OpenInBrowser'
+	| 'OpenInvidiousAbout'
 	| 'OpenInvidiousInstancePicker'
 	| 'OpenPlaylistPopup'
 	| 'OpenRssSubscriptionPopup'

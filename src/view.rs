@@ -81,6 +81,9 @@ pub const WIKIDATA_MEDIA_PLAY_SYMBOL: &str = "▶";
 /// Official Invidious documentation listing public instances.
 pub const INVIDIOUS_INSTANCES_URL: &str = "https://docs.invidious.io/instances/";
 
+/// Wikipedia overview linked from the Invidious provider setup screen.
+pub const INVIDIOUS_ABOUT_URL: &str = "https://en.wikipedia.org/wiki/Invidious";
+
 /// Official yt-dlp source repository and release page.
 pub const YT_DLP_PROJECT_URL: &str = "https://github.com/yt-dlp/yt-dlp";
 
@@ -1905,23 +1908,23 @@ pub enum GitHubIssueSubmissionView {
     },
 }
 
-/// Diagnostic or actionable setup information shown above the normal interface.
+/// Diagnostic, setup, or service information shown above the normal interface.
 ///
 /// For reportable failures, `report` contains the complete, copyable diagnostic
-/// report rather than a shortened user-facing message. Setup guidance instead
-/// stores its concise instructions there. The controller owns `scroll_offset`
+/// report rather than a shortened user-facing message. Setup and service guidance
+/// instead store concise messages there. The controller owns `scroll_offset`
 /// so the position survives terminal redraws and resize events.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct ErrorPopupView {
     /// Short error title displayed in the popup border.
     pub title: String,
-    /// Complete diagnostic report or concise local setup guidance.
+    /// Complete diagnostic report or concise setup/service guidance.
     pub report: String,
     /// Zero-based wrapped-line offset at the top of the viewport.
     pub scroll_offset: usize,
     /// Whether direct GitHub CLI submission is available for this popup.
     pub gh_available: bool,
-    /// Whether this popup describes a reportable failure rather than setup guidance.
+    /// Whether this popup describes a reportable failure rather than setup/service guidance.
     pub reportable: bool,
     /// Result of the most recent copy or issue-submission action.
     pub action_status: Option<String>,
@@ -4145,6 +4148,8 @@ pub enum UiAction {
     OpenGoogleCloudCredentials,
     /// Open the official Invidious public-instance list.
     OpenInvidiousInstances,
+    /// Open the Wikipedia overview without changing the provider draft or picker.
+    OpenInvidiousAbout,
     /// Open or explicitly retry the on-demand public-instance dropdown.
     OpenInvidiousInstancePicker,
     /// Move the public-instance highlight by a signed row count.
@@ -4349,6 +4354,7 @@ impl UiAction {
                 | Self::OpenYouTubeApiKeyGuide
                 | Self::OpenGoogleCloudCredentials
                 | Self::OpenInvidiousInstances
+                | Self::OpenInvidiousAbout
                 | Self::OpenYandexOAuthGuide
         );
         #[cfg(feature = "commons-upload")]

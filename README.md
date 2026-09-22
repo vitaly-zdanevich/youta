@@ -901,8 +901,10 @@ field starts empty and stays masked; the existing key is never copied into it.
 Selecting a directory entry changes only the draft. **Save** applies the chosen
 provider and returns to the unchanged Preferences draft without starting a
 search; **Cancel** returns without changing the provider. Other Preferences
-changes still need their own Save. Providers omitted from a build are disabled.
-Environment overrides continue to prevent saving values they would shadow.
+changes still need their own Save. Clearing the Invidious URL disables the saved
+instance and keeps any saved YouTube API key. Providers omitted from a build are
+disabled. Environment overrides still take precedence; the editor identifies
+them when clearing a saved URL cannot disable the active instance.
 
 The provider selection and Invidious URL can be configured manually in
 `~/.config/youta/config.toml`:

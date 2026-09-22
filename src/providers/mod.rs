@@ -793,6 +793,19 @@ pub enum ProviderError {
     /// The server returned an unsuccessful HTTP status.
     #[error("provider returned HTTP status {0}")]
     HttpStatus(u16),
+    /// The configured provider endpoint returned an unsuccessful HTTP status.
+    ///
+    /// Keep only its credential-free base URL, never the request path, query,
+    /// or the application's currently selected (possibly different) instance.
+    #[error("{provider} ({instance}) returned HTTP status {status}")]
+    HttpStatusAt {
+        /// Static provider name supplied by the adapter.
+        provider: &'static str,
+        /// Validated base URL that owned the failed request.
+        instance: Url,
+        /// HTTP response code.
+        status: u16,
+    },
     /// The server returned a structured service error.
     #[error("provider returned HTTP status {status} ({reason}): {message}")]
     Service {

@@ -219,7 +219,8 @@ export function App() {
       {view.project_history_popup ? (
         <ProjectHistoryPopup popup={view.project_history_popup} />
       ) : null}
-		{view.youtube_provider_editor ? <YouTubeProviderPopup editor={view.youtube_provider_editor} /> : null}
+		{view.youtube_provider_editor ? <YouTubeProviderPopup editor={view.youtube_provider_editor}
+			externalOpenerAvailable={view.external_opener_available} /> : null}
       {view.yandex_music_setup_open ? (
         <CredentialEditorNotice editor="yandex_music_setup" />
       ) : null}

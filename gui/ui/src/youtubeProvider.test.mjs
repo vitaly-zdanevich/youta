@@ -50,9 +50,60 @@ function fixture(patch = {}) {
 		from_preferences: true, official_supported: true, invidious_supported: true, ...patch };
 }
 const picker = { loading: false, loading_frame: 0, instances: [], selected: 0, error: null };
-const render = (patch = {}) => module.exports.YouTubeProviderPopup({ editor: fixture(patch) });
+const render = (patch = {}, externalOpenerAvailable = true) => module.exports.YouTubeProviderPopup({
+	editor: fixture(patch), externalOpenerAvailable,
+});
 const button = (tree, label) => nodes(tree).find((node) => node.type === 'button'
 	&& (text(node) === label || node.props['aria-label'] === label));
+const aboutUrl = 'https://en.wikipedia.org/wiki/Invidious';
+
+test('the provider screen keeps its Wikipedia link visible with the directory closed or in any open state', () => {
+	for (const invidious_instances of [null, picker, { ...picker, loading: true },
+		{ ...picker, error: 'Directory temporarily unavailable' },
+		{ ...picker, instances: [{ url: 'https://instance.example/', label: 'Fixture' }] }]) {
+		actions.length = 0;
+		const tree = render({ invidious_instances });
+		const about = button(tree, aboutUrl);
+		assert.ok(about, 'the complete Wikipedia URL is visible on the provider screen');
+		assert.equal(about.props.role, 'link');
+		assert.equal(about.props.disabled, false);
+		assert.deepEqual(actions, [], 'displaying the link must not open it');
+		about.props.onClick();
+		assert.deepEqual(actions, ['OpenInvidiousAbout'], 'the native opener action is separate from save and selection');
+	}
+});
+
+test('the Wikipedia link follows Invidious and external-opener availability', () => {
+	assert.ok(!button(render({ invidious_supported: false }), aboutUrl));
+	for (const invidious_instances of [null, picker]) {
+		const about = button(render({ invidious_instances }, false), aboutUrl);
+		assert.ok(about, 'an unavailable opener leaves the article URL visible');
+		assert.equal(about.props.disabled, true);
+	}
+});
+
+test('Enter on the Wikipedia link opens only the article without reaching the provider editor', () => {
+	for (const invidious_instances of [null,
+		{ ...picker, instances: [{ url: 'https://instance.example/', label: 'Fixture' }] }]) {
+		for (const externalOpenerAvailable of [false, true]) {
+			actions.length = 0;
+			let prevented = false;
+			let stopped = false;
+			const about = button(render({ invidious_instances }, externalOpenerAvailable), aboutUrl);
+			about.props.onKeyDown({ key: 'Enter',
+				preventDefault: () => { prevented = true; },
+				stopPropagation: () => { stopped = true; },
+			});
+			assert.equal(prevented, true, 'the browser must not synthesize a second click');
+			assert.equal(stopped, true, 'Enter must not reach provider saving or instance confirmation');
+			assert.deepEqual(actions, externalOpenerAvailable ? ['OpenInvidiousAbout'] : []);
+			about.props.onKeyDown({ key: 'F5',
+				preventDefault: () => assert.fail('other keys retain the shared keymap'),
+				stopPropagation: () => assert.fail('other keys retain the shared keymap'),
+			});
+		}
+	}
+});
 
 test('provider controls remain masked and dispatch selection separately from save', () => {
 	actions.length = 0;

@@ -124,6 +124,21 @@
 	});
 	/** Exercise provider settings without providing a credential to the web-view fixture. */
 	async function checkProviderSettings() {
+		const aboutUrl = 'https://en.wikipedia.org/wiki/Invidious';
+		/** Link Enter belongs to its native opener, not the editor's save/confirm keymap. */
+		const openAboutWithEnter = async (label) => {
+			const about = button(aboutUrl, dialog());
+			about.focus();
+			assert(document.activeElement === about, 'The Wikipedia link can receive keyboard focus');
+			const start = calls.length;
+			const enter = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true });
+			await action('OpenInvidiousAbout', () => about.dispatchEvent(enter), label);
+			assert(enter.defaultPrevented, 'Link Enter suppresses a duplicate native click');
+			assert(calls.slice(start).filter((call) => call.command === 'dispatch').length === 1,
+				'Link Enter dispatches exactly one article action');
+			assert(!calls.slice(start).some((call) => call.command === 'key'),
+				'Link Enter never reaches the provider save or instance confirmation keymap');
+		};
 		const preferences = { ...clone(defaults.PreferencesPopupView), youtube_provider_settings_supported: true };
 		snapshot({ preferences_popup: preferences });
 		await until(() => button('YouTube API / Invidious…', dialog()), 'provider settings in Preferences');
@@ -136,6 +151,17 @@
 		assert(document.querySelectorAll('[role=dialog]').length === 1, 'Preferences is parked while the provider child editor is open');
 		assert(!dialog().querySelector('input, textarea'), 'Provider drafts are not copied into browser text controls');
 		assert(button('Save', dialog()) && !button('Save and retry', dialog()), 'Preferences provider changes save without retrying a search');
+		const about = button(aboutUrl, dialog());
+		assert(about?.getAttribute('role') === 'link', 'The closed chooser still shows the complete Wikipedia URL as a link');
+		assert(getComputedStyle(about).textDecorationLine.includes('underline'), 'The Wikipedia URL is visibly underlined');
+		assert(about.disabled, 'An unavailable native opener keeps the article visible but disabled');
+		const beforeAbout = calls.length;
+		about.click();
+		assert(calls.length === beforeAbout, 'A disabled Wikipedia link cannot dispatch an external open');
+		snapshot({ external_opener_available: true });
+		await until(() => !button(aboutUrl, dialog()).disabled, 'available article opener');
+		await action('OpenInvidiousAbout', () => button(aboutUrl, dialog()).click(), 'The Wikipedia link opens through the native action without opening the chooser');
+		await openAboutWithEnter('Focused Enter opens Wikipedia while the chooser is closed');
 		await action({ SelectYouTubeSetupField: 'ApiKey' }, () => button('YouTube API key', dialog()).click(), 'API key field selection uses the shared reducer');
 		await key('k', { Char: 'k' });
 		await key('Backspace', 'Backspace');
@@ -144,6 +170,7 @@
 		const picker = { loading: true, loading_frame: 0, instances: [], selected: 0, error: null };
 		snapshot({ youtube_provider_editor: { ...editor, selected_field: 'InvidiousUrl', invidious_instances: picker } });
 		await until(() => dialog()?.querySelector('[role=status]')?.textContent.includes('|'), 'first loading animation frame');
+		assert(Boolean(button(aboutUrl, dialog())), 'The Wikipedia URL remains visible while instances load');
 		snapshot({ youtube_provider_editor: { ...editor, invidious_instances: { ...picker, loading_frame: 1 } } });
 		await until(() => dialog()?.querySelector('[role=status]')?.textContent.includes('/'), 'second loading animation frame');
 		assert(button('Save', dialog()).disabled, 'An open directory cannot accidentally save the provider draft');
@@ -151,14 +178,18 @@
 		await action('DismissInvidiousInstancePicker', () => button('Close instance list', dialog()).click(), 'Closing the chooser leaves the provider editor open');
 		snapshot({ youtube_provider_editor: { ...editor, invidious_instances: { ...picker, loading: false, error: 'Directory temporarily unavailable' } } });
 		await until(() => dialog()?.textContent.includes('Directory temporarily unavailable'), 'instance directory error');
+		assert(Boolean(button(aboutUrl, dialog())), 'The Wikipedia URL remains visible after a directory error');
 		await action('OpenInvidiousInstancePicker', () => button('Retry', dialog()).click(), 'Directory failure can be retried explicitly');
 		snapshot({ youtube_provider_editor: { ...editor, invidious_instances: { ...picker, loading: false } } });
 		await until(() => dialog()?.textContent.includes('No public instances are available'), 'empty instance directory');
+		assert(Boolean(button(aboutUrl, dialog())), 'The Wikipedia URL remains visible with an empty directory');
 		const instances = Array.from({ length: 30 }, (_, index) => ({ url: `https://instance-${index}.example/`, label: `instance-${index}.example (Fixture)` }));
 		snapshot({ youtube_provider_editor: { ...editor, invidious_instances: { ...picker, loading: false, instances, selected: 29 } } });
 		const selectedInstance = await until(() => dialog()?.querySelector('[role=option][aria-selected=true]'), 'selected instance row');
 		await until(() => dialog()?.querySelector('[role=listbox]')?.scrollTop > 0, 'selected instance scrolls into the bounded list');
 		assert(selectedInstance.textContent.includes('instance-29.example'), 'The controller owns directory selection');
+		await action('OpenInvidiousAbout', () => button(aboutUrl, dialog()).click(), 'The Wikipedia link also opens while the chooser is populated');
+		await openAboutWithEnter('Focused Enter opens Wikipedia while the chooser is populated');
 		dialog().style.width = '260px';
 		dialog().style.maxHeight = '360px';
 		await until(() => dialog()?.clientWidth <= 260, 'narrow provider editor');
@@ -170,6 +201,7 @@
 		assert(!calls.slice(selectionStart).some((call) => call.command === 'dispatch' && call.args.action === 'SubmitYouTubeSetup'), 'Instance selection does not automatically save');
 		snapshot({ youtube_provider_editor: { ...editor, selected_field: 'InvidiousUrl', invidious_url: instances[29].url, invidious_url_length: instances[29].url.length } });
 		await until(() => dialog()?.textContent.includes(instances[29].url), 'safe validated instance URL');
+		assert(Boolean(button(aboutUrl, dialog())), 'The Wikipedia URL remains visible after choosing an instance');
 		await action('SubmitYouTubeSetup', () => button('Save', dialog()).click(), 'Provider Save is a separate explicit action');
 		snapshot({ youtube_provider_editor: { ...editor, validation_failed: true, invidious_url_length: 41 } });
 		await until(() => dialog()?.querySelector('[role=alert]'), 'generic provider validation feedback');
@@ -181,10 +213,11 @@
 		snapshot({ youtube_provider_editor: { ...editor, invidious_supported: false } });
 		await until(() => !button('Choose instance', dialog()), 'feature-disabled Invidious chooser');
 		assert(!button('Invidious instance URL', dialog()), 'Builds without Invidious hide its manual field and directory');
+		assert(!button(aboutUrl, dialog()), 'Builds without Invidious omit the article link');
 		snapshot({ youtube_provider_editor: null, preferences_popup: { ...preferences, youtube_provider_settings_supported: false } });
 		await until(() => dialog()?.textContent.includes('Preferences'), 'restored preferences');
 		assert(!button('YouTube API / Invidious…', dialog()), 'Unsupported builds hide provider settings in Preferences');
-		snapshot({ preferences_popup: null });
+		snapshot({ preferences_popup: null, external_opener_available: defaults.ViewModel.external_opener_available });
 		await until(() => !dialog(), 'closed provider fixtures');
 	}
 	/** Playback choices are display-only snapshots; only explicit actions reach the native reducer. */

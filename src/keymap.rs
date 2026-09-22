@@ -181,6 +181,49 @@ mod wire_tests {
         }
     }
 
+    /// The fixed overview link works without typing into or closing the setup draft.
+    #[test]
+    fn invidious_about_link_works_with_the_picker_open_or_closed() {
+        use crate::view::{
+            INVIDIOUS_ABOUT_URL, InvidiousInstancePickerView, YouTubeSetupPopupView,
+        };
+
+        for picker in [
+            None,
+            Some(InvidiousInstancePickerView::default()),
+            Some(InvidiousInstancePickerView {
+                loading: true,
+                ..InvidiousInstancePickerView::default()
+            }),
+            Some(InvidiousInstancePickerView {
+                error: Some("Directory unavailable".to_owned()),
+                ..InvidiousInstancePickerView::default()
+            }),
+        ] {
+            for external_opener_available in [false, true] {
+                let view = ViewModel {
+                    external_opener_available,
+                    youtube_setup_popup: Some(YouTubeSetupPopupView {
+                        invidious_instances: picker.clone(),
+                        ..YouTubeSetupPopupView::default()
+                    }),
+                    ..ViewModel::default()
+                };
+                assert_eq!(
+                    key_action(KeyPress::new(Key::F(5)), &view, None, None),
+                    (cfg!(feature = "invidious") && external_opener_available)
+                        .then_some(UiAction::OpenInvidiousAbout),
+                    "picker={picker:?}, opener={external_opener_available}"
+                );
+            }
+        }
+        assert_eq!(
+            INVIDIOUS_ABOUT_URL,
+            "https://en.wikipedia.org/wiki/Invidious"
+        );
+        assert!(UiAction::OpenInvidiousAbout.requires_external_opener());
+    }
+
     /// Choosing an instance edits the setup draft; only the closed picker permits Save.
     #[test]
     fn invidious_instance_picker_owns_setup_keys_without_saving() {
@@ -2223,6 +2266,7 @@ fn unfiltered_key_action(
             return match key.key {
                 Key::Esc => Some(UiAction::DismissInvidiousInstancePicker),
                 Key::F(4) => Some(UiAction::OpenInvidiousInstancePicker),
+                Key::F(5) => Some(UiAction::OpenInvidiousAbout),
                 Key::Up if selectable => Some(UiAction::MoveInvidiousInstance(-1)),
                 Key::Down if selectable => Some(UiAction::MoveInvidiousInstance(1)),
                 Key::Enter if selectable => Some(UiAction::ConfirmInvidiousInstance),
@@ -2240,6 +2284,7 @@ fn unfiltered_key_action(
             Key::F(2) => Some(UiAction::OpenGoogleCloudCredentials),
             Key::F(3) => Some(UiAction::OpenInvidiousInstances),
             Key::F(4) if cfg!(feature = "invidious") => Some(UiAction::OpenInvidiousInstancePicker),
+            Key::F(5) if cfg!(feature = "invidious") => Some(UiAction::OpenInvidiousAbout),
             Key::Tab | Key::BackTab | Key::Up | Key::Down => other_field
                 .enabled()
                 .then_some(UiAction::SelectYouTubeSetupField(other_field)),

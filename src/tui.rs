@@ -9586,6 +9586,19 @@ fn render_youtube_setup_popup(
     if inner.width == 0 || inner.height == 0 {
         return;
     }
+    let about_rows = invidious_about_link_rows(inner);
+    let about_area = Rect::new(
+        inner.x,
+        inner.bottom().saturating_sub(about_rows),
+        inner.width,
+        about_rows,
+    );
+    let content_area = Rect::new(
+        inner.x,
+        inner.y,
+        inner.width,
+        inner.height.saturating_sub(about_rows),
+    );
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -9600,7 +9613,7 @@ fn render_youtube_setup_popup(
             }),
             Constraint::Length(1),
         ])
-        .split(inner);
+        .split(content_area);
 
     let picker = setup
         .invidious_instances
@@ -9722,11 +9735,12 @@ fn render_youtube_setup_popup(
         render_invidious_instance_picker(
             frame,
             picker,
-            inner,
+            content_area,
             sections[2].bottom(),
             theme,
             hit_map,
         );
+        render_invidious_about_link(frame, about_area, external_opener_available, theme, hit_map);
         return;
     }
 
@@ -9904,6 +9918,72 @@ fn render_youtube_setup_popup(
             Rect::new(button_x, sections[5].y, width, sections[5].height),
         ));
         button_x = button_x.saturating_add(width).saturating_add(3);
+    }
+    render_invidious_about_link(frame, about_area, external_opener_available, theme, hit_map);
+}
+
+/// Reserves the full Wikipedia URL without hiding tiny-terminal picker controls.
+fn invidious_about_link_rows(available: Rect) -> u16 {
+    if !cfg!(feature = "invidious") || available.width == 0 {
+        return 0;
+    }
+    let rows = terminal_text_width(INVIDIOUS_ABOUT_URL).div_ceil(available.width);
+    if available.height.saturating_sub(rows) >= 4 {
+        rows
+    } else {
+        0
+    }
+}
+
+/// Shows the Wikipedia destination outside the picker with exact URL-cell hitboxes.
+fn render_invidious_about_link(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    external_opener_available: bool,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+) {
+    if !cfg!(feature = "invidious") || area.is_empty() {
+        return;
+    }
+    let url_width = terminal_text_width(INVIDIOUS_ABOUT_URL);
+    let prefix = if external_opener_available && area.width >= url_width.saturating_add(5) {
+        "[F5] "
+    } else {
+        ""
+    };
+    let style = if external_opener_available {
+        theme.accent.add_modifier(Modifier::UNDERLINED)
+    } else {
+        theme.muted
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(prefix, theme.accent),
+            Span::styled(INVIDIOUS_ABOUT_URL, style),
+        ]))
+        .wrap(Wrap { trim: false }),
+        area,
+    );
+    if !external_opener_available {
+        return;
+    }
+    let mut remaining = url_width;
+    for row in 0..area.height {
+        let offset = if row == 0 {
+            terminal_text_width(prefix)
+        } else {
+            0
+        };
+        let width = remaining.min(area.width.saturating_sub(offset));
+        if width == 0 {
+            break;
+        }
+        hit_map.youtube_setup_buttons.push((
+            UiAction::OpenInvidiousAbout,
+            Rect::new(area.x + offset, area.y + row, width, 1),
+        ));
+        remaining = remaining.saturating_sub(width);
     }
 }
 
@@ -14805,6 +14885,7 @@ fn mouse_action_unfiltered(
                                 UiAction::OpenInvidiousInstancePicker
                                     | UiAction::DismissInvidiousInstancePicker
                                     | UiAction::SelectInvidiousInstance(_)
+                                    | UiAction::OpenInvidiousAbout
                             )
                     })
                     .map(|(action, _)| action.clone()),
@@ -34318,7 +34399,7 @@ prose 07:25 remains clickable but is not a chapter";
         );
         assert_eq!(
             hit_map.youtube_setup_buttons.len(),
-            5 + usize::from(cfg!(feature = "invidious"))
+            5 + 2 * usize::from(cfg!(feature = "invidious"))
         );
     }
 
@@ -34451,6 +34532,10 @@ prose 07:25 remains clickable but is not a chapter";
         let rendered = rendered_text(&terminal);
         assert!(rendered.contains("https://manual.example"));
         assert_eq!(
+            rendered.contains(INVIDIOUS_ABOUT_URL),
+            cfg!(feature = "invidious")
+        );
+        assert_eq!(
             rendered.contains("[F4] Choose instance"),
             cfg!(feature = "invidious")
         );
@@ -34495,6 +34580,173 @@ prose 07:25 remains clickable but is not a chapter";
                     &view
                 ),
                 Some(UiAction::OpenInvidiousInstancePicker)
+            );
+        }
+    }
+
+    /// The Wikipedia destination remains readable and clickable with or without the picker.
+    #[cfg(feature = "invidious")]
+    #[test]
+    fn youtube_setup_exposes_the_invidious_about_url_in_every_picker_state() {
+        let picker_states = [
+            None,
+            Some(InvidiousInstancePickerView {
+                loading: true,
+                ..InvidiousInstancePickerView::default()
+            }),
+            Some(InvidiousInstancePickerView {
+                error: Some("Directory temporarily unavailable".to_owned()),
+                ..InvidiousInstancePickerView::default()
+            }),
+            Some(InvidiousInstancePickerView::default()),
+            Some(InvidiousInstancePickerView {
+                instances: vec![InvidiousInstanceView {
+                    label: "Public instance".to_owned(),
+                    url: "https://video.example".to_owned(),
+                }],
+                ..InvidiousInstancePickerView::default()
+            }),
+        ];
+        for (width, height) in [(80, 24), (140, 34)] {
+            for picker in &picker_states {
+                for external_opener_available in [false, true] {
+                    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                    let view = ViewModel {
+                        external_opener_available,
+                        youtube_setup_popup: Some(YouTubeSetupPopupView {
+                            invidious_instances: picker.clone(),
+                            ..YouTubeSetupPopupView::default()
+                        }),
+                        ..ViewModel::default()
+                    };
+                    let mut hits = HitMap::default();
+                    terminal
+                        .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hits))
+                        .unwrap();
+                    assert!(
+                        rendered_text(&terminal).contains(INVIDIOUS_ABOUT_URL),
+                        "the full Wikipedia URL must survive picker overlays at {width}x{height}"
+                    );
+                    let targets = hits
+                        .youtube_setup_buttons
+                        .iter()
+                        .filter_map(|(action, area)| {
+                            (*action == UiAction::OpenInvidiousAbout).then_some(*area)
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(!targets.is_empty(), external_opener_available);
+                    let mut linked_text = String::new();
+                    for target in targets {
+                        for column in target.x..target.right() {
+                            let cell = &terminal.backend().buffer()[(column, target.y)];
+                            linked_text.push_str(cell.symbol());
+                            assert_eq!((cell.fg, cell.bg), (Color::Cyan, Color::Reset));
+                            assert!(cell.modifier.contains(Modifier::UNDERLINED));
+                            assert_eq!(
+                                mouse_action(
+                                    MouseEvent {
+                                        kind: MouseEventKind::Down(MouseButton::Left),
+                                        column,
+                                        row: target.y,
+                                        modifiers: KeyModifiers::NONE,
+                                    },
+                                    &hits,
+                                    &view,
+                                ),
+                                Some(UiAction::OpenInvidiousAbout)
+                            );
+                        }
+                    }
+                    if external_opener_available {
+                        assert_eq!(linked_text, INVIDIOUS_ABOUT_URL);
+                    } else {
+                        assert!(!rendered_text(&terminal).contains("[F5]"));
+                        let stale_hits = HitMap {
+                            youtube_setup_buttons: vec![(
+                                UiAction::OpenInvidiousAbout,
+                                Rect::new(2, 2, 4, 1),
+                            )],
+                            ..HitMap::default()
+                        };
+                        assert_eq!(
+                            mouse_action(
+                                MouseEvent {
+                                    kind: MouseEventKind::Down(MouseButton::Left),
+                                    column: 2,
+                                    row: 2,
+                                    modifiers: KeyModifiers::NONE,
+                                },
+                                &stale_hits,
+                                &view,
+                            ),
+                            None,
+                            "unavailable external openers reject stale Wikipedia link targets"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Wrapped Wikipedia URL cells cannot steal list or retry/close targets.
+    #[cfg(feature = "invidious")]
+    #[test]
+    fn youtube_setup_invidious_about_url_wraps_without_overlapping_picker_controls() {
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        let view = ViewModel {
+            external_opener_available: true,
+            youtube_setup_popup: Some(YouTubeSetupPopupView {
+                invidious_instances: Some(InvidiousInstancePickerView {
+                    instances: (0..12)
+                        .map(|index| InvidiousInstanceView {
+                            label: format!("Instance {index}"),
+                            url: format!("https://video{index}.example"),
+                        })
+                        .collect(),
+                    selected: 9,
+                    ..InvidiousInstancePickerView::default()
+                }),
+                ..YouTubeSetupPopupView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut hits = HitMap::default();
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hits))
+            .unwrap();
+        assert!(rendered_text(&terminal).contains("Instance 9"));
+        let mut linked_text = String::new();
+        for (action, target) in &hits.youtube_setup_buttons {
+            assert!(target.right() <= 40 && target.bottom() <= 12);
+            if *action == UiAction::OpenInvidiousAbout {
+                for column in target.x..target.right() {
+                    linked_text.push_str(terminal.backend().buffer()[(column, target.y)].symbol());
+                    assert_eq!(
+                        mouse_action(
+                            MouseEvent {
+                                kind: MouseEventKind::Down(MouseButton::Left),
+                                column,
+                                row: target.y,
+                                modifiers: KeyModifiers::NONE,
+                            },
+                            &hits,
+                            &view,
+                        ),
+                        Some(UiAction::OpenInvidiousAbout)
+                    );
+                }
+            }
+        }
+        assert_eq!(linked_text, INVIDIOUS_ABOUT_URL);
+        for action in [
+            UiAction::SelectInvidiousInstance(9),
+            UiAction::OpenInvidiousInstancePicker,
+            UiAction::DismissInvidiousInstancePicker,
+        ] {
+            assert!(
+                hits.youtube_setup_buttons
+                    .iter()
+                    .any(|(candidate, _)| *candidate == action)
             );
         }
     }
@@ -35177,7 +35429,7 @@ prose 07:25 remains clickable but is not a chapter";
         }
         assert_eq!(
             hit_map.youtube_setup_buttons.len(),
-            5 + usize::from(cfg!(feature = "invidious"))
+            5 + 2 * usize::from(cfg!(feature = "invidious"))
         );
     }
 

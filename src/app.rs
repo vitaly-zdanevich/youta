@@ -306,16 +306,17 @@ use crate::view::{ChannelDownloadOption, ChannelDownloadPopupView};
 use crate::view::{
     ClipboardRequest, ClipboardSubject, DetailTimecodeView, DetailVideoLinkView, DetailView,
     DetailWikidataMediaView, DetailsScroll, DetailsTextSelection, ErrorPopupScroll, ErrorPopupView,
-    GOOGLE_CLOUD_CREDENTIALS_URL, GitHubIssueSubmissionView, INVIDIOUS_INSTANCES_URL,
-    LocalFilePopupView, LocalSizeSort, LocalVideoThumbnailView, MAX_DETAILS_SELECTION_BYTES,
-    NowPlayingView, PlaylistChoiceView, PlaylistEditorField, PlaylistItemView, PlaylistPopupMode,
-    PlaylistPopupView, PreferencesPopupView, PrivateNoteCursorMotion, PrivateNotePopupView,
-    ProjectCommitView, ProjectHistoryPopupView, ProjectHistoryRemoteState, QueuePopupView,
-    QueueRowView, RightPanelMode, RowView, RssSubscriptionPopupView, Screen, SearchActivity,
-    SearchKind, SubscriptionPane, SubscriptionRoute, UiAction, UiController, VideoCommentView,
-    VideoCommentsPopupState, VideoCommentsPopupView, VideoSummaryPopupState, ViewModel,
-    WaveformView, YANDEX_OAUTH_GUIDE_URL, YOUTUBE_API_KEY_GUIDE_URL, YouTubeSearchSort,
-    YouTubeSetupField, YouTubeSetupPopupView,
+    GOOGLE_CLOUD_CREDENTIALS_URL, GitHubIssueSubmissionView, INVIDIOUS_ABOUT_URL,
+    INVIDIOUS_INSTANCES_URL, LocalFilePopupView, LocalSizeSort, LocalVideoThumbnailView,
+    MAX_DETAILS_SELECTION_BYTES, NowPlayingView, PlaylistChoiceView, PlaylistEditorField,
+    PlaylistItemView, PlaylistPopupMode, PlaylistPopupView, PreferencesPopupView,
+    PrivateNoteCursorMotion, PrivateNotePopupView, ProjectCommitView, ProjectHistoryPopupView,
+    ProjectHistoryRemoteState, QueuePopupView, QueueRowView, RightPanelMode, RowView,
+    RssSubscriptionPopupView, Screen, SearchActivity, SearchKind, SubscriptionPane,
+    SubscriptionRoute, UiAction, UiController, VideoCommentView, VideoCommentsPopupState,
+    VideoCommentsPopupView, VideoSummaryPopupState, ViewModel, WaveformView,
+    YANDEX_OAUTH_GUIDE_URL, YOUTUBE_API_KEY_GUIDE_URL, YouTubeSearchSort, YouTubeSetupField,
+    YouTubeSetupPopupView,
 };
 #[cfg(feature = "wikidata")]
 use crate::view::{
@@ -2403,6 +2404,8 @@ pub const fn search_route(screen: Screen) -> SearchRoute {
 }
 
 enum ProviderRequest {
+    /// Disable both worker lanes while invalidating requests queued under the old adapter.
+    ClearYouTubeProvider,
     ReplaceYouTubeProvider {
         provider: Box<dyn Provider>,
     },
@@ -7221,6 +7224,8 @@ impl AppController {
         }
         let api_key = popup.api_key.trim().to_owned();
         let invidious_url = popup.invidious_url.trim().to_owned();
+        let clearing_invidious =
+            selected_field == YouTubeSetupField::InvidiousUrl && invidious_url.is_empty();
 
         let (provider, setting, provider_name) = match selected_field {
             YouTubeSetupField::ApiKey => {
@@ -7232,9 +7237,22 @@ impl AppController {
                     }
                 };
                 (
-                    provider,
+                    Some(provider),
                     YouTubeProviderSetting::OfficialApiKey(api_key),
                     "official YouTube Data API",
+                )
+            }
+            YouTubeSetupField::InvidiousUrl if clearing_invidious => {
+                // Construction is local: clearing must not probe an instance or
+                // validate an unsaved API-key draft from the other editor field.
+                let effective = self.config.providers_after_invidious_clear();
+                let provider = crate::providers::configured_youtube_provider(&effective)
+                    .ok()
+                    .flatten();
+                (
+                    provider,
+                    YouTubeProviderSetting::ClearInvidious,
+                    "configured YouTube metadata",
                 )
             }
             YouTubeSetupField::InvidiousUrl => {
@@ -7255,24 +7273,31 @@ impl AppController {
                     }
                 };
                 (
-                    provider,
+                    Some(provider),
                     YouTubeProviderSetting::InvidiousUrl(base_url),
                     "Invidious",
                 )
             }
         };
 
-        let channel_statistics_mode = provider.channel_statistics_mode();
-        let video_comments_supported = provider.capabilities().video_comments;
+        let provider_available = provider.is_some();
+        let channel_statistics_mode = provider
+            .as_ref()
+            .map_or(ChannelStatisticsMode::Unsupported, |provider| {
+                provider.channel_statistics_mode()
+            });
+        let video_comments_supported = provider
+            .as_ref()
+            .is_some_and(|provider| provider.capabilities().video_comments);
         if let Err(error) = self.config.save_youtube_provider(setting) {
             self.set_youtube_setup_error(error.to_string());
             self.show_error("Could not save YouTube provider configuration", &error);
             return;
         }
-        if !self.send_provider_request(
-            ProviderRequest::ReplaceYouTubeProvider { provider },
-            "Could not initialize the YouTube provider",
-        ) {
+        let request = provider.map_or(ProviderRequest::ClearYouTubeProvider, |provider| {
+            ProviderRequest::ReplaceYouTubeProvider { provider }
+        });
+        if !self.send_provider_request(request, "Could not initialize the YouTube provider") {
             return;
         }
 
@@ -7345,9 +7370,40 @@ impl AppController {
             self.subscription_video_cache.clear();
             self.subscription_cache_order.clear();
         }
-        self.youtube_provider_available = true;
+        self.youtube_provider_available = provider_available;
         self.view.youtube_setup_popup = None;
         self.dismiss_invidious_instance_picker();
+        if clearing_invidious {
+            let returned_to_preferences = self.restore_youtube_setup_preferences();
+            let overrides = [
+                crate::config::INVIDIOUS_BASE_URL_ENV,
+                crate::config::YOUTUBE_BACKEND_ENV,
+            ]
+            .into_iter()
+            .filter(|name| std::env::var_os(name).is_some())
+            .collect::<Vec<_>>();
+            self.view.status_line = if overrides.is_empty() {
+                format!(
+                    "Invidious disabled; {}{}",
+                    if provider_available {
+                        "using the saved YouTube API key"
+                    } else {
+                        "YouTube metadata is not configured"
+                    },
+                    if returned_to_preferences {
+                        "; returned to unsaved preferences"
+                    } else {
+                        ""
+                    }
+                )
+            } else {
+                format!(
+                    "Saved Invidious URL cleared; {} still overrides the file; remove it to change the active provider",
+                    overrides.join(", ")
+                )
+            };
+            return;
+        }
         if self.restore_youtube_setup_preferences() {
             self.view.status_line =
                 format!("Using {provider_name}; returned to unsaved preferences");
@@ -30822,8 +30878,12 @@ impl AppController {
     where
         E: std::error::Error + 'static,
     {
+        let message = error.to_string();
+        if self.show_provider_http_500_message(title, &message) {
+            return;
+        }
         #[cfg(feature = "yt-dlp")]
-        if message_reports_yt_dlp_http_403(&error.to_string()) {
+        if message_reports_yt_dlp_http_403(&message) {
             let report =
                 DiagnosticReport::capture_error(error, self.unprobed_diagnostic_helpers()).render();
             self.show_yt_dlp_forbidden_report(report);
@@ -30836,6 +30896,9 @@ impl AppController {
 
     fn show_error_message(&mut self, title: &str, message: impl std::fmt::Display) {
         let message = message.to_string();
+        if self.show_provider_http_500_message(title, &message) {
+            return;
+        }
         #[cfg(feature = "yt-dlp")]
         if message_reports_yt_dlp_http_403(&message) {
             let report =
@@ -30848,6 +30911,34 @@ impl AppController {
             DiagnosticReport::capture_message(&message, self.diagnostic_helpers()).render();
         self.show_diagnostic_report(title, report);
         self.view.status_line = format!("{title}: {message}");
+    }
+
+    /// Shows a provider HTTP 500 without probing helpers or generating a
+    /// Youta bug report for an external service failure.
+    ///
+    /// Workers stringify provider errors, so both error entry points recognize
+    /// the exact canonical message, including validated request-owned instance
+    /// context. Other contextual errors keep their diagnostics.
+    fn show_provider_http_500_message(&mut self, title: &str, message: &str) -> bool {
+        let named_invidious = message
+            .strip_prefix("Invidious (")
+            .and_then(|rest| rest.strip_suffix(") returned HTTP status 500"))
+            .filter(|base| base.len() <= 2_048 && !base.chars().any(char::is_control))
+            .and_then(|base| url::Url::parse(base).ok())
+            .is_some_and(|base| {
+                matches!(base.scheme(), "http" | "https")
+                    && base.host_str().is_some()
+                    && base.username().is_empty()
+                    && base.password().is_none()
+                    && base.query().is_none()
+                    && base.fragment().is_none()
+            });
+        if message != "provider returned HTTP status 500" && !named_invidious {
+            return false;
+        }
+        self.show_actionable_message(title, message);
+        self.view.status_line = format!("{title}: {message}");
+        true
     }
 
     /// Presents an actionable restart conflict without manufacturing a bug report.
@@ -31078,7 +31169,7 @@ impl AppController {
         self.show_report_popup(title.into(), report.into(), true);
     }
 
-    /// Opens a concise local setup message without offering issue submission.
+    /// Opens concise setup or service guidance without offering issue submission.
     fn show_actionable_message(&mut self, title: impl Into<String>, report: impl Into<String>) {
         self.show_report_popup(title.into(), report.into(), false);
     }
@@ -35659,6 +35750,9 @@ impl UiController for AppController {
             UiAction::OpenInvidiousInstances => {
                 self.open_external_url(INVIDIOUS_INSTANCES_URL);
             }
+            UiAction::OpenInvidiousAbout => {
+                self.open_external_url(INVIDIOUS_ABOUT_URL);
+            }
             UiAction::OpenInvidiousInstancePicker => self.open_invidious_instance_picker(),
             UiAction::MoveInvidiousInstance(delta) => self.move_invidious_instance(delta),
             UiAction::SelectInvidiousInstance(index) => self.select_invidious_instance(index),
@@ -38227,6 +38321,15 @@ fn replace_shared_youtube_provider(
     state.provider = Some(Arc::from(replacement));
 }
 
+/// Removes the adapter from both lanes and invalidates earlier routing snapshots.
+fn clear_shared_youtube_provider(provider: &SharedYouTubeProvider) {
+    let mut state = provider
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.epoch = state.epoch.wrapping_add(1);
+    state.provider = None;
+}
+
 /// Executes one page against its routing-time provider snapshot.
 fn load_youtube_channel_page(
     snapshot: &YouTubeProviderSnapshot,
@@ -38457,6 +38560,9 @@ fn provider_worker(
                     break;
                 };
                 match request {
+                    ProviderRequest::ClearYouTubeProvider => {
+                        clear_shared_youtube_provider(&provider);
+                    }
                     ProviderRequest::ReplaceYouTubeProvider { provider: replacement } => {
                         replace_shared_youtube_provider(&provider, replacement);
                     }
@@ -38792,6 +38898,9 @@ fn general_provider_worker(
         }
         let routed_youtube_provider = youtube_provider.and_then(|snapshot| snapshot.provider);
         match request {
+            ProviderRequest::ClearYouTubeProvider => {
+                clear_shared_youtube_provider(&provider);
+            }
             ProviderRequest::ReplaceYouTubeProvider {
                 provider: replacement,
             } => {
@@ -71737,6 +71846,184 @@ mod tests {
     }
 
     /// Saving either provider returns to Preferences without submitting another screen's query.
+    #[cfg(feature = "invidious")]
+    #[test]
+    fn empty_invidious_setup_disables_instance_preserves_key_and_unrelated_preferences() {
+        for stored_key in [None, Some("AIzaSyPreserved_key_123456789012345678")] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut config = Config::for_dir(directory.path().join("youta"));
+            if let Some(key) = stored_key {
+                config
+                    .save_youtube_provider(YouTubeProviderSetting::OfficialApiKey(key.into()))
+                    .unwrap();
+            }
+            config
+                .save_youtube_provider(YouTubeProviderSetting::InvidiousUrl(
+                    url::Url::parse("https://previous.example.org/").unwrap(),
+                ))
+                .unwrap();
+            let credentials = std::fs::read(config.credentials_file()).ok();
+            let mut controller = AppController::new(
+                config,
+                StateStore::open_in_memory().unwrap(),
+                Some(Box::new(EmptyYouTubeProvider)),
+                None,
+            );
+            let (sender, requests) = unbounded();
+            controller.provider_requests = Some(sender);
+            controller.view.screen = Screen::Local;
+            controller.view.search_query = "unrelated folder query".into();
+            controller.view.search_activity = Some(SearchActivity::ArchiveOrg);
+            controller.dispatch(UiAction::OpenPreferences);
+            controller.dispatch(UiAction::ToggleSkipAdvertisementChapters);
+            controller.dispatch(UiAction::OpenYouTubeProviderSettings);
+            let draft = controller.youtube_setup_preferences.clone();
+            let popup = controller.view.youtube_setup_popup.as_mut().unwrap();
+            popup.selected_field = YouTubeSetupField::InvidiousUrl;
+            popup.invidious_url = "   ".into();
+            popup.api_key = "unsaved field must not replace an existing key".into();
+
+            controller.dispatch(UiAction::SubmitYouTubeSetup);
+
+            assert!(
+                controller.view.youtube_setup_popup.is_none(),
+                "empty instance must save"
+            );
+            assert!(controller.view.error_popup.is_none());
+            assert_eq!(controller.view.preferences_popup, draft);
+            assert_eq!(controller.config.providers.invidious_base_url, None);
+            assert_eq!(
+                controller.config.providers.youtube_backend,
+                YouTubeBackend::Auto
+            );
+            assert_eq!(
+                controller.config.providers.youtube_api_key.as_deref(),
+                stored_key
+            );
+            assert_eq!(
+                std::fs::read(controller.config.credentials_file()).ok(),
+                credentials
+            );
+            assert_eq!(
+                controller.youtube_provider_available,
+                stored_key.is_some() && cfg!(feature = "youtube-official")
+            );
+            assert_eq!(controller.view.screen, Screen::Local);
+            assert_eq!(controller.view.search_query, "unrelated folder query");
+            assert_eq!(
+                controller.view.search_activity,
+                Some(SearchActivity::ArchiveOrg)
+            );
+            let request = requests.try_recv().expect("one worker provider update");
+            if controller.youtube_provider_available {
+                assert!(matches!(
+                    request,
+                    ProviderRequest::ReplaceYouTubeProvider { .. }
+                ));
+            } else {
+                assert!(matches!(request, ProviderRequest::ClearYouTubeProvider));
+            }
+            assert!(
+                requests.try_recv().is_err(),
+                "clearing must not start a network request"
+            );
+        }
+    }
+
+    /// Clearing from an initial setup does not immediately reopen it by retrying.
+    #[cfg(feature = "invidious")]
+    #[test]
+    fn empty_invidious_setup_waits_for_next_explicit_search_when_no_key_exists() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = Config::for_dir(directory.path().join("youta"));
+        let mut controller =
+            AppController::new(config, StateStore::open_in_memory().unwrap(), None, None);
+        let (sender, requests) = unbounded();
+        controller.provider_requests = Some(sender);
+        controller.view.search_query = "preserve this search".into();
+        controller.open_youtube_setup();
+        controller
+            .view
+            .youtube_setup_popup
+            .as_mut()
+            .unwrap()
+            .selected_field = YouTubeSetupField::InvidiousUrl;
+        controller.dispatch(UiAction::SubmitYouTubeSetup);
+        assert!(controller.view.youtube_setup_popup.is_none());
+        assert!(!controller.youtube_provider_available);
+        assert!(matches!(
+            requests.try_recv().unwrap(),
+            ProviderRequest::ClearYouTubeProvider
+        ));
+        assert!(requests.try_recv().is_err());
+        controller.dispatch(UiAction::SubmitSearch);
+        assert!(controller.view.youtube_setup_popup.is_some());
+        assert_eq!(controller.view.search_query, "preserve this search");
+        assert!(requests.try_recv().is_err());
+    }
+
+    /// A failed clear keeps the child editor and its parent's unsaved draft intact.
+    #[cfg(feature = "invidious")]
+    #[test]
+    fn empty_invidious_setup_save_failure_retains_provider_and_parked_draft() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = Config::for_dir(directory.path().join("youta"));
+        config
+            .save_youtube_provider(YouTubeProviderSetting::InvidiousUrl(
+                url::Url::parse("https://previous.example.org/").unwrap(),
+            ))
+            .unwrap();
+        let mut controller = AppController::new(
+            config,
+            StateStore::open_in_memory().unwrap(),
+            Some(Box::new(EmptyYouTubeProvider)),
+            None,
+        );
+        use_mock_diagnostics(&mut controller);
+        let (sender, requests) = unbounded();
+        controller.provider_requests = Some(sender);
+        controller.dispatch(UiAction::OpenPreferences);
+        controller.dispatch(UiAction::OpenYouTubeProviderSettings);
+        let before = controller.config.clone();
+        let draft = controller.youtube_setup_preferences.clone();
+        let popup = controller.view.youtube_setup_popup.as_mut().unwrap();
+        popup.selected_field = YouTubeSetupField::InvidiousUrl;
+        popup.invidious_url.clear();
+        std::fs::write(controller.config.config_file(), "[providers\nmalformed").unwrap();
+        controller.dispatch(UiAction::SubmitYouTubeSetup);
+        assert_eq!(controller.config, before);
+        assert!(controller.youtube_provider_available);
+        assert_eq!(controller.youtube_setup_preferences, draft);
+        assert!(controller.view.preferences_popup.is_none());
+        assert!(
+            controller
+                .view
+                .youtube_setup_popup
+                .as_ref()
+                .unwrap()
+                .validation_error
+                .is_some()
+        );
+        assert!(requests.try_recv().is_err());
+    }
+
+    /// Clearing invalidates both worker lanes' snapshots before any queued call can reuse them.
+    #[cfg(feature = "invidious")]
+    #[test]
+    fn empty_invidious_setup_removes_shared_worker_provider_and_invalidates_old_epoch() {
+        let provider = Arc::new(RwLock::new(YouTubeProviderState {
+            epoch: 7,
+            provider: Some(Arc::new(EmptyYouTubeProvider)),
+        }));
+        let old = youtube_provider_snapshot(&provider);
+        clear_shared_youtube_provider(&provider);
+        let current = youtube_provider_snapshot(&provider);
+        assert!(current.provider.is_none());
+        assert!(!youtube_provider_snapshot_is_current(&provider, &old));
+        assert!(youtube_provider_snapshot_is_current(&provider, &current));
+    }
+
+    /// Saving either provider returns to Preferences without submitting another screen's query.
     #[cfg(any(feature = "youtube-official", feature = "invidious"))]
     #[test]
     fn preferences_youtube_provider_save_replaces_only_provider_and_restores_draft() {
@@ -72584,6 +72871,108 @@ mod tests {
         (controller, requests, cancelled)
     }
 
+    /// A provider's HTTP 500 is a service failure, not a full application diagnostic.
+    #[test]
+    fn provider_http_500_details_failure_is_concise_without_helper_probes() {
+        let (mut controller, _) =
+            controller_with_mock_statuses(Vec::<crate::playback::PlaybackStatus>::new());
+        controller.report_actions = Box::new(MockDiagnosticActions {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            gh_available: true,
+            submission_result: Mutex::new(None),
+        });
+        let message = crate::providers::ProviderError::HttpStatus(500).to_string();
+
+        controller.handle_provider_response(ProviderResponse::Details {
+            generation: controller.details_generation,
+            result: Err(message.clone()),
+        });
+
+        let popup = controller
+            .view
+            .error_popup
+            .as_ref()
+            .expect("HTTP 500 popup");
+        assert_eq!(popup.title, "Video details failed");
+        assert_eq!(popup.report, message);
+        assert!(!popup.reportable);
+        assert!(!popup.gh_available);
+        assert!(popup.yt_dlp_forbidden.is_none());
+        assert_eq!(popup.scroll_offset, 0);
+        assert!(controller.diagnostic_helpers_cache.is_none());
+        assert_eq!(
+            controller.view.status_line,
+            "Video details failed: provider returned HTTP status 500"
+        );
+    }
+
+    /// Direct provider errors use the same concise policy as worker messages.
+    #[test]
+    fn provider_http_500_typed_error_is_concise_without_helper_probes() {
+        let (mut controller, _) =
+            controller_with_mock_statuses(Vec::<crate::playback::PlaybackStatus>::new());
+
+        controller.show_error(
+            "Provider request failed",
+            &crate::providers::ProviderError::HttpStatus(500),
+        );
+
+        let popup = controller
+            .view
+            .error_popup
+            .as_ref()
+            .expect("HTTP 500 popup");
+        assert_eq!(popup.report, "provider returned HTTP status 500");
+        assert!(!popup.reportable);
+        assert!(!popup.gh_available);
+        assert!(controller.diagnostic_helpers_cache.is_none());
+    }
+
+    /// Similar text must not discard useful diagnostics for other failures.
+    #[test]
+    fn named_invidious_http_500_is_concise_and_preserves_request_instance() {
+        let (mut controller, _) = controller_with_mock_statuses([]);
+        controller.config.providers.invidious_base_url =
+            Some(url::Url::parse("https://new-instance.example/").unwrap());
+        let message =
+            "Invidious (https://request-instance.example/proxy/) returned HTTP status 500";
+        controller.show_error_message("Video details failed", message);
+        let popup = controller.view.error_popup.as_ref().unwrap();
+        assert_eq!(popup.report, message);
+        assert!(!popup.reportable);
+        assert!(controller.diagnostic_helpers_cache.is_none());
+    }
+
+    /// Similar text must not discard useful diagnostics for other failures.
+    #[test]
+    fn provider_http_500_policy_does_not_match_other_errors_or_substrings() {
+        let (mut controller, _) =
+            controller_with_mock_statuses(Vec::<crate::playback::PlaybackStatus>::new());
+        controller.diagnostic_helpers_cache = Some(Vec::new());
+        for message in [
+            "provider returned HTTP status 401",
+            "provider returned HTTP status 5000",
+            "invalid response: provider returned HTTP status 500",
+            "provider returned HTTP status 500\nAdditional diagnostic context",
+            "Invidious (https://instance.example/) returned HTTP status 5000",
+            "Invidious (https://user:password@instance.example/) returned HTTP status 500",
+            "Invidious (https://instance.example/?token=secret) returned HTTP status 500",
+        ] {
+            controller.show_error_message("Provider request failed", message);
+            let popup = controller
+                .view
+                .error_popup
+                .as_ref()
+                .expect("diagnostic popup");
+            assert!(popup.reportable, "{message}");
+            assert!(
+                popup.report.contains("Youta diagnostic report"),
+                "{message}"
+            );
+            assert!(popup.report.contains("Cargo.lock packages"), "{message}");
+        }
+    }
+
     #[test]
     fn operational_error_opens_a_redacted_complete_diagnostic_popup() {
         let (mut controller, _) =
@@ -72837,6 +73226,35 @@ mod tests {
         controller.drain_github_issue_submission_results();
         controller.dispatch(UiAction::Quit);
         assert!(controller.view.quitting);
+    }
+
+    /// Opening provider help must neither save credentials nor dismiss its picker.
+    #[test]
+    fn invidious_about_link_preserves_setup_and_respects_opener_policy() {
+        let (mut controller, _) =
+            controller_with_mock_statuses(Vec::<crate::playback::PlaybackStatus>::new());
+        let draft = YouTubeSetupPopupView {
+            api_key: "unsaved-fixture-key".to_owned(),
+            invidious_url: "https://fixture.example/".to_owned(),
+            invidious_instances: Some(crate::view::InvidiousInstancePickerView::default()),
+            ..YouTubeSetupPopupView::default()
+        };
+        controller.view.youtube_setup_popup = Some(draft.clone());
+        // Exercise dispatch without launching a real browser in the test runner.
+        controller.url_open_pending = MAX_URL_OPEN_TASKS;
+        for (available, status) in [
+            (
+                false,
+                "External URL opening is unavailable on this Linux virtual console",
+            ),
+            (true, "Wait for an earlier system-opener request to finish"),
+        ] {
+            controller.view.external_opener_available = available;
+            controller.dispatch(UiAction::OpenInvidiousAbout);
+            assert_eq!(controller.view.status_line, status);
+            assert_eq!(controller.view.youtube_setup_popup.as_ref(), Some(&draft));
+            assert_eq!(controller.url_open_pending, MAX_URL_OPEN_TASKS);
+        }
     }
 
     #[test]

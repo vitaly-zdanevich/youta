@@ -2102,8 +2102,12 @@ export function LocalFilePopup({ popup }: { popup: LocalFilePopupView }) {
  * Provider replacement without reflecting credentials into the web view.
  * Button-shaped fields use App's existing sendKey path; the reducer owns every
  * typed character, selected directory row, validation result and save decision.
+ * The article link uses the native opener, preserving the embedded app view.
  */
-export function YouTubeProviderPopup({ editor }: { editor: YouTubeProviderEditorView }) {
+export function YouTubeProviderPopup({ editor, externalOpenerAvailable }: {
+	editor: YouTubeProviderEditorView;
+	externalOpenerAvailable: boolean;
+}) {
 	const picker = editor.invidious_supported ? editor.invidious_instances : null;
 	const selected = useRef<HTMLButtonElement>(null);
 	useEffect(() => {
@@ -2149,9 +2153,27 @@ export function YouTubeProviderPopup({ editor }: { editor: YouTubeProviderEditor
 					</button>
 				))}
 				{editor.invidious_supported ? (
-					<PopupButton onClick={() => void dispatch('OpenInvidiousInstancePicker')}>
-						{picker ? 'Retry' : 'Choose instance'}
-					</PopupButton>
+					<>
+						<p className='m-0 min-w-0 text-ink-dim'>
+							About Invidious:{' '}
+							<button type='button' role='link' disabled={!externalOpenerAvailable}
+								title='Open the Wikipedia article about Invidious in your browser'
+								onClick={() => void dispatch('OpenInvidiousAbout')}
+								onKeyDown={(event) => {
+									if (event.key !== 'Enter') return;
+									// A focused link owns Enter instead of the editor's save/confirm keymap.
+									event.preventDefault();
+									event.stopPropagation();
+									if (externalOpenerAvailable) void dispatch('OpenInvidiousAbout');
+								}}
+								className='max-w-full break-all text-left text-accent underline underline-offset-2 disabled:cursor-default disabled:opacity-50 not-disabled:hover:brightness-125 focus-visible:outline-2 focus-visible:outline-accent'>
+								https://en.wikipedia.org/wiki/Invidious
+							</button>
+						</p>
+						<PopupButton onClick={() => void dispatch('OpenInvidiousInstancePicker')}>
+							{picker ? 'Retry' : 'Choose instance'}
+						</PopupButton>
+					</>
 				) : null}
 				{picker ? (
 					<section aria-label='Public Invidious instances' className='grid min-w-0 gap-2 rounded-[5px] border border-line-strong p-2'>

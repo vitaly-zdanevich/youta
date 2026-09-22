@@ -465,6 +465,8 @@ impl Config {
     /// Youta refuses to write the selection while [`YOUTUBE_BACKEND_ENV`] or
     /// the selected provider's value-specific environment variable is present,
     /// because that override would shadow the saved setting on the next start.
+    /// Clearing an instance is different: it removes the saved URL even when
+    /// the environment overrides it, leaving the effective override intact.
     ///
     /// # Errors
     ///
@@ -476,9 +478,13 @@ impl Config {
         &mut self,
         setting: YouTubeProviderSetting,
     ) -> Result<(), ConfigError> {
+        if matches!(setting, YouTubeProviderSetting::ClearInvidious) {
+            return self.clear_invidious_provider();
+        }
         let value_override = match &setting {
             YouTubeProviderSetting::OfficialApiKey(_) => YOUTUBE_API_KEY_ENV,
             YouTubeProviderSetting::InvidiousUrl(_) => INVIDIOUS_BASE_URL_ENV,
+            YouTubeProviderSetting::ClearInvidious => unreachable!("clearing is handled above"),
         };
         for variable in [YOUTUBE_BACKEND_ENV, value_override] {
             if std::env::var_os(variable).is_some() {
@@ -500,6 +506,7 @@ impl Config {
             YouTubeProviderSetting::InvidiousUrl(url) => {
                 ValidatedSetting::InvidiousUrl(validate_provider_url(url, "Invidious")?)
             }
+            YouTubeProviderSetting::ClearInvidious => unreachable!("clearing is handled above"),
         };
         let backend = match &setting {
             ValidatedSetting::OfficialApiKey(_) => YouTubeBackend::Official,
@@ -544,6 +551,36 @@ impl Config {
                 self.providers.invidious_base_url = Some(url);
             }
         }
+        Ok(())
+    }
+
+    /// Computes the effective provider configuration after removing the saved instance.
+    ///
+    /// Environment values still win over disk and are never silently erased.
+    #[cfg(feature = "controller")]
+    pub(crate) fn providers_after_invidious_clear(&self) -> ProviderConfig {
+        let mut providers = self.providers.clone();
+        if std::env::var_os(INVIDIOUS_BASE_URL_ENV).is_none() {
+            providers.invidious_base_url = None;
+        }
+        if std::env::var_os(YOUTUBE_BACKEND_ENV).is_none() {
+            providers.youtube_backend = YouTubeBackend::Auto;
+        }
+        providers
+    }
+
+    /// Clears only the saved instance and backend choice, leaving credentials untouched.
+    #[cfg(feature = "controller")]
+    fn clear_invidious_provider(&mut self) -> Result<(), ConfigError> {
+        let effective = self.providers_after_invidious_clear();
+        self.ensure_directories()?;
+        let path = self.config_file();
+        let mut document = read_editable_config(&path)?;
+        let providers = editable_table(&mut document, "providers")?;
+        providers.remove("invidious_base_url");
+        providers["youtube_backend"] = value(YouTubeBackend::Auto.as_config_value());
+        write_private_config(&path, document.to_string().as_bytes())?;
+        self.providers = effective;
         Ok(())
     }
 
@@ -2191,6 +2228,8 @@ pub enum YouTubeProviderSetting {
     OfficialApiKey(String),
     /// Select and store a credential-free Invidious base URL.
     InvidiousUrl(Url),
+    /// Remove the saved Invidious instance and return to automatic provider selection.
+    ClearInvidious,
 }
 
 /// Errors produced while loading or preparing configuration.
@@ -4256,6 +4295,122 @@ youtube_api_key = "keep-this-existing-secret"
             reloaded.providers.evernote_auth_token.as_deref(),
             Some(token)
         );
+    }
+
+    #[cfg(feature = "controller")]
+    #[test]
+    fn clearing_invidious_preserves_credentials_and_selects_automatic_backend() {
+        let directory = tempdir().unwrap();
+        let mut config = Config::for_dir(directory.path().join("youta"));
+        let key = "AIzaSyPreserved_key_123456789012345678";
+        config
+            .save_youtube_provider(YouTubeProviderSetting::OfficialApiKey(key.into()))
+            .unwrap();
+        config
+            .save_youtube_provider(YouTubeProviderSetting::InvidiousUrl(
+                Url::parse("https://previous.example.org/").unwrap(),
+            ))
+            .unwrap();
+        let credentials = fs::read(config.credentials_file()).unwrap();
+        config
+            .save_youtube_provider(YouTubeProviderSetting::ClearInvidious)
+            .unwrap();
+        assert_eq!(config.providers.invidious_base_url, None);
+        assert_eq!(config.providers.youtube_backend, YouTubeBackend::Auto);
+        assert_eq!(config.providers.youtube_api_key.as_deref(), Some(key));
+        assert_eq!(fs::read(config.credentials_file()).unwrap(), credentials);
+        let restored =
+            Config::load_from_dir_with_environment(config.config_dir().to_path_buf(), false)
+                .unwrap();
+        assert_eq!(restored.providers, config.providers);
+        assert!(
+            !fs::read_to_string(config.config_file())
+                .unwrap()
+                .contains("invidious_base_url")
+        );
+    }
+
+    #[cfg(feature = "controller")]
+    #[test]
+    fn clearing_invidious_failure_changes_neither_memory_nor_credentials() {
+        let directory = tempdir().unwrap();
+        let mut config = Config::for_dir(directory.path().join("youta"));
+        config
+            .save_youtube_provider(YouTubeProviderSetting::InvidiousUrl(
+                Url::parse("https://previous.example.org/").unwrap(),
+            ))
+            .unwrap();
+        fs::write(config.config_file(), "[providers\nmalformed").unwrap();
+        let before = config.clone();
+        assert!(
+            config
+                .save_youtube_provider(YouTubeProviderSetting::ClearInvidious)
+                .is_err()
+        );
+        assert_eq!(config, before);
+        assert!(!config.credentials_file().exists());
+        assert_eq!(
+            fs::read_to_string(config.config_file()).unwrap(),
+            "[providers\nmalformed"
+        );
+    }
+
+    #[cfg(feature = "controller")]
+    #[test]
+    fn clearing_invidious_removes_disk_value_but_keeps_environment_overrides() {
+        const CHILD: &str = "YOUTA_CLEAR_INVIDIOUS_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let root = PathBuf::from(std::env::var(CONFIG_DIR_ENV).unwrap());
+            let mut config = Config::load_from_dir(&root).unwrap();
+            let previous = config.providers.clone();
+            config
+                .save_youtube_provider(YouTubeProviderSetting::ClearInvidious)
+                .unwrap();
+            let file = fs::read_to_string(config.config_file()).unwrap();
+            assert!(!file.contains("invidious_base_url"));
+            assert!(file.contains("youtube_backend = \"auto\""));
+            assert!(file.contains("# preserve this comment"));
+            assert!(file.contains("AIzaSyLegacy_key_123456789012345678"));
+            assert_eq!(config.providers.youtube_api_key, previous.youtube_api_key);
+            assert_eq!(
+                config.providers.invidious_base_url,
+                if std::env::var_os(INVIDIOUS_BASE_URL_ENV).is_some() {
+                    previous.invidious_base_url
+                } else {
+                    None
+                }
+            );
+            assert_eq!(
+                config.providers.youtube_backend,
+                if std::env::var_os(YOUTUBE_BACKEND_ENV).is_some() {
+                    previous.youtube_backend
+                } else {
+                    YouTubeBackend::Auto
+                }
+            );
+            assert!(
+                !config.credentials_file().exists(),
+                "clearing must not rewrite credentials"
+            );
+            return;
+        }
+        for variable in [INVIDIOUS_BASE_URL_ENV, YOUTUBE_BACKEND_ENV] {
+            let directory = tempdir().unwrap();
+            fs::write(directory.path().join("config.toml"), "# preserve this comment\n[providers]\nyoutube_backend = 'invidious'\ninvidious_base_url = 'https://saved.example.org/'\nyoutube_api_key = 'AIzaSyLegacy_key_123456789012345678'\n").unwrap();
+            let value = if variable == INVIDIOUS_BASE_URL_ENV {
+                "https://environment.example.org/"
+            } else {
+                "invidious"
+            };
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "config::tests::clearing_invidious_removes_disk_value_but_keeps_environment_overrides", "--nocapture"])
+                .env_clear().env(CHILD, "1").env(CONFIG_DIR_ENV, directory.path()).env(variable, value).output().unwrap();
+            assert!(
+                output.status.success(),
+                "{variable}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
     #[cfg(feature = "controller")]

@@ -98,6 +98,18 @@ impl InvidiousProvider {
         &self.base_url
     }
 
+    /// Attaches request-owned instance context without exposing query or media identifiers.
+    fn request_json<T: serde::de::DeserializeOwned>(&self, url: &Url) -> Result<T, ProviderError> {
+        get_bounded_json(&self.agent, url, self.max_json_bytes).map_err(|error| match error {
+            ProviderError::HttpStatus(status) => ProviderError::HttpStatusAt {
+                provider: "Invidious",
+                instance: self.base_url.clone(),
+                status,
+            },
+            error => error,
+        })
+    }
+
     fn build_search_url(&self, request: &SearchRequest) -> Result<Url, ProviderError> {
         request.validate()?;
         let mut url = self.endpoint("api/v1/search")?;
@@ -680,14 +692,14 @@ impl Provider for InvidiousProvider {
 
     fn search(&self, request: &SearchRequest) -> Result<SearchPage, ProviderError> {
         let url = self.build_search_url(request)?;
-        let values: Vec<Value> = get_bounded_json(&self.agent, &url, self.max_json_bytes)?;
+        let values: Vec<Value> = self.request_json(&url)?;
         self.parse_search_values(values, request)
     }
 
     fn channel_videos(&self, request: &ChannelVideosRequest) -> Result<SearchPage, ProviderError> {
         let continuation = self.channel_page_context(request)?;
         let url = self.build_channel_videos_url(request, continuation.as_deref())?;
-        let raw: RawChannelVideosPage = get_bounded_json(&self.agent, &url, self.max_json_bytes)?;
+        let raw: RawChannelVideosPage = self.request_json(&url)?;
         let (page, next_token) = self.convert_channel_videos_page(raw, request)?;
         self.lock_channel_page_tokens()?.remember_next_page(
             &request.channel_id,
@@ -699,25 +711,25 @@ impl Provider for InvidiousProvider {
 
     fn channel_details(&self, channel_id: &str) -> Result<ChannelSummary, ProviderError> {
         let url = self.build_channel_url(channel_id)?;
-        let raw: RawChannelDetails = get_bounded_json(&self.agent, &url, self.max_json_bytes)?;
+        let raw: RawChannelDetails = self.request_json(&url)?;
         self.convert_channel_details(raw, channel_id)
     }
 
     fn full_channel_details(&self, channel_id: &str) -> Result<ChannelDetails, ProviderError> {
         let url = self.build_channel_url(channel_id)?;
-        let raw: RawChannelDetails = get_bounded_json(&self.agent, &url, self.max_json_bytes)?;
+        let raw: RawChannelDetails = self.request_json(&url)?;
         self.convert_full_channel_details(raw, channel_id)
     }
 
     fn video_details(&self, video_id: &str) -> Result<VideoDetails, ProviderError> {
         let url = self.build_video_url(video_id)?;
-        let raw: RawVideoDetails = get_bounded_json(&self.agent, &url, self.max_json_bytes)?;
+        let raw: RawVideoDetails = self.request_json(&url)?;
         self.convert_video_details(raw)
     }
 
     fn video_comments(&self, video_id: &str) -> Result<Vec<VideoComment>, ProviderError> {
         let url = self.build_video_comments_url(video_id)?;
-        let raw: RawVideoCommentsPage = get_bounded_json(&self.agent, &url, self.max_json_bytes)?;
+        let raw: RawVideoCommentsPage = self.request_json(&url)?;
         Self::convert_video_comments(raw, video_id)
     }
 
@@ -734,7 +746,7 @@ impl Provider for InvidiousProvider {
             return Ok(Vec::new());
         };
         let url = self.build_channel_url(channel_id)?;
-        let raw: RawChannelDetails = get_bounded_json(&self.agent, &url, self.max_json_bytes)?;
+        let raw: RawChannelDetails = self.request_json(&url)?;
         Ok(vec![Self::convert_channel_subscriber_count(
             raw, channel_id,
         )?])
@@ -2264,6 +2276,20 @@ mod tests {
             !cache.channels.contains_key(&format!("UC{:022}", 1)),
             "the least recently used untouched channel should be evicted"
         );
+    }
+
+    /// Failed API responses identify the exact configured instance, without request queries.
+    #[test]
+    fn http_failure_names_the_invidious_instance() {
+        let server = MockServer::spawn(vec![json_response("500 Internal Server Error", "{}")]);
+        let provider = InvidiousProvider::new(server.base_url.clone()).unwrap();
+        let error = provider.video_details("dQw4w9WgXcQ").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!("Invidious ({}) returned HTTP status 500", server.base_url)
+        );
+        assert!(!error.to_string().contains("dQw4w9WgXcQ"));
+        server.finish();
     }
 
     struct MockServer {
