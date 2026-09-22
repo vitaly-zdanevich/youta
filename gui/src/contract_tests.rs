@@ -759,11 +759,11 @@ fn soundcloud_tab_follows_youtube_music_and_exposes_search_to_the_window() {
     assert_eq!(soundcloud["search_verb"], "Search");
     assert_eq!(soundcloud["details_kind"], "Generic");
     assert_eq!(
-        serde_json::from_value::<youta::keymap::UiAction>(
+        serde_json::from_value::<youta::view::UiAction>(
             serde_json::json!({"ShowScreen": "SoundCloud"})
         )
         .expect("SoundCloud tab action"),
-        youta::keymap::UiAction::ShowScreen(youta::view::Screen::SoundCloud)
+        youta::view::UiAction::ShowScreen(youta::view::Screen::SoundCloud)
     );
 }
 
