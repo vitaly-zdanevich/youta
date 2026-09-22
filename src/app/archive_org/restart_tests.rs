@@ -1,5 +1,7 @@
 //! Restart restoration uses persistent state and bounded fixture metadata, never live HTTP.
 
+use std::sync::Mutex;
+
 use super::*;
 use crate::providers::ProviderError;
 use crate::providers::archive_org::ArchiveOrgTransport;

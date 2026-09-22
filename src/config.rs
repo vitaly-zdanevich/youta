@@ -4402,9 +4402,22 @@ youtube_api_key = "keep-this-existing-secret"
             } else {
                 "invidious"
             };
-            let output = Command::new(std::env::current_exe().unwrap())
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
                 .args(["--exact", "config::tests::clearing_invidious_removes_disk_value_but_keeps_environment_overrides", "--nocapture"])
-                .env_clear().env(CHILD, "1").env(CONFIG_DIR_ENV, directory.path()).env(variable, value).output().unwrap();
+                .env_clear()
+                .env(CHILD, "1")
+                .env(CONFIG_DIR_ENV, directory.path())
+                .env(variable, value);
+            // Preserve only the account and ACL-tool location needed by private writes.
+            // Unrelated YOUTA overrides must remain excluded from this isolated child.
+            #[cfg(windows)]
+            for name in ["USERNAME", "USERDOMAIN", "SystemRoot"] {
+                if let Ok(value) = std::env::var(name) {
+                    command.env(name, value);
+                }
+            }
+            let output = command.output().unwrap();
             assert!(
                 output.status.success(),
                 "{variable}: {}",

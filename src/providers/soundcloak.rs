@@ -650,6 +650,8 @@ mod tests {
                     Err(error) => panic!("mock Soundcloak accept failed: {error}"),
                 }
             };
+            // Windows can inherit the listener's nonblocking mode; use bounded reads.
+            socket.set_nonblocking(false).unwrap();
             socket
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
