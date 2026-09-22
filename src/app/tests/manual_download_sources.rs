@@ -25,6 +25,75 @@ fn source_test_controller() -> (
     (controller, requests, directory)
 }
 
+/// Original-first playback leaves an explicitly requested MP3 download independent.
+#[cfg(feature = "archive-org")]
+#[test]
+fn archive_original_playback_preserves_the_explicit_mp3_download_choice() {
+    use crate::providers::archive_org::{ArchiveOrgClient, ArchiveOrgTransport};
+
+    /// Returns only fixture metadata; no media or external helper is accessed.
+    struct MetadataTransport(Vec<u8>);
+
+    impl ArchiveOrgTransport for MetadataTransport {
+        fn fetch(
+            &self,
+            url: &url::Url,
+            _: usize,
+        ) -> Result<Vec<u8>, crate::providers::ProviderError> {
+            if url.as_str() != "https://archive.org/metadata/fixture" {
+                return Err(crate::providers::ProviderError::HttpStatus(404));
+            }
+            Ok(self.0.clone())
+        }
+    }
+
+    for (filename, format) in [
+        ("original.flac", "Flac"),
+        ("original.asf", "Windows Media Audio"),
+        ("original.mp4", "MPEG4"),
+    ] {
+        let metadata = serde_json::to_vec(&serde_json::json!({
+            "metadata": {"identifier": "fixture", "mediatype": "audio", "title": "Original recording"},
+            "files": [
+                {"name": filename, "source": "original", "format": format},
+                {"name": "generated.mp3", "source": "derivative", "original": filename, "format": "VBR MP3"},
+                {"name": "generated.ogg", "source": "derivative", "original": filename, "format": "Ogg Vorbis"},
+                {"name": "original.png", "source": "derivative", "original": filename, "format": "PNG", "size": 11254}
+            ]
+        })).unwrap();
+        let client = ArchiveOrgClient::with_transport(Arc::new(MetadataTransport(metadata)));
+        let details = client
+            .item_details("fixture")
+            .expect("original audio family");
+        let track = &details.tracks[0];
+        let queue = crate::app::archive_org::queue_item(&details.item, track);
+        let original_url = format!("https://archive.org/download/fixture/{filename}");
+        assert_eq!(queue.playback_location, original_url);
+        assert_eq!(queue.media.webpage_url.as_str(), original_url);
+        assert_eq!(queue.media.kind, crate::domain::MediaKind::Audio);
+        assert_eq!(
+            queue.media.id,
+            MediaId::new(SourceKind::ArchiveOrg, &original_url)
+        );
+        assert!(crate::app::archive_org::is_direct_audio_url(
+            &queue.media.webpage_url
+        ));
+        assert_eq!(queue.media.thumbnail_url, track.waveform_url);
+
+        let (mut controller, requests, _directory) = source_test_controller();
+        controller.config.downloads.archive_format =
+            crate::config::ArchiveDownloadPreference::ArchiveMp3;
+        controller.choose_archive_download(queue, track.download_variants.clone());
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].source_url.as_str(),
+            "https://archive.org/download/fixture/generated.mp3"
+        );
+        assert_eq!(requests[0].format, DownloadFormat::ExactFile);
+    }
+}
+
 /// Exercises the real resolved-media adapter with separate stable page and media URLs.
 fn resolved_source_fixture(
     source: SourceKind,

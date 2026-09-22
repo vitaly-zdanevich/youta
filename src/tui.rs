@@ -1471,7 +1471,11 @@ fn synchronize_thumbnail_prefetch(
     if let Some(source) = view
         .details
         .as_ref()
-        .filter(|details| !is_apple_podcast_artwork(details) && !is_youtube_video_artwork(details))
+        .filter(|details| {
+            !is_apple_podcast_artwork(details)
+                && !is_youtube_video_artwork(details)
+                && !is_archive_waveform_artwork(details)
+        })
         .and_then(|details| details.expanded_thumbnail_url.as_ref())
     {
         sources.push(source.clone());
@@ -1497,6 +1501,8 @@ fn synchronize_thumbnail_prefetch(
 /// advertised larger source and known fullscreen pixels that exceed the
 /// selected preview's native fit. The manager defers either source until its
 /// visible preview is ready and cancels stale generations during navigation.
+/// Archive waveforms reuse the already-decoded native preview source, so they
+/// can warm a fullscreen protocol without a second image download or decode.
 fn synchronize_selected_artwork_prefetch(
     view: &ViewModel,
     fullscreen: Rect,
@@ -1518,14 +1524,35 @@ fn synchronize_selected_artwork_prefetch(
         .filter(|details| {
             is_apple_podcast_artwork(details)
                 || (renderer.is_enabled()
-                    && youtube_expansion_benefits_from_fullscreen(
-                        details,
-                        fullscreen,
-                        terminal_window,
-                    ))
+                    && (is_archive_waveform_artwork(details)
+                        || youtube_expansion_benefits_from_fullscreen(
+                            details,
+                            fullscreen,
+                            terminal_window,
+                        )))
         })
         .and_then(|details| details.expanded_thumbnail_url.as_ref());
     renderer.synchronize_expansion(source, fullscreen)
+}
+
+/// Limits native-source reuse to exact validated Archive waveforms, not arbitrary artwork.
+fn is_archive_waveform_artwork(details: &DetailView) -> bool {
+    #[cfg(feature = "images")]
+    {
+        details
+            .media_id
+            .as_ref()
+            .is_some_and(|id| id.source == SourceKind::ArchiveOrg)
+            && details.thumbnail_url.as_ref().is_some_and(|source| {
+                details.expanded_thumbnail_url.as_ref() == Some(source)
+                    && crate::artwork::is_archive_waveform_url(source)
+            })
+    }
+    #[cfg(not(feature = "images"))]
+    {
+        let _ = details;
+        false
+    }
 }
 
 /// Identifies a selected YouTube video across search, subscriptions and history.
@@ -28865,6 +28892,48 @@ for encoded, expected in json.load(sys.stdin):
         assert!(!rendered.contains("⏸ Spoken fixture.opus"));
         assert!(rendered.contains("▶ Spoken fixture.opus"));
         assert!(rendered.contains("▶ Video fixture.webm"));
+    }
+
+    /// Native Archive waveforms reuse the visible source instead of a second disk request.
+    #[cfg(feature = "images")]
+    #[test]
+    fn archive_waveform_expansion_warms_the_native_source_without_disk_prefetch() {
+        let source = url::Url::parse(
+            "https://iiif.archive.org/image/iiif/3/mock_audio%2Ftrack.png/full/max/0/default.jpg",
+        )
+        .unwrap();
+        let mut view = ViewModel {
+            screen: Screen::ArchiveOrg,
+            details: Some(DetailView {
+                media_id: Some(MediaId::new(SourceKind::ArchiveOrg, "mock_audio")),
+                thumbnail_url: Some(source.clone()),
+                expanded_thumbnail_url: Some(source.clone()),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let fullscreen = Rect::new(0, 0, 160, 60);
+        let mut renderer = MockThumbnailRenderer {
+            enabled: true,
+            ..MockThumbnailRenderer::default()
+        };
+        synchronize_thumbnail_prefetch(&view, &UiSettings::default(), &mut renderer);
+        synchronize_selected_artwork_prefetch(&view, fullscreen, None, &mut renderer);
+        assert_eq!(renderer.prefetch_batches, [Vec::<url::Url>::new()]);
+        assert_eq!(renderer.expansion_prefetches, [(Some(source), fullscreen)]);
+        renderer.enabled = false;
+        synchronize_selected_artwork_prefetch(&view, fullscreen, None, &mut renderer);
+        assert_eq!(
+            renderer.expansion_prefetches.last(),
+            Some(&(None, fullscreen))
+        );
+        renderer.enabled = true;
+        view.details = None;
+        synchronize_selected_artwork_prefetch(&view, fullscreen, None, &mut renderer);
+        assert_eq!(
+            renderer.expansion_prefetches.last(),
+            Some(&(None, fullscreen))
+        );
     }
 
     /// Podcast enlargement uses the full terminal and RAM, never the disk-warming backlog.

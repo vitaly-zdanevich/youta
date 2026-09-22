@@ -109,7 +109,31 @@ impl std::fmt::Display for ThumbnailFailure {
 /// every build that can reach the network for artwork.
 #[cfg(feature = "images")]
 pub(crate) trait ThumbnailTransport: Send + 'static {
-    fn fetch(&mut self, source: &Url) -> Result<Vec<u8>, ThumbnailFailure>;
+    fn fetch(&mut self, source: &Url) -> Result<DownloadedThumbnail, ThumbnailFailure>;
+}
+
+/// Image bytes with explicit provenance for cache admission.
+///
+/// An Archive item tile can keep artwork visible during a waveform outage, but
+/// must never satisfy the full-image URL in either the disk or prepared RAM cache.
+#[cfg(feature = "remote-artwork")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DownloadedThumbnail {
+    /// Encoded bytes subject to the same download and decode limits as primary art.
+    pub(crate) bytes: Vec<u8>,
+    /// True only when an item tile replaced the requested full waveform.
+    pub(crate) is_fallback: bool,
+}
+
+#[cfg(feature = "remote-artwork")]
+impl DownloadedThumbnail {
+    /// Marks bytes fetched from the requested source, including validated redirects.
+    pub(crate) fn primary(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            is_fallback: false,
+        }
+    }
 }
 
 /// Builds the agent every artwork request uses.
@@ -212,7 +236,7 @@ impl HttpThumbnailTransport {
 
 #[cfg(feature = "images")]
 impl ThumbnailTransport for HttpThumbnailTransport {
-    fn fetch(&mut self, source: &Url) -> Result<Vec<u8>, ThumbnailFailure> {
+    fn fetch(&mut self, source: &Url) -> Result<DownloadedThumbnail, ThumbnailFailure> {
         fetch_thumbnail(&self.agent, source)
     }
 }
@@ -531,7 +555,7 @@ pub(crate) use crate::private_files::{
 pub(crate) fn fetch_thumbnail(
     agent: &ureq::Agent,
     source: &Url,
-) -> Result<Vec<u8>, ThumbnailFailure> {
+) -> Result<DownloadedThumbnail, ThumbnailFailure> {
     fetch_thumbnail_with_policy(agent, source, false)
 }
 
@@ -541,7 +565,7 @@ pub(crate) fn fetch_thumbnail_with_policy(
     agent: &ureq::Agent,
     source: &Url,
     allow_non_public_test_source: bool,
-) -> Result<Vec<u8>, ThumbnailFailure> {
+) -> Result<DownloadedThumbnail, ThumbnailFailure> {
     if source.scheme() == "file" {
         let path = source
             .to_file_path()
@@ -553,7 +577,9 @@ pub(crate) fn fetch_thumbnail_with_policy(
         if metadata.len() > MAX_DOWNLOAD_BYTES as u64 {
             return Err(ThumbnailFailure::ResponseTooLarge);
         }
-        return fs::read(path).map_err(|_| ThumbnailFailure::DownloadFailed);
+        return fs::read(path)
+            .map(DownloadedThumbnail::primary)
+            .map_err(|_| ThumbnailFailure::DownloadFailed);
     }
     if !is_safe_remote_thumbnail_source(source, allow_non_public_test_source) {
         return Err(ThumbnailFailure::InvalidSource);
@@ -566,13 +592,15 @@ pub(crate) fn fetch_thumbnail_with_policy(
 /// Only the exact Archive waveform route enables fallback. Invalid redirect
 /// targets fail closed; transport, status, byte-limit, and format failures can
 /// use the canonical item tile without resetting the redirect or time budget.
+/// Tile results retain fallback provenance so no caller can cache them as the
+/// full waveform merely because the transfer succeeded.
 #[cfg(feature = "remote-artwork")]
 fn fetch_remote_thumbnail_with_fallback(
     agent: &ureq::Agent,
     source: &Url,
     started: Instant,
     timeout: Duration,
-) -> Result<Vec<u8>, ThumbnailFailure> {
+) -> Result<DownloadedThumbnail, ThumbnailFailure> {
     let deadline = started
         .checked_add(timeout)
         .ok_or(ThumbnailFailure::DownloadFailed)?;
@@ -585,15 +613,20 @@ fn fetch_remote_thumbnail_with_fallback(
     let mut redirects = 0;
     let result = fetch_remote_thumbnail(agent, source, primary_deadline, &mut redirects);
     let Some(fallback) = fallback else {
-        return result;
+        return result.map(DownloadedThumbnail::primary);
     };
     match result {
-        Ok(bytes) if ArtworkFormat::sniff(&bytes).is_some() => Ok(bytes),
+        Ok(bytes) if ArtworkFormat::sniff(&bytes).is_some() => {
+            Ok(DownloadedThumbnail::primary(bytes))
+        }
         Err(ThumbnailFailure::InvalidSource) => Err(ThumbnailFailure::InvalidSource),
         _ => {
             let bytes = fetch_remote_thumbnail(agent, &fallback, deadline, &mut redirects)?;
             if ArtworkFormat::sniff(&bytes).is_some() {
-                Ok(bytes)
+                Ok(DownloadedThumbnail {
+                    bytes,
+                    is_fallback: true,
+                })
             } else {
                 Err(ThumbnailFailure::UnsupportedFormat)
             }
@@ -676,6 +709,14 @@ fn fetch_remote_thumbnail(
     } else {
         Ok(bytes)
     }
+}
+
+/// Recognizes the canonical native waveform route without any metadata request.
+///
+/// The same strict URL validation controls tile fallback and decoded-source reuse.
+#[cfg(feature = "images")]
+pub(crate) fn is_archive_waveform_url(source: &Url) -> bool {
+    archive_iiif_thumbnail_fallback(source).is_some()
 }
 
 /// Derives a tile only from the canonical, single-encoded PNG waveform route.
@@ -830,7 +871,7 @@ impl ArtworkFormat {
 /// One piece of artwork, ready to hand to a front-end.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Artwork {
-    /// Encoded image bytes, exactly as cached.
+    /// Encoded image bytes, unchanged from the validated response or cache.
     pub bytes: Vec<u8>,
     /// Format determined from those bytes.
     pub format: ArtworkFormat,
@@ -842,7 +883,8 @@ pub struct Artwork {
 /// deliberately narrow. Every protection stays on this side of the boundary:
 /// only public `http`/`https` origins are accepted, redirects are refused except
 /// for bounded Archive.org CDN hops, responses are size-capped, and the bytes
-/// must be an image stored in the confined private cache. A window
+/// must be an image. Requested images use the confined private cache; temporary
+/// item-tile fallbacks are displayed without satisfying the full-image cache key. A window
 /// that fetched artwork itself would keep none of that, and would additionally
 /// hand a provider a request from the user's browser stack.
 ///
@@ -855,6 +897,16 @@ pub struct Artwork {
 /// Returns why the artwork is unavailable, without echoing the URL.
 #[cfg(feature = "remote-artwork")]
 pub fn remote_artwork(cache_directory: &Path, source: &Url) -> Result<Artwork, ThumbnailFailure> {
+    remote_artwork_with_agent(cache_directory, source, &thumbnail_agent())
+}
+
+/// Shares the guarded GUI cache path with deterministic HTTP fixtures.
+#[cfg(feature = "remote-artwork")]
+fn remote_artwork_with_agent(
+    cache_directory: &Path,
+    source: &Url,
+    agent: &ureq::Agent,
+) -> Result<Artwork, ThumbnailFailure> {
     if !is_safe_remote_thumbnail_source(source, false) {
         return Err(ThumbnailFailure::InvalidSource);
     }
@@ -866,14 +918,19 @@ pub fn remote_artwork(cache_directory: &Path, source: &Url) -> Result<Artwork, T
         return Ok(Artwork { bytes, format });
     }
 
-    let bytes = fetch_thumbnail(&thumbnail_agent(), source)?;
+    let downloaded = fetch_thumbnail(agent, source)?;
+    let bytes = downloaded.bytes;
     let Some(format) = ArtworkFormat::sniff(&bytes) else {
         // A response that is not an image is a failure, not something to cache
         // and certainly not something to pass to a renderer.
         return Err(ThumbnailFailure::UnsupportedFormat);
     };
+    // Only the requested image can satisfy this URL. A temporary tile remains
+    // visible, but the next request can recover the full waveform.
     // A cache write failure only costs a refetch later.
-    let _ = cache.prepare().and_then(|()| cache.store(source, &bytes));
+    if !downloaded.is_fallback {
+        let _ = cache.prepare().and_then(|()| cache.store(source, &bytes));
+    }
     Ok(Artwork { bytes, format })
 }
 
@@ -1038,6 +1095,41 @@ mod public_surface_tests {
         (agent, calls)
     }
 
+    /// GUI fallback display must not stop a recovered full waveform from loading.
+    #[test]
+    fn archive_waveform_fallback_is_not_a_persistent_full_image_cache_hit() {
+        let directory = tempfile::tempdir().expect("artwork cache");
+        let cache = super::ThumbnailCache::new(directory.path().to_path_buf());
+        let waveform =
+            Url::parse("https://iiif.archive.org/image/iiif/3/book%2Fa.png/full/max/0/default.jpg")
+                .expect("waveform URL");
+        let tile = "https://archive.org/services/img/book";
+        let small = b"\xFF\xD8\xFFsmall tile";
+        let full = b"\xFF\xD8\xFFfull waveform";
+        let (agent, calls) = scripted_thumbnail_agent(vec![
+            (waveform.as_str(), 503, None, Vec::new()),
+            (tile, 200, None, small.to_vec()),
+            (waveform.as_str(), 200, None, full.to_vec()),
+        ]);
+
+        let first = super::remote_artwork_with_agent(directory.path(), &waveform, &agent)
+            .expect("temporary fallback");
+        assert_eq!(first.bytes, small);
+        assert_eq!(
+            cache
+                .read(&waveform)
+                .expect("no false full image cache hit"),
+            None
+        );
+        let recovered = super::remote_artwork_with_agent(directory.path(), &waveform, &agent)
+            .expect("recovered full waveform");
+        assert_eq!(recovered.bytes, full);
+        let cached = super::remote_artwork_with_agent(directory.path(), &waveform, &agent)
+            .expect("cached full waveform");
+        assert_eq!(cached, recovered);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 3);
+    }
+
     /// A failed full-resolution waveform uses the same item's bounded image tile.
     #[test]
     fn archive_iiif_waveform_failures_fall_back_to_the_item_tile() {
@@ -1054,7 +1146,13 @@ mod public_surface_tests {
                 (source.as_str(), status, None, body),
                 (fallback, 200, None, image.to_vec()),
             ]);
-            assert_eq!(super::fetch_thumbnail(&agent, &source), Ok(image.to_vec()));
+            assert_eq!(
+                super::fetch_thumbnail(&agent, &source),
+                Ok(super::DownloadedThumbnail {
+                    bytes: image.to_vec(),
+                    is_fallback: true,
+                })
+            );
             assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
         }
     }
@@ -1066,7 +1164,10 @@ mod public_surface_tests {
         let image = b"\xFF\xD8\xFFwaveform";
         let (agent, calls) =
             scripted_thumbnail_agent(vec![(source.as_str(), 200, None, image.to_vec())]);
-        assert_eq!(super::fetch_thumbnail(&agent, &source), Ok(image.to_vec()));
+        assert_eq!(
+            super::fetch_thumbnail(&agent, &source),
+            Ok(super::DownloadedThumbnail::primary(image.to_vec()))
+        );
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 
@@ -1219,7 +1320,13 @@ mod public_surface_tests {
             (source.as_str(), 404, None, Vec::new()),
             (fallback, 200, None, image.to_vec()),
         ]);
-        assert_eq!(super::fetch_thumbnail(&agent, &source), Ok(image.to_vec()));
+        assert_eq!(
+            super::fetch_thumbnail(&agent, &source),
+            Ok(super::DownloadedThumbnail {
+                bytes: image.to_vec(),
+                is_fallback: true,
+            })
+        );
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 
@@ -1260,7 +1367,13 @@ mod public_surface_tests {
             )
             .build()
             .into();
-        assert_eq!(super::fetch_thumbnail(&agent, &source), Ok(image.to_vec()));
+        assert_eq!(
+            super::fetch_thumbnail(&agent, &source),
+            Ok(super::DownloadedThumbnail {
+                bytes: image.to_vec(),
+                is_fallback: true,
+            })
+        );
         assert_eq!(calls.load(Ordering::Relaxed), 2);
     }
 
@@ -1342,7 +1455,7 @@ mod public_surface_tests {
             ]);
             assert_eq!(
                 super::fetch_thumbnail(&agent, &source).expect("redirected cover"),
-                image
+                super::DownloadedThumbnail::primary(image.to_vec())
             );
             assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
         }

@@ -673,6 +673,14 @@ impl AppController {
             .as_ref()
             .and_then(|details| details.tracks.get(self.view.selected));
         let mut detail = detail_view(&item, track);
+        if self.archive_org.active.is_none()
+            && self.cached_archive_details(&item.identifier).is_none()
+        {
+            // Search only advertises the small item tile. Wait for metadata to
+            // choose the native waveform or cover before requesting artwork.
+            detail.thumbnail_url = None;
+            detail.expanded_thumbnail_url = None;
+        }
         let same_identity = self
             .view
             .details
@@ -1361,6 +1369,47 @@ mod tests {
             .thread
             .join()
             .unwrap();
+    }
+
+    /// Search tiles are withheld until metadata has selected the native waveform
+    /// or confirmed that only the item tile is available.
+    #[test]
+    fn archive_waveform_preview_waits_for_metadata_before_requesting_item_tile() {
+        let (_temporary, mut app) = lookup_controller();
+        let (requests, _pending_requests) = bounded(8);
+        app.provider_requests = Some(requests);
+        app.view.screen = Screen::ArchiveOrg;
+        let mut details = (*lookup_details("fixture")).clone();
+        let tile = details.item.artwork_url.clone();
+        app.archive_org.items = vec![details.item.clone()];
+        app.populate_archive_org();
+        let preview = app.view.details.as_ref().unwrap();
+        assert_eq!(
+            preview.thumbnail_url, None,
+            "do not fetch the small search tile first"
+        );
+        assert_eq!(preview.expanded_thumbnail_url, None);
+
+        let waveform = url::Url::parse(
+            "https://iiif.archive.org/image/iiif/3/fixture%2Faudio.png/full/max/0/default.jpg",
+        )
+        .unwrap();
+        details.item.artwork_url = Some(waveform.clone());
+        app.archive_org
+            .cache
+            .push_back(("fixture".into(), Ok(Arc::new(details))));
+        app.update_archive_org_detail();
+        assert_eq!(
+            app.view.details.as_ref().unwrap().thumbnail_url,
+            Some(waveform)
+        );
+
+        app.archive_org.cache.clear();
+        app.archive_org
+            .cache
+            .push_back(("fixture".into(), Err("metadata unavailable".into())));
+        app.update_archive_org_detail();
+        assert_eq!(app.view.details.as_ref().unwrap().thumbnail_url, tile);
     }
 
     /// Passive enrichment preserves the user's current artwork overlay for both

@@ -12,6 +12,8 @@
 //! filesystem fingerprint before reuse.
 //! Selected fullscreen artwork can also be prepared independently after its
 //! preview is ready; that pipeline uses RAM only and shares the prepared LRU.
+//! One selected Archive waveform may additionally retain its validated native
+//! pixels (at most 32 MiB), avoiding another fetch or decode for expansion.
 
 use std::collections::{HashSet, VecDeque};
 use std::fs;
@@ -46,14 +48,15 @@ use crate::terminal_environment::{TerminalAttachment, is_linux_virtual_console};
 
 const MAX_DOWNLOAD_BYTES: usize = 4 * 1024 * 1024;
 use crate::artwork::{
-    HttpThumbnailTransport, ThumbnailCache, ThumbnailTransport, is_safe_thumbnail_source,
+    HttpThumbnailTransport, ThumbnailCache, ThumbnailTransport, is_archive_waveform_url,
+    is_safe_thumbnail_source,
 };
 // The renderer's tests still exercise the pipeline end to end, so they reach
 // into the neutral half for its fetch entry points and guarded resolver.
 #[cfg(test)]
 use crate::artwork::{
-    ActiveCacheTemporary, ThumbnailCachePolicy, fetch_thumbnail, fetch_thumbnail_with_policy,
-    is_cache_entry_name, mock_thumbnail_agent, thumbnail_agent,
+    ActiveCacheTemporary, DownloadedThumbnail, ThumbnailCachePolicy, fetch_thumbnail,
+    fetch_thumbnail_with_policy, is_cache_entry_name, mock_thumbnail_agent, thumbnail_agent,
 };
 
 // `ThumbnailFailure` moved to the neutral half; keep its published path.
@@ -303,6 +306,8 @@ struct ThumbnailTarget {
 struct WorkerRequest {
     generation: u64,
     target: ThumbnailTarget,
+    /// Already validated native pixels; cloning the handle never resizes on the UI thread.
+    native_waveform: Option<Arc<DynamicImage>>,
 }
 
 struct WorkerResult {
@@ -385,6 +390,10 @@ struct EncodedThumbnail {
     render_size: Size,
     decoded_bytes: usize,
     local_fingerprint: Option<LocalThumbnailFingerprint>,
+    /// Temporary replacement pixels must not satisfy a later full-image request.
+    is_fallback: bool,
+    /// The original waveform before preview fitting, bounded by the decoder policy.
+    native_waveform: Option<Arc<DynamicImage>>,
 }
 
 /// One terminal protocol plus an optional local derivative to persist after
@@ -394,6 +403,9 @@ struct LoadedThumbnail {
     render_size: Size,
     decoded_bytes: usize,
     local_fingerprint: Option<LocalThumbnailFingerprint>,
+    /// Retains transport provenance until the visible result reaches the manager.
+    is_fallback: bool,
+    native_waveform: Option<Arc<DynamicImage>>,
     deferred_local_frame: Option<DeferredLocalPreview>,
     deferred_local_preview: Option<DeferredLocalPreview>,
 }
@@ -868,6 +880,8 @@ pub struct ThumbnailManager {
 struct ExpansionPrefetch {
     picker: Option<Picker>,
     source: Option<Url>,
+    /// One URL-owned native source, at most 32 MiB, separate from prepared protocols.
+    native_waveform: Option<(Url, Arc<DynamicImage>)>,
     target: Option<ThumbnailTarget>,
     generation: u64,
     current_generation: Arc<AtomicU64>,
@@ -1099,6 +1113,7 @@ impl ThumbnailManager {
     ///
     /// Uses an independent worker and the existing bounded prepared-image cache;
     /// no persistent cache is read or written and background failures stay silent.
+    /// Native Archive waveforms reuse the visible worker's validated pixels.
     pub fn synchronize_expansion(&mut self, source: Option<&Url>, area: Rect) -> bool {
         if !self.is_enabled() {
             return false;
@@ -1131,6 +1146,19 @@ impl ThumbnailManager {
         {
             return false;
         }
+        if is_archive_waveform_url(source)
+            && self
+                .target
+                .as_ref()
+                .is_some_and(|target| target.source == *source)
+            && self.native_waveform_for(source).is_none()
+        {
+            // A prepared preview restored from the protocol LRU may outlive its
+            // single retained original. Do not fetch that original speculatively;
+            // an explicit click can recover it through the visible disk cache.
+            self.expansion.source = None;
+            return self.cancel_expansion();
+        }
         self.request_expansion(target)
     }
 
@@ -1143,6 +1171,7 @@ impl ThumbnailManager {
         self.expansion.target = Some(target.clone());
         let request = WorkerRequest {
             generation: self.expansion.generation,
+            native_waveform: self.native_waveform_for(&target.source),
             target,
         };
         self.expansion.pending = self
@@ -1151,6 +1180,15 @@ impl ThumbnailManager {
             .as_ref()
             .is_some_and(|sender| sender.try_send(request).is_ok());
         self.expansion.pending
+    }
+
+    /// Shares only pixels owned by this exact source, never by a previous row.
+    fn native_waveform_for(&self, source: &Url) -> Option<Arc<DynamicImage>> {
+        self.expansion
+            .native_waveform
+            .as_ref()
+            .filter(|(owner, _)| owner == source)
+            .map(|(_, image)| Arc::clone(image))
     }
 
     /// Starts a separate RAM-only encoder so warming cannot block visible selections.
@@ -1219,14 +1257,19 @@ impl ThumbnailManager {
             let visible = self.target.as_ref() == Some(target);
             match result {
                 Ok(encoded) => {
-                    let key = PreparedThumbnailKey::from(target);
+                    if visible && !encoded.is_fallback {
+                        self.expansion.native_waveform = encoded
+                            .native_waveform
+                            .map(|image| (target.source.clone(), image));
+                    }
+                    let key = (!encoded.is_fallback).then(|| PreparedThumbnailKey::from(target));
                     if visible {
-                        self.protocol_key = Some(key);
+                        self.protocol_key = key;
                         self.protocol = Some(encoded.protocol);
                         self.protocol_render_size = Some(encoded.render_size);
                         self.protocol_decoded_bytes = encoded.decoded_bytes;
                         self.state = ThumbnailState::Ready;
-                    } else {
+                    } else if let Some(key) = key {
                         self.cache_prepared_protocol(
                             key,
                             encoded.protocol,
@@ -1316,6 +1359,14 @@ impl ThumbnailManager {
         if self.expansion.target.as_ref() != Some(&target) {
             self.cancel_expansion();
         }
+        if self
+            .expansion
+            .native_waveform
+            .as_ref()
+            .is_some_and(|(source, _)| source != &target.source)
+        {
+            self.expansion.native_waveform = None;
+        }
 
         // Pin the requested entry before retaining the preview: inserting the
         // preview into a full LRU must not evict the image about to be displayed.
@@ -1358,6 +1409,7 @@ impl ThumbnailManager {
         }
         let request = WorkerRequest {
             generation: self.generation,
+            native_waveform: self.native_waveform_for(&target.source),
             target,
         };
         if !self.ensure_visible_worker() || !self.send_latest(request) {
@@ -1525,9 +1577,27 @@ impl ThumbnailManager {
                     changed = true;
                     match result.result {
                         Ok(encoded) => {
-                            self.protocol_key = self.target.as_ref().and_then(|target| {
-                                PreparedThumbnailKey::from_loaded(target, encoded.local_fingerprint)
-                            });
+                            self.expansion.native_waveform = self
+                                .target
+                                .as_ref()
+                                .filter(|_| !encoded.is_fallback)
+                                .and_then(|target| {
+                                    encoded
+                                        .native_waveform
+                                        .map(|image| (target.source.clone(), image))
+                                });
+                            // Display temporary item tiles, but only the requested image
+                            // may satisfy a later selection from the prepared cache.
+                            self.protocol_key = self
+                                .target
+                                .as_ref()
+                                .filter(|_| !encoded.is_fallback)
+                                .and_then(|target| {
+                                    PreparedThumbnailKey::from_loaded(
+                                        target,
+                                        encoded.local_fingerprint,
+                                    )
+                                });
                             self.protocol = Some(encoded.protocol);
                             self.protocol_render_size = Some(encoded.render_size);
                             self.protocol_decoded_bytes = encoded.decoded_bytes;
@@ -1599,6 +1669,7 @@ impl ThumbnailManager {
     /// Returns `true` when visible state was cleared.
     pub fn clear(&mut self) -> bool {
         self.expansion.source = None;
+        self.expansion.native_waveform = None;
         self.cancel_expansion();
         let changed = self.target.is_some()
             || self.protocol.is_some()
@@ -1722,16 +1793,32 @@ fn spawn_expansion_worker_with_transport<T: ThumbnailTransport>(
                 if cancellation.is_cancelled() {
                     continue;
                 }
-                let bytes = transport.fetch(&request.target.source);
-                if cancellation.is_cancelled() {
-                    continue;
-                }
-                let image = bytes.and_then(|bytes| decode_thumbnail(&bytes));
-                if cancellation.is_cancelled() {
-                    continue;
-                }
-                let result = image
-                    .and_then(|image| encode_remote_thumbnail(&picker, &request.target, image));
+                let result = if let Some(image) = request.native_waveform {
+                    encode_native_waveform(&picker, &request.target, image)
+                } else {
+                    let downloaded = transport.fetch(&request.target.source);
+                    if cancellation.is_cancelled() {
+                        continue;
+                    }
+                    let image = downloaded.and_then(|downloaded| {
+                        decode_thumbnail(&downloaded.bytes)
+                            .map(|image| (image, downloaded.is_fallback))
+                    });
+                    if cancellation.is_cancelled() {
+                        continue;
+                    }
+                    image.and_then(|(image, is_fallback)| {
+                        encode_remote_thumbnail(&picker, &request.target, image).map(
+                            |mut encoded| {
+                                encoded.is_fallback = is_fallback;
+                                if is_fallback {
+                                    encoded.native_waveform = None;
+                                }
+                                encoded
+                            },
+                        )
+                    })
+                };
                 if !cancellation.is_cancelled()
                     && results
                         .send(WorkerResult {
@@ -2039,6 +2126,14 @@ fn render_worker_request<T: ThumbnailTransport>(
     current_generation: &Arc<AtomicU64>,
 ) -> bool {
     let mut cache = cache;
+    if let Some(image) = request.native_waveform.take() {
+        return results
+            .send(WorkerResult {
+                generation: request.generation,
+                result: encode_native_waveform(picker, &request.target, image),
+            })
+            .is_ok();
+    }
     if matches!(request.target.source.scheme(), "http" | "https")
         && let Some(result) = load_cached_thumbnail(cache.as_deref_mut(), picker, &request.target)
     {
@@ -2058,6 +2153,14 @@ fn render_worker_request<T: ThumbnailTransport>(
     for newer in requests.try_iter() {
         request = newer;
     }
+    if let Some(image) = request.native_waveform.take() {
+        return results
+            .send(WorkerResult {
+                generation: request.generation,
+                result: encode_native_waveform(picker, &request.target, image),
+            })
+            .is_ok();
+    }
     let cancellation = RequestCancellation {
         generation: request.generation,
         current_generation: Arc::clone(current_generation),
@@ -2076,6 +2179,8 @@ fn render_worker_request<T: ThumbnailTransport>(
             render_size,
             decoded_bytes,
             local_fingerprint,
+            is_fallback,
+            native_waveform,
             deferred_local_frame,
             deferred_local_preview,
         }) => (
@@ -2084,6 +2189,8 @@ fn render_worker_request<T: ThumbnailTransport>(
                 render_size,
                 decoded_bytes,
                 local_fingerprint,
+                is_fallback,
+                native_waveform,
             }),
             deferred_local_frame,
             deferred_local_preview,
@@ -2134,13 +2241,13 @@ fn prefetch_thumbnail(
         Err(error) => return Err(error),
     }
 
-    let Ok(bytes) = transport.fetch(source) else {
+    let Ok(downloaded) = transport.fetch(source) else {
         return Ok(());
     };
-    if decode_thumbnail(&bytes).is_err() {
+    if downloaded.is_fallback || decode_thumbnail(&downloaded.bytes).is_err() {
         return Ok(());
     }
-    cache.store(source, &bytes)
+    cache.store(source, &downloaded.bytes)
 }
 
 fn load_thumbnail(
@@ -2174,21 +2281,30 @@ fn load_thumbnail(
             render_size: encoded.render_size,
             decoded_bytes: encoded.decoded_bytes,
             local_fingerprint: None,
+            is_fallback: encoded.is_fallback,
+            native_waveform: encoded.native_waveform,
             deferred_local_frame: None,
             deferred_local_preview: None,
         });
     }
 
-    let bytes = transport.fetch(&target.source)?;
-    let image = decode_thumbnail(&bytes)?;
-    if persistent_cache_allowed && let Some(cache) = cache {
-        let _ = cache.store(&target.source, &bytes);
+    let downloaded = transport.fetch(&target.source)?;
+    let image = decode_thumbnail(&downloaded.bytes)?;
+    if persistent_cache_allowed
+        && !downloaded.is_fallback
+        && let Some(cache) = cache
+    {
+        let _ = cache.store(&target.source, &downloaded.bytes);
     }
     encode_remote_thumbnail(picker, target, image).map(|encoded| LoadedThumbnail {
         protocol: encoded.protocol,
         render_size: encoded.render_size,
         decoded_bytes: encoded.decoded_bytes,
         local_fingerprint: None,
+        is_fallback: downloaded.is_fallback,
+        native_waveform: (!downloaded.is_fallback)
+            .then_some(encoded.native_waveform)
+            .flatten(),
         deferred_local_frame: None,
         deferred_local_preview: None,
     })
@@ -2224,6 +2340,8 @@ fn load_local_thumbnail(
                 render_size: encoded.render_size,
                 decoded_bytes: encoded.decoded_bytes,
                 local_fingerprint: Some(fingerprint),
+                is_fallback: false,
+                native_waveform: None,
                 deferred_local_frame: None,
                 deferred_local_preview: None,
             });
@@ -2249,6 +2367,8 @@ fn load_local_thumbnail(
         render_size: encoded.render_size,
         decoded_bytes: encoded.decoded_bytes,
         local_fingerprint: Some(fingerprint.clone()),
+        is_fallback: false,
+        native_waveform: None,
         deferred_local_frame: None,
         deferred_local_preview: record.map(|record| DeferredLocalPreview {
             cache_key,
@@ -2295,6 +2415,8 @@ fn load_local_video_thumbnail(
                 render_size: encoded.render_size,
                 decoded_bytes: encoded.decoded_bytes,
                 local_fingerprint: Some(fingerprint),
+                is_fallback: false,
+                native_waveform: None,
                 deferred_local_frame: None,
                 deferred_local_preview: None,
             });
@@ -2364,6 +2486,8 @@ fn load_local_video_thumbnail(
         render_size: encoded.render_size,
         decoded_bytes: encoded.decoded_bytes,
         local_fingerprint: Some(fingerprint.clone()),
+        is_fallback: false,
+        native_waveform: None,
         deferred_local_frame,
         deferred_local_preview: preview_record.map(|record| DeferredLocalPreview {
             cache_key: preview_cache_key,
@@ -2515,11 +2639,31 @@ fn encode_remote_thumbnail(
     target: &ThumbnailTarget,
     image: DynamicImage,
 ) -> Result<EncodedThumbnail, ThumbnailFailure> {
+    if is_archive_waveform_url(&target.source)
+        && image.as_bytes().len() as u64 <= MAX_DECODE_ALLOC_BYTES
+    {
+        return encode_native_waveform(picker, target, Arc::new(image));
+    }
     encode_target_thumbnail(
         picker,
         target,
         crop_youtube_letterbox(&target.source, image),
     )
+}
+
+/// Fits one shared native waveform on a worker without downloading or decoding it.
+///
+/// The retained source remains native-resolution even when the protocol stores a
+/// tiny preview or an enlarged terminal fit. Only one source is retained by the
+/// manager; in-flight bounded worker requests may share that allocation.
+fn encode_native_waveform(
+    picker: &Picker,
+    target: &ThumbnailTarget,
+    image: Arc<DynamicImage>,
+) -> Result<EncodedThumbnail, ThumbnailFailure> {
+    let mut encoded = encode_target_thumbnail(picker, target, image.as_ref().clone())?;
+    encoded.native_waveform = Some(image);
+    Ok(encoded)
 }
 
 /// Scales only fullscreen sources before the ordinary native-fit protocol encoding.
@@ -2625,6 +2769,8 @@ fn encode_thumbnail(
             render_size,
             decoded_bytes,
             local_fingerprint: None,
+            is_fallback: false,
+            native_waveform: None,
         }),
         Some(Err(_)) | None => Err(ThumbnailFailure::EncodingFailed),
     }
@@ -2910,22 +3056,56 @@ pub(crate) mod tests {
     }
 
     impl ThumbnailTransport for MockTransport {
-        fn fetch(&mut self, source: &Url) -> Result<Vec<u8>, ThumbnailFailure> {
+        fn fetch(&mut self, source: &Url) -> Result<DownloadedThumbnail, ThumbnailFailure> {
             self.observed
                 .send(source.clone())
                 .map_err(|_| ThumbnailFailure::WorkerStopped)?;
             self.replies
                 .recv_timeout(Duration::from_secs(2))
                 .unwrap_or(Err(ThumbnailFailure::WorkerStopped))
+                .map(DownloadedThumbnail::primary)
         }
     }
 
     struct RejectingTransport;
 
     impl ThumbnailTransport for RejectingTransport {
-        fn fetch(&mut self, _source: &Url) -> Result<Vec<u8>, ThumbnailFailure> {
+        fn fetch(&mut self, _source: &Url) -> Result<DownloadedThumbnail, ThumbnailFailure> {
             Err(ThumbnailFailure::DownloadFailed)
         }
+    }
+
+    /// Supplies explicit fallback provenance without network or response deadlines.
+    struct SequencedThumbnailTransport {
+        responses: VecDeque<DownloadedThumbnail>,
+        calls: Arc<AtomicU64>,
+    }
+
+    impl ThumbnailTransport for SequencedThumbnailTransport {
+        fn fetch(&mut self, _source: &Url) -> Result<DownloadedThumbnail, ThumbnailFailure> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.responses
+                .pop_front()
+                .ok_or(ThumbnailFailure::DownloadFailed)
+        }
+    }
+
+    /// Models a temporary item tile followed by recovery of the requested waveform.
+    fn recovering_waveform_transport() -> (SequencedThumbnailTransport, Arc<AtomicU64>) {
+        let calls = Arc::new(AtomicU64::new(0));
+        (
+            SequencedThumbnailTransport {
+                responses: VecDeque::from([
+                    DownloadedThumbnail {
+                        bytes: fixture_png(),
+                        is_fallback: true,
+                    },
+                    DownloadedThumbnail::primary(fixture_thumbnail_png()),
+                ]),
+                calls: Arc::clone(&calls),
+            },
+            calls,
+        )
     }
 
     struct MockVideoExtractor {
@@ -3218,10 +3398,11 @@ pub(crate) mod tests {
             .write_to(&mut png, ImageFormat::Png)
             .expect("encode fixture PNG");
         let (source, server) = serve_once("200 OK", Vec::new(), png.into_inner());
-        let bytes = fetch_thumbnail_with_policy(&mock_thumbnail_agent(), &source, true)
+        let downloaded = fetch_thumbnail_with_policy(&mock_thumbnail_agent(), &source, true)
             .expect("fetch bounded fixture image");
         server.join().expect("fixture image server");
-        let decoded = decode_thumbnail(&bytes).expect("decode fetched fixture");
+        assert!(!downloaded.is_fallback);
+        let decoded = decode_thumbnail(&downloaded.bytes).expect("decode fetched fixture");
         assert_eq!((decoded.width(), decoded.height()), (3, 2));
 
         let (oversized, server) = serve_once(
@@ -3241,11 +3422,11 @@ pub(crate) mod tests {
 
         let directory = tempfile::tempdir().expect("local thumbnail directory");
         let local_path = directory.path().join("cover.png");
-        fs::write(&local_path, &bytes).expect("write local thumbnail fixture");
+        fs::write(&local_path, &downloaded.bytes).expect("write local thumbnail fixture");
         let file = Url::from_file_path(&local_path).expect("fixture file URL");
         assert_eq!(
             fetch_thumbnail(&thumbnail_agent(), &file).expect("read local image in place"),
-            bytes
+            downloaded
         );
 
         let ftp = Url::parse("ftp://example.com/cover.png").expect("fixture FTP URL");
@@ -3962,6 +4143,135 @@ pub(crate) mod tests {
             assert!(observed.is_empty());
             assert!(warm_observed.is_empty());
         }
+    }
+
+    /// A native waveform already fetched for the preview needs no second transfer,
+    /// including after a process restart whose first preview came from disk.
+    #[test]
+    fn archive_waveform_expansion_reuses_native_preview_without_refetching() {
+        let source = Url::parse(
+            "https://iiif.archive.org/image/iiif/3/item%2Faudio.png/full/max/0/default.jpg",
+        )
+        .unwrap();
+        let mut bytes = Cursor::new(Vec::new());
+        DynamicImage::new_rgb8(800, 200)
+            .write_to(&mut bytes, ImageFormat::Png)
+            .unwrap();
+        for cached in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            if cached {
+                ThumbnailCache::new(directory.path().to_owned())
+                    .store(&source, bytes.get_ref())
+                    .unwrap();
+            }
+            let (mut manager, replies, observed) =
+                manager_with_mock_transport_in_cache(cached.then(|| directory.path().to_owned()));
+            let (warm_replies, warm_observed) = install_mock_expansion_transport(&mut manager);
+            let preview = Rect::new(0, 0, 20, 10);
+            let fullscreen = Rect::new(0, 0, 160, 45);
+            manager.synchronize(Some(&source), preview);
+            if !cached {
+                assert_eq!(
+                    observed.recv_timeout(Duration::from_secs(1)).unwrap(),
+                    source
+                );
+                replies.send(Ok(bytes.get_ref().clone())).unwrap();
+            }
+            assert_eq!(wait_for_terminal_state(&mut manager), ThumbnailState::Ready);
+            let native = manager.native_waveform_for(&source).unwrap();
+            assert_eq!((native.width(), native.height()), (800, 200));
+            drop(warm_replies);
+            assert!(manager.synchronize_expansion(Some(&source), fullscreen));
+            wait_for_mock_expansion(&mut manager);
+            assert!(
+                warm_observed.is_empty(),
+                "native waveform was downloaded again"
+            );
+            assert!(manager.synchronize_fullscreen(Some(&source), fullscreen));
+            assert_eq!(manager.state(), &ThumbnailState::Ready);
+            assert_eq!(manager.render_size(), Some(Size::new(160, 20)));
+            assert!(observed.is_empty());
+
+            manager.synchronize_fullscreen(Some(&source), Rect::new(0, 0, 120, 40));
+            assert_eq!(wait_for_terminal_state(&mut manager), ThumbnailState::Ready);
+            assert_eq!(manager.render_size(), Some(Size::new(120, 15)));
+            assert!(Arc::ptr_eq(
+                &native,
+                &manager.native_waveform_for(&source).unwrap()
+            ));
+            assert!(
+                warm_observed.is_empty(),
+                "resizing must reuse the native waveform too"
+            );
+        }
+    }
+
+    /// An early click must use the decoded original even before idle warming begins.
+    #[test]
+    fn archive_waveform_early_expansion_reuses_native_preview_without_refetching() {
+        let source = Url::parse(
+            "https://iiif.archive.org/image/iiif/3/item%2Faudio.png/full/max/0/default.jpg",
+        )
+        .unwrap();
+        let (mut manager, replies, observed) = manager_with_mock_transport();
+        manager.synchronize(Some(&source), Rect::new(0, 0, 20, 10));
+        assert_eq!(
+            observed.recv_timeout(Duration::from_secs(1)).unwrap(),
+            source
+        );
+        replies.send(Ok(fixture_thumbnail_png())).unwrap();
+        assert_eq!(wait_for_terminal_state(&mut manager), ThumbnailState::Ready);
+        drop(replies);
+        manager.synchronize_fullscreen(Some(&source), Rect::new(0, 0, 120, 40));
+        assert_eq!(wait_for_terminal_state(&mut manager), ThumbnailState::Ready);
+        assert!(
+            observed.is_empty(),
+            "early click must not download the preview again"
+        );
+    }
+
+    /// The extra source is bounded independently of the protocol LRU and never
+    /// supplies pixels to a different selected URL.
+    #[test]
+    fn archive_waveform_retained_source_is_bounded_and_owned_by_selected_url() {
+        let source = Url::parse(
+            "https://iiif.archive.org/image/iiif/3/item%2Faudio.png/full/max/0/default.jpg",
+        )
+        .unwrap();
+        let picker = picker_for_protocol(ThumbnailProtocol::Kitty, FALLBACK_FONT_SIZE);
+        let area = Rect::new(0, 0, 20, 10);
+        let target = ThumbnailTarget {
+            source: source.clone(),
+            local_video_midpoint: None,
+            area,
+            sizing: ThumbnailSizing::Native,
+        };
+        let encoded =
+            encode_remote_thumbnail(&picker, &target, DynamicImage::new_rgba8(4096, 2049)).unwrap();
+        assert!(encoded.native_waveform.is_none());
+
+        let (mut manager, replies, observed) = manager_with_mock_transport();
+        manager.synchronize(Some(&source), area);
+        assert_eq!(
+            observed.recv_timeout(Duration::from_secs(1)).unwrap(),
+            source
+        );
+        replies.send(Ok(fixture_thumbnail_png())).unwrap();
+        assert_eq!(wait_for_terminal_state(&mut manager), ThumbnailState::Ready);
+        assert!(manager.native_waveform_for(&source).is_some());
+        let other = Url::parse("https://images.example/other.png").unwrap();
+        assert!(manager.native_waveform_for(&other).is_none());
+        manager.synchronize(Some(&other), area);
+        assert!(manager.expansion.native_waveform.is_none());
+        assert_eq!(
+            observed.recv_timeout(Duration::from_secs(1)).unwrap(),
+            other
+        );
+        replies.send(Ok(fixture_thumbnail_png())).unwrap();
+        assert_eq!(wait_for_terminal_state(&mut manager), ThumbnailState::Ready);
+        assert!(manager.expansion.native_waveform.is_none());
+        manager.clear();
+        assert!(manager.expansion.native_waveform.is_none());
     }
 
     /// Fullscreen preparation must not persist scaled pixels as a native local derivative.
@@ -4902,6 +5212,174 @@ pub(crate) mod tests {
             ),
             "a valid restart cache hit must not reach the network transport"
         );
+    }
+
+    /// A displayed item tile neither poisons the full-image cache nor retries every frame.
+    #[test]
+    fn archive_waveform_fallback_is_temporary_and_reselection_recovers() {
+        let directory = tempfile::tempdir().expect("waveform cache fixture");
+        let cache_directory = directory.path().join("thumbnail-cache");
+        let cache = ThumbnailCache::new(cache_directory.clone());
+        let source = Url::parse(
+            "https://iiif.archive.org/image/iiif/3/fixture%2Ftrack.png/full/max/0/default.jpg",
+        )
+        .unwrap();
+        let area = Rect::new(0, 0, 40, 16);
+        let (transport, calls) = recovering_waveform_transport();
+        let mut manager = halfblock_manager_for_tui(Some(cache_directory.clone()));
+        let (requests, request_receiver) = bounded(1);
+        let (results, result_receiver) = bounded(1);
+        manager.request_discarder = Some(request_receiver.clone());
+        assert!(spawn_visible_worker_with_transport(
+            picker_for_protocol(ThumbnailProtocol::Halfblocks, FALLBACK_FONT_SIZE),
+            request_receiver,
+            results,
+            transport,
+            Some(ThumbnailCache::new(cache_directory.clone())),
+            Duration::ZERO,
+        ));
+        manager.request_sender = Some(requests);
+        manager.result_receiver = Some(result_receiver);
+
+        assert!(manager.synchronize(Some(&source), area));
+        assert_eq!(wait_for_terminal_state(&mut manager), ThumbnailState::Ready);
+        assert!(
+            manager.protocol().is_some(),
+            "the temporary tile remains visible"
+        );
+        assert!(
+            manager.protocol_key.is_none(),
+            "fallback pixels are not a reusable full image"
+        );
+        assert!(cache.read(&source).unwrap().is_none());
+        for _ in 0..10 {
+            assert!(!manager.synchronize(Some(&source), area));
+            assert!(!manager.poll());
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        manager.synchronize(None, area);
+        assert!(manager.prepared.is_empty());
+        assert!(manager.synchronize(Some(&source), area));
+        assert_eq!(wait_for_terminal_state(&mut manager), ThumbnailState::Ready);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert_eq!(manager.render_size(), Some(Size::new(32, 9)));
+        assert_eq!(cache.read(&source).unwrap(), Some(fixture_thumbnail_png()));
+        manager.synchronize(None, area);
+        assert!(manager.synchronize(Some(&source), area));
+        assert_eq!(
+            manager.state(),
+            &ThumbnailState::Ready,
+            "recovered artwork reopens immediately"
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+
+        let (mut restarted, _replies, observed) =
+            manager_with_mock_transport_in_cache(Some(cache_directory));
+        restarted.synchronize(Some(&source), area);
+        assert_eq!(
+            wait_for_terminal_state(&mut restarted),
+            ThumbnailState::Ready
+        );
+        assert!(
+            observed.is_empty(),
+            "the recovered full image survives restart"
+        );
+    }
+
+    /// Background warming must not publish a successful tile under the waveform URL.
+    #[test]
+    fn archive_waveform_fallback_prefetch_does_not_poison_the_full_image_cache() {
+        let directory = tempfile::tempdir().expect("waveform prefetch fixture");
+        let mut cache = ThumbnailCache::new(directory.path().to_path_buf());
+        let source = Url::parse(
+            "https://iiif.archive.org/image/iiif/3/fixture%2Ftrack.png/full/max/0/default.jpg",
+        )
+        .unwrap();
+        let (mut transport, calls) = recovering_waveform_transport();
+        prefetch_thumbnail(&mut transport, &mut cache, &source).unwrap();
+        assert!(cache.read(&source).unwrap().is_none());
+        prefetch_thumbnail(&mut transport, &mut cache, &source).unwrap();
+        assert_eq!(cache.read(&source).unwrap(), Some(fixture_thumbnail_png()));
+        prefetch_thumbnail(&mut transport, &mut cache, &source).unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    /// Speculative and early-click expansion tiles are not retained as full-resolution images.
+    #[test]
+    fn archive_waveform_fallback_expansion_is_not_cached_or_retried_per_frame() {
+        for click_before_ready in [false, true] {
+            let (mut manager, replies, observed) = manager_with_mock_transport();
+            let preview = Url::parse("https://archive.org/services/img/fixture").unwrap();
+            let expanded = Url::parse(
+                "https://iiif.archive.org/image/iiif/3/fixture%2Ftrack.png/full/max/0/default.jpg",
+            )
+            .unwrap();
+            let area = Rect::new(0, 0, 20, 8);
+            manager.synchronize(Some(&preview), area);
+            assert_eq!(
+                observed.recv_timeout(Duration::from_secs(1)).unwrap(),
+                preview
+            );
+            replies.send(Ok(fixture_png())).unwrap();
+            assert_eq!(wait_for_terminal_state(&mut manager), ThumbnailState::Ready);
+
+            let (transport, calls) = recovering_waveform_transport();
+            let (requests, request_receiver) = bounded(1);
+            let (results, result_receiver) = bounded(1);
+            manager.expansion.request_discarder = Some(request_receiver.clone());
+            manager.expansion.request_sender = Some(requests);
+            manager.expansion.result_receiver = Some(result_receiver);
+            assert!(manager.synchronize_expansion(Some(&expanded), area));
+            if click_before_ready {
+                manager.synchronize_fullscreen(Some(&expanded), area);
+            }
+            // Queue any early click before the worker can finish its tiny fixture.
+            assert!(spawn_expansion_worker_with_transport(
+                picker_for_protocol(ThumbnailProtocol::Halfblocks, FALLBACK_FONT_SIZE),
+                request_receiver,
+                results,
+                transport,
+                Arc::clone(&manager.expansion.current_generation),
+            ));
+            wait_for_image_work(
+                || {
+                    manager.poll();
+                    !manager.expansion.pending
+                },
+                "fallback expansion did not finish",
+            );
+            assert!(
+                manager
+                    .prepared
+                    .iter()
+                    .all(|entry| entry.key.source != expanded)
+            );
+            if click_before_ready {
+                assert_eq!(manager.state(), &ThumbnailState::Ready);
+                assert!(manager.protocol().is_some());
+                assert!(manager.protocol_key.is_none());
+            }
+            for _ in 0..10 {
+                assert!(!manager.synchronize_expansion(Some(&expanded), area));
+                assert!(!manager.poll());
+            }
+            assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+            if click_before_ready {
+                manager.synchronize(Some(&preview), area);
+                assert_eq!(manager.state(), &ThumbnailState::Ready);
+            }
+            manager.synchronize_fullscreen(Some(&expanded), area);
+            assert_eq!(wait_for_terminal_state(&mut manager), ThumbnailState::Ready);
+            assert_eq!(calls.load(Ordering::Relaxed), 2);
+            assert!(manager.protocol_key.is_some());
+            manager.synchronize(Some(&preview), area);
+            manager.synchronize_fullscreen(Some(&expanded), area);
+            assert_eq!(manager.state(), &ThumbnailState::Ready);
+            assert_eq!(calls.load(Ordering::Relaxed), 2);
+            assert!(observed.is_empty(), "the preview still reopens from RAM");
+        }
     }
 
     #[test]

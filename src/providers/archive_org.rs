@@ -181,6 +181,35 @@ pub struct ArchiveOrgTrack {
     pub download_variants: Vec<ArchiveOrgDownloadVariant>,
 }
 
+/// Selects an existing audio-only alternative using the normal playback ranking.
+///
+/// Explicit uploaded originals precede the established derivative codec order;
+/// file size never stands in for quality. Video containers and unrecognized
+/// encodings are excluded, and legacy snapshots without variants need a refresh.
+#[must_use]
+pub fn preferred_audio_variant(track: &ArchiveOrgTrack) -> Option<&ArchiveOrgDownloadVariant> {
+    track
+        .download_variants
+        .iter()
+        .filter_map(|variant| {
+            if variant.is_video {
+                return None;
+            }
+            let rank = audio_format_rank(&variant.filename, &variant.format)?;
+            Some((
+                (
+                    variant.provenance != ArchiveOrgFileProvenance::Original,
+                    rank,
+                    variant.download_url != track.download_url,
+                    variant.filename.as_str(),
+                ),
+                variant,
+            ))
+        })
+        .min_by_key(|(priority, _)| *priority)
+        .map(|(_, variant)| variant)
+}
+
 /// Complete bounded item metadata and selected tracks.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ArchiveOrgItemDetails {
@@ -979,10 +1008,50 @@ fn valid_filename(filename: &str) -> bool {
             .all(|part| !matches!(part, "" | "." | ".."))
 }
 
-/// Prefers practical compressed encodings, avoiding low-bitrate MP3 derivatives.
+/// Rejects explicit metadata/image/archive records despite misleading media suffixes.
+/// The caller supplies the ASCII-lowercased Archive format label.
+fn non_media_format(format: &str) -> bool {
+    ["analysis", "metadata", "spectrogram", "waveform", "tile"]
+        .iter()
+        .any(|denied| format.contains(denied))
+        || matches!(
+            format,
+            "png"
+                | "jpeg"
+                | "gif"
+                | "text"
+                | "xml"
+                | "zip"
+                | "rar"
+                | "7z"
+                | "tar"
+                | "gzip"
+                | "bzip2"
+        )
+}
+
+/// Recognizes explicit video labels in containers that may otherwise hold audio.
+/// The caller supplies the ASCII-lowercased Archive format label.
+fn video_format(format: &str) -> bool {
+    format.contains("video") || format.contains("theora")
+}
+
+/// Admits audio encodings and retains the existing derivative preference order.
+///
+/// Original provenance is ranked separately. Ambiguous ASF containers require
+/// explicit audio metadata, and declared video/analysis files never become audio
+/// merely because their filename resembles a supported encoding.
 fn audio_rank(file: &Value, filename: &str) -> Option<u8> {
+    audio_format_rank(filename, file["format"].as_str().unwrap_or_default())
+}
+
+/// Shares one admission/ranking policy between normalized tracks and playback choices.
+fn audio_format_rank(filename: &str, format: &str) -> Option<u8> {
     let extension = filename.rsplit('.').next()?.to_ascii_lowercase();
-    let format = file["format"].as_str().unwrap_or_default();
+    let normalized_format = format.to_ascii_lowercase();
+    if non_media_format(&normalized_format) || video_format(&normalized_format) {
+        return None;
+    }
     match extension.as_str() {
         "mp3" if format.eq_ignore_ascii_case("VBR MP3") => Some(0),
         "opus" => Some(1),
@@ -993,6 +1062,7 @@ fn audio_rank(file: &Value, filename: &str) -> Option<u8> {
         "flac" => Some(7),
         "wav" | "wave" | "aif" | "aiff" => Some(8),
         "mp2" | "wma" | "ape" | "shn" => Some(9),
+        "asf" if format.eq_ignore_ascii_case("Windows Media Audio") => Some(9),
         _ => None,
     }
 }
@@ -1037,6 +1107,32 @@ struct TrackCandidate<'a> {
 }
 
 impl TrackCandidate<'_> {
+    /// Uses original video audio only inside an already validated playable audio family.
+    ///
+    /// A missing original record, unknown provenance, or non-media container
+    /// leaves the selected audio encoding untouched. This final source choice
+    /// never admits standalone movies or changes track order or waveform ranking.
+    fn playback_source(&self) -> (&str, &Value) {
+        if self.original["name"].as_str() == Some(self.root_name)
+            && file_provenance(self.original) == ArchiveOrgFileProvenance::Original
+            && download_media_kind(self.original, self.root_name) == Some(true)
+        {
+            (self.root_name, self.original)
+        } else {
+            (self.filename, self.file)
+        }
+    }
+
+    /// Keeps uploaded audio quality before codec convenience, without using file size.
+    fn playback_priority(&self) -> (bool, u8, bool, &str) {
+        (
+            file_provenance(self.file) != ArchiveOrgFileProvenance::Original,
+            self.rank,
+            self.filename != self.root_name,
+            self.filename,
+        )
+    }
+
     /// Uses disc and track tags on either the encoding or its original file.
     fn order(&self) -> (Option<u64>, Option<u64>) {
         (
@@ -1046,7 +1142,7 @@ impl TrackCandidate<'_> {
     }
 }
 
-/// Selects one audio encoding per derivative family, then applies natural order.
+/// Prefers original media within validated audio families, retaining natural track order.
 fn normalize_tracks(
     identifier: &str,
     files: &[Value],
@@ -1060,6 +1156,7 @@ fn normalize_tracks(
         }
     }
     let mut selected = BTreeMap::<&str, TrackCandidate<'_>>::new();
+    let mut audio_sources = HashSet::new();
     for (&filename, &file) in &by_name {
         let Some(rank) = audio_rank(file, filename) else {
             continue;
@@ -1067,6 +1164,7 @@ fn normalize_tracks(
         let Some((root_name, original)) = original_file(filename, &by_name) else {
             continue;
         };
+        collect_audio_source_ancestry(filename, &by_name, &mut audio_sources);
         let candidate = TrackCandidate {
             filename,
             file,
@@ -1074,14 +1172,9 @@ fn normalize_tracks(
             root_name,
             rank,
         };
-        let replace = selected.get(root_name).is_none_or(|previous| {
-            (rank, filename != root_name, filename)
-                < (
-                    previous.rank,
-                    previous.filename != root_name,
-                    previous.filename,
-                )
-        });
+        let replace = selected
+            .get(root_name)
+            .is_none_or(|previous| candidate.playback_priority() < previous.playback_priority());
         if replace {
             selected.insert(root_name, candidate);
             if selected.len() > MAX_TRACKS {
@@ -1089,7 +1182,7 @@ fn normalize_tracks(
             }
         }
     }
-    let waveforms = accepted_family_waveforms(&by_name, &selected);
+    let waveforms = accepted_family_waveforms(&by_name, &selected, &audio_sources);
     let mut download_variants = accepted_family_download_variants(identifier, &by_name, &selected)?;
     let mut candidates: Vec<_> = selected.into_values().collect();
     candidates.sort_by(|left, right| {
@@ -1109,20 +1202,23 @@ fn normalize_tracks(
     candidates
         .into_iter()
         .map(|candidate| {
+            let (filename, file) = candidate.playback_source();
             let mut segments = vec!["download", identifier];
-            segments.extend(candidate.filename.split('/'));
+            segments.extend(filename.split('/'));
             Ok(ArchiveOrgTrack {
-                filename: candidate.filename.into(),
-                title: text_value(&candidate.file["title"], MAX_LABEL_BYTES, false)
+                filename: filename.into(),
+                title: text_value(&file["title"], MAX_LABEL_BYTES, false)
+                    .or_else(|| text_value(&candidate.file["title"], MAX_LABEL_BYTES, false))
                     .or_else(|| text_value(&candidate.original["title"], MAX_LABEL_BYTES, false))
                     .and_then(|title| {
                         crate::legacy_text::normalized_legacy_windows_1251_value(Some(&title))
                     })
-                    .unwrap_or_else(|| candidate.filename.into()),
+                    .unwrap_or_else(|| filename.into()),
                 download_url: archive_url(&segments)?,
-                duration_seconds: duration(&candidate.file["length"])
+                duration_seconds: duration(&file["length"])
+                    .or_else(|| duration(&candidate.file["length"]))
                     .or_else(|| duration(&candidate.original["length"])),
-                size_bytes: number(&candidate.file["size"]),
+                size_bytes: number(&file["size"]),
                 waveform_url: waveforms
                     .get(candidate.root_name)
                     .and_then(|filename| waveform_jpeg_url(identifier, filename)),
@@ -1208,15 +1304,6 @@ fn accepted_family_download_variants<'a>(
         }
         let mut segments = vec!["download", identifier];
         segments.extend(filename.split('/'));
-        let provenance = match file["source"].as_str() {
-            Some("original")
-                if file["original"].is_null() || file["original"].as_str() == Some("") =>
-            {
-                ArchiveOrgFileProvenance::Original
-            }
-            Some("derivative") => ArchiveOrgFileProvenance::Derivative,
-            _ => ArchiveOrgFileProvenance::Unknown,
-        };
         family.push(ArchiveOrgDownloadVariant {
             filename: filename.into(),
             download_url: archive_url(&segments)?,
@@ -1228,7 +1315,7 @@ fn accepted_family_download_variants<'a>(
                     .to_ascii_uppercase()
             }),
             size_bytes: number(&file["size"]),
-            provenance,
+            provenance: file_provenance(file),
             is_video,
         });
     }
@@ -1241,6 +1328,17 @@ fn accepted_family_download_variants<'a>(
         });
     }
     Ok(variants)
+}
+
+/// Uses explicit, consistent provenance for both playback and download choices.
+fn file_provenance(file: &Value) -> ArchiveOrgFileProvenance {
+    match file["source"].as_str() {
+        Some("original") if file["original"].is_null() || file["original"].as_str() == Some("") => {
+            ArchiveOrgFileProvenance::Original
+        }
+        Some("derivative") => ArchiveOrgFileProvenance::Derivative,
+        _ => ArchiveOrgFileProvenance::Unknown,
+    }
 }
 
 /// Sorts uploaded originals before generated and unknown-provenance files.
@@ -1259,18 +1357,18 @@ fn download_media_kind(file: &Value, filename: &str) -> Option<bool> {
         .as_str()
         .unwrap_or_default()
         .to_ascii_lowercase();
-    if ["analysis", "metadata", "spectrogram", "waveform", "tile"]
-        .iter()
-        .any(|denied| format.contains(denied))
-        || matches!(format.as_str(), "png" | "jpeg" | "gif" | "text" | "xml")
-    {
+    if non_media_format(&format) {
         return None;
     }
     if audio_rank(file, filename).is_some() {
         return Some(false);
     }
+    let extension = filename.rsplit('.').next()?.to_ascii_lowercase();
+    if matches!(extension.as_str(), "ogg" | "oga" | "asf") && video_format(&format) {
+        return Some(true);
+    }
     matches!(
-        filename.rsplit('.').next()?.to_ascii_lowercase().as_str(),
+        extension.as_str(),
         "mp4"
             | "m4v"
             | "webm"
@@ -1293,12 +1391,15 @@ fn download_media_kind(file: &Value, filename: &str) -> Option<bool> {
 ///
 /// Archive waveforms use the exact audio parent's path with a PNG extension.
 /// Source/format, matching stem, ancestry and resource bounds prevent arbitrary
-/// images, spectrograms or tiles from becoming waveform fallbacks. Root-original
-/// waveforms rank ahead of selected-encoding or other family derivatives, with
-/// deterministic filename ties independent of metadata/HashMap iteration order.
+/// images, spectrograms or tiles from becoming waveform fallbacks. Any original
+/// or intermediate source of an accepted audio encoding qualifies regardless of
+/// its container format; playback preferences do not determine image support.
+/// Root-original waveforms rank ahead of selected-encoding or other known audio
+/// derivatives, with deterministic filename ties independent of metadata order.
 fn accepted_family_waveforms<'a>(
     files: &HashMap<&'a str, &'a Value>,
     selected: &BTreeMap<&'a str, TrackCandidate<'a>>,
+    audio_sources: &HashSet<&'a str>,
 ) -> HashMap<&'a str, &'a str> {
     let mut waveforms = HashMap::<&str, (u8, &str)>::new();
     for (&filename, &file) in files {
@@ -1322,11 +1423,8 @@ fn accepted_family_waveforms<'a>(
         else {
             continue;
         };
-        let Some(parent_file) = files.get(parent) else {
-            continue;
-        };
-        if parent.rsplit_once('.').map(|(stem, _)| stem) != Some(stem)
-            || audio_rank(parent_file, parent).is_none()
+        if !audio_sources.contains(parent)
+            || parent.rsplit_once('.').map(|(stem, _)| stem) != Some(stem)
             || !bounded_waveform_dimensions(file)
         {
             continue;
@@ -1358,6 +1456,31 @@ fn accepted_family_waveforms<'a>(
         .into_iter()
         .map(|(root, (_, filename))| (root, filename))
         .collect()
+}
+
+/// Records format-independent sources of all validated playable audio encodings.
+///
+/// `original_file` already validated restrictions, paths and cycles. Each source
+/// is retained once and walking stops at shared ancestry, so alternate playback
+/// branches need neither format allowlists nor a whole-file scan per waveform.
+fn collect_audio_source_ancestry<'a>(
+    filename: &'a str,
+    files: &HashMap<&'a str, &'a Value>,
+    sources: &mut HashSet<&'a str>,
+) {
+    let mut current = filename;
+    for _ in 0..MAX_DERIVATIVE_DEPTH {
+        let Some(file) = files.get(current) else {
+            return;
+        };
+        if !sources.insert(current) {
+            return;
+        }
+        let Some(original) = file["original"].as_str() else {
+            return;
+        };
+        current = original;
+    }
 }
 
 /// Metadata can reject over-budget waveforms early; image decoding repeats these checks.
@@ -1735,6 +1858,41 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
+
+    /// Playback choices share normalization's original-first rank, independent of size/order.
+    #[test]
+    fn preferred_audio_variant_keeps_original_quality_and_derivative_rank() {
+        for (original, format, expected) in [
+            ("recording.flac", "Flac", "recording.flac"),
+            ("recording.asf", "Windows Media Audio", "recording.asf"),
+            ("recording.mp4", "MPEG4", "recording.mp3"),
+        ] {
+            let files = [
+                json!({"name": original, "source": "original", "format": format, "size": 100000000}),
+                json!({"name": "recording.ogg", "original": original, "source": "derivative", "format": "Ogg Vorbis", "size": 10}),
+                json!({"name": "recording.mp3", "original": original, "source": "derivative", "format": "VBR MP3", "size": 10000000}),
+            ];
+            let mut tracks = normalize_tracks("mock_audio", &files).unwrap();
+            let track = &mut tracks[0];
+            for _ in 0..2 {
+                assert_eq!(preferred_audio_variant(track).unwrap().filename, expected);
+                track.download_variants.reverse();
+            }
+        }
+    }
+
+    /// Neither missing inventories nor declared video files can satisfy audio-only playback.
+    #[test]
+    fn preferred_audio_variant_rejects_video_and_missing_inventory() {
+        let mut track = normalize_tracks("mock_audio", &[
+            json!({"name": "recording.mp4", "source": "original", "format": "MPEG4"}),
+            json!({"name": "recording.mp3", "original": "recording.mp4", "source": "derivative", "format": "VBR MP3"}),
+        ]).unwrap().remove(0);
+        track.download_variants.retain(|variant| variant.is_video);
+        assert!(preferred_audio_variant(&track).is_none());
+        track.download_variants.clear();
+        assert!(preferred_audio_variant(&track).is_none());
+    }
 
     /// The reported item has a full-size original alongside tiny generated tiles.
     #[test]
@@ -2369,8 +2527,8 @@ mod tests {
     fn legacy_cyrillic_original_title_fallback_keeps_exact_remote_file_identity() {
         let filename = "Áåòîíîìåøàëêà.opus";
         let files = vec![
-            json!({"name":"original.wav", "source":"original", "title":"Áåòîíîìåøàëêà"}),
-            json!({"name":filename, "source":"derivative", "original":"original.wav"}),
+            json!({"name":"original.mov", "title":"Áåòîíîìåøàëêà"}),
+            json!({"name":filename, "source":"derivative", "original":"original.mov"}),
         ];
         let tracks = normalize_tracks("mock_audio", &files).expect("audio family");
         assert_eq!(tracks.len(), 1);
@@ -2380,7 +2538,12 @@ mod tests {
             tracks[0].download_url,
             archive_url(&["download", "mock_audio", filename]).expect("unchanged exact path")
         );
-        assert_eq!(tracks[0].download_variants[0].filename, "original.wav");
+        assert!(
+            tracks[0]
+                .download_variants
+                .iter()
+                .any(|variant| variant.filename == "original.mov")
+        );
     }
 
     /// Accented Latin, real Unicode and ambiguous short text are not guessed.
@@ -2795,7 +2958,232 @@ mod tests {
         assert!(transport.requests.lock().expect("requests").is_empty());
     }
 
-    /// Choosing a playback encoding must not discard the user's original download option.
+    /// Audio quality comes from the uploaded source, not the smallest derivative.
+    #[test]
+    fn playback_prefers_declared_original_audio_before_codec_rank_or_file_size() {
+        for (filename, format) in [
+            ("original.mp3", "MP3"),
+            ("original.ogg", "Ogg Vorbis"),
+            ("original.wav", "WAVE"),
+            ("original.flac", "Flac"),
+            ("original.asf", "Windows Media Audio"),
+            ("original.ASF", "windows media audio"),
+        ] {
+            for pointer in [Value::Null, json!("")] {
+                let files = vec![
+                    json!({"name": filename, "source": "original", "format": format, "original": pointer, "size": 100000000}),
+                    json!({"name": "generated.mp3", "source": "derivative", "format": "VBR MP3", "original": filename, "size": 1000000}),
+                    json!({"name": "tiny.ogg", "source": "derivative", "format": "Ogg Vorbis", "original": filename, "size": 1}),
+                ];
+                for offset in 0..files.len() {
+                    let mut reordered = files.clone();
+                    reordered.rotate_left(offset);
+                    let tracks = normalize_tracks("mock_audio", &reordered).unwrap();
+                    assert_eq!(tracks.len(), 1);
+                    assert_eq!(tracks[0].filename, filename, "{format}");
+                    assert_eq!(tracks[0].size_bytes, Some(100000000));
+                    assert_eq!(
+                        tracks[0].download_url,
+                        archive_url(&["download", "mock_audio", filename]).unwrap()
+                    );
+                    assert_eq!(tracks[0].download_variants.len(), 3);
+                    assert_eq!(tracks[0].download_variants[0].filename, filename);
+                    assert_eq!(
+                        tracks[0].download_variants[0].provenance,
+                        ArchiveOrgFileProvenance::Original
+                    );
+                }
+            }
+        }
+    }
+
+    /// A root filename alone, or inconsistent source metadata, proves no original.
+    #[test]
+    fn playback_original_preference_requires_explicit_consistent_provenance() {
+        for (source, original) in [
+            (Value::Null, Value::Null),
+            (json!("unexpected"), Value::Null),
+            (json!("derivative"), Value::Null),
+            (json!("original"), json!(42)),
+            (json!("original"), json!("missing.wav")),
+        ] {
+            let tracks = normalize_tracks("mock_audio", &[
+                json!({"name": "unproven.flac", "source": source, "original": original}),
+                json!({"name": "preferred.mp3", "source": "derivative", "format": "VBR MP3", "original": "unproven.flac"}),
+                json!({"name": "tiny.ogg", "source": "derivative", "original": "unproven.flac", "size": 1}),
+            ]).unwrap();
+            assert_eq!(tracks.len(), 1);
+            assert_eq!(tracks[0].filename, "preferred.mp3");
+            assert_ne!(
+                tracks[0]
+                    .download_variants
+                    .iter()
+                    .find(|variant| variant.filename == "unproven.flac")
+                    .unwrap()
+                    .provenance,
+                ArchiveOrgFileProvenance::Original
+            );
+        }
+    }
+
+    /// Video roots retain their original audio only after an audio derivative proves the family.
+    #[test]
+    fn playback_original_video_preserves_audio_family_metadata_and_waveform() {
+        for (filename, format) in [
+            ("recording.mov", "QuickTime"),
+            ("recording.mp4", "MPEG4"),
+            ("recording.ogg", "Ogg Theora"),
+            ("recording.asf", "Windows Media Video"),
+        ] {
+            for has_original_tags in [false, true] {
+                let files = vec![
+                    json!({"name": filename, "source": "original", "format": format, "size": 100000000,
+                        "title": has_original_tags.then_some("Original title"), "length": has_original_tags.then_some("123.5")}),
+                    json!({"name": "copy.mp4", "source": "derivative", "format": "MPEG4", "original": filename}),
+                    json!({"name": "audio.mp3", "source": "derivative", "format": "VBR MP3", "original": "copy.mp4",
+                        "title": "Audio title", "length": "234.5", "size": 1000}),
+                    waveform_fixture("recording.png", filename),
+                    json!({"name": "unrelated.mp4", "source": "original", "format": "MPEG4"}),
+                ];
+                for offset in 0..files.len() {
+                    let mut reordered = files.clone();
+                    reordered.rotate_left(offset);
+                    let tracks = normalize_tracks("mock_audio", &reordered).unwrap();
+                    assert_eq!(tracks.len(), 1);
+                    assert_eq!(tracks[0].filename, filename);
+                    assert_eq!(
+                        tracks[0].download_url,
+                        archive_url(&["download", "mock_audio", filename]).unwrap()
+                    );
+                    assert_eq!(tracks[0].size_bytes, Some(100000000));
+                    assert_eq!(
+                        tracks[0].title,
+                        if has_original_tags {
+                            "Original title"
+                        } else {
+                            "Audio title"
+                        }
+                    );
+                    assert_eq!(
+                        tracks[0].duration_seconds,
+                        Some(if has_original_tags { 123 } else { 234 })
+                    );
+                    assert_eq!(
+                        tracks[0].waveform_url.as_ref().map(Url::as_str),
+                        Some(
+                            "https://iiif.archive.org/image/iiif/3/mock_audio%2Frecording.png/full/max/0/default.jpg"
+                        )
+                    );
+                    assert_eq!(tracks[0].download_variants.len(), 3);
+                    assert_eq!(tracks[0].download_variants[0].filename, filename);
+                    assert!(tracks[0].download_variants[0].is_video);
+                    assert!(
+                        tracks[0]
+                            .download_variants
+                            .iter()
+                            .any(|variant| variant.filename == "audio.mp3" && !variant.is_video)
+                    );
+                }
+            }
+        }
+    }
+
+    /// Promoting the playback source keeps the existing natural family order.
+    #[test]
+    fn playback_original_video_preserves_natural_track_order() {
+        let tracks = normalize_tracks(
+            "mock_audio",
+            &[
+                json!({"name": "track10.mp4", "source": "original", "format": "MPEG4"}),
+                json!({"name": "audio10.mp3", "source": "derivative", "original": "track10.mp4"}),
+                json!({"name": "track2.mov", "source": "original", "format": "QuickTime"}),
+                json!({"name": "audio2.mp3", "source": "derivative", "original": "track2.mov"}),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            tracks
+                .iter()
+                .map(|track| track.filename.as_str())
+                .collect::<Vec<_>>(),
+            ["track2.mov", "track10.mp4"]
+        );
+    }
+
+    /// Neither a movie alone nor an unproven original expands the audio catalogue.
+    #[test]
+    fn playback_original_video_requires_trustworthy_provenance_and_audio_ancestry() {
+        assert!(normalize_tracks("mock_audio", &[
+            json!({"name": "standalone.mp4", "source": "original", "format": "MPEG4"}),
+            json!({"name": "standalone.mov", "source": "original", "format": "QuickTime"}),
+            json!({"name": "analysis.mp3", "source": "derivative", "format": "Audio Analysis", "original": "standalone.mp4"}),
+        ]).unwrap().is_empty());
+        for (filename, source, original, format) in [
+            ("root.mp4", Value::Null, Value::Null, "MPEG4"),
+            ("root.mp4", json!("derivative"), Value::Null, "MPEG4"),
+            ("root.mp4", json!("original"), json!(42), "MPEG4"),
+            ("root.mp4", json!("original"), json!("missing.mp4"), "MPEG4"),
+            ("root.zip", json!("original"), Value::Null, "ZIP"),
+            ("root.mp4", json!("original"), Value::Null, "ZIP"),
+            ("root.mp4", json!("original"), Value::Null, "RAR"),
+            ("root.mp4", json!("original"), Value::Null, "7z"),
+            ("root.mp4", json!("original"), Value::Null, "TAR"),
+            ("root.mp4", json!("original"), Value::Null, "GZIP"),
+            ("root.mp4", json!("original"), Value::Null, "BZIP2"),
+            ("root.mp4", json!("original"), Value::Null, "PNG"),
+        ] {
+            let tracks = normalize_tracks("mock_audio", &[
+                json!({"name": filename, "source": source, "format": format, "original": original}),
+                json!({"name": "audio.mp3", "source": "derivative", "original": filename}),
+            ]).unwrap();
+            assert_eq!(tracks.len(), 1);
+            assert_eq!(tracks[0].filename, "audio.mp3");
+        }
+        for restriction in ["private", "nodownload"] {
+            let mut original =
+                json!({"name": "private.mp4", "source": "original", "format": "MPEG4"});
+            original[restriction] = json!(true);
+            assert!(normalize_tracks("mock_audio", &[
+                original,
+                json!({"name": "audio.mp3", "source": "derivative", "original": "private.mp4"}),
+            ]).unwrap().is_empty());
+        }
+    }
+
+    /// Explicit non-audio metadata cannot be promoted by a familiar audio suffix.
+    #[test]
+    fn playback_rejects_nonaudio_originals_and_ambiguous_asf_containers() {
+        for (filename, format) in [
+            ("original.mp3", "PNG"),
+            ("original.mp3", "JPEG"),
+            ("original.mp3", "Audio Analysis"),
+            ("original.asf", "ASF"),
+            ("original.asf", ""),
+        ] {
+            let tracks = normalize_tracks("mock_audio", &[
+                json!({"name": filename, "source": "original", "format": format}),
+                json!({"name": "audio.flac", "source": "derivative", "format": "Flac", "original": filename}),
+            ]).unwrap();
+            assert_eq!(tracks.len(), 1);
+            assert_eq!(tracks[0].filename, "audio.flac", "{filename}: {format}");
+        }
+    }
+
+    /// Original video audio playback does not relabel the separate video download option.
+    #[test]
+    fn playback_ogg_video_original_keeps_its_separate_video_download_variant() {
+        let tracks = normalize_tracks("mock_audio", &[
+            json!({"name": "original.ogg", "source": "original", "format": "Ogg Video"}),
+            json!({"name": "audio.flac", "source": "derivative", "format": "Flac", "original": "original.ogg"}),
+        ]).unwrap();
+        assert_eq!(tracks[0].filename, "original.ogg");
+        assert_eq!(tracks[0].download_variants.len(), 2);
+        assert_eq!(tracks[0].download_variants[0].filename, "original.ogg");
+        assert!(tracks[0].download_variants[0].is_video);
+        assert!(!tracks[0].download_variants[1].is_video);
+    }
+
+    /// Original playback must retain every independently selectable download encoding.
     #[test]
     fn download_variants_preserve_original_and_derivatives_in_stable_order() {
         let files = vec![
@@ -2808,7 +3196,7 @@ mod tests {
             reordered.rotate_left(offset);
             let tracks = normalize_tracks("mock_audio", &reordered).expect("tracks");
             assert_eq!(tracks.len(), 1);
-            assert_eq!(tracks[0].filename, "Звук/track.mp3");
+            assert_eq!(tracks[0].filename, "Звук/track.flac");
             let variants = &tracks[0].download_variants;
             assert_eq!(
                 variants
@@ -2892,7 +3280,7 @@ mod tests {
             json!({"name": "unrelated.mp4", "source": "original", "format": "MPEG4"}),
         ]).expect("tracks");
         assert_eq!(tracks.len(), 1);
-        assert_eq!(tracks[0].filename, "recording.mp3");
+        assert_eq!(tracks[0].filename, "recording.mov");
         let variants = &tracks[0].download_variants;
         assert_eq!(
             variants
@@ -2963,7 +3351,7 @@ mod tests {
     #[test]
     fn item_waveform_uses_original_family_despite_opus_playback_and_metadata_order() {
         let files = vec![
-            json!({"name": "track.mp3", "source": "original"}),
+            json!({"name": "track.mp3"}),
             json!({"name": "preferred.opus", "source": "derivative", "original": "track.mp3"}),
             waveform_fixture("preferred.png", "preferred.opus"),
             waveform_fixture("track.png", "track.mp3"),
@@ -2983,6 +3371,180 @@ mod tests {
             );
             assert_eq!(details.item.artwork_url, details.tracks[0].waveform_url);
         }
+    }
+
+    /// Waveform provenance must not depend on the original's playback support.
+    #[test]
+    fn item_waveform_accepts_all_original_formats_of_playable_audio_families() {
+        for (original, format) in [
+            ("00824454.asf", Some("Windows Media Audio")),
+            ("00824454.asf", None),
+            ("00824454.ra", Some("RealAudio")),
+            ("00824454.au", Some("AU")),
+            ("00824454.caf", Some("Core Audio Format")),
+            ("00824454.mod", Some("Tracker Module")),
+            ("00824454.unknown", None),
+        ] {
+            let files = vec![
+                json!({"name": original, "source": "original", "format": format}),
+                json!({"name": "00824454.mp3", "source": "derivative", "format": "VBR MP3", "original": original}),
+                json!({"name": "00824454.ogg", "source": "derivative", "format": "Ogg Vorbis", "original": original}),
+                // Match the reported ASF family's real PNG metadata: no dimensions.
+                json!({"name": "00824454.png", "source": "derivative", "format": "PNG", "original": original, "size": 11254}),
+                json!({"name": "__ia_thumb.jpg", "source": "original", "format": "JPEG Thumb", "size": 3085}),
+            ];
+            for offset in 0..files.len() {
+                let mut reordered = files.clone();
+                reordered.rotate_left(offset);
+                let (client, _) = mock_client(vec![bytes(&metadata(json!(reordered)))]);
+                let details = client.item_details("mock_audio").unwrap();
+                assert_eq!(details.tracks.len(), 1, "{original}");
+                let expected_audio = if format == Some("Windows Media Audio") {
+                    original
+                } else {
+                    "00824454.mp3"
+                };
+                assert_eq!(details.tracks[0].filename, expected_audio, "{original}");
+                assert_eq!(
+                    details.tracks[0].waveform_url.as_ref().map(Url::as_str),
+                    Some(
+                        "https://iiif.archive.org/image/iiif/3/mock_audio%2F00824454.png/full/max/0/default.jpg"
+                    ),
+                    "{original}"
+                );
+                assert_eq!(details.item.artwork_url, details.tracks[0].waveform_url);
+            }
+        }
+    }
+
+    /// An intermediate source may also use a format outside the playback choices.
+    #[test]
+    fn item_waveform_accepts_unknown_intermediate_audio_ancestors() {
+        let (client, _) = mock_client(vec![bytes(&metadata(json!([
+            {"name": "original.unknown", "source": "original"},
+            {"name": "intermediate.unknown", "source": "derivative", "original": "original.unknown"},
+            {"name": "preferred.mp3", "source": "derivative", "format": "VBR MP3", "original": "intermediate.unknown"},
+            waveform_fixture("intermediate.png", "intermediate.unknown")
+        ])))]);
+        let details = client.item_details("mock_audio").unwrap();
+        assert_eq!(details.tracks.len(), 1);
+        assert_eq!(details.tracks[0].filename, "preferred.mp3");
+        assert_eq!(
+            details.tracks[0].waveform_url.as_ref().map(Url::as_str),
+            Some(
+                "https://iiif.archive.org/image/iiif/3/mock_audio%2Fintermediate.png/full/max/0/default.jpg"
+            )
+        );
+        assert_eq!(details.item.artwork_url, details.tracks[0].waveform_url);
+    }
+
+    /// Source evidence from an alternate audio encoding must survive playback ranking.
+    #[test]
+    fn item_waveform_accepts_unknown_sources_on_alternate_playable_branches() {
+        let files = vec![
+            json!({"name": "original.wav", "source": "original"}),
+            json!({"name": "preferred.mp3", "source": "derivative", "format": "VBR MP3", "original": "original.wav"}),
+            json!({"name": "source.unknown", "source": "derivative", "original": "original.wav"}),
+            json!({"name": "alternate.ogg", "source": "derivative", "original": "source.unknown"}),
+            waveform_fixture("source.png", "source.unknown"),
+        ];
+        for offset in 0..files.len() {
+            let mut reordered = files.clone();
+            reordered.rotate_left(offset);
+            let (client, _) = mock_client(vec![bytes(&metadata(json!(reordered)))]);
+            let details = client.item_details("mock_audio").unwrap();
+            assert_eq!(details.tracks.len(), 1);
+            assert_eq!(details.tracks[0].filename, "original.wav");
+            assert_eq!(
+                details.tracks[0].waveform_url.as_ref().map(Url::as_str),
+                Some(
+                    "https://iiif.archive.org/image/iiif/3/mock_audio%2Fsource.png/full/max/0/default.jpg"
+                )
+            );
+            assert_eq!(details.item.artwork_url, details.tracks[0].waveform_url);
+            assert_eq!(
+                details.tracks[0]
+                    .download_variants
+                    .iter()
+                    .map(|variant| variant.filename.as_str())
+                    .collect::<Vec<_>>(),
+                ["original.wav", "alternate.ogg", "preferred.mp3"]
+            );
+        }
+    }
+
+    /// Format-independent ancestry has the same exact depth ceiling as track selection.
+    #[test]
+    fn item_waveform_unknown_source_ancestry_respects_the_depth_boundary() {
+        for chain_length in [MAX_DERIVATIVE_DEPTH, MAX_DERIVATIVE_DEPTH + 1] {
+            let mut files = vec![json!({"name": "root.unknown", "source": "original"})];
+            let mut previous = "root.unknown".to_owned();
+            for depth in 1..chain_length - 1 {
+                let filename = format!("source{depth}.unknown");
+                files.push(json!({"name": filename, "source": "derivative", "original": previous}));
+                previous = filename;
+            }
+            files.push(json!({"name": "preferred.mp3", "source": "derivative", "format": "VBR MP3", "original": previous}));
+            files.push(waveform_fixture("root.png", "root.unknown"));
+            let tracks = normalize_tracks("mock_audio", &files).unwrap();
+            if chain_length == MAX_DERIVATIVE_DEPTH {
+                assert_eq!(tracks.len(), 1);
+                assert_eq!(tracks[0].filename, "preferred.mp3");
+                assert_eq!(
+                    tracks[0].waveform_url.as_ref().map(Url::as_str),
+                    Some(
+                        "https://iiif.archive.org/image/iiif/3/mock_audio%2Froot.png/full/max/0/default.jpg"
+                    )
+                );
+            } else {
+                assert!(tracks.is_empty());
+            }
+        }
+    }
+
+    /// Sharing an original does not turn an analysis/image sibling into audio.
+    #[test]
+    fn item_waveform_rejects_unknown_nonancestor_parents_in_audio_families() {
+        for (parent, format) in [
+            ("analysis.json", "Audio Analysis"),
+            ("scan.jpg", "JPEG"),
+            ("unrelated.unknown", "Unknown"),
+        ] {
+            let stem = parent.rsplit_once('.').unwrap().0;
+            let (client, _) = mock_client(vec![bytes(&metadata(json!([
+                {"name": "original.asf", "source": "original", "format": "Windows Media Audio"},
+                {"name": "preferred.mp3", "source": "derivative", "format": "VBR MP3", "original": "original.asf"},
+                {"name": parent, "source": "derivative", "format": format, "original": "original.asf"},
+                waveform_fixture(&format!("{stem}.png"), parent)
+            ])))]);
+            let details = client.item_details("mock_audio").unwrap();
+            assert_eq!(details.tracks.len(), 1, "{parent}");
+            assert_eq!(details.tracks[0].waveform_url, None, "{parent}");
+            assert_eq!(
+                details.item.artwork_url.as_ref().map(Url::as_str),
+                Some("https://archive.org/services/img/mock_audio")
+            );
+        }
+    }
+
+    /// Existing waveforms of recognized audio siblings remain valid fallbacks.
+    #[test]
+    fn item_waveform_accepts_known_audio_siblings_of_selected_encoding() {
+        let (client, _) = mock_client(vec![bytes(&metadata(json!([
+            {"name": "original.asf", "format": "Windows Media Audio"},
+            {"name": "preferred.mp3", "source": "derivative", "format": "VBR MP3", "original": "original.asf"},
+            {"name": "sibling.ogg", "source": "derivative", "original": "original.asf"},
+            waveform_fixture("sibling.png", "sibling.ogg")
+        ])))]);
+        let details = client.item_details("mock_audio").unwrap();
+        assert_eq!(details.tracks.len(), 1);
+        assert_eq!(details.tracks[0].filename, "preferred.mp3");
+        assert_eq!(
+            details.tracks[0].waveform_url.as_ref().map(Url::as_str),
+            Some(
+                "https://iiif.archive.org/image/iiif/3/mock_audio%2Fsibling.png/full/max/0/default.jpg"
+            )
+        );
     }
 
     #[test]
@@ -3107,7 +3669,7 @@ mod tests {
         ])))]);
         let details = client.item_details("mock_audio").unwrap();
         assert_eq!(details.tracks.len(), 1);
-        assert_eq!(details.tracks[0].filename, "preferred.opus");
+        assert_eq!(details.tracks[0].filename, "track.wav");
         assert_eq!(
             details.tracks[0].waveform_url.as_ref().map(Url::as_str),
             Some(
@@ -3176,10 +3738,10 @@ mod tests {
         ])))]);
         let details = client.item_details("mock_audio").expect("details");
         assert_eq!(details.tracks.len(), 2);
-        assert_eq!(details.tracks[0].filename, "disc/track2.mp3");
+        assert_eq!(details.tracks[0].filename, "disc/track2.wav");
         assert_eq!(details.tracks[0].title, "Second");
         assert_eq!(details.tracks[0].duration_seconds, Some(62));
-        assert_eq!(details.tracks[0].size_bytes, Some(123));
+        assert_eq!(details.tracks[0].size_bytes, Some(900));
         assert_eq!(details.tracks[1].duration_seconds, Some(3723));
     }
 
