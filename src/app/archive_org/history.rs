@@ -23,9 +23,42 @@ pub(super) struct ArchiveLocation {
 struct CachedLocation {
     items: Vec<ArchiveOrgItem>,
     active: Option<Arc<ArchiveOrgItemDetails>>,
+    /// The original HTTP page stride must travel with its continuation cursor.
+    page_limit: Option<usize>,
     next_page: Option<u32>,
     total: u64,
     weight: usize,
+}
+
+impl ArchiveLocation {
+    /// Reconstructs only the logical route; fresh bounded metadata supplies all content.
+    pub(super) fn from_session(location: crate::domain::ArchiveOrgSessionLocation) -> Self {
+        Self {
+            query: location.query,
+            scope: location.scope,
+            selected: location.catalogue_selected,
+            selected_id: location.catalogue_identifier,
+            active_id: Some(location.identifier),
+            track: 0,
+            filename: location.filename,
+            scroll: 0,
+            focused: false,
+            cached: None,
+        }
+    }
+
+    /// Preserves an in-flight destination if the session is saved before metadata arrives.
+    pub(super) fn session_location(&self) -> Option<crate::domain::ArchiveOrgSessionLocation> {
+        let location = crate::domain::ArchiveOrgSessionLocation {
+            query: self.query.clone(),
+            scope: self.scope,
+            catalogue_selected: self.selected,
+            catalogue_identifier: self.selected_id.clone(),
+            identifier: self.active_id.clone()?,
+            filename: self.filename.clone(),
+        };
+        location.is_valid().then_some(location)
+    }
 }
 
 impl AppController {
@@ -81,6 +114,7 @@ impl AppController {
                     items,
                     active,
                     weight,
+                    page_limit: self.archive_org.page_limit,
                     next_page: self.archive_org.next_page,
                     total: self.archive_org.total,
                 });
@@ -128,10 +162,15 @@ impl AppController {
             self.archive_org.submitted_scope = location.scope;
             self.archive_org.items = cached.items;
             self.archive_org.active = cached.active;
+            self.archive_org.page_limit = cached.page_limit;
             self.archive_org.next_page = cached.next_page;
             self.archive_org.total = cached.total;
         } else {
-            self.start_archive_org_search(location.query.clone(), location.scope);
+            // Twenty restoration pages must still cover the bounded 1,000-item
+            // result set after a viewport shrinks. This is a fresh fetch with
+            // no retained offsets; ordinary searches keep the frontend's size.
+            let limit = self.archive_org.search_page_capacity.unwrap_or(50).max(50);
+            self.start_archive_org_search_with_limit(location.query.clone(), location.scope, limit);
         }
         self.archive_org.restoring = Some(location);
         if !self.continue_archive_restore() {
@@ -163,7 +202,7 @@ impl AppController {
                     query: location.query.clone(),
                     scope: location.scope,
                     page,
-                    limit: 50,
+                    limit: self.archive_org.page_limit.unwrap_or(50),
                 }),
                 false,
             );
@@ -200,17 +239,17 @@ impl AppController {
             .restoring
             .take()
             .expect("owned Archive restoration");
+        let mut missing_file = false;
         if let Some(details) = &self.archive_org.active {
-            self.archive_org_selected = location
-                .filename
-                .as_ref()
-                .and_then(|filename| {
-                    details
-                        .tracks
-                        .iter()
-                        .position(|track| track.filename == *filename)
-                })
-                .unwrap_or(location.track)
+            let exact_file = location.filename.as_ref().and_then(|filename| {
+                details
+                    .tracks
+                    .iter()
+                    .position(|track| track.filename == *filename)
+            });
+            missing_file = location.filename.is_some() && exact_file.is_none();
+            self.archive_org_selected = exact_file
+                .unwrap_or(if missing_file { 0 } else { location.track })
                 .min(details.tracks.len().saturating_sub(1));
         }
         self.archive_org.message = if let Some(details) = &self.archive_org.active {
@@ -225,6 +264,11 @@ impl AppController {
                 self.archive_org.total
             )
         };
+        if missing_file {
+            self.archive_org
+                .message
+                .push_str(" · saved file is no longer available");
+        }
         self.populate_archive_org();
         self.view.details_scroll = location.scroll;
         self.view.details_focused = location.focused;
@@ -403,6 +447,72 @@ mod tests {
             })),
         );
         assert_eq!(app.view.selected, 1);
+        app.archive_org
+            .worker
+            .take()
+            .unwrap()
+            .thread
+            .join()
+            .unwrap();
+    }
+
+    /// An evicted route retains its reachable identity budget after a terminal shrinks.
+    #[test]
+    fn archive_back_evicted_identity_survives_small_viewport_with_bounded_requests() {
+        let (_temporary, mut app) = controller();
+        super::super::tests::occupy_archive_worker(&mut app);
+        let make_item = |index: usize| {
+            let mut item = super::super::tests::item();
+            item.identifier = format!("item-{index}");
+            item
+        };
+        app.archive_org.submitted_query = "original".into();
+        app.archive_org_search_query = "original".into();
+        app.archive_org.page_limit = Some(100);
+        app.archive_org.items = (0..300).map(make_item).collect();
+        app.view.selected = 250;
+        app.update_archive_org_search_page_capacity(10);
+        app.search_archive_metadata("topic".into(), ArchiveOrgSearchScope::Topic);
+        app.archive_org.history[0].cached = None;
+        assert!(app.go_back_archive_org());
+        let mut requests = 0;
+        for _ in 0..20 {
+            if app.archive_org.restoring.is_none() {
+                break;
+            }
+            let job = app
+                .archive_org
+                .pending
+                .clone()
+                .expect("pending restore page");
+            let ArchiveRequest::Search(request) = &job.kind else {
+                panic!("restoring a result identity must request its catalogue");
+            };
+            assert!(request.page <= 20);
+            let start = (usize::try_from(request.page).expect("bounded page") - 1) * request.limit;
+            let end = (start + request.limit).min(1_000);
+            let page = ArchiveOrgSearchPage {
+                items: (start..end).map(make_item).collect(),
+                page: request.page,
+                total: 1_000,
+                next_page: (end < 1_000).then_some(request.page + 1),
+            };
+            app.handle_archive_response(job, Ok(ArchiveResponse::Search(page)));
+            requests += 1;
+        }
+        assert!(app.archive_org.restoring.is_none());
+        assert_eq!(
+            app.archive_org.items[app.view.selected].identifier,
+            "item-250"
+        );
+        assert!(requests <= 20);
+
+        // Restoration's larger stride must not override the frontend's next search size.
+        app.submit_archive_org_search("new search".into());
+        assert!(matches!(
+            &app.archive_org.pending.as_ref().unwrap().kind,
+            ArchiveRequest::Search(request) if request.limit == 10
+        ));
         app.archive_org
             .worker
             .take()

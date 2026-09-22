@@ -454,8 +454,11 @@ resolver:
   public audio and live-music collections without an account. Press `/` to
   search, Enter to open an item, Enter again to play a track, `d` to download
   the selected track, and Esc to return to the search results. Autoplay follows
-  the item's track order. Large searches use explicit 50-item continuation
-  pages, with at most 1,000 results retained per search.
+  the item's track order. Terminal searches size their first request to the
+  available result rows, reserving the bottom row for continuation when more
+  items exist. Loading more advances to the next batch without skipping results;
+  each search retains at most 1,000 items. Restarting restores the open item and
+  exact selected file without starting playback.
 
   Playback prefers supported uploaded originals. When an audio track comes
   from an original video and separate audio files exist, the default chooser

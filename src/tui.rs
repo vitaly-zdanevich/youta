@@ -1037,12 +1037,14 @@ pub fn run(controller: &mut impl UiController, settings: &UiSettings) -> io::Res
             })?;
         } else {
             session.terminal.draw(|frame| {
+                fullscreen_artwork_area = frame.area();
                 render_frame(frame, controller.view(), settings, &mut hit_map, None);
                 render_local_rename_cursor(frame, controller.view(), !virtual_cursor.active);
                 render_virtual_cursor_overlay(frame, controller.view(), &mut virtual_cursor);
                 normalize_physical_linux_console_frame(frame, controller.view());
             })?;
         }
+        synchronize_archive_org_search_page_capacity(controller, fullscreen_artwork_area);
         if let Some(renderer) = renderer.as_deref_mut() {
             synchronize_thumbnail_prefetch(controller.view(), settings, renderer);
             synchronize_selected_artwork_prefetch(
@@ -1105,7 +1107,11 @@ pub fn run(controller: &mut impl UiController, settings: &UiSettings) -> io::Res
                         controller.dispatch(action);
                     }
                 }
-                Event::Resize(_, _) => {
+                Event::Resize(columns, rows) => {
+                    synchronize_archive_org_search_page_capacity(
+                        controller,
+                        Rect::new(0, 0, columns, rows),
+                    );
                     let (width, height) = current_terminal_window_pixels();
                     controller.dispatch(UiAction::SetTerminalWindowPixels { width, height });
                 }
@@ -1135,6 +1141,26 @@ pub fn run(controller: &mut impl UiController, settings: &UiSettings) -> io::Res
         thumbnail_renderer = renderer;
     }
     Ok(())
+}
+
+/// Measures a prospective Archive page even before the first result or tab switch.
+///
+/// Archive rows occupy one cell row each. Shared rendering geometry accounts for
+/// narrow panes, playback/download rows, the search heading and catalogue controls;
+/// one additional result row is reserved for explicit continuation. Tiny terminals
+/// still request one item, and the controller applies the provider's safety ceiling.
+fn archive_org_search_page_capacity(area: Rect, view: &ViewModel) -> usize {
+    let body = main_frame_sections(area, view)[1];
+    let pane = main_body_panes(body)[0];
+    let (list, _) = main_list_pane_areas(pane, Screen::ArchiveOrg);
+    let rows = main_panel_content_area(list, true);
+    usize::from(rows.height.saturating_sub(1)).max(1)
+}
+
+/// Publishes the available result slots before a terminal action can start an Archive search.
+fn synchronize_archive_org_search_page_capacity(controller: &mut impl UiController, area: Rect) {
+    let capacity = archive_org_search_page_capacity(area, controller.view());
+    controller.set_archive_org_search_page_capacity(capacity);
 }
 
 /// Applies the controller's live physical-TTY artwork preference.
@@ -2326,6 +2352,51 @@ fn render_fullscreen_thumbnail_overlay(
     hit_map.thumbnail_area = Some(artwork_area);
 }
 
+/// Shares the terminal's actual content budget with pre-request page sizing.
+fn main_frame_sections(area: Rect, view: &ViewModel) -> [Rect; 5] {
+    let chapter_label_rows = if view.waveform_visible {
+        0
+    } else {
+        chapter_label_row_count(view, area.width, area.height, view.download.is_some())
+    };
+    #[cfg(feature = "youtube-captions")]
+    let caption_rows = u16::from(
+        view.youtube_caption_line
+            .as_deref()
+            .is_some_and(|caption| !caption.is_empty()),
+    );
+    #[cfg(not(feature = "youtube-captions"))]
+    let caption_rows = 0;
+    let player_rows = if view.waveform_visible {
+        WAVEFORM_PLAYER_ROWS
+    } else {
+        2_u16.saturating_add(chapter_label_rows)
+    }
+    .saturating_add(caption_rows);
+    let footer_rows = u16::from(
+        view.transient_footer_notice
+            .as_deref()
+            .is_some_and(|notice| !notice.is_empty()),
+    );
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(8),
+            Constraint::Length(if view.download.is_some() { 2 } else { 0 }),
+            Constraint::Length(player_rows),
+            Constraint::Length(footer_rows),
+        ])
+        .split(area);
+    [
+        sections[0],
+        sections[1],
+        sections[2],
+        sections[3],
+        sections[4],
+    ]
+}
+
 fn render_frame(
     frame: &mut Frame<'_>,
     view: &ViewModel,
@@ -2347,46 +2418,11 @@ fn render_frame(
         render_ascii_visualizer(frame, visualizer, &theme);
         return;
     }
-
-    let chapter_label_rows = if view.waveform_visible {
-        0
-    } else {
-        chapter_label_row_count(
-            view,
-            frame.area().width,
-            frame.area().height,
-            view.download.is_some(),
-        )
-    };
-    #[cfg(feature = "youtube-captions")]
-    let caption_rows = u16::from(
-        view.youtube_caption_line
-            .as_deref()
-            .is_some_and(|caption| !caption.is_empty()),
-    );
-    #[cfg(not(feature = "youtube-captions"))]
-    let caption_rows = 0;
-    let player_rows = if view.waveform_visible {
-        WAVEFORM_PLAYER_ROWS
-    } else {
-        2_u16.saturating_add(chapter_label_rows)
-    }
-    .saturating_add(caption_rows);
+    let sections = main_frame_sections(frame.area(), view);
     let footer_notice = view
         .transient_footer_notice
         .as_deref()
         .filter(|notice| !notice.is_empty());
-    let footer_rows = u16::from(footer_notice.is_some());
-    let sections = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(2),
-            Constraint::Min(8),
-            Constraint::Length(if view.download.is_some() { 2 } else { 0 }),
-            Constraint::Length(player_rows),
-            Constraint::Length(footer_rows),
-        ])
-        .split(frame.area());
     // The permanent shortcut footer was removed to return its row to content.
     // Clear its legacy hit map on every frame so an earlier render cannot leave
     // invisible mouse targets behind.
@@ -3174,6 +3210,31 @@ fn two_digit_component_under_sixty(component: &str) -> bool {
     component.len() == 2 && numeric_component_under_sixty(component)
 }
 
+/// Shares the responsive catalogue/details split with first-page request sizing.
+fn main_body_panes(area: Rect) -> [Rect; 2] {
+    let panes = Layout::default()
+        .direction(if area.width >= 80 {
+            Direction::Horizontal
+        } else {
+            Direction::Vertical
+        })
+        .constraints([Constraint::Percentage(46), Constraint::Percentage(54)])
+        .split(area);
+    [panes[0], panes[1]]
+}
+
+/// Separates catalogue controls from selectable rows before applying the heading.
+fn main_list_pane_areas(mut pane: Rect, screen: Screen) -> (Rect, Rect) {
+    let controls_height = pane.height.min(match screen {
+        Screen::Web => 2,
+        Screen::ArchiveOrg | Screen::ApplePodcasts | Screen::TrackerMusic => 1,
+        _ => 0,
+    });
+    pane.height = pane.height.saturating_sub(controls_height);
+    let controls = Rect::new(pane.x, pane.bottom(), pane.width, controls_height);
+    (pane, controls)
+}
+
 fn render_body(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -3217,40 +3278,16 @@ fn render_body(
         return;
     }
 
-    let horizontal = area.width >= 80;
-    let panes = Layout::default()
-        .direction(if horizontal {
-            Direction::Horizontal
-        } else {
-            Direction::Vertical
-        })
-        .constraints([Constraint::Percentage(46), Constraint::Percentage(54)])
-        .split(area);
+    let panes = main_body_panes(area);
 
     let search_title = search_panel_title(view);
-    let mut list_area = panes[0];
+    let (list_area, controls) = main_list_pane_areas(panes[0], view.screen);
     if view.screen == Screen::Web {
-        let controls_height = list_area.height.min(2);
-        list_area.height = list_area.height.saturating_sub(controls_height);
-        let controls = Rect::new(
-            list_area.x,
-            list_area.bottom(),
-            list_area.width,
-            controls_height,
-        );
         render_web_controls(frame, controls, show_hotkeys, view.autoplay, theme, hit_map);
     } else if matches!(
         view.screen,
         Screen::ArchiveOrg | Screen::ApplePodcasts | Screen::TrackerMusic
     ) {
-        let controls_height = list_area.height.min(1);
-        list_area.height = list_area.height.saturating_sub(controls_height);
-        let controls = Rect::new(
-            list_area.x,
-            list_area.bottom(),
-            list_area.width,
-            controls_height,
-        );
         render_catalog_playback_controls(frame, controls, view, show_hotkeys, theme, hit_map);
     }
     hit_map.rows_row_height = row_list_height(&view.rows);
@@ -15039,13 +15076,20 @@ fn wrap_text_lines(value: &str, width: u16) -> Vec<String> {
 /// configuration dialogs remain visually distinct from the primary workspace.
 /// An empty title does not reserve a row, allowing top-tab context to stand alone.
 fn render_main_panel_heading(frame: &mut Frame<'_>, area: Rect, title: &str, style: Style) -> Rect {
-    let heading_height = u16::from(area.height > 0 && !title.is_empty());
+    let content = main_panel_content_area(area, !title.is_empty());
+    let heading_height = area.height.saturating_sub(content.height);
     if area.width > 0 && heading_height > 0 {
         frame.render_widget(
             Paragraph::new(title).style(style),
             Rect::new(area.x, area.y, area.width, heading_height),
         );
     }
+    content
+}
+
+/// Excludes only a present main-pane heading from the selectable content budget.
+fn main_panel_content_area(area: Rect, has_heading: bool) -> Rect {
+    let heading_height = u16::from(area.height > 0 && has_heading);
     Rect::new(
         area.x,
         area.y.saturating_add(heading_height),
@@ -18648,6 +18692,151 @@ for encoded, expected in json.load(sys.stdin):
             visible_main_list_page_rows(&hit_map, &ViewModel::default()),
             None
         );
+    }
+
+    /// The first Archive page fills the actual compact pane, leaving its continuation visible.
+    #[test]
+    fn archive_search_page_capacity_matches_rendered_small_tall_and_narrow_panes() {
+        for (width, height) in [(120, 24), (120, 80), (60, 24), (60, 80), (12, 5)] {
+            for extra in 0..4 {
+                let mut view = ViewModel {
+                    screen: Screen::Local,
+                    ..ViewModel::default()
+                };
+                match extra {
+                    1 => view.download = Some(DownloadView::default()),
+                    2 => view.transient_footer_notice = Some("Temporary notice".to_owned()),
+                    3 => view.waveform_visible = true,
+                    _ => {}
+                }
+                let area = Rect::new(0, 0, width, height);
+                let capacity = archive_org_search_page_capacity(area, &view);
+                // The source tab may still be Local, and no Archive rows exist before the request.
+                view.screen = Screen::ArchiveOrg;
+                assert_eq!(archive_org_search_page_capacity(area, &view), capacity);
+                view.rows = (0..capacity)
+                    .map(|index| RowView {
+                        title: format!("Archive result {index}"),
+                        compact: true,
+                        ..RowView::default()
+                    })
+                    .chain(std::iter::once(RowView {
+                        title: "Load more items…".to_owned(),
+                        compact: true,
+                        ..RowView::default()
+                    }))
+                    .collect();
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                let mut hit_map = HitMap::default();
+                terminal
+                    .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+                    .unwrap();
+                assert_eq!(
+                    capacity,
+                    usize::from(hit_map.rows.height.saturating_sub(1)).max(1),
+                    "{width}x{height}, extra={extra}"
+                );
+                if hit_map.rows.height >= 2 {
+                    assert_eq!(view.rows.len(), usize::from(hit_map.rows.height));
+                    assert_eq!(hit_map.rows_first_index, 0);
+                    if width >= 60 {
+                        let last_row = (hit_map.rows.x..hit_map.rows.right())
+                            .map(|column| {
+                                terminal.backend().buffer()[(column, hit_map.rows.bottom() - 1)]
+                                    .symbol()
+                            })
+                            .collect::<String>();
+                        assert!(
+                            last_row.contains("Load more items…"),
+                            "continuation must occupy the last results line: {width}x{height}, extra={extra}, {last_row:?}"
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            archive_org_search_page_capacity(Rect::new(0, 0, 120, 24), &ViewModel::default()),
+            17
+        );
+        assert_eq!(
+            archive_org_search_page_capacity(Rect::new(0, 0, 120, 80), &ViewModel::default()),
+            73
+        );
+        assert_eq!(
+            archive_org_search_page_capacity(Rect::default(), &ViewModel::default()),
+            1
+        );
+    }
+
+    /// Selecting the continuation after each fetch shows every newly appended result.
+    #[test]
+    fn archive_load_more_renders_exactly_the_new_screen_with_continuation_at_bottom() {
+        for (width, height) in [(120, 24), (120, 80), (60, 24), (60, 80)] {
+            let mut view = ViewModel {
+                screen: Screen::ArchiveOrg,
+                ..ViewModel::default()
+            };
+            let capacity = archive_org_search_page_capacity(Rect::new(0, 0, width, height), &view);
+            for page in 2..=4 {
+                view.rows = (0..capacity * page)
+                    .map(|index| RowView {
+                        title: format!("Archive result {index}"),
+                        compact: true,
+                        ..RowView::default()
+                    })
+                    .chain(std::iter::once(RowView {
+                        title: "Load more items…".to_owned(),
+                        compact: true,
+                        ..RowView::default()
+                    }))
+                    .collect();
+                view.selected = view.rows.len() - 1;
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                let mut hit_map = HitMap::default();
+                terminal
+                    .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+                    .unwrap();
+                assert_eq!(hit_map.rows_first_index, capacity * (page - 1));
+                assert_eq!(usize::from(hit_map.rows.height), capacity + 1);
+                let last_row = (hit_map.rows.x..hit_map.rows.right())
+                    .map(|column| {
+                        terminal.backend().buffer()[(column, hit_map.rows.bottom() - 1)].symbol()
+                    })
+                    .collect::<String>();
+                assert!(last_row.contains("Load more items…"));
+            }
+        }
+    }
+
+    /// Terminal geometry reaches the controller before an initial tick or submitted search.
+    #[test]
+    fn archive_search_capacity_is_published_before_actions_and_after_resize() {
+        #[derive(Default)]
+        struct CapacityController {
+            view: ViewModel,
+            capacity: usize,
+            observed: Vec<usize>,
+        }
+        impl UiController for CapacityController {
+            fn view(&self) -> &ViewModel {
+                &self.view
+            }
+            fn dispatch(&mut self, _: UiAction) {
+                self.observed.push(self.capacity);
+            }
+            fn tick(&mut self) {
+                self.observed.push(self.capacity);
+            }
+            fn set_archive_org_search_page_capacity(&mut self, capacity: usize) {
+                self.capacity = capacity;
+            }
+        }
+        let mut controller = CapacityController::default();
+        synchronize_archive_org_search_page_capacity(&mut controller, Rect::new(0, 0, 120, 24));
+        controller.tick();
+        synchronize_archive_org_search_page_capacity(&mut controller, Rect::new(0, 0, 120, 80));
+        controller.dispatch(UiAction::SubmitSearch);
+        assert_eq!(controller.observed, [17, 73]);
     }
 
     #[test]

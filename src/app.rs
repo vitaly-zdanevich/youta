@@ -6287,7 +6287,7 @@ impl AppController {
             apple_podcast_episode_origin: ApplePodcastEpisodeOrigin::Shows(apple_podcasts_selected),
             apple_podcast_episode_selected: 0,
             #[cfg(feature = "archive-org")]
-            archive_org: archive_org::ArchiveOrgState::default(),
+            archive_org: archive_org::ArchiveOrgState::restored(&saved),
             archive_org_search_query,
             archive_org_search_scope: saved.archive_org_search_scope,
             archive_org_selected,
@@ -6762,7 +6762,11 @@ impl AppController {
             quit_on_error_dismiss: false,
             shutdown_persistence_succeeded: None,
         };
-        controller.populate_local_screen();
+        // The terminal supplies Archive search capacity after its first frame;
+        // defer only this restored route's initial request until the first tick.
+        if controller.view.screen != Screen::ArchiveOrg || !cfg!(feature = "archive-org") {
+            controller.populate_local_screen();
+        }
         controller.restore_manual_downloads();
         if controller.view.screen == Screen::Search && !controller.youtube_results.is_empty() {
             controller.cache_search_channel_subscriber_counts();
@@ -34471,6 +34475,8 @@ impl AppController {
             bandcamp_selected_row: Some(self.bandcamp_selected),
             apple_podcasts_selected_row: Some(self.apple_podcasts_selected),
             archive_org_selected_row: Some(persisted_archive_org_selected_row),
+            #[cfg(feature = "archive-org")]
+            archive_org_location: self.archive_org_session_location(),
             librivox_selected_row: Some(persisted_librivox_selected_row),
             radio_selected_row: Some(persisted_radio_selected_row),
             radio_selected_station_id,
@@ -34653,6 +34659,11 @@ impl AppController {
 impl UiController for AppController {
     fn view(&self) -> &ViewModel {
         &self.view
+    }
+
+    #[cfg(feature = "archive-org")]
+    fn set_archive_org_search_page_capacity(&mut self, rows: usize) {
+        self.update_archive_org_search_page_capacity(rows);
     }
 
     fn dispatch(&mut self, action: UiAction) {

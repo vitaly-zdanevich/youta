@@ -6,6 +6,13 @@ mod worker_tests;
 
 mod history;
 mod playback_choice;
+mod session;
+
+#[cfg(test)]
+mod search_pagination_tests;
+
+#[cfg(test)]
+mod restart_tests;
 
 pub(super) use playback_choice::{ArchivePlaybackOwner, playback_step};
 
@@ -40,6 +47,12 @@ pub(super) struct ArchiveOrgState {
     submitted_query: String,
     /// Metadata field owning the displayed results and their continuations.
     submitted_scope: ArchiveOrgSearchScope,
+    /// Latest frontend capacity; absent for frontends that do not report terminal rows.
+    search_page_capacity: Option<usize>,
+    /// Fixed stride for this result set, independent of subsequent terminal resizes.
+    page_limit: Option<usize>,
+    /// Explicit continuation owner and old boundary; never steal a changed selection.
+    page_turn: Option<(u64, usize)>,
     next_page: Option<u32>,
     total: u64,
     generation: u64,
@@ -54,6 +67,8 @@ pub(super) struct ArchiveOrgState {
     message: String,
     history: VecDeque<history::ArchiveLocation>,
     restoring: Option<history::ArchiveLocation>,
+    /// Unconsumed public restart destination; retained until the first Archive tick.
+    restart: Option<crate::domain::ArchiveOrgSessionLocation>,
 }
 
 /// Retains only the current description projection, independently of its search query.
@@ -123,6 +138,12 @@ enum ArchiveResponse {
 }
 
 impl AppController {
+    /// Updates future searches without changing in-flight or cached page offsets.
+    pub(super) fn update_archive_org_search_page_capacity(&mut self, rows: usize) {
+        // Match the provider's existing bounded rows range.
+        self.archive_org.search_page_capacity = Some(rows.clamp(1, 100));
+    }
+
     /// Resolves exact existing files for a manual download without changing navigation.
     ///
     /// None means the existing bounded metadata worker is still loading this
@@ -259,7 +280,7 @@ impl AppController {
             query: query.trim().to_owned(),
             scope,
             page: 1,
-            limit: 50,
+            limit: self.archive_org.search_page_capacity.unwrap_or(50),
         };
         if let Err(error) = request.validate() {
             self.view.status_line = error.to_string();
@@ -276,6 +297,20 @@ impl AppController {
 
     /// Owns accepted text and field independently of any subsequent editor draft.
     fn start_archive_org_search(&mut self, query: String, scope: ArchiveOrgSearchScope) {
+        let limit = self.archive_org.search_page_capacity.unwrap_or(50);
+        self.start_archive_org_search_with_limit(query, scope, limit);
+    }
+
+    /// Pins one page stride for a fresh search or bounded restoration of evicted results.
+    fn start_archive_org_search_with_limit(
+        &mut self,
+        query: String,
+        scope: ArchiveOrgSearchScope,
+        limit: usize,
+    ) {
+        self.archive_org.restart = None;
+        self.archive_org.page_limit = Some(limit);
+        self.archive_org.page_turn = None;
         self.archive_org_search_query = query.trim().to_owned();
         self.archive_org_search_scope = scope;
         self.archive_org.submitted_scope = scope;
@@ -297,7 +332,7 @@ impl AppController {
                 scope,
                 query: self.archive_org_search_query.clone(),
                 page: 1,
-                limit: 50,
+                limit,
             }),
             false,
         );
@@ -385,6 +420,11 @@ impl AppController {
 
     /// Polls only finished threads, so network delays cannot stop terminal input.
     pub(super) fn poll_archive_org_worker(&mut self) {
+        // Restored tabs wait until the frontend has had a frame to report its
+        // result capacity. Frontends without a hint retain the default size.
+        if self.view.screen == Screen::ArchiveOrg && !self.archive_org.initialized {
+            self.populate_archive_org();
+        }
         if self
             .archive_org
             .worker
@@ -452,6 +492,7 @@ impl AppController {
         }
         match result {
             Ok(ArchiveResponse::Search(page)) => {
+                let previous_len = self.archive_org.items.len();
                 let mut seen: HashSet<String> = self
                     .archive_org
                     .items
@@ -470,6 +511,24 @@ impl AppController {
                     None
                 };
                 self.archive_org.total = page.total;
+                if let Some((generation, boundary)) = self.archive_org.page_turn.take()
+                    && generation == owner.generation
+                    && self.archive_org.restoring.is_none()
+                    && self.archive_org_selected == boundary
+                    && self.archive_org.items.len() > previous_len
+                {
+                    // A page contains exactly one viewport's items; selecting its
+                    // continuation scrolls that new batch into view without gaps.
+                    // The final page has no continuation: select its last real row.
+                    self.archive_org_selected = if self.archive_org.next_page.is_some() {
+                        self.archive_org.items.len()
+                    } else {
+                        self.archive_org.items.len().saturating_sub(1)
+                    };
+                    if self.view.screen == Screen::ArchiveOrg {
+                        self.view.selected = self.archive_org_selected;
+                    }
+                }
                 self.archive_org.message = format!(
                     "{} of {} archive.org items · Enter: open · /: search",
                     self.archive_org.items.len(),
@@ -492,11 +551,20 @@ impl AppController {
                 self.complete_archive_comments(&details);
             }
             Err(error) => {
+                self.archive_org.page_turn = None;
+                let was_restoring = self.archive_org.restoring.is_some();
                 self.archive_org.restoring = None;
-                self.archive_org.message = format!("Archive.org: {error}");
+                self.archive_org.message = if was_restoring {
+                    format!(
+                        "Saved archive.org location is unavailable; showing the catalogue: {error}"
+                    )
+                } else {
+                    format!("Archive.org: {error}")
+                };
                 // Only explicit, still-visible navigation warrants a modal;
                 // background selection prefetches must not interrupt the user.
                 if self.view.screen == Screen::ArchiveOrg
+                    && !was_restoring
                     && matches!(owner.kind, ArchiveRequest::Details { open: true, .. })
                 {
                     self.show_actionable_message("Could not open archive.org item", &error);
@@ -528,6 +596,9 @@ impl AppController {
             return;
         }
         if !self.archive_org.initialized {
+            if self.begin_archive_session_restore() {
+                return;
+            }
             let restored = self.archive_org_selected;
             self.start_archive_org_search(
                 self.archive_org_search_query.clone(),
@@ -638,8 +709,11 @@ impl AppController {
         Some(item)
     }
 
-    /// Persists the catalogue row, not an index into a transient open item.
+    /// Persists the logical catalogue row, never a file or temporary restoration row.
     pub(super) fn archive_org_catalogue_selection(&self) -> usize {
+        if let Some(location) = self.archive_org_session_location() {
+            return location.catalogue_selected;
+        }
         if self.archive_org.active.is_some() {
             self.archive_org.search_selected
         } else {
@@ -733,6 +807,16 @@ impl AppController {
             self.view.selected_detail_link = None;
             self.view.detail_link_reveal = None;
         }
+        // Passive selection must not replace an explicitly requested search
+        // page. Its response will refresh the current selection's metadata.
+        if self
+            .archive_org
+            .pending
+            .as_ref()
+            .is_some_and(|job| matches!(job.kind, ArchiveRequest::Search(_)))
+        {
+            return;
+        }
         if !self.archive_download_lookup_pending()
             && self.archive_org.active.is_none()
             && self.cached_archive_details(&item.identifier).is_none()
@@ -808,15 +892,22 @@ impl AppController {
                 .as_ref()
                 .is_none_or(|job| !matches!(job.kind, ArchiveRequest::Search(_)))
         {
+            let boundary = self.archive_org.items.len();
+            self.archive_org_selected = self.view.selected;
             self.queue_archive_request(
                 ArchiveRequest::Search(ArchiveOrgSearchRequest {
                     scope: self.archive_org.submitted_scope,
                     query: self.archive_org.submitted_query.clone(),
                     page,
-                    limit: 50,
+                    limit: self.archive_org.page_limit.unwrap_or(50),
                 }),
                 false,
             );
+            self.archive_org.page_turn = self
+                .archive_org
+                .pending
+                .as_ref()
+                .map(|job| (job.generation, boundary));
             self.begin_search_activity(SearchActivity::ArchiveOrg);
         }
     }

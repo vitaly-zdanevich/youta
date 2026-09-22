@@ -1450,6 +1450,69 @@ pub enum ArchiveOrgSearchScope {
     Uploader,
 }
 
+/// Bounded public Archive navigation, independent of transient metadata and stream URLs.
+///
+/// The submitted parent search is separate from the editable session search text:
+/// closing with an unsubmitted draft must not attach an open item to that draft.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ArchiveOrgSessionLocation {
+    /// Accepted parent catalogue search, not the current editor draft.
+    pub query: String,
+    /// Metadata field owning the accepted parent search.
+    pub scope: ArchiveOrgSearchScope,
+    /// Bounded fallback catalogue row when the selected item has disappeared.
+    pub catalogue_selected: usize,
+    /// Exact catalogue identity, so reordered results do not select another item.
+    pub catalogue_identifier: Option<String>,
+    /// Public Archive item identifier; never an arbitrary URL or local path.
+    pub identifier: String,
+    /// Exact relative file name in the item's public metadata, absent for an empty item.
+    pub filename: Option<String>,
+}
+
+impl ArchiveOrgSessionLocation {
+    /// Checks persisted navigation before it can schedule any metadata restoration.
+    ///
+    /// These provider-independent limits also apply when the Archive feature is absent.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        let identifier_is_valid = |value: &str| {
+            !value.is_empty()
+                && value.len() <= 100
+                && (value.as_bytes()[0].is_ascii_alphanumeric() || value.as_bytes()[0] == b'@')
+                && value
+                    .bytes()
+                    .skip(1)
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+        };
+        self.query.len() <= 512
+            && !self.query.chars().any(char::is_control)
+            && (self.scope == ArchiveOrgSearchScope::Text || !self.query.trim().is_empty())
+            && (self.scope != ArchiveOrgSearchScope::Uploader
+                || (self.query.len() <= 100
+                    && self
+                        .query
+                        .strip_prefix('@')
+                        .is_some_and(|name| !name.starts_with('@') && identifier_is_valid(name))))
+            && self.catalogue_selected < 1_000
+            && self
+                .catalogue_identifier
+                .as_deref()
+                .is_none_or(identifier_is_valid)
+            && identifier_is_valid(&self.identifier)
+            && self.filename.as_deref().is_none_or(|filename| {
+                !filename.is_empty()
+                    && filename.len() <= 2_048
+                    && !filename.contains('\\')
+                    && !filename.chars().any(char::is_control)
+                    && filename.split('/').count() <= 32
+                    && filename
+                        .split('/')
+                        .all(|part| !matches!(part, "" | "." | ".."))
+            })
+    }
+}
+
 /// Restart-safe terminal navigation and selection state.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SessionState {
@@ -1524,6 +1587,9 @@ pub struct SessionState {
     /// Exact Archive metadata field selected by an internal Creator/Topics link.
     #[serde(default)]
     pub archive_org_search_scope: ArchiveOrgSearchScope,
+    /// Last open Archive item and exact file, with its accepted parent catalogue.
+    #[serde(default)]
+    pub archive_org_location: Option<ArchiveOrgSessionLocation>,
     /// Last search text entered on the independent `LibriVox` tab.
     #[serde(default)]
     pub librivox_search_text: String,
@@ -1570,6 +1636,7 @@ impl Default for SessionState {
             apple_podcasts_search_text: String::new(),
             archive_org_search_text: String::new(),
             archive_org_search_scope: ArchiveOrgSearchScope::Text,
+            archive_org_location: None,
             librivox_search_text: String::new(),
             local_path: None,
             waveform_visible: false,
@@ -2008,6 +2075,7 @@ mod tests {
         object.remove("archive_org_selected_row");
         object.remove("archive_org_search_text");
         object.remove("archive_org_search_scope");
+        object.remove("archive_org_location");
         let restored: SessionState = serde_json::from_value(encoded).expect("older session");
         assert_eq!(restored.archive_org_selected_row, None);
         assert!(restored.archive_org_search_text.is_empty());
@@ -2015,6 +2083,66 @@ mod tests {
             restored.archive_org_search_scope,
             ArchiveOrgSearchScope::Text
         );
+        assert_eq!(restored.archive_org_location, None);
+    }
+
+    /// Exact public file names round-trip without storing an endpoint, token, or cache.
+    #[test]
+    fn archive_session_location_round_trips_and_rejects_unbounded_or_unsafe_values() {
+        let location = ArchiveOrgSessionLocation {
+            query: "Field recording".to_owned(),
+            scope: ArchiveOrgSearchScope::Topic,
+            catalogue_selected: 12,
+            catalogue_identifier: Some("public-item".to_owned()),
+            identifier: "public-item".to_owned(),
+            filename: Some("folder/日本語 recording.opus".to_owned()),
+        };
+        assert!(location.is_valid());
+        let session = SessionState {
+            archive_org_location: Some(location.clone()),
+            ..SessionState::default()
+        };
+        let encoded = serde_json::to_string(&session).unwrap();
+        assert_eq!(
+            serde_json::from_str::<SessionState>(&encoded).unwrap(),
+            session
+        );
+        assert!(!encoded.contains("https://"));
+        for filename in [
+            "",
+            "../recording.opus",
+            "nested/../recording.opus",
+            "/recording.opus",
+            "nested\\recording.opus",
+            "recording\n.opus",
+        ] {
+            let mut invalid = location.clone();
+            invalid.filename = Some(filename.to_owned());
+            assert!(!invalid.is_valid(), "{filename:?}");
+        }
+        let mut invalid = location.clone();
+        invalid.filename = Some("x".repeat(2_049));
+        assert!(!invalid.is_valid());
+        for identifier in [
+            "",
+            "../private",
+            "https://user:secret@host/item",
+            "a/b",
+            "bad\nitem",
+        ] {
+            let mut invalid = location.clone();
+            invalid.identifier = identifier.to_owned();
+            assert!(!invalid.is_valid(), "{identifier:?}");
+        }
+        let mut invalid = location.clone();
+        invalid.catalogue_selected = 1_000;
+        assert!(!invalid.is_valid());
+        let mut invalid = location.clone();
+        invalid.query = "x".repeat(513);
+        assert!(!invalid.is_valid());
+        let mut invalid = location;
+        invalid.scope = ArchiveOrgSearchScope::Uploader;
+        assert!(!invalid.is_valid());
     }
 
     /// Public uploader navigation remains restart-safe without the provider feature.

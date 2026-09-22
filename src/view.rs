@@ -4275,6 +4275,10 @@ pub trait UiController {
     /// Returns the view for the next frame.
     fn view(&self) -> &ViewModel;
 
+    /// Reports visible Archive result slots, excluding the continuation/footer rows.
+    /// Frontends without terminal geometry may retain the controller's default.
+    fn set_archive_org_search_page_capacity(&mut self, _rows: usize) {}
+
     /// Applies one semantic user action.
     fn dispatch(&mut self, action: UiAction);
 
