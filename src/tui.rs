@@ -3022,6 +3022,7 @@ fn search_panel_title(view: &ViewModel) -> String {
                 }
             ),
             Screen::YouTubeMusic
+            | Screen::SoundCloud
             | Screen::Bandcamp
             | Screen::ApplePodcasts
             | Screen::ArchiveOrg
@@ -4117,6 +4118,7 @@ fn completed_search_has_no_rows(view: &ViewModel) -> bool {
         Screen::YandexMusic => view.yandex_music_route == YandexMusicRouteView::Search,
         Screen::Search
         | Screen::YouTubeMusic
+        | Screen::SoundCloud
         | Screen::Bandcamp
         | Screen::ApplePodcasts
         | Screen::ArchiveOrg
@@ -16465,6 +16467,7 @@ for encoded, expected in json.load(sys.stdin):
 
         for screen in [
             Screen::YouTubeMusic,
+            Screen::SoundCloud,
             Screen::Bandcamp,
             Screen::ApplePodcasts,
             Screen::ArchiveOrg,
@@ -37188,6 +37191,8 @@ prose 07:25 remains clickable but is not a chapter";
                 Screen::Search,
                 #[cfg(feature = "youtube-music")]
                 Screen::YouTubeMusic,
+                #[cfg(feature = "soundcloud")]
+                Screen::SoundCloud,
                 #[cfg(feature = "yandex-music")]
                 Screen::YandexMusic,
                 #[cfg(feature = "bandcamp")]

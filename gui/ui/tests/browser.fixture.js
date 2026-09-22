@@ -45,6 +45,8 @@
 	};
 	const sources = [
 		{ id: 'Search', label: 'YouTube', details_kind: 'Video', search_verb: 'Search' },
+		{ id: 'YouTubeMusic', label: 'YT Music', details_kind: 'Video', search_verb: 'Search' },
+		{ id: 'SoundCloud', label: 'SoundCloud', details_kind: 'Generic', search_verb: 'Search' },
 		{ id: 'ArchiveOrg', label: 'archive.org', details_kind: 'Generic', search_verb: 'Search' },
 		{ id: 'LibriVox', label: 'LibriVox', details_kind: 'Podcast', search_verb: 'Search' },
 	];
@@ -185,8 +187,30 @@
 		snapshot({ preferences_popup: null });
 		await until(() => !dialog(), 'closed provider fixtures');
 	}
+	/** SoundCloud stays on the shared tab, search-editor, and playback-action paths. */
+	async function checkSoundCloudTab() {
+		const previous = clone(view);
+		const tabs = [...document.querySelectorAll('[aria-label=Sources] button')].map((node) => node.textContent);
+		assert(tabs.indexOf('SoundCloud') === tabs.indexOf('YT Music') + 1, 'SoundCloud follows YT Music in the source catalogue');
+		await action({ ShowScreen: 'SoundCloud' }, () => button('SoundCloud').click(), 'SoundCloud tab selects its shared reducer screen');
+		snapshot({ screen: 'SoundCloud', search_query: '', rows: [], details: null });
+		await until(() => document.querySelector('[title="Search SoundCloud"]'), 'SoundCloud search');
+		await action('BeginSearch', () => document.querySelector('[title="Search SoundCloud"]')
+			.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })), 'SoundCloud search enters the shared query editor');
+		snapshot({ search_editing: true, search_query: 'ambient', search_cursor_byte: 7 });
+		await until(() => document.querySelector('[role=search]').textContent.includes('ambient'), 'SoundCloud query snapshot');
+		await key('Enter', 'Enter');
+		const track = { ...row('SoundCloud fixture track', { source: 'sound-cloud', external_id: 'https://soundcloud.com/artist/track' }), source: 'SoundCloud' };
+		snapshot({ search_editing: false, rows: [track] });
+		const item = await until(() => button(track.title, document.querySelector('[aria-label=Results]')), 'SoundCloud result');
+		await action({ SelectRow: 0 }, () => item.click(), 'SoundCloud result selects through the shared reducer');
+		await action('ActivateSelection', () => item.dispatchEvent(new MouseEvent('dblclick', { bubbles: true })), 'SoundCloud result requests playback through the shared reducer');
+		snapshot(previous);
+		await until(() => document.querySelector('[title="Search archive.org"]'), 'restored Archive fixture');
+	}
 	async function run() {
 		await until(() => document.querySelector('[title="Search archive.org"]'), 'Archive search');
+		await checkSoundCloudTab();
 		await checkProviderSettings();
 		assert(!button('[Esc] Back'), 'Archive root hides Back when no return route exists');
 		const tabs = [...document.querySelectorAll('[aria-label=Sources] button')].map((node) => node.textContent);

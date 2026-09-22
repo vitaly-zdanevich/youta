@@ -47,6 +47,8 @@ pub mod radio;
 pub mod radio_wikidata;
 #[cfg(feature = "rss")]
 pub mod rss;
+#[cfg(feature = "soundcloud")]
+pub mod soundcloak;
 #[cfg(feature = "soundstream")]
 pub mod soundstream;
 #[cfg(feature = "sponsorblock")]

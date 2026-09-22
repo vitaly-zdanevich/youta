@@ -2518,6 +2518,7 @@ fn unfiltered_key_action(
             if matches!(
                 view.screen,
                 Screen::ApplePodcasts
+                    | Screen::SoundCloud
                     | Screen::ArchiveOrg
                     | Screen::LibriVox
                     | Screen::Local
@@ -2534,6 +2535,7 @@ fn unfiltered_key_action(
             if matches!(
                 view.screen,
                 Screen::ApplePodcasts
+                    | Screen::SoundCloud
                     | Screen::ArchiveOrg
                     | Screen::LibriVox
                     | Screen::Local

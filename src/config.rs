@@ -348,6 +348,17 @@ impl Config {
         if let Some(token) = self.providers.evernote_auth_token.as_deref() {
             validate_generic_credential("providers.evernote_auth_token", token)?;
         }
+        if let Some(url) = self.providers.soundcloak_base_url.as_ref() {
+            validate_provider_url(url.clone(), "Soundcloak")?;
+            if crate::domain::remote_url_has_non_public_host(url)
+                || (url.scheme() == "http" && !self.providers.allow_insecure_http)
+            {
+                return Err(ConfigError::Invalid(
+                    "providers.soundcloak_base_url must use an allowed public HTTP(S) host"
+                        .to_owned(),
+                ));
+            }
+        }
         validate_wikimedia_commons_credentials(
             self.providers.wikimedia_commons_username.as_deref(),
             self.providers.wikimedia_commons_password.as_deref(),
@@ -483,7 +494,7 @@ impl Config {
                 validate_youtube_api_key("providers.youtube_api_key", &api_key)?,
             ),
             YouTubeProviderSetting::InvidiousUrl(url) => {
-                ValidatedSetting::InvidiousUrl(validate_provider_url(url)?)
+                ValidatedSetting::InvidiousUrl(validate_provider_url(url, "Invidious")?)
             }
         };
         let backend = match &setting {
@@ -1807,6 +1818,11 @@ pub struct ProviderConfig {
     pub youtube_backend: YouTubeBackend,
     /// Optional Invidious instance base URL.
     pub invidious_base_url: Option<Url>,
+    /// Optional public Soundcloak base URL for SoundCloud search and playback.
+    ///
+    /// When unset, the Soundcloak adapter uses its built-in default instance.
+    /// No SoundCloud application credentials are needed by this adapter.
+    pub soundcloak_base_url: Option<Url>,
     /// Optional default `PeerTube` instance base URL.
     pub peertube_instance_url: Option<Url>,
     /// Optional default `Funkwhale` instance base URL.
@@ -1863,6 +1879,7 @@ impl fmt::Debug for ProviderConfig {
             .field("allow_insecure_http", &self.allow_insecure_http)
             .field("youtube_backend", &self.youtube_backend)
             .field("invidious_base_url", &self.invidious_base_url)
+            .field("soundcloak_base_url", &self.soundcloak_base_url)
             .field("peertube_instance_url", &self.peertube_instance_url)
             .field("funkwhale_instance_url", &self.funkwhale_instance_url)
             .field(
@@ -1921,6 +1938,7 @@ impl Default for ProviderConfig {
             allow_insecure_http: true,
             youtube_backend: YouTubeBackend::Auto,
             invidious_base_url: None,
+            soundcloak_base_url: None,
             peertube_instance_url: None,
             funkwhale_instance_url: None,
             youtube_api_key: None,
@@ -2299,8 +2317,8 @@ fn ensure_youta_gitignore(path: &Path) -> Result<(), ConfigError> {
     write_private_config(path, contents.as_bytes())
 }
 
-#[cfg(feature = "controller")]
-fn validate_provider_url(mut url: Url) -> Result<Url, ConfigError> {
+/// Validates and normalizes one credential-free provider base URL.
+fn validate_provider_url(mut url: Url, provider: &str) -> Result<Url, ConfigError> {
     if !matches!(url.scheme(), "http" | "https")
         || url.host_str().is_none()
         || url.cannot_be_a_base()
@@ -2309,9 +2327,9 @@ fn validate_provider_url(mut url: Url) -> Result<Url, ConfigError> {
         || url.query().is_some()
         || url.fragment().is_some()
     {
-        return Err(ConfigError::Invalid(
-            "the Invidious instance must be a credential-free HTTP(S) base URL".to_owned(),
-        ));
+        return Err(ConfigError::Invalid(format!(
+            "the {provider} instance must be a credential-free HTTP(S) base URL"
+        )));
     }
     if !url.path().ends_with('/') {
         let path = format!("{}/", url.path());
@@ -3508,6 +3526,28 @@ youtube_api_key = "keep-this-existing-secret"
         let mut config = Config::default();
         config.playback.speed_percent = 40;
         assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
+    }
+
+    #[test]
+    fn soundcloak_configuration_requires_a_public_credential_free_base_url() {
+        let mut config = Config::default();
+        assert_eq!(config.providers.soundcloak_base_url, None);
+        for invalid in [
+            "ftp://sc.example.org/",
+            "https://user:secret@sc.example.org/",
+            "https://sc.example.org/?token=secret",
+            "https://sc.example.org/#fragment",
+            "https://127.0.0.1/",
+            "https://localhost/",
+        ] {
+            config.providers.soundcloak_base_url = Some(Url::parse(invalid).unwrap());
+            assert!(config.validate().is_err(), "accepted {invalid}");
+        }
+        config.providers.soundcloak_base_url = Some(Url::parse("https://sc.example.org/").unwrap());
+        config.validate().expect("valid public Soundcloak instance");
+        config.providers.allow_insecure_http = false;
+        config.providers.soundcloak_base_url = Some(Url::parse("http://sc.example.org/").unwrap());
+        assert!(config.validate().is_err());
     }
 
     #[test]

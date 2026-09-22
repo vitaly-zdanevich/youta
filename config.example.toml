@@ -191,6 +191,11 @@ youtube_backend = 'auto'
 # peertube_instance_url = 'https://video.example.org/'
 # funkwhale_instance_url = 'https://audio.example.org/'
 
+# SoundCloud uses Soundcloak for public track search and playback without API
+# credentials. Override its default instance (https://sc1.maid.zone/) here.
+# Public instances: https://maid.zone/soundcloak/instances.html
+# soundcloak_base_url = 'https://sc1.maid.zone/'
+
 # Mirsoft Game Music Base currently serves its catalog only over unencrypted
 # HTTP. The insecure catalog is enabled by default at the user's request and
 # triggers a one-time warning. Set this to false to reject Mirsoft and every

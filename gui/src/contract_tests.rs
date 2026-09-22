@@ -699,6 +699,29 @@ fn the_window_screen_catalog_uses_compact_labels_without_changing_ids() {
     }
 }
 
+/// SoundCloud uses the same source catalogue and semantic search actions as the terminal.
+#[test]
+fn soundcloud_tab_follows_youtube_music_and_exposes_search_to_the_window() {
+    let screens = serde_json::to_value(super::screens()).expect("serialized screen catalogue");
+    let screens = screens.as_array().expect("screen catalogue array");
+    let music = screens
+        .iter()
+        .position(|screen| screen["id"] == "YouTubeMusic")
+        .expect("YouTube Music tab");
+    let soundcloud = &screens[music + 1];
+    assert_eq!(soundcloud["id"], "SoundCloud");
+    assert_eq!(soundcloud["label"], "SoundCloud");
+    assert_eq!(soundcloud["search_verb"], "Search");
+    assert_eq!(soundcloud["details_kind"], "Generic");
+    assert_eq!(
+        serde_json::from_value::<youta::keymap::UiAction>(
+            serde_json::json!({"ShowScreen": "SoundCloud"})
+        )
+        .expect("SoundCloud tab action"),
+        youta::keymap::UiAction::ShowScreen(youta::view::Screen::SoundCloud)
+    );
+}
+
 /// Comment labels must distinguish Archive.org reviews from YouTube comments.
 ///
 /// Identical Rust and TypeScript field names alone cannot prove their wire

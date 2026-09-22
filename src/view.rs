@@ -98,6 +98,8 @@ pub enum Screen {
     Search,
     /// Music-focused search through `music.youtube.com`.
     YouTubeMusic,
+    /// Public SoundCloud track search and playback through Soundcloak.
+    SoundCloud,
     /// Personalized recommendations and catalogue search through Yandex Music.
     YandexMusic,
     /// Artist, album, and track discovery through `Bandcamp`.
@@ -130,9 +132,10 @@ pub enum Screen {
 
 impl Screen {
     /// Stable ordering shared by the terminal, desktop tabs, and native menus.
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 17] = [
         Self::Search,
         Self::YouTubeMusic,
+        Self::SoundCloud,
         Self::YandexMusic,
         Self::Bandcamp,
         Self::ApplePodcasts,
@@ -153,6 +156,7 @@ impl Screen {
     pub const fn enabled(self) -> bool {
         match self {
             Self::YouTubeMusic => cfg!(feature = "youtube-music"),
+            Self::SoundCloud => cfg!(feature = "soundcloud"),
             Self::YandexMusic => cfg!(feature = "yandex-music"),
             Self::Bandcamp => cfg!(feature = "bandcamp"),
             Self::ApplePodcasts => cfg!(feature = "apple-podcasts"),
@@ -187,9 +191,12 @@ impl Screen {
             Self::LibriVox => InformationPanelKind::Audiobook,
             Self::Radio => InformationPanelKind::Radio,
             Self::YandexMusic => InformationPanelKind::YandexMusic,
-            Self::Bandcamp | Self::ArchiveOrg | Self::Web | Self::Playlists | Self::History => {
-                InformationPanelKind::Generic
-            }
+            Self::SoundCloud
+            | Self::Bandcamp
+            | Self::ArchiveOrg
+            | Self::Web
+            | Self::Playlists
+            | Self::History => InformationPanelKind::Generic,
             _ => InformationPanelKind::Video,
         }
     }
@@ -207,6 +214,7 @@ impl Screen {
         match self {
             Self::Search
             | Self::YouTubeMusic
+            | Self::SoundCloud
             | Self::YandexMusic
             | Self::Bandcamp
             | Self::ApplePodcasts
@@ -229,6 +237,7 @@ impl Screen {
         match self {
             Self::Search => "YT",
             Self::YouTubeMusic => "YT Music",
+            Self::SoundCloud => "SoundCloud",
             Self::YandexMusic => "Yandex",
             Self::Bandcamp => "Bandcamp",
             Self::ApplePodcasts => "Podcasts",
@@ -252,6 +261,7 @@ impl Screen {
         match self {
             Self::Search => "YT",
             Self::YouTubeMusic => "YT Music",
+            Self::SoundCloud => "SoundCloud",
             Self::YandexMusic => "Yandex",
             Self::Bandcamp => "Bandcamp",
             Self::ApplePodcasts => "Podcasts",
@@ -528,6 +538,8 @@ pub enum SearchActivity {
     YouTube,
     /// A music-focused search through `yt-dlp` and `music.youtube.com`.
     YouTubeMusic,
+    /// A public SoundCloud track search through the selected Soundcloak instance.
+    SoundCloud,
     /// A Yandex Music catalogue search.
     YandexMusic,
     /// A public track and album search through `Bandcamp`.
@@ -551,6 +563,7 @@ impl SearchActivity {
         match self {
             Self::YouTube => Screen::Search,
             Self::YouTubeMusic => Screen::YouTubeMusic,
+            Self::SoundCloud => Screen::SoundCloud,
             Self::YandexMusic => Screen::YandexMusic,
             Self::Bandcamp => Screen::Bandcamp,
             Self::ApplePodcasts => Screen::ApplePodcasts,
@@ -4422,7 +4435,7 @@ mod tests {
             .iter()
             .position(|screen| *screen == Screen::Local)
             .unwrap();
-        assert_eq!(Screen::ALL.len(), 16);
+        assert_eq!(Screen::ALL.len(), 17);
         assert_eq!(Screen::ALL[local + 1], Screen::Web);
         assert_eq!(Screen::ALL[local + 2], Screen::Playlists);
         assert_eq!(Screen::Web.label(), "Web");
@@ -4437,6 +4450,24 @@ mod tests {
             Screen::Playlists
         };
         assert_eq!(Screen::Local.next_available(true), next);
+    }
+
+    #[test]
+    fn soundcloud_tab_follows_youtube_music_and_exposes_generic_track_search() {
+        let music = Screen::ALL
+            .iter()
+            .position(|screen| *screen == Screen::YouTubeMusic)
+            .unwrap();
+        assert_eq!(Screen::ALL[music + 1], Screen::SoundCloud);
+        assert_eq!(Screen::SoundCloud.label(), "SoundCloud");
+        assert_eq!(Screen::SoundCloud.compact_label(), "SoundCloud");
+        assert_eq!(Screen::SoundCloud.enabled(), cfg!(feature = "soundcloud"));
+        assert_eq!(Screen::SoundCloud.search_verb(), Some("Search"));
+        assert_eq!(
+            Screen::SoundCloud.details_kind(),
+            InformationPanelKind::Generic
+        );
+        assert_eq!(SearchActivity::SoundCloud.screen(), Screen::SoundCloud);
     }
 
     #[test]

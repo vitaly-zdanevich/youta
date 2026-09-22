@@ -419,10 +419,20 @@ resolver:
   the process. Signed playback tokens and manifests are not reused for a later
   Play action or persisted. BBC podcast feeds remain importable through
   RSS/OPML. The `bbc-radio` feature enables the shared `radio` feature.
-- **SoundCloud** accepts direct URLs through `yt-dlp`. Rich search and
-  subscriptions use the official API only when users provide their own
-  application credentials; the API uses OAuth 2.1. See the [SoundCloud API
-  guide](https://developers.soundcloud.com/docs/api/).
+- **SoundCloud** has its own tab after YT Music. Public track search and HLS
+  playback use [Soundcloak](https://github.com/maid-zone/soundcloak), without
+  an API key or SoundCloud login. Each track links to both its original
+  SoundCloud page and its page on the configured Soundcloak instance. History
+  and playlists retain the original URL, not an instance-specific stream.
+  The default is `https://sc1.maid.zone/`; set `providers.soundcloak_base_url`
+  in `config.toml` to use another trusted instance. The [official instance
+  directory](https://maid.zone/soundcloak/instances.html) lists alternatives,
+  including `sc2.maid.zone` and `sc3.maid.zone`. Choose an instance with API,
+  stream proxying, and image proxying enabled. Public instances can go offline
+  or disable their API; unavailable or preview-only tracks are not treated
+  as full playable tracks. SoundCloud also has an [official API](https://developers.soundcloud.com/docs/api/),
+  but [registering an application](https://developers.soundcloud.com/docs/api/register-app)
+  currently requires Artist Pro; Youta's Soundcloak tab does not use it.
 - **SoundStream** accepts exact `soundstream.media` playlist and clip links
   through its current read-only v3 metadata endpoints. Those endpoints are not
   documented for third-party clients and may change. Youta does not automate

@@ -30,6 +30,7 @@ mod original_download;
 mod queued_yandex_download;
 #[cfg(feature = "s3-upload")]
 mod s3_upload;
+mod soundcloud;
 #[cfg(feature = "web-browser")]
 mod web;
 #[cfg(all(feature = "web-browser", feature = "local-metadata"))]
@@ -779,6 +780,8 @@ pub enum SearchRoute {
     YouTube,
     /// The music tab queries `music.youtube.com` through the installed `yt-dlp`.
     YouTubeMusic,
+    /// Public SoundCloud tracks searched through the configured Soundcloak instance.
+    SoundCloud,
     /// The Yandex Music tab queries the authenticated private catalogue.
     YandexMusic,
     /// The Bandcamp tab queries public track and album search pages.
@@ -2380,6 +2383,7 @@ pub const fn search_route(screen: Screen) -> SearchRoute {
     match screen {
         Screen::Search => SearchRoute::YouTube,
         Screen::YouTubeMusic => SearchRoute::YouTubeMusic,
+        Screen::SoundCloud => SearchRoute::SoundCloud,
         Screen::YandexMusic => SearchRoute::YandexMusic,
         Screen::Bandcamp => SearchRoute::Bandcamp,
         Screen::ApplePodcasts => SearchRoute::ApplePodcasts,
@@ -3787,6 +3791,12 @@ enum AutoplayOrigin {
         generation: u64,
         index: usize,
     },
+    #[cfg(feature = "soundcloud")]
+    SoundCloud {
+        /// Canonical tracks captured independently of subsequent searches.
+        items: Arc<[QueueItem]>,
+        index: usize,
+    },
     #[cfg(feature = "yandex-music")]
     YandexMusic {
         /// Credential-free tracks captured from the activated provider list.
@@ -4696,6 +4706,8 @@ pub struct AppController {
     /// Next public page advertised by Bandcamp, when available.
     #[cfg(feature = "bandcamp")]
     bandcamp_next_page: Option<u16>,
+    /// Independent SoundCloud query, bounded worker, and canonical result set.
+    soundcloud: soundcloud::SoundCloudState,
     /// Query retained independently for the tracker-archive tab.
     tracker_search_query: String,
     /// Selected tracker row retained while another tab is visible.
@@ -5866,6 +5878,7 @@ impl AppController {
             local_path: saved.local_path.clone().unwrap_or_default(),
             search_query: match saved.screen {
                 StoredScreen::YouTubeMusic => saved.youtube_music_search_text.clone(),
+                StoredScreen::SoundCloud => saved.soundcloud_search_text.clone(),
                 #[cfg(feature = "yandex-music")]
                 StoredScreen::YandexMusic => saved.yandex_music_search_text.clone(),
                 #[cfg(feature = "bandcamp")]
@@ -6269,6 +6282,7 @@ impl AppController {
             archive_org_search_query,
             archive_org_search_scope: saved.archive_org_search_scope,
             archive_org_selected,
+            soundcloud: soundcloud::SoundCloudState::restored(&saved),
             librivox_search_query,
             librivox_selected,
             #[cfg(feature = "web-browser")]
@@ -7495,6 +7509,7 @@ impl AppController {
                 Ok(None) => self.submit_youtube_music_search(query),
                 Err(error) => self.view.status_line = error.to_owned(),
             },
+            SearchRoute::SoundCloud => self.submit_soundcloud_search(query),
             SearchRoute::YandexMusic => match parse_direct_source_input(&query) {
                 Ok(Some(direct)) if direct.source == SourceKind::YandexMusic => {
                     if let Some(album_id) = yandex_music_album_id_from_url(&direct.url) {
@@ -15357,6 +15372,7 @@ impl AppController {
                 .and_then(|entry| local_path_from_locator(&entry.media.replay_locator))
                 .filter(|path| path.is_file()),
             Screen::YouTubeMusic
+            | Screen::SoundCloud
             | Screen::YandexMusic
             | Screen::Bandcamp
             | Screen::ApplePodcasts
@@ -15411,6 +15427,7 @@ impl AppController {
                         Screen::History => self.update_history_detail(),
                         Screen::Playlists => self.update_playlist_detail(),
                         Screen::YouTubeMusic
+                        | Screen::SoundCloud
                         | Screen::YandexMusic
                         | Screen::Bandcamp
                         | Screen::ApplePodcasts
@@ -15449,6 +15466,7 @@ impl AppController {
                 Screen::History => self.update_history_detail(),
                 Screen::Playlists => self.update_playlist_detail(),
                 Screen::YouTubeMusic
+                | Screen::SoundCloud
                 | Screen::YandexMusic
                 | Screen::Bandcamp
                 | Screen::ApplePodcasts
@@ -16664,6 +16682,10 @@ impl AppController {
 
     fn update_non_youtube_detail(&mut self) {
         match self.view.screen {
+            Screen::SoundCloud => {
+                self.update_soundcloud_detail();
+                return;
+            }
             Screen::Web => {
                 #[cfg(feature = "web-browser")]
                 self.update_web_detail();
@@ -16883,6 +16905,8 @@ impl AppController {
                 self.yandex_music_selected = self.view.selected;
                 self.update_yandex_music_detail();
             }
+        } else if self.view.screen == Screen::SoundCloud {
+            self.update_soundcloud_detail();
         } else if self.view.screen == Screen::Bandcamp {
             #[cfg(feature = "bandcamp")]
             {
@@ -16950,6 +16974,8 @@ impl AppController {
                 self.yandex_music_selected = self.view.selected;
                 self.update_yandex_music_detail();
             }
+        } else if self.view.screen == Screen::SoundCloud {
+            self.update_soundcloud_detail();
         } else if self.view.screen == Screen::Bandcamp {
             #[cfg(feature = "bandcamp")]
             {
@@ -17022,6 +17048,9 @@ impl AppController {
     }
 
     fn selected_queue_item(&self) -> Result<QueueItem, String> {
+        if self.view.screen == Screen::SoundCloud {
+            return self.selected_soundcloud_queue_item();
+        }
         if self.view.screen == Screen::ArchiveOrg {
             return self.selected_archive_org_queue_item();
         }
@@ -17263,6 +17292,11 @@ impl AppController {
             return playlist_snapshot_from_local_media_presentation(&item, &title, &description);
         }
 
+        if self.view.screen == Screen::SoundCloud {
+            return self
+                .selected_soundcloud_queue_item()
+                .and_then(|item| playlist_snapshot_from_queue_item(&item));
+        }
         if self.view.screen == Screen::Bandcamp {
             #[cfg(feature = "bandcamp")]
             {
@@ -17425,6 +17459,12 @@ impl AppController {
     /// This cheap path is used while navigating so Details membership never
     /// causes a second FLAC tag read or a provider request.
     fn selected_playlist_identity(&self) -> Option<(MediaId, String)> {
+        if self.view.screen == Screen::SoundCloud {
+            return self
+                .selected_soundcloud_queue_item()
+                .ok()
+                .map(|item| (item.media.id, item.media.title));
+        }
         if self.view.screen == Screen::Subscriptions {
             let video_is_active = match self.view.subscriptions.layout {
                 SubscriptionsLayout::DrillDown => {
@@ -17773,7 +17813,7 @@ impl AppController {
                     None
                 }
             }
-            Screen::ArchiveOrg | Screen::LibriVox | Screen::Web => {
+            Screen::ArchiveOrg | Screen::LibriVox | Screen::Web | Screen::SoundCloud => {
                 let details = self.view.details.as_ref()?;
                 let media_id = details.media_id.clone()?;
                 Some(PrivateNoteSelection {
@@ -20574,6 +20614,10 @@ impl AppController {
     }
 
     fn activate_selection(&mut self) {
+        if self.view.screen == Screen::SoundCloud {
+            self.activate_soundcloud_selection();
+            return;
+        }
         #[cfg(feature = "web-browser")]
         if self.view.screen == Screen::Web {
             self.activate_web_selection();
@@ -24896,6 +24940,10 @@ impl AppController {
 
     /// Identifies the same-source cursor represented by a queue item.
     fn autoplay_origin_for_media(&self, media_id: &MediaId) -> Option<AutoplayOrigin> {
+        #[cfg(feature = "soundcloud")]
+        if self.view.screen == Screen::SoundCloud {
+            return self.soundcloud_autoplay_origin(media_id);
+        }
         let video_at = |items: &[SearchItem], index: usize| {
             items.get(index).is_some_and(|item| {
                 matches!(
@@ -25257,6 +25305,18 @@ impl AppController {
                     },
                 )
             }
+            #[cfg(feature = "soundcloud")]
+            AutoplayOrigin::SoundCloud { items, index } => {
+                neighbour_list_step(items, *index, direction, |index, item: &QueueItem| {
+                    Some(AutoplayStep::Play {
+                        item: Box::new(item.clone()),
+                        origin: AutoplayOrigin::SoundCloud {
+                            items: Arc::clone(items),
+                            index,
+                        },
+                    })
+                })
+            }
             #[cfg(feature = "yandex-music")]
             AutoplayOrigin::YandexMusic { items, index } => {
                 neighbour_list_step(items, *index, direction, |index, item: &QueueItem| {
@@ -25488,6 +25548,25 @@ impl AppController {
         origin: Option<AutoplayOrigin>,
         resolved_input: Option<PlaybackInput>,
     ) {
+        // All SoundCloud paths, including History and playlists, use the configured
+        // proxy. The canonical page remains the only persisted replay locator.
+        #[cfg(feature = "soundcloud")]
+        let resolved_input = if item.media.id.source == SourceKind::SoundCloud {
+            match self.soundcloud_playback_input(&item) {
+                Ok(input) => Some(input),
+                Err(error) => {
+                    self.view.status_line = format!("Soundcloak playback: {error}");
+                    return;
+                }
+            }
+        } else {
+            resolved_input
+        };
+        #[cfg(not(feature = "soundcloud"))]
+        if item.media.id.source == SourceKind::SoundCloud {
+            self.view.status_line = "This build omits the `soundcloud` feature".to_owned();
+            return;
+        }
         #[cfg(not(feature = "yandex-music"))]
         if item.media.id.source == SourceKind::YandexMusic {
             self.view.status_line =
@@ -26679,6 +26758,11 @@ impl AppController {
                     .clone_from(&self.view.search_query);
                 self.youtube_selected = self.view.selected;
             }
+            Screen::SoundCloud => {
+                self.soundcloud.query.clone_from(&self.view.search_query);
+                self.soundcloud.selected = self.view.selected;
+                self.finish_search_activity(SearchActivity::SoundCloud);
+            }
             Screen::YouTubeMusic => {
                 self.youtube_music_search_query
                     .clone_from(&self.view.search_query);
@@ -26762,6 +26846,10 @@ impl AppController {
             self.view.right_panel_mode = RightPanelMode::Details;
         }
         match screen {
+            Screen::SoundCloud => {
+                self.view.search_query.clone_from(&self.soundcloud.query);
+                self.view.selected = self.soundcloud.selected;
+            }
             Screen::Search => {
                 self.view
                     .search_query
@@ -27050,6 +27138,7 @@ impl AppController {
                 }
                 ApplePodcastsRoute::Direct => self.refresh_apple_direct_view(),
             },
+            Screen::SoundCloud => self.populate_soundcloud(),
             Screen::ArchiveOrg => self.populate_archive_org(),
             Screen::LibriVox => self.populate_librivox(),
             Screen::Web => {
@@ -30110,6 +30199,15 @@ impl AppController {
     }
 
     fn current_url(&self) -> Option<String> {
+        if self.view.screen == Screen::SoundCloud {
+            return self
+                .view
+                .details
+                .as_ref()?
+                .webpage_url
+                .as_ref()
+                .map(ToString::to_string);
+        }
         if let Some(linked) = self.active_description_video.as_ref() {
             return LinkTarget::YouTubeVideo {
                 video_id: linked.video_id.clone(),
@@ -34216,6 +34314,9 @@ impl AppController {
             self.youtube_music_search_query
                 .clone_from(&self.view.search_query);
             self.youtube_music_selected = self.view.selected;
+        } else if self.view.screen == Screen::SoundCloud {
+            self.soundcloud.query.clone_from(&self.view.search_query);
+            self.soundcloud.selected = self.view.selected;
         } else if self.view.screen == Screen::YandexMusic {
             self.yandex_music_search_query
                 .clone_from(&self.view.search_query);
@@ -34305,6 +34406,7 @@ impl AppController {
             selected_row: self.view.selected,
             youtube_selected_row: Some(self.youtube_selected),
             youtube_music_selected_row: Some(self.youtube_music_selected),
+            soundcloud_selected_row: Some(self.soundcloud.selected),
             yandex_music_selected_row: Some(self.yandex_music_selected),
             #[cfg(feature = "bandcamp")]
             bandcamp_selected_row: Some(self.bandcamp_selected),
@@ -34317,6 +34419,7 @@ impl AppController {
             details_scroll: u64::try_from(self.view.details_scroll).unwrap_or(u64::MAX),
             search_text: self.youtube_search_query.clone(),
             youtube_music_search_text: self.youtube_music_search_query.clone(),
+            soundcloud_search_text: self.soundcloud.query.clone(),
             yandex_music_search_text: self.yandex_music_search_query.clone(),
             #[cfg(feature = "bandcamp")]
             bandcamp_search_text: self.bandcamp_search_query.clone(),
@@ -35971,6 +36074,7 @@ impl UiController for AppController {
     }
 
     fn tick(&mut self) {
+        self.poll_soundcloud_worker();
         expire_transient_footer_notice(
             &mut self.view,
             &mut self.transient_footer_notice_deadline,
@@ -42845,6 +42949,8 @@ fn search_item_url(item: &SearchItem) -> Option<String> {
 
 fn stored_screen_from_tui(screen: Screen) -> StoredScreen {
     match screen {
+        Screen::SoundCloud if cfg!(feature = "soundcloud") => StoredScreen::SoundCloud,
+        Screen::SoundCloud => StoredScreen::Search,
         Screen::Search => StoredScreen::Search,
         #[cfg(feature = "youtube-music")]
         Screen::YouTubeMusic => StoredScreen::YouTubeMusic,
@@ -42919,6 +43025,8 @@ fn restored_playlists_route(
 
 fn tui_screen_from_stored(screen: &StoredScreen) -> Screen {
     match screen {
+        StoredScreen::SoundCloud if cfg!(feature = "soundcloud") => Screen::SoundCloud,
+        StoredScreen::SoundCloud => Screen::Search,
         StoredScreen::Search => Screen::Search,
         #[cfg(feature = "youtube-music")]
         StoredScreen::YouTubeMusic => Screen::YouTubeMusic,

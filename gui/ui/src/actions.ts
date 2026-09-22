@@ -20,6 +20,7 @@ import type {
 export type ActionScreen =
 	| 'Search'
 	| 'YouTubeMusic'
+	| 'SoundCloud'
 	| 'YandexMusic'
 	| 'Bandcamp'
 	| 'ApplePodcasts'

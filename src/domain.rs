@@ -327,7 +327,15 @@ impl SourceKind {
                 stream: true,
                 ..SourceCapabilities::default()
             },
-            Self::Vimeo | Self::RuTube | Self::SoundCloud | Self::BbcRadio | Self::GenericYtDlp => {
+            Self::SoundCloud => SourceCapabilities {
+                search: true,
+                video_details: true,
+                pagination: true,
+                download: true,
+                stream: true,
+                ..SourceCapabilities::default()
+            },
+            Self::Vimeo | Self::RuTube | Self::BbcRadio | Self::GenericYtDlp => {
                 SourceCapabilities {
                     video_details: true,
                     download: true,
@@ -1374,6 +1382,8 @@ pub enum Screen {
     Search,
     /// Music-focused `YouTube Music` search results and details.
     YouTubeMusic,
+    /// Public SoundCloud track search through Soundcloak.
+    SoundCloud,
     /// Yandex Music recommendations, catalogue results, and album tracks.
     YandexMusic,
     /// Bandcamp track and album search results.
@@ -1459,6 +1469,9 @@ pub struct SessionState {
     /// Last selected row in the independent `YouTube Music` result list.
     #[serde(default)]
     pub youtube_music_selected_row: Option<usize>,
+    /// Last selected row in the independent SoundCloud result list.
+    #[serde(default)]
+    pub soundcloud_selected_row: Option<usize>,
     /// Last selected row in the independent Yandex Music result list.
     #[serde(default)]
     pub yandex_music_selected_row: Option<usize>,
@@ -1493,6 +1506,9 @@ pub struct SessionState {
     /// Last search text entered on the independent `YouTube Music` tab.
     #[serde(default)]
     pub youtube_music_search_text: String,
+    /// Last search text entered on the independent SoundCloud tab.
+    #[serde(default)]
+    pub soundcloud_search_text: String,
     /// Last search text entered on the independent Yandex Music tab.
     #[serde(default)]
     pub yandex_music_search_text: String,
@@ -1536,6 +1552,7 @@ impl Default for SessionState {
             selected_row: 0,
             youtube_selected_row: None,
             youtube_music_selected_row: None,
+            soundcloud_selected_row: None,
             yandex_music_selected_row: None,
             bandcamp_selected_row: None,
             apple_podcasts_selected_row: None,
@@ -1547,6 +1564,7 @@ impl Default for SessionState {
             details_scroll: 0,
             search_text: String::new(),
             youtube_music_search_text: String::new(),
+            soundcloud_search_text: String::new(),
             yandex_music_search_text: String::new(),
             bandcamp_search_text: String::new(),
             apple_podcasts_search_text: String::new(),
@@ -1852,6 +1870,43 @@ mod tests {
 
         assert_eq!(restored.bandcamp_selected_row, None);
         assert!(restored.bandcamp_search_text.is_empty());
+    }
+
+    #[test]
+    fn soundcloud_sessions_round_trip_and_accept_older_sessions() {
+        let mut old = serde_json::to_value(SessionState::default()).unwrap();
+        old.as_object_mut()
+            .unwrap()
+            .remove("soundcloud_selected_row");
+        old.as_object_mut()
+            .unwrap()
+            .remove("soundcloud_search_text");
+        let restored: SessionState = serde_json::from_value(old).unwrap();
+        assert_eq!(restored.soundcloud_selected_row, None);
+        assert!(restored.soundcloud_search_text.is_empty());
+
+        let session = SessionState {
+            screen: Screen::SoundCloud,
+            soundcloud_selected_row: Some(4),
+            soundcloud_search_text: "ambient".to_owned(),
+            ..SessionState::default()
+        };
+        let encoded = serde_json::to_value(&session).unwrap();
+        assert_eq!(encoded["screen"]["screen"], "sound-cloud");
+        assert_eq!(
+            serde_json::from_value::<SessionState>(encoded).unwrap(),
+            session
+        );
+    }
+
+    #[test]
+    fn soundcloud_capabilities_include_paginated_search_without_inventing_subscriptions() {
+        let capabilities = SourceKind::SoundCloud.capabilities();
+        assert!(capabilities.search);
+        assert!(capabilities.pagination);
+        assert!(capabilities.video_details);
+        assert!(capabilities.stream);
+        assert!(!capabilities.subscriptions);
     }
 
     #[test]
