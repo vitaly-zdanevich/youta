@@ -364,6 +364,7 @@ fn archive_playback_preference_values_match_the_window_union() {
     assert_eq!(declared, emitted);
 }
 
+/// The history control declares its reducer action and uses the shared click handler.
 #[test]
 fn window_filters_and_edits_playback_history_from_the_shared_view_policy() {
     let sources = window_sources();
@@ -384,9 +385,9 @@ fn window_filters_and_edits_playback_history_from_the_shared_view_policy() {
         assert!(app.contains(required), "App no longer contains {required}");
     }
     for required in [
-        "Save playback history",
-        "popup.save_playback_history",
-        "dispatch(\"TogglePlaybackHistorySaving\")",
+        "toggle('PlaybackHistory', 'Save playback history', popup.save_playback_history, 'TogglePlaybackHistorySaving')",
+        "controls.map(({ field, label, value, action, on }) =>",
+        "onClick={() => void dispatch(action)}",
         "playbackHistoryEnabled ?",
     ] {
         assert!(
@@ -1812,6 +1813,7 @@ fn the_window_exposes_only_available_codex_video_summaries() {
     }
 }
 
+/// Summary consent stays visible beside the supported, declarative action control.
 #[test]
 fn the_window_preferences_make_codex_summary_consent_explicit() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1825,8 +1827,10 @@ fn the_window_preferences_make_codex_summary_consent_explicit() {
     for required in [
         "popup.video_summary_supported",
         "popup.video_summary_backend",
-        "dispatch(\"CycleVideoSummaryBackend\")",
-        "Video summaries",
+        "add('VideoSummaries', 'Video summaries', popup.video_summary_backend === 'codex' ? 'Codex CLI' : 'off',",
+        "'CycleVideoSummaryBackend', popup.video_summary_supported, popup.video_summary_backend === 'codex')",
+        "controls.map(({ field, label, value, action, on }) =>",
+        "onClick={() => void dispatch(action)}",
         "authenticated Codex CLI",
         "only when you request a summary",
         "does not store an API key",
