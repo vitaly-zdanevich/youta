@@ -2194,7 +2194,33 @@ struct ChapterLabelLayout {
     placements: Vec<ChapterLabelPlacement>,
 }
 
-/// Centers the current chapter and adds compact adjacent controls when they fit.
+/// Chooses a complete adjacent title when it fits, otherwise its compact control.
+///
+/// Measures terminal cells rather than bytes, and keeps unnamed chapters
+/// navigable without rendering an uninformative arrow-only label.
+fn adjacent_chapter_label(
+    chapter: &Chapter,
+    previous: bool,
+    available_width: u16,
+) -> Option<(String, u16)> {
+    let title = chapter_title_for_display(&chapter.title);
+    let named = if previous {
+        format!("◀ {title}")
+    } else {
+        format!("{title} ▶")
+    };
+    let text = if !title.is_empty() && Span::raw(&named).width() <= usize::from(available_width) {
+        named
+    } else if previous {
+        PREVIOUS_CHAPTER_LABEL.to_owned()
+    } else {
+        NEXT_CHAPTER_LABEL.to_owned()
+    };
+    let width = terminal_text_width(&text);
+    (width <= available_width).then_some((text, width))
+}
+
+/// Centers the current chapter and adds full or compact adjacent controls.
 ///
 /// Labels are deliberately independent from proportional timecode positions:
 /// chapter splits remain on the seek track, while this row stays stable no
@@ -2215,17 +2241,17 @@ fn chapter_label_layout(
     let mut layout = ChapterLabelLayout::default();
 
     let Some(current) = current else {
-        if let Some(next) = visible.first().copied() {
-            let control_width = terminal_text_width(NEXT_CHAPTER_LABEL);
-            if control_width <= width {
-                layout.placements.push(ChapterLabelPlacement {
-                    index: next,
-                    row: 0,
-                    start: width.saturating_sub(control_width),
-                    width: control_width,
-                    text: NEXT_CHAPTER_LABEL.to_owned(),
-                });
-            }
+        if let Some(next) = visible.first().copied()
+            && let Some((text, control_width)) =
+                adjacent_chapter_label(&view.playback_chapters[next], false, width)
+        {
+            layout.placements.push(ChapterLabelPlacement {
+                index: next,
+                row: 0,
+                start: width.saturating_sub(control_width),
+                width: control_width,
+                text,
+            });
         }
         return layout;
     };
@@ -2236,12 +2262,12 @@ fn chapter_label_layout(
     let show_hours = duration.as_secs() >= 60 * 60 || chapter.start_seconds >= 60 * 60;
     let current_label = if duration.is_zero() && view.show_chapter_timestamps {
         format!(
-            "▶ {} {}",
+            "{} {}",
             format_duration(Duration::from_secs(chapter.start_seconds)),
             chapter_title_for_display(&chapter.title),
         )
     } else {
-        chapter_timeline_label(chapter, true, view.show_chapter_timestamps, show_hours)
+        chapter_timeline_label(chapter, view.show_chapter_timestamps, show_hours)
     };
     let text = truncate_terminal_text(&current_label, usize::from(width));
     let current_width = terminal_text_width(&text).min(width);
@@ -2255,33 +2281,41 @@ fn chapter_label_layout(
             text,
         });
     }
-    let previous_width = terminal_text_width(PREVIOUS_CHAPTER_LABEL);
     if let Some(previous) = current_position
         .checked_sub(1)
         .and_then(|position| visible.get(position))
         .copied()
-        && current_start >= previous_width.saturating_add(CHAPTER_NAVIGATION_GAP)
+        && let Some((text, previous_width)) = adjacent_chapter_label(
+            &view.playback_chapters[previous],
+            true,
+            current_start.saturating_sub(CHAPTER_NAVIGATION_GAP),
+        )
     {
         layout.placements.push(ChapterLabelPlacement {
             index: previous,
             row: 0,
             start: 0,
             width: previous_width,
-            text: PREVIOUS_CHAPTER_LABEL.to_owned(),
+            text,
         });
     }
 
-    let next_width = terminal_text_width(NEXT_CHAPTER_LABEL);
     let current_end = current_start.saturating_add(current_width);
     if let Some(next) = visible.get(current_position.saturating_add(1)).copied()
-        && width.saturating_sub(current_end) >= next_width.saturating_add(CHAPTER_NAVIGATION_GAP)
+        && let Some((text, next_width)) = adjacent_chapter_label(
+            &view.playback_chapters[next],
+            false,
+            width
+                .saturating_sub(current_end)
+                .saturating_sub(CHAPTER_NAVIGATION_GAP),
+        )
     {
         layout.placements.push(ChapterLabelPlacement {
             index: next,
             row: 0,
             start: width.saturating_sub(next_width),
             width: next_width,
-            text: NEXT_CHAPTER_LABEL.to_owned(),
+            text,
         });
     }
 
@@ -7715,21 +7749,15 @@ fn render_chapter_navigation_labels(
 
 /// Formats one chapter label while keeping its seek position independent from
 /// the user's timestamp-visibility preference.
-fn chapter_timeline_label(
-    chapter: &Chapter,
-    current: bool,
-    show_timestamp: bool,
-    show_hours: bool,
-) -> String {
-    let prefix = if current { "▶ " } else { "" };
+fn chapter_timeline_label(chapter: &Chapter, show_timestamp: bool, show_hours: bool) -> String {
     if show_timestamp {
         format!(
-            "{prefix}{} {}",
+            "{} {}",
             format_timeline_timestamp(chapter.start_seconds, show_hours),
             chapter_title_for_display(&chapter.title)
         )
     } else {
-        format!("{prefix}{}", chapter_title_for_display(&chapter.title))
+        chapter_title_for_display(&chapter.title).to_owned()
     }
 }
 
@@ -32947,11 +32975,11 @@ for encoded, expected in json.load(sys.stdin):
             .iter()
             .find(|placement| placement.index == 3)
             .expect("next control");
-        assert_eq!(previous.text, "◀ Prev");
+        assert_eq!(previous.text, "◀ Previous chapter");
         assert_eq!(previous.start, 0);
-        assert_eq!(current.text, "▶ Current chapter");
+        assert_eq!(current.text, "Current chapter");
         assert_eq!(current.start, (80 - current.width) / 2);
-        assert_eq!(next.text, "Next ▶");
+        assert_eq!(next.text, "Next chapter ▶");
         assert_eq!(next.start + next.width, 80);
     }
 
@@ -32990,8 +33018,204 @@ for encoded, expected in json.load(sys.stdin):
         assert_eq!(current.row, 0);
         assert_eq!(current.start, 0);
         assert_eq!(current.width, 18);
-        assert!(current.text.starts_with("▶ "));
+        assert!(current.text.starts_with("Текущая"));
         assert!(current.text.ends_with('…'));
+    }
+
+    /// Supplies adjacent chapters with a stable current selection for layout tests.
+    fn chapter_navigation_fixture() -> ViewModel {
+        ViewModel {
+            playback: PlaybackStatus {
+                idle: false,
+                position: Duration::from_secs(150),
+                duration: Some(Duration::from_secs(300)),
+                ..PlaybackStatus::default()
+            },
+            playing_media_id: Some(MediaId::new(SourceKind::YouTube, "abcdefghijk")),
+            playback_chapters: ["Previous chapter.", "Current", "Next chapter..."]
+                .into_iter()
+                .enumerate()
+                .map(|(index, title)| Chapter {
+                    title: title.to_owned(),
+                    start_seconds: index as u64 * 100,
+                    end_seconds: Some((index as u64 + 1) * 100),
+                })
+                .collect(),
+            ..ViewModel::default()
+        }
+    }
+
+    #[test]
+    fn chapter_navigation_selects_titles_or_compact_controls_by_terminal_cells() {
+        let mut view = chapter_navigation_fixture();
+        view.playback_chapters[0].title = "界界界".to_owned();
+        view.playback_chapters[2].title = "次の章".to_owned();
+
+        for (width, previous_text, next_text) in [
+            (27, Some("◀ 界界界"), Some("次の章 ▶")),
+            (26, Some("◀ Prev"), Some("次の章 ▶")),
+            (25, Some("◀ Prev"), Some("Next ▶")),
+            (21, None, None),
+        ] {
+            let layout = chapter_label_layout(&view, Duration::from_secs(300), width, 1);
+            let current = layout
+                .placements
+                .iter()
+                .find(|placement| placement.index == 1)
+                .expect("current chapter");
+            assert_eq!(current.text, "Current");
+            assert_eq!(current.start, (width - current.width) / 2);
+            for (index, expected) in [(0, previous_text), (2, next_text)] {
+                let placement = layout
+                    .placements
+                    .iter()
+                    .find(|placement| placement.index == index);
+                assert_eq!(
+                    placement.map(|placement| placement.text.as_str()),
+                    expected,
+                    "chapter {index} at width {width}",
+                );
+                if let Some(placement) = placement {
+                    assert_eq!(placement.width, terminal_text_width(&placement.text));
+                    assert_eq!(placement.row, 0);
+                    if index == 0 {
+                        assert_eq!(placement.start, 0);
+                        assert!(placement.width + CHAPTER_NAVIGATION_GAP <= current.start);
+                    } else {
+                        assert_eq!(placement.start + placement.width, width);
+                        assert!(
+                            current.start + current.width + CHAPTER_NAVIGATION_GAP
+                                <= placement.start
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn chapter_navigation_omits_only_generated_current_arrows() {
+        let mut view = chapter_navigation_fixture();
+        for (duration, timestamp) in [
+            (Duration::from_secs(300), "01:40"),
+            (Duration::ZERO, "1:40"),
+        ] {
+            for show_timestamp in [false, true] {
+                view.show_chapter_timestamps = show_timestamp;
+                for title in ["Current", "▶ Authored title"] {
+                    view.playback_chapters[1].title = title.to_owned();
+                    let layout = chapter_label_layout(&view, duration, 120, 1);
+                    let current = layout
+                        .placements
+                        .iter()
+                        .find(|placement| placement.index == 1)
+                        .expect("current chapter");
+                    assert_eq!(
+                        current.text,
+                        if show_timestamp {
+                            format!("{timestamp} {title}")
+                        } else {
+                            title.to_owned()
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn chapter_navigation_before_first_marker_uses_the_same_title_fallback() {
+        let mut view = chapter_navigation_fixture();
+        view.playback.position = Duration::ZERO;
+        view.playback_chapters[0].start_seconds = 5;
+        view.playback_chapters[0].title = "界界界.".to_owned();
+        for duration in [Duration::from_secs(300), Duration::ZERO] {
+            for (width, expected) in [(8, Some("界界界 ▶")), (7, Some("Next ▶")), (5, None)]
+            {
+                let layout = chapter_label_layout(&view, duration, width, 1);
+                assert_eq!(layout.placements.len(), usize::from(expected.is_some()));
+                if let Some(placement) = layout.placements.first() {
+                    assert_eq!(Some(placement.text.as_str()), expected);
+                    assert_eq!(placement.index, 0);
+                    assert_eq!(placement.start + placement.width, width);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn chapter_navigation_empty_adjacent_titles_retain_compact_controls() {
+        let mut view = chapter_navigation_fixture();
+        view.playback_chapters[0].title.clear();
+        view.playback_chapters[2].title = "   ".to_owned();
+        let layout = chapter_label_layout(&view, Duration::from_secs(300), 120, 1);
+        for (index, expected) in [(0, "◀ Prev"), (2, "Next ▶")] {
+            assert_eq!(
+                layout
+                    .placements
+                    .iter()
+                    .find(|placement| placement.index == index)
+                    .expect("compact control for unnamed chapter")
+                    .text,
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn chapter_navigation_rendered_titles_and_compact_labels_seek_exactly() {
+        let view = chapter_navigation_fixture();
+        for (width, previous_text, next_text) in [
+            (120, "◀ Previous chapter", "Next chapter... ▶"),
+            (40, "◀ Prev", "Next ▶"),
+        ] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 3)).expect("terminal");
+            let mut hit_map = HitMap::default();
+            terminal
+                .draw(|frame| {
+                    render_seek_bar(
+                        frame,
+                        frame.area(),
+                        &view,
+                        &UiSettings::default(),
+                        &Theme::new(false),
+                        &mut hit_map,
+                    );
+                })
+                .expect("draw chapter navigation");
+            let rendered = rendered_text(&terminal);
+            assert!(rendered.contains(previous_text), "{rendered}");
+            assert!(rendered.contains(next_text), "{rendered}");
+            assert!(!rendered.contains("▶ Current"), "{rendered}");
+            assert_eq!(hit_map.seek_bar, Rect::new(0, 1, width, 1));
+            for (seconds, text) in [(0, previous_text), (100, "Current"), (200, next_text)] {
+                let expected = UiAction::ActivateTimecode {
+                    media_id: view.playing_media_id.clone().expect("playing media"),
+                    seconds,
+                };
+                let (_, area) = hit_map
+                    .seek_markers
+                    .iter()
+                    .find(|(action, area)| *action == expected && area.y < hit_map.seek_bar.y)
+                    .expect("exact label hitbox");
+                assert_eq!(area.width, terminal_text_width(text));
+                for column in [area.x, area.right() - 1] {
+                    assert_eq!(
+                        mouse_action(
+                            MouseEvent {
+                                kind: MouseEventKind::Down(MouseButton::Left),
+                                column,
+                                row: area.y,
+                                modifiers: KeyModifiers::NONE,
+                            },
+                            &hit_map,
+                            &view,
+                        ),
+                        Some(expected.clone()),
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -33042,7 +33266,8 @@ for encoded, expected in json.load(sys.stdin):
             })
             .expect("draw chapter timeline");
         let rendered = rendered_text(&terminal);
-        assert!(rendered.contains("▶ 00:30 Middle"), "{rendered}");
+        assert!(rendered.contains("00:30 Middle"), "{rendered}");
+        assert!(!rendered.contains("▶ 00:30 Middle"), "{rendered}");
         assert!(
             rendered.contains('┃'),
             "current chapter needs a strong split"
@@ -33128,7 +33353,7 @@ prose 07:25 remains clickable but is not a chapter";
 
         let rendered = rendered_text(&terminal);
         assert!(
-            rendered.contains("▶ 05:45 Дело не в фамилиях"),
+            rendered.contains("05:45 Дело не в фамилиях"),
             "the active description chapter must be visible above the seek bar: {rendered}"
         );
         assert_eq!(
@@ -33800,7 +34025,7 @@ prose 07:25 remains clickable but is not a chapter";
             .expect("draw unknown-duration chapter");
         let rendered = rendered_text(&terminal);
         assert!(
-            rendered.contains("▶ 0:11"),
+            rendered.starts_with("0:11 Se…"),
             "a narrow unknown-duration timeline must retain the active timestamp: {rendered}"
         );
         assert!(
