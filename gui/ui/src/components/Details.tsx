@@ -114,6 +114,19 @@ function factsFor(kind: InformationPanelKind, details: DetailView): Array<[strin
 					['Uploaded', fact(details.published)],
 				);
 			}
+			if (details.media_id?.source === 'sound-cloud' && details.soundcloud) {
+				const track = details.soundcloud;
+				rows.push(
+					['Length', fact(details.length)],
+					['Plays', count(track.plays)],
+					['Likes', fact(details.likes)],
+					['Reposts', count(track.reposts)],
+					['Comments', fact(details.comments)],
+					['Created', fact(track.created)],
+					['Modified', fact(track.modified)],
+					['Tags', fact(track.tags.join(', '))],
+				);
+			}
       break;
   }
   rows.push(["Source", fact(details.source)], ["License", fact(details.license)]);
@@ -289,6 +302,7 @@ export function Details({ view, kind }: { view: ViewModel; kind: InformationPane
   const facts = factsFor(kind, details);
   const isYouTube = details.media_id?.source === YOUTUBE;
 	const isArchiveOrg = details.media_id?.source === 'archive-org';
+	const isSoundCloud = details.media_id?.source === 'sound-cloud';
   const openable =
     view.external_opener_available &&
     (kind === "Video" || kind === "Podcast" || kind === "Radio" || kind === "YandexMusic" ||
@@ -318,7 +332,7 @@ export function Details({ view, kind }: { view: ViewModel; kind: InformationPane
       }}
     >
       <Artwork
-        url={details.expanded_thumbnail_url ?? details.thumbnail_url}
+        url={isSoundCloud ? details.thumbnail_url : details.expanded_thumbnail_url ?? details.thumbnail_url}
         className="mb-3 block max-h-[220px] w-full rounded-md object-cover"
         onClick={() => void dispatch("ToggleThumbnailExpansion")}
       />
@@ -422,7 +436,7 @@ export function Details({ view, kind }: { view: ViewModel; kind: InformationPane
             Favorite
           </Action>
         ) : null}
-        {(view.video_comments_available && kind === 'Video' && isYouTube) || (isArchiveOrg && view.screen === 'ArchiveOrg') ? (
+        {(view.video_comments_available && kind === 'Video' && isYouTube) || (isArchiveOrg && view.screen === 'ArchiveOrg') || (isSoundCloud && view.screen === 'SoundCloud') ? (
           <Action onClick={() => void dispatch("OpenVideoComments")}>Comments</Action>
         ) : null}
         {kind === "Video" && view.video_summary_available && isYouTube ? (

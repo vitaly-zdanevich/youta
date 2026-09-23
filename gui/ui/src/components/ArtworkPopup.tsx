@@ -4,7 +4,7 @@ import { Artwork } from './Artwork';
 import { Popup } from './Popup';
 
 /**
- * Enlarges the existing cached artwork without requesting another rendition.
+ * Opens cached artwork or its provider-advertised larger rendition on demand.
  *
  * The controller owns expansion and Escape handling. Keeping this layer below
  * other popups preserves their keyboard priority, just as in the terminal.

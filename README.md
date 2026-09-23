@@ -425,13 +425,22 @@ resolver:
   an API key or SoundCloud login. Each track links to both its original
   SoundCloud page and its page on the configured Soundcloak instance. History
   and playlists retain the original URL, not an instance-specific stream.
+  Search requests fit the visible result rows (up to 100 tracks); explicit
+  **Load more tracks…** keeps that page size and scrolls one page at a time.
+  Details show the available plays, likes, reposts, creation/modification dates,
+  license, tags, and linked genre. Artwork uses the 500-pixel rendition in
+  Details; the 1080-pixel rendition is requested only when expanded. **F6**
+  loads up to 20 public comments for the selected track on demand. Exact
+  track/account Wikidata matches are loaded lazily when `wikidata` is enabled.
   The default is `https://sc1.maid.zone/`; set `providers.soundcloak_base_url`
   in `config.toml` to use another trusted instance. The [official instance
   directory](https://maid.zone/soundcloak/instances.html) lists alternatives,
   including `sc2.maid.zone` and `sc3.maid.zone`. Choose an instance with API,
   stream proxying, and image proxying enabled. Public instances can go offline
-  or disable their API; unavailable or preview-only tracks are not treated
-  as full playable tracks. SoundCloud also has an [official API](https://developers.soundcloud.com/docs/api/),
+  or disable their API. Public previews are playable and explicitly labeled
+  with their actual duration; they never overwrite full-track resume or
+  completion progress. Every playback, including History and playlist replay,
+  checks current public availability first. SoundCloud also has an [official API](https://developers.soundcloud.com/docs/api/),
   but [registering an application](https://developers.soundcloud.com/docs/api/register-app)
   currently requires Artist Pro; Youta's Soundcloak tab does not use it.
 - **SoundStream** accepts exact `soundstream.media` playlist and clip links

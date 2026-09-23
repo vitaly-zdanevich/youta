@@ -1440,13 +1440,14 @@ export function ErrorPopup({
   );
 }
 
-/** Bounded public YouTube comments or Archive.org item reviews. */
+/** Bounded public YouTube/SoundCloud comments or Archive.org item reviews. */
 export function VideoCommentsPopup({ popup }: { popup: VideoCommentsPopupView }) {
   const state = popup.state;
 	const archiveOrg = popup.source === 'archive-org';
+	const soundcloud = popup.source === 'sound-cloud';
   return (
     <Popup
-      title={archiveOrg ? 'archive.org comments' : 'Comments'}
+      title={archiveOrg ? 'archive.org comments' : soundcloud ? 'SoundCloud comments' : 'Comments'}
       subtitle={popup.video_title}
       layer={LAYER.videoComments}
       onDismiss={() => void dispatch("DismissVideoComments")}
@@ -1458,7 +1459,7 @@ export function VideoCommentsPopup({ popup }: { popup: VideoCommentsPopupView })
       ) : state === "Empty" ? (
         <Body>
 					<p className='text-ink-faint'>
-						{archiveOrg ? 'This item has no public reviews.' : 'This video has no public top-level comments.'}
+						{archiveOrg ? 'This item has no public reviews.' : soundcloud ? 'This track has no public comments.' : 'This video has no public top-level comments.'}
 					</p>
         </Body>
       ) : typeof state === "object" ? (
@@ -1477,8 +1478,8 @@ export function VideoCommentsPopup({ popup }: { popup: VideoCommentsPopupView })
             <div key={`${comment.author_name}-${index}`} className="mb-[8px]">
               <span className="text-accent">{comment.author_name}</span>
               <span className="text-ink-faint">
-								{/* Archive review scores are not like counts. */}
-								{archiveOrg
+								{/* Only YouTube reports comment likes through the current adapters. */}
+								{archiveOrg || soundcloud
 									? comment.published ? ` · ${comment.published}` : ''
 									: ` · ${comment.like_count} likes${comment.published ? ` · ${comment.published}` : ''}`}
               </span>

@@ -27,8 +27,8 @@ test('Archive.org item pages are available in the generic panel', () => {
 function commentsButtonVisible(view, kind, source) {
 	const guard = details.match(/\{([^\n]+) \? \(\s*<Action onClick=\{\(\) => void dispatch\("OpenVideoComments"\)\}>Comments<\/Action>/)?.[1];
 	assert.ok(guard, 'Comments button must have a provider-aware visibility guard');
-	return new Function('view', 'kind', 'isYouTube', 'isArchiveOrg', `return (${guard});`)(
-		view, kind, source === 'youtube', source === 'archive-org',
+	return new Function('view', 'kind', 'isYouTube', 'isArchiveOrg', 'isSoundCloud', `return (${guard});`)(
+		view, kind, source === 'youtube', source === 'archive-org', source === 'sound-cloud',
 	);
 }
 
@@ -56,12 +56,19 @@ test('YouTube comments still require its backend and Video layout', () => {
 	}
 });
 
+/** Public SoundCloud comments belong only to the selected SoundCloud source tab. */
+test('SoundCloud comments do not borrow YouTube capability or appear on History', () => {
+	for (const screen of ['SoundCloud', 'History', 'Downloaded', 'Playlists', 'Search']) {
+		assert.equal(commentsButtonVisible({ screen, video_comments_available: false }, 'Generic', 'sound-cloud'), screen === 'SoundCloud');
+	}
+});
+
 /** Review stars must not become likes; empty reviews are not called video comments. */
 test('Archive.org comments popup retains source identity and omits fictional likes', () => {
 	assert.match(popups, /const archiveOrg = popup\.source === 'archive-org'/);
-	assert.match(popups, /title=\{archiveOrg \? 'archive.org comments' : 'Comments'\}/);
+	assert.match(popups, /title=\{archiveOrg \? 'archive.org comments' : soundcloud \? 'SoundCloud comments' : 'Comments'\}/);
 	assert.match(popups, /This item has no public reviews\./);
-	assert.match(popups, /archiveOrg\s*\? comment\.published/);
+	assert.match(popups, /archiveOrg \|\| soundcloud\s*\? comment\.published/);
 	assert.match(contract, /export interface VideoCommentsPopupView \{\s*source: string;/);
 });
 

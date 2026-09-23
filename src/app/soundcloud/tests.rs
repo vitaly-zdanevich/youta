@@ -1,9 +1,10 @@
 //! Offline controller coverage for Soundcloak navigation and canonical replay.
 
 use super::*;
+use std::sync::Mutex;
 
 /// Builds public metadata without contacting any real instance.
-fn track(slug: &str) -> SoundcloakTrack {
+pub(super) fn track(slug: &str) -> SoundcloakTrack {
     SoundcloakTrack {
         id: slug.to_owned(),
         title: format!("Track {slug}"),
@@ -11,14 +12,26 @@ fn track(slug: &str) -> SoundcloakTrack {
         webpage_url: url::Url::parse(&format!("https://soundcloud.com/fixture-artist/{slug}"))
             .unwrap(),
         artwork_url: None,
+        expanded_artwork_url: None,
         duration_seconds: Some(120),
+        full_duration_seconds: Some(120),
         description: Some("Fixture description".to_owned()),
         streamable: true,
+        playback: crate::providers::soundcloak::SoundcloakPlayback::Full,
+        likes_count: None,
+        playback_count: None,
+        reposts_count: None,
+        comment_count: None,
+        created_at: None,
+        last_modified: None,
+        license: None,
+        tags: Vec::new(),
+        genre: None,
     }
 }
 
 /// Uses in-memory persistence and an explicit test instance, with no live network.
-fn controller() -> AppController {
+pub(super) fn controller() -> AppController {
     let mut config = Config::for_dir("/tmp/youta-soundcloud-controller-test");
     config.providers.soundcloak_base_url =
         Some(url::Url::parse("https://soundcloak.example/").unwrap());
@@ -29,7 +42,7 @@ fn controller() -> AppController {
 }
 
 /// Supplies a completion without creating a worker or fetching media.
-fn complete(
+pub(super) fn complete(
     controller: &mut AppController,
     generation: u64,
     items: Vec<SoundcloakTrack>,
@@ -279,6 +292,120 @@ fn soundcloud_details_show_both_original_and_instance_page_links() {
 }
 
 #[test]
+fn soundcloud_details_preserve_source_facts_genre_and_lazy_artwork_sizes() {
+    let mut app = controller();
+    let mut item = track("metadata");
+    item.likes_count = Some(1234);
+    item.playback_count = Some(5678);
+    item.reposts_count = Some(90);
+    item.comment_count = Some(12);
+    item.created_at = Some("2024-03-02T10:20:30Z".into());
+    item.last_modified = Some("2025-01-04T11:22:33Z".into());
+    item.license = Some("cc-by".into());
+    item.tags = vec!["ambient".into(), "field recording".into()];
+    item.genre = Some("Ambient & Field".into());
+    item.artwork_url = Some(url::Url::parse("https://soundcloak.example/artwork-500").unwrap());
+    item.expanded_artwork_url =
+        Some(url::Url::parse("https://soundcloak.example/artwork-1080").unwrap());
+    complete(&mut app, 0, vec![item.clone()], None);
+    let details = app.view.details.as_ref().unwrap();
+    assert_eq!(details.likes, "1,234");
+    assert_eq!(details.comments, "12");
+    assert_eq!(details.license, "cc-by");
+    assert!(details.views.is_empty(), "plays are not video views");
+    assert!(details.published.is_empty(), "creation is not publication");
+    let facts = details.soundcloud.as_ref().unwrap();
+    assert_eq!((facts.plays, facts.reposts), (Some(5678), Some(90)));
+    assert!(facts.created.contains("2024"));
+    assert!(facts.modified.contains("2025"));
+    assert_eq!(facts.tags, ["ambient", "field recording"]);
+    assert_eq!(details.thumbnail_url, item.artwork_url);
+    assert_eq!(details.expanded_thumbnail_url, item.expanded_artwork_url);
+    assert!(!details.thumbnail_expanded);
+    let genre = details
+        .links
+        .iter()
+        .find(|link| link.prefix == "Genre: ")
+        .unwrap();
+    assert_eq!(genre.label, "Ambient & Field");
+    assert!(genre.url.starts_with("https://soundcloak.example/tags/"));
+}
+
+#[test]
+fn soundcloud_preview_rows_and_details_never_claim_full_length_playback() {
+    let mut app = controller();
+    let mut item = track("preview");
+    item.playback = crate::providers::soundcloak::SoundcloakPlayback::Preview;
+    item.duration_seconds = Some(30);
+    item.full_duration_seconds = Some(180);
+    complete(&mut app, 0, vec![item], None);
+    assert!(app.view.rows[0].subtitle.contains("preview"));
+    let details = app.view.details.as_ref().unwrap();
+    assert_eq!(details.length, "0:30 preview (full track 3:00)");
+    assert_eq!(
+        details
+            .soundcloud
+            .as_ref()
+            .unwrap()
+            .preview_duration_seconds,
+        Some(30)
+    );
+    assert!(
+        app.selected_soundcloud_queue_item().is_ok(),
+        "public previews are explicit playable choices"
+    );
+}
+
+#[cfg(feature = "wikidata")]
+#[test]
+fn soundcloud_detail_rebuild_preserves_same_track_wikidata_links_and_spoilers() {
+    let mut app = controller();
+    complete(&mut app, 0, vec![track("one"), track("two")], None);
+    let details = app.view.details.as_mut().unwrap();
+    details.wikidata = "Fixture artist (Q123)".into();
+    details.links.push(DetailLinkView {
+        label: "Fixture artist".into(),
+        url: "https://www.wikidata.org/wiki/Q123".into(),
+        wikidata_item_id: Some("Q123".into()),
+        ..DetailLinkView::default()
+    });
+    details.expanded_wikidata_item = Some("Q123".into());
+    details.loading_wikidata_item = Some("Q123".into());
+    details
+        .wikidata_entities
+        .push(crate::view::DetailWikidataEntityView {
+            item_id: "Q123".into(),
+            text: "Fixture artist properties".into(),
+            ..crate::view::DetailWikidataEntityView::default()
+        });
+    for _ in 0..2 {
+        app.update_soundcloud_detail();
+        let details = app.view.details.as_ref().unwrap();
+        assert_eq!(details.wikidata, "Fixture artist (Q123)");
+        assert_eq!(
+            details
+                .links
+                .iter()
+                .filter(|link| link.wikidata_item_id.as_deref() == Some("Q123"))
+                .count(),
+            1
+        );
+        assert_eq!(details.expanded_wikidata_item.as_deref(), Some("Q123"));
+        assert_eq!(details.loading_wikidata_item.as_deref(), Some("Q123"));
+        assert_eq!(details.wikidata_entities.len(), 1);
+    }
+    app.select_row(1);
+    let details = app.view.details.as_ref().unwrap();
+    assert!(details.wikidata_entities.is_empty());
+    assert!(
+        details
+            .links
+            .iter()
+            .all(|link| link.wikidata_item_id.is_none())
+    );
+}
+
+#[test]
 fn soundcloud_results_ignore_stale_completions_and_do_not_replace_another_tab() {
     let mut controller = controller();
     controller.soundcloud.generation = 2;
@@ -327,14 +454,17 @@ fn soundcloud_saved_track_and_runtime_stream_have_separate_urls() {
         "https://soundcloud.com/fixture-artist/one"
     );
     assert_eq!(item.media.id.external_id, snapshot.replay_locator);
-    let input = controller.soundcloud_playback_input(&item).unwrap();
-    assert!(input.bypass_ytdl);
+    let input = controller
+        .soundcloak_client()
+        .unwrap()
+        .playback_url(&track("one"))
+        .unwrap();
     assert!(
         input
-            .location
+            .as_str()
             .starts_with("https://soundcloak.example/_/api/hls/fixture-artist/one?")
     );
-    assert!(input.location.contains("redirect_parts=false"));
+    assert!(input.as_str().contains("redirect_parts=false"));
     assert!(!snapshot.replay_locator.contains("soundcloak"));
 }
 
@@ -371,8 +501,314 @@ fn soundcloud_duplicate_continuations_stop_pagination() {
     assert_eq!(controller.soundcloud.next_page, None);
 }
 
+/// Returns exact consecutive pages from the real provider's validated offset contract.
+#[derive(Default)]
+struct PagingSoundcloakTransport(Mutex<Vec<url::Url>>);
+
+impl crate::providers::soundcloak::SoundcloakTransport for PagingSoundcloakTransport {
+    fn fetch(&self, url: &url::Url, _: usize) -> Result<Vec<u8>, crate::providers::ProviderError> {
+        self.0.lock().unwrap().push(url.clone());
+        let pairs = url.query_pairs().collect::<HashMap<_, _>>();
+        let limit = pairs["limit"].parse::<usize>().unwrap();
+        let offset = pairs["offset"].parse::<usize>().unwrap();
+        let items = (offset..offset + limit)
+            .map(|index| {
+                serde_json::json!({
+                    "id": index + 1,
+                    "kind": "track",
+                    "title": format!("Track {index}"),
+                    "user": {"username": "Fixture Artist"},
+                    "permalink_url": format!("https://soundcloud.com/fixture-artist/track-{index}"),
+                    "duration": 120_000,
+                    "policy": "ALLOW",
+                    "streamable": true,
+                    "media": {"transcodings": [{
+                        "snipped": false,
+                        "format": {"protocol": "hls", "mime_type": "audio/mpeg"}
+                    }]}
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut next = url::Url::parse("https://api-v2.soundcloud.com/search/tracks").unwrap();
+        next.query_pairs_mut()
+            .append_pair("q", &pairs["q"])
+            .append_pair("limit", &limit.to_string())
+            .append_pair("offset", &(offset + limit).to_string());
+        Ok(serde_json::to_vec(&serde_json::json!({
+            "collection": items,
+            "next_href": next,
+        }))
+        .unwrap())
+    }
+}
+
+/// Installs a recording in-memory transport; no test contacts a public instance.
+fn paging_controller() -> (AppController, Arc<PagingSoundcloakTransport>) {
+    let mut app = controller();
+    let transport = Arc::new(PagingSoundcloakTransport::default());
+    app.soundcloud.client = Some(
+        SoundcloakClient::with_transport(
+            url::Url::parse("https://soundcloak.example/").unwrap(),
+            transport.clone(),
+        )
+        .unwrap(),
+    );
+    (app, transport)
+}
+
+/// Completes one immediately available mock page without starting a second request.
+fn finish_soundcloud_page(app: &mut AppController) {
+    wait_for_soundcloud_worker(app);
+    app.poll_soundcloud_worker();
+    assert!(app.soundcloud.worker.is_none());
+}
+
+#[test]
+fn soundcloud_first_request_uses_bounded_visible_capacity() {
+    for (capacity, expected) in [(10, 10), (100, 100), (0, 1), (usize::MAX, 100)] {
+        let (mut app, requests) = paging_controller();
+        app.set_soundcloud_search_page_capacity(capacity);
+        assert!(
+            requests.0.lock().unwrap().is_empty(),
+            "geometry must not fetch"
+        );
+        app.submit_soundcloud_search("fixture".into());
+        finish_soundcloud_page(&mut app);
+        assert_eq!(app.soundcloud.items.len(), expected);
+        assert_eq!(app.view.rows.len(), expected + 1);
+        assert_eq!(app.view.rows.last().unwrap().title, "Load more tracks…");
+        let urls = requests.0.lock().unwrap();
+        assert_eq!(urls.len(), 1);
+        let pairs = urls[0].query_pairs().collect::<HashMap<_, _>>();
+        assert_eq!(pairs["limit"], expected.to_string());
+        assert_eq!(pairs["offset"], "0");
+    }
+}
+
+#[test]
+fn soundcloud_load_more_turns_one_page_and_keeps_its_stride_after_resize() {
+    let (mut app, requests) = paging_controller();
+    app.set_soundcloud_search_page_capacity(10);
+    app.submit_soundcloud_search("fixture".into());
+    finish_soundcloud_page(&mut app);
+    app.set_soundcloud_search_page_capacity(100);
+    app.view.search_query = "unsubmitted draft".into();
+    for page in 2..=4 {
+        app.select_row(app.soundcloud.items.len());
+        app.activate_soundcloud_selection();
+        finish_soundcloud_page(&mut app);
+        let loaded = page * 10;
+        assert_eq!(app.view.selected, loaded);
+        assert_eq!(app.soundcloud.selected, loaded);
+        assert_eq!(app.view.rows[loaded].title, "Load more tracks…");
+        assert_eq!(
+            app.soundcloud.items[loaded - 10].title,
+            format!("Track {}", loaded - 10)
+        );
+        assert_eq!(
+            app.soundcloud.items[loaded - 1].title,
+            format!("Track {}", loaded - 1)
+        );
+    }
+    for (index, url) in requests.0.lock().unwrap().iter().enumerate() {
+        let pairs = url.query_pairs().collect::<HashMap<_, _>>();
+        assert_eq!(pairs["limit"], "10");
+        assert_eq!(pairs["offset"], (index * 10).to_string());
+        assert_eq!(pairs["q"], "fixture");
+    }
+    app.submit_soundcloud_search("next query".into());
+    finish_soundcloud_page(&mut app);
+    assert_eq!(app.soundcloud.items.len(), 100);
+}
+
+#[test]
+fn soundcloud_load_more_does_not_steal_changed_selection_or_tab() {
+    let (mut app, _) = paging_controller();
+    app.set_soundcloud_search_page_capacity(10);
+    app.submit_soundcloud_search("fixture".into());
+    finish_soundcloud_page(&mut app);
+    app.select_row(10);
+    app.activate_soundcloud_selection();
+    app.select_row(2);
+    finish_soundcloud_page(&mut app);
+    assert_eq!(app.view.selected, 2);
+    app.select_row(20);
+    app.activate_soundcloud_selection();
+    app.show_screen(Screen::Search);
+    let rows = app.view.rows.clone();
+    let selected = app.view.selected;
+    finish_soundcloud_page(&mut app);
+    assert_eq!(app.view.rows, rows);
+    assert_eq!(app.view.selected, selected);
+    app.show_screen(Screen::SoundCloud);
+    assert_eq!(
+        app.view.selected, 20,
+        "changing tabs cancels a pending page turn"
+    );
+    assert_eq!(app.soundcloud.items.len(), 30);
+}
+
+#[test]
+fn soundcloud_final_page_and_result_cap_remove_the_continuation() {
+    for initial in [3, 999] {
+        let mut app = controller();
+        complete(
+            &mut app,
+            0,
+            (0..initial)
+                .map(|index| track(&index.to_string()))
+                .collect(),
+            Some(2),
+        );
+        app.select_row(initial);
+        app.soundcloud.page_turn = Some((0, initial));
+        complete(
+            &mut app,
+            0,
+            (initial..initial + 3)
+                .map(|index| track(&index.to_string()))
+                .collect(),
+            (initial == 999).then_some(3),
+        );
+        let expected = (initial + 3).min(1_000);
+        assert_eq!(app.soundcloud.items.len(), expected);
+        assert_eq!(app.view.rows.len(), expected);
+        assert_eq!(app.view.selected, expected - 1);
+        assert_eq!(app.soundcloud.next_page, None);
+    }
+}
+
+#[test]
+fn soundcloud_partial_duplicate_page_keeps_the_provider_offset_stride() {
+    let (mut app, requests) = paging_controller();
+    app.soundcloud.page_limit = Some(10);
+    app.soundcloud.submitted_query = "fixture".into();
+    complete(
+        &mut app,
+        0,
+        (0..10).map(|index| track(&index.to_string())).collect(),
+        Some(2),
+    );
+    complete(
+        &mut app,
+        0,
+        (8..18).map(|index| track(&index.to_string())).collect(),
+        Some(3),
+    );
+    assert_eq!(app.soundcloud.items.len(), 18);
+    app.select_row(18);
+    app.activate_soundcloud_selection();
+    finish_soundcloud_page(&mut app);
+    let urls = requests.0.lock().unwrap();
+    assert_eq!(urls.len(), 1);
+    let query = urls[0].query_pairs().collect::<HashMap<_, _>>();
+    assert_eq!(
+        query["offset"], "20",
+        "deduplicated row count must not replace provider offset"
+    );
+    assert_eq!(query["limit"], "10");
+}
+
+#[cfg(any(feature = "yandex-music", feature = "bbc-radio"))]
+#[test]
+fn soundcloud_intent_cancels_older_provider_resolution_before_metadata_returns() {
+    let mut app = controller();
+    install_playback_transport(&mut app);
+    let item = queue_item_from_soundcloud(&track("one"));
+    #[cfg(feature = "yandex-music")]
+    {
+        app.yandex_music_generation = 7;
+        app.pending_yandex_music_playback = Some(PendingYandexMusicPlayback {
+            generation: 7,
+            track_id: "old-track".into(),
+            item: item.clone(),
+            queue_cursor_already_positioned: false,
+            origin: None,
+        });
+    }
+    #[cfg(feature = "bbc-radio")]
+    {
+        let mut old_item = item.clone();
+        old_item.media.id = MediaId::new(SourceKind::Radio, "bbc_radio_three");
+        app.bbc_playback_generation = 9;
+        app.pending_bbc_playback = Some(PendingBbcPlayback {
+            generation: 9,
+            item: old_item,
+            queue_cursor_already_positioned: false,
+            origin: None,
+        });
+    }
+    app.play_queue_item_with_origin(item, false, None);
+    assert!(app.soundcloud_playback_pending());
+    #[cfg(feature = "yandex-music")]
+    {
+        assert!(app.pending_yandex_music_playback.is_none());
+        assert!(app.yandex_music_generation > 7);
+    }
+    #[cfg(feature = "bbc-radio")]
+    {
+        assert!(app.pending_bbc_playback.is_none());
+        assert!(app.bbc_playback_generation > 9);
+        let status = app.view.status_line.clone();
+        app.handle_bbc_live(
+            9,
+            "bbc_radio_three".into(),
+            Err("obsolete BBC resolution".into()),
+        );
+        assert_eq!(app.view.status_line, status);
+        assert!(app.soundcloud_playback_pending());
+        assert!(app.view.error_popup.is_none());
+    }
+}
+
 /// Records actual backend loads without starting mpv, fetching media, or emitting sound.
 struct RecordingPlayer(Arc<Mutex<Vec<PlaybackInput>>>);
+
+/// Supplies action-resolved public metadata without a real instance or media fetch.
+struct PlaybackMetadataTransport;
+
+impl crate::providers::soundcloak::SoundcloakTransport for PlaybackMetadataTransport {
+    fn fetch(&self, url: &url::Url, _: usize) -> Result<Vec<u8>, crate::providers::ProviderError> {
+        assert_eq!(url.path(), "/_/api/v2/resolve");
+        let canonical = url
+            .query_pairs()
+            .find(|(key, _)| key == "url")
+            .unwrap()
+            .1
+            .into_owned();
+        Ok(serde_json::to_vec(&serde_json::json!({
+            "id": 1, "kind": "track", "title": "Track one", "user": {"username": "Fixture Artist"},
+            "permalink_url": canonical, "duration": 120_000, "full_duration": 120_000,
+            "policy": "ALLOW", "streamable": true,
+            "media": {"transcodings": [{"snipped": false, "format": {"protocol": "hls", "mime_type": "audio/mpeg"}}]},
+        })).unwrap())
+    }
+}
+
+/// Installs the fixture on the currently configured instance, including replay after a change.
+fn install_playback_transport(app: &mut AppController) {
+    app.soundcloud.client = Some(
+        SoundcloakClient::with_transport(
+            app.config.providers.soundcloak_base_url.clone().unwrap(),
+            Arc::new(PlaybackMetadataTransport),
+        )
+        .unwrap(),
+    );
+}
+
+/// Waits for one bounded metadata response to reach the recording backend.
+fn finish_playback(
+    app: &mut AppController,
+    played: &Arc<Mutex<Vec<PlaybackInput>>>,
+    expected: usize,
+) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while played.lock().unwrap().len() < expected {
+        assert!(Instant::now() < deadline, "{}", app.view.status_line);
+        app.poll_soundcloud_playback();
+        thread::yield_now();
+    }
+}
 
 impl PlaybackBackend for RecordingPlayer {
     fn play(&mut self, input: &PlaybackInput) -> PlaybackResult<()> {
@@ -396,10 +832,12 @@ impl PlaybackBackend for RecordingPlayer {
 #[test]
 fn soundcloud_play_and_history_replay_bypass_ytdlp_and_keep_canonical_identity() {
     let mut controller = controller();
+    install_playback_transport(&mut controller);
     let played = Arc::new(Mutex::new(Vec::new()));
     controller.player = Some(Box::new(RecordingPlayer(Arc::clone(&played))));
     complete(&mut controller, 0, vec![track("one"), track("two")], None);
     controller.activate_selection();
+    finish_playback(&mut controller, &played, 1);
     assert_eq!(played.lock().unwrap().len(), 1);
     let item = controller.playback_queue.items.last().unwrap();
     assert_eq!(
@@ -422,7 +860,9 @@ fn soundcloud_play_and_history_replay_bypass_ytdlp_and_keep_canonical_identity()
     let replay = queue_item_from_history(&entry, &target).unwrap();
     controller.config.providers.soundcloak_base_url =
         Some(url::Url::parse("https://another.example/").unwrap());
+    install_playback_transport(&mut controller);
     controller.play_queue_item_with_origin(replay, false, None);
+    finish_playback(&mut controller, &played, 2);
     let played = played.lock().unwrap();
     assert_eq!(played.len(), 2);
     assert!(
@@ -431,41 +871,4 @@ fn soundcloud_play_and_history_replay_bypass_ytdlp_and_keep_canonical_identity()
             .starts_with("https://another.example/_/api/hls/fixture-artist/one?")
     );
     assert!(played[1].bypass_ytdl);
-}
-
-#[test]
-fn soundcloud_old_public_share_links_use_the_proxy_without_accepting_private_or_foreign_urls() {
-    let controller = controller();
-    for url in [
-        "https://www.soundcloud.com/fixture-artist/one/",
-        "http://soundcloud.com/fixture-artist/one?utm_source=clipboard#t=30",
-    ] {
-        let item = queue_item_from_direct(&DirectSourceInput {
-            source: SourceKind::SoundCloud,
-            url: url::Url::parse(url).unwrap(),
-        });
-        let input = controller.soundcloud_playback_input(&item).unwrap();
-        assert!(
-            input
-                .location
-                .starts_with("https://soundcloak.example/_/api/hls/fixture-artist/one?")
-        );
-        assert!(!input.location.contains("utm_source"));
-    }
-    for url in [
-        "https://soundcloud.com/fixture-artist/one?secret_token=s-private",
-        "https://soundcloud.com/fixture-artist/one/s-private",
-        "https://foreign.example/fixture-artist/one",
-        "https://user:password@soundcloud.com/fixture-artist/one",
-        "https://soundcloud.com/fixture-artist/sets",
-    ] {
-        let item = queue_item_from_direct(&DirectSourceInput {
-            source: SourceKind::SoundCloud,
-            url: url::Url::parse(url).unwrap(),
-        });
-        assert!(
-            controller.soundcloud_playback_input(&item).is_err(),
-            "{url}"
-        );
-    }
 }

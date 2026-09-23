@@ -53,8 +53,9 @@ use youta::view::{
     DownloadChoicePopupView, DownloadView, ErrorPopupView, GitHubIssueSubmissionView,
     LocalMoveDestinationView, NowPlayingView, PlaylistChoiceView, PlaylistPopupView,
     PreferencesPopupView, ProjectCommitView, ProjectHistoryPopupView, QueuePopupView, QueueRowView,
-    RowView, SubscriptionsView, VideoCommentView, VideoCommentsPopupView, VideoSummaryPopupView,
-    ViewModel, WaveformView, YtDlpForbiddenView, YtDlpGentooVersionView, YtDlpVersionLookupView,
+    RowView, SoundCloudDetailsView, SubscriptionsView, VideoCommentView, VideoCommentsPopupView,
+    VideoSummaryPopupView, ViewModel, WaveformView, YtDlpForbiddenView, YtDlpGentooVersionView,
+    YtDlpVersionLookupView,
 };
 use youta::view::{ChannelDownloadOption, ChannelDownloadPopupView};
 #[cfg(feature = "lan-sharing")]
@@ -443,6 +444,10 @@ fn the_typescript_contract_names_only_fields_the_reducer_emits() {
     }
     emitted.insert("DetailView", emitted_keys(&DetailView::default()));
     emitted.insert(
+        "SoundCloudDetailsView",
+        emitted_keys(&SoundCloudDetailsView::default()),
+    );
+    emitted.insert(
         "DetailHighlightRange",
         emitted_keys(&DetailHighlightRange {
             start_byte: 0,
@@ -768,10 +773,71 @@ fn soundcloud_tab_follows_youtube_music_and_exposes_search_to_the_window() {
     );
 }
 
-/// Comment labels must distinguish Archive.org reviews from YouTube comments.
+/// Public track facts retain their source semantics and lazy artwork URLs over IPC.
+#[test]
+fn soundcloud_details_preserve_known_zero_counts_genre_and_artwork_variants() {
+    let details = DetailView {
+        media_id: Some(MediaId::new(
+            SourceKind::SoundCloud,
+            "https://soundcloud.com/artist/track",
+        )),
+        source: "SoundCloud".to_owned(),
+        length: "0:30 preview (full track 3:00)".to_owned(),
+        likes: "0".to_owned(),
+        comments: "12".to_owned(),
+        license: "cc-by".to_owned(),
+        soundcloud: Some(SoundCloudDetailsView {
+            plays: Some(0),
+            reposts: None,
+            created: "2024 March 2".to_owned(),
+            modified: "2025 January 4".to_owned(),
+            tags: vec!["ambient".to_owned(), "field recording".to_owned()],
+            preview_duration_seconds: Some(30),
+        }),
+        thumbnail_url: Some(url::Url::parse("https://soundcloak.example/artwork-500").unwrap()),
+        expanded_thumbnail_url: Some(
+            url::Url::parse("https://soundcloak.example/artwork-1080").unwrap(),
+        ),
+        links: vec![DetailLinkView {
+            prefix: "Genre: ".to_owned(),
+            label: "Ambient & Field".to_owned(),
+            url: "https://soundcloak.example/tags/Ambient%20%26%20Field".to_owned(),
+            ..DetailLinkView::default()
+        }],
+        ..DetailView::default()
+    };
+    let emitted = serde_json::to_value(details).expect("serialized track details");
+    assert_eq!(emitted["media_id"]["source"], "sound-cloud");
+    assert_eq!(
+        emitted["soundcloud"],
+        serde_json::json!({
+            "plays": 0, "reposts": null, "created": "2024 March 2", "modified": "2025 January 4",
+            "tags": ["ambient", "field recording"], "preview_duration_seconds": 30,
+        })
+    );
+    assert_eq!(emitted["likes"], "0");
+    assert_eq!(emitted["comments"], "12");
+    assert_eq!(emitted["license"], "cc-by");
+    assert_eq!(
+        emitted["thumbnail_url"],
+        "https://soundcloak.example/artwork-500"
+    );
+    assert_eq!(
+        emitted["expanded_thumbnail_url"],
+        "https://soundcloak.example/artwork-1080"
+    );
+    assert_eq!(emitted["thumbnail_expanded"], false);
+    assert_eq!(emitted["links"][0]["prefix"], "Genre: ");
+    assert_eq!(
+        emitted["links"][0]["url"],
+        "https://soundcloak.example/tags/Ambient%20%26%20Field"
+    );
+}
+
+/// Comment labels distinguish Archive.org reviews, YouTube and SoundCloud comments.
 ///
 /// Identical Rust and TypeScript field names alone cannot prove their wire
-/// values agree, so exercise the discriminator for both supported providers.
+/// values agree, so exercise the discriminator for all supported providers.
 #[test]
 fn public_comments_preserve_the_provider_discriminator_for_gui_labels() {
     let declared = declared_interfaces(&contract_source());
@@ -779,6 +845,7 @@ fn public_comments_preserve_the_provider_discriminator_for_gui_labels() {
     for (source, wire_value) in [
         (SourceKind::YouTube, "you-tube"),
         (SourceKind::ArchiveOrg, "archive-org"),
+        (SourceKind::SoundCloud, "sound-cloud"),
     ] {
         let popup = VideoCommentsPopupView {
             source,
@@ -805,6 +872,7 @@ fn every_checked_interface_is_actually_declared() {
         "PlaybackStatus",
         "AsciiVisualizerView",
         "DetailView",
+        "SoundCloudDetailsView",
         "DetailHighlightRange",
         "DetailHighlightView",
         "DetailUrlEscapeView",

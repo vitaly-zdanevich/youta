@@ -9083,6 +9083,8 @@ impl AppController {
         queue_cursor_already_positioned: bool,
         origin: Option<AutoplayOrigin>,
     ) {
+        #[cfg(feature = "soundcloud")]
+        self.cancel_pending_soundcloud_playback();
         self.cancel_pending_yandex_music_playback();
         self.yandex_music_generation = self.yandex_music_generation.wrapping_add(1);
         let generation = self.yandex_music_generation;
@@ -11010,6 +11012,8 @@ impl AppController {
 
     /// Invalidates one popup owner so a late provider response cannot reopen it.
     fn invalidate_youtube_video_comments_popup(&mut self) {
+        #[cfg(feature = "soundcloud")]
+        self.cancel_pending_soundcloud_comments();
         self.youtube_video_comments_generation =
             self.youtube_video_comments_generation.wrapping_add(1);
         self.pending_youtube_video_comments = None;
@@ -11684,6 +11688,11 @@ impl AppController {
 
     /// Opens cached comments or starts one worker-owned selected-video request.
     fn open_youtube_video_comments(&mut self) {
+        #[cfg(feature = "soundcloud")]
+        if self.view.screen == Screen::SoundCloud {
+            self.open_soundcloud_comments();
+            return;
+        }
         #[cfg(feature = "archive-org")]
         if self.view.screen == Screen::ArchiveOrg
             && self
@@ -14227,6 +14236,8 @@ impl AppController {
                 external_id,
                 result,
             } => {
+                #[cfg(feature = "soundcloud")]
+                self.finish_soundcloud_wikidata(generation, &property_id);
                 #[cfg(feature = "yandex-music")]
                 if self
                     .pending_yandex_music_wikidata
@@ -25643,20 +25654,30 @@ impl AppController {
         origin: Option<AutoplayOrigin>,
         resolved_input: Option<PlaybackInput>,
     ) {
-        // All SoundCloud paths, including History and playlists, use the configured
-        // proxy. The canonical page remains the only persisted replay locator.
+        // A newer source intent supersedes outstanding resolution before any
+        // source-specific early return can leave an older worker in charge.
+        #[cfg(feature = "yandex-music")]
+        if item.media.id.source != SourceKind::YandexMusic {
+            self.cancel_pending_yandex_music_playback();
+        }
+        #[cfg(all(feature = "soundcloud", feature = "bbc-radio"))]
+        if item.media.id.source == SourceKind::SoundCloud
+            && self.pending_bbc_playback.take().is_some()
+        {
+            self.bbc_playback_generation = self.bbc_playback_generation.wrapping_add(1);
+            self.clear_playback_start_activity();
+        }
+        // Every SoundCloud entry path first resolves public metadata so a preview
+        // cannot silently inherit full-track resume or completion state.
         #[cfg(feature = "soundcloud")]
-        let resolved_input = if item.media.id.source == SourceKind::SoundCloud {
-            match self.soundcloud_playback_input(&item) {
-                Ok(input) => Some(input),
-                Err(error) => {
-                    self.view.status_line = format!("Soundcloak playback: {error}");
-                    return;
-                }
+        if item.media.id.source == SourceKind::SoundCloud {
+            if resolved_input.is_none() || !self.soundcloud_resolved_candidate(&item.media.id) {
+                self.request_soundcloud_playback(item, queue_cursor_already_positioned, origin);
+                return;
             }
         } else {
-            resolved_input
-        };
+            self.cancel_pending_soundcloud_playback();
+        }
         #[cfg(not(feature = "soundcloud"))]
         if item.media.id.source == SourceKind::SoundCloud {
             self.view.status_line = "This build omits the `soundcloud` feature".to_owned();
@@ -25669,10 +25690,6 @@ impl AppController {
             self.view.status_line =
                 "This build omits the `yandex-music` feature; rebuild with it enabled".to_owned();
             return;
-        }
-        #[cfg(feature = "yandex-music")]
-        if item.media.id.source != SourceKind::YandexMusic {
-            self.cancel_pending_yandex_music_playback();
         }
         #[cfg(feature = "yandex-music")]
         if resolved_input.is_none() && item.media.id.source == SourceKind::YandexMusic {
@@ -25756,7 +25773,11 @@ impl AppController {
             }
         }
         let chapters = item.media.chapters.clone();
-        let stored_progress = if live_stream {
+        #[cfg(feature = "soundcloud")]
+        let preview = self.soundcloud_preview_candidate(&media_id);
+        #[cfg(not(feature = "soundcloud"))]
+        let preview = false;
+        let stored_progress = if live_stream || preview {
             None
         } else {
             match self.store.progress(&media_id) {
@@ -25767,7 +25788,7 @@ impl AppController {
                 }
             }
         };
-        let start_at = if live_stream {
+        let start_at = if live_stream || preview {
             0
         } else if let Some(start_at) = item.start_at_seconds {
             start_at
@@ -25869,6 +25890,8 @@ impl AppController {
                         .begin_now(item.clone(), had_active_media);
                 }
                 self.current_media = Some(media_id.clone());
+                #[cfg(feature = "soundcloud")]
+                self.accept_soundcloud_playback(&media_id);
                 #[cfg(feature = "sponsorblock")]
                 self.request_sponsorblock_segments(&media_id, item.media.duration_seconds);
                 if live_stream {
@@ -25882,7 +25905,7 @@ impl AppController {
                     self.view.radio_now_playing = None;
                 }
                 let now = unix_time();
-                self.current_playback_progress = (!live_stream).then(|| {
+                self.current_playback_progress = (!live_stream && !preview).then(|| {
                     let mut current_progress = stored_progress.unwrap_or_else(|| {
                         PlaybackProgress::new(media_id.clone(), item.media.duration_seconds, now)
                     });
@@ -26427,12 +26450,37 @@ impl AppController {
                     self.persist_position();
                 }
                 let autoplay_origin = self.current_autoplay_origin.clone();
+                #[cfg(feature = "soundcloud")]
+                let ended_media = self.current_media.clone();
                 #[cfg(feature = "waveform")]
                 let local_waveform_follow_from = self.local_waveform_follow_intent_after_eof();
                 self.reset_playback_state();
                 #[cfg(feature = "waveform")]
                 {
                     self.local_waveform_follow_from = local_waveform_follow_from;
+                }
+                #[cfg(feature = "soundcloud")]
+                if self.soundcloud_playback_pending() {
+                    // An explicit pending SoundCloud request owns the next start,
+                    // even when the previous track ends during metadata lookup.
+                    if !self.soundcloud_playback_owns_queue_cursor()
+                        && self
+                            .playback_queue
+                            .current()
+                            .is_some_and(|item| Some(&item.media.id) == ended_media.as_ref())
+                    {
+                        self.playback_queue.current_index = self
+                            .playback_queue
+                            .current_index
+                            .and_then(|index| index.checked_add(1))
+                            .filter(|index| *index < self.playback_queue.items.len());
+                    }
+                    #[cfg(feature = "waveform")]
+                    {
+                        self.local_waveform_follow_from = None;
+                    }
+                    self.view.status_line = "Resolving SoundCloud playback…".to_owned();
+                    return;
                 }
                 #[cfg(feature = "archive-org")]
                 if self.view.archive_playback_choice_popup.is_some() {
@@ -26497,6 +26545,8 @@ impl AppController {
                 }
             }
             PlaybackEndReason::Stop => {
+                #[cfg(feature = "soundcloud")]
+                self.cancel_pending_soundcloud_playback();
                 self.queued_autoplay_resume_origin = None;
                 #[cfg(feature = "tracker-music")]
                 self.cancel_pending_tracker_autoplay();
@@ -26659,6 +26709,8 @@ impl AppController {
     }
 
     fn reset_playback_state(&mut self) {
+        #[cfg(feature = "soundcloud")]
+        self.reset_soundcloud_preview();
         #[cfg(all(feature = "archive-org", feature = "yt-dlp", feature = "backend-mpv"))]
         {
             self.archive_playback_cache = None;
@@ -26721,6 +26773,10 @@ impl AppController {
     /// checkpoints therefore do not scan a growing human-readable progress
     /// document.
     fn current_progress_at_player_position(&mut self) -> Option<PlaybackProgress> {
+        #[cfg(feature = "soundcloud")]
+        if self.current_soundcloud_preview() {
+            return None;
+        }
         #[cfg(any(feature = "local-rename", feature = "local-move"))]
         if !self.local_move_persistence_queue.is_empty() {
             return None;
@@ -26765,6 +26821,10 @@ impl AppController {
 
     /// Atomically replaces the small periodic playback recovery document.
     fn checkpoint_position(&mut self) -> bool {
+        #[cfg(feature = "soundcloud")]
+        if let Some(result) = self.checkpoint_soundcloud_preview() {
+            return result;
+        }
         if self
             .current_media
             .as_ref()
@@ -26876,6 +26936,10 @@ impl AppController {
             Screen::SoundCloud => {
                 self.soundcloud.query.clone_from(&self.view.search_query);
                 self.soundcloud.selected = self.view.selected;
+                #[cfg(feature = "soundcloud")]
+                {
+                    self.soundcloud.page_turn = None;
+                }
                 self.finish_search_activity(SearchActivity::SoundCloud);
             }
             Screen::YouTubeMusic => {
@@ -34625,6 +34689,8 @@ impl AppController {
     }
 
     fn shutdown(&mut self) -> bool {
+        #[cfg(feature = "soundcloud")]
+        self.cancel_pending_soundcloud_playback();
         if let Some(succeeded) = self.shutdown_persistence_succeeded {
             return succeeded;
         }
@@ -34759,6 +34825,11 @@ impl UiController for AppController {
         self.update_archive_org_search_page_capacity(rows);
     }
 
+    #[cfg(feature = "soundcloud")]
+    fn set_soundcloud_search_page_capacity(&mut self, rows: usize) {
+        self.update_soundcloud_search_page_capacity(rows);
+    }
+
     fn dispatch(&mut self, action: UiAction) {
         self.synchronize_preferences_action_focus(&action);
         if !self.view.external_opener_available
@@ -34777,6 +34848,8 @@ impl UiController for AppController {
                     self.view.status_line =
                         "Wait for the Local move to finish before quitting".to_owned();
                 } else {
+                    #[cfg(feature = "soundcloud")]
+                    self.cancel_pending_soundcloud_playback();
                     self.clear_playback_start_activity();
                     self.view.quitting = true;
                 }
@@ -36272,6 +36345,10 @@ impl UiController for AppController {
 
     fn tick(&mut self) {
         self.poll_soundcloud_worker();
+        #[cfg(feature = "soundcloud")]
+        self.poll_soundcloud_comments();
+        #[cfg(feature = "soundcloud")]
+        self.poll_soundcloud_playback();
         expire_transient_footer_notice(
             &mut self.view,
             &mut self.transient_footer_notice_deadline,
@@ -36379,6 +36456,8 @@ impl UiController for AppController {
         self.request_due_channel_details(now);
         #[cfg(feature = "wikidata")]
         self.request_due_channel_wikidata(now);
+        #[cfg(all(feature = "soundcloud", feature = "wikidata"))]
+        self.request_due_soundcloud_wikidata(now);
         #[cfg(all(feature = "wikidata", feature = "yandex-music"))]
         self.request_due_yandex_music_wikidata(now);
         #[cfg(feature = "yt-dlp")]
@@ -42122,7 +42201,7 @@ fn detail_has_expandable_artwork(details: &DetailView) -> bool {
 /// state owned by a QID that remains linked prevents those refreshes from
 /// collapsing an open spoiler, while a station change starts with clean
 /// interaction state.
-#[cfg(feature = "radio")]
+#[cfg(any(feature = "radio", all(feature = "soundcloud", feature = "wikidata")))]
 fn preserve_same_media_wikidata_state(previous: Option<&DetailView>, next: &mut DetailView) {
     let Some(previous) = previous.filter(|previous| {
         previous
@@ -45571,7 +45650,7 @@ fn format_rfc3339_local_date_relative(value: &str, today: NaiveDate) -> Option<S
 ///
 /// Both the date and clock use the same local instant, including across day
 /// boundaries. Compact episode rows keep their existing date-only subtitle.
-#[cfg(feature = "apple-podcasts")]
+#[cfg(any(feature = "apple-podcasts", feature = "soundcloud"))]
 fn format_rfc3339_local_datetime_relative(value: &str, today: NaiveDate) -> Option<String> {
     let published = DateTime::parse_from_rfc3339(value)
         .ok()?

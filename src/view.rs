@@ -813,6 +813,23 @@ pub enum InformationPanelKind {
     Generic,
 }
 
+/// SoundCloud-only facts, kept distinct from video views and publication dates.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct SoundCloudDetailsView {
+    /// Public play count, not a video view count.
+    pub plays: Option<u64>,
+    /// Public repost count.
+    pub reposts: Option<u64>,
+    /// Track creation date reported by SoundCloud.
+    pub created: String,
+    /// Last track modification date reported by SoundCloud.
+    pub modified: String,
+    /// Provider-parsed tags; quoted multi-word tags remain intact.
+    pub tags: Vec<String>,
+    /// Duration of an explicitly identified public preview, never a full-track claim.
+    pub preview_duration_seconds: Option<u64>,
+}
+
 /// Details for the selected media item.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct DetailView {
@@ -875,6 +892,8 @@ pub struct DetailView {
     pub published: String,
     /// Provider-reported license.
     pub license: String,
+    /// Additional source-specific facts for a SoundCloud track.
+    pub soundcloud: Option<SoundCloudDetailsView>,
     /// Whether the selected Radio station is stored in persistent favorites.
     pub radio_favorite: bool,
     /// Local playlists that currently contain this media item.
@@ -3229,6 +3248,9 @@ impl ViewModel {
                 SourceKind::ArchiveOrg => {
                     cfg!(feature = "archive-org") && self.screen == Screen::ArchiveOrg
                 }
+                SourceKind::SoundCloud => {
+                    cfg!(feature = "soundcloud") && self.screen == Screen::SoundCloud
+                }
                 _ => false,
             })
     }
@@ -4427,6 +4449,10 @@ pub trait UiController {
     /// Reports visible Archive result slots, excluding the continuation/footer rows.
     /// Frontends without terminal geometry may retain the controller's default.
     fn set_archive_org_search_page_capacity(&mut self, _rows: usize) {}
+
+    /// Reports visible SoundCloud track slots, excluding its continuation row.
+    /// Frontends without terminal geometry may retain the controller's default.
+    fn set_soundcloud_search_page_capacity(&mut self, _rows: usize) {}
 
     /// Applies one semantic user action.
     fn dispatch(&mut self, action: UiAction);

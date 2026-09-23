@@ -10,6 +10,9 @@
 	// The production component must still request the same cached native URL.
 	const waveformUrl = 'https://archive.org/download/fixture/waveform.png';
 	const nativeWaveformUrl = `youta://artwork/${encodeURIComponent(waveformUrl)}`;
+	const soundcloudArtwork = ['https://soundcloak.example/artwork-500', 'https://soundcloak.example/artwork-1080'];
+	const nativeSoundcloudArtwork = soundcloudArtwork.map((url) => `youta://artwork/${encodeURIComponent(url)}`);
+	const requestedSoundcloudArtwork = new Set();
 	const waveformImage = 'data:image/svg+xml,' + encodeURIComponent(
 		'<svg xmlns="http://www.w3.org/2000/svg" width="800" height="200"><path d="M0 100H100L150 10L200 190L250 50L300 150L350 100H800" stroke="white" fill="none"/></svg>',
 	);
@@ -18,7 +21,8 @@
 	Object.defineProperty(HTMLImageElement.prototype, 'src', {
 		...imageSource,
 		set(value) {
-			if (value === nativeWaveformUrl) {
+			if (value === nativeWaveformUrl || nativeSoundcloudArtwork.includes(value)) {
+				if (nativeSoundcloudArtwork.includes(value)) requestedSoundcloudArtwork.add(value);
 				setAttribute.call(this, 'data-native-artwork', value);
 				imageSource.set.call(this, waveformImage);
 			} else {
@@ -27,7 +31,8 @@
 		},
 	});
 	Element.prototype.setAttribute = function(name, value) {
-		if (this instanceof HTMLImageElement && name === 'src' && value === nativeWaveformUrl) {
+		if (this instanceof HTMLImageElement && name === 'src' && (value === nativeWaveformUrl || nativeSoundcloudArtwork.includes(value))) {
+			if (nativeSoundcloudArtwork.includes(value)) requestedSoundcloudArtwork.add(value);
 			setAttribute.call(this, 'data-native-artwork', value);
 			return setAttribute.call(this, name, waveformImage);
 		}
@@ -312,6 +317,26 @@
 		const item = await until(() => button(track.title, document.querySelector('[aria-label=Results]')), 'SoundCloud result');
 		await action({ SelectRow: 0 }, () => item.click(), 'SoundCloud result selects through the shared reducer');
 		await action('ActivateSelection', () => item.dispatchEvent(new MouseEvent('dblclick', { bubbles: true })), 'SoundCloud result requests playback through the shared reducer');
+		const trackDetails = { ...details(track.title, track.media_id), source: 'SoundCloud', length: '0:30 preview (full track 3:00)',
+			likes: '1,234', comments: '12', license: 'cc-by', thumbnail_url: soundcloudArtwork[0], expanded_thumbnail_url: soundcloudArtwork[1],
+			soundcloud: { plays: 5678, reposts: 90, created: '2024 March 2', modified: '2025 January 4',
+				tags: ['ambient', 'field recording'], preview_duration_seconds: 30 },
+			links: [{ prefix: 'Genre: ', label: 'Ambient & Field', url: 'https://soundcloak.example/tags/Ambient%20%26%20Field',
+				presentation: 'LabelOnly', description_range: null, internal_target: null, wikidata_item_id: null, youtube_channel_id: null, media: null }] };
+		snapshot({ details: trackDetails });
+		const panel = await until(() => document.querySelector('[aria-label=Details]')?.textContent.includes('Reposts') && document.querySelector('[aria-label=Details]'), 'SoundCloud source-specific metadata');
+		for (const label of ['Plays', '5.7K', 'Likes', '1,234', 'Reposts', '90', 'Created', '2024 March 2', 'Modified', '2025 January 4', 'cc-by', 'field recording', '0:30 preview']) {
+			assert(panel.textContent.includes(label), `SoundCloud Details renders ${label}`);
+		}
+		assert(!panel.textContent.includes('Views') && !panel.textContent.includes('Published'), 'SoundCloud facts do not mislabel plays or creation');
+		await action({ ActivateDetailLink: 0 }, () => button('Ambient & Field', panel).click(), 'SoundCloud genre remains an explicit clickable source link');
+		await action('OpenVideoComments', () => button('Comments', panel).click(), 'SoundCloud comments load only through the explicit shared action');
+		await until(() => panel.querySelector('img[data-native-artwork]'), 'SoundCloud Details preview artwork');
+		assert(requestedSoundcloudArtwork.has(nativeSoundcloudArtwork[0]) && !requestedSoundcloudArtwork.has(nativeSoundcloudArtwork[1]), 'SoundCloud Details requests 500px artwork without fetching 1080px');
+		await action('ToggleThumbnailExpansion', () => panel.querySelector('img').click(), 'SoundCloud image expansion is explicit');
+		snapshot({ details: { ...trackDetails, thumbnail_expanded: true } });
+		await until(() => requestedSoundcloudArtwork.has(nativeSoundcloudArtwork[1]), 'SoundCloud expanded artwork request');
+		snapshot({ details: trackDetails });
 		snapshot(previous);
 		await until(() => document.querySelector('[title="Search archive.org"]'), 'restored Archive fixture');
 	}

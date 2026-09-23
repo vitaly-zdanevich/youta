@@ -2,20 +2,47 @@
 
 use super::*;
 
+#[cfg(all(feature = "soundcloud", feature = "wikidata"))]
+mod wikidata;
+
+#[cfg(feature = "soundcloud")]
+mod playback;
+
+#[cfg(feature = "soundcloud")]
+mod comments;
+
 #[cfg(feature = "soundcloud")]
 use crate::providers::soundcloak::{
-    SoundcloakClient, SoundcloakSearchPage, SoundcloakSearchRequest, SoundcloakTrack,
+    SoundcloakClient, SoundcloakPlayback, SoundcloakSearchPage, SoundcloakSearchRequest,
+    SoundcloakTrack,
 };
 
 /// Queries and selections remain independent even in builds without this provider.
 #[derive(Default)]
 pub(super) struct SoundCloudState {
+    #[cfg(feature = "soundcloud")]
+    playback: playback::SoundCloudPlaybackState,
+    #[cfg(feature = "soundcloud")]
+    comments: comments::SoundCloudCommentsState,
     pub(super) query: String,
     pub(super) selected: usize,
+    #[cfg(all(feature = "soundcloud", feature = "wikidata"))]
+    scheduled_wikidata: Option<wikidata::ScheduledSoundCloudWikidata>,
+    #[cfg(all(feature = "soundcloud", feature = "wikidata"))]
+    pending_wikidata: Option<u64>,
     #[cfg(feature = "soundcloud")]
     items: Vec<SoundcloakTrack>,
     #[cfg(feature = "soundcloud")]
     submitted_query: String,
+    /// Latest frontend result capacity, used only for a new query.
+    #[cfg(feature = "soundcloud")]
+    search_page_capacity: Option<usize>,
+    /// Fixed offset stride for the current result set, unaffected by resizing.
+    #[cfg(feature = "soundcloud")]
+    page_limit: Option<usize>,
+    /// Explicit continuation owner; changed selections and tabs cancel the turn.
+    #[cfg(feature = "soundcloud")]
+    pub(super) page_turn: Option<(u64, usize)>,
     #[cfg(feature = "soundcloud")]
     next_page: Option<u32>,
     #[cfg(feature = "soundcloud")]
@@ -58,6 +85,12 @@ struct SearchWorker {
 }
 
 impl AppController {
+    /// Reports future search capacity without fetching or changing existing offsets.
+    #[cfg(feature = "soundcloud")]
+    pub(super) fn update_soundcloud_search_page_capacity(&mut self, rows: usize) {
+        self.soundcloud.search_page_capacity = Some(rows.clamp(1, 100));
+    }
+
     /// Configures metadata and playback with the same user-selected instance.
     #[cfg(feature = "soundcloud")]
     fn soundcloak_client(&self) -> Result<SoundcloakClient, String> {
@@ -78,6 +111,8 @@ impl AppController {
             self.soundcloud.generation = self.soundcloud.generation.wrapping_add(1);
             self.soundcloud.query.clone_from(&query);
             self.soundcloud.submitted_query.clone_from(&query);
+            self.soundcloud.page_limit = Some(self.soundcloud.search_page_capacity.unwrap_or(50));
+            self.soundcloud.page_turn = None;
             self.soundcloud.selected = 0;
             self.soundcloud.items.clear();
             self.soundcloud.next_page = None;
@@ -103,7 +138,7 @@ impl AppController {
             request: SoundcloakSearchRequest {
                 query: self.soundcloud.submitted_query.clone(),
                 page,
-                limit: 50,
+                limit: self.soundcloud.page_limit.unwrap_or(50),
                 query_urn: self.soundcloud.query_urn.clone(),
             },
         });
@@ -199,12 +234,25 @@ impl AppController {
                     .then_some(page.next_page)
                     .flatten();
                 self.soundcloud.query_urn = page.query_urn;
+                if let Some((generation, boundary)) = self.soundcloud.page_turn.take()
+                    && generation == job.generation
+                    && self.view.screen == Screen::SoundCloud
+                    && self.soundcloud.selected == boundary
+                    && self.soundcloud.items.len() > previous_len
+                {
+                    self.soundcloud.selected = if self.soundcloud.next_page.is_some() {
+                        self.soundcloud.items.len()
+                    } else {
+                        self.soundcloud.items.len().saturating_sub(1)
+                    };
+                }
                 if self.view.screen == Screen::SoundCloud {
                     self.populate_soundcloud();
                     self.refresh_selected_playlist_state();
                 }
             }
             Err(error) => {
+                self.soundcloud.page_turn = None;
                 if self.view.screen == Screen::SoundCloud {
                     self.view.status_line = format!(
                         "Soundcloak: {error}; instance: {} (providers.soundcloak_base_url)",
@@ -233,6 +281,8 @@ impl AppController {
                     && self.soundcloud.pending.is_none()
                     && self.soundcloud.worker.is_none()
                 {
+                    self.soundcloud.page_turn =
+                        Some((self.soundcloud.generation, self.view.selected));
                     self.queue_soundcloud_page(page);
                 }
                 return;
@@ -283,10 +333,16 @@ impl AppController {
                 RowView {
                     media_id: Some(id),
                     title: track.title.clone(),
-                    subtitle: if track.streamable {
-                        track.artist.clone()
-                    } else {
-                        format!("{} · unavailable for full playback", track.artist)
+                    subtitle: match track.playback {
+                        SoundcloakPlayback::Full if track.streamable => track.artist.clone(),
+                        SoundcloakPlayback::Preview if track.streamable => format!(
+                            "{} · {} public preview",
+                            track.artist,
+                            track
+                                .duration_seconds
+                                .map_or_else(String::new, format_seconds),
+                        ),
+                        _ => format!("{} · playback unavailable", track.artist),
                     },
                     source: "SoundCloud".to_owned(),
                     thumbnail_url: track.artwork_url.clone(),
@@ -315,6 +371,8 @@ impl AppController {
         self.soundcloud.selected = self.view.selected;
         #[cfg(feature = "soundcloud")]
         {
+            #[cfg(feature = "wikidata")]
+            let previous = self.view.details.take();
             self.view.details = self.soundcloud.items.get(self.view.selected).map(|track| {
                 let mut links = vec![DetailLinkView {
                     label: "SoundCloud original".to_owned(),
@@ -332,21 +390,65 @@ impl AppController {
                         ..DetailLinkView::default()
                     });
                 }
+                if let Some(genre) = track.genre.as_ref()
+                    && let Ok(url) = self.soundcloak_client().and_then(|client| {
+                        client.genre_url(genre).map_err(|error| error.to_string())
+                    })
+                {
+                    links.push(DetailLinkView {
+                        prefix: "Genre: ".to_owned(),
+                        label: genre.clone(),
+                        url: url.to_string(),
+                        ..DetailLinkView::default()
+                    });
+                }
+                let preview = track.playback == SoundcloakPlayback::Preview;
                 DetailView {
                     media_id: Some(soundcloud_media_id(track)),
                     title: track.title.clone(),
                     channel_name: track.artist.clone(),
                     source: "SoundCloud".to_owned(),
-                    length: track
-                        .duration_seconds
-                        .map_or_else(String::new, format_seconds),
+                    length: soundcloud_duration_label(track),
+                    likes: track.likes_count.map_or_else(String::new, format_count),
+                    comments: track.comment_count.map_or_else(String::new, format_count),
+                    license: track.license.clone().unwrap_or_default(),
+                    soundcloud: Some(crate::view::SoundCloudDetailsView {
+                        plays: track.playback_count,
+                        reposts: track.reposts_count,
+                        created: soundcloud_date(track.created_at.as_deref()),
+                        modified: soundcloud_date(track.last_modified.as_deref()),
+                        tags: track.tags.clone(),
+                        preview_duration_seconds: preview
+                            .then_some(track.duration_seconds)
+                            .flatten(),
+                    }),
                     description: track.description.clone().unwrap_or_default(),
                     webpage_url: Some(track.webpage_url.clone()),
                     thumbnail_url: track.artwork_url.clone(),
+                    expanded_thumbnail_url: track.expanded_artwork_url.clone(),
                     links,
                     ..DetailView::default()
                 }
             });
+            #[cfg(feature = "wikidata")]
+            {
+                if let Some(details) = self.view.details.as_mut() {
+                    if let Some(previous) = previous.as_ref().filter(|previous| {
+                        previous.media_id.is_some() && previous.media_id == details.media_id
+                    }) {
+                        details.wikidata.clone_from(&previous.wikidata);
+                        details.links.extend(
+                            previous
+                                .links
+                                .iter()
+                                .filter(|link| link.wikidata_item_id.is_some())
+                                .cloned(),
+                        );
+                    }
+                    preserve_same_media_wikidata_state(previous.as_ref(), details);
+                }
+                self.schedule_selected_soundcloud_wikidata(Instant::now());
+            }
         }
         #[cfg(not(feature = "soundcloud"))]
         {
@@ -363,7 +465,9 @@ impl AppController {
                 .get(self.view.selected)
                 .filter(|track| track.streamable)
                 .map(queue_item_from_soundcloud)
-                .ok_or_else(|| "Select a SoundCloud track available for full playback".to_owned())
+                .ok_or_else(|| {
+                    "Select a SoundCloud track with full playback or a public preview".to_owned()
+                })
         }
         #[cfg(not(feature = "soundcloud"))]
         {
@@ -387,46 +491,29 @@ impl AppController {
             index,
         })
     }
+}
 
-    /// Resolves canonical replay locations locally; mpv retrieves proxied HLS off-thread.
-    #[cfg(feature = "soundcloud")]
-    pub(super) fn soundcloud_playback_input(
-        &self,
-        item: &QueueItem,
-    ) -> Result<PlaybackInput, String> {
-        let mut canonical = item.media.webpage_url.clone();
-        // Old direct links may use www/http or carry sharing parameters. Normalize
-        // public track pages only; the provider still rejects accounts, sets,
-        // private tokens, encoded separators, credentials, and foreign origins.
-        if matches!(canonical.scheme(), "http" | "https")
-            && matches!(
-                canonical.host_str(),
-                Some("soundcloud.com" | "www.soundcloud.com")
-            )
-            && canonical.port().is_none()
-            && !canonical
-                .query_pairs()
-                .any(|(key, _)| key == "secret_token")
-        {
-            canonical
-                .set_scheme("https")
-                .map_err(|()| "Invalid SoundCloud scheme".to_owned())?;
-            canonical
-                .set_host(Some("soundcloud.com"))
-                .map_err(|error| error.to_string())?;
-            canonical.set_query(None);
-            canonical.set_fragment(None);
-            let path = canonical.path().trim_end_matches('/').to_owned();
-            canonical.set_path(&path);
-        }
-        let stream = self
-            .soundcloak_client()?
-            .stream_url(&canonical)
-            .map_err(|error| error.to_string())?;
-        let mut input = PlaybackInput::new(stream.to_string());
-        input.bypass_ytdl = true;
-        Ok(input)
+/// Formats provider dates with the same local-calendar convention as other sources.
+#[cfg(feature = "soundcloud")]
+fn soundcloud_date(value: Option<&str>) -> String {
+    value
+        .and_then(|value| format_rfc3339_local_datetime_relative(value, Local::now().date_naive()))
+        .unwrap_or_default()
+}
+
+/// Labels the playable preview duration separately from the full work's duration.
+#[cfg(feature = "soundcloud")]
+fn soundcloud_duration_label(track: &SoundcloakTrack) -> String {
+    let duration = track
+        .duration_seconds
+        .map_or_else(String::new, format_seconds);
+    if track.playback != SoundcloakPlayback::Preview {
+        return duration;
     }
+    track.full_duration_seconds.map_or_else(
+        || format!("{duration} preview"),
+        |full| format!("{duration} preview (full track {})", format_seconds(full)),
+    )
 }
 
 /// Uses the existing direct-URL identity convention for History and playlists.

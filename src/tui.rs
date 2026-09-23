@@ -1053,7 +1053,7 @@ pub fn run(controller: &mut impl UiController, settings: &UiSettings) -> io::Res
                 normalize_physical_linux_console_frame(frame, controller.view());
             })?;
         }
-        synchronize_archive_org_search_page_capacity(controller, fullscreen_artwork_area);
+        synchronize_search_page_capacities(controller, fullscreen_artwork_area);
         if let Some(renderer) = renderer.as_deref_mut() {
             synchronize_thumbnail_prefetch(controller.view(), settings, renderer);
             synchronize_selected_artwork_prefetch(
@@ -1117,10 +1117,7 @@ pub fn run(controller: &mut impl UiController, settings: &UiSettings) -> io::Res
                     }
                 }
                 Event::Resize(columns, rows) => {
-                    synchronize_archive_org_search_page_capacity(
-                        controller,
-                        Rect::new(0, 0, columns, rows),
-                    );
+                    synchronize_search_page_capacities(controller, Rect::new(0, 0, columns, rows));
                     let (width, height) = current_terminal_window_pixels();
                     controller.dispatch(UiAction::SetTerminalWindowPixels { width, height });
                 }
@@ -1159,17 +1156,29 @@ pub fn run(controller: &mut impl UiController, settings: &UiSettings) -> io::Res
 /// one additional result row is reserved for explicit continuation. Tiny terminals
 /// still request one item, and the controller applies the provider's safety ceiling.
 fn archive_org_search_page_capacity(area: Rect, view: &ViewModel) -> usize {
+    source_search_page_capacity(area, view, Screen::ArchiveOrg)
+}
+
+/// Measures SoundCloud's compact rows without reserving Archive's catalogue footer.
+fn soundcloud_search_page_capacity(area: Rect, view: &ViewModel) -> usize {
+    source_search_page_capacity(area, view, Screen::SoundCloud)
+}
+
+/// Shares the renderer's exact source geometry and reserves one continuation row.
+fn source_search_page_capacity(area: Rect, view: &ViewModel, screen: Screen) -> usize {
     let body = main_frame_sections(area, view)[1];
     let pane = main_body_panes(body)[0];
-    let (list, _) = main_list_pane_areas(pane, Screen::ArchiveOrg);
+    let (list, _) = main_list_pane_areas(pane, screen);
     let rows = main_panel_content_area(list, true);
     usize::from(rows.height.saturating_sub(1)).max(1)
 }
 
-/// Publishes the available result slots before a terminal action can start an Archive search.
-fn synchronize_archive_org_search_page_capacity(controller: &mut impl UiController, area: Rect) {
+/// Publishes available result slots before an initial tick or search action can fetch a page.
+fn synchronize_search_page_capacities(controller: &mut impl UiController, area: Rect) {
     let capacity = archive_org_search_page_capacity(area, controller.view());
     controller.set_archive_org_search_page_capacity(capacity);
+    let capacity = soundcloud_search_page_capacity(area, controller.view());
+    controller.set_soundcloud_search_page_capacity(capacity);
 }
 
 /// Applies the controller's live physical-TTY artwork preference.
@@ -1510,6 +1519,10 @@ fn synchronize_thumbnail_prefetch(
             !is_apple_podcast_artwork(details)
                 && !is_youtube_video_artwork(details)
                 && !is_archive_waveform_artwork(details)
+                && details
+                    .media_id
+                    .as_ref()
+                    .is_none_or(|id| id.source != SourceKind::SoundCloud)
         })
         .and_then(|details| details.expanded_thumbnail_url.as_ref())
     {
@@ -4720,6 +4733,10 @@ fn render_information_panel(
         .media_id
         .as_ref()
         .is_some_and(|media_id| media_id.source == SourceKind::ArchiveOrg);
+    let soundcloud_details = details
+        .media_id
+        .as_ref()
+        .is_some_and(|media_id| media_id.source == SourceKind::SoundCloud);
     let title_already_visible = if view.screen == Screen::Subscriptions {
         view.subscriptions.source_title == details.title
     } else {
@@ -5400,6 +5417,28 @@ fn render_information_panel(
             }
         }
         InformationPanelKind::Generic => {
+            if soundcloud_details && let Some(track) = details.soundcloud.as_ref() {
+                for (label, value) in [
+                    ("Length", details.length.clone()),
+                    ("Plays", track.plays.map_or_else(String::new, format_count)),
+                    ("Likes", details.likes.clone()),
+                    (
+                        "Reposts",
+                        track.reposts.map_or_else(String::new, format_count),
+                    ),
+                    ("Comments", details.comments.clone()),
+                    ("Created", track.created.clone()),
+                    ("Modified", track.modified.clone()),
+                    ("Tags", track.tags.join(", ")),
+                ] {
+                    if !value.is_empty() {
+                        lines.push(Line::from(vec![
+                            Span::styled(format!("{label}: "), theme.muted),
+                            Span::raw(value),
+                        ]));
+                    }
+                }
+            }
             if archive_org_details {
                 for (name, value, field) in [
                     (
@@ -5460,6 +5499,7 @@ fn render_information_panel(
     if is_creative_commons_license(&details.license)
         || is_librivox_public_domain_license(&details.source, &details.license)
         || (archive_org_details && is_specified_archive_license(&details.license))
+        || (soundcloud_details && !details.license.is_empty())
     {
         let label = display_license_label(&details.license);
         let mut spans = vec![Span::styled("License: ", theme.muted)];
@@ -9125,10 +9165,10 @@ fn render_video_comments_popup(
 ) {
     let area = centered_rect(84, 82, frame.area());
     frame.render_widget(Clear, area);
-    let title = if popup.source == SourceKind::ArchiveOrg {
-        " archive.org comments "
-    } else {
-        " YouTube comments "
+    let title = match popup.source {
+        SourceKind::ArchiveOrg => " archive.org comments ",
+        SourceKind::SoundCloud => " SoundCloud comments ",
+        _ => " YouTube comments ",
     };
     frame.render_widget(panel_block(title, theme), area);
 
@@ -9167,7 +9207,12 @@ fn render_video_comments_popup(
     let mut content = Vec::new();
     match &popup.state {
         VideoCommentsPopupState::Loading => {
-            content.push(Line::styled("Loading top comments…", theme.muted));
+            let message = if popup.source == SourceKind::SoundCloud {
+                "Loading recent comments…"
+            } else {
+                "Loading top comments…"
+            };
+            content.push(Line::styled(message, theme.muted));
         }
         VideoCommentsPopupState::Empty => {
             content.push(Line::styled("No public comments.", theme.muted));
@@ -19172,6 +19217,165 @@ for encoded, expected in json.load(sys.stdin):
         }
     }
 
+    /// SoundCloud has no catalogue footer; every remaining compact row belongs to its page.
+    #[test]
+    fn soundcloud_page_capacity_and_continuations_fill_the_actual_results_pane() {
+        for (width, height) in [(120, 24), (120, 80), (60, 24), (60, 80), (12, 5)] {
+            let mut view = ViewModel {
+                screen: Screen::SoundCloud,
+                ..ViewModel::default()
+            };
+            let capacity = soundcloud_search_page_capacity(Rect::new(0, 0, width, height), &view);
+            for page in 1..=3 {
+                view.rows = (0..capacity * page)
+                    .map(|index| RowView {
+                        title: format!("SoundCloud track {index}"),
+                        compact: true,
+                        ..RowView::default()
+                    })
+                    .chain(std::iter::once(RowView {
+                        title: "Load more tracks…".into(),
+                        compact: true,
+                        ..RowView::default()
+                    }))
+                    .collect();
+                view.selected = if page == 1 { 0 } else { view.rows.len() - 1 };
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                let mut hit_map = HitMap::default();
+                terminal
+                    .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+                    .unwrap();
+                assert_eq!(
+                    capacity,
+                    usize::from(hit_map.rows.height.saturating_sub(1)).max(1)
+                );
+                if hit_map.rows.height >= 2 {
+                    assert_eq!(hit_map.rows_first_index, capacity * (page - 1));
+                    if width >= 60 {
+                        let last = (hit_map.rows.left()..hit_map.rows.right())
+                            .map(|x| {
+                                terminal.backend().buffer()[(x, hit_map.rows.bottom() - 1)].symbol()
+                            })
+                            .collect::<String>();
+                        assert!(last.contains("Load more tracks…"));
+                    }
+                }
+            }
+        }
+        let view = ViewModel::default();
+        let area = Rect::new(0, 0, 120, 24);
+        assert!(
+            soundcloud_search_page_capacity(area, &view)
+                > archive_org_search_page_capacity(area, &view)
+        );
+    }
+
+    /// Selection uses only the 500px source; 1080px belongs to explicit expansion.
+    #[test]
+    fn soundcloud_details_show_source_facts_and_keep_large_artwork_lazy() {
+        let preview = url::Url::parse("https://soundcloak.example/artwork-500").unwrap();
+        let expanded = url::Url::parse("https://soundcloak.example/artwork-1080").unwrap();
+        let mut view = ViewModel {
+            screen: Screen::SoundCloud,
+            external_opener_available: true,
+            details: Some(DetailView {
+                media_id: Some(MediaId::new(
+                    SourceKind::SoundCloud,
+                    "https://soundcloud.com/artist/track",
+                )),
+                title: "SoundCloud fixture".into(),
+                source: "SoundCloud".into(),
+                length: "0:30 preview (full track 3:00)".into(),
+                likes: "1,234".into(),
+                comments: "12".into(),
+                license: "all-rights-reserved".into(),
+                soundcloud: Some(crate::view::SoundCloudDetailsView {
+                    plays: Some(5678),
+                    reposts: Some(90),
+                    created: "2024 March 2".into(),
+                    modified: "2025 January 4".into(),
+                    tags: vec!["ambient".into(), "field recording".into()],
+                    preview_duration_seconds: Some(30),
+                }),
+                thumbnail_url: Some(preview.clone()),
+                expanded_thumbnail_url: Some(expanded.clone()),
+                links: vec![DetailLinkView {
+                    prefix: "Genre: ".into(),
+                    label: "Ambient & Field".into(),
+                    url: "https://soundcloak.example/tags/Ambient%20%26%20Field".into(),
+                    ..DetailLinkView::default()
+                }],
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut renderer = MockThumbnailRenderer {
+            enabled: true,
+            rendered_artwork: true,
+            ..MockThumbnailRenderer::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(160, 60)).unwrap();
+        let mut hit_map = HitMap::default();
+        synchronize_thumbnail_prefetch(&view, &UiSettings::default(), &mut renderer);
+        synchronize_selected_artwork_prefetch(&view, Rect::new(0, 0, 160, 60), None, &mut renderer);
+        terminal
+            .draw(|frame| {
+                render_frame(
+                    frame,
+                    &view,
+                    &UiSettings::default(),
+                    &mut hit_map,
+                    Some(&mut renderer),
+                )
+            })
+            .unwrap();
+        let rendered = rendered_text(&terminal);
+        for text in [
+            "Plays: 5,678",
+            "Likes: 1,234",
+            "Reposts: 90",
+            "Created: 2024 March 2",
+            "Modified: 2025 January 4",
+            "Tags: ambient, field recording",
+            "License: all-rights-reserved",
+            "0:30 preview",
+            "Genre: Ambient & Field",
+        ] {
+            assert!(rendered.contains(text), "missing {text}");
+        }
+        assert!(!rendered.contains("Views:"));
+        assert!(!rendered.contains("Published:"));
+        assert!(renderer.prefetch_batches.iter().all(Vec::is_empty));
+        assert!(
+            renderer
+                .expansion_prefetches
+                .iter()
+                .all(|(source, _)| source.is_none())
+        );
+        assert!(
+            renderer
+                .synchronized
+                .iter()
+                .all(|(source, _)| source.as_ref() == Some(&preview))
+        );
+        view.details.as_mut().unwrap().thumbnail_expanded = true;
+        terminal
+            .draw(|frame| {
+                render_frame(
+                    frame,
+                    &view,
+                    &UiSettings::default(),
+                    &mut hit_map,
+                    Some(&mut renderer),
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            renderer.synchronized.last().unwrap().0.as_ref(),
+            Some(&expanded)
+        );
+    }
+
     /// Terminal geometry reaches the controller before an initial tick or submitted search.
     #[test]
     fn archive_search_capacity_is_published_before_actions_and_after_resize() {
@@ -19196,9 +19400,9 @@ for encoded, expected in json.load(sys.stdin):
             }
         }
         let mut controller = CapacityController::default();
-        synchronize_archive_org_search_page_capacity(&mut controller, Rect::new(0, 0, 120, 24));
+        synchronize_search_page_capacities(&mut controller, Rect::new(0, 0, 120, 24));
         controller.tick();
-        synchronize_archive_org_search_page_capacity(&mut controller, Rect::new(0, 0, 120, 80));
+        synchronize_search_page_capacities(&mut controller, Rect::new(0, 0, 120, 80));
         controller.dispatch(UiAction::SubmitSearch);
         assert_eq!(controller.observed, [17, 73]);
     }
@@ -28617,6 +28821,27 @@ for encoded, expected in json.load(sys.stdin):
             key_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &view),
             Some(UiAction::SubmitSearch)
         );
+    }
+
+    #[test]
+    fn soundcloud_comments_loading_does_not_claim_a_top_ranked_order() {
+        let view = ViewModel {
+            video_comments_popup: Some(VideoCommentsPopupView {
+                source: SourceKind::SoundCloud,
+                video_title: "Public track".to_owned(),
+                state: VideoCommentsPopupState::Loading,
+                ..VideoCommentsPopupView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut HitMap::default()))
+            .unwrap();
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("SoundCloud comments"));
+        assert!(rendered.contains("Loading recent comments…"));
+        assert!(!rendered.contains("Loading top comments…"));
     }
 
     #[test]

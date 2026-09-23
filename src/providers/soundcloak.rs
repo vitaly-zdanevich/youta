@@ -18,6 +18,13 @@ const MAX_QUERY_URN_BYTES: usize = 512;
 const MAX_URL_BYTES: usize = 4_096;
 const MAX_LABEL_BYTES: usize = 1_024;
 const MAX_DESCRIPTION_BYTES: usize = 64 * 1_024;
+const MAX_TAG_LIST_BYTES: usize = 8_192;
+const MAX_TAG_BYTES: usize = 256;
+const MAX_TAGS: usize = 64;
+const MAX_COMMENTS: usize = 20;
+const MAX_COMMENT_BYTES: usize = 16_384;
+const MAX_DURATION_MILLIS: u64 = 7 * 24 * 60 * 60 * 1_000;
+const MAX_PREVIEW_MILLIS: u64 = 60_000;
 const MAX_SEARCH_PAGE: u32 = 1_000;
 
 /// Public default; users may explicitly configure another trusted instance.
@@ -58,6 +65,18 @@ impl SoundcloakSearchRequest {
     }
 }
 
+/// Public playback access advertised by metadata, without attempting to unlock restrictions.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum SoundcloakPlayback {
+    /// An explicitly allowed, unencrypted full-length HLS rendition exists.
+    Full,
+    /// Only an explicitly advertised, bounded public progressive preview is playable.
+    Preview,
+    /// No supported public rendition is available; no playback endpoint should be used.
+    #[default]
+    Unavailable,
+}
+
 /// Canonical `SoundCloud` metadata; no signed or third-party playback locator is retained.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SoundcloakTrack {
@@ -71,12 +90,61 @@ pub struct SoundcloakTrack {
     pub webpage_url: Url,
     /// Artwork routed through the configured instance, when valid CDN artwork exists.
     pub artwork_url: Option<Url>,
-    /// Full track duration in whole seconds, when reported.
+    /// Larger artwork locator for explicit expansion only; constructing it does not fetch it.
+    #[serde(default)]
+    pub expanded_artwork_url: Option<Url>,
+    /// Playable duration in whole seconds; previews never inherit the full track length.
     pub duration_seconds: Option<u64>,
+    /// Full work's separately reported duration, including when playback is preview-only.
+    #[serde(default)]
+    pub full_duration_seconds: Option<u64>,
     /// Bounded terminal-safe description, when reported.
     pub description: Option<String>,
-    /// True only for explicitly allowed, full-length, unencrypted playable audio.
+    /// True only when either the full track or an explicitly labeled public preview is playable.
     pub streamable: bool,
+    /// Admission and endpoint policy; callers must retain the preview/full distinction.
+    #[serde(default)]
+    pub playback: SoundcloakPlayback,
+    /// Public like count, including a known zero, or unknown when absent/invalid.
+    #[serde(default)]
+    pub likes_count: Option<u64>,
+    /// Public play count, including a known zero, or unknown when absent/invalid.
+    #[serde(default)]
+    pub playback_count: Option<u64>,
+    /// Public repost count, including a known zero, or unknown when absent/invalid.
+    #[serde(default)]
+    pub reposts_count: Option<u64>,
+    /// Public comment count, distinct from the bounded comments fetched on demand.
+    #[serde(default)]
+    pub comment_count: Option<u64>,
+    /// Validated creation timestamp normalized to RFC 3339 UTC.
+    #[serde(default)]
+    pub created_at: Option<String>,
+    /// Validated modification timestamp normalized to RFC 3339 UTC.
+    #[serde(default)]
+    pub last_modified: Option<String>,
+    /// Provider-reported license label; it is not a grant inferred by this adapter.
+    #[serde(default)]
+    pub license: Option<String>,
+    /// Bounded tags, retaining quoted multiword groups and commas within each tag.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Public genre label, suitable for [`SoundcloakClient::genre_url`].
+    #[serde(default)]
+    pub genre: Option<String>,
+}
+
+/// One bounded public comment; markup is retained as literal text, never executable HTML.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SoundcloakComment {
+    /// Terminal-safe public author display name.
+    pub author: String,
+    /// Bounded plain body with normalized line endings and no terminal controls.
+    pub body: String,
+    /// Validated publication timestamp normalized to RFC 3339 UTC, when available.
+    pub created_at: Option<String>,
+    /// Optional position within the track, converted from milliseconds.
+    pub timestamp_seconds: Option<u64>,
 }
 
 /// Normalized bounded results and an instance-independent continuation token.
@@ -242,6 +310,39 @@ impl SoundcloakClient {
         Ok(url)
     }
 
+    /// Constructs the ordinary public progressive endpoint for an admitted preview.
+    ///
+    /// This does not request full-track access or follow a signed CDN redirect.
+    /// Callers must use it only after metadata explicitly advertises a preview.
+    ///
+    /// # Errors
+    /// Rejects noncanonical public track URLs before constructing the instance endpoint.
+    pub fn preview_stream_url(&self, canonical_url: &Url) -> Result<Url, ProviderError> {
+        let (artist, track) = canonical_segments(canonical_url)?;
+        let mut url = self.endpoint(&format!("_/api/progressive/{artist}/{track}"))?;
+        url.query_pairs_mut().append_pair("redirect", "false");
+        Ok(url)
+    }
+
+    /// Chooses only the endpoint explicitly supported by normalized public metadata.
+    ///
+    /// # Errors
+    /// Rejects unavailable tracks, inconsistent admission state and invalid canonical URLs.
+    pub fn playback_url(&self, track: &SoundcloakTrack) -> Result<Url, ProviderError> {
+        if !track.streamable {
+            return Err(ProviderError::InvalidRequest(
+                "SoundCloud track is unavailable".into(),
+            ));
+        }
+        match track.playback {
+            SoundcloakPlayback::Full => self.stream_url(&track.webpage_url),
+            SoundcloakPlayback::Preview => self.preview_stream_url(&track.webpage_url),
+            SoundcloakPlayback::Unavailable => Err(ProviderError::InvalidRequest(
+                "SoundCloud track is unavailable".into(),
+            )),
+        }
+    }
+
     /// Maps a canonical track to its human-readable page on the configured instance.
     ///
     /// # Errors
@@ -249,6 +350,57 @@ impl SoundcloakClient {
     pub fn page_url(&self, canonical_url: &Url) -> Result<Url, ProviderError> {
         let (artist, track) = canonical_segments(canonical_url)?;
         self.endpoint(&format!("{artist}/{track}"))
+    }
+
+    /// Links a genre to the configured instance, encoding it as exactly one path segment.
+    ///
+    /// # Errors
+    /// Rejects empty, oversized, control-bearing or dot-segment labels.
+    pub fn genre_url(&self, genre: &str) -> Result<Url, ProviderError> {
+        let genre = safe_label(genre, MAX_TAG_BYTES)
+            .filter(|genre| !matches!(genre.as_str(), "." | ".."))
+            .ok_or_else(|| ProviderError::InvalidRequest("invalid SoundCloud genre".into()))?;
+        let mut url = self.endpoint("tags/")?;
+        url.path_segments_mut()
+            .map_err(|()| {
+                ProviderError::InvalidBaseUrl("invalid Soundcloak genre endpoint".into())
+            })?
+            .pop_if_empty()
+            .push(&genre);
+        Ok(url)
+    }
+
+    /// Fetches at most twenty recent public top-level comments, without following continuation.
+    ///
+    /// Unsupported/disabled API responses remain ordinary provider errors. No signed
+    /// URLs, private comments, user profiles or author images are requested.
+    ///
+    /// # Errors
+    /// Rejects invalid numeric identifiers, oversized/malformed envelopes and HTTP failures.
+    pub fn comments(&self, track_id: &str) -> Result<Vec<SoundcloakComment>, ProviderError> {
+        if track_id.len() > 20
+            || !track_id.bytes().all(|byte| byte.is_ascii_digit())
+            || !track_id.parse::<u64>().is_ok_and(|id| id > 0)
+        {
+            return Err(ProviderError::InvalidRequest(
+                "invalid SoundCloud track identifier".into(),
+            ));
+        }
+        let mut endpoint = self.endpoint(&format!("_/api/v2/tracks/{track_id}/comments"))?;
+        endpoint
+            .query_pairs_mut()
+            .append_pair("limit", &MAX_COMMENTS.to_string())
+            .append_pair("threaded", "0")
+            .append_pair("filter_replies", "1")
+            .append_pair("sort", "created_at");
+        let value = self.fetch_json(&endpoint)?;
+        let collection = value["collection"]
+            .as_array()
+            .ok_or_else(|| invalid_response("missing comment collection"))?;
+        if collection.len() > MAX_COMMENTS {
+            return Err(invalid_response("too many comments in response"));
+        }
+        Ok(collection.iter().filter_map(normalize_comment).collect())
     }
 
     /// Joins only adapter-owned paths onto the manually configured base.
@@ -285,16 +437,19 @@ impl SoundcloakClient {
         canonical_segments(&webpage_url).ok()?;
         let artwork_url = value["artwork_url"]
             .as_str()
-            .and_then(|raw| self.artwork_url(raw));
+            .and_then(|raw| self.artwork_url(raw, "t500x500"));
+        let expanded_artwork_url = value["artwork_url"]
+            .as_str()
+            .and_then(|raw| self.artwork_url(raw, "t1080x1080"));
         let duration = value
             .get("full_duration")
             .filter(|value| !value.is_null())
             .or_else(|| value.get("duration").filter(|value| !value.is_null()));
-        let duration_seconds = if let Some(duration) = duration {
+        let mut full_duration_seconds = if let Some(duration) = duration {
             Some(
                 duration
                     .as_u64()
-                    .filter(|milliseconds| *milliseconds <= 7 * 24 * 60 * 60 * 1_000)?
+                    .filter(|milliseconds| *milliseconds <= MAX_DURATION_MILLIS)?
                     / 1_000,
             )
         } else {
@@ -302,52 +457,53 @@ impl SoundcloakClient {
         };
         let description = value["description"]
             .as_str()
-            .filter(|text| text.len() <= MAX_DESCRIPTION_BYTES)
-            .map(|text| {
-                text.replace("\r\n", "\n")
-                    .replace('\r', "\n")
-                    .replace('\t', " ")
-            })
-            .filter(|text| {
-                !text
-                    .chars()
-                    .any(|character| character.is_control() && character != '\n')
-            })
-            .filter(|text| !text.trim().is_empty());
-        let streamable = value["streamable"].as_bool() == Some(true)
-            && value["policy"].as_str() == Some("ALLOW")
-            && value["media"]["transcodings"]
-                .as_array()
-                .is_some_and(|transcodings| {
-                    transcodings.len() <= 32
-                        && transcodings.iter().any(|transcoding| {
-                            matches!(
-                                transcoding.get("snipped"),
-                                None | Some(Value::Null | Value::Bool(false))
-                            ) && transcoding["format"]["protocol"].as_str() == Some("hls")
-                                && transcoding["format"]["mime_type"]
-                                    .as_str()
-                                    .is_some_and(|mime| mime.starts_with("audio/"))
-                        })
-                });
+            .and_then(|text| safe_multiline(text, MAX_DESCRIPTION_BYTES));
+        let (playback, preview_seconds) = playback_admission(value);
+        let duration_seconds = if playback == SoundcloakPlayback::Preview {
+            if value["full_duration"].is_null() {
+                full_duration_seconds = None;
+            }
+            preview_seconds
+        } else {
+            full_duration_seconds
+        };
         Some(SoundcloakTrack {
             id,
             title,
             artist,
             webpage_url,
             artwork_url,
+            expanded_artwork_url,
             duration_seconds,
+            full_duration_seconds,
             description,
-            streamable,
+            streamable: playback != SoundcloakPlayback::Unavailable,
+            playback,
+            likes_count: value["likes_count"].as_u64(),
+            playback_count: value["playback_count"].as_u64(),
+            reposts_count: value["reposts_count"].as_u64(),
+            comment_count: value["comment_count"].as_u64(),
+            created_at: normalized_timestamp(&value["created_at"]),
+            last_modified: normalized_timestamp(&value["last_modified"]),
+            license: value["license"]
+                .as_str()
+                .and_then(|text| safe_label(text, 128)),
+            tags: value["tag_list"]
+                .as_str()
+                .map(parse_tags)
+                .unwrap_or_default(),
+            genre: value["genre"]
+                .as_str()
+                .and_then(|text| safe_label(text, MAX_TAG_BYTES)),
         })
     }
 
     /// Proxies only bounded credential-free HTTPS artwork on `SoundCloud`'s own image CDN.
-    fn artwork_url(&self, raw: &str) -> Option<Url> {
+    fn artwork_url(&self, raw: &str, variant: &str) -> Option<Url> {
         if raw.len() > MAX_URL_BYTES {
             return None;
         }
-        let artwork = Url::parse(raw).ok()?;
+        let mut artwork = Url::parse(raw).ok()?;
         if artwork.scheme() != "https"
             || artwork.port().is_some()
             || !artwork.username().is_empty()
@@ -361,10 +517,192 @@ impl SoundcloakClient {
         {
             return None;
         }
+        resize_known_artwork(&mut artwork, variant);
         let mut url = self.endpoint("_/proxy/images").ok()?;
         url.query_pairs_mut().append_pair("url", artwork.as_str());
         Some(url)
     }
+}
+
+/// Admits only supported public renditions; preview duration comes from the actual snippet.
+fn playback_admission(value: &Value) -> (SoundcloakPlayback, Option<u64>) {
+    let unavailable = (SoundcloakPlayback::Unavailable, None);
+    if value["streamable"].as_bool() != Some(true)
+        || value["sharing"]
+            .as_str()
+            .is_some_and(|sharing| sharing != "public")
+    {
+        return unavailable;
+    }
+    let Some(transcodings) = value["media"]["transcodings"]
+        .as_array()
+        .filter(|items| items.len() <= 32)
+    else {
+        return unavailable;
+    };
+    for transcoding in transcodings {
+        let format = &transcoding["format"];
+        if !format["mime_type"]
+            .as_str()
+            .is_some_and(|mime| mime.starts_with("audio/"))
+        {
+            continue;
+        }
+        if value["policy"].as_str() == Some("ALLOW")
+            && format["protocol"].as_str() == Some("hls")
+            && matches!(
+                transcoding.get("snipped"),
+                None | Some(Value::Null | Value::Bool(false))
+            )
+        {
+            return (SoundcloakPlayback::Full, None);
+        }
+        if value["policy"].as_str() == Some("SNIP")
+            && format["protocol"].as_str() == Some("progressive")
+            && format["mime_type"].as_str() == Some("audio/mpeg")
+            && transcoding["snipped"].as_bool() == Some(true)
+        {
+            // SoundCloud's preview metadata normally reports 30,000 ms in both
+            // places. Never infer its length from the full work, nor admit an
+            // unbounded rendition as a snippet when duration metadata is absent.
+            let duration = transcoding
+                .get("duration")
+                .filter(|duration| !duration.is_null())
+                .unwrap_or(&value["duration"])
+                .as_u64()
+                .filter(|millis| (1_000..=MAX_PREVIEW_MILLIS).contains(millis));
+            if let Some(duration) = duration {
+                return (SoundcloakPlayback::Preview, Some(duration / 1_000));
+            }
+        }
+    }
+    unavailable
+}
+
+/// Rewrites only `SoundCloud`'s known root-level artwork/avatar filename variants.
+/// Custom image names, unknown variants and other CDN paths remain untouched.
+fn resize_known_artwork(artwork: &mut Url, variant: &str) {
+    let Some(image_host) = artwork
+        .host_str()
+        .and_then(|host| host.strip_suffix(".sndcdn.com"))
+        .and_then(|host| host.strip_prefix('i'))
+    else {
+        return;
+    };
+    if image_host.is_empty() || !image_host.bytes().all(|byte| byte.is_ascii_digit()) {
+        return;
+    }
+    let Some(filename) = artwork.path().strip_prefix('/') else {
+        return;
+    };
+    if filename.contains('/')
+        || !(filename.starts_with("artworks-") || filename.starts_with("avatars-"))
+    {
+        return;
+    }
+    let Some((stem, extension)) = filename.rsplit_once('.') else {
+        return;
+    };
+    if !matches!(extension, "jpg" | "jpeg" | "png") {
+        return;
+    }
+    let Some((identifier, old_variant)) = stem.rsplit_once('-') else {
+        return;
+    };
+    let has_identifier = identifier
+        .strip_prefix("artworks-")
+        .or_else(|| identifier.strip_prefix("avatars-"))
+        .is_some_and(|id| id.bytes().any(|byte| byte.is_ascii_alphanumeric()));
+    if !matches!(
+        old_variant,
+        "large" | "t200x200" | "t500x500" | "t1080x1080"
+    ) || !has_identifier
+        || !identifier
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return;
+    }
+    artwork.set_path(&format!("/{identifier}-{variant}.{extension}"));
+}
+
+/// Normalizes bounded public timestamps once, leaving malformed optional dates unknown.
+fn normalized_timestamp(value: &Value) -> Option<String> {
+    let raw = value.as_str().filter(|text| text.len() <= 64)?;
+    let date = chrono::DateTime::parse_from_rfc3339(raw).ok()?;
+    Some(
+        date.with_timezone(&chrono::Utc)
+            .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
+    )
+}
+
+/// Normalizes whitespace while rejecting complete text fields containing terminal controls.
+fn safe_multiline(text: &str, max_bytes: usize) -> Option<String> {
+    if text.len() > max_bytes {
+        return None;
+    }
+    let text = text
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .replace('\t', " ");
+    (!text.trim().is_empty()
+        && !text
+            .chars()
+            .any(|character| character.is_control() && character != '\n'))
+    .then_some(text)
+}
+
+/// Parses `SoundCloud`'s whitespace-separated tags, preserving quoted phrases and commas.
+/// Malformed quotes or oversized input are omitted rather than partially misrepresented.
+fn parse_tags(raw: &str) -> Vec<String> {
+    if raw.len() > MAX_TAG_LIST_BYTES || raw.chars().any(char::is_control) {
+        return Vec::new();
+    }
+    let mut tags = Vec::new();
+    let mut tag = String::new();
+    let mut quoted = false;
+    for character in raw.chars() {
+        if character == '"' {
+            quoted = !quoted;
+        } else if character.is_whitespace() && !quoted {
+            if let Some(tag) = safe_label(&tag, MAX_TAG_BYTES) {
+                tags.push(tag);
+            }
+            tag.clear();
+        } else {
+            tag.push(character);
+        }
+        if tag.len() > MAX_TAG_BYTES || tags.len() > MAX_TAGS {
+            return Vec::new();
+        }
+    }
+    if quoted {
+        return Vec::new();
+    }
+    if let Some(tag) = safe_label(&tag, MAX_TAG_BYTES) {
+        tags.push(tag);
+    }
+    if tags.len() > MAX_TAGS {
+        Vec::new()
+    } else {
+        tags
+    }
+}
+
+/// Discards malformed comments without retaining any unrelated upstream profile fields.
+fn normalize_comment(value: &Value) -> Option<SoundcloakComment> {
+    if value["kind"].as_str() != Some("comment") {
+        return None;
+    }
+    Some(SoundcloakComment {
+        author: safe_label(value["user"]["username"].as_str()?, MAX_LABEL_BYTES)?,
+        body: safe_multiline(value["body"].as_str()?, MAX_COMMENT_BYTES)?,
+        created_at: normalized_timestamp(&value["created_at"]),
+        timestamp_seconds: value["timestamp"]
+            .as_u64()
+            .filter(|timestamp| *timestamp <= MAX_DURATION_MILLIS)
+            .map(|timestamp| timestamp / 1_000),
+    })
 }
 
 /// Enforces canonical durable identity before using either path segment in an endpoint.
@@ -798,6 +1136,336 @@ mod tests {
                 .query_pairs()
                 .any(|(key, value)| key == "query_urn" && value == "soundcloud:search:fixture")
         );
+    }
+
+    #[test]
+    fn detail_metadata_retains_bounded_counts_dates_license_and_quoted_tags() {
+        let mut source = fixture_track();
+        for (field, value) in [
+            ("likes_count", json!(0)),
+            ("playback_count", json!(1_832_732)),
+            ("reposts_count", json!(1_510)),
+            ("comment_count", json!(720)),
+            ("created_at", json!("2017-07-12T08:41:32Z")),
+            ("last_modified", json!("2022-06-01T04:19:40+04:00")),
+            ("license", json!("all-rights-reserved")),
+            ("genre", json!("Hip-hop & Rap")),
+            (
+                "tag_list",
+                json!("Underground Minsk \"минский андеграунд\" \"Post-Punk,Synthwave\""),
+            ),
+        ] {
+            source[field] = value;
+        }
+        let (client, _) = client(vec![json!({"collection": [source]})]);
+        let track = serde_json::to_value(&client.search(&request()).unwrap().items[0]).unwrap();
+        assert_eq!(track["likes_count"], json!(0));
+        assert_eq!(track["playback_count"], json!(1_832_732));
+        assert_eq!(track["reposts_count"], json!(1_510));
+        assert_eq!(track["comment_count"], json!(720));
+        assert_eq!(track["created_at"], json!("2017-07-12T08:41:32Z"));
+        assert_eq!(track["last_modified"], json!("2022-06-01T00:19:40Z"));
+        assert_eq!(track["license"], json!("all-rights-reserved"));
+        assert_eq!(track["genre"], json!("Hip-hop & Rap"));
+        assert_eq!(
+            track["tags"],
+            json!([
+                "Underground",
+                "Minsk",
+                "минский андеграунд",
+                "Post-Punk,Synthwave"
+            ])
+        );
+    }
+
+    #[test]
+    fn detail_artwork_uses_500_and_exposes_lazy_1080_without_fetching_either() {
+        let mut source = fixture_track();
+        source["artwork_url"] =
+            json!("https://i1.sndcdn.com/artworks-000233237713-ycrkrp-large.jpg");
+        let (client, transport) = client(vec![json!({"collection": [source]})]);
+        let track = client.search(&request()).unwrap().items.remove(0);
+        let artwork = track.artwork_url.as_ref().unwrap();
+        assert_eq!(
+            artwork
+                .query_pairs()
+                .find(|(key, _)| key == "url")
+                .unwrap()
+                .1,
+            "https://i1.sndcdn.com/artworks-000233237713-ycrkrp-t500x500.jpg"
+        );
+        let serialized = serde_json::to_value(&track).unwrap();
+        let expanded = Url::parse(serialized["expanded_artwork_url"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            expanded
+                .query_pairs()
+                .find(|(key, _)| key == "url")
+                .unwrap()
+                .1,
+            "https://i1.sndcdn.com/artworks-000233237713-ycrkrp-t1080x1080.jpg"
+        );
+        assert_eq!(transport.requests.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn public_progressive_preview_is_playable_with_actual_not_full_duration() {
+        let mut source = fixture_track();
+        source["policy"] = json!("SNIP");
+        source["duration"] = json!(30_000);
+        source["full_duration"] = json!(218_593);
+        source["media"]["transcodings"][0] = json!({
+            "snipped": true, "duration": 30_000,
+            "format": {"protocol": "progressive", "mime_type": "audio/mpeg"}
+        });
+        let (client, _) = client(vec![json!({"collection": [source]})]);
+        let track = client.search(&request()).unwrap().items.remove(0);
+        assert!(
+            track.streamable,
+            "an explicitly advertised public preview must be playable"
+        );
+        assert_eq!(track.duration_seconds, Some(30));
+        let serialized = serde_json::to_value(&track).unwrap();
+        assert_eq!(serialized["full_duration_seconds"], json!(218));
+        assert_eq!(serialized["playback"], json!("Preview"));
+        assert_eq!(
+            client.playback_url(&track).unwrap().as_str(),
+            "https://sc1.maid.zone/_/api/progressive/artist/track?redirect=false"
+        );
+    }
+
+    #[test]
+    fn artwork_variant_rewriting_preserves_custom_originals_and_stays_on_the_instance() {
+        let (client, transport) = client(vec![]);
+        for raw in [
+            "https://i1.sndcdn.com/custom-large.jpg",
+            "https://i1.sndcdn.com/artworks-123-custom.jpg",
+            "https://i1.sndcdn.com/artworks-123-original.jpg",
+            "https://i1.sndcdn.com/custom/artworks-123-large.jpg",
+            "https://i1.sndcdn.com//artworks-123-large.jpg",
+            "https://i1.sndcdn.com/artworks-large.jpg",
+            "https://files.sndcdn.com/artworks-123-large.jpg",
+        ] {
+            for variant in ["t500x500", "t1080x1080"] {
+                let url = client.artwork_url(raw, variant).unwrap();
+                assert_eq!(url.origin(), client.base_url.origin());
+                assert_eq!(
+                    url.query_pairs().find(|(key, _)| key == "url").unwrap().1,
+                    raw
+                );
+            }
+        }
+        for raw in [
+            "http://i1.sndcdn.com/artworks-123-large.jpg",
+            "https://i1.sndcdn.com.evil.test/artworks-123-large.jpg",
+            "https://i1.sndcdn.com/artworks-123-large.jpg?token=secret",
+            "https://secret@i1.sndcdn.com/artworks-123-large.jpg",
+        ] {
+            assert!(client.artwork_url(raw, "t1080x1080").is_none(), "{raw}");
+        }
+        assert!(transport.requests.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn genre_urls_encode_one_segment_and_preserve_configured_instance_prefix() {
+        let (_, transport) = client(vec![]);
+        let client = SoundcloakClient::with_transport(
+            Url::parse("https://soundcloak.example/instance/").unwrap(),
+            transport.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            client.genre_url("Hip-hop & Rap").unwrap().as_str(),
+            "https://soundcloak.example/instance/tags/Hip-hop%20&%20Rap"
+        );
+        let genre = client
+            .genre_url("../?next=https://evil.example/#Jazz")
+            .unwrap();
+        assert_eq!(
+            genre.path(),
+            "/instance/tags/..%2F%3Fnext=https:%2F%2Fevil.example%2F%23Jazz"
+        );
+        assert!(genre.query().is_none());
+        assert!(genre.fragment().is_none());
+        for invalid in [
+            "",
+            " ",
+            ".",
+            "..",
+            "Jazz\u{1b}",
+            &"x".repeat(MAX_TAG_BYTES + 1),
+        ] {
+            assert!(client.genre_url(invalid).is_err(), "{invalid:?}");
+        }
+        assert!(transport.requests.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn optional_metadata_and_tags_are_bounded_without_discarding_the_track() {
+        let mut source = fixture_track();
+        for (key, value) in [
+            ("likes_count", json!(-1)),
+            ("playback_count", json!("12")),
+            ("reposts_count", json!(1.5)),
+            ("comment_count", Value::Null),
+            ("created_at", json!("2026-02-30T00:00:00Z")),
+            ("last_modified", json!("x".repeat(100))),
+            ("license", json!("copyright\u{1b}")),
+            ("genre", json!("x".repeat(MAX_TAG_BYTES + 1))),
+            ("tag_list", json!("x".repeat(MAX_TAG_LIST_BYTES + 1))),
+        ] {
+            source[key] = value;
+        }
+        let track = client(vec![]).0.normalize_track(&source).unwrap();
+        assert_eq!(track.playback, SoundcloakPlayback::Full);
+        assert!(
+            track.likes_count.is_none()
+                && track.playback_count.is_none()
+                && track.reposts_count.is_none()
+                && track.comment_count.is_none()
+        );
+        assert!(track.created_at.is_none() && track.last_modified.is_none());
+        assert!(track.license.is_none() && track.genre.is_none() && track.tags.is_empty());
+        for invalid in [
+            "\"unclosed",
+            "bad\u{1b}tag",
+            &"a ".repeat(MAX_TAGS + 1),
+            &format!("\"{}\"", "x".repeat(MAX_TAG_BYTES + 1)),
+        ] {
+            assert!(parse_tags(invalid).is_empty(), "{invalid:?}");
+        }
+        assert_eq!(
+            parse_tags("  \"Hip-hop & Rap\" rock  \"Post-Punk,Synthwave\"  "),
+            ["Hip-hop & Rap", "rock", "Post-Punk,Synthwave"]
+        );
+        assert_eq!(parse_tags("\"\" rock"), ["rock"]);
+    }
+
+    #[test]
+    fn preview_admission_never_promotes_restricted_private_or_ambiguous_renditions() {
+        let mut preview = fixture_track();
+        preview["policy"] = json!("SNIP");
+        preview["duration"] = json!(30_000);
+        preview["full_duration"] = json!(218_593);
+        preview["media"]["transcodings"][0] = json!({"snipped": true, "duration": 30_000,
+            "format": {"protocol": "progressive", "mime_type": "audio/mpeg"}});
+        let client = client(vec![]).0;
+        for (key, value) in [
+            ("policy", json!("BLOCK")),
+            ("policy", json!("MONETIZE")),
+            ("policy", json!("ALLOW")),
+            ("sharing", json!("private")),
+            ("streamable", json!(false)),
+            ("streamable", Value::Null),
+        ] {
+            let mut source = preview.clone();
+            source[key] = value;
+            let track = client.normalize_track(&source).unwrap();
+            assert_eq!(track.playback, SoundcloakPlayback::Unavailable, "{key}");
+            assert!(!track.streamable);
+            assert!(client.playback_url(&track).is_err());
+        }
+        for (key, value) in [
+            ("snipped", Value::Null),
+            ("snipped", json!(false)),
+            ("duration", json!(0)),
+            ("duration", json!(61_000)),
+            ("duration", json!("30000")),
+            (
+                "format",
+                json!({"protocol": "hls", "mime_type": "audio/mpeg"}),
+            ),
+            (
+                "format",
+                json!({"protocol": "encrypted-hls", "mime_type": "audio/mpeg"}),
+            ),
+            (
+                "format",
+                json!({"protocol": "progressive", "mime_type": "video/mp4"}),
+            ),
+        ] {
+            let mut source = preview.clone();
+            source["media"]["transcodings"][0][key] = value;
+            assert_eq!(
+                client.normalize_track(&source).unwrap().playback,
+                SoundcloakPlayback::Unavailable,
+                "{key}"
+            );
+        }
+        // Missing rendition duration can use the bounded actual metadata length,
+        // but the full work's duration must never be substituted for that length.
+        preview["media"]["transcodings"][0]["duration"] = Value::Null;
+        preview["full_duration"] = Value::Null;
+        let track = client.normalize_track(&preview).unwrap();
+        assert_eq!(track.duration_seconds, Some(30));
+        assert_eq!(track.full_duration_seconds, None);
+        preview["duration"] = Value::Null;
+        preview["full_duration"] = json!(218_593);
+        assert_eq!(
+            client.normalize_track(&preview).unwrap().playback,
+            SoundcloakPlayback::Unavailable
+        );
+    }
+
+    #[test]
+    fn recent_comments_use_bounded_public_route_and_ignore_unsafe_text_and_continuation() {
+        let valid = json!({"kind": "comment", "body": "First\r\nSecond\tline <literal>",
+            "created_at": "2026-09-19T14:48:20+04:00", "timestamp": 63_133,
+            "user": {"username": "Public listener"}});
+        let mut unsafe_body = valid.clone();
+        unsafe_body["body"] = json!("Hello\u{1b}]52;secret");
+        let mut unsafe_author = valid.clone();
+        unsafe_author["user"]["username"] = json!("Unsafe\nAuthor");
+        let mut oversized = valid.clone();
+        oversized["body"] = json!("x".repeat(MAX_COMMENT_BYTES + 1));
+        let (client, transport) = client(vec![
+            json!({"collection": [valid, unsafe_body, unsafe_author,
+            oversized, {"kind": "track"}], "next_href": "http://127.0.0.1/private"}),
+        ]);
+        let comments = client.comments("332838846").unwrap();
+        assert_eq!(
+            comments,
+            [SoundcloakComment {
+                author: "Public listener".into(),
+                body: "First\nSecond line <literal>".into(),
+                created_at: Some("2026-09-19T10:48:20Z".into()),
+                timestamp_seconds: Some(63)
+            }]
+        );
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].path(), "/_/api/v2/tracks/332838846/comments");
+        assert_eq!(
+            requests[0].query(),
+            Some("limit=20&threaded=0&filter_replies=1&sort=created_at")
+        );
+    }
+
+    #[test]
+    fn comments_reject_invalid_ids_and_oversized_envelopes_without_followups() {
+        let (client, transport) = client(vec![
+            json!({"collection": vec![json!({}); MAX_COMMENTS + 1]}),
+            json!({"collection": {}}),
+            json!({"collection": []}),
+        ]);
+        for invalid in [
+            "",
+            "0",
+            "-1",
+            "1/comments",
+            "123?url=private",
+            "18446744073709551616",
+        ] {
+            assert!(client.comments(invalid).is_err(), "{invalid}");
+        }
+        assert!(transport.requests.lock().unwrap().is_empty());
+        assert!(client.comments("123").is_err());
+        assert!(client.comments("123").is_err());
+        assert!(client.comments("123").unwrap().is_empty());
+        assert!(matches!(
+            client.comments("123"),
+            Err(ProviderError::HttpStatus(503))
+        ));
+        assert_eq!(transport.requests.lock().unwrap().len(), 4);
     }
 
     #[test]

@@ -199,6 +199,16 @@ export interface DetailHighlightView {
 	ranges: DetailHighlightRange[];
 }
 
+/** SoundCloud facts keep public plays/creation distinct from video terminology. */
+export interface SoundCloudDetailsView {
+	plays: number | null;
+	reposts: number | null;
+	created: string;
+	modified: string;
+	tags: string[];
+	preview_duration_seconds: number | null;
+}
+
 /**
  * The Details panel.
  *
@@ -233,6 +243,7 @@ export interface DetailView {
   comments: string;
   published: string;
   license: string;
+	soundcloud: SoundCloudDetailsView | null;
   radio_favorite: boolean;
   playlist_names: string[];
   has_private_note: boolean;
