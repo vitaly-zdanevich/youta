@@ -299,6 +299,36 @@
 		snapshot({ preferences_popup: null });
 		await until(() => !dialog(), 'closed playback fixtures');
 	}
+
+	/** A live station has no finite duration; recording exports are not live-stream actions. */
+	async function checkRadioPresentation() {
+		const previous = clone(view);
+		const radioId = { source: 'radio', external_id: 'fixture-station' };
+		snapshot({ screen: 'Radio', now_playing: { media_id: radioId, title: 'Fixture station', subtitle: '' }, playing_media_id: radioId,
+			evernote_available: true, details: { ...details('Fixture station', radioId), source: 'Radio' },
+			playback: { ...view.playback, idle: false, live: true, title: 'Fixture station', position: { secs: 86387, nanos: 0 },
+				duration: { secs: 86400, nanos: 0 }, live_seekable_range: { start: { secs: 0, nanos: 0 }, end: { secs: 86400, nanos: 0 } } } });
+		await until(() => document.querySelector('footer')?.textContent.includes('Fixture station'), 'live station footer');
+		const footer = document.querySelector('footer');
+		assert(footer.textContent.includes('radio') && !footer.textContent.includes('24:00:00'), 'radio footer omits live-buffer duration');
+		assert(!document.querySelector('[aria-label="Playback position"]').disabled, 'radio label keeps buffered seeking available');
+		assert(!button('Save audio to Evernote'), 'live radio has no direct Evernote upload action');
+		await action('ShowNowPlaying', () => button('Fixture station', footer).click(), 'radio title retains source navigation');
+		const beforeOffer = calls.length;
+		snapshot({ evernote_popup: {
+			draft: { title: 'Fixture station recording', body: '', tags: '', source_url: '' },
+			selected_field: 'Title', phase: 'Review', animation_frame: 0, total_bytes: null,
+			validation_error: null, result_url: null, captions_available: false, undo_available: false,
+		} });
+		await until(() => dialog()?.textContent.includes('Fixture station recording'), 'completed recording review');
+		assert(!calls.slice(beforeOffer).some((call) => call.command === 'dispatch'), 'Showing a completed recording offer does not submit it');
+		assert(Boolean(button('Save note', dialog())) && Boolean(button('Cancel', dialog())), 'Completed recording offer requires an explicit save or cancel');
+		await action('SubmitEvernoteNote', () => button('Save note', dialog()).click(), 'Recording review saves only through the existing explicit submit action');
+		await action('DismissEvernoteNote', () => button('Cancel', dialog()).click(), 'Recording offer can be skipped without uploading');
+		snapshot({ evernote_popup: null });
+		await until(() => !dialog(), 'closed recording review');
+		snapshot(previous);
+	}
 	/** SoundCloud stays on the shared tab, search-editor, and playback-action paths. */
 	async function checkSoundCloudTab() {
 		const previous = clone(view);
@@ -373,6 +403,7 @@
 	async function run() {
 		await until(() => document.querySelector('[title="Search archive.org"]'), 'Archive search');
 		await checkSoundCloudTab();
+		await checkRadioPresentation();
 		await checkPreferencesFocus();
 		await checkProviderSettings();
 		await checkArchivePlaybackChoices();

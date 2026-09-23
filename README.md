@@ -594,6 +594,10 @@ stations. `[r] Record` starts capture only when the selected station is already
 playing; press `r` again to stop recording. Youta asks `mpv` to copy the encoded
 stream packets rather than re-encoding the audio. The recording indicator marks
 the playing station. Here `r` controls recording, not Repeat.
+The player labels live playback as `radio`, while retaining buffered seeking
+when available. Live streams cannot be sent directly to Evernote. With the
+`evernote` feature enabled, stopping a successful recording offers its completed
+local file for review; uploading requires explicit confirmation.
 
 `[/] Search` is a zero-network live filter on this tab: every typed character
 immediately narrows the catalogue. Whitespace-separated terms match station

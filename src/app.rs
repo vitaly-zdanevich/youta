@@ -29,6 +29,8 @@ mod original_download;
 mod preferences_focus;
 #[cfg(feature = "yandex-music")]
 mod queued_yandex_download;
+#[cfg(all(feature = "radio", feature = "evernote"))]
+mod radio_evernote;
 #[cfg(feature = "s3-upload")]
 mod s3_upload;
 mod soundcloud;
@@ -5431,6 +5433,12 @@ pub struct AppController {
     /// Selected provider media and audio locator behind the Evernote popup.
     #[cfg(feature = "evernote")]
     evernote_selection: Option<EvernoteSelection>,
+    /// Edited review parked only while an explicitly requested token editor is open.
+    #[cfg(feature = "evernote")]
+    evernote_credentials_draft: Option<EvernoteNoteDraft>,
+    /// Completed local captures awaiting a free modal surface; never persisted or auto-uploaded.
+    #[cfg(all(feature = "radio", feature = "evernote"))]
+    pending_radio_evernote_offers: VecDeque<radio_evernote::CompletedRecordingOffer>,
     /// Monotonic owner for Evernote worker responses.
     #[cfg(feature = "evernote")]
     evernote_generation: u64,
@@ -6702,6 +6710,10 @@ impl AppController {
             commons_upload_thread: None,
             #[cfg(feature = "evernote")]
             evernote_selection: None,
+            #[cfg(feature = "evernote")]
+            evernote_credentials_draft: None,
+            #[cfg(all(feature = "radio", feature = "evernote"))]
+            pending_radio_evernote_offers: VecDeque::new(),
             #[cfg(feature = "evernote")]
             evernote_generation: 0,
             #[cfg(feature = "evernote")]
@@ -17735,7 +17747,9 @@ impl AppController {
                     .is_ok_and(|item| match item.media.id.source {
                         SourceKind::Local => local_path_from_media_id(&item.media.id)
                             .is_some_and(|path| path.is_file()),
-                        SourceKind::ModArchive | SourceKind::RemoteFiles => false,
+                        SourceKind::Radio | SourceKind::ModArchive | SourceKind::RemoteFiles => {
+                            false
+                        }
                         _ => matches!(item.media.webpage_url.scheme(), "http" | "https"),
                     });
         }
@@ -19020,6 +19034,15 @@ impl AppController {
             "An Evernote operation is already running".clone_into(&mut self.view.status_line);
             return;
         }
+        if self.evernote_selection.is_some()
+            || self.view.evernote_popup.is_some()
+            || self.view.evernote_credentials_popup.is_some()
+            || self.evernote_credentials_draft.is_some()
+        {
+            "Finish or dismiss the current Evernote note first"
+                .clone_into(&mut self.view.status_line);
+            return;
+        }
         let item = match self.selected_export_queue_item() {
             Ok(item) => item,
             Err(error) => {
@@ -19027,6 +19050,11 @@ impl AppController {
                 return;
             }
         };
+        if item.media.id.source == SourceKind::Radio {
+            "Record the Radio stream first; only completed local recordings can be saved to Evernote"
+                .clone_into(&mut self.view.status_line);
+            return;
+        }
         if matches!(
             item.media.id.source,
             SourceKind::ModArchive | SourceKind::RemoteFiles
@@ -19105,6 +19133,7 @@ impl AppController {
         self.view.evernote_popup = Some(EvernoteNotePopupView {
             draft,
             captions_available,
+            undo_available: !self.evernote_body_undo.is_empty(),
             ..EvernoteNotePopupView::default()
         });
         "Review the Evernote audio note".clone_into(&mut self.view.status_line);
@@ -19309,11 +19338,11 @@ impl AppController {
             }
             return;
         }
-        let Some(draft) = self
-            .evernote_selection
-            .as_ref()
-            .map(EvernoteSelection::draft)
-        else {
+        let Some(draft) = self.evernote_credentials_draft.take().or_else(|| {
+            self.evernote_selection
+                .as_ref()
+                .map(EvernoteSelection::draft)
+        }) else {
             self.view.evernote_credentials_popup = None;
             return;
         };
@@ -19344,7 +19373,17 @@ impl AppController {
             return;
         };
         let Some(token) = self.config.providers.evernote_auth_token.clone() else {
-            "Evernote authentication is unavailable".clone_into(&mut self.view.status_line);
+            // A recording is offered as a note first. Only explicit Submit may
+            // request credentials; keep all edits and return to review after saving.
+            self.evernote_credentials_draft = Some(draft);
+            self.view.evernote_popup = None;
+            self.view.evernote_credentials_popup = Some(EvernoteCredentialsPopupView {
+                token: String::new(),
+                credentials_path: self.config.credentials_file().display().to_string(),
+                validation_error: None,
+            });
+            "Enter an Evernote token to return to your review; nothing has been uploaded"
+                .clone_into(&mut self.view.status_line);
             return;
         };
         if let Err(error) = self.config.ensure_directories() {
@@ -27587,7 +27626,7 @@ impl AppController {
             );
             return;
         }
-        self.publish_stopped_radio_recording(recording);
+        self.publish_stopped_radio_recording(recording, true);
     }
 
     /// Finalizes a recording whose backend has already been stopped during graceful shutdown.
@@ -27617,18 +27656,28 @@ impl AppController {
             );
             return;
         }
-        self.publish_stopped_radio_recording(recording);
+        self.publish_stopped_radio_recording(recording, false);
     }
 
     /// Moves a fully closed private capture into Downloaded and refreshes that view when open.
     #[cfg(feature = "radio")]
-    fn publish_stopped_radio_recording(&mut self, recording: ActiveRadioRecording) {
+    fn publish_stopped_radio_recording(
+        &mut self,
+        recording: ActiveRadioRecording,
+        interactive: bool,
+    ) {
+        #[cfg(not(feature = "evernote"))]
+        let _ = interactive;
         self.view.radio_recording = None;
         match publish_radio_recording(&self.config, &recording) {
             Ok(path) => {
                 self.view.status_line = format!("Radio recording saved: {}", path.display());
                 if self.view.screen == Screen::Downloaded {
                     self.populate_downloads();
+                }
+                #[cfg(feature = "evernote")]
+                if interactive {
+                    self.offer_completed_radio_recording_to_evernote(path);
                 }
             }
             Err(error) => {
@@ -35659,6 +35708,7 @@ impl UiController for AppController {
                 } else {
                     self.view.evernote_popup = None;
                     self.evernote_selection = None;
+                    self.evernote_credentials_draft = None;
                     self.evernote_body_undo.clear();
                 }
             }
@@ -35940,6 +35990,7 @@ impl UiController for AppController {
             UiAction::DismissEvernoteCredentials => {
                 self.view.evernote_credentials_popup = None;
                 self.evernote_selection = None;
+                self.evernote_credentials_draft = None;
                 "Evernote export cancelled".clone_into(&mut self.view.status_line);
             }
             #[cfg(feature = "evernote")]
@@ -36378,6 +36429,8 @@ impl UiController for AppController {
         #[cfg(feature = "evernote")]
         {
             self.drain_evernote_responses();
+            #[cfg(feature = "radio")]
+            self.maybe_offer_completed_radio_recording_to_evernote();
             if let Some(popup) = self.view.evernote_popup.as_mut()
                 && matches!(
                     popup.phase,
@@ -46271,6 +46324,9 @@ mod tests {
     #[cfg(feature = "yandex-music")]
     #[path = "queued_yandex_download.rs"]
     mod queued_yandex_download_tests;
+    #[cfg(all(feature = "radio", feature = "evernote"))]
+    #[path = "radio_evernote.rs"]
+    mod radio_evernote_tests;
     #[cfg(feature = "s3-upload")]
     #[path = "s3_upload.rs"]
     mod s3_upload_tests;

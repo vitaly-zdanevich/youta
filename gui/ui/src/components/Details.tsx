@@ -482,7 +482,7 @@ export function Details({ view, kind }: { view: ViewModel; kind: InformationPane
         {view.commons_upload_available ? (
           <Action onClick={() => void dispatch("OpenCommonsUpload")}>Upload to Commons</Action>
         ) : null}
-		{view.evernote_available ? (
+		{view.evernote_available && details.media_id?.source !== 'radio' ? (
 			<Action onClick={() => void dispatch('OpenEvernoteNote')}>Save audio to Evernote</Action>
 		) : null}
 		{view.archive_upload_supported && view.archive_upload_available && isYouTube ? (

@@ -4795,7 +4795,13 @@ fn render_information_panel(
         );
     }
     #[cfg(feature = "evernote")]
-    if show_text_selection && view.evernote_available {
+    if show_text_selection
+        && view.evernote_available
+        && !details
+            .media_id
+            .as_ref()
+            .is_some_and(|id| id.source == SourceKind::Radio)
+    {
         push_right_detail_button(
             &mut lines,
             &mut right_buttons,
@@ -7394,7 +7400,18 @@ fn render_seek_bar(
         .then_some("● REC  ")
         .unwrap_or_default();
     let recording_active = !recording_prefix.is_empty();
-    let status_prefix = if view.playback.live {
+    let radio = view.playback.live
+        && view
+            .playing_media_id
+            .as_ref()
+            .is_some_and(|id| id.source == SourceKind::Radio);
+    let status_prefix = if radio {
+        format!(
+            "{recording_prefix}radio  {}×  vol {}%{state_suffix}{title_spacing}",
+            trim_speed(view.playback.speed),
+            view.playback.volume
+        )
+    } else if view.playback.live {
         if live_seekable {
             format!(
                 "{recording_prefix}LIVE −{} / {} buffer  {}×  vol {}%{state_suffix}{title_spacing}",
@@ -33132,6 +33149,85 @@ for encoded, expected in json.load(sys.stdin):
         assert!(
             hit_map.now_playing.is_some(),
             "the live title must remain a navigation target"
+        );
+    }
+
+    /// Radio's cache is seekable storage, not a finite programme duration.
+    #[test]
+    fn radio_seek_status_uses_plain_label_without_losing_controls() {
+        for seekable in [false, true] {
+            let mut terminal = Terminal::new(TestBackend::new(160, 2)).unwrap();
+            let view = ViewModel {
+                playing_media_id: Some(MediaId::new(SourceKind::Radio, "station")),
+                radio_now_playing: Some("Track: Artist — Track".into()),
+                playback: PlaybackStatus {
+                    idle: false,
+                    live: true,
+                    paused: true,
+                    volume: 70,
+                    speed: 1.0,
+                    title: Some("Fixture station".into()),
+                    position: Duration::from_secs(86400),
+                    duration: Some(Duration::from_secs(86400)),
+                    live_seekable_range: seekable.then_some(crate::playback::BufferedRange {
+                        start: Duration::ZERO,
+                        end: Duration::from_secs(86400),
+                    }),
+                    ..PlaybackStatus::default()
+                },
+                ..ViewModel::default()
+            };
+            let mut hit_map = HitMap::default();
+            terminal
+                .draw(|frame| {
+                    render_seek_bar(
+                        frame,
+                        frame.area(),
+                        &view,
+                        &UiSettings::default(),
+                        &Theme::new(false),
+                        &mut hit_map,
+                    )
+                })
+                .unwrap();
+            let rendered = rendered_text(&terminal);
+            assert!(rendered.contains("radio  1×  vol 70%"));
+            assert!(rendered.contains("Fixture station · Track: Artist — Track"));
+            assert!(
+                !rendered.contains("LIVE")
+                    && !rendered.contains("24:00:00")
+                    && !rendered.contains(" buffer")
+            );
+            assert_eq!(!hit_map.seek_bar.is_empty(), seekable);
+            assert!(hit_map.now_playing.is_some());
+        }
+    }
+
+    /// Live stations cannot become finite Evernote audio resources.
+    #[cfg(feature = "evernote")]
+    #[test]
+    fn radio_details_hide_direct_evernote_upload() {
+        let view = ViewModel {
+            screen: Screen::Radio,
+            evernote_available: true,
+            details: Some(DetailView {
+                media_id: Some(MediaId::new(SourceKind::Radio, "station")),
+                title: "Live station".into(),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(140, 32)).unwrap();
+        let mut hit_map = HitMap::default();
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .unwrap();
+        assert!(!rendered_text(&terminal).contains("Save audio to Evernote"));
+        assert!(
+            !hit_map
+                .detail_buttons
+                .iter()
+                .any(|(action, _)| *action == UiAction::OpenEvernoteNote)
         );
     }
 
