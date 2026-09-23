@@ -10,6 +10,7 @@
 [![Maintainability](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_youta&metric=sqale_rating)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_youta)
 [![Reliability](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_youta&metric=reliability_rating)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_youta)
 [![Security](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_youta&metric=security_rating)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_youta)
+[![Production code only](docs/badges/production-code.svg)](docs/PRODUCTION_CODE.md)
 [![Lines of Code](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_youta&metric=ncloc)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_youta)
 [![Technical Debt](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_youta&metric=sqale_index)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_youta)
 

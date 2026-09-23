@@ -80,6 +80,20 @@ fn shared_ci_retains_branch_triggers_and_declares_boolean_release_mode() {
     assert!(job(&ci, "coverage").contains("--fail-under-lines 70"));
 }
 
+/// The production-code badge must be tested and rejected when its count is stale.
+#[test]
+fn production_code_badge_has_a_read_only_reproducible_gate() {
+    let ci = workflow("ci.yml");
+    let badge = job(&ci, "production-code");
+    assert!(badge.contains("timeout-minutes: 360"));
+    assert!(badge.contains("scripts/production-loc-requirements.txt"));
+    assert!(badge.contains("test_production_loc.py"));
+    assert!(badge.contains("scripts/production_loc.py --check"));
+    assert!(!badge.contains("contents: write"));
+    assert!(!badge.contains("--write"));
+    assert!(!badge.contains("continue-on-error:"));
+}
+
 /// Consolidation must retain behavior and documentation checks formerly in Release.
 #[test]
 fn shared_feature_matrix_preserves_release_only_boundaries() {

@@ -35,6 +35,28 @@ env:
   RUST_VERSION: 1.95.0
 
 jobs:
+  production-code:
+    name: Production-code badge
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@v6
+
+      - name: Install development-only source parsers
+        run: |
+          python3 -m venv "${RUNNER_TEMP}/production-loc"
+          "${RUNNER_TEMP}/production-loc/bin/python" -m pip install \
+            -r scripts/production-loc-requirements.txt
+
+      - name: Test production-code exclusions
+        run: >-
+          "${RUNNER_TEMP}/production-loc/bin/python" -m unittest discover
+          -s scripts/tests -p 'test_production_loc.py'
+
+      - name: Check the README badge is current
+        run: '"${RUNNER_TEMP}/production-loc/bin/python" scripts/production_loc.py --check'
+
   lint:
     name: Formatting, Clippy, and Rustdoc
     runs-on: ubuntu-24.04
