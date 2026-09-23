@@ -67,14 +67,14 @@ pub use crate::view::*;
 
 use crate::keymap::{Key, KeyPress, PopupGeometry, ScrollGeometry};
 
-/// Fixed-width marker rendered for the same actively playing Commons value.
-const WIKIDATA_MEDIA_PAUSE_SYMBOL: &str = "⏸";
+/// Two ASCII cells keep the pause action legible with basic TTY fonts.
+const WIKIDATA_MEDIA_PAUSE_SYMBOL: &str = "||";
 
 /// Marker shown while the current media is playing.
 const PLAYBACK_PLAYING_SYMBOL: &str = "▶";
 
-/// Marker shown while the current media is paused.
-const PLAYBACK_PAUSED_SYMBOL: &str = "⏸";
+/// Two-cell ASCII marker shown while the current media is paused.
+const PLAYBACK_PAUSED_SYMBOL: &str = "||";
 
 /// Chapter navigation always occupies at most one row above the seek track.
 const CHAPTER_LABEL_ROWS: u16 = 1;
@@ -6223,7 +6223,7 @@ fn render_information_panel(
         } else {
             std::borrow::Cow::Borrowed(&details.video_links)
         };
-        let description_lines = wrap_description_source(
+        let description_lines = wrap_description_source_with_character_width(
             body_source,
             usize::from(description_text_area.width.max(1)),
             if body_is_wikidata { &[] } else { &video_links },
@@ -6231,6 +6231,23 @@ fn render_information_panel(
                 &[]
             } else {
                 &details.description_url_escapes
+            },
+            |offset, character| {
+                // Keep the provider's source bytes and link offsets intact,
+                // but reserve both cells of the active ASCII pause control.
+                if body_is_wikidata
+                    && character == '▶'
+                    && !view.playback.idle
+                    && !view.playback.paused
+                    && wikidata_media_controls.iter().any(|control| {
+                        control.marker_start_byte == offset
+                            && view.playing_media_id.as_ref() == Some(&control.media_id)
+                    })
+                {
+                    usize::from(terminal_text_width(WIKIDATA_MEDIA_PAUSE_SYMBOL))
+                } else {
+                    Span::raw(character.to_string()).width()
+                }
             },
         );
         let visible_lines = usize::from(description_text_area.height);
@@ -14336,6 +14353,27 @@ fn wrap_description_source(
     video_links: &[DetailVideoLinkView],
     url_escapes: &[DetailUrlEscapeView],
 ) -> Vec<WrappedSourceLine> {
+    wrap_description_source_with_character_width(
+        description,
+        width,
+        video_links,
+        url_escapes,
+        |_, character| Span::raw(character.to_string()).width(),
+    )
+}
+
+/// Accounts for painted marker widths without changing source/link byte ranges.
+///
+/// The callback receives the original byte offset and character. Ordinary
+/// descriptions use native character widths; Wikidata's active pause control
+/// substitutes two ASCII cells for its one-cell play marker.
+fn wrap_description_source_with_character_width(
+    description: &str,
+    width: usize,
+    video_links: &[DetailVideoLinkView],
+    url_escapes: &[DetailUrlEscapeView],
+    character_width: impl Fn(usize, char) -> usize,
+) -> Vec<WrappedSourceLine> {
     let width = width.max(1);
     let action_width = usize::from(terminal_text_width(DESCRIPTION_VIDEO_ACTION_SYMBOL));
     let mut action_indexes = video_links
@@ -14408,7 +14446,7 @@ fn wrap_description_source(
             }
 
             let character_end = absolute_byte.saturating_add(character.len_utf8());
-            let character_width = Span::raw(character.to_string()).width();
+            let character_width = character_width(absolute_byte, character);
             if builder.width > 0 && builder.width.saturating_add(character_width) > width {
                 wrapped.push(builder.finish());
                 builder = WrappedSourceLineBuilder::new(absolute_byte);
@@ -17738,7 +17776,8 @@ for encoded, expected in json.load(sys.stdin):
             .expect("draw independent playing and selected rows");
         let buffer = terminal.backend().buffer();
 
-        assert_eq!(buffer[(0, 1)].symbol(), "⏸");
+        assert_eq!(buffer[(0, 1)].symbol(), "|");
+        assert_eq!(buffer[(1, 1)].symbol(), "|");
         assert_eq!(buffer[(0, 1)].fg, Color::Cyan);
         assert_eq!(buffer[(0, 3)].symbol(), " ");
         assert_eq!(buffer[(0, 3)].bg, Color::Cyan);
@@ -17746,9 +17785,9 @@ for encoded, expected in json.load(sys.stdin):
             buffer
                 .content()
                 .iter()
-                .filter(|cell| cell.symbol() == "⏸")
+                .filter(|cell| cell.symbol() == "|")
                 .count(),
-            1
+            2
         );
 
         view.playback.paused = false;
@@ -22106,20 +22145,21 @@ for encoded, expected in json.load(sys.stdin):
         let buffer = terminal.backend().buffer();
         let playing_row = hit_map.rows.y;
         let selected_row = playing_row.saturating_add(1);
-        assert_eq!(buffer[(hit_map.rows.x, playing_row)].symbol(), "⏸");
-        let playing_title = &buffer[(hit_map.rows.x.saturating_add(4), playing_row)];
+        assert_eq!(buffer[(hit_map.rows.x, playing_row)].symbol(), "|");
+        assert_eq!(buffer[(hit_map.rows.x + 1, playing_row)].symbol(), "|");
+        let playing_title = &buffer[(hit_map.rows.x.saturating_add(5), playing_row)];
         assert_eq!(playing_title.symbol(), "p");
         assert!(playing_title.modifier.contains(Modifier::BOLD));
         assert_eq!(playing_title.fg, Color::Cyan);
         assert_ne!(
             buffer[(hit_map.rows.x, selected_row)].symbol(),
-            "⏸",
+            "|",
             "selection must not move the playback marker"
         );
         assert_eq!(
             [playing_row, selected_row]
                 .into_iter()
-                .filter(|row| buffer[(hit_map.rows.x, *row)].symbol() == "⏸")
+                .filter(|row| buffer[(hit_map.rows.x, *row)].symbol() == "|")
                 .count(),
             1
         );
@@ -30473,7 +30513,7 @@ for encoded, expected in json.load(sys.stdin):
             .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
             .expect("draw active Wikidata media");
         let rendered = rendered_text(&terminal);
-        assert!(rendered.contains("⏸ Spoken fixture.opus"));
+        assert!(rendered.contains("|| Spoken fixture.opus"));
         assert!(rendered.contains("▶ Video fixture.webm"));
 
         let control_areas = [0, 1].map(|index| {
@@ -30533,9 +30573,124 @@ for encoded, expected in json.load(sys.stdin):
             .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
             .expect("draw paused Wikidata media");
         let rendered = rendered_text(&terminal);
-        assert!(!rendered.contains("⏸ Spoken fixture.opus"));
+        assert!(!rendered.contains("|| Spoken fixture.opus"));
         assert!(rendered.contains("▶ Spoken fixture.opus"));
         assert!(rendered.contains("▶ Video fixture.webm"));
+    }
+
+    /// The ASCII pause control needs two cells without dropping linked source text.
+    #[test]
+    fn ascii_pause_wikidata_wrapping_keeps_filenames_and_click_targets() {
+        let filename = "Fixture.opus";
+        let text = format!("abcd▶ {filename}");
+        let marker_start_byte = text.find('▶').unwrap();
+        let filename_start_byte = text.find(filename).unwrap();
+        let webpage_url =
+            url::Url::parse("https://commons.wikimedia.org/wiki/File:Fixture.opus").unwrap();
+        let media_id = MediaId::new(SourceKind::WikimediaCommons, webpage_url.to_string());
+        let mut view = ViewModel {
+            details: Some(DetailView {
+                expanded_wikidata_item: Some("Q42".to_owned()),
+                wikidata_entities: vec![DetailWikidataEntityView {
+                    item_id: "Q42".to_owned(),
+                    text: text.clone(),
+                    value_links: vec![DetailWikidataValueLinkView {
+                        start_byte: filename_start_byte,
+                        end_byte: text.len(),
+                        url: webpage_url.to_string(),
+                    }],
+                    media_controls: vec![DetailWikidataMediaView {
+                        marker_start_byte,
+                        marker_end_byte: marker_start_byte + "▶".len(),
+                        media_id: media_id.clone(),
+                        kind: MediaKind::Audio,
+                        title: filename.to_owned(),
+                        webpage_url: webpage_url.clone(),
+                        playback_url: url::Url::parse(
+                            "https://commons.wikimedia.org/wiki/Special:Redirect/file/Fixture.opus",
+                        )
+                        .unwrap(),
+                    }],
+                    image_url: None,
+                }],
+                ..DetailView::default()
+            }),
+            details_focused: true,
+            selected_wikidata_media: Some(0),
+            playing_media_id: Some(media_id),
+            playback: PlaybackStatus {
+                idle: false,
+                paused: false,
+                ..PlaybackStatus::default()
+            },
+            ..ViewModel::default()
+        };
+        // The panel reserves one column for its scrollbar. These widths put
+        // the marker and linked filename exactly at several wrapping edges.
+        for width in [6, 7, 9, 18] {
+            for paused in [false, true] {
+                view.playback.paused = paused;
+                let mut terminal = Terminal::new(TestBackend::new(width, 40)).unwrap();
+                let mut hit_map = HitMap::default();
+                terminal
+                    .draw(|frame| {
+                        render_details(
+                            frame,
+                            frame.area(),
+                            &view,
+                            false,
+                            DEFAULT_THUMBNAIL_HEIGHT,
+                            &Theme::new(false),
+                            &mut hit_map,
+                            None,
+                        );
+                    })
+                    .unwrap();
+                let marker = hit_map
+                    .detail_buttons
+                    .iter()
+                    .find_map(|(action, area)| {
+                        (*action == UiAction::ActivateWikidataMedia(0)).then_some(*area)
+                    })
+                    .expect("visible media control");
+                assert_eq!(marker.width, if paused { 1 } else { 2 });
+                assert!(marker.right() < width, "the scrollbar is not a button");
+                let mut linked_filename = String::new();
+                for (action, area) in &hit_map.detail_buttons {
+                    if *action == UiAction::OpenWikidataValue(webpage_url.to_string()) {
+                        linked_filename.extend(
+                            (area.x..area.right()).map(|column| {
+                                terminal.backend().buffer()[(column, area.y)].symbol()
+                            }),
+                        );
+                    } else if *action != UiAction::ActivateWikidataMedia(0) {
+                        continue;
+                    }
+                    for column in area.x..area.right() {
+                        assert_eq!(
+                            mouse_action(
+                                MouseEvent {
+                                    kind: MouseEventKind::Down(MouseButton::Left),
+                                    column,
+                                    row: area.y,
+                                    modifiers: KeyModifiers::NONE,
+                                },
+                                &hit_map,
+                                &view,
+                            ),
+                            Some(action.clone()),
+                        );
+                    }
+                }
+                assert_eq!(linked_filename, filename, "width {width}, paused {paused}");
+                let marker_text = (marker.x..marker.right())
+                    .map(|column| terminal.backend().buffer()[(column, marker.y)].symbol())
+                    .collect::<String>();
+                assert_eq!(marker_text, if paused { "▶" } else { "||" });
+                assert!(!rendered_text(&terminal).contains('\u{23f8}'));
+            }
+        }
+        assert_eq!(view.details.unwrap().wikidata_entities[0].text, text);
     }
 
     /// Native Archive waveforms reuse the visible source instead of a second disk request.
@@ -34577,7 +34732,7 @@ prose 07:25 remains clickable but is not a chapter";
         let status_row = (0..120)
             .map(|x| terminal.backend().buffer()[(x, 1)].symbol())
             .collect::<String>();
-        let expected = "18:28 / 1:33:06  1×  vol 80% ⏸";
+        let expected = "18:28 / 1:33:06  1×  vol 80% ||";
         assert!(!track_row.contains(expected));
         assert!(status_row.contains(expected));
     }
@@ -34612,7 +34767,8 @@ prose 07:25 remains clickable but is not a chapter";
             })
             .expect("draw paused seek status");
         let paused = rendered_text(&terminal);
-        assert!(paused.contains("vol 80% ⏸"));
+        assert!(paused.contains("vol 80% ||"));
+        assert!(!paused.contains('\u{23f8}'));
         assert!(!paused.contains("paused"));
         assert!(!paused.contains("playing"));
 
@@ -34654,7 +34810,7 @@ prose 07:25 remains clickable but is not a chapter";
         let idle = rendered_text(&terminal);
         assert!(idle.contains("vol 80%"));
         assert!(!idle.contains("vol 80% ▶"));
-        assert!(!idle.contains("vol 80% ⏸"));
+        assert!(!idle.contains("vol 80% ||"));
     }
 
     #[test]

@@ -551,9 +551,13 @@
 		snapshot({ playing_media_id: mediaId, now_playing: { media_id: mediaId, title: 'First fixture track', subtitle: 'archive.org' } });
 		tick({ idle: false, paused: false, position: { secs: 1, nanos: 0 }, duration: { secs: 120, nanos: 0 } });
 		await until(() => button('Pause') && !document.querySelector('[aria-label="Playback position"]').disabled, 'playing controls');
+		assert(button('Pause').textContent.trim() === '||', 'Pause uses two ASCII bars without a special-font dependency');
+		await action('TogglePause', () => button('Pause').click(), 'ASCII pause control retains the shared playback action');
 		checks.push('Playing snapshot enables transport and seek controls');
 		tick({ paused: true, position: { secs: 120, nanos: 0 } });
 		await until(() => button('Play') && !button('Play').disabled, 'retained EOF pause');
+		assert(button('Play').textContent.trim() === '▶', 'Replacing the pause marker does not change the play control');
+		await action('TogglePause', () => button('Play').click(), 'Play control retains the shared playback action');
 		assert(!document.querySelector('[aria-label="Playback position"]').disabled, 'Retained EOF snapshot keeps the seekbar enabled');
 		await action({ SeekRelative: -5 }, () => button('Back 5 seconds').click(), 'EOF back-seek forwards the same relative-seek action');
 		tick({ paused: false, position: { secs: 115, nanos: 0 } });

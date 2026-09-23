@@ -243,7 +243,7 @@ export function Player({
             onClick={() => void dispatch("TogglePause")}
             className="h-[26px] min-w-[32px] rounded-[5px] border border-accent bg-accent px-[7px] text-[13px] leading-none text-ground disabled:opacity-40 hover:brightness-110 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
           >
-            {playback.paused ? "▶" : "⏸"}
+            {playback.paused ? '▶' : '||'}
           </button>
           <Control label="Forward 5 seconds" disabled={!seekable} onClick={() => void dispatch({ SeekRelative: SEEK_STEP_SECONDS })}>
             ↷
