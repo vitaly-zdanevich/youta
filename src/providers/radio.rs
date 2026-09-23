@@ -832,7 +832,181 @@ impl RadioStationPreset {
 /// Some stations intentionally use HTTP because that is the endpoint published
 /// by the station. Users should treat those streams as unauthenticated and
 /// susceptible to network interception.
+///
+/// Relax FM's thirteen themed presets follow its [official channel directory](https://relax-fm.ru/channels).
+/// Public GPM stream paths and decoded quality were verified on 2026-09-23;
+/// no expiring server-list tokens are stored. The Covers stream is 256 kbps,
+/// despite the legacy `/128/` segment in its published endpoint.
 pub const STATIONS: &[RadioStationPreset] = &[
+    RadioStationPreset {
+        id: "relax-fm-weekend",
+        name: "Relax FM — Музыка для выходного дня",
+        homepage: "https://relax-fm.ru/channels/265",
+        stream: "https://srv01.gpmradio.ru/stream/trust/mp3/128/265",
+        summary: "Relax FM's relaxed melodies for a quiet weekend.",
+        codec: Some(RadioCodec::Mp3),
+        bitrate_kbps: Some(128),
+        sample_rate_hz: Some(44_100),
+        channels: Some(2),
+        stream_kind: RadioStreamKind::Direct,
+        now_playing: None,
+    },
+    RadioStationPreset {
+        id: "relax-fm-inspiration",
+        name: "Relax FM — Музыка для вдохновения",
+        homepage: "https://relax-fm.ru/channels/471",
+        stream: "https://srv01.gpmradio.ru/stream/trust/mp3/128/471",
+        summary: "Relax FM's gentle music for inspiration and creativity.",
+        codec: Some(RadioCodec::Mp3),
+        bitrate_kbps: Some(128),
+        sample_rate_hz: Some(44_100),
+        channels: Some(2),
+        stream_kind: RadioStreamKind::Direct,
+        now_playing: None,
+    },
+    RadioStationPreset {
+        id: "relax-fm-walk",
+        name: "Relax FM — Музыка для прогулок",
+        homepage: "https://relax-fm.ru/channels/266",
+        stream: "https://srv01.gpmradio.ru/stream/trust/mp3/128/266",
+        summary: "Relax FM's easy-listening music for relaxed walks.",
+        codec: Some(RadioCodec::Mp3),
+        bitrate_kbps: Some(128),
+        sample_rate_hz: Some(44_100),
+        channels: Some(2),
+        stream_kind: RadioStreamKind::Direct,
+        now_playing: None,
+    },
+    RadioStationPreset {
+        id: "relax-fm-covers",
+        name: "Relax FM — Релакс-Каверы",
+        homepage: "https://relax-fm.ru/channels/788",
+        stream: "https://srv01.gpmradio.ru/stream/trust/mp3/128/788",
+        summary: "Relax FM's mellow cover versions of familiar songs.",
+        codec: Some(RadioCodec::Mp3),
+        bitrate_kbps: Some(256),
+        sample_rate_hz: Some(44_100),
+        channels: Some(2),
+        stream_kind: RadioStreamKind::Direct,
+        now_playing: None,
+    },
+    RadioStationPreset {
+        id: "relax-fm-driving",
+        name: "Relax FM — Музыка для автомобиля",
+        homepage: "https://relax-fm.ru/channels/475",
+        stream: "https://srv01.gpmradio.ru/stream/trust/mp3/128/475",
+        summary: "Relax FM's calm music for relaxed driving.",
+        codec: Some(RadioCodec::Mp3),
+        bitrate_kbps: Some(128),
+        sample_rate_hz: Some(44_100),
+        channels: Some(2),
+        stream_kind: RadioStreamKind::Direct,
+        now_playing: None,
+    },
+    RadioStationPreset {
+        id: "relax-fm-meditation",
+        name: "Relax FM — Музыка для медитации",
+        homepage: "https://relax-fm.ru/channels/461",
+        stream: "https://srv01.gpmradio.ru/stream/trust/mp3/128/461",
+        summary: "Relax FM's peaceful music for meditation and relaxation.",
+        codec: Some(RadioCodec::Mp3),
+        bitrate_kbps: Some(128),
+        sample_rate_hz: Some(44_100),
+        channels: Some(2),
+        stream_kind: RadioStreamKind::Direct,
+        now_playing: None,
+    },
+    RadioStationPreset {
+        id: "relax-fm-evening",
+        name: "Relax FM — Музыка для вечера",
+        homepage: "https://relax-fm.ru/channels/470",
+        stream: "https://srv01.gpmradio.ru/stream/trust/mp3/128/470",
+        summary: "Relax FM's gentle evening music for winding down.",
+        codec: Some(RadioCodec::Mp3),
+        bitrate_kbps: Some(128),
+        sample_rate_hz: Some(44_100),
+        channels: Some(2),
+        stream_kind: RadioStreamKind::Direct,
+        now_playing: None,
+    },
+    RadioStationPreset {
+        id: "relax-fm-home",
+        name: "Relax FM — Музыка для дома",
+        homepage: "https://relax-fm.ru/channels/264",
+        stream: "https://srv01.gpmradio.ru/stream/trust/mp3/128/264",
+        summary: "Relax FM's comfortable background music for home.",
+        codec: Some(RadioCodec::Mp3),
+        bitrate_kbps: Some(128),
+        sample_rate_hz: Some(44_100),
+        channels: Some(2),
+        stream_kind: RadioStreamKind::Direct,
+        now_playing: None,
+    },
+    RadioStationPreset {
+        id: "relax-fm-lounge",
+        name: "Relax FM — Релакс-Лаунж",
+        homepage: "https://relax-fm.ru/channels/791",
+        stream: "https://srv01.gpmradio.ru/stream/trust/mp3/128/791",
+        summary: "Relax FM's lounge music and relaxed background listening.",
+        codec: Some(RadioCodec::Mp3),
+        bitrate_kbps: Some(128),
+        sample_rate_hz: Some(44_100),
+        channels: Some(2),
+        stream_kind: RadioStreamKind::Direct,
+        now_playing: None,
+    },
+    RadioStationPreset {
+        id: "relax-fm-nature",
+        name: "Relax FM — Наедине с природой",
+        homepage: "https://relax-fm.ru/channels/263",
+        stream: "https://srv01.gpmradio.ru/stream/trust/mp3/128/263",
+        summary: "Relax FM's nature-inspired relaxing music.",
+        codec: Some(RadioCodec::Mp3),
+        bitrate_kbps: Some(128),
+        sample_rate_hz: Some(44_100),
+        channels: Some(2),
+        stream_kind: RadioStreamKind::Direct,
+        now_playing: None,
+    },
+    RadioStationPreset {
+        id: "relax-fm-office",
+        name: "Relax FM — Музыка для офиса",
+        homepage: "https://relax-fm.ru/channels/267",
+        stream: "https://srv01.gpmradio.ru/stream/trust/mp3/128/267",
+        summary: "Relax FM's light background music for work and concentration.",
+        codec: Some(RadioCodec::Mp3),
+        bitrate_kbps: Some(128),
+        sample_rate_hz: Some(44_100),
+        channels: Some(2),
+        stream_kind: RadioStreamKind::Direct,
+        now_playing: None,
+    },
+    RadioStationPreset {
+        id: "relax-fm-morning",
+        name: "Relax FM — Легкое пробуждение",
+        homepage: "https://relax-fm.ru/channels/468",
+        stream: "https://srv01.gpmradio.ru/stream/trust/mp3/128/468",
+        summary: "Relax FM's gentle music for waking up.",
+        codec: Some(RadioCodec::Mp3),
+        bitrate_kbps: Some(128),
+        sample_rate_hz: Some(44_100),
+        channels: Some(2),
+        stream_kind: RadioStreamKind::Direct,
+        now_playing: None,
+    },
+    RadioStationPreset {
+        id: "relax-fm-babies",
+        name: "Relax FM — Музыка для малышей",
+        homepage: "https://relax-fm.ru/channels/462",
+        stream: "https://srv01.gpmradio.ru/stream/trust/mp3/128/462",
+        summary: "Relax FM's calm music for babies.",
+        codec: Some(RadioCodec::Mp3),
+        bitrate_kbps: Some(128),
+        sample_rate_hz: Some(44_100),
+        channels: Some(2),
+        stream_kind: RadioStreamKind::Direct,
+        now_playing: None,
+    },
     RadioStationPreset {
         id: "sector-radio-progressive-flac",
         name: "Sector Radio — Progressive",
@@ -1998,6 +2172,76 @@ mod tests {
     };
 
     use super::*;
+
+    /// Public channel IDs and titles from the official Relax FM channels page,
+    /// checked on 2026-09-23; city FM relays are a separate catalogue.
+    #[test]
+    fn relax_fm_presets_cover_all_thirteen_official_themed_channels() {
+        let expected = [
+            ("relax-fm-weekend", "265", "Музыка для выходного дня"),
+            ("relax-fm-inspiration", "471", "Музыка для вдохновения"),
+            ("relax-fm-walk", "266", "Музыка для прогулок"),
+            ("relax-fm-covers", "788", "Релакс-Каверы"),
+            ("relax-fm-driving", "475", "Музыка для автомобиля"),
+            ("relax-fm-meditation", "461", "Музыка для медитации"),
+            ("relax-fm-evening", "470", "Музыка для вечера"),
+            ("relax-fm-home", "264", "Музыка для дома"),
+            ("relax-fm-lounge", "791", "Релакс-Лаунж"),
+            ("relax-fm-nature", "263", "Наедине с природой"),
+            ("relax-fm-office", "267", "Музыка для офиса"),
+            ("relax-fm-morning", "468", "Легкое пробуждение"),
+            ("relax-fm-babies", "462", "Музыка для малышей"),
+        ];
+        assert_eq!(
+            all_stations()
+                .filter(|station| station.id.starts_with("relax-fm-"))
+                .count(),
+            expected.len()
+        );
+        for (id, channel, title) in expected {
+            let station = station_by_id(id)
+                .unwrap_or_else(|| panic!("missing official Relax FM channel: {id}"));
+            assert_eq!(station.name, format!("Relax FM — {title}"));
+            assert_eq!(
+                station.homepage,
+                format!("https://relax-fm.ru/channels/{channel}")
+            );
+            assert_eq!(
+                station.stream,
+                format!("https://srv01.gpmradio.ru/stream/trust/mp3/128/{channel}")
+            );
+            let stream = station.stream_url().unwrap();
+            assert!(
+                stream.query().is_none(),
+                "public streams must not persist expiring API tokens"
+            );
+            assert_eq!(station.stream_kind, RadioStreamKind::Direct);
+            assert_eq!(station.codec, Some(RadioCodec::Mp3));
+            assert_eq!(station.sample_rate_hz, Some(44_100));
+            assert_eq!(station.channels, Some(2));
+            assert!(!station.summary.trim().is_empty());
+            assert_eq!(
+                station.now_playing, None,
+                "no extra unsupported metadata polling"
+            );
+        }
+    }
+
+    /// Decoded MP3 frames and ICY headers override the misleading `/128/` Covers path.
+    #[test]
+    fn relax_fm_quality_uses_verified_audio_bitrate_not_the_endpoint_path() {
+        assert_eq!(
+            station_by_id("relax-fm-covers")
+                .expect("Covers channel")
+                .bitrate_kbps,
+            Some(256)
+        );
+        for station in all_stations().filter(|station| {
+            station.id.starts_with("relax-fm-") && station.id != "relax-fm-covers"
+        }) {
+            assert_eq!(station.bitrate_kbps, Some(128), "{}", station.id);
+        }
+    }
 
     #[test]
     fn station_identifiers_are_unique_and_nonempty() {
