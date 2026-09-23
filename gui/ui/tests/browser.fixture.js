@@ -445,6 +445,20 @@
 		await until(() => !button('[Esc] Back'), 'Back hidden after returning to root');
 		checks.push('Archive Back disappears when its last return route is consumed');
 
+		// A linked licence belongs in the link list, without a duplicate facts row.
+		snapshot({ details: { ...details('Licensed archive item'), archive_file_counts: { total: 42, playable: 12 }, license: 'CC BY-NC-ND 3.0', links: [{
+			prefix: 'License: ', label: 'CC BY-NC-ND 3.0', url: 'https://creativecommons.org/licenses/by-nc-nd/3.0/',
+			presentation: 'LabelAndUrl', description_range: null, internal_target: null, wikidata_item_id: null,
+		}] } });
+		await until(() => button('CC BY-NC-ND 3.0'), 'linked archive licence');
+		assert(document.querySelector('[aria-label=Details]').textContent.includes('42 total · 12 playable'), 'Archive displays file counts from loaded item metadata');
+		assert([...document.querySelectorAll('[aria-label=Details] dt')].every((node) => node.textContent !== 'License'), 'Archive keeps its linked licence without a duplicate fact');
+		await action({ ActivateDetailLink: 0 }, () => button('CC BY-NC-ND 3.0').click(), 'Archive licence remains clickable');
+		snapshot({ details: { ...view.details, archive_file_counts: { total: 0, playable: 0 } } });
+		await until(() => document.querySelector('[aria-label=Details]').textContent.includes('0 total · 0 playable'), 'known empty Archive item displays zero counts');
+		snapshot({ details: { ...view.details, archive_file_counts: null } });
+		await until(() => ![...document.querySelectorAll('[aria-label=Details] dt')].some((node) => node.textContent === 'Files'), 'unknown Archive counts do not invent zero');
+
 		// Expansion is a shared controller state, not an independent browser modal.
 		const waveformDetails = { ...details('Waveform fixture'), thumbnail_url: waveformUrl,
 			expanded_thumbnail_url: waveformUrl, thumbnail_expanded: false };

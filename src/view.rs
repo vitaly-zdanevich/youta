@@ -830,6 +830,15 @@ pub struct SoundCloudDetailsView {
     pub preview_duration_seconds: Option<u64>,
 }
 
+/// Archive.org inventory counts supplied only after item metadata is known.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct ArchiveOrgFileCountsView {
+    /// All file records, including images, metadata and inaccessible files.
+    pub total: u64,
+    /// Individually playable original/derivative files, not logical track groups.
+    pub playable: u64,
+}
+
 /// Details for the selected media item.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct DetailView {
@@ -894,6 +903,8 @@ pub struct DetailView {
     pub license: String,
     /// Additional source-specific facts for a SoundCloud track.
     pub soundcloud: Option<SoundCloudDetailsView>,
+    /// Exact Archive.org file inventory; absent while unknown or unavailable.
+    pub archive_file_counts: Option<ArchiveOrgFileCountsView>,
     /// Whether the selected Radio station is stored in persistent favorites.
     pub radio_favorite: bool,
     /// Local playlists that currently contain this media item.

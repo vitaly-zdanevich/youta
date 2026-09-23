@@ -761,6 +761,19 @@ impl AppController {
             .as_ref()
             .and_then(|details| details.tracks.get(self.view.selected));
         let mut detail = detail_view(&item, track);
+        detail.archive_file_counts = self
+            .archive_org
+            .active
+            .clone()
+            .or_else(|| {
+                self.cached_archive_details(&item.identifier)
+                    .and_then(Result::ok)
+            })
+            .and_then(|details| details.file_counts)
+            .map(|counts| crate::view::ArchiveOrgFileCountsView {
+                total: counts.total,
+                playable: counts.playable,
+            });
         if self.archive_org.active.is_none()
             && self.cached_archive_details(&item.identifier).is_none()
         {
@@ -1952,8 +1965,42 @@ mod tests {
         Arc::new(ArchiveOrgItemDetails {
             item: value,
             tracks: vec![audio],
+            file_counts: None,
             comments: Vec::new(),
         })
+    }
+
+    /// Item-level counts remain available on both catalogue containers and selected files.
+    #[test]
+    fn archive_file_counts_follow_cached_and_active_metadata_without_extra_requests() {
+        let (_directory, mut controller) = lookup_controller();
+        controller.view.screen = Screen::ArchiveOrg;
+        let mut value = serde_json::to_value(lookup_details("fixture").as_ref()).unwrap();
+        value["file_counts"] = serde_json::json!({"total": 42, "playable": 12});
+        let details: Arc<ArchiveOrgItemDetails> = Arc::new(serde_json::from_value(value).unwrap());
+        controller.archive_org.items = vec![details.item.clone()];
+        controller
+            .archive_org
+            .cache
+            .push_back(("fixture".into(), Ok(Arc::clone(&details))));
+        for active in [false, true] {
+            controller.archive_org.active = active.then(|| Arc::clone(&details));
+            controller.populate_archive_org();
+            assert_eq!(
+                serde_json::to_value(controller.view.details.as_ref().unwrap()).unwrap()["archive_file_counts"],
+                serde_json::json!({"total": 42, "playable": 12})
+            );
+            assert!(controller.archive_org.worker.is_none());
+            assert!(controller.archive_org.pending.is_none());
+        }
+        controller.archive_org.active = None;
+        controller.archive_org.cache.clear();
+        controller
+            .archive_org
+            .cache
+            .push_back(("fixture".into(), Err("unavailable".into())));
+        controller.update_archive_org_detail();
+        assert!(serde_json::to_value(controller.view.details.as_ref().unwrap()).unwrap()["archive_file_counts"].is_null());
     }
 
     /// A gated metadata transport proves asynchronous ownership without accessing a real item.

@@ -106,6 +106,10 @@ function factsFor(kind: InformationPanelKind, details: DetailView): Array<[strin
     case "Generic":
 			// Archive.org supplies item-level statistics, not YouTube likes/views.
 			if (details.media_id?.source === 'archive-org') {
+				const files = details.archive_file_counts;
+				if (files !== null) {
+					rows.push(['Files', `${files.total.toLocaleString()} total · ${files.playable.toLocaleString()} playable`]);
+				}
 				rows.push(
 					['Length', fact(details.length)],
 					['Favourites', fact(details.likes)],
@@ -129,7 +133,11 @@ function factsFor(kind: InformationPanelKind, details: DetailView): Array<[strin
 			}
       break;
   }
-  rows.push(["Source", fact(details.source)], ["License", fact(details.license)]);
+	rows.push(['Source', fact(details.source)]);
+	// Keep plain rights notices, but avoid repeating an Archive licence with a link.
+	if (details.media_id?.source !== 'archive-org' || !details.links.some((link) => link.prefix === 'License: ')) {
+		rows.push(['License', fact(details.license)]);
+	}
   if (details.playlist_names.length > 0) {
     rows.push(["Playlists", details.playlist_names.join(", ")]);
   }

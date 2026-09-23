@@ -209,6 +209,12 @@ export interface SoundCloudDetailsView {
 	preview_duration_seconds: number | null;
 }
 
+/** Counts of metadata files and admitted playable variants, not grouped tracks. */
+export interface ArchiveOrgFileCountsView {
+	total: number;
+	playable: number;
+}
+
 /**
  * The Details panel.
  *
@@ -244,6 +250,8 @@ export interface DetailView {
   published: string;
   license: string;
 	soundcloud: SoundCloudDetailsView | null;
+	/** Absent until this item's metadata has been loaded. */
+	archive_file_counts: ArchiveOrgFileCountsView | null;
   radio_favorite: boolean;
   playlist_names: string[];
   has_private_note: boolean;

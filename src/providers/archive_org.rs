@@ -210,6 +210,15 @@ pub fn preferred_audio_variant(track: &ArchiveOrgTrack) -> Option<&ArchiveOrgDow
         .map(|(_, variant)| variant)
 }
 
+/// Exact metadata inventory counts, independent of logical track grouping.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ArchiveOrgFileCounts {
+    /// All raw file records, including non-media and restricted files.
+    pub total: u64,
+    /// Accepted audio/video encodings in playable audio families, counted individually.
+    pub playable: u64,
+}
+
 /// Complete bounded item metadata and selected tracks.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ArchiveOrgItemDetails {
@@ -217,6 +226,9 @@ pub struct ArchiveOrgItemDetails {
     pub item: ArchiveOrgItem,
     /// One encoding per original track, ordered by track number and filename.
     pub tracks: Vec<ArchiveOrgTrack>,
+    /// Known inventory counts; older snapshots do not invent zero-valued counts.
+    #[serde(default)]
+    pub file_counts: Option<ArchiveOrgFileCounts>,
     /// At most twenty public reviews represented as comments; stars stay text.
     pub comments: Vec<VideoComment>,
 }
@@ -457,6 +469,15 @@ impl ArchiveOrgClient {
         }
         Ok(ArchiveOrgItemDetails {
             item,
+            file_counts: Some(ArchiveOrgFileCounts {
+                total: files.len() as u64,
+                // Variants are already unique, validated, and partitioned by
+                // audio family. Counting them reuses the actual playback policy.
+                playable: tracks
+                    .iter()
+                    .map(|track| track.download_variants.len() as u64)
+                    .sum(),
+            }),
             tracks,
             comments,
         })
@@ -2450,6 +2471,48 @@ mod tests {
             "metadata": {"identifier": "mock_audio", "title": "Mock audio", "mediatype": "audio"},
             "files": files, "reviews": []
         })
+    }
+
+    /// Counts exact accepted encodings, not logical tracks or unsafe metadata records.
+    #[test]
+    fn archive_file_counts_include_variants_without_admitting_restricted_files() {
+        let files = json!([
+            {"name": "song.flac", "source": "original"},
+            {"name": "song.mp3", "source": "derivative", "original": "song.flac"},
+            {"name": "song.opus", "source": "derivative", "original": "song.flac"},
+            {"name": "concert.mp4", "source": "original", "format": "MPEG4"},
+            {"name": "concert.mp3", "source": "derivative", "original": "concert.mp4"},
+            {"name": "cover.jpg", "format": "JPEG"},
+            {"name": "metadata.xml", "format": "Metadata"},
+            {"name": "private.wav", "private": true},
+            {"name": "private.mp3", "original": "private.wav"},
+            {"name": "../unsafe.mp3"},
+            {"name": "cycle-a.mp3", "original": "cycle-b.mp3"},
+            {"name": "cycle-b.mp3", "original": "cycle-a.mp3"},
+            {"name": "standalone.mp4", "format": "MPEG4"},
+            {"name": "analysis.mp3", "format": "Spectrogram"},
+            {"format": "VBR MP3"}
+        ]);
+        let (client, transport) = mock_client(vec![bytes(&metadata(files))]);
+        let details = client.item_details("mock_audio").unwrap();
+        assert_eq!(details.tracks.len(), 2);
+        assert_eq!(
+            serde_json::to_value(&details).unwrap()["file_counts"],
+            json!({"total": 15, "playable": 5})
+        );
+        assert_eq!(transport.requests.lock().unwrap().len(), 2);
+    }
+
+    /// Known empty metadata differs from an older snapshot with no inventory count.
+    #[test]
+    fn archive_file_counts_preserve_known_zero_and_unknown_legacy_snapshots() {
+        let (client, _) = mock_client(vec![bytes(&metadata(json!([])))]);
+        let details = client.item_details("mock_audio").unwrap();
+        let mut snapshot = serde_json::to_value(details).unwrap();
+        assert_eq!(snapshot["file_counts"], json!({"total": 0, "playable": 0}));
+        snapshot.as_object_mut().unwrap().remove("file_counts");
+        let legacy: ArchiveOrgItemDetails = serde_json::from_value(snapshot).unwrap();
+        assert!(serde_json::to_value(legacy).unwrap()["file_counts"].is_null());
     }
 
     /// Archive's public JSON already contains this Latin-1-decoded legacy title.

@@ -5440,6 +5440,16 @@ fn render_information_panel(
                 }
             }
             if archive_org_details {
+                if let Some(files) = details.archive_file_counts.as_ref() {
+                    lines.push(Line::from(vec![
+                        Span::styled("Files: ", theme.muted),
+                        Span::raw(format!(
+                            "{} total · {} playable",
+                            format_count(files.total),
+                            format_count(files.playable)
+                        )),
+                    ]));
+                }
                 for (name, value, field) in [
                     (
                         "Length",
@@ -5495,11 +5505,14 @@ fn render_information_panel(
                 .map(Line::raw),
         );
     }
-    // Archive rights notices may be plain text and do not imply a standard licence.
-    if is_creative_commons_license(&details.license)
-        || is_librivox_public_domain_license(&details.source, &details.license)
-        || (archive_org_details && is_specified_archive_license(&details.license))
-        || (soundcloud_details && !details.license.is_empty())
+    // Archive rights notices without links still need a plain-text fallback.
+    let archive_linked_license =
+        archive_org_details && details.links.iter().any(|link| link.prefix == "License: ");
+    if !archive_linked_license
+        && (is_creative_commons_license(&details.license)
+            || is_librivox_public_domain_license(&details.source, &details.license)
+            || (archive_org_details && is_specified_archive_license(&details.license))
+            || (soundcloud_details && !details.license.is_empty()))
     {
         let label = display_license_label(&details.license);
         let mut spans = vec![Span::styled("License: ", theme.muted)];
@@ -28354,6 +28367,85 @@ for encoded, expected in json.load(sys.stdin):
                     "Actual Archive rights must stay visible without a licence URL: {license}"
                 );
             }
+        }
+    }
+
+    /// A linked Archive licence is rendered once; plain rights retain their fallback.
+    #[test]
+    fn archive_org_linked_license_is_not_repeated_above_artwork() {
+        let view = ViewModel {
+            screen: Screen::ArchiveOrg,
+            external_opener_available: true,
+            details: Some(DetailView {
+                media_id: Some(MediaId::new(SourceKind::ArchiveOrg, "fixture")),
+                license: "CC BY-NC-ND 3.0".to_owned(),
+                links: vec![DetailLinkView {
+                    prefix: "License: ".to_owned(),
+                    label: "CC BY-NC-ND 3.0".to_owned(),
+                    url: "https://creativecommons.org/licenses/by-nc-nd/3.0/".to_owned(),
+                    ..DetailLinkView::default()
+                }],
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(240, 40)).unwrap();
+        let mut hit_map = HitMap::default();
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .unwrap();
+        let rendered = rendered_text(&terminal);
+        assert_eq!(rendered.matches("License:").count(), 1);
+        assert!(rendered.contains("https://creativecommons.org/licenses/by-nc-nd/3.0/"));
+        assert!(hit_map.detail_links.iter().any(|(index, _)| *index == 0));
+    }
+
+    /// Only loaded Archive metadata supplies file counts, including a known zero.
+    #[test]
+    fn archive_org_file_counts_are_item_scoped_and_preserve_known_zero() {
+        for (counts, expected) in [
+            (
+                Some(crate::view::ArchiveOrgFileCountsView {
+                    total: 42,
+                    playable: 12,
+                }),
+                Some("Files: 42 total · 12 playable"),
+            ),
+            (
+                Some(crate::view::ArchiveOrgFileCountsView {
+                    total: 0,
+                    playable: 0,
+                }),
+                Some("Files: 0 total · 0 playable"),
+            ),
+            (None, None),
+        ] {
+            let mut view = ViewModel {
+                screen: Screen::ArchiveOrg,
+                details: Some(DetailView {
+                    media_id: Some(MediaId::new(SourceKind::ArchiveOrg, "fixture")),
+                    archive_file_counts: counts,
+                    ..DetailView::default()
+                }),
+                ..ViewModel::default()
+            };
+            let mut terminal = Terminal::new(TestBackend::new(160, 30)).unwrap();
+            let mut hit_map = HitMap::default();
+            terminal
+                .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+                .unwrap();
+            let rendered = rendered_text(&terminal);
+            if let Some(expected) = expected {
+                assert!(rendered.contains(expected));
+            } else {
+                assert!(!rendered.contains("Files:"));
+            }
+            view.details.as_mut().unwrap().media_id =
+                Some(MediaId::new(SourceKind::SoundCloud, "fixture"));
+            terminal
+                .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+                .unwrap();
+            assert!(!rendered_text(&terminal).contains("Files:"));
         }
     }
 

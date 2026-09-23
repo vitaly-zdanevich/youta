@@ -547,6 +547,10 @@ fn the_typescript_contract_names_only_fields_the_reducer_emits() {
         emitted_keys(&VideoCommentView::default()),
     );
     emitted.insert(
+        "ArchiveOrgFileCountsView",
+        emitted_keys(&youta::view::ArchiveOrgFileCountsView::default()),
+    );
+    emitted.insert(
         "ProjectHistoryPopupView",
         emitted_keys(&ProjectHistoryPopupView::default()),
     );
@@ -873,6 +877,7 @@ fn every_checked_interface_is_actually_declared() {
         "AsciiVisualizerView",
         "DetailView",
         "SoundCloudDetailsView",
+        "ArchiveOrgFileCountsView",
         "DetailHighlightRange",
         "DetailHighlightView",
         "DetailUrlEscapeView",

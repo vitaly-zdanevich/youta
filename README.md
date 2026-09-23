@@ -518,6 +518,8 @@ resolver:
   Missing rights information is omitted, not treated as permission
   to redistribute. See the [Internet Archive search API](https://archive.org/advancedsearch.php)
   and [metadata API](https://archive.org/developers/md-read.html).
+  Loaded item details show total and playable file counts, including alternate
+  playable formats rather than only the grouped track count.
 
   Suitable original covers take priority. For items without a cover, Youta can
   show the selected track's full-size waveform through Archive.org's
