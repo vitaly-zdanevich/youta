@@ -1191,6 +1191,20 @@ impl ThumbnailManager {
             .map(|(_, image)| Arc::clone(image))
     }
 
+    /// Reports the selected waveform's native size without fetching or decoding.
+    ///
+    /// Layout can reserve room for the original pixels instead of a fitted
+    /// preview. URL ownership prevents another item's dimensions from leaking
+    /// into the current selection, and temporary item-tile fallbacks have none.
+    #[must_use]
+    pub fn native_waveform_dimensions(&self, source: &Url) -> Option<(u32, u32)> {
+        self.expansion
+            .native_waveform
+            .as_ref()
+            .filter(|(owner, _)| owner == source)
+            .map(|(_, image)| (image.width(), image.height()))
+    }
+
     /// Starts a separate RAM-only encoder so warming cannot block visible selections.
     fn ensure_expansion_worker(&mut self) -> bool {
         if self.expansion.request_sender.is_some() {
@@ -4180,6 +4194,10 @@ pub(crate) mod tests {
             assert_eq!(wait_for_terminal_state(&mut manager), ThumbnailState::Ready);
             let native = manager.native_waveform_for(&source).unwrap();
             assert_eq!((native.width(), native.height()), (800, 200));
+            assert_eq!(
+                manager.native_waveform_dimensions(&source),
+                Some((800, 200))
+            );
             drop(warm_replies);
             assert!(manager.synchronize_expansion(Some(&source), fullscreen));
             wait_for_mock_expansion(&mut manager);
@@ -4251,6 +4269,7 @@ pub(crate) mod tests {
         assert!(encoded.native_waveform.is_none());
 
         let (mut manager, replies, observed) = manager_with_mock_transport();
+        assert_eq!(manager.native_waveform_dimensions(&source), None);
         manager.synchronize(Some(&source), area);
         assert_eq!(
             observed.recv_timeout(Duration::from_secs(1)).unwrap(),
@@ -4259,10 +4278,17 @@ pub(crate) mod tests {
         replies.send(Ok(fixture_thumbnail_png())).unwrap();
         assert_eq!(wait_for_terminal_state(&mut manager), ThumbnailState::Ready);
         assert!(manager.native_waveform_for(&source).is_some());
+        let native = manager.native_waveform_for(&source).unwrap();
+        assert_eq!(
+            manager.native_waveform_dimensions(&source),
+            Some((native.width(), native.height()))
+        );
         let other = Url::parse("https://images.example/other.png").unwrap();
         assert!(manager.native_waveform_for(&other).is_none());
+        assert_eq!(manager.native_waveform_dimensions(&other), None);
         manager.synchronize(Some(&other), area);
         assert!(manager.expansion.native_waveform.is_none());
+        assert_eq!(manager.native_waveform_dimensions(&source), None);
         assert_eq!(
             observed.recv_timeout(Duration::from_secs(1)).unwrap(),
             other
@@ -4272,6 +4298,7 @@ pub(crate) mod tests {
         assert!(manager.expansion.native_waveform.is_none());
         manager.clear();
         assert!(manager.expansion.native_waveform.is_none());
+        assert_eq!(manager.native_waveform_dimensions(&source), None);
     }
 
     /// Fullscreen preparation must not persist scaled pixels as a native local derivative.
@@ -5250,6 +5277,11 @@ pub(crate) mod tests {
         assert!(
             manager.protocol_key.is_none(),
             "fallback pixels are not a reusable full image"
+        );
+        assert_eq!(
+            manager.native_waveform_dimensions(&source),
+            None,
+            "a temporary tile must not constrain the full waveform layout"
         );
         assert!(cache.read(&source).unwrap().is_none());
         for _ in 0..10 {

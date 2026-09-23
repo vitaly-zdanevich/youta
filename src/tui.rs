@@ -171,6 +171,10 @@ trait ThumbnailRenderer {
     fn prepared_artwork_area(&self, _available: Rect) -> Option<Rect> {
         None
     }
+    /// Returns decoded native waveform dimensions for this exact source, without I/O.
+    fn native_waveform_dimensions(&self, _source: &url::Url) -> Option<(u32, u32)> {
+        None
+    }
     fn synchronize(&mut self, source: Option<&url::Url>, area: Rect) -> bool;
     /// Synchronizes a preferred artwork URL with a lower-resolution fallback.
     ///
@@ -383,6 +387,10 @@ impl ThumbnailRenderer for TerminalThumbnailRenderer {
                 render_size.height.min(available.height),
             )
         })
+    }
+
+    fn native_waveform_dimensions(&self, source: &url::Url) -> Option<(u32, u32)> {
+        self.manager.native_waveform_dimensions(source)
     }
 
     fn synchronize(&mut self, source: Option<&url::Url>, area: Rect) -> bool {
@@ -4325,6 +4333,33 @@ const DETAIL_ACTION_RAIL_GUTTER: u16 = 2;
 /// media artwork harder to inspect on narrow information panes.
 const MIN_DETAIL_ACTION_RAIL_ARTWORK_WIDTH: u16 = 48;
 
+/// Width needed to show native waveform pixels within the available image rows.
+///
+/// Taller sources may already be height-limited, so moving a link must not claim
+/// more width than an aspect-preserving fit can use. The fallback cell geometry
+/// matches image sizing when the terminal does not report its pixel dimensions.
+fn native_waveform_width(
+    dimensions: Option<(u32, u32)>,
+    artwork_height: u16,
+    terminal_window: Option<TerminalWindowMetrics>,
+) -> Option<u16> {
+    let (width, height) = dimensions.filter(|(width, height)| *width > 0 && *height > 0)?;
+    let (columns, rows, width_pixels, height_pixels) =
+        terminal_window.map_or((1, 1, 10, 20), |window| {
+            (
+                u128::from(window.columns),
+                u128::from(window.rows),
+                u128::from(window.width_pixels),
+                u128::from(window.height_pixels),
+            )
+        });
+    let native_columns = (u128::from(width) * columns).div_ceil(width_pixels);
+    let height_limited_columns =
+        (u128::from(width) * columns * u128::from(artwork_height) * height_pixels)
+            .div_ceil(u128::from(height) * rows * width_pixels);
+    Some(u16::try_from(native_columns.min(height_limited_columns)).unwrap_or(u16::MAX))
+}
+
 /// Returns a stable rail slot width for labels that change after activation.
 fn detail_button_layout_width(button_placement: &DetailButtonPlacement, show_hotkeys: bool) -> u16 {
     let stable_label = match &button_placement.action {
@@ -5462,7 +5497,7 @@ fn render_information_panel(
     let has_details_body = !details.description.is_empty()
         || !details.lastfm_artist_description.is_empty()
         || !details.local_audio_quality_description.is_empty();
-    let text_reserve = if details.thumbnail_expanded {
+    let mut text_reserve = if details.thumbnail_expanded {
         0
     } else {
         u16::from(has_details_body) + u16::from(!details.links.is_empty())
@@ -5480,24 +5515,97 @@ fn render_information_panel(
     )
     .unwrap_or(u16::MAX)
     .min(inner.height);
-    let side_rail = (!details.thumbnail_expanded
+    let can_use_side_rail = !details.thumbnail_expanded
         && thumbnail_renderer
             .as_ref()
             .is_some_and(|renderer| renderer.is_enabled())
-        && (visible_thumbnail_url.is_some() || visible_local_video.is_some()))
-    .then(|| {
-        detail_action_rail(
-            &detail_buttons,
-            inner.width,
-            inner.height,
-            compact_metadata_height,
-            text_reserve,
-            thumbnail_sizing,
-            details,
-            show_hotkeys,
-        )
-    })
-    .flatten();
+        && (visible_thumbnail_url.is_some() || visible_local_video.is_some());
+    let mut side_rail = can_use_side_rail
+        .then(|| {
+            detail_action_rail(
+                &detail_buttons,
+                inner.width,
+                inner.height,
+                compact_metadata_height,
+                text_reserve,
+                thumbnail_sizing,
+                details,
+                show_hotkeys,
+            )
+        })
+        .flatten();
+    let mut below_artwork_button = None;
+    if can_use_side_rail && is_archive_waveform_artwork(details) {
+        let native_dimensions = visible_thumbnail_url
+            .and_then(|source| {
+                thumbnail_renderer
+                    .as_ref()
+                    .and_then(|renderer| renderer.native_waveform_dimensions(source))
+            })
+            .or(details.thumbnail_dimensions);
+        let original_page = detail_buttons
+            .iter()
+            .find(|button| button.action == UiAction::OpenInBrowser);
+        let needs_more_width = side_rail.as_ref().is_none_or(|rail| {
+            native_waveform_width(
+                native_dimensions,
+                rail.artwork_height,
+                thumbnail_sizing.terminal_window,
+            )
+            .is_none_or(|width| width.min(inner.width) > rail.artwork_width)
+        });
+        if let Some(original_page) = original_page.filter(|_| needs_more_width) {
+            let short_buttons = detail_buttons
+                .iter()
+                .filter(|button| button.action != UiAction::OpenInBrowser)
+                .cloned()
+                .collect::<Vec<_>>();
+            let link_rows = wrap_text_lines(&original_page.label, inner.width);
+            // Reserve both the complete URL and its separator before choosing a
+            // rail. Short terminals otherwise lose the link below the image.
+            let link_reserve = u16::try_from(link_rows.len())
+                .unwrap_or(u16::MAX)
+                .saturating_add(1);
+            let short_rail = detail_action_rail(
+                &short_buttons,
+                inner.width,
+                inner.height,
+                compact_metadata_height,
+                text_reserve.saturating_add(link_reserve),
+                thumbnail_sizing,
+                details,
+                show_hotkeys,
+            );
+            let short_rail = short_rail.filter(|rail| {
+                native_waveform_width(
+                    native_dimensions,
+                    rail.artwork_height,
+                    thumbnail_sizing.terminal_window,
+                )
+                .is_none_or(|width| width.min(inner.width) <= rail.artwork_width)
+            });
+            let original_owns_row = !detail_buttons.iter().any(|button| {
+                button.action != UiAction::OpenInBrowser
+                    && button.line_index == original_page.line_index
+            });
+            let compact_rows = u16::try_from(lines.len())
+                .unwrap_or(u16::MAX)
+                .saturating_sub(u16::from(original_owns_row));
+            let fits_without_rail = inner
+                .height
+                .saturating_sub(compact_rows)
+                .saturating_sub(text_reserve)
+                .saturating_sub(link_reserve)
+                >= MIN_THUMBNAIL_HEIGHT;
+            if short_rail.is_some() || fits_without_rail {
+                below_artwork_button = Some((original_page.clone(), link_rows));
+                text_reserve = text_reserve.saturating_add(link_reserve);
+            }
+            // If even the short controls constrain the native waveform, keep
+            // them above a full-width image, with the URL below when it fits.
+            side_rail = short_rail;
+        }
+    }
     if side_rail.is_some() {
         lines = lines
             .into_iter()
@@ -5509,6 +5617,36 @@ fn render_information_panel(
                 .then_some(line)
             })
             .collect();
+    } else if let Some((original_page, _)) = below_artwork_button.as_ref() {
+        detail_buttons.retain(|button| button.action != UiAction::OpenInBrowser);
+        let mut shared_buttons = detail_buttons
+            .iter()
+            .filter(|button| button.line_index == original_page.line_index)
+            .collect::<Vec<_>>();
+        if shared_buttons.is_empty() {
+            lines.remove(original_page.line_index);
+            for button in &mut detail_buttons {
+                if button.line_index > original_page.line_index {
+                    button.line_index -= 1;
+                }
+            }
+        } else {
+            // Compact rows can pair a left action with the right-aligned URL.
+            // Retain that action and its exact hit target when moving the URL.
+            shared_buttons.sort_by_key(|button| button.column);
+            let mut spans = Vec::new();
+            let mut column = 0;
+            for button in shared_buttons {
+                spans.push(Span::raw(
+                    " ".repeat(usize::from(button.column.saturating_sub(column))),
+                ));
+                spans.push(Span::styled(button.label.clone(), button.style));
+                column = button
+                    .column
+                    .saturating_add(terminal_text_width(&button.label));
+            }
+            lines[original_page.line_index] = Line::from(spans);
+        }
     }
     let metadata_height = u16::try_from(lines.len())
         .unwrap_or(u16::MAX)
@@ -5645,6 +5783,20 @@ fn render_information_panel(
         } else {
             renderer.clear();
         }
+    }
+    if let Some((button, rows)) = below_artwork_button {
+        for row in rows.into_iter().take(usize::from(remaining_height)) {
+            let area = Rect::new(inner.x, cursor_y, inner.width, 1);
+            let width = terminal_text_width(&row).min(inner.width);
+            frame.render_widget(Paragraph::new(Line::styled(row, button.style)), area);
+            if width > 0 {
+                hit_map
+                    .detail_buttons
+                    .push((button.action.clone(), Rect::new(area.x, area.y, width, 1)));
+            }
+            cursor_y = cursor_y.saturating_add(1);
+        }
+        remaining_height = inner.bottom().saturating_sub(cursor_y);
     }
     if !details.links.is_empty() && remaining_height > 0 {
         let description_reserve = if has_details_body {
@@ -15513,6 +15665,7 @@ mod tests {
         immediate_redraw: bool,
         rendered_artwork: bool,
         prepared_artwork_size: Option<Size>,
+        native_waveform: Option<(url::Url, (u32, u32))>,
         rendered_areas: Vec<Rect>,
         poll_results: VecDeque<bool>,
         poll_count: usize,
@@ -15559,6 +15712,13 @@ mod tests {
                     size.height.min(available.height),
                 )
             })
+        }
+
+        fn native_waveform_dimensions(&self, source: &url::Url) -> Option<(u32, u32)> {
+            self.native_waveform
+                .as_ref()
+                .filter(|(owner, _)| owner == source)
+                .map(|(_, dimensions)| *dimensions)
         }
 
         fn synchronize(&mut self, source: Option<&url::Url>, area: Rect) -> bool {
@@ -27960,6 +28120,235 @@ for encoded, expected in json.load(sys.stdin):
                 assert!(
                     rendered.contains(&format!("License: {license}")),
                     "Actual Archive rights must stay visible without a licence URL: {license}"
+                );
+            }
+        }
+    }
+
+    /// Archive item whose original-page label caused the reported image shrink.
+    #[cfg(all(feature = "archive-org", feature = "images"))]
+    fn archive_waveform_layout_view(dimensions: Option<(u32, u32)>) -> ViewModel {
+        let identifier = "cunpbzjgvwcspaob9ud3znlwb1lgnvs65izznmwg";
+        let webpage = format!("https://archive.org/details/{identifier}");
+        let artwork = url::Url::parse(&format!(
+            "https://iiif.archive.org/image/iiif/3/{identifier}%2Ftrack.png/full/max/0/default.jpg"
+        ))
+        .unwrap();
+        ViewModel {
+            screen: Screen::ArchiveOrg,
+            external_opener_available: true,
+            video_comments_available: true,
+            private_note_available: true,
+            details: Some(DetailView {
+                media_id: Some(MediaId::new(SourceKind::ArchiveOrg, identifier)),
+                source: "archive.org".to_owned(),
+                title: "Twin Peaks waveform layout regression".to_owned(),
+                description: "Description remains below the waveform and original page.".to_owned(),
+                webpage_url: Some(url::Url::parse(&webpage).unwrap()),
+                thumbnail_url: Some(artwork.clone()),
+                expanded_thumbnail_url: Some(artwork),
+                thumbnail_dimensions: dimensions,
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        }
+    }
+
+    #[cfg(all(feature = "archive-org", feature = "images"))]
+    #[test]
+    fn archive_waveform_keeps_native_width_by_moving_long_original_page_below() {
+        // Archive details do not carry image dimensions; use the decoded native
+        // source, not the previous, already-constrained thumbnail render size.
+        let view = archive_waveform_layout_view(None);
+        let details = view.details.as_ref().unwrap();
+        let webpage = details.webpage_url.as_ref().unwrap().as_str();
+        let mut terminal = Terminal::new(TestBackend::new(148, 60)).unwrap();
+        let mut hit_map = HitMap::default();
+        let mut thumbnails = MockThumbnailRenderer {
+            enabled: true,
+            rendered_artwork: true,
+            prepared_artwork_size: Some(Size::new(115, 15)),
+            native_waveform: Some((details.thumbnail_url.clone().unwrap(), (800, 200))),
+            ..MockThumbnailRenderer::default()
+        };
+        terminal
+            .draw(|frame| {
+                render_details_with_terminal_window(
+                    frame,
+                    frame.area(),
+                    &view,
+                    true,
+                    DEFAULT_THUMBNAIL_HEIGHT,
+                    TerminalWindowMetrics::new(148, 60, 1036, 840),
+                    &Theme::new(false),
+                    &mut hit_map,
+                    Some(&mut thumbnails),
+                );
+            })
+            .unwrap();
+        let (_, requested) = thumbnails.synchronized.last().unwrap();
+        assert!(
+            requested.width >= 115,
+            "800 native pixels at seven pixels per cell must fit: {requested:?}"
+        );
+        let image = hit_map.thumbnail_area.unwrap();
+        let target = |expected| {
+            hit_map
+                .detail_buttons
+                .iter()
+                .find_map(|(action, area)| (*action == expected).then_some(*area))
+                .unwrap_or_else(|| panic!("missing action {expected:?}"))
+        };
+        let original = target(UiAction::OpenInBrowser);
+        assert!(original.y > image.bottom());
+        assert_eq!(original.x, hit_map.details_panel.x);
+        assert!(rendered_text(&terminal).contains(webpage));
+        for action in [UiAction::EditPrivateNote, UiAction::OpenVideoComments] {
+            let area = target(action);
+            assert!(area.x >= image.right().saturating_add(2));
+            assert!(area.y < image.bottom());
+        }
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: original.x,
+                    row: original.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                &view,
+            ),
+            Some(UiAction::OpenInBrowser)
+        );
+    }
+
+    #[test]
+    fn native_waveform_width_uses_source_dimensions_and_available_height() {
+        let window = TerminalWindowMetrics::new(148, 60, 1036, 840);
+        assert_eq!(
+            native_waveform_width(Some((800, 200)), 20, window),
+            Some(115)
+        );
+        assert_eq!(native_waveform_width(Some((320, 80)), 20, window), Some(46));
+        assert_eq!(
+            native_waveform_width(Some((1200, 300)), 30, window),
+            Some(172)
+        );
+        assert_eq!(
+            native_waveform_width(Some((800, 200)), 10, window),
+            Some(80)
+        );
+        assert_eq!(native_waveform_width(Some((800, 200)), 20, None), Some(80));
+        assert_eq!(native_waveform_width(None, 20, window), None);
+        assert_eq!(native_waveform_width(Some((0, 200)), 20, window), None);
+    }
+
+    #[cfg(all(feature = "archive-org", feature = "images"))]
+    #[test]
+    fn archive_waveform_layout_preserves_small_sources_and_fits_narrow_or_short_panes() {
+        for (width, height, dimensions, expected_width, link_below, comments) in [
+            (148, 60, Some((320, 80)), 58, false, true),
+            (148, 60, Some((800, 200)), 125, true, true),
+            (148, 60, Some((1200, 200)), 148, true, true),
+            (80, 30, Some((800, 200)), 80, true, true),
+            (40, 20, Some((800, 200)), 40, true, true),
+            (148, 12, Some((800, 200)), 125, true, true),
+            (148, 8, Some((800, 200)), 58, false, true),
+            (148, 60, None, 125, true, true),
+            // The compact note and original URL initially share the same row.
+            (148, 60, Some((1200, 200)), 148, true, false),
+        ] {
+            let mut view = archive_waveform_layout_view(dimensions);
+            if !comments {
+                // Archive comments are tab-specific; History still shows the
+                // same Archive artwork and original-page control without them.
+                view.screen = Screen::History;
+            }
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let mut hit_map = HitMap::default();
+            let mut thumbnails = MockThumbnailRenderer {
+                enabled: true,
+                rendered_artwork: true,
+                ..MockThumbnailRenderer::default()
+            };
+            terminal
+                .draw(|frame| {
+                    render_details_with_terminal_window(
+                        frame,
+                        frame.area(),
+                        &view,
+                        true,
+                        DEFAULT_THUMBNAIL_HEIGHT,
+                        TerminalWindowMetrics::new(width, height, width * 7, height * 14),
+                        &Theme::new(false),
+                        &mut hit_map,
+                        Some(&mut thumbnails),
+                    );
+                })
+                .unwrap();
+            let (_, requested) = thumbnails.synchronized.last().unwrap();
+            assert_eq!(
+                requested.width, expected_width,
+                "{width}×{height}, {dimensions:?}"
+            );
+            let image = hit_map.thumbnail_area.unwrap();
+            let original_rows = hit_map
+                .detail_buttons
+                .iter()
+                .filter(|(action, _)| *action == UiAction::OpenInBrowser)
+                .map(|(_, area)| *area)
+                .collect::<Vec<_>>();
+            assert!(!original_rows.is_empty());
+            assert_eq!(
+                original_rows[0].y > image.bottom(),
+                link_below,
+                "{width}×{height}"
+            );
+            for (action, area) in &hit_map.detail_buttons {
+                assert!(area.right() <= width && area.bottom() <= height);
+                assert_eq!(
+                    mouse_action(
+                        MouseEvent {
+                            kind: MouseEventKind::Down(MouseButton::Left),
+                            column: area.x,
+                            row: area.y,
+                            modifiers: KeyModifiers::NONE,
+                        },
+                        &hit_map,
+                        &view,
+                    ),
+                    Some(action.clone()),
+                );
+            }
+            if link_below {
+                let complete_label = original_rows
+                    .iter()
+                    .map(|area| {
+                        (area.left()..area.right())
+                            .map(|x| terminal.backend().buffer()[(x, area.y)].symbol())
+                            .collect::<String>()
+                    })
+                    .collect::<String>();
+                assert!(
+                    complete_label.contains(
+                        view.details
+                            .as_ref()
+                            .unwrap()
+                            .webpage_url
+                            .as_ref()
+                            .unwrap()
+                            .as_str()
+                    )
+                );
+            }
+            for action in [UiAction::EditPrivateNote, UiAction::OpenVideoComments] {
+                assert_eq!(
+                    hit_map
+                        .detail_buttons
+                        .iter()
+                        .any(|(found, _)| *found == action),
+                    action != UiAction::OpenVideoComments || comments,
                 );
             }
         }
