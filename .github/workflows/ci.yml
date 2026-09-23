@@ -171,6 +171,12 @@ jobs:
             feature_arguments: --no-default-features --features tui,librivox,wikidata
           - feature_set: TUI with Bandcamp
             feature_arguments: --no-default-features --features tui,bandcamp
+          - feature_set: standalone SoundCloud provider
+            feature_arguments: --no-default-features --features soundcloud
+          - feature_set: TUI with SoundCloud
+            feature_arguments: --no-default-features --features tui,soundcloud
+          - feature_set: TUI with SoundCloud and Wikidata
+            feature_arguments: --no-default-features --features tui,soundcloud,wikidata
           - feature_set: TUI with Radio
             feature_arguments: --no-default-features --features tui,radio
           - feature_set: TUI with standalone Yandex Music

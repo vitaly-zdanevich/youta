@@ -97,6 +97,9 @@ fn shared_feature_matrix_preserves_release_only_boundaries() {
         "evernote",
         "tui,evernote",
         "lan-sharing",
+        "soundcloud",
+        "tui,soundcloud",
+        "tui,soundcloud,wikidata",
     ] {
         assert!(
             matrix.contains(&format!(
