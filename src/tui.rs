@@ -1159,7 +1159,7 @@ fn archive_org_search_page_capacity(area: Rect, view: &ViewModel) -> usize {
     source_search_page_capacity(area, view, Screen::ArchiveOrg)
 }
 
-/// Measures SoundCloud's compact rows without reserving Archive's catalogue footer.
+/// Measures SoundCloud's compact rows after reserving its playback-control footer.
 fn soundcloud_search_page_capacity(area: Rect, view: &ViewModel) -> usize {
     source_search_page_capacity(area, view, Screen::SoundCloud)
 }
@@ -1549,6 +1549,7 @@ fn synchronize_thumbnail_prefetch(
 /// advertised larger source and known fullscreen pixels that exceed the
 /// selected preview's native fit. The manager defers either source until its
 /// visible preview is ready and cancels stale generations during navigation.
+/// SoundCloud warms its distinct larger rendition for the selected track only.
 /// Archive waveforms reuse the already-decoded native preview source, so they
 /// can warm a fullscreen protocol without a second image download or decode.
 fn synchronize_selected_artwork_prefetch(
@@ -1573,6 +1574,7 @@ fn synchronize_selected_artwork_prefetch(
             is_apple_podcast_artwork(details)
                 || (renderer.is_enabled()
                     && (is_archive_waveform_artwork(details)
+                        || is_soundcloud_expansion_artwork(details)
                         || youtube_expansion_benefits_from_fullscreen(
                             details,
                             fullscreen,
@@ -1581,6 +1583,19 @@ fn synchronize_selected_artwork_prefetch(
         })
         .and_then(|details| details.expanded_thumbnail_url.as_ref());
     renderer.synchronize_expansion(source, fullscreen)
+}
+
+/// Warms selected SoundCloud artwork without refetching unchanged original URLs.
+fn is_soundcloud_expansion_artwork(details: &DetailView) -> bool {
+    details
+        .media_id
+        .as_ref()
+        .is_some_and(|id| id.source == SourceKind::SoundCloud)
+        && details
+            .thumbnail_url
+            .as_ref()
+            .zip(details.expanded_thumbnail_url.as_ref())
+            .is_some_and(|(preview, expanded)| preview != expanded)
 }
 
 /// Limits native-source reuse to exact validated Archive waveforms, not arbitrary artwork.
@@ -3283,7 +3298,7 @@ fn main_body_panes(area: Rect) -> [Rect; 2] {
 fn main_list_pane_areas(mut pane: Rect, screen: Screen) -> (Rect, Rect) {
     let controls_height = pane.height.min(match screen {
         Screen::Web => 2,
-        Screen::ArchiveOrg | Screen::ApplePodcasts | Screen::TrackerMusic => 1,
+        Screen::ArchiveOrg | Screen::SoundCloud | Screen::ApplePodcasts | Screen::TrackerMusic => 1,
         _ => 0,
     });
     pane.height = pane.height.saturating_sub(controls_height);
@@ -3342,7 +3357,7 @@ fn render_body(
         render_web_controls(frame, controls, show_hotkeys, view.autoplay, theme, hit_map);
     } else if matches!(
         view.screen,
-        Screen::ArchiveOrg | Screen::ApplePodcasts | Screen::TrackerMusic
+        Screen::ArchiveOrg | Screen::SoundCloud | Screen::ApplePodcasts | Screen::TrackerMusic
     ) {
         render_catalog_playback_controls(frame, controls, view, show_hotkeys, theme, hit_map);
     }
@@ -3392,7 +3407,7 @@ fn render_body(
     }
 }
 
-/// Shares playback toggles below catalogue lists, with Back limited to Archive.
+/// Shares playback toggles and available parent navigation below catalogue lists.
 fn render_catalog_playback_controls(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -3406,8 +3421,9 @@ fn render_catalog_playback_controls(
     }
     let mut x = area.x;
     // Back has priority in narrow catalogue panes; the playback hotkeys remain global.
-    for (key, label, action) in (view.screen == Screen::ArchiveOrg
+    for (key, label, action) in ((view.screen == Screen::ArchiveOrg
         && view.archive_org_back_available)
+        || (view.screen == Screen::SoundCloud && view.soundcloud_back_available))
         .then_some(("Esc", "Back", UiAction::GoBack))
         .into_iter()
         .chain([
@@ -5435,7 +5451,19 @@ fn render_information_panel(
                     ("Comments", details.comments.clone()),
                     ("Created", track.created.clone()),
                     ("Modified", track.modified.clone()),
-                    ("Tags", track.tags.join(", ")),
+                    (
+                        "Tags",
+                        if details.links.iter().any(|link| {
+                            matches!(
+                                link.internal_target,
+                                Some(DetailLinkInternalTarget::SoundCloudTag(_))
+                            )
+                        }) {
+                            String::new()
+                        } else {
+                            track.tags.join(", ")
+                        },
+                    ),
                 ] {
                     if !value.is_empty() {
                         lines.push(Line::from(vec![
@@ -9235,6 +9263,7 @@ fn render_video_comments_popup(
         (content_area, Rect::default())
     };
     let mut content = Vec::new();
+    let mut author_lines = Vec::new();
     match &popup.state {
         VideoCommentsPopupState::Loading => {
             let message = if popup.source == SourceKind::SoundCloud {
@@ -9260,7 +9289,22 @@ fn render_video_comments_popup(
                 if index > 0 {
                     content.push(Line::raw(""));
                 }
-                let mut header = vec![Span::styled(comment.author_name.clone(), theme.heading)];
+                let linked = popup.source == SourceKind::SoundCloud
+                    && comment
+                        .author_url
+                        .as_deref()
+                        .is_some_and(|url| !url.trim().is_empty());
+                let style = if linked {
+                    author_lines.push((
+                        content.len(),
+                        index,
+                        terminal_text_width(&comment.author_name),
+                    ));
+                    theme.accent.add_modifier(Modifier::UNDERLINED)
+                } else {
+                    theme.heading
+                };
+                let mut header = vec![Span::styled(comment.author_name.clone(), style)];
                 if popup.source == SourceKind::YouTube {
                     header.push(Span::styled(" · ", theme.muted));
                     header.push(Span::raw(format!(
@@ -9297,6 +9341,21 @@ fn render_video_comments_popup(
     hit_map.video_comments_scroll_offset = offset;
     hit_map.video_comments_scroll_maximum = maximum_offset;
     hit_map.video_comments_page_lines = visible_lines.max(1);
+    // Header indices refer to wrapped content, not comment indices; only visible
+    // author cells become targets, leaving dates, text and clipped rows inert.
+    for (line, index, width) in author_lines {
+        if line >= offset && line < offset.saturating_add(visible_lines) && width > 0 {
+            hit_map.video_comments_buttons.push((
+                UiAction::OpenVideoCommentAuthor(index),
+                Rect::new(
+                    text_area.x,
+                    text_area.y + (line - offset) as u16,
+                    width.min(text_area.width),
+                    1,
+                ),
+            ));
+        }
+    }
     let visible = content
         .into_iter()
         .skip(offset)
@@ -19247,7 +19306,7 @@ for encoded, expected in json.load(sys.stdin):
         }
     }
 
-    /// SoundCloud has no catalogue footer; every remaining compact row belongs to its page.
+    /// SoundCloud reserves its footer and keeps continuation on the final result row.
     #[test]
     fn soundcloud_page_capacity_and_continuations_fill_the_actual_results_pane() {
         for (width, height) in [(120, 24), (120, 80), (60, 24), (60, 80), (12, 5)] {
@@ -19294,15 +19353,15 @@ for encoded, expected in json.load(sys.stdin):
         }
         let view = ViewModel::default();
         let area = Rect::new(0, 0, 120, 24);
-        assert!(
-            soundcloud_search_page_capacity(area, &view)
-                > archive_org_search_page_capacity(area, &view)
+        assert_eq!(
+            soundcloud_search_page_capacity(area, &view),
+            archive_org_search_page_capacity(area, &view)
         );
     }
 
-    /// Selection uses only the 500px source; 1080px belongs to explicit expansion.
+    /// Details retain the 500px source while selected 1080px artwork warms in RAM.
     #[test]
-    fn soundcloud_details_show_source_facts_and_keep_large_artwork_lazy() {
+    fn soundcloud_details_show_source_facts_and_warm_large_artwork_in_background() {
         let preview = url::Url::parse("https://soundcloak.example/artwork-500").unwrap();
         let expanded = url::Url::parse("https://soundcloak.example/artwork-1080").unwrap();
         let mut view = ViewModel {
@@ -19376,11 +19435,9 @@ for encoded, expected in json.load(sys.stdin):
         assert!(!rendered.contains("Views:"));
         assert!(!rendered.contains("Published:"));
         assert!(renderer.prefetch_batches.iter().all(Vec::is_empty));
-        assert!(
-            renderer
-                .expansion_prefetches
-                .iter()
-                .all(|(source, _)| source.is_none())
+        assert_eq!(
+            renderer.expansion_prefetches,
+            [(Some(expanded.clone()), Rect::new(0, 0, 160, 60))]
         );
         assert!(
             renderer
@@ -28176,6 +28233,7 @@ for encoded, expected in json.load(sys.stdin):
     fn catalog_playback_footers_show_autoplay_repeat_and_working_controls() {
         for (screen, width) in [
             Screen::ArchiveOrg,
+            Screen::SoundCloud,
             Screen::ApplePodcasts,
             Screen::TrackerMusic,
         ]
@@ -28295,6 +28353,7 @@ for encoded, expected in json.load(sys.stdin):
     fn catalog_playback_footers_stay_bounded_in_small_terminals() {
         for (screen, (width, height)) in [
             Screen::ArchiveOrg,
+            Screen::SoundCloud,
             Screen::ApplePodcasts,
             Screen::TrackerMusic,
         ]
@@ -28951,6 +29010,129 @@ for encoded, expected in json.load(sys.stdin):
         assert!(rendered.contains("SoundCloud comments"));
         assert!(rendered.contains("Loading recent comments…"));
         assert!(!rendered.contains("Loading top comments…"));
+    }
+
+    /// Only visible SoundCloud author labels navigate; body/date text stays inert.
+    #[test]
+    fn soundcloud_comment_author_links_follow_scroll_and_clear_when_closed() {
+        let mut view = ViewModel {
+            video_comments_popup: Some(VideoCommentsPopupView {
+                source: SourceKind::SoundCloud,
+                state: VideoCommentsPopupState::Ready,
+                comments: (0..20)
+                    .map(|index| VideoCommentView {
+                        author_name: format!("Artist 名 {index}"),
+                        author_url: (index != 0)
+                            .then(|| format!("https://soundcloud.com/artist-{index}")),
+                        published: Some("2026 September 23".to_owned()),
+                        text: "Public comment".to_owned(),
+                        ..VideoCommentView::default()
+                    })
+                    .collect(),
+                scroll_offset: 3,
+                ..VideoCommentsPopupView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut hit_map = HitMap::default();
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .unwrap();
+        let (action, area) = hit_map
+            .video_comments_buttons
+            .iter()
+            .find(|(action, _)| *action == UiAction::OpenVideoCommentAuthor(1))
+            .expect("scrolled author remains clickable")
+            .clone();
+        assert_eq!(area.y, hit_map.video_comments_text_area.y);
+        assert_eq!(area.width, terminal_text_width("Artist 名 1"));
+        assert!(
+            terminal.backend().buffer()[(area.x, area.y)]
+                .modifier
+                .contains(Modifier::UNDERLINED)
+        );
+        let click = |x, y| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(
+            mouse_action(click(area.x, area.y), &hit_map, &view),
+            Some(action)
+        );
+        assert_eq!(
+            mouse_action(click(area.right(), area.y), &hit_map, &view),
+            None
+        );
+        assert_eq!(
+            mouse_action(click(area.x, area.y + 1), &hit_map, &view),
+            None
+        );
+        assert!(
+            !hit_map
+                .video_comments_buttons
+                .iter()
+                .any(|(action, _)| *action == UiAction::OpenVideoCommentAuthor(0))
+        );
+        view.video_comments_popup.as_mut().unwrap().source = SourceKind::YouTube;
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .unwrap();
+        assert!(
+            !hit_map
+                .video_comments_buttons
+                .iter()
+                .any(|(action, _)| matches!(action, UiAction::OpenVideoCommentAuthor(_)))
+        );
+        view.video_comments_popup = None;
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .unwrap();
+        assert!(hit_map.video_comments_buttons.is_empty());
+    }
+
+    /// Catalogue Back precedes unfocusing Details but not editing or expansion.
+    #[test]
+    fn soundcloud_back_control_and_escape_respect_route_and_modal_state() {
+        let mut view = ViewModel {
+            screen: Screen::SoundCloud,
+            soundcloud_back_available: true,
+            details_focused: true,
+            ..ViewModel::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut hit_map = HitMap::default();
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .unwrap();
+        assert!(rendered_text(&terminal).contains("[Esc] Back"));
+        assert!(
+            hit_map
+                .detail_buttons
+                .iter()
+                .any(|(action, _)| *action == UiAction::GoBack)
+        );
+        let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(key_action(escape, &view), Some(UiAction::GoBack));
+        view.search_editing = true;
+        assert_eq!(key_action(escape, &view), Some(UiAction::CancelSearch));
+        view.search_editing = false;
+        view.details = Some(DetailView {
+            thumbnail_expanded: true,
+            ..DetailView::default()
+        });
+        assert_eq!(
+            key_action(escape, &view),
+            Some(UiAction::ToggleThumbnailExpansion)
+        );
+        view.details = None;
+        view.soundcloud_back_available = false;
+        assert_eq!(
+            key_action(escape, &view),
+            Some(UiAction::SetDetailsFocus(false))
+        );
     }
 
     #[test]
@@ -30385,6 +30567,90 @@ for encoded, expected in json.load(sys.stdin):
             renderer.expansion_prefetches.last(),
             Some(&(None, fullscreen))
         );
+    }
+
+    /// Only a selected, enabled SoundCloud rendition warms; early clicks keep its work.
+    #[test]
+    fn soundcloud_expansion_prefetch_is_selected_only_and_clears_stale_targets() {
+        let preview = url::Url::parse("https://soundcloak.example/artwork-500").unwrap();
+        let expanded = url::Url::parse("https://soundcloak.example/artwork-1080").unwrap();
+        let area = Rect::new(0, 0, 160, 60);
+        let base = ViewModel {
+            screen: Screen::SoundCloud,
+            details: Some(DetailView {
+                media_id: Some(MediaId::new(
+                    SourceKind::SoundCloud,
+                    "https://soundcloud.com/artist/track",
+                )),
+                thumbnail_url: Some(preview.clone()),
+                expanded_thumbnail_url: Some(expanded.clone()),
+                ..DetailView::default()
+            }),
+            rows: vec![RowView {
+                thumbnail_url: Some(
+                    url::Url::parse("https://soundcloak.example/unselected-500").unwrap(),
+                ),
+                ..RowView::default()
+            }],
+            ..ViewModel::default()
+        };
+        for screen in [Screen::SoundCloud, Screen::History, Screen::Playlists] {
+            let mut view = base.clone();
+            view.screen = screen;
+            let mut renderer = MockThumbnailRenderer {
+                enabled: true,
+                ..MockThumbnailRenderer::default()
+            };
+            synchronize_thumbnail_prefetch(&view, &UiSettings::default(), &mut renderer);
+            synchronize_selected_artwork_prefetch(&view, area, None, &mut renderer);
+            assert_eq!(renderer.prefetch_batches, [Vec::<url::Url>::new()]);
+            assert_eq!(
+                renderer.expansion_prefetches,
+                [(Some(expanded.clone()), area)]
+            );
+
+            view.details.as_mut().unwrap().thumbnail_expanded = true;
+            assert!(!synchronize_selected_artwork_prefetch(
+                &view,
+                area,
+                None,
+                &mut renderer
+            ));
+            assert_eq!(renderer.expansion_prefetches.len(), 1);
+            view.details = None;
+            synchronize_selected_artwork_prefetch(&view, area, None, &mut renderer);
+            assert_eq!(renderer.expansion_prefetches.last(), Some(&(None, area)));
+        }
+
+        for reason in [
+            "disabled",
+            "no preview",
+            "no expanded image",
+            "same URL",
+            "different provider",
+            "missing identity",
+            "rows only",
+        ] {
+            let mut view = base.clone();
+            let details = view.details.as_mut().unwrap();
+            match reason {
+                "no preview" => details.thumbnail_url = None,
+                "no expanded image" => details.expanded_thumbnail_url = None,
+                "same URL" => details.expanded_thumbnail_url = Some(preview.clone()),
+                "different provider" => {
+                    details.media_id = Some(MediaId::new(SourceKind::Bandcamp, "track"));
+                }
+                "missing identity" => details.media_id = None,
+                "rows only" => view.details = None,
+                _ => {}
+            }
+            let mut renderer = MockThumbnailRenderer {
+                enabled: reason != "disabled",
+                ..MockThumbnailRenderer::default()
+            };
+            synchronize_selected_artwork_prefetch(&view, area, None, &mut renderer);
+            assert_eq!(renderer.expansion_prefetches, [(None, area)], "{reason}");
+        }
     }
 
     /// Podcast enlargement uses the full terminal and RAM, never the disk-warming backlog.
@@ -37841,6 +38107,7 @@ prose 07:25 remains clickable but is not a chapter";
         let comments = (0..20)
             .map(|index| VideoCommentView {
                 author_name: format!("Author {index}"),
+                author_url: None,
                 like_count: u64::try_from(index).expect("fixture index"),
                 published: Some("2026 July 30".to_owned()),
                 text: format!(

@@ -13,6 +13,13 @@ use url::Url;
 
 use super::{DEFAULT_MAX_JSON_BYTES, DEFAULT_REQUEST_TIMEOUT, ProviderError, validate_base_url};
 
+mod catalog;
+pub use catalog::{
+    SoundcloakAlbum, SoundcloakAlbumDetails, SoundcloakAlbumTrack, SoundcloakAlbumTrackPage,
+    SoundcloakArtist, SoundcloakArtistAlbumPage, SoundcloakArtistTrackPage,
+    SoundcloakCatalogCursor,
+};
+
 const MAX_QUERY_BYTES: usize = 512;
 const MAX_QUERY_URN_BYTES: usize = 512;
 const MAX_URL_BYTES: usize = 4_096;
@@ -86,6 +93,9 @@ pub struct SoundcloakTrack {
     pub title: String,
     /// Terminal-safe public artist display name.
     pub artist: String,
+    /// Canonical public uploader profile, never derived from its display name.
+    #[serde(default)]
+    pub artist_url: Option<Url>,
     /// Canonical public `SoundCloud` permalink used for queue, playlists and History.
     pub webpage_url: Url,
     /// Artwork routed through the configured instance, when valid CDN artwork exists.
@@ -139,6 +149,9 @@ pub struct SoundcloakTrack {
 pub struct SoundcloakComment {
     /// Terminal-safe public author display name.
     pub author: String,
+    /// Canonical public author profile when the response advertises one safely.
+    #[serde(default)]
+    pub author_url: Option<Url>,
     /// Bounded plain body with normalized line endings and no terminal controls.
     pub body: String,
     /// Validated publication timestamp normalized to RFC 3339 UTC, when available.
@@ -235,6 +248,15 @@ impl SoundcloakClient {
         &self,
         request: &SoundcloakSearchRequest,
     ) -> Result<SoundcloakSearchPage, ProviderError> {
+        self.search_filtered(request, None)
+    }
+
+    /// Shares bounded parsing/pagination while keeping ordinary full-text requests unchanged.
+    fn search_filtered(
+        &self,
+        request: &SoundcloakSearchRequest,
+        tag: Option<&str>,
+    ) -> Result<SoundcloakSearchPage, ProviderError> {
         request.validate()?;
         let mut endpoint = self.endpoint("_/api/v2/search/tracks")?;
         let offset = u64::from(request.page - 1)
@@ -247,6 +269,10 @@ impl SoundcloakClient {
             query.append_pair("limit", &request.limit.to_string());
             query.append_pair("offset", &offset.to_string());
             query.append_pair("linked_partitioning", "1");
+            if let Some(tag) = tag {
+                query.append_pair("filter.genre_or_tag", tag);
+                query.append_pair("sort", "popular");
+            }
             if let Some(token) = &request.query_urn {
                 query.append_pair("query_urn", token);
             }
@@ -258,7 +284,7 @@ impl SoundcloakClient {
         if collection.len() > request.limit {
             return Err(invalid_response("too many tracks in search page"));
         }
-        let (next_page, query_urn) = continuation(&value, request)?;
+        let (next_page, query_urn) = continuation(&value, request, tag)?;
         let items = collection
             .iter()
             .filter_map(|value| self.normalize_track(value))
@@ -269,6 +295,28 @@ impl SoundcloakClient {
             next_page,
             query_urn,
         })
+    }
+
+    /// Searches tracks tagged with an exact bounded tag using Soundcloak's popular-tag route.
+    ///
+    /// Supply `query: "*"` in the unchanged search request; page size, numeric
+    /// offsets and validated search-session tokens retain their usual semantics.
+    ///
+    /// # Errors
+    /// Rejects invalid tags, non-wildcard queries, changed filters and ordinary search failures.
+    pub fn search_tag(
+        &self,
+        request: &SoundcloakSearchRequest,
+        tag: &str,
+    ) -> Result<SoundcloakSearchPage, ProviderError> {
+        let tag = safe_label(tag, MAX_TAG_BYTES)
+            .filter(|_| request.query.trim() == "*")
+            .ok_or_else(|| {
+                ProviderError::InvalidRequest(
+                    "tag search requires a bounded tag and wildcard query".into(),
+                )
+            })?;
+        self.search_filtered(request, Some(&tag))
     }
 
     /// Resolves a canonical public track without retaining a CDN playback locator.
@@ -471,6 +519,7 @@ impl SoundcloakClient {
             id,
             title,
             artist,
+            artist_url: catalog::user_profile_url(&value["user"]),
             webpage_url,
             artwork_url,
             expanded_artwork_url,
@@ -696,6 +745,7 @@ fn normalize_comment(value: &Value) -> Option<SoundcloakComment> {
     }
     Some(SoundcloakComment {
         author: safe_label(value["user"]["username"].as_str()?, MAX_LABEL_BYTES)?,
+        author_url: catalog::user_profile_url(&value["user"]),
         body: safe_multiline(value["body"].as_str()?, MAX_COMMENT_BYTES)?,
         created_at: normalized_timestamp(&value["created_at"]),
         timestamp_seconds: value["timestamp"]
@@ -780,6 +830,7 @@ fn valid_query_urn(token: &str) -> bool {
 fn continuation(
     value: &Value,
     request: &SoundcloakSearchRequest,
+    tag: Option<&str>,
 ) -> Result<(Option<u32>, Option<String>), ProviderError> {
     let token = value
         .get("query_urn")
@@ -815,8 +866,11 @@ fn continuation(
     let mut next_offset = None;
     let mut next_limit = None;
     let mut next_token = None;
+    let mut next_tag = None;
+    let mut next_sort = None;
     for (key, value) in next.query_pairs() {
-        if matches!(key.as_ref(), "q" | "limit" | "offset" | "query_urn")
+        if (matches!(key.as_ref(), "q" | "limit" | "offset" | "query_urn")
+            || (tag.is_some() && matches!(key.as_ref(), "filter.genre_or_tag" | "sort")))
             && !seen.insert(key.to_string())
         {
             return Err(invalid_response("duplicate search continuation parameter"));
@@ -833,8 +887,17 @@ fn continuation(
                 }
                 next_token = Some(value.into_owned());
             }
+            "filter.genre_or_tag" if tag.is_some() => next_tag = Some(value.into_owned()),
+            "sort" if tag.is_some() => next_sort = Some(value.into_owned()),
             _ => {} // In particular, never copy upstream client_id into the instance request.
         }
+    }
+    if let Some(tag) = tag
+        && (next_tag.as_deref() != Some(tag) || next_sort.as_deref() != Some("popular"))
+    {
+        return Err(invalid_response(
+            "tag continuation changed or omitted its filter",
+        ));
     }
     let expected_offset = u64::from(request.page)
         * u64::try_from(request.limit).map_err(|_| invalid_response("search limit overflows"))?;
@@ -1426,6 +1489,7 @@ mod tests {
             comments,
             [SoundcloakComment {
                 author: "Public listener".into(),
+                author_url: None,
                 body: "First\nSecond line <literal>".into(),
                 created_at: Some("2026-09-19T10:48:20Z".into()),
                 timestamp_seconds: Some(63)

@@ -245,6 +245,10 @@ export interface UiActionPayloads {
 	MoveArchivePlaybackChoice: number;
 	MoveInvidiousInstance: number;
 	OpenCommonsCategorySuggestionAt: number;
+	OpenVideoCommentAuthor: number;
+	OpenSoundCloudArtist: string;
+	OpenSoundCloudArtistAlbums: string;
+	SearchSoundCloudTag: string;
 	OpenWikidataValue: string;
 	OpenYandexMusicAlbumById: string;
 	OpenYandexMusicArtistById: string;

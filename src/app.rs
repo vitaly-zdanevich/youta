@@ -22337,6 +22337,10 @@ impl AppController {
     }
 
     fn go_back(&mut self) {
+        #[cfg(feature = "soundcloud")]
+        if self.view.screen == Screen::SoundCloud && self.go_back_soundcloud_catalog() {
+            return;
+        }
         #[cfg(feature = "archive-org")]
         if self.view.screen == Screen::ArchiveOrg && self.go_back_archive_org() {
             return;
@@ -26978,6 +26982,7 @@ impl AppController {
                 #[cfg(feature = "soundcloud")]
                 {
                     self.soundcloud.page_turn = None;
+                    self.cancel_soundcloud_catalog_page_turn();
                 }
                 self.finish_search_activity(SearchActivity::SoundCloud);
             }
@@ -30687,6 +30692,13 @@ impl AppController {
         self.view.selected_detail_link = Some(index);
         if let Some(target) = link.internal_target {
             match target {
+                DetailLinkInternalTarget::SoundCloudArtist(url) => {
+                    self.open_soundcloud_artist(url, false)
+                }
+                DetailLinkInternalTarget::SoundCloudArtistAlbums(url) => {
+                    self.open_soundcloud_artist(url, true)
+                }
+                DetailLinkInternalTarget::SoundCloudTag(tag) => self.search_soundcloud_tag(tag),
                 DetailLinkInternalTarget::YandexMusicArtist(artist_id) => {
                     #[cfg(feature = "yandex-music")]
                     self.open_yandex_music_artist(artist_id);
@@ -35776,6 +35788,10 @@ impl UiController for AppController {
                 }
             }
             UiAction::OpenVideoComments => self.open_youtube_video_comments(),
+            UiAction::OpenVideoCommentAuthor(index) => self.open_soundcloud_comment_author(index),
+            UiAction::OpenSoundCloudArtist(url) => self.open_soundcloud_artist(url, false),
+            UiAction::OpenSoundCloudArtistAlbums(url) => self.open_soundcloud_artist(url, true),
+            UiAction::SearchSoundCloudTag(tag) => self.search_soundcloud_tag(tag),
             UiAction::SetVideoCommentsScroll(offset) => {
                 if let Some(popup) = self.view.video_comments_popup.as_mut() {
                     popup.scroll_offset = offset;
@@ -45563,6 +45579,7 @@ fn video_comments_popup(
         .take(MAX_VIDEO_COMMENTS)
         .map(|comment| VideoCommentView {
             author_name: comment.author_name,
+            author_url: None,
             like_count: comment.like_count,
             published: comment
                 .published_at

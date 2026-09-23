@@ -9,6 +9,7 @@ pub(super) fn track(slug: &str) -> SoundcloakTrack {
         id: slug.to_owned(),
         title: format!("Track {slug}"),
         artist: "Fixture Artist".to_owned(),
+        artist_url: None,
         webpage_url: url::Url::parse(&format!("https://soundcloud.com/fixture-artist/{slug}"))
             .unwrap(),
         artwork_url: None,
@@ -51,6 +52,7 @@ pub(super) fn complete(
     controller.apply_soundcloud_page(
         SearchJob {
             generation,
+            tag: None,
             request: SoundcloakSearchRequest {
                 query: "fixture".to_owned(),
                 page: 1,
@@ -554,6 +556,221 @@ fn paging_controller() -> (AppController, Arc<PagingSoundcloakTransport>) {
         .unwrap(),
     );
     (app, transport)
+}
+
+/// Reopens only persisted navigation, installing mock HTTP before the first UI tick.
+fn restored_soundcloud_controller(query: &str) -> (AppController, Arc<PagingSoundcloakTransport>) {
+    restored_soundcloud_controller_on_screen(query, StoredScreen::SoundCloud)
+}
+
+/// Leaves a saved SoundCloud query dormant when startup restores a different tab.
+fn restored_soundcloud_controller_on_screen(
+    query: &str,
+    screen: StoredScreen,
+) -> (AppController, Arc<PagingSoundcloakTransport>) {
+    let mut config = Config::for_dir("/tmp/youta-soundcloud-restored-search-test");
+    config.providers.soundcloak_base_url =
+        Some(url::Url::parse("https://soundcloak.example/").unwrap());
+    let store = StateStore::open_in_memory().unwrap();
+    store
+        .save_session(
+            &SessionState {
+                screen,
+                soundcloud_search_text: query.to_owned(),
+                soundcloud_selected_row: Some(2),
+                selected_row: 2,
+                ..SessionState::default()
+            },
+            1,
+        )
+        .unwrap();
+    let mut app = AppController::new(config, store, None, None);
+    assert!(
+        app.soundcloud.worker.is_none(),
+        "construction must wait for viewport geometry"
+    );
+    let transport = Arc::new(PagingSoundcloakTransport::default());
+    app.soundcloud.client = Some(
+        SoundcloakClient::with_transport(
+            url::Url::parse("https://soundcloak.example/").unwrap(),
+            transport.clone(),
+        )
+        .unwrap(),
+    );
+    (app, transport)
+}
+
+#[test]
+fn soundcloud_restored_query_searches_once_after_viewport_and_keeps_selection() {
+    let (mut app, requests) = restored_soundcloud_controller("minsk");
+    assert_eq!(app.view.search_query, "minsk");
+    assert_eq!(
+        app.view.search_activity,
+        Some(SearchActivity::SoundCloud),
+        "unrequested saved text is not a completed empty search"
+    );
+    assert!(requests.0.lock().unwrap().is_empty());
+    app.set_soundcloud_search_page_capacity(10);
+    app.populate_soundcloud();
+    app.show_screen(Screen::SoundCloud);
+    assert!(
+        requests.0.lock().unwrap().is_empty(),
+        "redraw and tab click must not start HTTP"
+    );
+    app.tick();
+    assert!(
+        app.soundcloud.worker.is_some(),
+        "the first tick must schedule the saved query"
+    );
+    finish_soundcloud_page(&mut app);
+    assert_eq!(app.view.rows.len(), 11);
+    assert_eq!(app.view.selected, 2);
+    assert_eq!(app.view.search_activity, None);
+    for _ in 0..3 {
+        app.populate_soundcloud();
+        app.show_screen(Screen::SoundCloud);
+        app.tick();
+    }
+    let urls = requests.0.lock().unwrap();
+    assert_eq!(urls.len(), 1);
+    let query = urls[0].query_pairs().collect::<HashMap<_, _>>();
+    assert_eq!(query["q"], "minsk");
+    assert_eq!(query["offset"], "0");
+    assert_eq!(query["limit"], "10");
+}
+
+#[test]
+fn soundcloud_restored_query_respects_newer_navigation_or_input() {
+    for change in [
+        "empty",
+        "tab",
+        "edit",
+        "different query",
+        "diagnostic",
+        "quit",
+    ] {
+        let (mut app, requests) =
+            restored_soundcloud_controller(if change == "empty" { " " } else { "minsk" });
+        match change {
+            "tab" => app.show_screen(Screen::Search),
+            "edit" => app.view.search_editing = true,
+            "different query" => app.view.search_query = "new draft".into(),
+            "diagnostic" => app.diagnostic_only = true,
+            "quit" => app.view.quitting = true,
+            _ => {}
+        }
+        app.tick();
+        assert!(app.soundcloud.worker.is_none(), "{change}");
+        assert!(requests.0.lock().unwrap().is_empty(), "{change}");
+    }
+}
+
+#[test]
+fn soundcloud_manual_search_replaces_the_unstarted_saved_query() {
+    let (mut app, requests) = restored_soundcloud_controller("minsk");
+    app.set_soundcloud_search_page_capacity(8);
+    app.view.search_query = "manual query".into();
+    app.submit_soundcloud_search("manual query".into());
+    finish_soundcloud_page(&mut app);
+    app.tick();
+    assert_eq!(app.view.selected, 0);
+    let urls = requests.0.lock().unwrap();
+    assert_eq!(urls.len(), 1);
+    assert!(
+        urls[0]
+            .query_pairs()
+            .any(|(key, value)| key == "q" && value == "manual query")
+    );
+}
+
+#[test]
+fn soundcloud_restored_query_waits_for_visible_tab_and_supports_no_geometry_hint() {
+    for starts_hidden in [false, true] {
+        let (mut app, requests) = restored_soundcloud_controller_on_screen(
+            "minsk",
+            if starts_hidden {
+                StoredScreen::Search
+            } else {
+                StoredScreen::SoundCloud
+            },
+        );
+        if !starts_hidden {
+            app.show_screen(Screen::Search);
+        }
+        app.tick();
+        assert!(requests.0.lock().unwrap().is_empty());
+        assert!(app.soundcloud.worker.is_none());
+        app.show_screen(Screen::SoundCloud);
+        app.tick();
+        assert!(app.soundcloud.worker.is_some());
+        finish_soundcloud_page(&mut app);
+        let urls = requests.0.lock().unwrap();
+        assert_eq!(urls.len(), 1);
+        assert!(
+            urls[0]
+                .query_pairs()
+                .any(|(key, value)| key == "limit" && value == "50"),
+            "non-terminal frontend uses the bounded fallback"
+        );
+    }
+}
+
+/// Returns terminal search outcomes without contacting an instance or following continuations.
+struct RestoredTerminalOutcomeTransport {
+    requests: std::sync::atomic::AtomicUsize,
+    fail: bool,
+}
+
+impl crate::providers::soundcloak::SoundcloakTransport for RestoredTerminalOutcomeTransport {
+    fn fetch(&self, _: &url::Url, _: usize) -> Result<Vec<u8>, crate::providers::ProviderError> {
+        self.requests
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.fail {
+            Err(crate::providers::ProviderError::Transport(
+                "fixture search failure".into(),
+            ))
+        } else {
+            Ok(br#"{"collection":[],"next_href":null}"#.to_vec())
+        }
+    }
+}
+
+#[test]
+fn soundcloud_restored_query_empty_or_error_never_retries_on_redraw_or_tab_return() {
+    for fail in [false, true] {
+        let (mut app, _) = restored_soundcloud_controller("minsk");
+        let transport = Arc::new(RestoredTerminalOutcomeTransport {
+            requests: std::sync::atomic::AtomicUsize::new(0),
+            fail,
+        });
+        app.soundcloud.client = Some(
+            SoundcloakClient::with_transport(
+                url::Url::parse("https://soundcloak.example/").unwrap(),
+                transport.clone(),
+            )
+            .unwrap(),
+        );
+        app.tick();
+        assert!(app.soundcloud.worker.is_some());
+        finish_soundcloud_page(&mut app);
+        assert!(app.view.rows.is_empty());
+        assert_eq!(app.view.search_activity, None);
+        if fail {
+            assert!(app.view.status_line.contains("fixture search failure"));
+        }
+        for _ in 0..3 {
+            app.populate_soundcloud();
+            app.tick();
+            app.show_screen(Screen::Search);
+            app.show_screen(Screen::SoundCloud);
+            app.tick();
+        }
+        assert_eq!(
+            transport.requests.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert!(app.soundcloud.worker.is_none());
+    }
 }
 
 /// Completes one immediately available mock page without starting a second request.

@@ -75,7 +75,7 @@ test('Archive.org comments popup retains source identity and omits fictional lik
 /** Search, item loading, and parent navigation reuse the shared reducer actions. */
 test('Archive.org browsing has loading feedback and a back button', () => {
 	assert.match(search, /view\.screen === 'ArchiveOrg'/);
-	assert.match(search, /view\.search_activity === 'ArchiveOrg'/);
-	assert.match(search, /aria-label='Loading archive\.org'/);
+	assert.match(search, /view\.search_activity === view\.screen/);
+	assert.match(search, /aria-label=\{`Loading \$\{label\}`\}/);
 	assert.match(search, /dispatch\('GoBack'\)/);
 });

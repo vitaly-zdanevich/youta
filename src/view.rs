@@ -1712,6 +1712,12 @@ pub struct DetailLinkView {
 /// Exact provider destination exposed by a Details link or inline metadata value.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub enum DetailLinkInternalTarget {
+    /// Browse one canonical public SoundCloud artist's uploaded tracks.
+    SoundCloudArtist(String),
+    /// Browse one canonical public SoundCloud artist's albums and EPs.
+    SoundCloudArtistAlbums(String),
+    /// Search the exact public SoundCloud tag through the configured instance.
+    SoundCloudTag(String),
     /// One stable Yandex Music artist identifier.
     YandexMusicArtist(String),
     /// One stable Yandex Music album, show, or audiobook identifier.
@@ -1731,6 +1737,9 @@ impl DetailLinkInternalTarget {
     #[must_use]
     pub fn action(&self) -> UiAction {
         match self {
+            Self::SoundCloudArtist(url) => UiAction::OpenSoundCloudArtist(url.clone()),
+            Self::SoundCloudArtistAlbums(url) => UiAction::OpenSoundCloudArtistAlbums(url.clone()),
+            Self::SoundCloudTag(tag) => UiAction::SearchSoundCloudTag(tag.clone()),
             Self::YandexMusicArtist(id) => UiAction::OpenYandexMusicArtistById(id.clone()),
             Self::YandexMusicAlbum(id) => UiAction::OpenYandexMusicAlbumById(id.clone()),
             Self::LibriVoxAuthor(id) => UiAction::OpenLibriVoxAuthorById(id.clone()),
@@ -2085,6 +2094,8 @@ pub struct YouTubeCaptionsPopupView {
 pub struct VideoCommentView {
     /// Public author display name.
     pub author_name: String,
+    /// Validated canonical public SoundCloud profile; other providers remain inert.
+    pub author_url: Option<String>,
     /// Public like count attached to the comment.
     pub like_count: u64,
     /// Human-readable publication date, when exposed by the provider.
@@ -2988,6 +2999,8 @@ pub struct ViewModel {
     pub detail_link_reveal: Option<usize>,
     /// Archive can leave the current item, pending open, or metadata-search hop.
     pub archive_org_back_available: bool,
+    /// Whether SoundCloud has a cached parent catalogue to restore without fetching.
+    pub soundcloud_back_available: bool,
     /// Selected Commons media control inside the expanded Wikidata spoiler.
     pub selected_wikidata_media: Option<usize>,
     /// Selected right-panel mode.
@@ -3239,6 +3252,9 @@ impl ViewModel {
                             DetailLinkInternalTarget::ArchiveCreator(_)
                                 | DetailLinkInternalTarget::ArchiveTopic(_)
                                 | DetailLinkInternalTarget::ArchiveUploader(_)
+                                | DetailLinkInternalTarget::SoundCloudArtist(_)
+                                | DetailLinkInternalTarget::SoundCloudArtistAlbums(_)
+                                | DetailLinkInternalTarget::SoundCloudTag(_)
                         )
                     )
                 })
@@ -3400,6 +3416,7 @@ impl Default for ViewModel {
             selected_detail_link: None,
             detail_link_reveal: None,
             archive_org_back_available: false,
+            soundcloud_back_available: false,
             selected_wikidata_media: None,
             right_panel_mode: RightPanelMode::Details,
             waveform_visible: false,
@@ -4074,6 +4091,14 @@ pub enum UiAction {
     OpenGentooYtDlpPackage,
     /// Open bounded public comments for the selected provider item.
     OpenVideoComments,
+    /// Browse the validated public artist owning this current SoundCloud comment.
+    OpenVideoCommentAuthor(usize),
+    /// Browse public tracks from a canonical SoundCloud artist profile.
+    OpenSoundCloudArtist(String),
+    /// Browse public albums from a canonical SoundCloud artist profile.
+    OpenSoundCloudArtistAlbums(String),
+    /// Search one exact public SoundCloud tag, retaining its parent for Back.
+    SearchSoundCloudTag(String),
     /// Set the exact wrapped-line offset in the public-comments popup.
     SetVideoCommentsScroll(usize),
     /// Close the public-comments popup without changing Details.

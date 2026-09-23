@@ -113,7 +113,10 @@ export type DetailLinkInternalTarget =
 	| { LibriVoxAuthor: string }
 	| { ArchiveCreator: string }
 	| { ArchiveTopic: string }
-	| { ArchiveUploader: string };
+	| { ArchiveUploader: string }
+	| { SoundCloudArtist: string }
+	| { SoundCloudArtistAlbums: string }
+	| { SoundCloudTag: string };
 
 /** One selectable external link beside a media item or channel. */
 export interface DetailLinkView {
@@ -346,6 +349,8 @@ export interface AudioQualityPopupView {
 /** One public top-level comment. */
 export interface VideoCommentView {
   author_name: string;
+	/** Canonical SoundCloud profile, when the provider supplied a usable permalink. */
+	author_url: string | null;
   like_count: number;
   published: string | null;
   text: string;
@@ -938,6 +943,8 @@ export interface ViewModel {
 	detail_link_reveal: number | null;
 	/** Whether Archive can cancel an open, leave its track list or restore a prior metadata route. */
 	archive_org_back_available: boolean;
+	/** Whether SoundCloud can restore a previous artist, album or search route. */
+	soundcloud_back_available: boolean;
   selected_wikidata_media: number | null;
   subscriptions: SubscriptionsView;
   waveform: WaveformView;

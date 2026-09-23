@@ -30,7 +30,7 @@ struct CommentsWorker {
 impl AppController {
     /// Fetches comments only after F6/click, never during result selection or artwork loading.
     pub(in crate::app) fn open_soundcloud_comments(&mut self) {
-        let Some(track) = self.soundcloud.items.get(self.view.selected).cloned() else {
+        let Some(track) = self.selected_soundcloud_track().cloned() else {
             self.view.status_line = "Select a SoundCloud track to load its public comments".into();
             return;
         };
@@ -179,6 +179,7 @@ impl AppController {
                         let date = soundcloud_date(comment.created_at.as_deref());
                         VideoCommentView {
                             author_name: comment.author,
+                            author_url: comment.author_url.map(|url| url.to_string()),
                             like_count: 0,
                             published: (!date.is_empty()).then_some(date),
                             text: comment.timestamp_seconds.map_or_else(

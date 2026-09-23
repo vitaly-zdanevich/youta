@@ -13,29 +13,44 @@
 	const soundcloudArtwork = ['https://soundcloak.example/artwork-500', 'https://soundcloak.example/artwork-1080'];
 	const nativeSoundcloudArtwork = soundcloudArtwork.map((url) => `youta://artwork/${encodeURIComponent(url)}`);
 	const requestedSoundcloudArtwork = new Set();
+	const controlledSoundcloudArtwork = new Map();
+	const decodedSoundcloudArtwork = [];
 	const waveformImage = 'data:image/svg+xml,' + encodeURIComponent(
 		'<svg xmlns="http://www.w3.org/2000/svg" width="800" height="200"><path d="M0 100H100L150 10L200 190L250 50L300 150L350 100H800" stroke="white" fill="none"/></svg>',
 	);
 	const setAttribute = Element.prototype.setAttribute;
 	const imageSource = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'src');
+	const decodeImage = HTMLImageElement.prototype.decode;
+	HTMLImageElement.prototype.decode = function() {
+		const native = this.dataset.nativeArtwork;
+		if (nativeSoundcloudArtwork.includes(native) || controlledSoundcloudArtwork.has(native)) {
+			decodedSoundcloudArtwork.push({ native, image: this });
+			if (controlledSoundcloudArtwork.get(native)?.rejectDecode) return Promise.reject(new Error('Fixture decode failure'));
+		}
+		return decodeImage.call(this);
+	};
+	/** Keep all image bytes local while allowing delayed and failed native responses. */
+	function mockedArtwork(image, value, assign) {
+		if (value !== nativeWaveformUrl && !nativeSoundcloudArtwork.includes(value) && !controlledSoundcloudArtwork.has(value)) return false;
+		if (value !== nativeWaveformUrl) requestedSoundcloudArtwork.add(value);
+		setAttribute.call(image, 'data-native-artwork', value);
+		const fixture = controlledSoundcloudArtwork.get(value);
+		if (fixture) {
+			fixture.images.push(image);
+			if (fixture.held) return true;
+		}
+		assign(fixture?.fail ? 'data:image/png;base64,broken' : waveformImage);
+		return true;
+	}
 	Object.defineProperty(HTMLImageElement.prototype, 'src', {
 		...imageSource,
 		set(value) {
-			if (value === nativeWaveformUrl || nativeSoundcloudArtwork.includes(value)) {
-				if (nativeSoundcloudArtwork.includes(value)) requestedSoundcloudArtwork.add(value);
-				setAttribute.call(this, 'data-native-artwork', value);
-				imageSource.set.call(this, waveformImage);
-			} else {
-				imageSource.set.call(this, value);
-			}
+			if (!mockedArtwork(this, value, (source) => imageSource.set.call(this, source))) imageSource.set.call(this, value);
 		},
 	});
 	Element.prototype.setAttribute = function(name, value) {
-		if (this instanceof HTMLImageElement && name === 'src' && (value === nativeWaveformUrl || nativeSoundcloudArtwork.includes(value))) {
-			if (nativeSoundcloudArtwork.includes(value)) requestedSoundcloudArtwork.add(value);
-			setAttribute.call(this, 'data-native-artwork', value);
-			return setAttribute.call(this, name, waveformImage);
-		}
+		if (this instanceof HTMLImageElement && name === 'src'
+			&& mockedArtwork(this, value, (source) => setAttribute.call(this, name, source))) return;
 		return setAttribute.call(this, name, value);
 	};
 	const clone = (value) => structuredClone(value);
@@ -362,13 +377,93 @@
 		await action({ ActivateDetailLink: 0 }, () => button('Ambient & Field', panel).click(), 'SoundCloud genre remains an explicit clickable source link');
 		await action('OpenVideoComments', () => button('Comments', panel).click(), 'SoundCloud comments load only through the explicit shared action');
 		await until(() => panel.querySelector('img[data-native-artwork]'), 'SoundCloud Details preview artwork');
-		assert(requestedSoundcloudArtwork.has(nativeSoundcloudArtwork[0]) && !requestedSoundcloudArtwork.has(nativeSoundcloudArtwork[1]), 'SoundCloud Details requests 500px artwork without fetching 1080px');
+		await until(() => requestedSoundcloudArtwork.has(nativeSoundcloudArtwork[1]), 'selected SoundCloud 1080px artwork prefetch before expansion');
+		await until(() => decodedSoundcloudArtwork.some(({ native }) => native === nativeSoundcloudArtwork[1]), 'selected SoundCloud background artwork decode');
+		assert(decodedSoundcloudArtwork.find(({ native }) => native === nativeSoundcloudArtwork[1]).image.isConnected === false, 'SoundCloud prefetch uses one detached image without replacing Details');
+		assert(panel.querySelector('img').dataset.nativeArtwork === nativeSoundcloudArtwork[0], 'SoundCloud Details stays at 500px while 1080px loads in the background');
 		await action('ToggleThumbnailExpansion', () => panel.querySelector('img').click(), 'SoundCloud image expansion is explicit');
 		snapshot({ details: { ...trackDetails, thumbnail_expanded: true } });
-		await until(() => requestedSoundcloudArtwork.has(nativeSoundcloudArtwork[1]), 'SoundCloud expanded artwork request');
+		await until(() => dialog()?.querySelector('img')?.dataset.nativeArtwork === nativeSoundcloudArtwork[1], 'expanded SoundCloud artwork uses the prefetched cached URL');
 		snapshot({ details: trackDetails });
+		await until(() => !dialog(), 'collapsed SoundCloud artwork');
+		await checkSoundCloudArtworkOwnership(trackDetails);
+		await checkSoundCloudNavigation(trackDetails);
 		snapshot(previous);
 		await until(() => document.querySelector('[title="Search archive.org"]'), 'restored Archive fixture');
+	}
+
+	/** Author, artist and tag navigation remain internal shared actions, without a browser opener. */
+	async function checkSoundCloudNavigation(base) {
+		const profile = 'https://soundcloud.com/canonical-artist';
+		snapshot({ video_comments_popup: { source: 'sound-cloud', video_id: 'track', video_title: 'Commented track', state: 'Ready', scroll_offset: 0,
+			comments: [{ author_name: 'Display artist', author_url: profile, like_count: 0, published: '2026 September 23', text: 'Comment text' },
+				{ author_name: 'Unknown author', author_url: null, like_count: 0, published: null, text: 'Another comment' }] } });
+		const author = await until(() => button('Display artist', dialog()), 'clickable SoundCloud comment author');
+		assert(author.title === profile && author.className.includes('underline'), 'comment author is visibly linked to its canonical profile');
+		assert(!button('Unknown author', dialog()), 'comment without canonical author URL stays plain');
+		await action({ OpenVideoCommentAuthor: 0 }, () => author.click(), 'comment author opens its artist in Youta');
+		snapshot({ video_comments_popup: { ...view.video_comments_popup, source: 'youtube' } });
+		await until(() => !button('Display artist', dialog()), 'YouTube author does not inherit SoundCloud navigation');
+		snapshot({ video_comments_popup: null, soundcloud_back_available: true, external_opener_available: false,
+			details: { ...base, thumbnail_url: null, expanded_thumbnail_url: null, links: [
+				{ prefix: 'Artist: ', label: 'Artist tracks', url: profile, presentation: 'LabelOnlySpaced', description_range: null,
+					internal_target: { SoundCloudArtist: profile }, wikidata_item_id: null },
+				{ prefix: '', label: 'Artist albums', url: profile, presentation: 'LabelOnlySpaced', description_range: null,
+					internal_target: { SoundCloudArtistAlbums: profile }, wikidata_item_id: null },
+				{ prefix: 'Tag: ', label: 'field recording', url: 'https://soundcloud.com/tags/field%20recording', presentation: 'LabelOnlySpaced', description_range: null,
+					internal_target: { SoundCloudTag: 'field recording' }, wikidata_item_id: null },
+			] } });
+		await until(() => !dialog() && button('Artist tracks'), 'SoundCloud artist and tag links');
+		const panel = document.querySelector('[aria-label=Details]');
+		for (const [index, label] of ['Artist tracks', 'Artist albums', 'field recording'].entries()) {
+			await action({ ActivateDetailLink: index }, () => button(label, panel).click(), `${label} navigates internally without external opener`);
+		}
+		assert(!panel.textContent.includes('Tags'), 'clickable tags replace duplicate plain-text tags');
+		await action('GoBack', () => button('[Esc] Back').click(), 'SoundCloud Back restores the preceding route');
+		snapshot({ soundcloud_back_available: false });
+		await until(() => !button('[Esc] Back'), 'SoundCloud root hides unavailable Back');
+	}
+
+	/** A selected rendition owns its callbacks; hidden rows and stale failures never do. */
+	async function checkSoundCloudArtworkOwnership(base) {
+		const fixture = (slug, preview = {}, expanded = {}) => {
+			const urls = [500, 1080].map((size) => `https://soundcloak.example/artwork-${slug}-${size}`);
+			const native = urls.map((url) => `youta://artwork/${encodeURIComponent(url)}`);
+			for (const [index, options] of [preview, expanded].entries()) controlledSoundcloudArtwork.set(native[index], { images: [], ...options });
+			return { native, urls, details: { ...base, title: `SoundCloud ${slug}`,
+				media_id: { source: 'sound-cloud', external_id: `https://soundcloud.com/artist/${slug}` },
+				thumbnail_url: urls[0], expanded_thumbnail_url: urls[1], thumbnail_expanded: false } };
+		};
+		const selected = fixture('held', { held: true }, { held: true });
+		const unselected = fixture('unselected');
+		snapshot({ details: selected.details, rows: [row('Selected SoundCloud', selected.details.media_id),
+			{ ...row('Unselected SoundCloud', unselected.details.media_id), thumbnail_url: unselected.urls[0] }] });
+		await until(() => controlledSoundcloudArtwork.get(selected.native[0]).images.length, 'held selected preview request');
+		await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+		assert(!requestedSoundcloudArtwork.has(selected.native[1]), 'SoundCloud background loading waits for the visible 500px image');
+		for (const image of controlledSoundcloudArtwork.get(selected.native[0]).images) imageSource.set.call(image, waveformImage);
+		const old = await until(() => controlledSoundcloudArtwork.get(selected.native[1]).images[0], 'selected held 1080px prefetch');
+		const staleLoad = old.onload;
+		assert(typeof staleLoad === 'function', 'The selected prefetch has an explicit guarded completion');
+		assert(!requestedSoundcloudArtwork.has(unselected.native[1]), 'Unselected result artwork never triggers a 1080px prefetch');
+		const replacement = fixture('replacement', {}, { rejectDecode: true });
+		snapshot({ details: replacement.details });
+		await until(() => decodedSoundcloudArtwork.some(({ native }) => native === replacement.native[1]), 'replacement prefetch attempts decode');
+		assert(old.onload === null && old.onerror === null && old.getAttribute('src') === null, 'Changing selection retires the previous image owner and callbacks');
+		staleLoad.call(old, new Event('load'));
+		assert(!decodedSoundcloudArtwork.some(({ native }) => native === selected.native[1]), 'A captured stale completion cannot decode the previous track');
+		assert(document.querySelector('[aria-label=Details] img')?.dataset.nativeArtwork === replacement.native[0], 'A quiet background decode failure leaves the replacement preview intact');
+		const failedPreview = fixture('failed-preview', { fail: true });
+		snapshot({ details: failedPreview.details });
+		await until(() => document.querySelector('[aria-label=Details]')?.textContent.includes(failedPreview.details.title)
+			&& !document.querySelector('[aria-label=Details] img'), 'failed preview placeholder');
+		assert(!requestedSoundcloudArtwork.has(failedPreview.native[1]), 'A failed 500px preview does not prefetch its larger rendition');
+		const failedLarge = fixture('failed-large', {}, { fail: true });
+		snapshot({ details: failedLarge.details });
+		await until(() => requestedSoundcloudArtwork.has(failedLarge.native[1]), 'failed background rendition request');
+		assert(document.querySelector('[aria-label=Details] img')?.dataset.nativeArtwork === failedLarge.native[0], 'A new selection recovers after preview failure and background HTTP/image failure stays quiet');
+		snapshot({ details: null });
+		await until(() => !document.querySelector('[aria-label=Details]'), 'cleared selected artwork owner');
 	}
 	/** Focus snapshots and native checkbox/button keys must agree with the shared keymap. */
 	async function checkPreferencesFocus() {

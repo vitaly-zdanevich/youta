@@ -1476,7 +1476,12 @@ export function VideoCommentsPopup({ popup }: { popup: VideoCommentsPopupView })
         >
           {popup.comments.map((comment, index) => (
             <div key={`${comment.author_name}-${index}`} className="mb-[8px]">
-              <span className="text-accent">{comment.author_name}</span>
+							{soundcloud && comment.author_url?.trim() ? (
+								<button type='button' className='text-accent underline' title={comment.author_url}
+									onClick={() => void dispatch({ OpenVideoCommentAuthor: index })}>
+									{comment.author_name}
+								</button>
+							) : <span className='text-accent'>{comment.author_name}</span>}
               <span className="text-ink-faint">
 								{/* Only YouTube reports comment likes through the current adapters. */}
 								{archiveOrg || soundcloud

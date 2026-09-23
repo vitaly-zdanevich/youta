@@ -425,12 +425,16 @@ resolver:
   an API key or SoundCloud login. Each track links to both its original
   SoundCloud page and its page on the configured Soundcloak instance. History
   and playlists retain the original URL, not an instance-specific stream.
+  Artist links open their tracks and albums inside Youta; clickable tags run
+  SoundCloud tag searches. **Esc / Back** restores the preceding catalogue.
   Search requests fit the visible result rows (up to 100 tracks); explicit
   **Load more tracks…** keeps that page size and scrolls one page at a time.
   Details show the available plays, likes, reposts, creation/modification dates,
   license, tags, and linked genre. Artwork uses the 500-pixel rendition in
-  Details; the 1080-pixel rendition is requested only when expanded. **F6**
-  loads up to 20 public comments for the selected track on demand. Exact
+  Details; the selected track's 1080-pixel rendition warms in the background
+  for immediate expansion once ready. **F6**
+  loads up to 20 public comments for the selected track on demand. Comment
+  authors with a public profile link also open their artist catalogue. Exact
   track/account Wikidata matches are loaded lazily when `wikidata` is enabled.
   The default is `https://sc1.maid.zone/`; set `providers.soundcloak_base_url`
   in `config.toml` to use another trusted instance. The [official instance

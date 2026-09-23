@@ -2587,7 +2587,10 @@ fn unfiltered_key_action(
         {
             Some(UiAction::GoBack)
         }
-        Key::Esc if view.screen == Screen::ArchiveOrg && view.archive_org_back_available => {
+        Key::Esc
+            if (view.screen == Screen::ArchiveOrg && view.archive_org_back_available)
+                || (view.screen == Screen::SoundCloud && view.soundcloud_back_available) =>
+        {
             Some(UiAction::GoBack)
         }
         Key::Esc if view.details_focused => Some(UiAction::SetDetailsFocus(false)),

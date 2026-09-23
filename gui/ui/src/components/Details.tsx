@@ -128,7 +128,8 @@ function factsFor(kind: InformationPanelKind, details: DetailView): Array<[strin
 					['Comments', fact(details.comments)],
 					['Created', fact(track.created)],
 					['Modified', fact(track.modified)],
-					['Tags', fact(track.tags.join(', '))],
+					['Tags', details.links.some((link) => link.internal_target && 'SoundCloudTag' in link.internal_target)
+						? null : fact(track.tags.join(', '))],
 				);
 			}
       break;
@@ -340,7 +341,9 @@ export function Details({ view, kind }: { view: ViewModel; kind: InformationPane
       }}
     >
       <Artwork
+		key={isSoundCloud ? JSON.stringify([details.media_id, details.thumbnail_url, details.expanded_thumbnail_url]) : undefined}
         url={isSoundCloud ? details.thumbnail_url : details.expanded_thumbnail_url ?? details.thumbnail_url}
+		prefetchUrl={isSoundCloud ? details.expanded_thumbnail_url : null}
         className="mb-3 block max-h-[220px] w-full rounded-md object-cover"
         onClick={() => void dispatch("ToggleThumbnailExpansion")}
       />
