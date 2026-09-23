@@ -24,6 +24,7 @@ mod download_choice;
 mod end_pause;
 mod invidious_instances;
 mod manual_downloads;
+mod now_playing;
 #[cfg(all(feature = "archive-org", feature = "yt-dlp", feature = "backend-mpv"))]
 mod original_download;
 mod preferences_focus;
@@ -4601,6 +4602,8 @@ pub struct AppController {
     config: Config,
     store: StateStore,
     view: ViewModel,
+    /// Bounded accepted metadata and a reversible source-focused navigation page.
+    now_playing_navigation: now_playing::NowPlayingNavigation,
     /// Query retained independently for the YouTube tab.
     youtube_search_query: String,
     /// Selected YouTube row retained while another tab is visible.
@@ -6180,6 +6183,7 @@ impl AppController {
             config,
             store,
             view,
+            now_playing_navigation: now_playing::NowPlayingNavigation::default(),
             youtube_search_query,
             youtube_selected,
             youtube_music_search_query,
@@ -7430,6 +7434,8 @@ impl AppController {
 
     /// Starts editing the active search, Web address, or local Radio filter.
     fn begin_search_input(&mut self) {
+        #[cfg(feature = "librivox")]
+        self.cancel_librivox_now_playing_navigation();
         #[cfg(feature = "radio")]
         if self.view.screen == Screen::Radio {
             let selected_station_id = self
@@ -12918,6 +12924,9 @@ impl AppController {
                 book_id,
                 result,
             } => {
+                if self.finish_playing_librivox(generation, book_id, &result) {
+                    return;
+                }
                 let owns = matches!(
                     self.pending_librivox_request.as_ref(),
                     Some(PendingLibrivoxRequest::Book {
@@ -21058,7 +21067,7 @@ impl AppController {
             .is_some()
             .then(|| self.autoplay_origin_for_media(&summary.id))
             .flatten();
-        self.play_queue_item_with_origin_and_input(item, false, origin, Some(input));
+        self.play_bandcamp_with_navigation_context(item, summary, origin, input);
     }
 
     /// Starts one Apple collection lookup with stable tab and row ownership.
@@ -21361,11 +21370,11 @@ impl AppController {
         if item.media.id != pending.entry.media_id {
             self.show_error_message(
                 "History item could not be resolved",
-                "The provider page resolved to a different media identifier; the History record was kept",
+            "The provider page resolved to a different media identifier; the History record was kept",
             );
             return true;
         }
-        self.play_queue_item(item, false);
+        self.play_resolved_with_navigation_context(item, media);
         true
     }
 
@@ -21604,7 +21613,13 @@ impl AppController {
         if self.view.screen == Screen::History {
             self.cancel_pending_history_replay();
         }
-        let music_origin = item.media.webpage_url.host_str() == Some("music.youtube.com");
+        let music_origin = self.view.playing_screen == Some(Screen::YouTubeMusic)
+            || item.media.webpage_url.host_str() == Some("music.youtube.com");
+
+        if self.reveal_cached_now_playing(&item) {
+            self.finish_now_playing_selection(&item);
+            return;
+        }
 
         #[cfg(feature = "radio")]
         if item.media.id.source == SourceKind::Radio
@@ -21633,7 +21648,8 @@ impl AppController {
         }
 
         if item.media.id.source == SourceKind::YouTube
-            && (self.view.screen == Screen::YouTubeMusic || music_origin)
+            && (music_origin
+                || (self.view.playing_screen.is_none() && self.view.screen == Screen::YouTubeMusic))
             && let Some(index) = self.youtube_music_results.iter().position(|candidate| {
                 matches!(
                     candidate,
@@ -21773,6 +21789,24 @@ impl AppController {
             self.view.right_panel_mode = RightPanelMode::Details;
             self.view.status_line = format!("Selected playing item: {}", item.media.title);
             self.refresh_selected_playlist_state();
+            return;
+        }
+
+        if self.reveal_retained_now_playing(&item) {
+            self.finish_now_playing_selection(&item);
+            return;
+        }
+        #[cfg(feature = "archive-org")]
+        if item.media.id.source == SourceKind::ArchiveOrg
+            && self.request_playing_archive_org(&item.media.id)
+        {
+            return;
+        }
+        if self.reveal_uncached_local_now_playing(&item) {
+            return;
+        }
+        #[cfg(feature = "librivox")]
+        if item.media.id.source == SourceKind::LibriVox && self.request_playing_librivox(&item) {
             return;
         }
 
@@ -22337,6 +22371,9 @@ impl AppController {
     }
 
     fn go_back(&mut self) {
+        if self.restore_now_playing_location() {
+            return;
+        }
         #[cfg(feature = "soundcloud")]
         if self.view.screen == Screen::SoundCloud && self.go_back_soundcloud_catalog() {
             return;
@@ -25933,6 +25970,8 @@ impl AppController {
                         .begin_now(item.clone(), had_active_media);
                 }
                 self.current_media = Some(media_id.clone());
+                self.remember_now_playing_context(&item);
+                self.update_now_playing_screen(&item, origin.as_ref());
                 #[cfg(feature = "soundcloud")]
                 self.accept_soundcloud_playback(&media_id);
                 #[cfg(feature = "sponsorblock")]
@@ -26752,6 +26791,7 @@ impl AppController {
     }
 
     fn reset_playback_state(&mut self) {
+        self.clear_now_playing_context();
         #[cfg(feature = "soundcloud")]
         self.reset_soundcloud_preview();
         #[cfg(all(feature = "archive-org", feature = "yt-dlp", feature = "backend-mpv"))]
@@ -26949,121 +26989,7 @@ impl AppController {
             };
             return;
         }
-        self.clear_scheduled_subscription_video_metadata();
-        if self.view.screen == Screen::History && screen != Screen::History {
-            self.cancel_pending_history_replay();
-        }
-        self.clear_detail_navigation_history();
-        #[cfg(feature = "yt-dlp")]
-        self.cancel_youtube_prewarm();
-        if self.view.screen == Screen::Local && screen != Screen::Local {
-            #[cfg(feature = "acoustid")]
-            self.cancel_local_fingerprint();
-            #[cfg(feature = "audio-quality")]
-            if self.pending_local_audio_quality.is_some() {
-                self.cancel_visible_local_audio_quality();
-            }
-            self.invalidate_local_folder_sizes();
-        }
-        self.view.search_editing = false;
-        #[cfg(feature = "radio")]
-        if self.view.screen == Screen::Radio {
-            self.radio_filter_edit_snapshot = None;
-        }
-        match self.view.screen {
-            Screen::Search => {
-                self.youtube_search_query
-                    .clone_from(&self.view.search_query);
-                self.youtube_selected = self.view.selected;
-            }
-            Screen::SoundCloud => {
-                self.soundcloud.query.clone_from(&self.view.search_query);
-                self.soundcloud.selected = self.view.selected;
-                #[cfg(feature = "soundcloud")]
-                {
-                    self.soundcloud.page_turn = None;
-                    self.cancel_soundcloud_catalog_page_turn();
-                }
-                self.finish_search_activity(SearchActivity::SoundCloud);
-            }
-            Screen::YouTubeMusic => {
-                self.youtube_music_search_query
-                    .clone_from(&self.view.search_query);
-                self.youtube_music_selected = self.view.selected;
-            }
-            #[cfg(feature = "yandex-music")]
-            Screen::YandexMusic => {
-                self.yandex_music_search_query
-                    .clone_from(&self.view.search_query);
-                self.yandex_music_selected = self.view.selected;
-            }
-            #[cfg(not(feature = "yandex-music"))]
-            Screen::YandexMusic => {}
-            #[cfg(feature = "bandcamp")]
-            Screen::Bandcamp => {
-                self.bandcamp_search_query
-                    .clone_from(&self.view.search_query);
-                self.bandcamp_selected = self.view.selected;
-                self.cancel_pending_bandcamp_resolution();
-            }
-            Screen::ApplePodcasts => {
-                self.apple_podcasts_search_query
-                    .clone_from(&self.view.search_query);
-                match self.apple_podcasts_route {
-                    ApplePodcastsRoute::Shows => {
-                        self.apple_podcasts_selected = self.view.selected;
-                    }
-                    ApplePodcastsRoute::Episodes => {
-                        self.apple_podcast_episode_selected = self.view.selected;
-                    }
-                    ApplePodcastsRoute::Direct => {}
-                }
-            }
-            #[cfg(feature = "web-browser")]
-            Screen::Web => {
-                self.web.selected = self.view.selected;
-                self.finish_search_activity(SearchActivity::Web);
-            }
-            Screen::ArchiveOrg => {
-                if self.archive_org_search_scope == crate::domain::ArchiveOrgSearchScope::Text {
-                    self.archive_org_search_query
-                        .clone_from(&self.view.search_query);
-                }
-                self.archive_org_selected = self.view.selected;
-                self.finish_search_activity(SearchActivity::ArchiveOrg);
-            }
-            Screen::LibriVox => {
-                self.librivox_search_query
-                    .clone_from(&self.view.search_query);
-                self.librivox_selected = self.view.selected;
-            }
-            Screen::Radio => {
-                self.radio_filter_query.clone_from(&self.view.search_query);
-                #[cfg(feature = "radio")]
-                self.remember_selected_radio_station();
-                #[cfg(not(feature = "radio"))]
-                {
-                    self.radio_selected = self.view.selected;
-                }
-            }
-            Screen::TrackerMusic => {
-                self.tracker_search_query
-                    .clone_from(&self.view.search_query);
-                self.tracker_selected = self.view.selected;
-            }
-            Screen::Playlists => match self.playlists_route {
-                PlaylistsRoute::Index => self.playlist_selected = self.view.selected,
-                PlaylistsRoute::Entries { .. } => {
-                    self.playlist_entry_selected = self.view.selected;
-                }
-            },
-            _ => {}
-        }
-        self.details_generation = self.details_generation.wrapping_add(1);
-        #[cfg(feature = "wikidata")]
-        self.invalidate_wikidata_lookup();
-        self.channel_details_generation = self.channel_details_generation.wrapping_add(1);
-        self.scheduled_channel_details = None;
+        self.prepare_screen_transition(screen);
         self.view.screen = screen;
         if self.view.right_panel_mode == RightPanelMode::Channel {
             self.view.right_panel_mode = RightPanelMode::Details;
@@ -28777,7 +28703,7 @@ impl AppController {
         if item.media.id != pending.owner.entry.media.id {
             self.show_error_message(
                 "Playlist item could not be resolved",
-                "The provider page resolved to a different media identifier; the playlist entry was kept",
+            "The provider page resolved to a different media identifier; the playlist entry was kept",
             );
             return true;
         }
@@ -28786,7 +28712,7 @@ impl AppController {
             self.view.status_line = error;
             return true;
         }
-        self.play_queue_item(item, false);
+        self.play_resolved_with_navigation_context(item, media);
         true
     }
 
@@ -46335,6 +46261,8 @@ mod tests {
     #[cfg(feature = "yt-dlp")]
     #[path = "manual_download_sources.rs"]
     mod manual_download_sources_tests;
+    #[path = "now_playing.rs"]
+    mod now_playing_tests;
     #[cfg(feature = "tui")]
     #[path = "performance.rs"]
     mod performance_tests;
@@ -76499,8 +76427,8 @@ mod tests {
 
         assert_eq!(
             controller.view.screen,
-            Screen::History,
-            "an unsubscribed channel's stale RAM cache must not select another source"
+            Screen::Search,
+            "an unsubscribed channel's stale RAM cache must not restore Subscriptions; use the canonical playing video adapter"
         );
         assert_eq!(
             controller
@@ -76513,7 +76441,7 @@ mod tests {
     }
 
     #[test]
-    fn show_now_playing_falls_back_to_queued_metadata_outside_the_current_list() {
+    fn show_now_playing_reveals_accepted_direct_metadata_outside_the_current_list() {
         let (mut controller, _state) = controller_with_mock_statuses([]);
         let mut item = fixture_direct_item("spoken-word");
         item.media.description = Some("Queued description".to_owned());
@@ -76525,12 +76453,9 @@ mod tests {
         let details = controller.view.details.as_ref().expect("queued details");
         assert_eq!(details.title, "spoken-word");
         assert_eq!(details.description, "Queued description");
-        assert!(
-            controller
-                .view
-                .status_line
-                .contains("not in the current list")
-        );
+        assert_eq!(controller.view.screen, Screen::Search);
+        assert_eq!(controller.view.rows[0].media_id, details.media_id);
+        assert!(controller.resolved_direct.is_some());
     }
 
     /// Podcast continuation keeps its original playable episodes across navigation,

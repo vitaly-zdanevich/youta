@@ -934,6 +934,8 @@ export interface ViewModel {
   rows: RowView[];
   selected: number;
   playing_media_id: MediaId | null;
+	/** Source route owning accepted playback, including while paused. */
+	playing_screen: ActionScreen | null;
   now_playing: NowPlayingView | null;
   details: DetailView | null;
   details_focused: boolean;

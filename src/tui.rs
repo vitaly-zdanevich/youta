@@ -2978,6 +2978,21 @@ fn render_download_bar(
     }
 }
 
+/// Adds transport state to the owning source without changing tab identity.
+fn source_tab_label(screen: Screen, view: &ViewModel, compact: bool) -> String {
+    let label = if compact {
+        screen.compact_label()
+    } else {
+        screen.label()
+    };
+    let marker = if !view.playback.idle && view.playing_screen == Some(screen) {
+        if view.playback.paused { "|| " } else { "▶ " }
+    } else {
+        ""
+    };
+    format!("{marker}{label}")
+}
+
 fn render_tabs(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -2997,7 +3012,7 @@ fn render_tabs(
         .collect::<Vec<_>>();
     let full_width = available
         .iter()
-        .map(|screen| usize::from(terminal_text_width(screen.label())))
+        .map(|screen| usize::from(terminal_text_width(&source_tab_label(*screen, view, false))))
         .sum::<usize>()
         .saturating_add(
             usize::from(terminal_text_width(FULL_DIVIDER))
@@ -3012,13 +3027,13 @@ fn render_tabs(
     let divider_width = terminal_text_width(divider);
     let compact_width = available
         .iter()
-        .map(|screen| usize::from(terminal_text_width(screen.compact_label())))
+        .map(|screen| usize::from(terminal_text_width(&source_tab_label(*screen, view, true))))
         .sum::<usize>()
         .saturating_add(
             usize::from(divider_width).saturating_mul(available.len().saturating_sub(1)),
         );
     let visible = if compact && compact_width > usize::from(area.width) {
-        active_tab_window(&available, view.screen, area.width, divider_width)
+        active_tab_window(&available, view, area.width, divider_width)
     } else {
         0..available.len()
     };
@@ -3035,12 +3050,8 @@ fn render_tabs(
         if x >= area.right() {
             break;
         }
-        let label = if compact {
-            screen.compact_label()
-        } else {
-            screen.label()
-        };
-        let width = terminal_text_width(label).min(area.right().saturating_sub(x));
+        let label = source_tab_label(screen, view, compact);
+        let width = terminal_text_width(&label).min(area.right().saturating_sub(x));
         if width == 0 {
             break;
         }
@@ -3061,16 +3072,16 @@ fn render_tabs(
 /// Chooses a contiguous compact-tab window that always contains the active tab.
 fn active_tab_window(
     screens: &[Screen],
-    active: Screen,
+    view: &ViewModel,
     available_width: u16,
     divider_width: u16,
 ) -> std::ops::Range<usize> {
-    let Some(active_index) = screens.iter().position(|screen| *screen == active) else {
+    let Some(active_index) = screens.iter().position(|screen| *screen == view.screen) else {
         return 0..screens.len();
     };
     let widths = screens
         .iter()
-        .map(|screen| terminal_text_width(screen.compact_label()))
+        .map(|screen| terminal_text_width(&source_tab_label(*screen, view, true)))
         .collect::<Vec<_>>();
     let mut start = active_index;
     let mut end = active_index.saturating_add(1);
@@ -39529,7 +39540,7 @@ prose 07:25 remains clickable but is not a chapter";
         let compact_divider_width = terminal_text_width("│");
         let visible = active_tab_window(
             &compact_screens,
-            view.screen,
+            &view,
             compact_width,
             compact_divider_width,
         );
@@ -39581,6 +39592,67 @@ prose 07:25 remains clickable but is not a chapter";
                     modifiers: KeyModifiers::NONE,
                 };
                 assert_eq!(mouse_action(divider_click, &compact_hit_map, &view), None);
+            }
+        }
+    }
+
+    /// Marker width participates in compact layout and never changes click identity.
+    #[test]
+    fn playing_source_tab_markers_keep_paused_and_compact_hitboxes_exact() {
+        for width in [12, 32, 80, 240] {
+            for (idle, paused, marker) in [
+                (false, false, "▶ "),
+                (false, true, "|| "),
+                (true, false, ""),
+            ] {
+                let view = ViewModel {
+                    screen: Screen::Local,
+                    playing_screen: Some(Screen::Local),
+                    playback: PlaybackStatus {
+                        idle,
+                        paused,
+                        ..PlaybackStatus::default()
+                    },
+                    ..ViewModel::default()
+                };
+                let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+                let mut hit_map = HitMap::default();
+                terminal
+                    .draw(|frame| {
+                        render_tabs(frame, frame.area(), &view, &Theme::new(false), &mut hit_map)
+                    })
+                    .unwrap();
+                let (_, area) = hit_map
+                    .tabs
+                    .iter()
+                    .find(|(screen, _)| *screen == Screen::Local)
+                    .expect("active tab visible");
+                let text = (area.x..area.right())
+                    .map(|x| terminal.backend().buffer()[(x, 0)].symbol())
+                    .collect::<String>();
+                assert_eq!(text, format!("{marker}Local"));
+                for column in [area.x, area.right() - 1] {
+                    assert_eq!(
+                        mouse_action(
+                            MouseEvent {
+                                kind: MouseEventKind::Down(MouseButton::Left),
+                                column,
+                                row: 0,
+                                modifiers: KeyModifiers::NONE
+                            },
+                            &hit_map,
+                            &view
+                        ),
+                        Some(UiAction::ShowScreen(Screen::Local))
+                    );
+                }
+                assert!(hit_map.tabs.iter().all(|(_, area)| area.right() <= width));
+                assert!(
+                    hit_map
+                        .tabs
+                        .windows(2)
+                        .all(|tabs| tabs[0].1.right() < tabs[1].1.x)
+                );
             }
         }
     }

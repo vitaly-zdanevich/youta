@@ -7,7 +7,9 @@ import { dispatch } from "../ipc";
  * The catalogue comes from Rust so a feature-trimmed build never offers a tab
  * it cannot serve, and so this window does not restate the source list.
  */
-export function Tabs({ sources, active }: { sources: ScreenEntry[]; active: string }) {
+export function Tabs({ sources, active, playing, paused }: {
+	sources: ScreenEntry[]; active: string; playing: string | null; paused: boolean;
+}) {
   return (
     <nav
       className="flex gap-[3px] overflow-x-auto border-b border-line bg-surface px-[13px] py-[9px]"
@@ -27,7 +29,7 @@ export function Tabs({ sources, active }: { sources: ScreenEntry[]; active: stri
                 : "text-ink-faint hover:text-ink"
             }`}
           >
-            {source.label}
+						{source.id === playing ? paused ? '|| ' : '▶ ' : ''}{source.label}
           </button>
         );
       })}

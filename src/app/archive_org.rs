@@ -5,6 +5,7 @@
 mod worker_tests;
 
 mod history;
+mod now_playing;
 mod playback_choice;
 mod session;
 
@@ -61,6 +62,8 @@ pub(super) struct ArchiveOrgState {
     worker: Option<ArchiveWorker>,
     initialized: bool,
     download_lookup: Option<ArchiveDownloadLookup>,
+    /// Exact accepted-file reveal; its ownership never extends to later navigation.
+    now_playing: Option<now_playing::PendingArchiveNowPlaying>,
     playback_choice_generation: u64,
     playback_choice: Option<playback_choice::PendingArchivePlaybackChoice>,
     search_selected: usize,
@@ -420,6 +423,7 @@ impl AppController {
 
     /// Polls only finished threads, so network delays cannot stop terminal input.
     pub(super) fn poll_archive_org_worker(&mut self) {
+        self.cancel_stale_archive_now_playing_navigation();
         // Restored tabs wait until the frontend has had a frame to report its
         // result capacity. Frontends without a hint retain the default size.
         if self.view.screen == Screen::ArchiveOrg && !self.archive_org.initialized {
@@ -467,6 +471,9 @@ impl AppController {
                     self.archive_org.cache.pop_front();
                 }
             }
+        }
+        if self.complete_archive_now_playing_lookup(&job, &result) {
+            return;
         }
         if self
             .archive_org
@@ -736,9 +743,11 @@ impl AppController {
 
     /// Displays known metadata immediately and debounces only missing metadata.
     pub(super) fn update_archive_org_detail(&mut self) {
+        self.cancel_stale_archive_now_playing_navigation();
         self.archive_org_selected = self.view.selected;
         let selected = self.selected_archive_item();
-        if !self.archive_download_lookup_pending()
+        if self.archive_org.now_playing.is_none()
+            && !self.archive_download_lookup_pending()
             && self.archive_org.pending.as_ref().is_some_and(|job| {
                 matches!(&job.kind, ArchiveRequest::Details { identifier, .. }
                 if selected.as_ref().is_none_or(|item| item.identifier != *identifier))
@@ -830,7 +839,8 @@ impl AppController {
         {
             return;
         }
-        if !self.archive_download_lookup_pending()
+        if self.archive_org.now_playing.is_none()
+            && !self.archive_download_lookup_pending()
             && self.archive_org.active.is_none()
             && self.cached_archive_details(&item.identifier).is_none()
         {
@@ -927,6 +937,11 @@ impl AppController {
 
     /// Leaves a track list or cancels an explicit pending open without losing search results.
     pub(super) fn go_back_archive_org(&mut self) -> bool {
+        if self.archive_org.now_playing.is_some() {
+            self.cancel_archive_now_playing_navigation();
+            self.view.status_line = "Cancelled locating the playing archive.org file".into();
+            return true;
+        }
         if self.archive_download_lookup_pending() {
             return false;
         }
@@ -1055,7 +1070,6 @@ impl AppController {
 /// Decode each filename segment exactly once, reject separators/control bytes,
 /// and rebuild with the same URL builder as the provider. This supports Unicode
 /// and literal percent signs without accepting encoded traversal or credentials.
-#[cfg(any(feature = "yt-dlp", test))]
 fn archive_download_identifier(source: &url::Url) -> Option<String> {
     // The provider filename is at most 2048 UTF-8 bytes, escaped at most 3x.
     if source.as_str().len() > 3 * 2048 + 200 || !is_direct_audio_url(source) {
@@ -2029,7 +2043,7 @@ mod tests {
         }
     }
 
-    fn lookup_transport(
+    pub(super) fn lookup_transport(
         controller: &mut AppController,
     ) -> (
         Receiver<url::Url>,
@@ -2048,7 +2062,7 @@ mod tests {
         (requests, release, count)
     }
 
-    fn lookup_metadata(identifier: &str) -> Vec<u8> {
+    pub(super) fn lookup_metadata(identifier: &str) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({
             "metadata": {"identifier": identifier, "title": "Download inventory", "mediatype": "audio"},
             "files": [
@@ -2058,7 +2072,7 @@ mod tests {
         })).unwrap()
     }
 
-    fn finish_lookup_worker(controller: &mut AppController) {
+    pub(super) fn finish_lookup_worker(controller: &mut AppController) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while controller.archive_org.worker.is_some() {
             assert!(

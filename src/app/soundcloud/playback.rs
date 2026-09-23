@@ -10,6 +10,8 @@ pub(super) struct SoundCloudPlaybackState {
     worker: Option<PlaybackWorker>,
     admitting: Option<PlaybackCandidate>,
     active_preview: Option<MediaId>,
+    /// One accepted metadata owner supports navigation after its search was replaced.
+    active_track: Option<(MediaId, SoundcloakTrack)>,
 }
 
 /// A queued intent retains stable replay metadata, never a signed audio locator.
@@ -175,6 +177,9 @@ impl AppController {
             .admitting
             .take()
             .is_some_and(|candidate| candidate.accepted);
+        if accepted {
+            self.soundcloud.playback.active_track = Some((item.media.id.clone(), track));
+        }
         // Positioned queue transitions normally retain their saved entry. Replace
         // only its accepted metadata so a preview is also labeled in the queue.
         if accepted
@@ -238,6 +243,7 @@ impl AppController {
     pub(in crate::app) fn accept_soundcloud_playback(&mut self, id: &MediaId) {
         let preview = self.soundcloud_preview_candidate(id);
         self.soundcloud.playback.active_preview = preview.then(|| id.clone());
+        self.soundcloud.playback.active_track = None;
         if let Some(candidate) = self.soundcloud.playback.admitting.as_mut()
             && &candidate.id == id
         {
@@ -253,9 +259,20 @@ impl AppController {
         })
     }
 
-    /// Clears only the active marker, preserving an explicit pending next request.
+    /// Returns metadata owned by the exact currently accepted SoundCloud track.
+    pub(in crate::app) fn current_soundcloud_track(&self, id: &MediaId) -> Option<SoundcloakTrack> {
+        self.soundcloud
+            .playback
+            .active_track
+            .as_ref()
+            .filter(|(owner, _)| owner == id && self.current_media.as_ref() == Some(id))
+            .map(|(_, track)| track.clone())
+    }
+
+    /// Clears accepted preview/navigation state, preserving an explicit pending next request.
     pub(in crate::app) fn reset_soundcloud_preview(&mut self) {
         self.soundcloud.playback.active_preview = None;
+        self.soundcloud.playback.active_track = None;
     }
 
     /// Checkpoints preview listening without recording full-track progress.
@@ -625,6 +642,81 @@ mod tests {
             assert_eq!(app.playback_queue, queue);
             assert!(app.current_soundcloud_preview());
         }
+    }
+
+    /// Navigation retains rich accepted metadata, not a failed replacement or another identity.
+    #[test]
+    fn soundcloud_now_playing_metadata_is_rich_identity_bound_and_accepted_only() {
+        let mut rich: serde_json::Value = serde_json::from_slice(&metadata("one", true)).unwrap();
+        rich["likes_count"] = serde_json::json!(123);
+        rich["genre"] = serde_json::json!("Ambient");
+        let (mut app, _, player) = fixture(
+            vec![serde_json::to_vec(&rich).unwrap(), metadata("two", false)],
+            None,
+        );
+        let first = item("one").media.id;
+        assert!(app.current_soundcloud_track(&first).is_none());
+        app.play_queue_item_with_origin(item("one"), false, None);
+        finish(&mut app);
+        started(&mut app, &player);
+        let track = app
+            .current_soundcloud_track(&first)
+            .expect("accepted full metadata");
+        assert_eq!(track.title, "Resolved one");
+        assert_eq!(track.likes_count, Some(123));
+        assert_eq!(track.genre.as_deref(), Some("Ambient"));
+        assert_eq!(track.playback, SoundcloakPlayback::Preview);
+        assert!(
+            app.current_soundcloud_track(&item("two").media.id)
+                .is_none()
+        );
+
+        player.lock().unwrap().reject = true;
+        app.play_queue_item_with_origin(item("two"), false, None);
+        finish(&mut app);
+        assert_eq!(
+            app.current_soundcloud_track(&first).unwrap().title,
+            "Resolved one"
+        );
+        assert!(
+            app.current_soundcloud_track(&item("two").media.id)
+                .is_none()
+        );
+        app.current_media = Some(item("two").media.id);
+        assert!(app.current_soundcloud_track(&first).is_none());
+        app.current_media = Some(first.clone());
+        app.handle_playback_end(
+            PlaybackEnd {
+                reason: PlaybackEndReason::Stop,
+                error: None,
+                file_error: None,
+                diagnostic: None,
+            },
+            Duration::ZERO,
+        );
+        assert!(app.current_soundcloud_track(&first).is_none());
+    }
+
+    /// Accepting another source cannot expose metadata retained for an older SoundCloud track.
+    #[test]
+    fn soundcloud_now_playing_metadata_is_retired_after_another_source_is_accepted() {
+        let (mut app, _, player) = fixture(vec![metadata("one", false)], None);
+        let first = item("one").media.id;
+        app.play_queue_item_with_origin(item("one"), false, None);
+        finish(&mut app);
+        started(&mut app, &player);
+        assert!(app.current_soundcloud_track(&first).is_some());
+        let mut replacement = item("other");
+        replacement.media.id = MediaId::new(SourceKind::GenericYtDlp, "other");
+        replacement.media.webpage_url = url::Url::parse("https://example.org/other.mp3").unwrap();
+        replacement.playback_location = replacement.media.webpage_url.to_string();
+        app.play_queue_item_with_origin(replacement, false, None);
+        assert!(app.current_soundcloud_track(&first).is_none());
+        app.current_media = Some(first.clone());
+        assert!(
+            app.current_soundcloud_track(&first).is_none(),
+            "previous owner was discarded"
+        );
     }
 
     #[test]

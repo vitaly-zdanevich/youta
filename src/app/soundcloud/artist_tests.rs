@@ -605,6 +605,31 @@ fn soundcloud_artist_tag_search_uses_fixed_filter_and_back_restores_scope() {
 }
 
 #[test]
+fn soundcloud_artist_reveal_cached_album_row_uses_ordered_slot_without_fetch() {
+    let (mut app, transport) = controller(vec![album(), json!([track(3)])]);
+    app.open_soundcloud_catalog(Request::Album {
+        url: url::Url::parse("https://soundcloud.com/fixture-artist/sets/release").unwrap(),
+    });
+    settle(&mut app);
+    let id = app.view.rows[2].media_id.clone().unwrap();
+    app.open_soundcloud_artist("https://soundcloud.com/fixture-artist".into(), false);
+    let before = transport.requests.lock().unwrap().len();
+    assert!(app.reveal_playing_soundcloud(&id));
+    assert_eq!(app.view.selected, 2);
+    assert_eq!(
+        app.view.details.as_ref().unwrap().media_id.as_ref(),
+        Some(&id)
+    );
+    assert!(app.soundcloud.catalog.pending.is_none());
+    assert_eq!(transport.requests.lock().unwrap().len(), before);
+    let unknown = MediaId::new(
+        SourceKind::SoundCloud,
+        "https://soundcloud.com/other/missing",
+    );
+    assert!(!app.reveal_playing_soundcloud(&unknown));
+}
+
+#[test]
 fn soundcloud_artist_album_duplicate_tracks_keep_order_and_autoplay_position() {
     let mut release = album();
     release["tracks"] = json!([track(1), track(2), track(1)]);

@@ -498,6 +498,14 @@
 	async function run() {
 		await until(() => document.querySelector('[title="Search archive.org"]'), 'Archive search');
 		await checkSoundCloudTab();
+		const beforeTabMarkers = clone(view);
+		for (const [idle, paused, label] of [[false, false, '▶ SoundCloud'], [false, true, '|| SoundCloud'], [true, false, 'SoundCloud']]) {
+			snapshot({ playing_screen: 'SoundCloud', playback: { ...view.playback, idle, paused } });
+			const tab = await until(() => button(label, document.querySelector('[aria-label=Sources]')), 'source playback tab marker');
+			assert(tab.getAttribute('aria-selected') === 'false', 'playback marker is independent of the selected tab');
+			await action({ ShowScreen: 'SoundCloud' }, () => tab.click(), `${label} preserves tab navigation`);
+		}
+		snapshot(beforeTabMarkers);
 		await checkRadioPresentation();
 		await checkPreferencesFocus();
 		await checkProviderSettings();

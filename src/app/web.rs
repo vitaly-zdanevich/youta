@@ -31,6 +31,13 @@ pub(super) struct WebWorker {
 }
 
 impl AppController {
+    /// Revokes queued and in-flight directory ownership before restoring a typed source page.
+    pub(super) fn cancel_web_navigation_for_now_playing(&mut self) {
+        self.web.generation = self.web.generation.wrapping_add(1);
+        self.web.request = None;
+        self.web.pending = false;
+    }
+
     /// Opens an explicitly supplied startup URL through the normal Web worker.
     ///
     /// Navigation is session-only and never activates a media row or playback.

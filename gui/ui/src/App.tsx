@@ -145,7 +145,8 @@ export function App() {
   return (
     <>
       <div className="grid h-full grid-rows-[auto_auto_minmax(0,1fr)_auto_auto_auto_auto]">
-        <Tabs sources={visibleSources} active={view.screen} />
+        <Tabs sources={visibleSources} active={view.screen}
+					playing={view.playback.idle ? null : view.playing_screen} paused={view.playback.paused} />
 
         {/* Only where the reducer accepts a query; the catalogue says which
             screens those are, so this window never offers a field whose Enter

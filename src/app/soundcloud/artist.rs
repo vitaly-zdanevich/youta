@@ -45,6 +45,7 @@ enum Route {
         slots: Vec<SoundcloakAlbumTrack>,
         next: Option<usize>,
     },
+    Playing,
 }
 
 /// A small Back stack contains only public metadata and exact navigation positions.
@@ -775,6 +776,46 @@ impl AppController {
         })
     }
 
+    /// Reveals exact accepted metadata without resolving, searching, or restarting playback.
+    pub(in crate::app) fn reveal_playing_soundcloud(&mut self, id: &MediaId) -> bool {
+        let current = self.soundcloud_snapshot();
+        if let Some(index) = snapshot_track_index(&current, id) {
+            self.show_screen(Screen::SoundCloud);
+            self.soundcloud.selected = index;
+            self.populate_soundcloud();
+            return true;
+        }
+        if let Some((snapshot, index)) =
+            self.soundcloud
+                .catalog
+                .history
+                .iter()
+                .rev()
+                .find_map(|snapshot| {
+                    snapshot_track_index(snapshot, id).map(|index| (snapshot.clone(), index))
+                })
+        {
+            self.push_soundcloud_snapshot();
+            self.show_screen(Screen::SoundCloud);
+            self.restore_soundcloud_snapshot(snapshot);
+            self.soundcloud.selected = index;
+            self.populate_soundcloud();
+            return true;
+        }
+        let Some(track) = self.current_soundcloud_track(id) else {
+            return false;
+        };
+        self.push_soundcloud_snapshot();
+        self.invalidate_soundcloud_requests();
+        self.soundcloud.catalog.route = Route::Playing;
+        self.soundcloud.items = vec![track];
+        self.soundcloud.next_page = None;
+        self.soundcloud.selected = 0;
+        self.view.soundcloud_back_available = !self.soundcloud.catalog.history.is_empty();
+        self.show_screen(Screen::SoundCloud);
+        self.populate_soundcloud();
+        true
+    }
 }
 
 /// Allocation-free metadata counter which fails immediately before exceeding its cap.
@@ -803,6 +844,23 @@ impl HistoryBytes {
 impl std::fmt::Write for HistoryBytes {
     fn write_str(&mut self, text: &str) -> std::fmt::Result {
         self.add(text.len()).ok_or(std::fmt::Error)
+    }
+}
+
+/// Finds a canonical identity using the route's actual visible row positions.
+#[cfg(feature = "soundcloud")]
+fn snapshot_track_index(snapshot: &Snapshot, id: &MediaId) -> Option<usize> {
+    match &snapshot.route {
+        Route::Album { slots, .. } => slots.iter().position(|slot| {
+            slot.track
+                .as_ref()
+                .is_some_and(|track| soundcloud_media_id(track) == *id)
+        }),
+        Route::Albums { .. } | Route::Loading => None,
+        _ => snapshot
+            .items
+            .iter()
+            .position(|track| soundcloud_media_id(track) == *id),
     }
 }
 

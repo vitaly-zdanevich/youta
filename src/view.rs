@@ -3001,6 +3001,8 @@ pub struct ViewModel {
     pub archive_org_back_available: bool,
     /// Whether SoundCloud has a cached parent catalogue to restore without fetching.
     pub soundcloud_back_available: bool,
+    /// Authoritative playback-source tab, retained while paused; idle playback hides its marker.
+    pub playing_screen: Option<Screen>,
     /// Selected Commons media control inside the expanded Wikidata spoiler.
     pub selected_wikidata_media: Option<usize>,
     /// Selected right-panel mode.
@@ -3417,6 +3419,7 @@ impl Default for ViewModel {
             detail_link_reveal: None,
             archive_org_back_available: false,
             soundcloud_back_available: false,
+            playing_screen: None,
             selected_wikidata_media: None,
             right_panel_mode: RightPanelMode::Details,
             waveform_visible: false,
