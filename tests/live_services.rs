@@ -338,6 +338,11 @@ fn librivox_catalogue_book_author_and_audio_are_usable() {
 
 /// Creates a Wikidata client after verifying that live service tests were
 /// explicitly enabled.
+///
+/// Allow the public service's [60-second query deadline] plus transport overhead,
+/// without increasing the normal application's 15-second request timeout.
+///
+/// [60-second query deadline]: https://www.mediawiki.org/wiki/Wikidata_query_service/Implementation#Usage_constraints
 #[cfg(feature = "wikidata")]
 fn live_wikidata_provider() -> youta::providers::wikidata::WikidataProvider {
     assert_eq!(
@@ -345,7 +350,10 @@ fn live_wikidata_provider() -> youta::providers::wikidata::WikidataProvider {
         Ok("1"),
         "set YOUTA_RUN_LIVE_WIKIDATA_TEST=1 when invoking this live test"
     );
-    youta::providers::wikidata::WikidataProvider::new()
+    youta::providers::wikidata::WikidataProvider::with_request_timeout(
+        std::time::Duration::from_secs(65),
+    )
+    .expect("the live Wikidata request timeout is positive")
 }
 
 /// Queries the public Wikidata endpoint for the live `YouTube` video fixture.

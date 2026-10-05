@@ -162,6 +162,69 @@ fn live_service_gates_respect_release_mode() {
     assert!(job(&ci, "live-youtube").contains("vars.RUN_LIVE_YOUTUBE == 'true'"));
 }
 
+/// Slow live Wikidata requests retain bounded retries and all real-service checks.
+#[test]
+fn wikidata_live_probe_retains_bounded_retries_and_real_provider_checks() {
+    let ci = workflow("ci.yml");
+    let probe = job(&ci, "live-wikidata");
+    assert!(probe.contains("timeout-minutes: 360"));
+    assert!(!probe.contains("continue-on-error:"));
+    assert!(!probe.contains("|| true"));
+    assert_eq!(probe.matches("for attempt in 1 2; do").count(), 4);
+    assert_eq!(probe.matches("--exact ").count(), 4);
+    for fixture in [
+        "wikidata_finds_the_youtube_video_fixture_item",
+        "wikidata_finds_the_youtube_channel_fixture_item",
+        "wikidata_loads_the_media_fixture_statements",
+        "wikidata_loads_the_follower_history_fixture",
+    ] {
+        let exact_fixture = format!("--exact {fixture} ");
+        assert_eq!(probe.matches(&exact_fixture).count(), 1, "{fixture}");
+        let step = probe
+            .split("      - name:")
+            .find(|step| step.contains(&exact_fixture))
+            .expect("each live fixture retains its own CI step");
+        for required in [
+            "YOUTA_RUN_LIVE_WIKIDATA_TEST: '1'",
+            "for attempt in 1 2; do",
+            "if cargo test",
+            "--locked",
+            "--test live_services",
+            "--no-default-features",
+            "--features wikidata",
+            "--ignored",
+            "exit 0",
+            "if [ \"${attempt}\" -eq 2 ]; then",
+            "exit 1",
+            "sleep 10",
+        ] {
+            assert!(step.contains(required), "{fixture} omits `{required}`");
+        }
+    }
+
+    let live_tests = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/live_services.rs"),
+    )
+    .expect("live-service test source");
+    let helper = live_tests
+        .split_once("fn live_wikidata_provider()")
+        .expect("the Wikidata fixtures share one live client")
+        .1
+        .split_once("\n}\n")
+        .expect("the live-provider helper has a complete body")
+        .0;
+    let compact_helper = helper
+        .split_whitespace()
+        .collect::<String>()
+        .replace(",)", ")");
+    assert!(
+        compact_helper
+            .contains("WikidataProvider::with_request_timeout(std::time::Duration::from_secs(65))"),
+        "live probes allow the documented query deadline without changing the interactive default"
+    );
+    assert!(!compact_helper.contains("WikidataProvider::new("));
+}
+
 /// Diagnostic artifacts would corrupt Release's strict deliverable inventory.
 #[test]
 fn shared_ci_does_not_upload_diagnostics_into_release_artifacts() {

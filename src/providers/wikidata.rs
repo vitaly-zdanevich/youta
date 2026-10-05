@@ -5,6 +5,7 @@
 //! provider worker and cache both positive and empty results.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -292,12 +293,34 @@ impl WikidataProvider {
     ///
     /// # Panics
     ///
-    /// Panics only if a compile-time Wikidata HTTPS endpoint is not a valid
-    /// URL.
+    /// Panics only if a compile-time Wikidata HTTPS endpoint or the default
+    /// request timeout is invalid.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            agent: provider_agent(DEFAULT_REQUEST_TIMEOUT),
+        Self::with_request_timeout(DEFAULT_REQUEST_TIMEOUT)
+            .expect("built-in Wikidata request settings must be valid")
+    }
+
+    /// Creates a client with a positive global deadline for each HTTP request.
+    ///
+    /// Response-size limits remain unchanged. Live service checks can allow a
+    /// longer deadline while interactive callers retain [`Self::new`]'s timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderError::InvalidRequest`] when the timeout is zero.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if a compile-time Wikidata HTTPS endpoint is not a valid URL.
+    pub fn with_request_timeout(timeout: Duration) -> Result<Self, ProviderError> {
+        if timeout.is_zero() {
+            return Err(ProviderError::InvalidRequest(
+                "Wikidata request timeout must be greater than zero".to_owned(),
+            ));
+        }
+        Ok(Self {
+            agent: provider_agent(timeout),
             max_response_bytes: MAX_RESPONSE_BYTES,
             entity_api_endpoint: Url::parse(ENTITY_API_ENDPOINT)
                 .expect("the compile-time Wikidata entity API URL is valid"),
@@ -308,7 +331,7 @@ impl WikidataProvider {
             max_entity_response_bytes: MAX_ENTITY_RESPONSE_BYTES,
             max_label_response_bytes: MAX_LABEL_RESPONSE_BYTES,
             max_formatter_response_bytes: MAX_FORMATTER_RESPONSE_BYTES,
-        }
+        })
     }
 
     /// Looks up items whose exact external identifier matches the selected
@@ -2898,6 +2921,44 @@ mod tests {
       },
       "success": 1
     }"#;
+
+    /// Normal application requests retain their existing 15-second deadline.
+    #[test]
+    fn default_request_timeout_remains_fifteen_seconds() {
+        for provider in [WikidataProvider::new(), WikidataProvider::default()] {
+            assert_eq!(
+                provider.agent.config().timeouts().global,
+                Some(std::time::Duration::from_secs(15))
+            );
+        }
+    }
+
+    /// Live checks can wait for the service deadline without relaxing response bounds.
+    #[test]
+    fn explicit_request_timeout_preserves_response_bounds() {
+        let timeout = std::time::Duration::from_secs(65);
+        let provider = WikidataProvider::with_request_timeout(timeout).expect("positive timeout");
+        assert_eq!(provider.agent.config().timeouts().global, Some(timeout));
+        assert_eq!(provider.max_response_bytes, MAX_RESPONSE_BYTES);
+        assert_eq!(
+            provider.max_entity_response_bytes,
+            MAX_ENTITY_RESPONSE_BYTES
+        );
+        assert_eq!(provider.max_label_response_bytes, MAX_LABEL_RESPONSE_BYTES);
+        assert_eq!(
+            provider.max_formatter_response_bytes,
+            MAX_FORMATTER_RESPONSE_BYTES
+        );
+    }
+
+    /// A zero deadline is rejected instead of silently changing request semantics.
+    #[test]
+    fn explicit_request_timeout_rejects_zero() {
+        assert!(matches!(
+            WikidataProvider::with_request_timeout(std::time::Duration::ZERO),
+            Err(ProviderError::InvalidRequest(_))
+        ));
+    }
 
     #[test]
     fn query_uses_exact_property_and_encoded_identifier() {
