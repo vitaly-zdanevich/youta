@@ -269,7 +269,7 @@ export function Player({
             −
           </Control>
           <span className="min-w-[34px] text-center font-mono text-[11px] tabular-nums text-ink-faint">
-            {playback.speed.toFixed(2)}×
+			{playback.speed.toFixed(2)}x
           </span>
           <Control label="Faster" disabled={playback.idle || playback.speed >= 3} onClick={() => void dispatch({ ChangeSpeed: SPEED_STEP })}>
             +

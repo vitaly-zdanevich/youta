@@ -7469,16 +7469,17 @@ fn render_seek_bar(
             .playing_media_id
             .as_ref()
             .is_some_and(|id| id.source == SourceKind::Radio);
+    // Keep the speed suffix ASCII so plain TTY fonts can display it.
     let status_prefix = if radio {
         format!(
-            "{recording_prefix}radio  {}×  vol {}%{state_suffix}{title_spacing}",
+            "{recording_prefix}radio  {}x  vol {}%{state_suffix}{title_spacing}",
             trim_speed(view.playback.speed),
             view.playback.volume
         )
     } else if view.playback.live {
         if live_seekable {
             format!(
-                "{recording_prefix}LIVE −{} / {} buffer  {}×  vol {}%{state_suffix}{title_spacing}",
+                "{recording_prefix}LIVE −{} / {} buffer  {}x  vol {}%{state_suffix}{title_spacing}",
                 format_duration(duration.saturating_sub(view.playback.position)),
                 format_duration(duration),
                 trim_speed(view.playback.speed),
@@ -7486,14 +7487,14 @@ fn render_seek_bar(
             )
         } else {
             format!(
-                "{recording_prefix}LIVE  {}×  vol {}%{state_suffix}{title_spacing}",
+                "{recording_prefix}LIVE  {}x  vol {}%{state_suffix}{title_spacing}",
                 trim_speed(view.playback.speed),
                 view.playback.volume,
             )
         }
     } else {
         format!(
-            "{} / {}  {}×  vol {}%{}{state_suffix}{title_spacing}",
+            "{} / {}  {}x  vol {}%{}{state_suffix}{title_spacing}",
             format_duration(view.playback.position),
             if duration.is_zero() {
                 "--:--".to_owned()
@@ -33948,7 +33949,7 @@ for encoded, expected in json.load(sys.stdin):
                 })
                 .unwrap();
             let rendered = rendered_text(&terminal);
-            assert!(rendered.contains("radio  1×  vol 70%"));
+            assert!(rendered.contains("radio  1x  vol 70%"));
             assert!(rendered.contains("Fixture station · Track: Artist — Track"));
             assert!(
                 !rendered.contains("LIVE")
@@ -35057,9 +35058,63 @@ prose 07:25 remains clickable but is not a chapter";
         let status_row = (0..120)
             .map(|x| terminal.backend().buffer()[(x, 1)].symbol())
             .collect::<String>();
-        let expected = "18:28 / 1:33:06  1×  vol 80% ||";
+        let expected = "18:28 / 1:33:06  1x  vol 80% ||";
         assert!(!track_row.contains(expected));
         assert!(status_row.contains(expected));
+    }
+
+    /// All playback timelines use an ASCII speed suffix supported by plain TTY fonts.
+    #[test]
+    fn seek_status_speed_marker_is_ascii_for_all_timelines() {
+        for (live, radio, seekable) in [
+            (false, false, false),
+            (true, false, false),
+            (true, false, true),
+            (true, true, false),
+            (true, true, true),
+        ] {
+            for (speed, label) in [(0.9, "0.9x"), (1.0, "1x"), (1.5, "1.5x")] {
+                let view = ViewModel {
+                    playing_media_id: radio.then(|| MediaId::new(SourceKind::Radio, "fixture")),
+                    playback: PlaybackStatus {
+                        idle: false,
+                        live,
+                        speed,
+                        volume: 80,
+                        position: Duration::from_secs(10),
+                        duration: Some(Duration::from_secs(100)),
+                        live_seekable_range: seekable.then_some(crate::playback::BufferedRange {
+                            start: Duration::ZERO,
+                            end: Duration::from_secs(100),
+                        }),
+                        ..PlaybackStatus::default()
+                    },
+                    ..ViewModel::default()
+                };
+                let mut terminal = Terminal::new(TestBackend::new(100, 2)).unwrap();
+                let mut hit_map = HitMap::default();
+                terminal
+                    .draw(|frame| {
+                        render_seek_bar(
+                            frame,
+                            frame.area(),
+                            &view,
+                            &UiSettings::default(),
+                            &Theme::new(false),
+                            &mut hit_map,
+                        );
+                    })
+                    .unwrap();
+                let status = (0..100)
+                    .map(|x| terminal.backend().buffer()[(x, 1)].symbol())
+                    .collect::<String>();
+                assert!(
+                    status.contains(&format!("{label}  vol 80%")),
+                    "unexpected speed label: {status}"
+                );
+                assert!(!status.contains('\u{00d7}'));
+            }
+        }
     }
 
     #[test]

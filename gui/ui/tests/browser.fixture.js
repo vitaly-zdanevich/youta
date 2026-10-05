@@ -583,6 +583,11 @@
 		tick({ idle: false, paused: false, position: { secs: 1, nanos: 0 }, duration: { secs: 120, nanos: 0 } });
 		await until(() => button('Pause') && !document.querySelector('[aria-label="Playback position"]').disabled, 'playing controls');
 		assert(button('Pause').textContent.trim() === '||', 'Pause uses two ASCII bars without a special-font dependency');
+		// Keep the speed marker portable while preserving two decimal places on playback updates.
+		assert(button('Slower').nextElementSibling.textContent === '1.00x', 'Default playback speed uses an ASCII x');
+		tick({ speed: 1.25 });
+		await until(() => button('Slower').nextElementSibling.textContent === '1.25x', 'updated ASCII playback speed');
+		assert(button('Slower').nextElementSibling.textContent === '1.25x', 'Updated playback speed retains two decimal places and an ASCII x');
 		await action('TogglePause', () => button('Pause').click(), 'ASCII pause control retains the shared playback action');
 		checks.push('Playing snapshot enables transport and seek controls');
 		tick({ paused: true, position: { secs: 120, nanos: 0 } });
