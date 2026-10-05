@@ -7269,7 +7269,7 @@ fn render_waveform(
         }
         WaveformView::Loading { .. } => {
             frame.render_widget(
-                Paragraph::new("Generating local waveform…")
+                Paragraph::new("Generating local waveform")
                     .style(theme.muted)
                     .wrap(Wrap { trim: true }),
                 area,
@@ -20786,6 +20786,7 @@ for encoded, expected in json.load(sys.stdin):
         }
     }
 
+    /// Pending waveforms explain their state without a special-font suffix or stale seek target.
     #[test]
     fn non_ready_waveforms_clear_stale_seek_targets() {
         let backend = TestBackend::new(48, 4);
@@ -20842,6 +20843,12 @@ for encoded, expected in json.load(sys.stdin):
                 rendered_text(&terminal).contains(expected_message),
                 "the non-ready state must explain itself"
             );
+            if matches!(view.waveform, WaveformView::Loading { .. }) {
+                let first_row = (0..48)
+                    .map(|x| terminal.backend().buffer()[(x, 0)].symbol())
+                    .collect::<String>();
+                assert_eq!(first_row.trim(), "Generating local waveform");
+            }
             assert_eq!(
                 mouse_action(
                     MouseEvent {

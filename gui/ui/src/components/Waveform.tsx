@@ -29,7 +29,7 @@ function message(view: ViewModel): string | null {
     return "Waveform is available for playable local files.";
   }
   if ("Loading" in waveform) {
-    return "Generating local waveform…";
+		return 'Generating local waveform';
   }
   if ("Failed" in waveform) {
     return `Waveform unavailable: ${waveform.Failed.message}`;

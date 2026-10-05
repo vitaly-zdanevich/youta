@@ -22782,7 +22782,7 @@ impl AppController {
             self.view.waveform = WaveformView::Loading {
                 media_id: media_id.clone(),
             };
-            self.view.status_line = "The local file changed; regenerating its waveform…".to_owned();
+            self.view.status_line = "The local file changed; regenerating its waveform".to_owned();
             self.synchronize_local_waveform();
             return;
         }
@@ -22795,7 +22795,7 @@ impl AppController {
                     media_id: media_id.clone(),
                 };
                 self.view.status_line =
-                    "The local duration changed; regenerating its waveform…".to_owned();
+                    "The local duration changed; regenerating its waveform".to_owned();
                 self.synchronize_local_waveform();
                 return;
             }
@@ -22803,7 +22803,7 @@ impl AppController {
                 self.invalidate_displayed_local_waveform();
                 self.view.waveform = WaveformView::Loading { media_id };
                 self.view.status_line =
-                    "Refreshing local duration before seeking the waveform…".to_owned();
+                    "Refreshing local duration before seeking the waveform".to_owned();
                 return;
             }
             LocalWaveformMetadata::Unavailable => {
@@ -23971,7 +23971,7 @@ impl AppController {
         }
         self.view.waveform_visible = true;
         self.view.waveform = WaveformView::Loading { media_id };
-        self.view.status_line = "Generating local waveform…".to_owned();
+        self.view.status_line = "Generating local waveform".to_owned();
         #[cfg(feature = "waveform")]
         {
             self.failed_local_waveform_key = None;
@@ -25038,7 +25038,7 @@ impl AppController {
                                         media_id: pending.media_id,
                                     };
                                     self.view.status_line =
-                                        "The local file changed; regenerating its waveform…"
+                                        "The local file changed; regenerating its waveform"
                                             .to_owned();
                                     self.synchronize_local_waveform();
                                 }
@@ -66835,6 +66835,7 @@ mod tests {
         controller.dispatch(UiAction::ToggleWaveform);
 
         assert_eq!(controller.view.right_panel_mode, RightPanelMode::Channel);
+        assert_eq!(controller.view.status_line, "Generating local waveform");
         assert!(controller.view.waveform_visible);
         assert_eq!(
             controller.view.waveform,
@@ -67274,6 +67275,10 @@ mod tests {
             state.lock().expect("mock state").commands.is_empty(),
             "a stale waveform click must not seek any active stream"
         );
+        assert_eq!(
+            controller.view.status_line,
+            "The local file changed; regenerating its waveform"
+        );
         let replacement = controller
             .pending_local_waveform
             .as_ref()
@@ -67661,6 +67666,10 @@ mod tests {
 
         controller.drain_local_waveform_responses();
 
+        assert_eq!(
+            controller.view.status_line,
+            "The local file changed; regenerating its waveform"
+        );
         assert!(
             !controller.local_waveform_cache.contains_key(&old_key),
             "old peaks must not enter the cache after same-path replacement"
@@ -67729,6 +67738,10 @@ mod tests {
         assert!(
             state.lock().expect("mock state").commands.is_empty(),
             "stale timeline coordinates must not reach the backend"
+        );
+        assert_eq!(
+            controller.view.status_line,
+            "The local duration changed; regenerating its waveform"
         );
         assert_eq!(
             controller

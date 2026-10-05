@@ -639,6 +639,16 @@
 		snapshot({ details: { ...view.details, archive_file_counts: null } });
 		await until(() => ![...document.querySelectorAll('[aria-label=Details] dt')].some((node) => node.textContent === 'Files'), 'unknown Archive counts do not invent zero');
 
+		// A loading waveform shows plain text until its owner has seekable peaks.
+		snapshot({ waveform_visible: true, waveform: { Loading: {
+			media_id: { source: 'local', external_id: '/fixture/audio.flac' },
+		} } });
+		const loadingWaveform = await until(() => [...document.querySelectorAll('p')]
+			.find((node) => node.textContent.startsWith('Generating local waveform')), 'local waveform loading notice');
+		assert(loadingWaveform.textContent === 'Generating local waveform', 'Waveform loading notice uses plain ASCII text');
+		assert(!document.querySelector('[aria-label="Waveform"]'), 'Loading waveform does not expose a seekable canvas');
+		snapshot({ waveform_visible: false, waveform: 'Unavailable' });
+
 		// Expansion is a shared controller state, not an independent browser modal.
 		const waveformDetails = { ...details('Waveform fixture'), thumbnail_url: waveformUrl,
 			expanded_thumbnail_url: waveformUrl, thumbnail_expanded: false };
