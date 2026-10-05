@@ -12892,7 +12892,7 @@ fn render_preferences_content(
             Constraint::Length(2),
             // Download and playback source policies remain independent controls.
             Constraint::Length(5),
-            Constraint::Length(2),
+            Constraint::Length(3),
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(2),
@@ -13284,6 +13284,37 @@ fn render_preferences_content(
             centered_line_x(folder_size_area, terminal_text_width(&folder_size_label)),
             folder_size_area.y,
             terminal_text_width(&folder_size_label).min(folder_size_area.width),
+            1,
+        ),
+    ));
+
+    // Local display preferences share a section and the common focus controls.
+    let full_paths_label = format!(
+        "Show full Local paths: {}",
+        if preferences.show_full_local_paths {
+            "on"
+        } else {
+            "off"
+        }
+    );
+    let full_paths_area = Rect::new(
+        sections[6].x,
+        sections[6].y.saturating_add(2),
+        sections[6].width,
+        1,
+    );
+    frame.render_widget(
+        Paragraph::new(full_paths_label.clone())
+            .style(theme.base)
+            .alignment(Alignment::Center),
+        full_paths_area,
+    );
+    hit_map.preferences_buttons.push((
+        UiAction::ToggleFullLocalPaths,
+        Rect::new(
+            centered_line_x(full_paths_area, terminal_text_width(&full_paths_label)),
+            full_paths_area.y,
+            terminal_text_width(&full_paths_label).min(full_paths_area.width),
             1,
         ),
     ));
@@ -23760,6 +23791,7 @@ for encoded, expected in json.load(sys.stdin):
                 youtube_thumbnail_size: YouTubeThumbnailSize::Standard,
                 show_images_in_tty: true,
                 show_local_folder_sizes: true,
+                show_full_local_paths: false,
                 bandcamp_audio_format: BandcampAudioFormat::BestAvailable,
                 video_summary_backend: VideoSummaryBackend::Codex,
                 video_summary_supported: true,
@@ -23813,6 +23845,7 @@ for encoded, expected in json.load(sys.stdin):
         #[cfg(not(feature = "images"))]
         assert!(rendered.contains("YouTube thumbnails: unavailable in this build"));
         assert!(rendered.contains("[f] Show Local folder sizes: on"));
+        assert!(rendered.contains("Show full Local paths: off"));
         #[cfg(feature = "images")]
         assert!(rendered.contains("[i] Show images in TTY: on"));
         #[cfg(not(feature = "images"))]
@@ -24347,6 +24380,95 @@ for encoded, expected in json.load(sys.stdin):
         }));
     }
 
+    /// Local path presentation remains accessible through shared focus and mouse routing.
+    #[test]
+    fn full_local_paths_preference_supports_keyboard_and_mouse() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut controller = crate::app::AppController::new(
+            crate::config::Config::for_dir(directory.path().join("youta")),
+            crate::persistence::StateStore::open_in_memory().unwrap(),
+            None,
+            None,
+        );
+        controller.dispatch(UiAction::OpenPreferences);
+        controller.dispatch(UiAction::SelectPreferencesField(
+            PreferencesField::LocalFolderSizes,
+        ));
+        let next = key_action(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            controller.view(),
+        )
+        .expect("move to full Local paths");
+        controller.dispatch(next);
+        let preferences = controller.view().preferences_popup.as_ref().unwrap();
+        assert_eq!(preferences.selected_field, PreferencesField::FullLocalPaths);
+        assert!(!preferences.show_full_local_paths);
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
+        let mut hit_map = HitMap::default();
+        terminal
+            .draw(|frame| {
+                render(
+                    frame,
+                    controller.view(),
+                    &UiSettings::default(),
+                    &mut hit_map,
+                );
+            })
+            .unwrap();
+        assert!(rendered_text(&terminal).contains("Show full Local paths: off"));
+        let (_, target) = hit_map
+            .preferences_buttons
+            .iter()
+            .find(|(action, _)| action == &UiAction::ToggleFullLocalPaths)
+            .expect("full Local paths click target");
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: target.x,
+                    row: target.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hit_map,
+                controller.view(),
+            ),
+            Some(UiAction::ToggleFullLocalPaths)
+        );
+        let toggle = key_action(
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+            controller.view(),
+        );
+        assert_eq!(toggle, Some(UiAction::ToggleFullLocalPaths));
+        controller.dispatch(toggle.unwrap());
+        terminal
+            .draw(|frame| {
+                render(
+                    frame,
+                    controller.view(),
+                    &UiSettings::default(),
+                    &mut hit_map,
+                );
+            })
+            .unwrap();
+        assert!(rendered_text(&terminal).contains("Show full Local paths: on"));
+        let previous = key_action(
+            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+            controller.view(),
+        )
+        .expect("return to Local folder sizes");
+        controller.dispatch(previous);
+        assert_eq!(
+            controller
+                .view()
+                .preferences_popup
+                .as_ref()
+                .unwrap()
+                .selected_field,
+            PreferencesField::LocalFolderSizes
+        );
+    }
+
     #[test]
     fn preferences_focus_remains_visible_and_clickable_on_short_terminals() {
         let directory = tempfile::tempdir().unwrap();
@@ -24426,6 +24548,7 @@ for encoded, expected in json.load(sys.stdin):
                 youtube_thumbnail_size: YouTubeThumbnailSize::Standard,
                 show_images_in_tty: true,
                 show_local_folder_sizes: true,
+                show_full_local_paths: false,
                 bandcamp_audio_format: BandcampAudioFormat::BestAvailable,
                 video_summary_backend: VideoSummaryBackend::Off,
                 video_summary_supported: true,
@@ -24484,6 +24607,7 @@ for encoded, expected in json.load(sys.stdin):
                 youtube_thumbnail_size: YouTubeThumbnailSize::Standard,
                 show_images_in_tty: true,
                 show_local_folder_sizes: true,
+                show_full_local_paths: false,
                 bandcamp_audio_format: BandcampAudioFormat::BestAvailable,
                 video_summary_backend: VideoSummaryBackend::Off,
                 video_summary_supported: true,

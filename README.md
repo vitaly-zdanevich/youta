@@ -96,6 +96,11 @@ are enabled by default and calculated asynchronously, one folder at a time,
 without following symbolic links. `[Z]` cycles size sorting off, ascending,
 and descending; unknown sizes remain after known ones.
 
+Local paths inside your home folder display as `~/…` by default. Enable
+**Show full Local paths** in Preferences (`ui.show_full_local_paths = true`)
+to show `/home/username/…` instead. Playback and saved folder locations always
+retain their full paths.
+
 Youta never reorganizes folders automatically. Only explicit Rename, Move to
 Trash, and Move actions change selected entries. A durable move journal lets
 startup finish or reconcile interrupted moves without guessing which copy is
@@ -2079,6 +2084,7 @@ archive_format = 'ask-each-time' # ask-each-time, original-file, or archive-mp3
 subscriptions_layout = 'drill-down' # drill-down or split
 show_youtube_shorts = true
 show_local_folder_sizes = true
+show_full_local_paths = false
 youtube_thumbnail_size = 'automatic'
 nyan_cat_seekbar = false
 

@@ -236,7 +236,7 @@ test('preferences preserve shared navigation order and distinguish focus from ac
 		'SubscriptionsLayout', 'PlaybackHistory', 'AdvertisementChapters', 'SponsorBlock',
 		'YouTubePrewarm', 'NyanCat', 'HourlyDownloads', 'CheckDownloads', 'DownloadMode',
 		'ArchiveDownload', 'ArchivePlayback', 'YouTubeThumbnails', 'LocalFolderSizes',
-		'TtyImages', 'BandcampAudio', 'VideoSummaries', 'YouTubeProvider',
+		'FullLocalPaths', 'TtyImages', 'BandcampAudio', 'VideoSummaries', 'YouTubeProvider',
 	]);
 	assert.equal(controls.filter((node) => node.props['data-preferences-focused'] === 'true').length, 1);
 	actions.length = 0;

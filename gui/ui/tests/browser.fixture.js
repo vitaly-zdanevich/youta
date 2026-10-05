@@ -474,6 +474,15 @@
 		await key('ArrowDown', 'Down');
 		snapshot({ preferences_popup: { ...preferences, selected_field: 'PlaybackHistory' } });
 		await until(() => dialog()?.querySelector('[data-preferences-focused=true]')?.dataset.preferencesField === 'PlaybackHistory', 'moved Preferences focus');
+		const fullPaths = dialog().querySelector('[data-preferences-field=FullLocalPaths]');
+		assert(fullPaths?.textContent.includes('Show full Local paths'), 'Preferences exposes the Local path display toggle');
+		assert(fullPaths.previousElementSibling?.dataset.preferencesField === 'LocalFolderSizes', 'Full Local paths follows the Local folder sizes toggle');
+		assert(button('off', fullPaths), 'Full Local paths is disabled by default');
+		await action('ToggleFullLocalPaths', () => button('off', fullPaths).click(), 'Local path display uses the shared toggle action');
+		snapshot({ preferences_popup: { ...preferences, selected_field: 'FullLocalPaths', show_full_local_paths: true } });
+		await until(() => dialog()?.querySelector('[data-preferences-focused=true]')?.dataset.preferencesField === 'FullLocalPaths', 'Local path Preferences focus');
+		assert(button('on', dialog().querySelector('[data-preferences-field=FullLocalPaths]')), 'The Local path toggle reflects the updated draft');
+		await key(' ', { Char: ' ' });
 		const checkbox = dialog().querySelector('input[type=checkbox]');
 		await action({ SelectPreferencesField: 'HourlyDownloads' }, () => checkbox.focus(), 'Focusing a Preferences checkbox selects its shared control without toggling');
 		snapshot({ preferences_popup: { ...preferences, selected_field: 'HourlyDownloads' } });

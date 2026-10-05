@@ -124,6 +124,11 @@ prefetch_search_thumbnails = true
 # scans and remove the Local [Z] size-sort control.
 # YOUTA_UI__SHOW_LOCAL_FOLDER_SIZES=false has higher precedence.
 show_local_folder_sizes = true
+
+# Abbreviate the home directory as ~ when displaying local paths.
+# Enable this to show complete paths instead; file operations always use full paths.
+# YOUTA_UI__SHOW_FULL_LOCAL_PATHS=true has higher precedence.
+show_full_local_paths = false
 seekbar_color = 'cyan'
 
 # Replace the standard seek fill with a six-color rainbow and place the cat at

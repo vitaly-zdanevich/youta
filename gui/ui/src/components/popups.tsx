@@ -1729,6 +1729,7 @@ export function PreferencesPopup({ popup, archiveSupported }: {
 	add('ArchivePlayback', 'archive.org playback', ARCHIVE_PLAYBACK_LABELS[popup.archive_playback_preference], 'CycleArchivePlaybackPreference', popup.archive_playback_supported);
 	add('YouTubeThumbnails', 'YouTube thumbnail size', popup.youtube_thumbnail_size, 'CycleYouTubeThumbnailSize');
 	toggle('LocalFolderSizes', 'Show Local folder sizes', popup.show_local_folder_sizes, 'ToggleLocalFolderSizes');
+	toggle('FullLocalPaths', 'Show full Local paths', popup.show_full_local_paths, 'ToggleFullLocalPaths');
 	toggle('TtyImages', 'Show artwork on a Linux console', popup.show_images_in_tty, 'ToggleTtyImages');
 	add('BandcampAudio', 'Bandcamp audio format', popup.bandcamp_audio_format, 'CycleBandcampAudioFormat');
 	add('VideoSummaries', 'Video summaries', popup.video_summary_backend === 'codex' ? 'Codex CLI' : 'off',

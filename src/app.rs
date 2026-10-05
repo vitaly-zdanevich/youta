@@ -23,6 +23,7 @@ mod cached_download;
 mod download_choice;
 mod end_pause;
 mod invidious_instances;
+mod local_path_display;
 mod manual_downloads;
 mod now_playing;
 #[cfg(all(feature = "archive-org", feature = "yt-dlp", feature = "backend-mpv"))]
@@ -97,8 +98,8 @@ use crate::commons_upload::{
 #[cfg(feature = "commons-upload")]
 use crate::config::WikimediaCommonsAuthMethod;
 use crate::config::{
-    BANDCAMP_AUDIO_FORMAT_ENV, BandcampAudioFormat, Config, LOCAL_FOLDER_SIZES_ENV,
-    NYAN_CAT_SEEKBAR_ENV, PersistenceBackend, SAVE_PLAYBACK_HISTORY_ENV,
+    BANDCAMP_AUDIO_FORMAT_ENV, BandcampAudioFormat, Config, FULL_LOCAL_PATHS_ENV,
+    LOCAL_FOLDER_SIZES_ENV, NYAN_CAT_SEEKBAR_ENV, PersistenceBackend, SAVE_PLAYBACK_HISTORY_ENV,
     SKIP_ADVERTISEMENT_CHAPTERS_ENV, SPONSORBLOCK_ENABLED_ENV, SUBSCRIPTIONS_AUTO_DOWNLOAD_ENV,
     SUBSCRIPTIONS_LAYOUT_ENV, SubscriptionsLayout, TTY_IMAGES_ENV, VIDEO_SUMMARY_BACKEND_ENV,
     VideoSummaryBackend, YOUTUBE_PREWARM_ENV, YOUTUBE_THUMBNAIL_SIZE_ENV, YouTubeBackend,
@@ -7931,7 +7932,7 @@ impl AppController {
         self.view.rows.clear();
         self.view.selected = 0;
         self.view.details = Some(DetailView {
-            title: local.path.display().to_string(),
+            title: self.local_display_path(&local.path),
             source: "Local".to_owned(),
             description: if local.directory {
                 "Scanning supported audio, video, and tracker-module files in place…".to_owned()
@@ -7954,12 +7955,15 @@ impl AppController {
                 return;
             }
             self.view.rows = vec![RowView {
-                title: local.path.display().to_string(),
+                title: self.local_display_path(&local.path),
                 subtitle: "scanning directory…".to_owned(),
                 source: "Local folder".to_owned(),
                 ..RowView::default()
             }];
-            self.view.status_line = format!("Scanning {} in the background…", local.path.display());
+            self.view.status_line = format!(
+                "Scanning {} in the background…",
+                self.local_display_path(&local.path)
+            );
         } else {
             self.local_results.push(local_media_item(
                 local.path,
@@ -15906,7 +15910,7 @@ impl AppController {
             self.view.selected = 0;
         }
         self.view.details = None;
-        self.view.local_path = self.local_display_path(&directory);
+        self.view.local_path = self.local_location_path(&directory);
         let status_line = format!("Reading {}…", self.local_display_path(&directory));
         self.view.local_browse_pending = false;
         if self.send_local_browse_request(
@@ -15927,8 +15931,8 @@ impl AppController {
         }
     }
 
-    /// Formats cache-backed archive paths as `archive.zip!/folder`.
-    fn local_display_path(&self, path: &Path) -> String {
+    /// Retains absolute Local locations, including logical archive-member suffixes.
+    fn local_location_path(&self, path: &Path) -> String {
         #[cfg(feature = "local-archives")]
         {
             return local_archive_display_path(&self.local_archive_stack, path);
@@ -15937,6 +15941,22 @@ impl AppController {
         {
             path.display().to_string()
         }
+    }
+
+    /// Abbreviates only visible home-directory paths, never replay or session locators.
+    fn local_display_path(&self, path: &Path) -> String {
+        let location = self.local_location_path(path);
+        let directories = directories::BaseDirs::new();
+        local_path_display::display_path(
+            Path::new(&location),
+            directories.as_ref().map(directories::BaseDirs::home_dir),
+            self.config.ui.show_full_local_paths,
+        )
+    }
+
+    /// Projects playable-file metadata with the current display-only path preference.
+    fn local_details_description(&self, item: &LocalMediaItem) -> String {
+        local_media_description_with_path(item, &self.local_display_path(&item.path))
     }
 
     /// Returns whether the current Local route is backed by archive cache data.
@@ -16423,7 +16443,7 @@ impl AppController {
             self.view.rows.clear();
             return;
         };
-        self.view.local_path = self.local_display_path(&listing.path);
+        self.view.local_path = self.local_location_path(&listing.path);
         let mut rows = Vec::with_capacity(
             listing
                 .entries
@@ -16530,7 +16550,7 @@ impl AppController {
             self.view.details = Some(DetailView {
                 title: "..".to_owned(),
                 source: "Local folder".to_owned(),
-                description: format!("Full path: {}", parent.display()),
+                description: format!("Full path: {}", self.local_display_path(&parent)),
                 ..DetailView::default()
             });
             #[cfg(feature = "audio-quality")]
@@ -16564,7 +16584,7 @@ impl AppController {
                 length: item
                     .duration_seconds
                     .map_or_else(|| "unknown".to_owned(), format_seconds),
-                description: local_media_description(&item),
+                description: self.local_details_description(&item),
                 local_video_thumbnail: local_video_thumbnail_view(
                     &item.path,
                     item.duration_seconds,
@@ -16873,7 +16893,7 @@ impl AppController {
                 length: item
                     .duration_seconds
                     .map_or_else(|| "unknown".to_owned(), format_seconds),
-                description: local_media_description(item),
+                description: self.local_details_description(item),
                 license: "local file".to_owned(),
                 wikidata: "not applicable".to_owned(),
                 thumbnail_url: None,
@@ -21383,7 +21403,7 @@ impl AppController {
     fn open_local_text_file(&mut self, path: PathBuf) {
         let context = TextFileOpenContext::current(self.view.physical_linux_console);
         self.pending_text_file_open = Some(plan_text_file_open(&path, &context));
-        self.view.status_line = format!("Opening {}…", path.display());
+        self.view.status_line = format!("Opening {}…", self.local_display_path(&path));
     }
 
     /// Reports the omitted capability in builds without Local browsing.
@@ -27318,7 +27338,10 @@ impl AppController {
                     self.sort_local_listing();
                     self.refresh_local_browser_rows();
                     self.schedule_local_folder_sizes();
-                    self.view.status_line = format!("Local folder: {}", self.view.local_path);
+                    self.view.status_line = format!(
+                        "Local folder: {}",
+                        self.local_display_path(Path::new(&self.view.local_path))
+                    );
                 } else {
                     #[cfg(feature = "waveform")]
                     let restored_waveform_selection =
@@ -30239,7 +30262,7 @@ impl AppController {
                 .cached_local_media_item(&path, size_bytes)
                 .unwrap_or_else(|| local_media_item_stub(path.clone(), Some(size_bytes)));
             (
-                local_media_description(&item),
+                self.local_details_description(&item),
                 item.duration_seconds
                     .map_or_else(String::new, format_seconds),
                 local_video_thumbnail_view(&item.path, item.duration_seconds),
@@ -30247,7 +30270,7 @@ impl AppController {
             )
         } else {
             (
-                format!("Full path: {}", path.display()),
+                format!("Full path: {}", self.local_display_path(&path)),
                 String::new(),
                 None,
                 false,
@@ -32858,6 +32881,7 @@ impl AppController {
             YOUTUBE_PREWARM_ENV,
             YOUTUBE_THUMBNAIL_SIZE_ENV,
             LOCAL_FOLDER_SIZES_ENV,
+            FULL_LOCAL_PATHS_ENV,
             TTY_IMAGES_ENV,
             BANDCAMP_AUDIO_FORMAT_ENV,
             SAVE_PLAYBACK_HISTORY_ENV,
@@ -32890,6 +32914,7 @@ impl AppController {
             auto_download_status: None,
             youtube_thumbnail_size: self.config.ui.youtube_thumbnail_size,
             show_local_folder_sizes: self.config.ui.show_local_folder_sizes,
+            show_full_local_paths: self.config.ui.show_full_local_paths,
             show_images_in_tty: self.config.ui.show_images_in_tty,
             bandcamp_audio_format: self.config.providers.bandcamp_audio_format,
             save_playback_history: self.config.persistence.save_playback_history,
@@ -33146,6 +33171,20 @@ impl AppController {
             return;
         }
         preferences.show_local_folder_sizes = !preferences.show_local_folder_sizes;
+        preferences.validation_error = None;
+    }
+
+    /// Changes only the path-display draft until Preferences is confirmed.
+    fn toggle_draft_full_local_paths(&mut self) {
+        let Some(preferences) = self.view.preferences_popup.as_mut() else {
+            return;
+        };
+        if preferences.environment_override.is_some() {
+            preferences.validation_error =
+                Some("an environment variable controls this preference".to_owned());
+            return;
+        }
+        preferences.show_full_local_paths = !preferences.show_full_local_paths;
         preferences.validation_error = None;
     }
 
@@ -34059,6 +34098,7 @@ impl AppController {
         let youtube_prewarm = preferences.youtube_prewarm;
         let youtube_thumbnail_size = preferences.youtube_thumbnail_size;
         let show_local_folder_sizes = preferences.show_local_folder_sizes;
+        let show_full_local_paths = preferences.show_full_local_paths;
         #[cfg(feature = "images")]
         let show_images_in_tty = preferences.show_images_in_tty;
         #[cfg(not(feature = "images"))]
@@ -34080,6 +34120,8 @@ impl AppController {
             self.config.playback.youtube_prewarm != youtube_prewarm;
         let local_folder_size_preference_changed =
             self.config.ui.show_local_folder_sizes != show_local_folder_sizes;
+        let local_path_preference_changed =
+            self.config.ui.show_full_local_paths != show_full_local_paths;
         let youtube_thumbnail_preference_changed =
             self.config.ui.youtube_thumbnail_size != youtube_thumbnail_size;
         if let Err(error) = self.config.save_tui_preferences(
@@ -34089,6 +34131,7 @@ impl AppController {
             nyan_cat_seekbar,
             youtube_prewarm,
             show_local_folder_sizes,
+            show_full_local_paths,
             show_images_in_tty,
             youtube_thumbnail_size,
             save_playback_history,
@@ -34163,6 +34206,16 @@ impl AppController {
             self.schedule_local_folder_sizes();
         }
         self.view.show_images_in_tty = show_images_in_tty;
+        if local_path_preference_changed {
+            match self.view.screen {
+                Screen::Local => self.update_local_browser_detail(),
+                Screen::Search if !self.local_results.is_empty() => {
+                    self.update_non_youtube_detail()
+                }
+                Screen::Downloaded => self.update_downloaded_detail(),
+                _ => {}
+            }
+        }
         if video_summary_backend_changed {
             self.diagnostic_helpers_cache = None;
         }
@@ -36151,6 +36204,7 @@ impl UiController for AppController {
                 self.cycle_draft_youtube_thumbnail_size();
             }
             UiAction::ToggleLocalFolderSizes => self.toggle_draft_local_folder_sizes(),
+            UiAction::ToggleFullLocalPaths => self.toggle_draft_full_local_paths(),
             UiAction::ToggleTtyImages => self.toggle_draft_tty_images(),
             UiAction::CycleBandcampAudioFormat => {
                 self.cycle_draft_bandcamp_audio_format();
@@ -41516,7 +41570,12 @@ fn local_video_thumbnail_view(
 
 /// Formats human and technical metadata for one playable Local Details panel.
 fn local_media_description(item: &LocalMediaItem) -> String {
-    let mut lines = vec![format!("Full path: {}", item.path.display())];
+    local_media_description_with_path(item, &item.path.display().to_string())
+}
+
+/// Formats metadata with a caller-provided display label, keeping the stored item untouched.
+fn local_media_description_with_path(item: &LocalMediaItem, path_label: &str) -> String {
+    let mut lines = vec![format!("Full path: {path_label}")];
     if let Some(artist) = &item.artist {
         lines.push(format!("Artists: {artist}"));
     }

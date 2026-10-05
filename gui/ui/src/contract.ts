@@ -527,6 +527,7 @@ export type PreferencesField =
 	| 'ArchivePlayback'
 	| 'YouTubeThumbnails'
 	| 'LocalFolderSizes'
+	| 'FullLocalPaths'
 	| 'TtyImages'
 	| 'BandcampAudio'
 	| 'VideoSummaries'
@@ -561,6 +562,8 @@ export interface PreferencesPopupView {
 	auto_download_status: string | null;
   youtube_thumbnail_size: string;
   show_local_folder_sizes: boolean;
+	/** Show absolute Local paths instead of abbreviating the home directory to ~. */
+	show_full_local_paths: boolean;
   show_images_in_tty: boolean;
   bandcamp_audio_format: string;
   config_path: string;

@@ -59,6 +59,9 @@ pub const YOUTUBE_PREWARM_ENV: &str = "YOUTA_PLAYBACK__YOUTUBE_PREWARM";
 /// Environment variable that overrides lazy Local-folder size measurement.
 pub const LOCAL_FOLDER_SIZES_ENV: &str = "YOUTA_UI__SHOW_LOCAL_FOLDER_SIZES";
 
+/// Environment variable that overrides full local-path display.
+pub const FULL_LOCAL_PATHS_ENV: &str = "YOUTA_UI__SHOW_FULL_LOCAL_PATHS";
+
 /// Environment variable that overrides artwork on a physical Linux TTY.
 pub const TTY_IMAGES_ENV: &str = "YOUTA_UI__SHOW_IMAGES_IN_TTY";
 
@@ -787,7 +790,7 @@ impl Config {
     ///
     /// The Subscriptions layout, advertisement-chapter behavior, `SponsorBlock`
     /// behavior (when compiled), Nyan Cat seek bar (when compiled), selected
-    /// YouTube-video prewarming, lazy Local folder size preference, physical-TTY
+    /// YouTube-video prewarming, lazy Local folder sizes, full Local paths, physical-TTY
     /// image preference, exact `YouTube`
     /// thumbnail size, playback-History saving preference, and (when compiled)
     /// video-summary backend are written together so confirming the popup
@@ -797,7 +800,7 @@ impl Config {
     /// [`SKIP_ADVERTISEMENT_CHAPTERS_ENV`] and
     /// [`SPONSORBLOCK_ENABLED_ENV`] and
     /// [`NYAN_CAT_SEEKBAR_ENV`], [`YOUTUBE_PREWARM_ENV`] and
-    /// [`LOCAL_FOLDER_SIZES_ENV`], [`TTY_IMAGES_ENV`], and
+    /// [`LOCAL_FOLDER_SIZES_ENV`], [`FULL_LOCAL_PATHS_ENV`], [`TTY_IMAGES_ENV`], and
     /// [`YOUTUBE_THUMBNAIL_SIZE_ENV`] and [`SAVE_PLAYBACK_HISTORY_ENV`] retain
     /// precedence and therefore prevent this writer from storing a shadowed
     /// draft. [`VIDEO_SUMMARY_BACKEND_ENV`] and [`SUBSCRIPTIONS_AUTO_DOWNLOAD_ENV`]
@@ -827,6 +830,7 @@ impl Config {
         nyan_cat_seekbar: bool,
         youtube_prewarm: bool,
         show_local_folder_sizes: bool,
+        show_full_local_paths: bool,
         show_images_in_tty: bool,
         youtube_thumbnail_size: YouTubeThumbnailSize,
         save_playback_history: bool,
@@ -843,6 +847,7 @@ impl Config {
             NYAN_CAT_SEEKBAR_ENV,
             YOUTUBE_PREWARM_ENV,
             LOCAL_FOLDER_SIZES_ENV,
+            FULL_LOCAL_PATHS_ENV,
             TTY_IMAGES_ENV,
             YOUTUBE_THUMBNAIL_SIZE_ENV,
             SAVE_PLAYBACK_HISTORY_ENV,
@@ -878,6 +883,7 @@ impl Config {
                 })?;
             ui["subscriptions_layout"] = value(layout.as_config_value());
             ui["show_local_folder_sizes"] = value(show_local_folder_sizes);
+            ui["show_full_local_paths"] = value(show_full_local_paths);
             #[cfg(feature = "nyan-cat")]
             {
                 ui["nyan_cat_seekbar"] = value(nyan_cat_seekbar);
@@ -998,6 +1004,7 @@ impl Config {
         let _ = archive_playback_preference;
         self.ui.subscriptions_layout = layout;
         self.ui.show_local_folder_sizes = show_local_folder_sizes;
+        self.ui.show_full_local_paths = show_full_local_paths;
         #[cfg(feature = "nyan-cat")]
         {
             self.ui.nyan_cat_seekbar = nyan_cat_seekbar;
@@ -1552,6 +1559,8 @@ pub struct UiConfig {
     pub prefetch_search_thumbnails: bool,
     /// Measure visible Local folders lazily and show complete recursive sizes.
     pub show_local_folder_sizes: bool,
+    /// Display full local paths instead of abbreviating the home directory as `~`.
+    pub show_full_local_paths: bool,
     /// Show `YouTube` Shorts in subscription video lists.
     pub show_youtube_shorts: bool,
     /// Seek-bar foreground color name or terminal palette index.
@@ -1575,6 +1584,7 @@ impl Default for UiConfig {
             thumbnail_height: DEFAULT_THUMBNAIL_HEIGHT,
             prefetch_search_thumbnails: true,
             show_local_folder_sizes: true,
+            show_full_local_paths: false,
             show_youtube_shorts: true,
             seekbar_color: "cyan".to_owned(),
             nyan_cat_seekbar: false,
@@ -2593,6 +2603,9 @@ mod tests {
         assert!(tui_preference_environment_variable_is_relevant(
             SAVE_PLAYBACK_HISTORY_ENV
         ));
+        assert!(tui_preference_environment_variable_is_relevant(
+            FULL_LOCAL_PATHS_ENV
+        ));
         assert_eq!(
             tui_preference_environment_variable_is_relevant(ARCHIVE_PLAYBACK_FORMAT_ENV),
             cfg!(feature = "archive-org")
@@ -2670,6 +2683,7 @@ mod tests {
             config.ui.nyan_cat_seekbar,
             config.playback.youtube_prewarm,
             config.ui.show_local_folder_sizes,
+            config.ui.show_full_local_paths,
             config.ui.show_images_in_tty,
             config.ui.youtube_thumbnail_size,
             config.persistence.save_playback_history,
@@ -2793,6 +2807,7 @@ mod tests {
             config.ui.nyan_cat_seekbar,
             config.playback.youtube_prewarm,
             config.ui.show_local_folder_sizes,
+            config.ui.show_full_local_paths,
             config.ui.show_images_in_tty,
             config.ui.youtube_thumbnail_size,
             config.persistence.save_playback_history,
@@ -2934,6 +2949,27 @@ mod tests {
         );
     }
 
+    /// Missing local-path preferences retain compact display while explicit values round-trip.
+    #[test]
+    fn local_paths_default_to_home_relative_and_accept_explicit_full_paths() {
+        let defaults: UiConfig = toml::from_str("").expect("default UI preferences");
+        assert_eq!(
+            serde_json::to_value(&defaults).unwrap()["show_full_local_paths"],
+            serde_json::json!(false)
+        );
+        for full_paths in [true, false] {
+            let configured: UiConfig =
+                toml::from_str(&format!("show_full_local_paths = {full_paths}"))
+                    .expect("explicit local-path preference");
+            let serialized = serde_json::to_value(&configured).unwrap();
+            assert_eq!(serialized["show_full_local_paths"], full_paths);
+            assert_eq!(
+                toml::from_str::<UiConfig>(&toml::to_string(&configured).unwrap()).unwrap(),
+                configured
+            );
+        }
+    }
+
     #[test]
     fn defaults_are_low_resource_and_paths_are_confined() {
         let root = PathBuf::from("/tmp/youta-config-test");
@@ -2962,6 +2998,7 @@ mod tests {
         assert!(config.ui.prefetch_search_thumbnails);
         assert!(config.ui.show_images_in_tty);
         assert!(config.ui.show_local_folder_sizes);
+        assert!(!config.ui.show_full_local_paths);
         assert!(config.ui.show_youtube_shorts);
         assert_eq!(
             config.ui.subscriptions_layout,
@@ -3011,6 +3048,7 @@ youtube_thumbnail_size = "high"
 prefetch_search_thumbnails = false
 show_images_in_tty = false
 show_local_folder_sizes = false
+show_full_local_paths = true
 show_youtube_shorts = false
 subscriptions_layout = "split"
 
@@ -3040,6 +3078,7 @@ codex_executable = "/opt/openai/bin/codex"
         assert!(!config.ui.prefetch_search_thumbnails);
         assert!(!config.ui.show_images_in_tty);
         assert!(!config.ui.show_local_folder_sizes);
+        assert!(config.ui.show_full_local_paths);
         assert!(!config.ui.show_youtube_shorts);
         assert_eq!(config.ui.subscriptions_layout, SubscriptionsLayout::Split);
         assert_eq!(
@@ -3173,6 +3212,7 @@ codex_executable = "/opt/openai/bin/codex"
             assert!(!config.ui.prefetch_search_thumbnails);
             assert!(!config.ui.show_images_in_tty);
             assert!(!config.ui.show_local_folder_sizes);
+            assert!(config.ui.show_full_local_paths);
             assert!(!config.ui.show_youtube_shorts);
             assert!(!config.persistence.save_playback_history);
             assert_eq!(config.ui.subscriptions_layout, SubscriptionsLayout::Split);
@@ -3220,6 +3260,7 @@ codex_executable = "/opt/openai/bin/codex"
             .env("YOUTA_UI__PREFETCH_SEARCH_THUMBNAILS", "false")
             .env(TTY_IMAGES_ENV, "false")
             .env(LOCAL_FOLDER_SIZES_ENV, "false")
+            .env(FULL_LOCAL_PATHS_ENV, "true")
             .env(SHOW_YOUTUBE_SHORTS_ENV, "false")
             .env(SAVE_PLAYBACK_HISTORY_ENV, "false")
             .env(SUBSCRIPTIONS_LAYOUT_ENV, "split")
@@ -3306,6 +3347,7 @@ youtube_api_key = "keep-this-existing-secret"
                 true,
                 false,
                 false,
+                true,
                 false,
                 YouTubeThumbnailSize::Maxres,
                 false,
@@ -3336,6 +3378,7 @@ youtube_api_key = "keep-this-existing-secret"
         assert!(contents.contains("youtube_prewarm = false"));
         assert!(contents.contains("save_playback_history = false"));
         assert!(contents.contains("show_local_folder_sizes = false"));
+        assert!(contents.contains("show_full_local_paths = true"));
         assert!(contents.contains("youtube_thumbnail_size = \"maxres\""));
         #[cfg(feature = "yt-dlp")]
         assert!(contents.contains("mode = \"audio-only\""));
@@ -3370,6 +3413,7 @@ youtube_api_key = "keep-this-existing-secret"
         assert!(!contents.contains("show_images_in_tty"));
         assert_eq!(config.ui.subscriptions_layout, SubscriptionsLayout::Split);
         assert!(!config.ui.show_local_folder_sizes);
+        assert!(config.ui.show_full_local_paths);
         #[cfg(feature = "images")]
         assert!(!config.ui.show_images_in_tty);
         #[cfg(not(feature = "images"))]
@@ -3411,6 +3455,7 @@ youtube_api_key = "keep-this-existing-secret"
         );
         assert_eq!(reloaded.ui.subscriptions_layout, SubscriptionsLayout::Split);
         assert!(!reloaded.ui.show_local_folder_sizes);
+        assert!(reloaded.ui.show_full_local_paths);
         #[cfg(feature = "images")]
         assert!(!reloaded.ui.show_images_in_tty);
         #[cfg(not(feature = "images"))]
@@ -3458,6 +3503,7 @@ youtube_api_key = "keep-this-existing-secret"
                 false,
                 false,
                 false,
+                false,
                 YouTubeThumbnailSize::High,
                 false,
                 true,
@@ -3494,6 +3540,7 @@ youtube_api_key = "keep-this-existing-secret"
                 false,
                 false,
                 true,
+                false,
                 false,
                 false,
                 false,
@@ -3705,6 +3752,7 @@ youtube_api_key = "keep-this-existing-secret"
             let original_thumbnail_size = config.ui.youtube_thumbnail_size;
             let original_downloads = config.downloads.clone();
             let original_archive_playback = config.playback.archive_format;
+            let original_full_local_paths = config.ui.show_full_local_paths;
             if override_name == SAVE_PLAYBACK_HISTORY_ENV {
                 assert!(!config.persistence.save_playback_history);
             }
@@ -3713,6 +3761,7 @@ youtube_api_key = "keep-this-existing-secret"
                     SubscriptionsLayout::Split,
                     false,
                     false,
+                    true,
                     true,
                     true,
                     true,
@@ -3731,6 +3780,7 @@ youtube_api_key = "keep-this-existing-secret"
             assert_eq!(config.ui.youtube_thumbnail_size, original_thumbnail_size);
             assert_eq!(config.downloads, original_downloads);
             assert_eq!(config.playback.archive_format, original_archive_playback);
+            assert_eq!(config.ui.show_full_local_paths, original_full_local_paths);
             if override_name == SAVE_PLAYBACK_HISTORY_ENV {
                 assert!(!config.persistence.save_playback_history);
             }
@@ -3744,6 +3794,7 @@ youtube_api_key = "keep-this-existing-secret"
             (NYAN_CAT_SEEKBAR_ENV, "true"),
             (YOUTUBE_PREWARM_ENV, "false"),
             (LOCAL_FOLDER_SIZES_ENV, "false"),
+            (FULL_LOCAL_PATHS_ENV, "false"),
             (TTY_IMAGES_ENV, "false"),
             (YOUTUBE_THUMBNAIL_SIZE_ENV, "high"),
             (DOWNLOAD_MODE_ENV, "video"),

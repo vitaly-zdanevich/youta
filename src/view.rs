@@ -1165,6 +1165,8 @@ pub enum PreferencesField {
     YouTubeThumbnails,
     /// Display sizes in the Local folder browser.
     LocalFolderSizes,
+    /// Display complete local paths instead of abbreviating the home directory.
+    FullLocalPaths,
     /// Render artwork on a Linux virtual console.
     TtyImages,
     /// Choose a Bandcamp audio encoding.
@@ -1195,6 +1197,7 @@ impl PreferencesField {
             Self::ArchivePlayback => UiAction::CycleArchivePlaybackPreference,
             Self::YouTubeThumbnails => UiAction::CycleYouTubeThumbnailSize,
             Self::LocalFolderSizes => UiAction::ToggleLocalFolderSizes,
+            Self::FullLocalPaths => UiAction::ToggleFullLocalPaths,
             Self::TtyImages => UiAction::ToggleTtyImages,
             Self::BandcampAudio => UiAction::CycleBandcampAudioFormat,
             Self::VideoSummaries => UiAction::CycleVideoSummaryBackend,
@@ -1219,6 +1222,7 @@ impl PreferencesField {
             UiAction::CycleArchivePlaybackPreference => Self::ArchivePlayback,
             UiAction::CycleYouTubeThumbnailSize => Self::YouTubeThumbnails,
             UiAction::ToggleLocalFolderSizes => Self::LocalFolderSizes,
+            UiAction::ToggleFullLocalPaths => Self::FullLocalPaths,
             UiAction::ToggleTtyImages => Self::TtyImages,
             UiAction::CycleBandcampAudioFormat => Self::BandcampAudio,
             UiAction::CycleVideoSummaryBackend => Self::VideoSummaries,
@@ -1273,6 +1277,8 @@ pub struct PreferencesPopupView {
     pub youtube_thumbnail_size: YouTubeThumbnailSize,
     /// Draft lazy Local-folder size behavior saved only on confirmation.
     pub show_local_folder_sizes: bool,
+    /// Draft full local-path display behavior saved only on confirmation.
+    pub show_full_local_paths: bool,
     /// Draft physical-Linux-TTY artwork behavior saved only on confirmation.
     pub show_images_in_tty: bool,
     /// Draft preferred Bandcamp playback encoding.
@@ -1307,6 +1313,7 @@ impl PreferencesPopupView {
             (Field::ArchivePlayback, self.archive_playback_supported),
             (Field::YouTubeThumbnails, cfg!(feature = "images")),
             (Field::LocalFolderSizes, true),
+            (Field::FullLocalPaths, true),
             (Field::TtyImages, cfg!(feature = "images")),
             (Field::BandcampAudio, cfg!(feature = "bandcamp")),
             (Field::VideoSummaries, self.video_summary_supported),
@@ -4329,6 +4336,8 @@ pub enum UiAction {
     CycleYouTubeThumbnailSize,
     /// Toggle lazy recursive Local-folder size measurement in the draft.
     ToggleLocalFolderSizes,
+    /// Toggle full local paths instead of home-relative display in the draft.
+    ToggleFullLocalPaths,
     /// Toggle half-block artwork on a physical Linux TTY in the draft.
     ToggleTtyImages,
     /// Cycle the preferred Bandcamp playback encoding in the draft.
@@ -4521,6 +4530,23 @@ pub trait UiController {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Both frontends share stable action and focus identifiers for local-path display.
+    #[test]
+    fn full_local_paths_preference_has_shared_action_and_focus_ids() {
+        assert_eq!(
+            PreferencesField::from_action(&UiAction::ToggleFullLocalPaths),
+            Some(PreferencesField::FullLocalPaths)
+        );
+        assert_eq!(
+            serde_json::to_value(UiAction::ToggleFullLocalPaths).unwrap(),
+            serde_json::json!("ToggleFullLocalPaths")
+        );
+        assert_eq!(
+            serde_json::from_str::<PreferencesField>("\"FullLocalPaths\"").unwrap(),
+            PreferencesField::FullLocalPaths
+        );
+    }
 
     /// Display-only renames must preserve the saved and frontend screen ID.
     #[test]
