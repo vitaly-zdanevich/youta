@@ -5209,7 +5209,7 @@ fn render_information_panel(
         )
     });
     let playlist_button = details_playlist_item.map(|_| {
-        let label = button("P", "Playlist…", show_hotkeys);
+        let label = button("P", "Playlist", show_hotkeys);
         push_left_detail_button(
             &mut lines,
             &right_buttons,
@@ -24855,6 +24855,7 @@ for encoded, expected in json.load(sys.stdin):
         assert!(!rendered.contains("Published:"));
     }
 
+    /// Playlist controls stay ASCII-readable and retain their exact mouse and keyboard actions.
     #[test]
     fn playable_details_show_playlist_actions_and_wrapped_selectable_membership() {
         let backend = TestBackend::new(80, 30);
@@ -24888,7 +24889,7 @@ for encoded, expected in json.load(sys.stdin):
             .expect("draw playlist membership");
         let rendered = rendered_text(&terminal);
         assert!(rendered.contains("[l] Remove from todo"));
-        assert!(rendered.contains("[P] Playlist…"));
+        assert!(rendered.contains("[P] Playlist"));
         assert!(rendered.contains("Playlists: todo"));
         assert!(rendered.contains("A playlist name"));
 
@@ -24920,6 +24921,11 @@ for encoded, expected in json.load(sys.stdin):
                     terminal_text_width("[l] Remove from todo"),
                     "the Details hit region must cover the full explicit action label"
                 );
+            } else {
+                let label = (target.x..target.right())
+                    .map(|x| terminal.backend().buffer()[(x, target.y)].symbol())
+                    .collect::<String>();
+                assert_eq!(label, "[P] Playlist", "omit the unsupported ellipsis glyph");
             }
             assert_eq!(
                 mouse_action(
@@ -24935,6 +24941,13 @@ for encoded, expected in json.load(sys.stdin):
                 Some(expected)
             );
         }
+        assert_eq!(
+            key_action(
+                KeyEvent::new(KeyCode::Char('P'), KeyModifiers::SHIFT),
+                &view
+            ),
+            Some(UiAction::OpenPlaylistPopup)
+        );
     }
 
     #[test]
@@ -24974,7 +24987,7 @@ for encoded, expected in json.load(sys.stdin):
         let rendered = rendered_text(&terminal);
         assert!(!rendered.contains("[l] Add to todo"));
         assert!(!rendered.contains("[l] Remove from todo"));
-        assert!(!rendered.contains("[P] Playlist…"));
+        assert!(!rendered.contains("[P] Playlist"));
         assert!(hit_map.detail_buttons.iter().all(|(action, _)| !matches!(
             action,
             UiAction::ToggleTodoPlaylist | UiAction::OpenPlaylistPopup
@@ -27244,7 +27257,7 @@ for encoded, expected in json.load(sys.stdin):
             "[F6] Twenty comments".to_owned(),
             "[O] open channel https://www.youtube.com/@fixture".to_owned(),
             "[o] open video".to_owned(),
-            "[P] Playlist…".to_owned(),
+            "[P] Playlist".to_owned(),
             "[n] Add private note".to_owned(),
             "[s] Subscribe (locally)".to_owned(),
         ];
@@ -27402,7 +27415,7 @@ for encoded, expected in json.load(sys.stdin):
             "left-side actions must retain their logical order on narrow panes"
         );
         let rendered = rendered_text(&terminal);
-        for label in ["[l] Add to todo", "[P] Playlist…", "[n] Add private note"] {
+        for label in ["[l] Add to todo", "[P] Playlist", "[n] Add private note"] {
             assert!(rendered.contains(label), "missing rendered label {label:?}");
         }
     }
@@ -29638,7 +29651,7 @@ for encoded, expected in json.load(sys.stdin):
         assert!(!rendered.contains("Likes:"));
         assert!(!rendered.contains("Views:"));
         assert!(rendered.contains("[l] Add to todo"));
-        assert!(rendered.contains("[P] Playlist…"));
+        assert!(rendered.contains("[P] Playlist"));
         assert!(rendered.contains("[n] Add private note"));
         assert!(rendered.contains("THUMBNAIL IMAGE"));
         assert!(hit_map.thumbnail_area.is_some());

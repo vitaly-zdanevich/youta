@@ -578,6 +578,12 @@
 		snapshot({ rows: [row('First fixture track'), row('Second fixture track', { ...mediaId, external_id: mediaId.external_id.replace('first', 'second') })], details: details('First fixture track') });
 		const track = await until(() => button('First fixture track', document.querySelector('[aria-label=Results]')), 'track rows');
 		assert(document.querySelector('[aria-label=Results]').textContent.includes('Second fixture track'), 'Item snapshot displays all fixture tracks');
+		// A plain Playlist label keeps the existing chooser action available without an ellipsis glyph.
+		snapshot({ playlist_item: { media_id: mediaId, title: 'First fixture track', in_todo: false } });
+		await until(() => button('To-do'), 'playlist actions for the selected track');
+		assert(Boolean(button('Playlist')), 'Playlist action uses its plain ASCII label');
+		await action('OpenPlaylistPopup', () => button('Playlist').click(), 'Playlist opens the shared chooser action');
+		snapshot({ playlist_item: null });
 		await action('ActivateSelection', () => track.dispatchEvent(new MouseEvent('dblclick', { bubbles: true })), 'Track double click requests playback');
 		snapshot({ playing_media_id: mediaId, now_playing: { media_id: mediaId, title: 'First fixture track', subtitle: 'archive.org' } });
 		tick({ idle: false, paused: false, position: { secs: 1, nanos: 0 }, duration: { secs: 120, nanos: 0 } });

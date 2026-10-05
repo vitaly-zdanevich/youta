@@ -431,7 +431,7 @@ export function Details({ view, kind }: { view: ViewModel; kind: InformationPane
             >
               To-do
             </Action>
-            <Action onClick={() => void dispatch("OpenPlaylistPopup")}>Playlist…</Action>
+			<Action onClick={() => void dispatch('OpenPlaylistPopup')}>Playlist</Action>
           </>
         ) : null}
         {view.screen === "Playlists" && view.playlist_edit_available ? (
