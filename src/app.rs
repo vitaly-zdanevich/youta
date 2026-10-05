@@ -36,6 +36,7 @@ mod radio_evernote;
 #[cfg(feature = "s3-upload")]
 mod s3_upload;
 mod soundcloud;
+mod subscription_confirmation;
 #[cfg(feature = "web-browser")]
 mod web;
 #[cfg(all(feature = "web-browser", feature = "local-metadata"))]
@@ -21928,10 +21929,13 @@ impl AppController {
         self.schedule_visible_channel_details(Instant::now());
     }
 
-    /// Mutates the selected channel's local subscription after reloading OPML.
+    /// Subscribes immediately, or asks before removing a local subscription.
     /// Search-video details may subscribe their parent channel, but cannot
     /// unsubscribe it, including through repeated or stale frontend actions.
     fn toggle_local_subscription(&mut self) {
+        if self.view.unsubscribe_popup.is_some() || self.view.error_popup.is_some() {
+            return;
+        }
         let Some(details) = self.view.details.as_ref() else {
             self.view.status_line = "No channel is selected".to_owned();
             return;
@@ -21955,13 +21959,38 @@ impl AppController {
         let channel_webpage_url = details.channel_webpage_url.clone();
         let now_subscribed = !details.channel_subscribed;
 
+        if !now_subscribed {
+            self.view.search_editing = false;
+            self.view.text_selection_mode = false;
+            self.view.unsubscribe_popup = Some(crate::view::UnsubscribePopupView {
+                channel_id,
+                channel_name,
+            });
+            self.view.status_line =
+                "Confirm unsubscribe, or cancel to keep the subscription".to_owned();
+            return;
+        }
+        self.apply_local_subscription_change(channel_id, channel_name, channel_webpage_url, true);
+    }
+
+    /// Saves one explicit subscription state while preserving concurrent OPML edits.
+    ///
+    /// Unsubscribe callers must first validate the captured confirmation target.
+    /// Cache and view updates happen only after a successful durable mutation.
+    fn apply_local_subscription_change(
+        &mut self,
+        channel_id: String,
+        channel_name: String,
+        channel_webpage_url: Option<url::Url>,
+        now_subscribed: bool,
+    ) -> bool {
         // Reload on each explicit mutation so external OPML edits are retained
         // and a malformed existing file can never be replaced by an empty tree.
         let mut candidate = match subscriptions::load(&self.config) {
             Ok(tree) => tree,
             Err(error) => {
                 self.show_error("Cannot change local subscriptions", &error);
-                return;
+                return false;
             }
         };
         let persisted_subscribed = candidate.contains_youtube_channel(&channel_id);
@@ -21980,11 +22009,11 @@ impl AppController {
                     "Cannot change local subscriptions",
                     "The requested local subscription change could not be represented in OPML",
                 );
-                return;
+                return false;
             }
             if let Err(error) = subscriptions::save(&self.config, &candidate) {
                 self.show_error("Cannot save local subscriptions", &error);
-                return;
+                return false;
             }
         }
 
@@ -22017,10 +22046,17 @@ impl AppController {
             details.channel_subscribed = now_subscribed;
             details.channel_auto_download &= now_subscribed;
         }
-        if self.view.screen == Screen::Subscriptions {
-            self.populate_subscriptions();
-        } else {
-            self.refresh_youtube_rows();
+        match self.view.screen {
+            Screen::Subscriptions => self.populate_subscriptions(),
+            Screen::Search
+                if self.local_results.is_empty()
+                    && self.direct_item.is_none()
+                    && self.resolved_direct.is_none() =>
+            {
+                self.refresh_youtube_rows()
+            }
+            Screen::YouTubeMusic => self.refresh_youtube_music_rows(),
+            _ => {}
         }
         self.view.status_line = format!(
             "{} {channel_name} locally",
@@ -22030,6 +22066,7 @@ impl AppController {
                 "Unsubscribed from"
             }
         );
+        true
     }
 
     /// Persists the displayed channel's automatic-download opt-in.
@@ -35240,6 +35277,8 @@ impl UiController for AppController {
                 self.view.details_focused = true;
                 self.toggle_local_subscription();
             }
+            UiAction::ConfirmUnsubscribe { channel_id } => self.confirm_unsubscribe(&channel_id),
+            UiAction::DismissUnsubscribe => self.dismiss_unsubscribe(),
             UiAction::ToggleChannelAutoDownload => {
                 self.view.details_focused = true;
                 self.toggle_channel_auto_download();
@@ -55599,6 +55638,22 @@ mod tests {
             .expect("persist subscribed channel snapshot");
         controller.dispatch(UiAction::ToggleSubscription);
         assert!(
+            subscriptions::load(&config)
+                .expect("subscriptions while confirmation is pending")
+                .contains_youtube_channel("UCfixture"),
+            "requesting unsubscribe must not remove the subscription before confirmation"
+        );
+        assert!(controller.view.unsubscribe_popup.is_some());
+        assert!(
+            controller
+                .subscription_video_cache
+                .contains_key("UCfixture")
+        );
+        controller.dispatch(UiAction::ConfirmUnsubscribe {
+            channel_id: "UCfixture".to_owned(),
+        });
+        assert!(controller.view.unsubscribe_popup.is_none());
+        assert!(
             !controller
                 .view
                 .details
@@ -74766,6 +74821,13 @@ mod tests {
             ..DetailView::default()
         });
         controller.toggle_local_subscription();
+        assert_eq!(controller.automatic_download_queue.len(), 1);
+        controller.dispatch(UiAction::DismissUnsubscribe);
+        assert_eq!(controller.automatic_download_queue.len(), 1);
+        controller.toggle_local_subscription();
+        controller.dispatch(UiAction::ConfirmUnsubscribe {
+            channel_id: "UCfixture".to_owned(),
+        });
         assert!(controller.automatic_download_queue.is_empty());
         controller.shutdown();
     }

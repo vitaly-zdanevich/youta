@@ -140,6 +140,26 @@ fn radio_evernote_modal_defers_exact_completed_recording_until_tick() {
 }
 
 #[test]
+fn radio_evernote_unsubscribe_confirmation_defers_recording_offer() {
+    let temporary = crate::test_support::canonical_tempdir("unsubscribe recording offer");
+    let (mut app, _, _) = radio_recording_controller(&temporary);
+    app.view.unsubscribe_popup = Some(crate::view::UnsubscribePopupView {
+        channel_id: "UCfixture".to_owned(),
+        channel_name: "Fixture channel".to_owned(),
+    });
+    let published = finish_mock_recording(&mut app);
+    assert_eq!(app.pending_radio_evernote_offers.len(), 1);
+    assert!(app.view.evernote_popup.is_none());
+    app.dispatch(UiAction::DismissUnsubscribe);
+    app.tick();
+    assert!(app.pending_radio_evernote_offers.is_empty());
+    assert!(app.view.evernote_popup.is_some());
+    assert!(matches!(&app.evernote_selection.as_ref().unwrap().source,
+        OpusAudioSource::LocalFile(path) if path == &published));
+    assert!(app.evernote_thread.is_none());
+}
+
+#[test]
 fn radio_evernote_fullscreen_artwork_defers_review_until_collapsed() {
     let temporary = crate::test_support::canonical_tempdir("artwork recording offer");
     let (mut app, _, _) = radio_recording_controller(&temporary);

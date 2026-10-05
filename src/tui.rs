@@ -2074,6 +2074,8 @@ struct HitMap {
     evernote_credentials_buttons: Vec<(UiAction, Rect)>,
     rss_subscription_field: Option<Rect>,
     rss_subscription_buttons: Vec<(UiAction, Rect)>,
+    /// Confirmation and cancel controls for the exact local subscription shown.
+    unsubscribe_buttons: Vec<(UiAction, Rect)>,
     preferences_buttons: Vec<(UiAction, Rect)>,
     /// Visible playlist membership rows inside the chooser popup.
     playlist_popup_rows: Rect,
@@ -2480,6 +2482,7 @@ fn render_frame(
     frame.render_widget(Block::default().style(theme.base), frame.area());
     #[cfg(feature = "ascii-visualizer")]
     if view.error_popup.is_none()
+        && view.unsubscribe_popup.is_none()
         && let Some(visualizer) = view.ascii_visualizer.as_ref()
     {
         if let Some(renderer) = thumbnail_renderer.as_mut() {
@@ -2506,6 +2509,7 @@ fn render_frame(
         || view.youtube_setup_popup.is_some()
         || view.yandex_music_setup_popup.is_some()
         || view.rss_subscription_popup.is_some()
+        || view.unsubscribe_popup.is_some()
         || view.preferences_popup.is_some()
         || view.playlist_popup.is_some()
         || view.private_note_popup.is_some()
@@ -2826,6 +2830,10 @@ fn render_frame(
     }
     if let Some(popup) = view.audio_quality_popup.as_ref() {
         render_audio_quality_popup(frame, popup, &theme, hit_map);
+    }
+    hit_map.unsubscribe_buttons.clear();
+    if let Some(popup) = view.unsubscribe_popup.as_ref() {
+        render_unsubscribe_popup(frame, popup, &theme, hit_map);
     }
     if let Some(error) = view.error_popup.as_ref() {
         render_error_popup(
@@ -13501,6 +13509,83 @@ fn render_preferences_content(
     }
 }
 
+/// Reviews one captured local subscription with wrapped identity and explicit controls.
+fn render_unsubscribe_popup(
+    frame: &mut Frame<'_>,
+    popup: &UnsubscribePopupView,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+) {
+    let message = format!(
+        "Remove this channel from your local subscriptions?\n\nChannel: {}\nChannel ID: {}",
+        popup.channel_name, popup.channel_id
+    );
+    let width = frame.area().width.saturating_sub(4).clamp(1, 96);
+    let wrapped = wrap_text_lines(&message, width.saturating_sub(6).max(1));
+    let confirm_label = "[Enter] Unsubscribe";
+    let cancel_label = "[Esc] Cancel";
+    let controls_width = terminal_text_width(confirm_label)
+        .saturating_add(3)
+        .saturating_add(terminal_text_width(cancel_label));
+    let stacked = controls_width > width.saturating_sub(4);
+    let control_rows = if stacked { 2 } else { 1 };
+    let height = u16::try_from(wrapped.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(3 + control_rows)
+        .min(frame.area().height.saturating_sub(2).max(1));
+    let area = centered_sized_rect(width, height, frame.area());
+    frame.render_widget(Clear, area);
+    frame.render_widget(panel_block(" Unsubscribe locally? ", theme), area);
+    let inner = area.inner(ratatui::layout::Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+    if inner.is_empty() {
+        return;
+    }
+    let sections = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(1),
+        Constraint::Length(control_rows),
+    ])
+    .split(inner);
+    frame.render_widget(
+        Paragraph::new(wrapped.join("\n")).style(theme.base),
+        sections[0],
+    );
+    let mut x = centered_line_x(sections[2], controls_width);
+    for (index, (label, action)) in [
+        (
+            confirm_label,
+            UiAction::ConfirmUnsubscribe {
+                channel_id: popup.channel_id.clone(),
+            },
+        ),
+        (cancel_label, UiAction::DismissUnsubscribe),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let label_width = terminal_text_width(label);
+        let y = sections[2].y + if stacked { index as u16 } else { 0 };
+        if y >= sections[2].bottom() {
+            continue;
+        }
+        if stacked {
+            x = centered_line_x(sections[2], label_width);
+        }
+        let target = Rect::new(
+            x,
+            y,
+            label_width.min(sections[2].right().saturating_sub(x)),
+            1,
+        );
+        frame.render_widget(Paragraph::new(label).style(theme.accent), target);
+        hit_map.unsubscribe_buttons.push((action, target));
+        x = x.saturating_add(label_width).saturating_add(3);
+    }
+}
+
 fn render_local_file_popup(
     frame: &mut Frame<'_>,
     popup: &LocalFilePopupView,
@@ -14733,6 +14818,16 @@ fn mouse_action_unfiltered(
             MouseEventKind::ScrollUp => {
                 Some(UiAction::ScrollErrorPopup(ErrorPopupScroll::Lines(-3)))
             }
+            _ => None,
+        };
+    }
+    if view.unsubscribe_popup.is_some() {
+        return match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => hit_map
+                .unsubscribe_buttons
+                .iter()
+                .find(|(_, area)| contains(*area, mouse.column, mouse.row))
+                .map(|(action, _)| action.clone()),
             _ => None,
         };
     }
@@ -26507,6 +26602,112 @@ for encoded, expected in json.load(sys.stdin):
             ),
             Some(UiAction::OpenChannelDownload)
         );
+    }
+
+    /// Removal review remains readable, modal, and bound to the named channel on narrow screens.
+    #[test]
+    fn unsubscribe_popup_wraps_channel_identity_and_blocks_background_input() {
+        let channel_name = "A channel with a long name for narrow terminal confirmation";
+        let channel_id = "UC0123456789abcdefghijkl";
+        let mut view = ViewModel {
+            unsubscribe_popup: Some(UnsubscribePopupView {
+                channel_id: channel_id.to_owned(),
+                channel_name: channel_name.to_owned(),
+            }),
+            ..ViewModel::default()
+        };
+        for width in [36, 80, 120] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            let mut hit_map = HitMap::default();
+            terminal
+                .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+                .unwrap();
+            let rendered = rendered_text(&terminal);
+            assert!(rendered.contains("Unsubscribe locally?"));
+            let message = format!(
+                "Remove this channel from your local subscriptions?\n\nChannel: {channel_name}\nChannel ID: {channel_id}"
+            );
+            for line in wrap_text_lines(&message, width.saturating_sub(4).min(96).saturating_sub(6))
+            {
+                assert!(
+                    rendered.contains(&line),
+                    "missing wrapped text at {width}: {line:?}"
+                );
+            }
+            for (action, label) in [
+                (
+                    UiAction::ConfirmUnsubscribe {
+                        channel_id: channel_id.to_owned(),
+                    },
+                    "[Enter] Unsubscribe",
+                ),
+                (UiAction::DismissUnsubscribe, "[Esc] Cancel"),
+            ] {
+                assert!(
+                    rendered.contains(label),
+                    "missing control at {width}: {label}"
+                );
+                let (_, target) = hit_map
+                    .unsubscribe_buttons
+                    .iter()
+                    .find(|(candidate, _)| candidate == &action)
+                    .expect("visible confirmation control");
+                assert!(target.right() <= width);
+                assert!(target.bottom() <= 24);
+                assert_eq!(
+                    mouse_action(
+                        MouseEvent {
+                            kind: MouseEventKind::Down(MouseButton::Left),
+                            column: target.x,
+                            row: target.y,
+                            modifiers: KeyModifiers::NONE,
+                        },
+                        &hit_map,
+                        &view
+                    ),
+                    Some(action)
+                );
+            }
+            for kind in [
+                MouseEventKind::Down(MouseButton::Left),
+                MouseEventKind::ScrollDown,
+                MouseEventKind::ScrollUp,
+            ] {
+                assert_eq!(
+                    mouse_action(
+                        MouseEvent {
+                            kind,
+                            column: 0,
+                            row: 0,
+                            modifiers: KeyModifiers::NONE,
+                        },
+                        &hit_map,
+                        &view
+                    ),
+                    None
+                );
+            }
+        }
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut hit_map = HitMap::default();
+        let mut thumbnails = MockThumbnailRenderer::default();
+        terminal
+            .draw(|frame| {
+                render_frame(
+                    frame,
+                    &view,
+                    &UiSettings::default(),
+                    &mut hit_map,
+                    Some(&mut thumbnails),
+                )
+            })
+            .unwrap();
+        assert_eq!(thumbnails.obscure_count, 1);
+        view.unsubscribe_popup = None;
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .unwrap();
+        assert!(hit_map.unsubscribe_buttons.is_empty());
     }
 
     #[cfg(feature = "yt-dlp")]

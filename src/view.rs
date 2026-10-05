@@ -1067,6 +1067,15 @@ impl Default for SubscriptionsView {
     }
 }
 
+/// Explicit confirmation for removing one captured local subscription.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct UnsubscribePopupView {
+    /// Exact subscription identity echoed by the confirmation action.
+    pub channel_id: String,
+    /// Human-readable channel name shown alongside its identity.
+    pub channel_name: String,
+}
+
 /// Focused editor for adding one portable audio or video podcast feed.
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct RssSubscriptionPopupView {
@@ -3209,6 +3218,8 @@ pub struct ViewModel {
         serialize_with = "serialize_editor_presence"
     )]
     pub rss_subscription_popup: Option<RssSubscriptionPopupView>,
+    /// Explicit removal review bound to one local subscription.
+    pub unsubscribe_popup: Option<UnsubscribePopupView>,
     /// Focused runtime preferences editor.
     pub preferences_popup: Option<PreferencesPopupView>,
     /// Focused local-playlist chooser or create/edit form.
@@ -3517,6 +3528,7 @@ impl Default for ViewModel {
             #[cfg(feature = "archive-upload")]
             archive_credentials_popup: None,
             rss_subscription_popup: None,
+            unsubscribe_popup: None,
             preferences_popup: None,
             playlist_popup: None,
             queue_popup: None,
@@ -3691,8 +3703,15 @@ pub enum UiAction {
         /// Bounded text reconstructed from selectable Details rows.
         text: String,
     },
-    /// Subscribe to or unsubscribe from the displayed channel in local OPML.
+    /// Subscribe immediately or review removal of the displayed local subscription.
     ToggleSubscription,
+    /// Remove only the local subscription currently awaiting explicit confirmation.
+    ConfirmUnsubscribe {
+        /// Exact subscription identity captured by the rendered confirmation.
+        channel_id: String,
+    },
+    /// Close the unsubscribe review without changing local subscriptions.
+    DismissUnsubscribe,
     /// Toggle automatic downloads for the displayed YouTube channel.
     ToggleChannelAutoDownload,
     /// Toggle pause in the invisible playback backend.

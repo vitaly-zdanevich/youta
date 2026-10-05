@@ -44,6 +44,32 @@ function text(element) {
 	return React.Children.toArray(element.props.children).map(text).join('');
 }
 
+test('unsubscribe confirmation names the captured channel and confirms only that identity', () => {
+	assert.equal(typeof module.exports.UnsubscribePopup, 'function');
+	const popup = { channel_id: 'UCcaptured', channel_name: 'Saved <channel>' };
+	actions.length = 0;
+	const tree = module.exports.UnsubscribePopup({ popup });
+	assert.ok(text(tree).includes(popup.channel_name));
+	assert.ok(text(tree).includes(popup.channel_id));
+	assert.equal(actions.length, 0, 'Opening confirmation must not remove a subscription');
+	const rendered = nodes(tree);
+	assert.ok(rendered.every((node) => !node.props.dangerouslySetInnerHTML));
+	const buttons = rendered.filter((node) => node.type === 'button');
+	buttons.find((node) => text(node) === 'Unsubscribe').props.onClick();
+	assert.deepEqual(actions.pop(), [{ ConfirmUnsubscribe: { channel_id: 'UCcaptured' } }]);
+	for (const label of ['Cancel', 'Dismiss']) {
+		buttons.find((node) => text(node) === label).props.onClick();
+		assert.deepEqual(actions.pop(), ['DismissUnsubscribe']);
+	}
+	assert.equal(actions.length, 0, 'Dismissal must not dispatch a removal or toggle action');
+});
+
+test('window mounts the captured unsubscribe confirmation using the shared contract', () => {
+	assert.match(contract, /export interface UnsubscribePopupView/);
+	assert.match(contract, /unsubscribe_popup: UnsubscribePopupView \| null/);
+	assert.match(app, /<UnsubscribePopup popup=\{view\.unsubscribe_popup\}/);
+});
+
 test('download chooser renders reducer labels and confirms exact option indices', () => {
 	assert.equal(typeof module.exports.DownloadChoicePopup, 'function');
 	actions.length = 0;

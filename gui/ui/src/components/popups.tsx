@@ -41,6 +41,7 @@ import type {
 	LanSharePopupView,
 	PodcastFeedOptionsPopupView,
   PlaylistPopupView,
+	UnsubscribePopupView,
   PreferencesPopupView,
 	PreferencesField,
   ProjectHistoryPopupView,
@@ -84,6 +85,7 @@ export const LAYER = {
   videoSummary: 13,
   youtubeCaptions: 14,
   audioQuality: 15,
+	unsubscribe: 15.5,
   error: 16,
 } as const;
 
@@ -1802,6 +1804,26 @@ export function PreferencesPopup({ popup, archiveSupported }: {
 				))}
 			</Body>
 			<PopupError message={popup.validation_error} />
+		</Popup>
+	);
+}
+
+/** Confirmation always echoes the displayed channel, never the current Details selection. */
+export function UnsubscribePopup({ popup }: { popup: UnsubscribePopupView }) {
+	return (
+		<Popup title='Unsubscribe?' layer={LAYER.unsubscribe} width='560px'
+			onDismiss={() => void dispatch('DismissUnsubscribe')} dismissLabel='Cancel'
+			footer={<>
+				<PopupButton onClick={() => void dispatch({ ConfirmUnsubscribe: { channel_id: popup.channel_id } })}>
+					Unsubscribe
+				</PopupButton>
+				<PopupButton onClick={() => void dispatch('DismissUnsubscribe')}>Cancel</PopupButton>
+			</>}>
+			<Body>
+				<p>Remove this channel from your local subscriptions?</p>
+				<p className='mt-3 break-words'>Channel: {popup.channel_name}</p>
+				<p className='mt-1 break-all text-ink-dim'>Channel ID: {popup.channel_id}</p>
+			</Body>
 		</Popup>
 	);
 }

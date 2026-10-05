@@ -621,6 +621,12 @@ export type PlaylistPopupMode = "Choose" | "Create" | "Edit";
 /** Which editor field receives printable characters. */
 export type PlaylistEditorField = "Name" | "Description";
 
+/** Channel identity captured before a local subscription can be removed. */
+export interface UnsubscribePopupView {
+	channel_id: string;
+	channel_name: string;
+}
+
 /** The local-playlist chooser and its create/edit form. */
 export interface PlaylistPopupView {
   item_title: string;
@@ -998,6 +1004,7 @@ export interface ViewModel {
 	podcast_feed_options_popup: PodcastFeedOptionsPopupView | null;
   preferences_popup: PreferencesPopupView | null;
   playlist_popup: PlaylistPopupView | null;
+	unsubscribe_popup: UnsubscribePopupView | null;
   queue_popup: QueuePopupView | null;
   local_file_popup: LocalFilePopupView | null;
   // Redacted projections expose editor controls without returning credentials.

@@ -121,6 +121,7 @@ export type UnitUiAction =
 	| 'DismissLanShare'
 	| 'DismissLocalFilePopup'
 	| 'DismissPlaylistPopup'
+	| 'DismissUnsubscribe'
 	| 'DismissPodcastFeed'
 	| 'DismissPreferences'
 	| 'DismissPrivateNotePopup'
@@ -242,6 +243,7 @@ export interface UiActionPayloads {
 	ChangeVolume: number;
 	ConfirmArchivePlaybackChoice: number;
 	ConfirmDownloadChoice: number;
+	ConfirmUnsubscribe: { channel_id: string; };
 	FocusSubscriptionPane: SubscriptionPane;
 	MoveArchivePlaybackChoice: number;
 	MoveInvidiousInstance: number;

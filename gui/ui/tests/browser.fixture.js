@@ -504,6 +504,27 @@
 		snapshot({ preferences_popup: null });
 		await until(() => !dialog(), 'closed Preferences focus fixture');
 	}
+	/** Confirmation retains its captured identity if background Details are replaced. */
+	async function checkUnsubscribeConfirmation() {
+		const previous = { screen: view.screen, details: view.details };
+		const popup = { channel_id: 'UCcaptured', channel_name: 'Saved <channel>' };
+		const beforeOpen = calls.length;
+		snapshot({ unsubscribe_popup: popup });
+		await until(() => dialog()?.textContent.includes('Remove this channel from your local subscriptions?'), 'unsubscribe confirmation');
+		assert(dialog().textContent.includes(popup.channel_name) && dialog().textContent.includes(popup.channel_id), 'Unsubscribe confirmation displays the captured channel name and identity');
+		assert(!calls.slice(beforeOpen).some((call) => call.command === 'dispatch'), 'Opening unsubscribe confirmation cannot remove a channel');
+		snapshot({ details: { ...details('Different channel', null), channel_id: 'UCdifferent', channel_name: 'Different channel' } });
+		await until(() => document.querySelector('[aria-label=Details]')?.textContent.includes('Different channel'), 'background channel replacement');
+		assert(dialog().textContent.includes(popup.channel_name), 'The pending unsubscribe target does not follow background selection');
+		await action({ ConfirmUnsubscribe: { channel_id: popup.channel_id } }, () => button('Unsubscribe', dialog()).click(), 'Unsubscribe confirms the exact captured channel');
+		await action('DismissUnsubscribe', () => button('Cancel', dialog()).click(), 'Cancel dismisses without removing a subscription');
+		await action('DismissUnsubscribe', () => dialog().querySelector('button[aria-label=Cancel]').click(), 'The close control also cancels unsubscribe');
+		await key('Escape', 'Esc');
+		await key('Enter', 'Enter');
+		snapshot({ unsubscribe_popup: null, ...previous });
+		await until(() => !dialog(), 'closed unsubscribe confirmation');
+	}
+
 	async function run() {
 		await until(() => document.querySelector('[title="Search archive.org"]'), 'Archive search');
 		await checkSoundCloudTab();
@@ -517,6 +538,7 @@
 		snapshot(beforeTabMarkers);
 		await checkRadioPresentation();
 		await checkPreferencesFocus();
+		await checkUnsubscribeConfirmation();
 		await checkProviderSettings();
 		await checkArchivePlaybackChoices();
 		assert(!button('[Esc] Back'), 'Archive root hides Back when no return route exists');

@@ -561,6 +561,13 @@ fn the_typescript_contract_names_only_fields_the_reducer_emits() {
     );
     emitted.insert("PreferencesPopupView", emitted_keys(&preferences()));
     emitted.insert(
+        "UnsubscribePopupView",
+        emitted_keys(&youta::view::UnsubscribePopupView {
+            channel_id: "UCfixture".to_owned(),
+            channel_name: "Fixture channel".to_owned(),
+        }),
+    );
+    emitted.insert(
         "DownloadChoicePopupView",
         emitted_keys(&DownloadChoicePopupView {
             generation: 7,
@@ -899,6 +906,7 @@ fn every_checked_interface_is_actually_declared() {
         "ProjectHistoryPopupView",
         "ProjectCommitView",
         "PreferencesPopupView",
+        "UnsubscribePopupView",
         "DownloadChoicePopupView",
         "ArchivePlaybackChoicePopupView",
         "PlaylistPopupView",

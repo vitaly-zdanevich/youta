@@ -32,6 +32,7 @@ import {
 	LanSharePopup,
 	PodcastFeedOptionsPopup,
   PlaylistPopup,
+	UnsubscribePopup,
   PreferencesPopup,
   ProjectHistoryPopup,
   QueuePopup,
@@ -247,6 +248,7 @@ export function App() {
 			{view.download_choice_popup ? <DownloadChoicePopup popup={view.download_choice_popup} /> : null}
 		{view.archive_playback_choice_popup ? <ArchivePlaybackChoicePopup popup={view.archive_playback_choice_popup} /> : null}
       {view.playlist_popup ? <PlaylistPopup popup={view.playlist_popup} /> : null}
+		{view.unsubscribe_popup ? <UnsubscribePopup popup={view.unsubscribe_popup} /> : null}
       {view.queue_popup ? <QueuePopup popup={view.queue_popup} /> : null}
       {view.private_note_open ? <CredentialEditorNotice editor="private_note" /> : null}
       {view.video_comments_popup ? (

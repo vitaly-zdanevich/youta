@@ -143,7 +143,8 @@ mod wire_tests {
     #[cfg(feature = "commons-upload")]
     use crate::view::{CommonsUploadField, CommonsUploadPhase, CommonsUploadPopupView};
     use crate::view::{
-        DownloadChoicePopupView, UiAction, VideoSummaryPopupState, VideoSummaryPopupView, ViewModel,
+        DetailView, DownloadChoicePopupView, ErrorPopupView, UiAction, UnsubscribePopupView,
+        VideoSummaryPopupState, VideoSummaryPopupView, ViewModel,
     };
     #[cfg(feature = "evernote")]
     use crate::view::{EvernoteNoteField, EvernoteNotePhase, EvernoteNotePopupView};
@@ -451,6 +452,61 @@ mod wire_tests {
         for key in [Key::Down, Key::Char('r'), Key::Delete] {
             assert_eq!(key_action(KeyPress::new(key), &view, None, None), None);
         }
+    }
+
+    /// Unsubscribe requires Enter for the captured channel and blocks repeated/background keys.
+    #[test]
+    fn unsubscribe_keys_require_explicit_confirmation_of_the_displayed_channel() {
+        let mut view = ViewModel {
+            search_editing: true,
+            unsubscribe_popup: Some(UnsubscribePopupView {
+                channel_id: "UC-reviewed-channel".to_owned(),
+                channel_name: "Reviewed channel".to_owned(),
+            }),
+            details: Some(DetailView {
+                channel_id: "UC-different-selection".to_owned(),
+                channel_subscribed: true,
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        assert_eq!(
+            key_action(KeyPress::new(Key::Enter), &view, None, None),
+            Some(UiAction::ConfirmUnsubscribe {
+                channel_id: "UC-reviewed-channel".to_owned(),
+            })
+        );
+        assert_eq!(
+            key_action(KeyPress::new(Key::Esc), &view, None, None),
+            Some(UiAction::DismissUnsubscribe)
+        );
+        for key in [
+            Key::Char('s'),
+            Key::Char('q'),
+            Key::Char(' '),
+            Key::Char('/'),
+            Key::Char('p'),
+            Key::Down,
+            Key::Up,
+            Key::Tab,
+            Key::Delete,
+            Key::F(5),
+        ] {
+            assert_eq!(
+                key_action(KeyPress::new(key), &view, None, None),
+                None,
+                "{key:?}"
+            );
+        }
+        view.error_popup = Some(ErrorPopupView::default());
+        assert_eq!(
+            key_action(KeyPress::new(Key::Esc), &view, None, None),
+            Some(UiAction::DismissErrorPopup)
+        );
+        assert_eq!(
+            key_action(KeyPress::new(Key::Enter), &view, None, None),
+            None
+        );
     }
 
     /// Format choices remain modal over a background query and reject empty confirmation.
@@ -1286,6 +1342,17 @@ pub fn key_action(
     page_rows: Option<usize>,
     popups: Option<PopupGeometry>,
 ) -> Option<UiAction> {
+    if view.error_popup.is_none()
+        && let Some(popup) = view.unsubscribe_popup.as_ref()
+    {
+        return match key.key {
+            Key::Enter => Some(UiAction::ConfirmUnsubscribe {
+                channel_id: popup.channel_id.clone(),
+            }),
+            Key::Esc => Some(UiAction::DismissUnsubscribe),
+            _ => None,
+        };
+    }
     #[cfg(feature = "ascii-visualizer")]
     if view.error_popup.is_none() && view.ascii_visualizer.is_some() {
         return match key.key {

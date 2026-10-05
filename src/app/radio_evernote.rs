@@ -108,6 +108,7 @@ fn recording_offer_modal_is_busy(view: &ViewModel) -> bool {
         || view.yandex_music_setup_popup.is_some()
         || view.rss_subscription_popup.is_some()
         || view.preferences_popup.is_some()
+        || view.unsubscribe_popup.is_some()
         || view.playlist_popup.is_some()
         || view.queue_popup.is_some()
         || view.private_note_popup.is_some()
