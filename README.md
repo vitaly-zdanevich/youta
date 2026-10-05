@@ -1578,6 +1578,27 @@ unavailable. Keep `yt-dlp` updated because extractor fixes and security fixes
 ship frequently. See the upstream [FAQ](https://github.com/yt-dlp/yt-dlp/wiki/FAQ)
 and [supported-sites warning](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md).
 
+If YouTube playback reports a sign-in error, such as “Sign in to confirm
+you’re not a bot,” Firefox users can try opening the video in Firefox,
+signing in if needed, and adding this line to `~/.config/yt-dlp/config`
+(create the directory and file if they do not exist):
+
+```text
+--cookies-from-browser firefox
+```
+
+If `XDG_CONFIG_HOME` is set, use `$XDG_CONFIG_HOME/yt-dlp/config` instead.
+Save the file and retry playback. This lets yt-dlp use Firefox's browser
+session through mpv's playback resolver. Youta's background audio preparation,
+metadata, captions, and download helpers ignore this configuration.
+
+Cookies do not resolve every playback error, and this setting also applies to
+other yt-dlp commands that load your configuration. Use account cookies only
+when needed; upstream warns that account use with yt-dlp can lead to account
+restrictions. See the [configuration guide](https://github.com/yt-dlp/yt-dlp#configuration),
+[cookie FAQ](https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp),
+and [YouTube cookie guidance](https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies).
+
 If YouTube rejects the initial media URL with HTTP 403 before audio starts,
 Youta retries once with yt-dlp's
 [`--check-formats`](https://github.com/yt-dlp/yt-dlp#video-format-options)
