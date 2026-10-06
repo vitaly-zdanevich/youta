@@ -102,12 +102,14 @@ export interface Chapter {
 export type DetailLinkPresentation =
   | "LabelAndUrl"
   | "LabelAndUrlSpaced"
+	| 'LabelOnly'
   | "LabelOnlySpaced"
   | "UrlOnly"
   | "UrlOnlySpaced";
 
 /** An exact provider destination reachable without leaving Youta. */
 export type DetailLinkInternalTarget =
+	| { YouTubeHashtag: string }
   | { YandexMusicArtist: string }
   | { YandexMusicAlbum: string }
 	| { LibriVoxAuthor: string }

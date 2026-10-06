@@ -615,7 +615,7 @@ fn parse_url_links(description: &str) -> Vec<DescriptionLink> {
     description_url_ranges(description)
         .filter_map(|(start_byte, end_byte)| {
             let raw = &description[start_byte..end_byte];
-            let normalized = if raw.starts_with("http://") || raw.starts_with("https://") {
+            let normalized = if matches!(url_prefix(raw), Some("http://" | "https://")) {
                 raw.to_owned()
             } else {
                 format!("https://{raw}")
@@ -630,7 +630,7 @@ fn parse_url_links(description: &str) -> Vec<DescriptionLink> {
         .collect()
 }
 
-/// Shares existing URL boundaries between navigation and display-only decoding.
+/// Shares URL boundaries between navigation, hashtag exclusion, and URL decoding.
 fn description_url_ranges(description: &str) -> impl Iterator<Item = (usize, usize)> + '_ {
     let mut index = 0;
     std::iter::from_fn(move || {
@@ -676,7 +676,11 @@ fn url_prefix(value: &str) -> Option<&'static str> {
         "youtu.be/",
     ]
     .into_iter()
-    .find(|prefix| value.starts_with(prefix))
+    .find(|prefix| {
+        value
+            .get(..prefix.len())
+            .is_some_and(|start| start.eq_ignore_ascii_case(prefix))
+    })
 }
 
 fn is_url_start_boundary(description: &str, index: usize) -> bool {
@@ -750,7 +754,12 @@ fn parse_timecodes(description: &str, links: &mut Vec<DescriptionLink>) {
     }
 }
 
+/// Finds standalone tags without treating any URL's fragment as a search term.
+///
+/// Exclusion uses raw URL ranges, not just recognized `YouTube` destinations:
+/// unsupported links and case-insensitive HTTP schemes still own their text.
 fn parse_hashtags(description: &str, links: &mut Vec<DescriptionLink>) {
+    let mut urls = description_url_ranges(description).peekable();
     for (start, character) in description.char_indices() {
         if character != '#'
             || !description[..start]
@@ -759,6 +768,15 @@ fn parse_hashtags(description: &str, links: &mut Vec<DescriptionLink>) {
                 .is_none_or(|previous| {
                     !previous.is_alphanumeric() && !matches!(previous, '_' | '#')
                 })
+        {
+            continue;
+        }
+        while urls.peek().is_some_and(|(_, end)| *end <= start) {
+            urls.next();
+        }
+        if urls
+            .peek()
+            .is_some_and(|(url_start, url_end)| *url_start <= start && start < *url_end)
         {
             continue;
         }
@@ -1243,6 +1261,55 @@ playlist https://www.youtube.com/playlist?list=PL123_test";
             .collect::<Vec<_>>();
 
         assert_eq!(seconds, [3723, 7425]);
+    }
+
+    #[test]
+    fn hashtags_ignore_url_fragments_including_unsupported_destinations() {
+        let description = concat!(
+            "https://example.org/#external ",
+            "http://example.org/?q=#query ",
+            "https://youtube.com/unsupported/#unknown ",
+            "https://youtu.be/dQw4w9WgXcQ#video ",
+            "HtTpS://YouTube.com/watch?v=dQw4w9WgXcQ#mixed ",
+            "[page](https://example.org/#markdown), ",
+            "HTTPS://example.org/#uppercase ",
+            "#Music #аудиокниги"
+        );
+        let links = parse_description_links(description);
+        let hashtags = links
+            .iter()
+            .filter(|link| matches!(link.target, LinkTarget::Hashtag { .. }))
+            .map(|link| link.selected_text(description).unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(hashtags, ["#Music", "#аудиокниги"]);
+        assert_eq!(
+            links
+                .iter()
+                .filter(|link| matches!(
+                    &link.target,
+                    LinkTarget::YouTubeVideo { video_id, .. } if video_id == "dQw4w9WgXcQ"
+                ))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn hashtags_keep_exact_unicode_ranges_and_punctuation_boundaries() {
+        let description = "🎧 (#Музыка), #音楽! #live_music\n#Музыка word#embedded ##double #";
+        let links = parse_description_links(description);
+        let labels = links
+            .iter()
+            .map(|link| link.selected_text(description).unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(labels, ["#Музыка", "#音楽", "#live_music", "#Музыка"]);
+        assert!(
+            links
+                .windows(2)
+                .all(|pair| pair[0].end_byte <= pair[1].start_byte)
+        );
     }
 
     #[test]

@@ -240,6 +240,7 @@
 	{"OpenSoundCloudArtist":"https://soundcloud.com/artist"},
 	{"OpenSoundCloudArtistAlbums":"https://soundcloud.com/artist"},
 	{"SearchSoundCloudTag":"field recording"},
+	{"SearchYouTubeHashtag":"Music"},
 	{"OpenYandexMusicArtistById":"fixture-id"},
 	{"PlayQueueNeighbour":1},
 	{"PrefetchSubscriptionVideosThrough":1},

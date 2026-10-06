@@ -973,6 +973,43 @@
 			prefix: '', label, url: '', wikidata_item_id: null, presentation: 'LabelOnly',
 			internal_target: target, description_range: range(text, label),
 		});
+		// Hashtags share indexed inline navigation without parsing provider text
+		// again in JavaScript or taking over nearby timestamps and video links.
+		const hashtagText = '📍 #Minsk, (#Беларусь).\n1:23 Visit https://youtu.be/fixture1234\nNot links: C# https://example.test/#fragment <b>plain</b>';
+		const hashtagMedia = { source: 'you-tube', external_id: 'fixture1234' };
+		const hashtagDetails = { ...details('YouTube hashtag fixture', hashtagMedia), source: 'YouTube', description: hashtagText,
+			links: [
+				{ ...inlineLink('#Minsk', { YouTubeHashtag: 'Minsk' }, hashtagText), url: 'https://www.youtube.com/hashtag/Minsk' },
+				{ ...inlineLink('#Беларусь', { YouTubeHashtag: 'Беларусь' }, hashtagText), url: 'https://www.youtube.com/hashtag/%D0%91%D0%B5%D0%BB%D0%B0%D1%80%D1%83%D1%81%D1%8C' },
+			],
+			timecodes: [{ ...range(hashtagText, '1:23'), seconds: 83, is_chapter: true }],
+			video_links: [{ ...range(hashtagText, 'https://youtu.be/fixture1234'), video_id: 'fixture1234', start_seconds: null }],
+			search_highlights: [{ field: 'Description', ranges: [range(hashtagText, 'Беларусь')] }],
+		};
+		snapshot({ screen: 'Search', details: hashtagDetails, external_opener_available: false });
+		const hashtag = await until(() => button('#Беларусь'), 'Unicode YouTube hashtag');
+		const hashtagDescription = document.querySelector('[data-description]');
+		assert(hashtagDescription.textContent === hashtagText.replace('https://youtu.be/fixture1234', 'https://youtu.be/fixture1234↪'),
+			'Clickable hashtags preserve Unicode, punctuation, literal markup and description text');
+		assert(hashtag.querySelector('mark')?.textContent === 'Беларусь', 'Unicode hashtag retains search highlighting');
+		assert(hashtagDescription.querySelectorAll('[data-detail-link]').length === 2,
+			'Only controller-provided hashtag spans become inline links');
+		assert(!document.querySelector('[aria-label=Details] ul li'), 'YouTube hashtags do not duplicate in the fixed link rail');
+		assert(!hashtagDescription.querySelector('b'), 'Hashtags never turn description markup into HTML');
+		await action({ SelectDetailLink: 1 }, () => hashtag.focus(), 'Focusing a Unicode hashtag selects its global link index');
+		await action({ ActivateDetailLink: 1 }, () => hashtag.click(), 'YouTube hashtag search does not require an external opener');
+		const beforeHashtagEnter = calls.length;
+		const hashtagEnter = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true });
+		hashtag.dispatchEvent(hashtagEnter);
+		await until(() => calls.slice(beforeHashtagEnter).some((call) => call.command === 'key' && call.args.press.key === 'Enter'),
+			'focused hashtag shared Enter');
+		assert(hashtagEnter.defaultPrevented && !calls.slice(beforeHashtagEnter).some((call) => call.command === 'dispatch'),
+			'Focused hashtag Enter reaches the shared selection keymap without a duplicate browser click');
+		await action({ ActivateTimecode: { media_id: hashtagMedia, seconds: 83 } }, () => button('1:23', hashtagDescription).click(),
+			'Timestamp beside YouTube hashtags keeps its exact seek target');
+		await action({ ActivateDescriptionVideo: { video_id: 'fixture1234', start_seconds: null } },
+			() => hashtagDescription.querySelector('[title="Open this video in Youta"]').click(),
+			'Video link beside YouTube hashtags retains internal video navigation');
 		const linkedDetails = { ...details('Metadata navigation fixture'), description: metadataText,
 			links: [
 				{ prefix: 'Uploader: ', label: 'Uploader fixture', url: 'https://archive.org/details/@fixture',
@@ -983,8 +1020,8 @@
 			],
 			search_highlights: [{ field: 'Description', ranges: [range(metadataText, 'Zdanevich')] }],
 		};
-		snapshot({ details: linkedDetails, external_opener_available: false });
-		const creator = await until(() => document.querySelector('[data-detail-link="1"]'), 'inline creator link');
+		snapshot({ screen: 'ArchiveOrg', details: linkedDetails, external_opener_available: false });
+		const creator = await until(() => button('Vitaly Zdanevich', document.querySelector('[data-description]')), 'inline creator link');
 		assert(document.querySelector('[aria-label=Details]').textContent.includes(metadataText), 'Inline metadata keeps the original compact text');
 		assert(document.querySelectorAll('[aria-label=Details] ul li').length === 1, 'Inline Creator and Topics do not add fixed action rows');
 		assert(creator.querySelector('mark')?.textContent === 'Zdanevich', 'Inline links retain active search highlighting');

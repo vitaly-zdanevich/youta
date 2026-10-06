@@ -368,6 +368,11 @@ The default-on SponsorBlock preference independently skips crowdsourced
 unchanged, and the preference can be disabled without disabling exact
 `Реклама` chapter handling.
 
+YouTube description hashtags are clickable in both interfaces: choosing
+`#Minsk` searches YouTube for that hashtag inside Youta. In the terminal,
+`Alt+j` / `Alt+k` selects a Details link and `Alt+Enter` opens it; clicking the
+hashtag works too. Unicode hashtags keep their original spelling.
+
 Vertical YouTube videos use a distinct title color once the configured
 provider reports a portrait aspect ratio. The official adapter uses player
 dimensions already returned by its batched video request, while Invidious

@@ -95,6 +95,17 @@ const fixtures = ${JSON.stringify(fixtures)} satisfies readonly UiAction[];`);
 	}
 });
 
+test('YouTube description hashtags retain inline targets and a typed search action', () => {
+	const { diagnostics } = compile(`import type { DetailLinkView, UiAction } from '../src/contract';
+const link = {
+	prefix: '', label: '#Беларусь', url: 'https://www.youtube.com/hashtag/%D0%91%D0%B5%D0%BB%D0%B0%D1%80%D1%83%D1%81%D1%8C',
+	wikidata_item_id: null, presentation: 'LabelOnly', internal_target: { YouTubeHashtag: 'Беларусь' },
+	description_range: { start_byte: 0, end_byte: 15 },
+} satisfies DetailLinkView;
+const action = { SearchYouTubeHashtag: 'Беларусь' } satisfies UiAction;`);
+	expectNoDiagnostics(diagnostics);
+});
+
 test('UiAction rejects unknown names, incorrect payloads, null identities and multiple tags', () => {
 	const invalid = [
 		'\'SeekAbsoluteSeconds\'',
@@ -125,6 +136,7 @@ test('UiAction rejects unknown names, incorrect payloads, null identities and mu
 		'{ ActivateTimecode: { media_id: { source: \'you-tube\', external_id: \'id\' } } }',
 		'{ ActivateWaveformTimecode: { media_id: { source: \'local\', external_id: \'id\' }, seconds: 1 } }',
 		'{ ActivateDescriptionVideo: { video_id: \'id\', start_seconds: \'1\' } }',
+		'{ SearchYouTubeHashtag: 123 }',
 		'{ SelectDownloadChoice: { generation: 1, index: 0, invented: true } }',
 	];
 	const { diagnostics } = compile(`import { dispatch as send } from '../src/ipc';

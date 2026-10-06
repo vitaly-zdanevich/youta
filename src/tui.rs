@@ -26082,6 +26082,190 @@ for encoded, expected in json.load(sys.stdin):
         assert_eq!(highlighted, "ПРИВЕТ");
     }
 
+    /// Hashtag bytes keep the same hit target through Unicode wrapping and scrolling.
+    #[test]
+    fn youtube_hashtag_links_wrap_scroll_and_exclude_adjacent_punctuation() {
+        let tag = "#Музыка世界_café2026";
+        let description = format!(
+            "{}😀 intro {tag}, tail\n{}",
+            "before\n".repeat(20),
+            "after\n".repeat(20)
+        );
+        let start = description.find(tag).unwrap();
+        let view = ViewModel {
+            screen: Screen::Search,
+            external_opener_available: false,
+            details_scroll: 20,
+            selected_detail_link: Some(1),
+            details: Some(DetailView {
+                description,
+                links: vec![
+                    DetailLinkView {
+                        label: "Website".into(),
+                        url: "https://example.org/".into(),
+                        presentation: DetailLinkPresentation::LabelOnly,
+                        ..DetailLinkView::default()
+                    },
+                    DetailLinkView {
+                        label: tag.into(),
+                        url: "https://www.youtube.com/hashtag/fixture".into(),
+                        presentation: DetailLinkPresentation::LabelOnly,
+                        internal_target: Some(DetailLinkInternalTarget::YouTubeHashtag(
+                            tag.strip_prefix('#').unwrap().into(),
+                        )),
+                        description_range: Some(DetailHighlightRange {
+                            start_byte: start,
+                            end_byte: start + tag.len(),
+                        }),
+                        ..DetailLinkView::default()
+                    },
+                ],
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(18, 16)).unwrap();
+        let mut hits = HitMap::default();
+        terminal
+            .draw(|frame| {
+                render_details(
+                    frame,
+                    frame.area(),
+                    &view,
+                    true,
+                    0,
+                    &Theme::new(false),
+                    &mut hits,
+                    None,
+                )
+            })
+            .unwrap();
+        assert_eq!(hits.details_scroll_offset, 20);
+        let tag_hits = hits
+            .detail_links
+            .iter()
+            .filter(|(index, _)| *index == 1)
+            .collect::<Vec<_>>();
+        assert!(tag_hits.len() > 1, "the hashtag must wrap across rows");
+        assert_eq!(
+            tag_hits.iter().map(|(_, area)| area.width).sum::<u16>(),
+            terminal_text_width(tag)
+        );
+        let buffer = terminal.backend().buffer();
+        let mut rendered_tag = String::new();
+        for (_, area) in tag_hits {
+            for column in area.x..area.right() {
+                let cell = &buffer[(column, area.y)];
+                // Wide glyph continuation cells have no source text of their own.
+                if cell.symbol() != " " {
+                    rendered_tag.push_str(cell.symbol());
+                    assert!(cell.modifier.contains(Modifier::UNDERLINED));
+                }
+                assert_eq!(
+                    mouse_action(
+                        MouseEvent {
+                            kind: MouseEventKind::Down(MouseButton::Left),
+                            column,
+                            row: area.y,
+                            modifiers: KeyModifiers::NONE,
+                        },
+                        &hits,
+                        &view,
+                    ),
+                    Some(UiAction::ActivateDetailLink(1))
+                );
+            }
+        }
+        assert_eq!(rendered_tag, tag);
+        let punctuation = (0..buffer.area.height)
+            .flat_map(|row| (0..buffer.area.width).map(move |column| (column, row)))
+            .find(|position| buffer[*position].symbol() == ",")
+            .expect("punctuation after the wrapped hashtag remains visible");
+        assert!(!buffer[punctuation].modifier.contains(Modifier::UNDERLINED));
+        assert_ne!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: punctuation.0,
+                    row: punctuation.1,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hits,
+                &view,
+            ),
+            Some(UiAction::ActivateDetailLink(1))
+        );
+    }
+
+    /// Inline hashtags share ordinary Details keyboard navigation without a browser.
+    #[test]
+    fn youtube_hashtag_keyboard_selection_and_enter_work_without_external_opener() {
+        let view = ViewModel {
+            screen: Screen::Search,
+            external_opener_available: false,
+            details_focused: true,
+            selected_detail_link: Some(1),
+            details: Some(DetailView {
+                description: "#music".into(),
+                links: vec![
+                    DetailLinkView::default(),
+                    DetailLinkView {
+                        label: "#music".into(),
+                        url: "https://www.youtube.com/hashtag/music".into(),
+                        presentation: DetailLinkPresentation::LabelOnly,
+                        internal_target: Some(DetailLinkInternalTarget::YouTubeHashtag(
+                            "music".into(),
+                        )),
+                        description_range: Some(DetailHighlightRange {
+                            start_byte: 0,
+                            end_byte: 6,
+                        }),
+                        ..DetailLinkView::default()
+                    },
+                ],
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        for (key, modifiers, expected) in [
+            (
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+                UiAction::ActivateDetailLink(1),
+            ),
+            (
+                KeyCode::Enter,
+                KeyModifiers::ALT,
+                UiAction::ActivateDetailLink(1),
+            ),
+            (
+                KeyCode::Char('j'),
+                KeyModifiers::ALT,
+                UiAction::MoveDetailLink(1),
+            ),
+            (
+                KeyCode::Char('k'),
+                KeyModifiers::ALT,
+                UiAction::MoveDetailLink(-1),
+            ),
+            (
+                KeyCode::Home,
+                KeyModifiers::ALT,
+                UiAction::SelectDetailLink(0),
+            ),
+            (
+                KeyCode::End,
+                KeyModifiers::ALT,
+                UiAction::SelectDetailLink(1),
+            ),
+        ] {
+            assert_eq!(
+                key_action(KeyEvent::new(key, modifiers), &view),
+                Some(expected)
+            );
+        }
+    }
+
     #[test]
     fn archive_metadata_inline_links_keep_global_indices_without_extra_rows() {
         let description = "Creator: Бьорк\nTopics: Live music\nBody remains unchanged";

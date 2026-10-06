@@ -285,8 +285,6 @@ use crate::video_summary::{VideoSummaryCancellation, YouTubeCaptionExtractor};
 use crate::view::AsciiVisualizerView;
 #[cfg(feature = "audio-quality")]
 use crate::view::AudioQualityPopupView;
-use crate::view::DetailLinkInternalTarget;
-#[cfg(any(feature = "librivox", feature = "yandex-music"))]
 use crate::view::DetailLinkPresentation;
 use crate::view::DetailLinkView;
 #[cfg(any(feature = "yt-dlp", feature = "yandex-music"))]
@@ -325,6 +323,7 @@ use crate::view::{
     YANDEX_OAUTH_GUIDE_URL, YOUTUBE_API_KEY_GUIDE_URL, YouTubeSearchSort, YouTubeSetupField,
     YouTubeSetupPopupView,
 };
+use crate::view::{DetailHighlightRange, DetailLinkInternalTarget};
 #[cfg(feature = "wikidata")]
 use crate::view::{
     DetailWikidataEntityView, DetailWikidataValueLinkView, WIKIDATA_MEDIA_PLAY_SYMBOL,
@@ -9795,6 +9794,46 @@ impl AppController {
             "This build omits the `librivox` feature; rebuild with it enabled".to_owned();
     }
 
+    /// Searches a clicked hashtag through the configured `YouTube` metadata provider.
+    ///
+    /// Uses the normal video-search route and its filters, without requesting the
+    /// previous selection's metadata or interrupting current playback.
+    fn search_youtube_hashtag(&mut self, tag: &str) {
+        if tag.len() > 400 {
+            "Invalid YouTube hashtag".clone_into(&mut self.view.status_line);
+            return;
+        }
+        let query = format!("#{tag}");
+        if !matches!(parse_description_links(&query).as_slice(), [link]
+            if link.start_byte == 0 && link.end_byte == query.len()
+                && matches!(&link.target, LinkTarget::Hashtag { tag: parsed } if parsed == tag))
+        {
+            "Invalid YouTube hashtag".clone_into(&mut self.view.status_line);
+            return;
+        }
+        if !self.youtube_provider_available {
+            self.open_youtube_setup();
+            return;
+        }
+        self.prepare_screen_transition(Screen::Search);
+        self.view.screen = Screen::Search;
+        self.view.right_panel_mode = RightPanelMode::Details;
+        self.view.search_kind = SearchKind::Videos;
+        self.view.search_query = query;
+        self.view.search_cursor_byte = self.view.search_query.len();
+        self.view.details_focused = false;
+        self.view.details_scroll = 0;
+        self.view.selected_detail_link = None;
+        self.view.detail_link_reveal = None;
+        self.active_subscription_channel_id = None;
+        if self.pending_subscription_refresh.take().is_some() {
+            self.subscription_generation = self.subscription_generation.wrapping_add(1);
+        }
+        self.clear_subscription_loading_state();
+        self.clear_search_activity();
+        self.submit_youtube_search(1);
+    }
+
     fn submit_youtube_search(&mut self, page: u32) {
         if !self.youtube_provider_available {
             self.open_youtube_setup();
@@ -13935,11 +13974,22 @@ impl AppController {
                                 .as_ref()
                                 .map(|view| view.wikidata.clone())
                                 .unwrap_or_else(|| "not loaded".to_owned());
+                            let previous_link = self
+                                .view
+                                .selected_detail_link
+                                .and_then(|index| self.view.details.as_ref()?.links.get(index))
+                                .cloned();
                             let links = self
                                 .view
                                 .details
                                 .as_ref()
-                                .map(|view| view.links.clone())
+                                .map(|view| {
+                                    view.links
+                                        .iter()
+                                        .filter(|link| link.description_range.is_none())
+                                        .cloned()
+                                        .collect::<Vec<_>>()
+                                })
                                 .unwrap_or_default();
                             let mut detail = detail_from_video_with_thumbnail_size(
                                 &details,
@@ -13952,7 +14002,14 @@ impl AppController {
                             }
                             self.apply_cached_channel_webpage_to_detail(&mut detail);
                             detail.wikidata = wikidata;
-                            detail.links = links;
+                            detail.links.extend(links);
+                            self.view.selected_detail_link = previous_link.and_then(|previous| {
+                                detail.links.iter().position(|link| link == &previous)
+                            });
+                            self.view.detail_link_reveal = self
+                                .view
+                                .detail_link_reveal
+                                .and(self.view.selected_detail_link);
                             preserve_thumbnail_expansion(self.view.details.as_ref(), &mut detail);
                             self.view.details = Some(detail);
                             #[cfg(feature = "dearrow")]
@@ -28562,6 +28619,11 @@ impl AppController {
                         .collect()
                 };
                 let video_links = detail_video_links(&saved_description);
+                let hashtag_links = if entry.media.id.source == SourceKind::YouTube {
+                    youtube_hashtag_links(&saved_description)
+                } else {
+                    Vec::new()
+                };
                 let mut metadata = Vec::with_capacity(2);
                 if let Some(creator) = entry
                     .media
@@ -28577,14 +28639,18 @@ impl AppController {
                     description.push_str("\n\n");
                 }
                 description.push_str(&metadata.join("\n"));
-                let links = matches!(entry.media.webpage_url.scheme(), "http" | "https")
-                    .then(|| DetailLinkView {
-                        label: "Canonical media page".to_owned(),
-                        url: entry.media.webpage_url.to_string(),
-                        wikidata_item_id: None,
-                        ..DetailLinkView::default()
-                    })
+                let links = hashtag_links
                     .into_iter()
+                    .chain(
+                        matches!(entry.media.webpage_url.scheme(), "http" | "https").then(|| {
+                            DetailLinkView {
+                                label: "Canonical media page".to_owned(),
+                                url: entry.media.webpage_url.to_string(),
+                                wikidata_item_id: None,
+                                ..DetailLinkView::default()
+                            }
+                        }),
+                    )
                     .collect();
                 let local_video_path = (entry.media.id.source == SourceKind::Local
                     && entry.media.kind == MediaKind::Video)
@@ -30834,6 +30900,7 @@ impl AppController {
         self.view.selected_detail_link = Some(index);
         if let Some(target) = link.internal_target {
             match target {
+                DetailLinkInternalTarget::YouTubeHashtag(tag) => self.search_youtube_hashtag(&tag),
                 DetailLinkInternalTarget::SoundCloudArtist(url) => {
                     self.open_soundcloud_artist(url, false)
                 }
@@ -36103,6 +36170,7 @@ impl UiController for AppController {
             UiAction::OpenSoundCloudArtist(url) => self.open_soundcloud_artist(url, false),
             UiAction::OpenSoundCloudArtistAlbums(url) => self.open_soundcloud_artist(url, true),
             UiAction::SearchSoundCloudTag(tag) => self.search_soundcloud_tag(tag),
+            UiAction::SearchYouTubeHashtag(tag) => self.search_youtube_hashtag(&tag),
             UiAction::SetVideoCommentsScroll(offset) => {
                 if let Some(popup) = self.view.video_comments_popup.as_mut() {
                     popup.scroll_offset = offset;
@@ -42455,6 +42523,35 @@ fn detail_video_links(description: &str) -> Vec<DetailVideoLinkView> {
         .collect()
 }
 
+/// Projects bounded hashtag links onto their original description bytes.
+///
+/// Reuses the shared parser so punctuation, timestamps and URLs retain ownership
+/// of their text. Inline links do not add duplicate rows to the Details link rail.
+fn youtube_hashtag_links(description: &str) -> Vec<DetailLinkView> {
+    const MAX_DESCRIPTION_HASHTAGS: usize = 256;
+
+    parse_description_links(description)
+        .into_iter()
+        .filter_map(|link| {
+            let LinkTarget::Hashtag { ref tag } = link.target else {
+                return None;
+            };
+            Some(DetailLinkView {
+                label: description[link.start_byte..link.end_byte].to_owned(),
+                url: link.target.canonical_url()?.to_string(),
+                internal_target: Some(DetailLinkInternalTarget::YouTubeHashtag(tag.clone())),
+                description_range: Some(DetailHighlightRange {
+                    start_byte: link.start_byte,
+                    end_byte: link.end_byte,
+                }),
+                presentation: DetailLinkPresentation::LabelOnly,
+                ..DetailLinkView::default()
+            })
+        })
+        .take(MAX_DESCRIPTION_HASHTAGS)
+        .collect()
+}
+
 /// Converts line-leading description timecodes into bounded playback chapters.
 fn description_chapters(description: &str, duration_seconds: Option<u64>) -> Vec<Chapter> {
     const MAX_DESCRIPTION_CHAPTERS: usize = 512;
@@ -42506,6 +42603,7 @@ fn preliminary_detail_with_thumbnail_size(
                     .map_or_else(|| "unknown".to_owned(), format_seconds),
                 timecodes: detail_timecodes(&description),
                 video_links: detail_video_links(&description),
+                links: youtube_hashtag_links(&description),
                 description,
                 views: video
                     .view_count
@@ -43245,6 +43343,7 @@ fn detail_from_video_with_thumbnail_size(
             .map_or_else(|| "unknown".to_owned(), format_seconds),
         timecodes: detail_timecodes(&description),
         video_links: detail_video_links(&description),
+        links: youtube_hashtag_links(&description),
         description,
         likes: video
             .like_count
@@ -43268,7 +43367,6 @@ fn detail_from_video_with_thumbnail_size(
         thumbnail_url,
         expanded_thumbnail_url,
         thumbnail_dimensions,
-        links: Vec::new(),
         ..DetailView::default()
     }
 }
@@ -43310,6 +43408,11 @@ fn detail_from_media_item(
         description: description.clone(),
         timecodes: detail_timecodes(&description),
         video_links: detail_video_links(&description),
+        links: if media.id.source == SourceKind::YouTube {
+            youtube_hashtag_links(&description)
+        } else {
+            Vec::new()
+        },
         likes: media
             .statistics
             .likes
@@ -51197,7 +51300,7 @@ mod tests {
         let description = concat!(
             "Saved provider description\n",
             "00:01 Chapter\n",
-            "https://www.youtube.com/watch?v=9bZkp7q19f0"
+            "https://www.youtube.com/watch?v=9bZkp7q19f0\n#音楽"
         );
         controller
             .view
@@ -51212,7 +51315,7 @@ mod tests {
             .expect("todo lookup")
             .expect("todo playlist");
         todo.name = concat!(
-            "To Do 00:42 ",
+            "To Do #NotAProviderTag 00:42 ",
             "https://www.youtube.com/watch?v=M7lc1UVf-VE"
         )
         .to_owned();
@@ -51231,6 +51334,29 @@ mod tests {
         assert_eq!(details.timecodes[0].seconds, 1);
         assert_eq!(details.video_links.len(), 1);
         assert_eq!(details.video_links[0].video_id, "9bZkp7q19f0");
+        let hashtag = details
+            .links
+            .iter()
+            .find(|link| link.description_range.is_some())
+            .expect("saved inline hashtag");
+        assert_eq!(
+            hashtag.internal_target,
+            Some(DetailLinkInternalTarget::YouTubeHashtag("音楽".to_owned()))
+        );
+        let range = hashtag.description_range.unwrap();
+        assert_eq!(
+            &details.description[range.start_byte..range.end_byte],
+            "#音楽"
+        );
+        assert_eq!(
+            details
+                .links
+                .iter()
+                .filter(|link| link.description_range.is_some())
+                .count(),
+            1,
+            "playlist metadata is not parsed as provider description"
+        );
 
         controller.dispatch(UiAction::ActivateTimecode {
             media_id: MediaId::new(SourceKind::YouTube, "dQw4w9WgXcQ"),
@@ -52966,6 +53092,245 @@ mod tests {
             description: description.to_owned(),
             ..subscription_video_details(title)
         }
+    }
+
+    /// Search previews and complete metadata retain exact inline hashtag bytes.
+    #[test]
+    fn youtube_hashtags_are_clickable_in_preliminary_and_complete_descriptions() {
+        let video = linked_video_details(
+            "dQw4w9WgXcQ",
+            "Hashtag fixture",
+            "📚 #Music, (#Беларусь) #音楽\n00:10 Chapter\nhttps://youtu.be/9bZkp7q19f0",
+        );
+        let tree = SubscriptionTree::default();
+        for details in [
+            preliminary_detail(&SearchItem::Video(summary_from_details(&video)), &tree),
+            detail_from_video(&video, &tree),
+        ] {
+            assert_eq!(details.description, video.description);
+            assert_eq!(
+                details.links.len(),
+                3,
+                "hashtags must be projected as inline links"
+            );
+            for (link, tag) in details.links.iter().zip(["Music", "Беларусь", "音楽"]) {
+                let range = link.description_range.expect("inline hashtag range");
+                assert_eq!(
+                    &details.description[range.start_byte..range.end_byte],
+                    format!("#{tag}")
+                );
+                assert_eq!(link.label, format!("#{tag}"));
+                assert_eq!(
+                    serde_json::to_value(&link.internal_target).unwrap(),
+                    serde_json::json!({ "YouTubeHashtag": tag })
+                );
+                assert_eq!(
+                    link.url,
+                    LinkTarget::Hashtag {
+                        tag: tag.to_owned()
+                    }
+                    .canonical_url()
+                    .unwrap()
+                    .as_str()
+                );
+            }
+            assert_eq!(details.timecodes.len(), 1);
+            assert_eq!(details.video_links.len(), 1);
+        }
+    }
+
+    /// Lazy metadata replaces preview ranges without losing independent rail links.
+    #[test]
+    fn youtube_hashtags_refresh_with_full_metadata_and_keep_wikidata_links() {
+        let (_temporary, mut controller, _requests) = controller_with_youtube_video_comments();
+        let preview = linked_video_details("dQw4w9WgXcQ", "Fixture", "#Preview");
+        let mut detail = detail_from_video(&preview, &controller.subscription_tree);
+        let wikidata = DetailLinkView {
+            label: "Fixture entity".to_owned(),
+            url: "https://www.wikidata.org/wiki/Q42".to_owned(),
+            wikidata_item_id: Some("Q42".to_owned()),
+            ..DetailLinkView::default()
+        };
+        detail.links.push(wikidata.clone());
+        controller.view.details = Some(detail);
+        controller.view.selected_detail_link = Some(0);
+        controller.view.detail_link_reveal = Some(0);
+        let full = linked_video_details("dQw4w9WgXcQ", "Fixture", "Longer text: #Full #音楽");
+        controller.handle_provider_response(ProviderResponse::Details {
+            generation: controller.details_generation,
+            result: Ok(full.clone()),
+        });
+        let detail = controller.view.details.as_ref().unwrap();
+        assert_eq!(detail.description, full.description);
+        assert!(detail.links.contains(&wikidata));
+        let hashtags = detail
+            .links
+            .iter()
+            .filter(|link| link.description_range.is_some())
+            .collect::<Vec<_>>();
+        assert_eq!(hashtags.len(), 2);
+        for (link, tag) in hashtags.into_iter().zip(["#Full", "#音楽"]) {
+            let range = link.description_range.unwrap();
+            assert_eq!(&detail.description[range.start_byte..range.end_byte], tag);
+        }
+        assert_eq!(
+            controller.view.selected_detail_link, None,
+            "a replaced hashtag must not silently select another destination"
+        );
+        assert_eq!(controller.view.detail_link_reveal, None);
+
+        controller.view.selected_detail_link = Some(2);
+        controller.handle_provider_response(ProviderResponse::Details {
+            generation: controller.details_generation,
+            result: Ok(linked_video_details("dQw4w9WgXcQ", "Fixture", "#Changed")),
+        });
+        assert_eq!(
+            controller.view.selected_detail_link,
+            Some(1),
+            "unchanged rail selection follows its new index"
+        );
+        assert_eq!(controller.view.details.as_ref().unwrap().links[1], wikidata);
+    }
+
+    /// Hashtag navigation stays internal even on a console and replaces old requests.
+    #[test]
+    fn youtube_hashtag_activation_submits_exact_video_search_without_changing_playback() {
+        for screen in [
+            Screen::Search,
+            Screen::YouTubeMusic,
+            Screen::Playlists,
+            Screen::History,
+        ] {
+            let (_temporary, mut controller, requests) = controller_with_youtube_video_comments();
+            let video = linked_video_details("dQw4w9WgXcQ", "Fixture", "#音楽");
+            controller.youtube_provider_available = true;
+            controller.view.screen = screen;
+            controller.view.search_query = "previous query".to_owned();
+            controller.view.search_kind = SearchKind::Channels;
+            controller.view.youtube_search_sort = YouTubeSearchSort::Newest;
+            controller.view.youtube_creative_commons_only = true;
+            controller.view.search_activity = Some(SearchActivity::YouTube);
+            controller.view.details =
+                Some(detail_from_video(&video, &controller.subscription_tree));
+            controller.view.details_focused = true;
+            controller.view.details_scroll = 20;
+            controller.view.selected_detail_link = Some(0);
+            controller.view.detail_link_reveal = Some(0);
+            let playing = MediaId::new(SourceKind::YouTube, "9bZkp7q19f0");
+            controller.current_media = Some(playing.clone());
+            controller.view.playing_media_id = Some(playing.clone());
+            let stale_details_generation = controller.details_generation;
+            let stale_search_generation = controller.search_generation;
+            controller.dispatch(UiAction::SetExternalOpenerAvailable(false));
+
+            controller.dispatch(UiAction::ActivateDetailLink(0));
+
+            assert_eq!(controller.view.screen, Screen::Search);
+            assert_eq!(controller.view.search_query, "#音楽");
+            assert_eq!(controller.view.search_cursor_byte, "#音楽".len());
+            assert!(!controller.view.search_editing);
+            assert_eq!(controller.view.search_kind, SearchKind::Videos);
+            assert_eq!(controller.view.details_scroll, 0);
+            assert_eq!(controller.view.selected_detail_link, None);
+            assert!(controller.view.rows.is_empty());
+            assert!(controller.view.details.is_none());
+            assert_eq!(controller.current_media.as_ref(), Some(&playing));
+            assert_eq!(controller.view.playing_media_id.as_ref(), Some(&playing));
+            let ProviderRequest::Search {
+                generation,
+                request,
+            } = requests.try_recv().expect("hashtag search request")
+            else {
+                panic!("only the new hashtag search should be queued");
+            };
+            assert_eq!(generation, controller.search_generation);
+            assert_ne!(generation, stale_search_generation);
+            assert_eq!(request.query, "#音楽");
+            assert_eq!(request.page, 1);
+            assert_eq!(request.target, SearchTarget::Videos);
+            assert_eq!(request.sort, ProviderSearchSort::UploadDate);
+            assert!(
+                request
+                    .filters
+                    .features
+                    .contains(&SearchFeature::CreativeCommons)
+            );
+            assert!(
+                requests.try_recv().is_err(),
+                "do not prefetch the previous selection while routing"
+            );
+            assert_eq!(controller.url_open_pending, 0);
+
+            controller.handle_provider_response(ProviderResponse::Details {
+                generation: stale_details_generation,
+                result: Ok(video),
+            });
+            controller.handle_provider_response(ProviderResponse::Search {
+                generation: stale_search_generation,
+                request: SearchRequest::new("previous query", SearchTarget::Videos),
+                result: Err("stale failure".to_owned()),
+            });
+            assert!(controller.view.details.is_none());
+            assert!(controller.view.error_popup.is_none());
+            assert_eq!(
+                controller.view.search_activity,
+                Some(SearchActivity::YouTube)
+            );
+        }
+    }
+
+    /// Raw frontend actions cannot inject extra search terms or bypass provider setup.
+    #[test]
+    fn youtube_hashtag_search_validates_input_before_changing_routes() {
+        let (_temporary, mut controller, requests) = controller_with_youtube_video_comments();
+        controller.view.screen = Screen::History;
+        controller.view.search_query = "unchanged".to_owned();
+        for tag in [
+            "".to_owned(),
+            "#Music".to_owned(),
+            "two words".to_owned(),
+            "x\ny".to_owned(),
+            "a/b".to_owned(),
+            "x".repeat(101),
+            "界".repeat(401),
+        ] {
+            controller.dispatch(UiAction::SearchYouTubeHashtag(tag));
+            assert_eq!(controller.view.screen, Screen::History);
+            assert_eq!(controller.view.search_query, "unchanged");
+            assert_eq!(controller.view.status_line, "Invalid YouTube hashtag");
+            assert!(requests.try_recv().is_err());
+        }
+        controller.youtube_provider_available = false;
+        controller.dispatch(UiAction::SearchYouTubeHashtag("Music".to_owned()));
+        assert!(controller.view.youtube_setup_popup.is_some());
+        assert_eq!(controller.view.screen, Screen::History);
+        assert_eq!(controller.view.search_query, "unchanged");
+        assert!(requests.try_recv().is_err());
+    }
+
+    /// Saved YouTube details gain links without misrouting another source's tags.
+    #[test]
+    fn youtube_hashtags_in_saved_media_are_source_scoped_and_bounded() {
+        let video = linked_video_details("dQw4w9WgXcQ", "Saved fixture", "#Music");
+        let mut media = queue_item_from_video(&summary_from_details(&video), None).media;
+        let detail = detail_from_media_item(&media, YouTubeThumbnailSize::Standard);
+        assert_eq!(detail.links.len(), 1);
+        assert_eq!(detail.links[0].label, "#Music");
+        media.id.source = SourceKind::SoundCloud;
+        assert!(
+            detail_from_media_item(&media, YouTubeThumbnailSize::Standard)
+                .links
+                .is_empty()
+        );
+        let repeated = "#Music ".repeat(257);
+        let bounded = youtube_hashtag_links(&repeated);
+        assert_eq!(bounded.len(), 256);
+        assert!(
+            bounded
+                .windows(2)
+                .all(|pair| pair[0].description_range.unwrap().end_byte
+                    <= pair[1].description_range.unwrap().start_byte)
+        );
     }
 
     #[test]

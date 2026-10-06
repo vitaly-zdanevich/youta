@@ -255,6 +255,7 @@ export interface UiActionPayloads {
 	OpenSoundCloudArtist: string;
 	OpenSoundCloudArtistAlbums: string;
 	SearchSoundCloudTag: string;
+	SearchYouTubeHashtag: string;
 	OpenWikidataValue: string;
 	OpenYandexMusicAlbumById: string;
 	OpenYandexMusicArtistById: string;

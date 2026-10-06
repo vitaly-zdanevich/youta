@@ -1765,6 +1765,8 @@ pub struct DetailLinkView {
 /// Exact provider destination exposed by a Details link or inline metadata value.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub enum DetailLinkInternalTarget {
+    /// Search `YouTube` videos for a description hashtag without the leading hash.
+    YouTubeHashtag(String),
     /// Browse one canonical public SoundCloud artist's uploaded tracks.
     SoundCloudArtist(String),
     /// Browse one canonical public SoundCloud artist's albums and EPs.
@@ -1790,6 +1792,7 @@ impl DetailLinkInternalTarget {
     #[must_use]
     pub fn action(&self) -> UiAction {
         match self {
+            Self::YouTubeHashtag(tag) => UiAction::SearchYouTubeHashtag(tag.clone()),
             Self::SoundCloudArtist(url) => UiAction::OpenSoundCloudArtist(url.clone()),
             Self::SoundCloudArtistAlbums(url) => UiAction::OpenSoundCloudArtistAlbums(url.clone()),
             Self::SoundCloudTag(tag) => UiAction::SearchSoundCloudTag(tag.clone()),
@@ -3310,7 +3313,8 @@ impl ViewModel {
                     matches!(
                         link.internal_target,
                         Some(
-                            DetailLinkInternalTarget::ArchiveCreator(_)
+                            DetailLinkInternalTarget::YouTubeHashtag(_)
+                                | DetailLinkInternalTarget::ArchiveCreator(_)
                                 | DetailLinkInternalTarget::ArchiveTopic(_)
                                 | DetailLinkInternalTarget::ArchiveUploader(_)
                                 | DetailLinkInternalTarget::SoundCloudArtist(_)
@@ -4170,6 +4174,8 @@ pub enum UiAction {
     OpenSoundCloudArtistAlbums(String),
     /// Search one exact public SoundCloud tag, retaining its parent for Back.
     SearchSoundCloudTag(String),
+    /// Search `YouTube` videos for one validated hashtag without the leading hash.
+    SearchYouTubeHashtag(String),
     /// Set the exact wrapped-line offset in the public-comments popup.
     SetVideoCommentsScroll(usize),
     /// Close the public-comments popup without changing Details.
