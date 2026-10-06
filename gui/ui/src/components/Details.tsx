@@ -497,12 +497,12 @@ export function Details({ view, kind }: { view: ViewModel; kind: InformationPane
         {view.screen === "Downloaded" ? (
           <Action onClick={() => void dispatch("RequestDownloadedTrash")}>Move to Trash</Action>
         ) : null}
-        {details.local_renamable ? (
-          <Action onClick={() => void dispatch("BeginLocalRename")}>Rename</Action>
-        ) : null}
-        {details.local_movable ? (
-          <Action onClick={() => void dispatch("BeginLocalMove")}>Move…</Action>
-        ) : null}
+		{details.local_movable ? (
+			<Action onClick={() => void dispatch('BeginLocalMove')}>Move…</Action>
+		) : null}
+		{details.local_renamable ? (
+			<Action onClick={() => void dispatch('BeginLocalRename')}>Rename</Action>
+		) : null}
         {details.local_trashable ? (
           <Action onClick={() => void dispatch("RequestLocalTrash")}>Trash</Action>
         ) : null}

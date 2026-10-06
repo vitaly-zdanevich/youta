@@ -4660,7 +4660,7 @@ fn push_left_detail_button<'a>(
     }
 }
 
-/// Keeps preservation and navigation pairs adjacent in the single-column rail.
+/// Keeps preservation, navigation, and Local Move/Rename groups adjacent in the rail.
 fn right_detail_button_reserves_full_row(
     action: &UiAction,
     right_buttons: &[DetailButtonPlacement],
@@ -4673,6 +4673,14 @@ fn right_detail_button_reserves_full_row(
             .any(|button| button.action == UiAction::OpenInBrowser);
     match action {
         UiAction::OpenChannelInBrowser | UiAction::OpenInBrowser => has_navigation_pair,
+        UiAction::BeginLocalMove | UiAction::BeginLocalRename => {
+            right_buttons
+                .iter()
+                .any(|button| button.action == UiAction::BeginLocalMove)
+                && right_buttons
+                    .iter()
+                    .any(|button| button.action == UiAction::BeginLocalRename)
+        }
         #[cfg(feature = "commons-upload")]
         UiAction::OpenCommonsUpload => true,
         #[cfg(feature = "evernote")]
@@ -5033,6 +5041,20 @@ fn render_information_panel(
             UiAction::BeginLocalMove,
         );
     }
+    // Keep file mutations together in the right column, with Rename after Move.
+    if cfg!(feature = "local-rename")
+        && kind == InformationPanelKind::Local
+        && details.local_renamable
+    {
+        push_right_detail_button(
+            &mut lines,
+            &mut right_buttons,
+            inner.width,
+            button("r", "Rename", show_hotkeys),
+            theme.accent,
+            UiAction::BeginLocalRename,
+        );
+    }
     if cfg!(feature = "local-trash")
         && kind == InformationPanelKind::Local
         && details.local_trashable
@@ -5044,28 +5066,6 @@ fn render_information_panel(
             button("Delete", "Move to Trash", show_hotkeys),
             theme.accent,
             UiAction::RequestLocalTrash,
-        );
-    }
-    if kind == InformationPanelKind::Local {
-        push_right_detail_button(
-            &mut lines,
-            &mut right_buttons,
-            inner.width,
-            button(
-                "H",
-                if view.show_all_local_files {
-                    "Show all files"
-                } else {
-                    "Media files only"
-                },
-                show_hotkeys,
-            ),
-            if view.show_all_local_files {
-                theme.selected
-            } else {
-                theme.accent
-            },
-            UiAction::ToggleLocalAllFiles,
         );
     }
     let mut next_left_row = 0;
@@ -5257,21 +5257,29 @@ fn render_information_panel(
             UiAction::EditPrivateNote,
         )
     });
-    let rename_button = (cfg!(feature = "local-rename")
-        && kind == InformationPanelKind::Local
-        && details.local_renamable)
-        .then(|| {
-            let label = button("r", "Rename", show_hotkeys);
-            push_left_detail_button(
-                &mut lines,
-                &right_buttons,
-                &mut next_left_row,
-                inner.width,
-                label,
-                theme.accent,
-                UiAction::BeginLocalRename,
-            )
-        });
+    let local_visibility_button = (kind == InformationPanelKind::Local).then(|| {
+        push_left_detail_button(
+            &mut lines,
+            &right_buttons,
+            &mut next_left_row,
+            inner.width,
+            button(
+                "H",
+                if view.show_all_local_files {
+                    "Show all files"
+                } else {
+                    "Media files only"
+                },
+                show_hotkeys,
+            ),
+            if view.show_all_local_files {
+                theme.selected
+            } else {
+                theme.accent
+            },
+            UiAction::ToggleLocalAllFiles,
+        )
+    });
     #[cfg(feature = "lan-sharing")]
     let local_share_button = (kind == InformationPanelKind::Local).then(|| {
         push_left_detail_button(
@@ -5616,7 +5624,7 @@ fn render_information_panel(
     detail_buttons.extend(channel_download_button);
     detail_buttons.extend(auto_download_button);
     detail_buttons.extend(subscription_button);
-    detail_buttons.extend(rename_button);
+    detail_buttons.extend(local_visibility_button);
     // Preserve the compact layout's established left-actions-first hit-map
     // order. The side rail independently sorts by visual row and column.
     detail_buttons.extend(right_buttons);
@@ -27166,6 +27174,60 @@ for encoded, expected in json.load(sys.stdin):
         assert_eq!(exact_fit.height, 15);
     }
 
+    /// Artwork's single-column layout keeps the Local Move/Rename pair adjacent.
+    #[cfg(all(feature = "local-move", feature = "local-rename"))]
+    #[test]
+    fn local_details_artwork_rail_keeps_move_and_rename_together() {
+        let view = ViewModel {
+            screen: Screen::Local,
+            private_note_available: true,
+            details: Some(DetailView {
+                source: "Local audio".to_owned(),
+                local_renamable: true,
+                local_movable: true,
+                local_trashable: true,
+                thumbnail_url: Some(url::Url::parse("https://images.example/local.jpg").unwrap()),
+                thumbnail_dimensions: Some((640, 480)),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(180, 50)).unwrap();
+        let mut hit_map = HitMap::default();
+        let mut thumbnails = MockThumbnailRenderer {
+            enabled: true,
+            rendered_artwork: true,
+            prepared_artwork_size: Some(Size::new(120, 30)),
+            ..MockThumbnailRenderer::default()
+        };
+        terminal
+            .draw(|frame| {
+                render_details(
+                    frame,
+                    frame.area(),
+                    &view,
+                    true,
+                    30,
+                    &Theme::new(false),
+                    &mut hit_map,
+                    Some(&mut thumbnails),
+                )
+            })
+            .unwrap();
+        let target = |action| {
+            hit_map
+                .detail_buttons
+                .iter()
+                .find_map(|(candidate, area)| (candidate == &action).then_some(*area))
+                .unwrap()
+        };
+        let move_area = target(UiAction::BeginLocalMove);
+        let rename_area = target(UiAction::BeginLocalRename);
+        assert!(hit_map.thumbnail_area.unwrap().right() < move_area.x);
+        assert_eq!(rename_area.x, move_area.x);
+        assert_eq!(rename_area.y, move_area.y + 2);
+    }
+
     #[cfg(feature = "lan-sharing")]
     #[test]
     fn wide_subscription_channel_uses_the_shared_spaced_action_rail() {
@@ -39242,23 +39304,17 @@ prose 07:25 remains clickable but is not a chapter";
                     hit_map.details_panel.right(),
                     "Move must be right-aligned"
                 );
+                if let Some(rename_area) = rename_area {
+                    assert_eq!(rename_area.y, move_area.bottom());
+                    assert_eq!(rename_area.right(), move_area.right());
+                }
                 if let Some(trash_area) = trash_area {
-                    assert_eq!(trash_area.y, move_area.y.saturating_add(1));
+                    assert_eq!(trash_area.y, rename_area.unwrap_or(move_area).bottom());
                     assert_eq!(
                         trash_area.right(),
                         hit_map.details_panel.right(),
                         "Move to Trash must be right-aligned"
                     );
-                    if let Some(rename_area) = rename_area {
-                        assert_eq!(
-                            rename_area.y, move_area.y,
-                            "Rename should reuse the free space before Move"
-                        );
-                        assert!(
-                            rename_area.right().saturating_add(2) <= move_area.x,
-                            "paired Local controls must retain a two-cell gap"
-                        );
-                    }
                 }
                 let click = |column| MouseEvent {
                     kind: MouseEventKind::Down(MouseButton::Left),
@@ -39279,6 +39335,97 @@ prose 07:25 remains clickable but is not a chapter";
                     Some(UiAction::BeginLocalMove),
                     "the Move target must not extend beyond its rendered label"
                 );
+            }
+        }
+    }
+
+    /// Local action columns swap Rename and visibility without overlapping hit targets.
+    #[cfg(all(feature = "local-move", feature = "local-rename"))]
+    #[test]
+    fn local_details_keep_rename_after_move_and_visibility_on_the_left() {
+        for width in [24, 48, 80] {
+            for show_hotkeys in [false, true] {
+                for show_all_local_files in [false, true] {
+                    let mut terminal = Terminal::new(TestBackend::new(width, 40)).unwrap();
+                    let view = ViewModel {
+                        screen: Screen::Local,
+                        show_all_local_files,
+                        private_note_available: true,
+                        details: Some(DetailView {
+                            title: "track.flac".to_owned(),
+                            source: "Local audio".to_owned(),
+                            local_renamable: true,
+                            local_movable: true,
+                            local_trashable: true,
+                            ..DetailView::default()
+                        }),
+                        ..ViewModel::default()
+                    };
+                    let mut hit_map = HitMap::default();
+                    terminal
+                        .draw(|frame| {
+                            render_details(
+                                frame,
+                                frame.area(),
+                                &view,
+                                show_hotkeys,
+                                0,
+                                &Theme::new(false),
+                                &mut hit_map,
+                                None,
+                            )
+                        })
+                        .unwrap();
+                    let target = |action: UiAction| {
+                        let targets = hit_map
+                            .detail_buttons
+                            .iter()
+                            .filter(|(candidate, _)| candidate == &action)
+                            .map(|(_, area)| *area)
+                            .collect::<Vec<_>>();
+                        assert_eq!(targets.len(), 1, "exactly one target for {action:?}");
+                        targets[0]
+                    };
+                    let move_area = target(UiAction::BeginLocalMove);
+                    let rename_area = target(UiAction::BeginLocalRename);
+                    let visibility_area = target(UiAction::ToggleLocalAllFiles);
+                    assert_eq!(rename_area.right(), move_area.right());
+                    assert_eq!(rename_area.y, move_area.bottom());
+                    assert_eq!(visibility_area.x, hit_map.details_panel.x);
+                    for (index, (action, area)) in hit_map.detail_buttons.iter().enumerate() {
+                        for (_, other) in hit_map.detail_buttons.iter().skip(index + 1) {
+                            assert!(
+                                area.intersection(*other).is_empty(),
+                                "overlapping action {action:?}"
+                            );
+                        }
+                        for column in [area.x, area.right() - 1] {
+                            assert_eq!(
+                                mouse_action(
+                                    MouseEvent {
+                                        kind: MouseEventKind::Down(MouseButton::Left),
+                                        column,
+                                        row: area.y,
+                                        modifiers: KeyModifiers::NONE,
+                                    },
+                                    &hit_map,
+                                    &view
+                                ),
+                                Some(action.clone())
+                            );
+                        }
+                    }
+                    let label = button(
+                        "H",
+                        if show_all_local_files {
+                            "Show all files"
+                        } else {
+                            "Media files only"
+                        },
+                        show_hotkeys,
+                    );
+                    assert!(rendered_text(&terminal).contains(&label));
+                }
             }
         }
     }

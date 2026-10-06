@@ -518,6 +518,28 @@
 		}
 		snapshot(previous);
 	}
+	/** Local mutations keep Move then Rename while each capability remains independent. */
+	async function checkLocalActionOrder() {
+		const previous = clone(view);
+		for (const [movable, renamable] of [[true, true], [true, false], [false, true], [false, false]]) {
+			const title = `Local actions: move=${movable}, rename=${renamable}`;
+			snapshot({ screen: 'Local', details: { ...clone(defaults.DetailView),
+				title, source: 'Local', local_movable: movable, local_renamable: renamable,
+				local_trashable: true,
+			} });
+			await until(() => document.querySelector('[aria-label=Details] h2')?.textContent === title, title);
+			const panel = document.querySelector('[aria-label=Details]');
+			const move = button('Move…', panel);
+			const rename = button('Rename', panel);
+			assert(Boolean(move) === movable, `Move follows its capability: ${title}`);
+			assert(Boolean(rename) === renamable, `Rename follows its capability: ${title}`);
+			if (move && rename) assert(move.nextElementSibling === rename, 'Local Rename immediately follows Move');
+			if (move) await action('BeginLocalMove', () => move.click(), `Local Move dispatches its shared action: ${title}`);
+			if (rename) await action('BeginLocalRename', () => rename.click(), `Local Rename dispatches its shared action: ${title}`);
+			await action('RequestLocalTrash', () => button('Trash', panel).click(), `Local Trash remains independent: ${title}`);
+		}
+		snapshot(previous);
+	}
 	/** Focus snapshots and native checkbox/button keys must agree with the shared keymap. */
 	async function checkPreferencesFocus() {
 		const preferences = { ...clone(defaults.PreferencesPopupView), selected_field: 'SubscriptionsLayout',
@@ -609,6 +631,7 @@
 		await checkRadioPresentation();
 		await checkLocalFullPath();
 		await checkLocalTrackMetadata();
+		await checkLocalActionOrder();
 		await checkPreferencesFocus();
 		await checkUnsubscribeConfirmation();
 		await checkProviderSettings();
