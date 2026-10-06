@@ -51,11 +51,11 @@ use youta::view::{
     DetailHighlightRange, DetailHighlightView, DetailLinkView, DetailTimecodeView,
     DetailUrlEscapeView, DetailVideoLinkView, DetailView, DetailWikidataEntityView,
     DownloadChoicePopupView, DownloadView, ErrorPopupView, GitHubIssueSubmissionView,
-    LocalMoveDestinationView, NowPlayingView, PlaylistChoiceView, PlaylistPopupView,
-    PreferencesPopupView, ProjectCommitView, ProjectHistoryPopupView, QueuePopupView, QueueRowView,
-    RowView, SoundCloudDetailsView, SubscriptionsView, VideoCommentView, VideoCommentsPopupView,
-    VideoSummaryPopupView, ViewModel, WaveformView, YtDlpForbiddenView, YtDlpGentooVersionView,
-    YtDlpVersionLookupView,
+    LocalFileProgressView, LocalMoveDestinationView, NowPlayingView, PlaylistChoiceView,
+    PlaylistPopupView, PreferencesPopupView, ProjectCommitView, ProjectHistoryPopupView,
+    QueuePopupView, QueueRowView, RowView, SoundCloudDetailsView, SubscriptionsView,
+    VideoCommentView, VideoCommentsPopupView, VideoSummaryPopupView, ViewModel, WaveformView,
+    YtDlpForbiddenView, YtDlpGentooVersionView, YtDlpVersionLookupView,
 };
 use youta::view::{ChannelDownloadOption, ChannelDownloadPopupView};
 #[cfg(feature = "lan-sharing")]
@@ -606,6 +606,10 @@ fn the_typescript_contract_names_only_fields_the_reducer_emits() {
             path: String::new(),
         }),
     );
+    emitted.insert(
+        "LocalFileProgressView",
+        emitted_keys(&LocalFileProgressView::default()),
+    );
     emitted.insert("DownloadView", emitted_keys(&DownloadView::default()));
     emitted.insert(
         "ChannelDownloadPopupView",
@@ -915,6 +919,7 @@ fn every_checked_interface_is_actually_declared() {
         "DownloadQueuePopupView",
         "PlaylistChoiceView",
         "LocalMoveDestinationView",
+        "LocalFileProgressView",
         "DownloadView",
         "ChannelDownloadPopupView",
         "CommonsUploadPopupView",

@@ -810,6 +810,14 @@ fn yandex_music_feature_and_credentials_remain_optional_and_documented() {
 #[test]
 fn local_capability_umbrella_and_ratatui_features_remain_intentional() {
     let manifest = manifest();
+    let copy = feature_closure(&manifest, "local-copy");
+    assert!(copy.contains("local-browser"));
+    for unrelated in ["local-move", "local-rename", "tui", "controller"] {
+        assert!(
+            !copy.contains(unrelated),
+            "Copy unexpectedly requires {unrelated}"
+        );
+    }
     let local = feature_closure(&manifest, "local");
     for capability in [
         "local-browser",
@@ -817,6 +825,7 @@ fn local_capability_umbrella_and_ratatui_features_remain_intentional() {
         "local-rename",
         "local-trash",
         "local-move",
+        "local-copy",
         "local-artwork",
     ] {
         assert!(local.contains(capability), "`local` omits `{capability}`");

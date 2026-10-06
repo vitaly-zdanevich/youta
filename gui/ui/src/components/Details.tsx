@@ -497,6 +497,9 @@ export function Details({ view, kind }: { view: ViewModel; kind: InformationPane
         {view.screen === "Downloaded" ? (
           <Action onClick={() => void dispatch("RequestDownloadedTrash")}>Move to Trash</Action>
         ) : null}
+		{details.local_copyable ? (
+			<Action onClick={() => void dispatch('BeginLocalCopy')}>Copy</Action>
+		) : null}
 		{details.local_movable ? (
 			<Action onClick={() => void dispatch('BeginLocalMove')}>Move…</Action>
 		) : null}

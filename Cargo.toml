@@ -246,6 +246,7 @@ local = [
     "local-rename",
     "local-trash",
     "local-move",
+    "local-copy",
     "local-artwork",
     "local-video-thumbnails",
 ]
@@ -262,6 +263,8 @@ local-rename = ["local-browser", "dep:rustix"]
 local-trash = ["local-browser", "dep:trash"]
 # No-overwrite file and directory movement with durable identity remapping.
 local-move = ["local-browser", "dep:rustix"]
+# No-overwrite copies of local files and directory trees, retaining originals.
+local-copy = ["local-browser", "dep:rustix"]
 # Embedded and sidecar artwork discovery. Rendering additionally requires
 # `images`, so `local` remains usable in text-only builds.
 #

@@ -120,6 +120,14 @@ Trash, and Move actions change selected entries. A durable move journal lets
 startup finish or reconcile interrupted moves without guessing which copy is
 authoritative.
 
+Press `c`, or choose **Copy** in Local Details, to copy the selected file or
+folder without removing the source. `Shift+J` / `Shift+K` mark multiple entries
+for Copy or Move. In either destination picker, `Enter` opens a folder;
+`c` / `C` confirms Copy and `m` / `M` confirms Move. `Esc` cancels before the
+transfer starts. Copy and Move run in a foreground dialog: navigation and
+dismissal stay blocked until completion, with byte or entry progress when
+available. Copy support is the standalone `local-copy` feature.
+
 Selecting media shows filename metadata immediately while tags and bounded
 `ffprobe` codec/container details load off the TUI thread. A fixed-size RAM
 cache makes revisits fast. With terminal images enabled, selecting a finite
@@ -137,7 +145,7 @@ containing folder and reselects it. ZIP decoding is in-process; RAR requires
 `unrar`. Youta validates member paths and types, then streams regular files
 through per-member and total byte limits into a private regenerable cache
 beneath `~/.config/youta/cache/`. It never asks `unrar` to choose output paths.
-Rename, Move, and Trash are disabled inside archives. Unchanged archives reuse
+Copy, Rename, Move, and Trash are disabled inside archives. Unchanged archives reuse
 their extraction; replacing a source atomically replaces its single cache
 entry rather than retaining stale copies.
 

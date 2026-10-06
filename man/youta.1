@@ -434,6 +434,19 @@ or a second
 .B r
 Rename the selected Local entry when supported.
 .TP
+.B c
+Open Copy for selected Local files or folders when supported.
+The source is retained. Use
+.B j/k
+or
+.B Up/Down
+to select a destination folder and
+.B Enter
+to open it. Confirm copying into the displayed directory with
+.B c
+or
+.BR C .
+.TP
 .B m
 Open Move for selected Local entries when supported.
 In the destination picker,
@@ -443,11 +456,15 @@ or
 select a directory,
 .B Enter
 opens it, and
-.B m
+.B m/M
 confirms moving into the current directory.
+.B Esc
+cancels either destination picker before transfer starts.
+During Copy or Move, the foreground dialog blocks navigation and dismissal
+until completion and displays byte or entry progress when available.
 .TP
 .BR Shift+j ", " Shift+k
-Extend Local file/folder selection down or up for move or quality analysis,
+Extend Local file/folder selection down or up for copy, move, or quality analysis,
 when supported and reported distinctly by the terminal.
 .TP
 .B Delete

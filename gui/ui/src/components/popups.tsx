@@ -38,6 +38,7 @@ import type {
   ErrorPopupView,
   GitHubIssueSubmissionView,
   LocalFilePopupView,
+	LocalFileProgressView,
 	LanSharePopupView,
 	PodcastFeedOptionsPopupView,
   PlaylistPopupView,
@@ -208,6 +209,7 @@ export function HelpPopup({
           ? ([['Y', 'search YouTube captions and seek to a cue']] satisfies Array<[string, string]>)
           : []),
         ["Shift+J · Shift+K", "mark Local row and move down · up"],
+		['c / m (Local)', 'copy / move selected files or folders, when supported'],
 		...(lanShareSupported
 			? ([['F11 · F12', 'share Local selection · publish Local/YouTube podcast feed']] satisfies Array<[string, string]>)
 			: []),
@@ -2018,7 +2020,8 @@ export function QueuePopup({ popup }: { popup: QueuePopupView }) {
   );
 }
 
-export function LocalFilePopup({ popup }: { popup: LocalFilePopupView }) {
+/** Shared Local destination browser; foreground progress disables all mutation controls. */
+export function LocalFilePopup({ popup, progress }: { popup: LocalFilePopupView; progress: LocalFileProgressView | null }) {
   const dismiss = () => void dispatch("DismissLocalFilePopup");
 
   if ("Rename" in popup) {
@@ -2084,33 +2087,50 @@ export function LocalFilePopup({ popup }: { popup: LocalFilePopupView }) {
     );
   }
 
-  const { source_names, destination, directories, selected, pending, error } = popup.Move;
+	const copying = 'Copy' in popup;
+	const mode = copying ? 'Copy' : 'Move';
+	const { source_names, destination, directories, selected, pending, error } = copying ? popup.Copy : popup.Move;
+	const busy = progress !== null;
+	const fraction = progress && (progress.total_bytes !== null && progress.total_bytes > 0
+		? Math.min(1, progress.completed_bytes / progress.total_bytes)
+		: progress.total_entries > 0 ? Math.min(1, progress.completed_entries / progress.total_entries) : undefined);
   return (
     <Popup
-      title={`Move ${source_names.length} item${source_names.length === 1 ? "" : "s"}`}
+      title={`${mode} ${source_names.length} item${source_names.length === 1 ? '' : 's'}`}
       subtitle={destination}
-      layer={LAYER.localFile}
+      layer={busy ? LAYER.error + 1 : LAYER.localFile}
       width="620px"
       onDismiss={dismiss}
+		dismissDisabled={busy}
       footer={
         <>
-          <PopupButton emphasis onClick={() => void dispatch("ConfirmLocalMoveHere")}>
-            Move here
+          <PopupButton emphasis disabled={busy} onClick={() => void dispatch(copying ? 'ConfirmLocalCopyHere' : 'ConfirmLocalMoveHere')}>
+            {mode} here
           </PopupButton>
-          <PopupButton onClick={dismiss}>Cancel</PopupButton>
-          {pending ? <span>Listing…</span> : null}
+          <PopupButton disabled={busy} onClick={dismiss}>Cancel</PopupButton>
+          {busy ? <span>{copying ? 'Copying...' : 'Moving...'}</span> : pending ? <span>Listing…</span> : null}
         </>
       }
     >
-      <div className="grid h-full grid-rows-[auto_minmax(0,1fr)]">
+      <div className='flex h-full min-h-0 flex-col'>
         <p className="truncate px-[18px] pt-[9px] text-[11px] text-ink-faint">
           {source_names.join(", ")}
         </p>
+			{progress ? (
+				<div className='px-[18px] py-[9px] text-xs' role='status'>
+					<p>{progress.total_bytes === null && progress.completed_bytes === 0 && progress.completed_entries === 0
+						? 'Preparing...'
+						: `${progress.completed_bytes}${progress.total_bytes === null ? '' : ` / ${progress.total_bytes}`} bytes - ${progress.completed_entries} / ${progress.total_entries} entries`}</p>
+					<progress className='w-full' aria-label={`${mode} progress`} max={1} value={fraction ?? undefined} />
+					<p>Navigation is paused until the transfer finishes.</p>
+				</div>
+			) : null}
         <ul className="m-0 list-none overflow-y-auto p-0 py-[6px]">
           {directories.map((directory, index) => (
             <li key={directory.path}>
               <button
                 type="button"
+								disabled={busy}
                 aria-current={index === selected}
                 onClick={() => void dispatch({ SelectLocalMoveDestination: index })}
                 onDoubleClick={() => void dispatch("ActivateLocalMoveDestination")}

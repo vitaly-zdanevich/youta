@@ -267,6 +267,7 @@ export interface DetailView {
   expanded_thumbnail_url: string | null;
   thumbnail_expanded: boolean;
   local_renamable: boolean;
+	local_copyable: boolean;
   local_movable: boolean;
   local_trashable: boolean;
   local_fingerprint_available: boolean;
@@ -645,7 +646,7 @@ export interface PlaylistPopupView {
   validation_error: string | null;
 }
 
-/** One destination row in the Local Move browser. */
+/** One destination row in the Local Copy or Move browser. */
 export interface LocalMoveDestinationView {
   name: string;
   path: string;
@@ -656,6 +657,16 @@ export type LocalFilePopupView =
   | { Rename: { value: string; cursor_byte: number; error: string | null } }
   | { Trash: { name: string; path: string; error: string | null } }
   | { DownloadedTrash: { name: string; path: string; error: string | null } }
+	| {
+		Copy: {
+			source_names: string[];
+			destination: string;
+			directories: LocalMoveDestinationView[];
+			selected: number;
+			pending: boolean;
+			error: string | null;
+		};
+	}
   | {
       Move: {
         source_names: string[];
@@ -666,6 +677,14 @@ export type LocalFilePopupView =
         error: string | null;
       };
     };
+
+/** Its presence blocks navigation and dismissal until the foreground transfer resolves. */
+export interface LocalFileProgressView {
+	completed_bytes: number;
+	total_bytes: number | null;
+	completed_entries: number;
+	total_entries: number;
+}
 
 /** The selected playable item, when playlist actions apply to it. */
 export interface PlaylistItemView {
@@ -1010,6 +1029,7 @@ export interface ViewModel {
 	unsubscribe_popup: UnsubscribePopupView | null;
   queue_popup: QueuePopupView | null;
   local_file_popup: LocalFilePopupView | null;
+	local_file_progress: LocalFileProgressView | null;
   // Redacted projections expose editor controls without returning credentials.
 	youtube_provider_editor: YouTubeProviderEditorView | null;
   yandex_music_setup_open: boolean;

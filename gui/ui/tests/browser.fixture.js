@@ -540,6 +540,61 @@
 		}
 		snapshot(previous);
 	}
+	/** Copy uses its own capability and confirmation, while the destination browser is shared. */
+	async function checkLocalCopy() {
+		const previous = clone(view);
+		for (const copyable of [true, false]) {
+			const title = `Local copy capability: ${copyable}`;
+			snapshot({ screen: 'Local', details: { ...clone(defaults.DetailView), title, source: 'Local',
+				local_copyable: copyable, local_movable: true, local_renamable: true } });
+			await until(() => document.querySelector('[aria-label=Details] h2')?.textContent === title, title);
+			const panel = document.querySelector('[aria-label=Details]');
+			const copy = button('Copy', panel);
+			assert(Boolean(copy) === copyable, `Copy follows its own capability: ${copyable}`);
+			if (copy) {
+				assert(copy.nextElementSibling === button('Move…', panel), 'Copy precedes the adjacent Move and Rename actions');
+				await action('BeginLocalCopy', () => copy.click(), 'Copy opens the shared destination workflow');
+			}
+		}
+		const destination = { source_names: ['track.flac', 'Album'], destination: '/fixture/destination',
+			directories: [{ name: '..', path: '/fixture' }, { name: 'Target', path: '/fixture/destination/Target' }],
+			selected: 0, pending: false, error: 'Destination already contains track.flac' };
+		for (const mode of ['Copy', 'Move']) {
+			snapshot({ local_file_popup: { [mode]: destination }, local_file_progress: null });
+			await until(() => dialog()?.textContent.includes(`${mode} 2 items`), `${mode} destination picker`);
+			assert(dialog().textContent.includes(destination.error), `${mode} retains its recoverable error`);
+			const directory = [...dialog().querySelectorAll('button')].find((node) => node.textContent.includes('Target'));
+			await action({ SelectLocalMoveDestination: 1 }, () => directory.click(), `${mode} selects a shared destination row`);
+			await action('ActivateLocalMoveDestination', () => directory.dispatchEvent(new MouseEvent('dblclick', { bubbles: true })), `${mode} opens a shared destination row`);
+			await action(`ConfirmLocal${mode}Here`, () => button(`${mode} here`, dialog()).click(), `${mode} confirms only its own operation`);
+			for (const [totalBytes, totalEntries, completedBytes, completedEntries, label] of [
+				[null, 0, 0, 0, 'Preparing...'], [100, 2, 50, 1, '50 / 100 bytes'],
+				[null, 2, 0, 1, '1 / 2 entries'], [0, 2, 0, 1, '0 / 0 bytes'],
+				[null, 2, 50, 0, '50 bytes - 0 / 2 entries'],
+			]) {
+				const progress = { completed_bytes: completedBytes, total_bytes: totalBytes,
+					completed_entries: completedEntries, total_entries: totalEntries };
+				snapshot({ local_file_progress: progress });
+				await until(() => dialog()?.textContent.includes(label), `${mode} progress: ${label}`);
+				assert([...dialog().querySelectorAll('button')].every((node) => node.disabled), `${mode} blocks dismissal, confirmation and destination navigation during ${label}`);
+				if (totalEntries) assert(dialog().querySelector('progress')?.value === (totalBytes > 0 ? completedBytes / totalBytes : completedEntries / totalEntries), `${mode} shows bounded byte or entry progress for ${label}`);
+				const start = calls.length;
+				button(`${mode} here`, dialog()).click();
+				button('Cancel', dialog()).click();
+				for (const keyName of ['Escape', 'Enter', 'c', 'm', 'q']) {
+					const event = new KeyboardEvent('keydown', { key: keyName, bubbles: true, cancelable: true });
+					document.dispatchEvent(event);
+					assert(event.defaultPrevented, `${mode} blocks ${keyName} during ${label}`);
+				}
+				assert(calls.length === start, `${mode} progress cannot start or dismiss an operation`);
+			}
+			snapshot({ local_file_popup: { [mode]: { ...destination, pending: true } } });
+			await until(() => dialog()?.textContent.includes(mode === 'Copy' ? 'Copying...' : 'Moving...'), `${mode} foreground status`);
+			assert(!dialog().textContent.includes('Listing'), `${mode} progress does not claim it is listing destinations`);
+		}
+		snapshot({ ...previous, local_file_popup: null, local_file_progress: null });
+		await until(() => !dialog(), 'closed transfer fixture');
+	}
 	/** The browser forwards arrow modifiers; Rust alone decides navigation and seek distances. */
 	async function checkArrowShortcuts() {
 		for (const [name, shared] of [['ArrowLeft', 'Left'], ['ArrowRight', 'Right']]) {
@@ -663,6 +718,7 @@
 		await checkLocalFullPath();
 		await checkLocalTrackMetadata();
 		await checkLocalActionOrder();
+		await checkLocalCopy();
 		await checkArrowShortcuts();
 		await checkPreferencesFocus();
 		await checkUnsubscribeConfirmation();

@@ -21,9 +21,30 @@ use std::time::SystemTime;
 
 use crate::domain::{MediaId, SourceKind};
 
+#[cfg(feature = "local-copy")]
+mod copy;
+#[cfg(feature = "local-copy")]
+pub use copy::{
+    LocalCopyError, LocalCopyFailure, LocalCopyPlan, LocalCopyReport, copy_local_entries,
+    execute_local_copy, execute_local_copy_with_progress, validate_local_copy,
+};
+
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
 const HIDDEN_NAME_ATTEMPTS: usize = 128;
 static HIDDEN_NAME_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Worker progress for a Local move or copy, independent of frontend rendering.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LocalTransferProgress {
+    /// Bytes transferred into destination-side staging so far.
+    pub completed_bytes: u64,
+    /// Known copy size, or `None` for moves that may use atomic renames.
+    pub total_bytes: Option<u64>,
+    /// Top-level selected entries successfully published so far.
+    pub completed_entries: usize,
+    /// Number of selected top-level entries in this operation.
+    pub total_entries: usize,
+}
 
 /// Resource limits for one explicitly requested Local move.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -414,6 +435,21 @@ pub fn execute_local_move(plan: &LocalMovePlan) -> Result<LocalMoveReport, Local
     execute_with_renamer(plan, &SystemNoReplaceRenamer)
 }
 
+/// Executes a move while reporting publication and cross-device copy progress.
+///
+/// Byte totals are unknown because same-filesystem moves publish by rename.
+/// Callbacks run on the calling worker and must not block filesystem progress.
+///
+/// # Errors
+/// Returns the same validation, filesystem and recovery failures as
+/// [`execute_local_move`].
+pub fn execute_local_move_with_progress(
+    plan: &LocalMovePlan,
+    mut progress: impl FnMut(LocalTransferProgress),
+) -> Result<LocalMoveReport, LocalMoveError> {
+    execute_with_renamer_and_progress(plan, &SystemNoReplaceRenamer, &mut progress)
+}
+
 /// Validates and executes one Local move batch.
 ///
 /// This is the production convenience API for an asynchronous application
@@ -753,9 +789,22 @@ fn execute_with_renamer<R: NoReplaceRenamer>(
     plan: &LocalMovePlan,
     renamer: &R,
 ) -> Result<LocalMoveReport, LocalMoveError> {
+    execute_with_renamer_and_progress(plan, renamer, &mut |_| {})
+}
+
+fn execute_with_renamer_and_progress<R: NoReplaceRenamer>(
+    plan: &LocalMovePlan,
+    renamer: &R,
+    progress: &mut impl FnMut(LocalTransferProgress),
+) -> Result<LocalMoveReport, LocalMoveError> {
     revalidate_plan(plan)?;
 
     let mut report = LocalMoveReport::default();
+    let mut state = LocalTransferProgress {
+        total_entries: plan.entries.len(),
+        ..LocalTransferProgress::default()
+    };
+    progress(state);
     for entry in &plan.entries {
         if let Err(cause) = revalidate_entry_for_execution(entry) {
             return Err(LocalMoveFailure {
@@ -772,7 +821,10 @@ fn execute_with_renamer<R: NoReplaceRenamer>(
         match renamer.rename_no_replace(&entry.mapping.source, &entry.mapping.target) {
             Ok(()) => report.completed.push(entry.mapping.clone()),
             Err(error) if error.kind() == io::ErrorKind::CrossesDevices => {
-                match copy_publish_and_remove(entry, plan.limits, renamer) {
+                match copy_publish_and_remove(entry, plan.limits, renamer, &mut |bytes| {
+                    state.completed_bytes = state.completed_bytes.saturating_add(bytes);
+                    progress(state);
+                }) {
                     Ok(recovery) => {
                         report.completed.push(entry.mapping.clone());
                         report.recovery.extend(recovery);
@@ -802,6 +854,8 @@ fn execute_with_renamer<R: NoReplaceRenamer>(
                 .into());
             }
         }
+        state.completed_entries = report.completed.len();
+        progress(state);
     }
     Ok(report)
 }
@@ -944,6 +998,7 @@ fn copy_publish_and_remove<R: NoReplaceRenamer>(
     entry: &PlannedEntry,
     limits: LocalMoveLimits,
     renamer: &R,
+    progress: &mut impl FnMut(u64),
 ) -> Result<Vec<LocalMoveRecovery>, (io::Error, LocalMoveRecovery)> {
     let manifest = snapshot_tree(&entry.mapping.source, limits).map_err(|cause| {
         (
@@ -970,7 +1025,7 @@ fn copy_publish_and_remove<R: NoReplaceRenamer>(
         )
     })?;
 
-    if let Err(cause) = populate_staging(&entry.mapping.source, &staging, &manifest)
+    if let Err(cause) = populate_staging(&entry.mapping.source, &staging, &manifest, progress)
         .and_then(|()| verify_source_manifest(&entry.mapping.source, &manifest, limits))
         .and_then(|()| verify_staged_copy(&entry.mapping.source, &staging, &manifest, limits))
     {
@@ -1170,7 +1225,12 @@ fn hidden_path(parent: &Path, role: &str) -> PathBuf {
     ))
 }
 
-fn populate_staging(source: &Path, staging: &Path, manifest: &[TreeNode]) -> io::Result<()> {
+fn populate_staging(
+    source: &Path,
+    staging: &Path,
+    manifest: &[TreeNode],
+    progress: &mut impl FnMut(u64),
+) -> io::Result<()> {
     for (index, node) in manifest.iter().enumerate() {
         let source_path = join_relative(source, &node.relative);
         let staging_path = join_relative(staging, &node.relative);
@@ -1182,9 +1242,9 @@ fn populate_staging(source: &Path, staging: &Path, manifest: &[TreeNode]) -> io:
             }
             NodeKind::File => {
                 if index == 0 {
-                    copy_file_into_existing(&source_path, &staging_path, &node.identity)?;
+                    copy_file_into_existing(&source_path, &staging_path, &node.identity, progress)?;
                 } else {
-                    copy_file_new(&source_path, &staging_path, &node.identity)?;
+                    copy_file_new(&source_path, &staging_path, &node.identity, progress)?;
                 }
             }
         }
@@ -1199,24 +1259,35 @@ fn populate_staging(source: &Path, staging: &Path, manifest: &[TreeNode]) -> io:
     Ok(())
 }
 
-fn copy_file_new(source: &Path, target: &Path, identity: &FilesystemIdentity) -> io::Result<()> {
+fn copy_file_new(
+    source: &Path,
+    target: &Path,
+    identity: &FilesystemIdentity,
+    progress: &mut impl FnMut(u64),
+) -> io::Result<()> {
     let output = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(target)?;
-    copy_file(source, output, identity)
+    copy_file(source, output, identity, progress)
 }
 
 fn copy_file_into_existing(
     source: &Path,
     target: &Path,
     identity: &FilesystemIdentity,
+    progress: &mut impl FnMut(u64),
 ) -> io::Result<()> {
     let output = OpenOptions::new().write(true).open(target)?;
-    copy_file(source, output, identity)
+    copy_file(source, output, identity, progress)
 }
 
-fn copy_file(source: &Path, output: File, identity: &FilesystemIdentity) -> io::Result<()> {
+fn copy_file(
+    source: &Path,
+    output: File,
+    identity: &FilesystemIdentity,
+    progress: &mut impl FnMut(u64),
+) -> io::Result<()> {
     let input = File::open(source)?;
     if FilesystemIdentity::from_metadata(&input.metadata()?) != *identity {
         return Err(io::Error::new(
@@ -1224,11 +1295,30 @@ fn copy_file(source: &Path, output: File, identity: &FilesystemIdentity) -> io::
             format!("source changed while copying `{}`", source.display()),
         ));
     }
-    let mut input = BufReader::with_capacity(COPY_BUFFER_BYTES, input);
+    let mut input = MoveProgressReader {
+        input: BufReader::with_capacity(COPY_BUFFER_BYTES, input),
+        progress,
+    };
     let mut output = BufWriter::with_capacity(COPY_BUFFER_BYTES, output);
     io::copy(&mut input, &mut output)?;
     output.flush()?;
     output.get_ref().sync_all()
+}
+
+/// Observes bounded copy reads without changing Move's existing I/O semantics.
+struct MoveProgressReader<'a, F> {
+    input: BufReader<File>,
+    progress: &'a mut F,
+}
+
+impl<F: FnMut(u64)> Read for MoveProgressReader<'_, F> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let read = self.input.read(buffer)?;
+        if read > 0 {
+            (self.progress)(read as u64);
+        }
+        Ok(read)
+    }
 }
 
 fn verify_source_manifest(
@@ -1525,6 +1615,43 @@ mod tests {
         fs::create_dir(&source).expect("source folder");
         fs::create_dir(&destination).expect("destination folder");
         (fixture, source, destination)
+    }
+
+    /// Both atomic renames and staged cross-device moves report entry completion.
+    #[test]
+    fn move_progress_reports_entries_and_cross_device_bytes() {
+        for cross_device in [false, true] {
+            let (_fixture, source, destination) = directories();
+            let track = source.join("track.opus");
+            let bytes = vec![b'x'; COPY_BUFFER_BYTES * 2 + 3];
+            fs::write(&track, &bytes).unwrap();
+            let plan = validate_local_move(
+                &source,
+                &[track.clone()],
+                &destination,
+                LocalMoveLimits::default(),
+            )
+            .unwrap();
+            let renamer = if cross_device {
+                ForceCrossDeviceRenamer::cross_device_once()
+            } else {
+                ForceCrossDeviceRenamer::default()
+            };
+            let mut progress = Vec::new();
+            execute_with_renamer_and_progress(&plan, &renamer, &mut |state| progress.push(state))
+                .unwrap();
+            assert_eq!(progress[0].completed_entries, 0);
+            assert!(progress.iter().all(|state| state.total_bytes.is_none()));
+            let final_state = progress.last().unwrap();
+            assert_eq!(final_state.completed_entries, 1);
+            assert_eq!(final_state.total_entries, 1);
+            assert_eq!(
+                final_state.completed_bytes,
+                if cross_device { bytes.len() as u64 } else { 0 }
+            );
+            assert!(!track.exists());
+            assert_eq!(fs::read(destination.join("track.opus")).unwrap(), bytes);
+        }
     }
 
     #[test]

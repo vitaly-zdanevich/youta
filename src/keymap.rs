@@ -149,6 +149,132 @@ mod wire_tests {
     #[cfg(feature = "evernote")]
     use crate::view::{EvernoteNoteField, EvernoteNotePhase, EvernoteNotePopupView};
 
+    /// Copy is an unmodified Local shortcut and shares existing batch marks.
+    #[test]
+    fn local_copy_shortcut_is_feature_screen_and_modifier_scoped() {
+        for screen in [crate::view::Screen::Local, crate::view::Screen::Search] {
+            let view = ViewModel {
+                screen,
+                ..ViewModel::default()
+            };
+            for ctrl in [false, true] {
+                for alt in [false, true] {
+                    for shift in [false, true] {
+                        let press = KeyPress {
+                            key: Key::Char('c'),
+                            ctrl,
+                            alt,
+                            shift,
+                        };
+                        assert_eq!(
+                            key_action(press, &view, None, None) == Some(UiAction::BeginLocalCopy),
+                            cfg!(feature = "local-copy")
+                                && screen == crate::view::Screen::Local
+                                && !ctrl
+                                && !alt
+                                && !shift,
+                        );
+                    }
+                }
+            }
+            if cfg!(any(
+                feature = "local-copy",
+                feature = "local-move",
+                feature = "audio-quality"
+            )) {
+                assert_eq!(
+                    key_action(
+                        KeyPress {
+                            shift: true,
+                            ..KeyPress::new(Key::Char('J'))
+                        },
+                        &view,
+                        None,
+                        None
+                    ) == Some(UiAction::ExtendLocalMoveSelection(1)),
+                    screen == crate::view::Screen::Local,
+                );
+            }
+        }
+    }
+
+    /// Destination browsing is shared, but a mode's confirmation cannot start the other operation.
+    #[test]
+    fn local_copy_and_move_popups_keep_confirmation_keys_separate() {
+        use crate::view::LocalFilePopupView;
+        for copy in [false, true] {
+            let popup = if copy {
+                LocalFilePopupView::Copy {
+                    source_names: vec![],
+                    destination: String::new(),
+                    directories: vec![],
+                    selected: 0,
+                    pending: false,
+                    error: None,
+                }
+            } else {
+                LocalFilePopupView::Move {
+                    source_names: vec![],
+                    destination: String::new(),
+                    directories: vec![],
+                    selected: 0,
+                    pending: false,
+                    error: None,
+                }
+            };
+            let mut view = ViewModel {
+                local_file_popup: Some(popup),
+                ..ViewModel::default()
+            };
+            for (key, expected) in [
+                (Key::Enter, UiAction::ActivateLocalMoveDestination),
+                (Key::Down, UiAction::MoveLocalMoveDestination(1)),
+                (Key::Up, UiAction::MoveLocalMoveDestination(-1)),
+                (Key::Esc, UiAction::DismissLocalFilePopup),
+            ] {
+                assert_eq!(
+                    key_action(KeyPress::new(key), &view, None, None),
+                    Some(expected)
+                );
+            }
+            for (character, is_copy) in [('c', true), ('C', true), ('m', false), ('M', false)] {
+                let press = KeyPress::new(Key::Char(character));
+                let expected = (copy == is_copy).then_some(if copy {
+                    UiAction::ConfirmLocalCopyHere
+                } else {
+                    UiAction::ConfirmLocalMoveHere
+                });
+                assert_eq!(key_action(press, &view, None, None), expected);
+                assert_eq!(
+                    key_action(
+                        KeyPress {
+                            ctrl: true,
+                            ..press
+                        },
+                        &view,
+                        None,
+                        None
+                    ),
+                    None
+                );
+                assert_eq!(
+                    key_action(KeyPress { alt: true, ..press }, &view, None, None),
+                    None
+                );
+            }
+            view.local_file_progress = Some(crate::view::LocalFileProgressView::default());
+            for key in [
+                Key::Esc,
+                Key::Enter,
+                Key::Char('c'),
+                Key::Char('m'),
+                Key::Char('q'),
+            ] {
+                assert_eq!(key_action(KeyPress::new(key), &view, None, None), None);
+            }
+        }
+    }
+
     /// Ctrl accelerates arrow seeking while Alt retains navigation precedence.
     #[test]
     fn ctrl_arrow_seek_preserves_plain_arrows_and_alt_history() {
@@ -1464,6 +1590,9 @@ pub fn key_action(
     page_rows: Option<usize>,
     popups: Option<PopupGeometry>,
 ) -> Option<UiAction> {
+    if view.local_file_progress.is_some() {
+        return None;
+    }
     if view.error_popup.is_none()
         && let Some(popup) = view.unsubscribe_popup.as_ref()
     {
@@ -2317,18 +2446,23 @@ fn unfiltered_key_action(
             (LocalFilePopupView::DownloadedTrash { .. }, Key::Enter) => {
                 Some(UiAction::ConfirmDownloadedTrash)
             }
-            (LocalFilePopupView::Move { .. }, Key::Enter) => {
+            (LocalFilePopupView::Move { .. } | LocalFilePopupView::Copy { .. }, Key::Enter) => {
                 Some(UiAction::ActivateLocalMoveDestination)
             }
-            (LocalFilePopupView::Move { .. }, Key::Char('m' | 'M')) => {
+            (LocalFilePopupView::Copy { .. }, Key::Char('c' | 'C')) if !key.chorded() => {
+                Some(UiAction::ConfirmLocalCopyHere)
+            }
+            (LocalFilePopupView::Move { .. }, Key::Char('m' | 'M')) if !key.chorded() => {
                 Some(UiAction::ConfirmLocalMoveHere)
             }
-            (LocalFilePopupView::Move { .. }, Key::Up | Key::Char('k')) => {
-                Some(UiAction::MoveLocalMoveDestination(-1))
-            }
-            (LocalFilePopupView::Move { .. }, Key::Down | Key::Char('j')) => {
-                Some(UiAction::MoveLocalMoveDestination(1))
-            }
+            (
+                LocalFilePopupView::Move { .. } | LocalFilePopupView::Copy { .. },
+                Key::Up | Key::Char('k'),
+            ) => Some(UiAction::MoveLocalMoveDestination(-1)),
+            (
+                LocalFilePopupView::Move { .. } | LocalFilePopupView::Copy { .. },
+                Key::Down | Key::Char('j'),
+            ) => Some(UiAction::MoveLocalMoveDestination(1)),
             _ => None,
         };
     }
@@ -2705,19 +2839,39 @@ fn unfiltered_key_action(
         Key::Char('m') if view.screen == Screen::Local && !key.modified() => {
             Some(UiAction::BeginLocalMove)
         }
-        #[cfg(any(feature = "local-move", feature = "audio-quality"))]
+        #[cfg(feature = "local-copy")]
+        Key::Char('c') if view.screen == Screen::Local && !key.modified() => {
+            Some(UiAction::BeginLocalCopy)
+        }
+        #[cfg(any(
+            feature = "local-copy",
+            feature = "local-move",
+            feature = "audio-quality"
+        ))]
         Key::Char('J') if view.screen == Screen::Local && key.shift => {
             Some(UiAction::ExtendLocalMoveSelection(1))
         }
-        #[cfg(any(feature = "local-move", feature = "audio-quality"))]
+        #[cfg(any(
+            feature = "local-copy",
+            feature = "local-move",
+            feature = "audio-quality"
+        ))]
         Key::Char('K') if view.screen == Screen::Local && key.shift => {
             Some(UiAction::ExtendLocalMoveSelection(-1))
         }
-        #[cfg(any(feature = "local-move", feature = "audio-quality"))]
+        #[cfg(any(
+            feature = "local-copy",
+            feature = "local-move",
+            feature = "audio-quality"
+        ))]
         Key::Char('j') if view.screen == Screen::Local && key.shift => {
             Some(UiAction::ExtendLocalMoveSelection(1))
         }
-        #[cfg(any(feature = "local-move", feature = "audio-quality"))]
+        #[cfg(any(
+            feature = "local-copy",
+            feature = "local-move",
+            feature = "audio-quality"
+        ))]
         Key::Char('k') if view.screen == Screen::Local && key.shift => {
             Some(UiAction::ExtendLocalMoveSelection(-1))
         }

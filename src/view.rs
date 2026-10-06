@@ -609,7 +609,7 @@ pub struct RowView {
     pub compact: bool,
     /// Whether a Radio station is pinned by the persistent favorites action.
     pub radio_favorite: bool,
-    /// Whether this Local row belongs to the current explicit move batch.
+    /// Whether this Local row belongs to the shared Copy/Move or quality-analysis batch.
     pub local_marked: bool,
     /// Whether this playable row is selected for the next download batch.
     pub download_marked: bool,
@@ -952,6 +952,8 @@ pub struct DetailView {
     pub thumbnail_expanded: bool,
     /// Whether the selected local entry can be renamed in place.
     pub local_renamable: bool,
+    /// Whether the selected local file or folder can enter the copy workflow.
+    pub local_copyable: bool,
     /// Whether the selected local file or folder can enter the move workflow.
     pub local_movable: bool,
     /// Whether the selected local entry can be moved to recoverable Trash.
@@ -1600,7 +1602,22 @@ pub enum LocalFilePopupView {
         /// Filesystem failure retained in the popup.
         error: Option<String>,
     },
-    /// Destination browser for one or more explicitly selected Local entries.
+    /// Copy destination browser for one or more explicitly selected Local entries.
+    Copy {
+        /// Lossy display names of the source entries, bounded by the controller.
+        source_names: Vec<String>,
+        /// Canonical directory that would receive copies of the selected sources.
+        destination: String,
+        /// Parent and real child directories available for navigation.
+        directories: Vec<LocalMoveDestinationView>,
+        /// Selected destination-browser row.
+        selected: usize,
+        /// Whether a background directory listing is in flight.
+        pending: bool,
+        /// Validation or filesystem failure retained in the popup.
+        error: Option<String>,
+    },
+    /// Move destination browser for one or more explicitly selected Local entries.
     Move {
         /// Lossy display names of the source entries, bounded by the controller.
         source_names: Vec<String>,
@@ -1617,13 +1634,26 @@ pub enum LocalFilePopupView {
     },
 }
 
-/// One exact destination-browser row inside the Local Move popup.
+/// One exact destination-browser row inside the Local Copy or Move popup.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct LocalMoveDestinationView {
     /// Human-readable basename, or `..` for the canonical parent.
     pub name: String,
     /// Canonical directory selected when this row is activated.
     pub path: String,
+}
+
+/// Foreground Local transfer progress; its presence blocks navigation and dismissal.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct LocalFileProgressView {
+    /// Bytes successfully transferred so far.
+    pub completed_bytes: u64,
+    /// Total bytes when measured, including zero for an empty batch.
+    pub total_bytes: Option<u64>,
+    /// Source entries completely transferred so far.
+    pub completed_entries: usize,
+    /// Total source entries when known; zero while preparing an unmeasured batch.
+    pub total_entries: usize,
 }
 
 /// One selectable timecode span inside the original Details description.
@@ -3245,8 +3275,10 @@ pub struct ViewModel {
     pub private_note_available: bool,
     /// Selection-sensitive actions for the Yandex Music tab.
     pub yandex_music_actions: YandexMusicActionsView,
-    /// Explicit rename, move, or recoverable Trash confirmation for a local file.
+    /// Explicit rename, copy, move, or recoverable Trash confirmation for a local file.
     pub local_file_popup: Option<LocalFilePopupView>,
+    /// Blocking foreground Copy/Move progress, absent while choosing a destination.
+    pub local_file_progress: Option<LocalFileProgressView>,
     /// Whether this build can supervise a full-channel `yt-dlp` download.
     pub channel_download_supported: bool,
     /// Review-first confirmation for downloading every public channel upload.
@@ -3543,6 +3575,7 @@ impl Default for ViewModel {
             private_note_available: false,
             yandex_music_actions: YandexMusicActionsView::default(),
             local_file_popup: None,
+            local_file_progress: None,
             channel_download_supported: cfg!(feature = "yt-dlp"),
             #[cfg(feature = "yt-dlp")]
             channel_download_popup: None,
@@ -4396,18 +4429,22 @@ pub enum UiAction {
     RequestDownloadedTrash,
     /// Move the selected download to recoverable system Trash.
     ConfirmDownloadedTrash,
-    /// Open the destination chooser for marked entries or the current row.
+    /// Open the copy destination chooser for marked entries or the current row.
+    BeginLocalCopy,
+    /// Open the move destination chooser for marked entries or the current row.
     BeginLocalMove,
     /// Toggle one Local batch mark and move the selection by one signed row.
     ExtendLocalMoveSelection(i32),
-    /// Select one exact row inside the Local Move destination browser.
+    /// Select one exact row inside the Local Copy or Move destination browser.
     SelectLocalMoveDestination(usize),
     /// Move destination-browser selection by a signed row count.
     MoveLocalMoveDestination(i32),
-    /// Open the selected parent or child directory in the Move popup.
+    /// Open the selected parent or child directory in the Copy or Move popup.
     ActivateLocalMoveDestination,
     /// Move the validated source batch into the displayed destination.
     ConfirmLocalMoveHere,
+    /// Copy the validated source batch into the displayed destination.
+    ConfirmLocalCopyHere,
     /// Close the local-entry popup without changing the filesystem.
     DismissLocalFilePopup,
     /// Select an exact subscription source row.

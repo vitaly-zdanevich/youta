@@ -512,6 +512,7 @@ pub fn enabled_compile_features() -> Vec<&'static str> {
         "local-archives",
         "local-artwork",
         "local-browser",
+        "local-copy",
         "local-metadata",
         "local-move",
         "local-rename",

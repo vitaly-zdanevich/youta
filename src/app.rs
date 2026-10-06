@@ -23,6 +23,8 @@ mod cached_download;
 mod download_choice;
 mod end_pause;
 mod invidious_instances;
+#[cfg(feature = "local-copy")]
+mod local_copy;
 mod local_path_display;
 mod manual_downloads;
 mod now_playing;
@@ -137,11 +139,10 @@ use crate::links::{
 };
 #[cfg(any(feature = "local-rename", feature = "local-move"))]
 use crate::local_move::LocalMoveMapping;
+#[cfg(any(feature = "local-move", feature = "local-copy"))]
+use crate::local_move::{LocalMoveDestinationLimits, LocalMoveLimits};
 #[cfg(feature = "local-move")]
-use crate::local_move::{
-    LocalMoveDestinationLimits, LocalMoveError, LocalMoveLimits, LocalMovePlan, LocalMoveRecovery,
-    LocalMoveReport,
-};
+use crate::local_move::{LocalMoveError, LocalMovePlan, LocalMoveRecovery, LocalMoveReport};
 #[cfg(feature = "waveform")]
 use crate::local_waveform::{
     FfmpegLocalWaveformExtractor, LocalWaveformError, LocalWaveformExtractor,
@@ -292,7 +293,7 @@ use crate::view::DetailLinkView;
 use crate::view::DownloadView;
 #[cfg(feature = "lan-sharing")]
 use crate::view::LanSharePopupView;
-#[cfg(feature = "local-move")]
+#[cfg(any(feature = "local-move", feature = "local-copy"))]
 use crate::view::LocalMoveDestinationView;
 #[cfg(feature = "radio")]
 use crate::view::RadioRecordingView;
@@ -3103,9 +3104,15 @@ enum LocalBrowseRequest {
         cache_directory: PathBuf,
         options: crate::local_browser::LocalBrowseOptions,
     },
-    /// Lists only real directories for the non-blocking Move destination chooser.
-    #[cfg(feature = "local-move")]
+    /// Lists real directories for the non-blocking Move or Copy chooser.
+    #[cfg(any(feature = "local-move", feature = "local-copy"))]
     MoveDestinations { generation: u64, directory: PathBuf },
+    /// Validates and copies a bounded source batch without changing originals.
+    #[cfg(feature = "local-copy")]
+    Copy {
+        generation: u64,
+        selection: LocalMoveSelection,
+    },
     /// Executes one prevalidated, no-overwrite move batch off the UI thread.
     #[cfg(feature = "local-move")]
     Move {
@@ -3118,6 +3125,12 @@ enum LocalBrowseRequest {
 
 /// One result returned by the isolated Local filesystem worker.
 enum LocalBrowseResponse {
+    /// Throttled progress for the currently accepted foreground transfer.
+    #[cfg(any(feature = "local-move", feature = "local-copy"))]
+    TransferProgress {
+        generation: u64,
+        progress: crate::local_move::LocalTransferProgress,
+    },
     /// A foreground Local-tab directory snapshot.
     Browse {
         generation: u64,
@@ -3135,11 +3148,17 @@ enum LocalBrowseResponse {
             String,
         >,
     },
-    /// A directory-only Move destination snapshot.
-    #[cfg(feature = "local-move")]
+    /// A directory-only Move or Copy destination snapshot.
+    #[cfg(any(feature = "local-move", feature = "local-copy"))]
     MoveDestinations {
         generation: u64,
         result: Result<crate::local_move::LocalMoveDestinationListing, String>,
+    },
+    /// A copy result whose source identities must never be remapped.
+    #[cfg(feature = "local-copy")]
+    Copy {
+        generation: u64,
+        result: Result<crate::local_move::LocalCopyReport, crate::local_move::LocalCopyError>,
     },
     /// A completed or partially completed no-overwrite move batch.
     #[cfg(feature = "local-move")]
@@ -3998,9 +4017,9 @@ struct PendingPlaylistReplay {
     start_at_seconds: Option<u64>,
 }
 
-/// Exact, non-lossy paths owned by the open Local Move destination chooser.
-#[cfg(feature = "local-move")]
-#[derive(Debug, Default)]
+/// Exact, non-lossy paths owned by the Local Move or Copy destination chooser.
+#[cfg(any(feature = "local-move", feature = "local-copy"))]
+#[derive(Clone, Debug, Default)]
 struct LocalMoveSelection {
     /// Canonical folder containing every selected source.
     source_directory: PathBuf,
@@ -5138,16 +5157,20 @@ pub struct AppController {
     #[cfg(feature = "waveform")]
     pending_restored_local_waveform_selection: Option<(u64, usize)>,
     /// Exact current-directory entries toggled into the next local batch action.
-    #[cfg(any(feature = "local-move", feature = "audio-quality"))]
+    #[cfg(any(
+        feature = "local-move",
+        feature = "local-copy",
+        feature = "audio-quality"
+    ))]
     local_move_marks: HashSet<PathBuf>,
-    /// Generation rejecting destination or move results for an older popup.
-    #[cfg(feature = "local-move")]
+    /// Generation rejecting destination or transfer results for an older popup.
+    #[cfg(any(feature = "local-move", feature = "local-copy"))]
     local_move_generation: u64,
     /// Exact source and destination paths hidden from the lossy TUI model.
-    #[cfg(feature = "local-move")]
+    #[cfg(any(feature = "local-move", feature = "local-copy"))]
     local_move_selection: Option<LocalMoveSelection>,
     /// Whether the worker may already be mutating an explicitly approved batch.
-    #[cfg(feature = "local-move")]
+    #[cfg(any(feature = "local-move", feature = "local-copy"))]
     local_move_execution_pending: bool,
     /// Authoritative completed mappings awaiting durable `StateStore` remapping.
     #[cfg(any(feature = "local-rename", feature = "local-move"))]
@@ -6519,13 +6542,17 @@ impl AppController {
             pending_local_reselection: None,
             #[cfg(feature = "waveform")]
             pending_restored_local_waveform_selection: None,
-            #[cfg(any(feature = "local-move", feature = "audio-quality"))]
+            #[cfg(any(
+                feature = "local-move",
+                feature = "local-copy",
+                feature = "audio-quality"
+            ))]
             local_move_marks: HashSet::new(),
-            #[cfg(feature = "local-move")]
+            #[cfg(any(feature = "local-move", feature = "local-copy"))]
             local_move_generation: 0,
-            #[cfg(feature = "local-move")]
+            #[cfg(any(feature = "local-move", feature = "local-copy"))]
             local_move_selection: None,
-            #[cfg(feature = "local-move")]
+            #[cfg(any(feature = "local-move", feature = "local-copy"))]
             local_move_execution_pending: false,
             #[cfg(any(feature = "local-rename", feature = "local-move"))]
             local_move_persistence_queue: Vec::new(),
@@ -15733,7 +15760,11 @@ impl AppController {
     /// Starts private ZIP/RAR materialization without blocking the UI thread.
     #[cfg(feature = "local-archives")]
     fn open_local_archive(&mut self, source: PathBuf) {
-        #[cfg(any(feature = "local-move", feature = "audio-quality"))]
+        #[cfg(any(
+            feature = "local-move",
+            feature = "local-copy",
+            feature = "audio-quality"
+        ))]
         self.local_move_marks.clear();
         self.local_generation = self.local_generation.wrapping_add(1);
         #[cfg(feature = "waveform")]
@@ -15771,6 +15802,20 @@ impl AppController {
     /// Applies one isolated Local worker result only when its owner is current.
     fn handle_local_browse_response(&mut self, response: LocalBrowseResponse) {
         match response {
+            #[cfg(any(feature = "local-move", feature = "local-copy"))]
+            LocalBrowseResponse::TransferProgress {
+                generation,
+                progress,
+            } => {
+                if generation == self.local_move_generation && self.local_move_execution_pending {
+                    self.view.local_file_progress = Some(crate::view::LocalFileProgressView {
+                        completed_bytes: progress.completed_bytes,
+                        total_bytes: progress.total_bytes,
+                        completed_entries: progress.completed_entries,
+                        total_entries: progress.total_entries,
+                    });
+                }
+            }
             LocalBrowseResponse::Browse { generation, result } => {
                 self.handle_local_directory_response(generation, result);
             }
@@ -15787,9 +15832,13 @@ impl AppController {
                     Err(error) => self.handle_local_directory_response(generation, Err(error)),
                 }
             }
-            #[cfg(feature = "local-move")]
+            #[cfg(any(feature = "local-move", feature = "local-copy"))]
             LocalBrowseResponse::MoveDestinations { generation, result } => {
                 self.handle_local_move_destinations_response(generation, result);
+            }
+            #[cfg(feature = "local-copy")]
+            LocalBrowseResponse::Copy { generation, result } => {
+                self.handle_local_copy_response(generation, result);
             }
             #[cfg(feature = "local-move")]
             LocalBrowseResponse::Move {
@@ -15840,7 +15889,11 @@ impl AppController {
                 self.sort_local_listing();
                 self.view.selected = selected;
                 self.select_local_path(reselected_path.as_deref());
-                #[cfg(any(feature = "local-move", feature = "audio-quality"))]
+                #[cfg(any(
+                    feature = "local-move",
+                    feature = "local-copy",
+                    feature = "audio-quality"
+                ))]
                 {
                     let visible_paths = self
                         .local_listing
@@ -15893,7 +15946,11 @@ impl AppController {
         {
             self.local_archive_stack.clear();
         }
-        #[cfg(any(feature = "local-move", feature = "audio-quality"))]
+        #[cfg(any(
+            feature = "local-move",
+            feature = "local-copy",
+            feature = "audio-quality"
+        ))]
         {
             let leaves_current_directory = self
                 .local_listing
@@ -16496,9 +16553,17 @@ impl AppController {
                 .and_then(|id| self.local_progress_cache.get(id))
                 .copied()
                 .unwrap_or_default();
-            #[cfg(any(feature = "local-move", feature = "audio-quality"))]
+            #[cfg(any(
+                feature = "local-move",
+                feature = "local-copy",
+                feature = "audio-quality"
+            ))]
             let local_marked = self.local_move_marks.contains(&entry.path);
-            #[cfg(not(any(feature = "local-move", feature = "audio-quality")))]
+            #[cfg(not(any(
+                feature = "local-move",
+                feature = "local-copy",
+                feature = "audio-quality"
+            )))]
             let local_marked = false;
             let subtitle = match entry.kind {
                 LocalEntryKind::Directory => self
@@ -16610,6 +16675,7 @@ impl AppController {
                 ),
                 local_renamable: cfg!(feature = "local-rename") && !self.local_archive_read_only(),
                 local_movable: cfg!(feature = "local-move") && !self.local_archive_read_only(),
+                local_copyable: cfg!(feature = "local-copy") && !self.local_archive_read_only(),
                 local_trashable: cfg!(feature = "local-trash") && !self.local_archive_read_only(),
                 local_audio_quality_available: cfg!(feature = "audio-quality")
                     && entry.kind == LocalEntryKind::Audio,
@@ -16657,6 +16723,7 @@ impl AppController {
                     && !is_directory
                     && !self.local_archive_read_only(),
                 local_movable: cfg!(feature = "local-move") && !self.local_archive_read_only(),
+                local_copyable: cfg!(feature = "local-copy") && !self.local_archive_read_only(),
                 local_trashable: cfg!(feature = "local-trash") && !self.local_archive_read_only(),
                 ..DetailView::default()
             });
@@ -31460,9 +31527,8 @@ impl AppController {
         if let Some(sender) = self.provider_requests.take() {
             let _ = sender.send(ProviderRequest::Shutdown);
         }
-        if let Some(handle) = self.local_browse_thread.take() {
-            let _ = handle.join();
-        }
+        // Drain an accepted transfer before diagnostic-only ticks stop worker polling.
+        self.shutdown_local_browse_worker();
         if let Some(handle) = self.provider_thread.take() {
             let _ = handle.join();
         }
@@ -32172,7 +32238,11 @@ impl AppController {
     /// The synthetic `..` row is navigation only and can never enter a move or
     /// audio-quality batch. Marks are exact paths, so sorting does not change
     /// their meaning.
-    #[cfg(any(feature = "local-move", feature = "audio-quality"))]
+    #[cfg(any(
+        feature = "local-move",
+        feature = "local-copy",
+        feature = "audio-quality"
+    ))]
     fn extend_local_move_selection(&mut self, direction: i32) {
         if self.view.screen != Screen::Local {
             return;
@@ -32261,14 +32331,22 @@ impl AppController {
     }
 
     /// Selects one exact destination row without interpreting its display text.
-    #[cfg(feature = "local-move")]
+    #[cfg(any(feature = "local-move", feature = "local-copy"))]
     fn select_local_move_destination(&mut self, index: usize) {
-        let Some(LocalFilePopupView::Move {
-            directories,
-            selected,
-            error,
-            ..
-        }) = self.view.local_file_popup.as_mut()
+        let Some(
+            LocalFilePopupView::Move {
+                directories,
+                selected,
+                error,
+                ..
+            }
+            | LocalFilePopupView::Copy {
+                directories,
+                selected,
+                error,
+                ..
+            },
+        ) = self.view.local_file_popup.as_mut()
         else {
             return;
         };
@@ -32279,13 +32357,20 @@ impl AppController {
     }
 
     /// Moves the destination chooser by a signed number of rows.
-    #[cfg(feature = "local-move")]
+    #[cfg(any(feature = "local-move", feature = "local-copy"))]
     fn move_local_move_destination(&mut self, direction: i32) {
-        let Some(LocalFilePopupView::Move {
-            directories,
-            selected,
-            ..
-        }) = self.view.local_file_popup.as_mut()
+        let Some(
+            LocalFilePopupView::Move {
+                directories,
+                selected,
+                ..
+            }
+            | LocalFilePopupView::Copy {
+                directories,
+                selected,
+                ..
+            },
+        ) = self.view.local_file_popup.as_mut()
         else {
             return;
         };
@@ -32296,11 +32381,16 @@ impl AppController {
     }
 
     /// Opens the exact selected parent or child in the destination chooser.
-    #[cfg(feature = "local-move")]
+    #[cfg(any(feature = "local-move", feature = "local-copy"))]
     fn activate_local_move_destination(&mut self) {
-        let Some(LocalFilePopupView::Move {
-            selected, pending, ..
-        }) = self.view.local_file_popup.as_ref()
+        let Some(
+            LocalFilePopupView::Move {
+                selected, pending, ..
+            }
+            | LocalFilePopupView::Copy {
+                selected, pending, ..
+            },
+        ) = self.view.local_file_popup.as_ref()
         else {
             return;
         };
@@ -32316,8 +32406,10 @@ impl AppController {
             self.view.status_line = "No destination folder is selected".to_owned();
             return;
         };
-        if let Some(LocalFilePopupView::Move { pending, error, .. }) =
-            self.view.local_file_popup.as_mut()
+        if let Some(
+            LocalFilePopupView::Move { pending, error, .. }
+            | LocalFilePopupView::Copy { pending, error, .. },
+        ) = self.view.local_file_popup.as_mut()
         {
             *pending = true;
             *error = None;
@@ -32326,7 +32418,7 @@ impl AppController {
     }
 
     /// Sends one bounded directory-only destination listing to the Local worker.
-    #[cfg(feature = "local-move")]
+    #[cfg(any(feature = "local-move", feature = "local-copy"))]
     fn request_local_move_destinations(&mut self, directory: PathBuf) {
         self.local_move_generation = self.local_move_generation.wrapping_add(1);
         let generation = self.local_move_generation;
@@ -32335,9 +32427,11 @@ impl AppController {
                 generation,
                 directory,
             },
-            "Could not browse Local move destinations",
-        ) && let Some(LocalFilePopupView::Move { pending, error, .. }) =
-            self.view.local_file_popup.as_mut()
+            "Could not browse Local destinations",
+        ) && let Some(
+            LocalFilePopupView::Move { pending, error, .. }
+            | LocalFilePopupView::Copy { pending, error, .. },
+        ) = self.view.local_file_popup.as_mut()
         {
             *pending = false;
             *error = Some("The Local filesystem worker is unavailable".to_owned());
@@ -32404,6 +32498,12 @@ impl AppController {
             *error = None;
         }
         self.local_move_execution_pending = true;
+        self.view.local_file_progress = Some(crate::view::LocalFileProgressView {
+            completed_bytes: 0,
+            total_bytes: None,
+            completed_entries: 0,
+            total_entries: mappings.len(),
+        });
         self.local_move_generation = self.local_move_generation.wrapping_add(1);
         let generation = self.local_move_generation;
         if !self.send_local_browse_request(
@@ -32411,6 +32511,7 @@ impl AppController {
             "Could not move Local entries",
         ) {
             self.local_move_execution_pending = false;
+            self.view.local_file_progress = None;
             let message = match self.store.discard_local_move_intents(&mappings) {
                 Ok(()) => {
                     self.local_move_journal_pending = false;
@@ -32430,7 +32531,7 @@ impl AppController {
     }
 
     /// Applies one current destination listing without disturbing Local rows.
-    #[cfg(feature = "local-move")]
+    #[cfg(any(feature = "local-move", feature = "local-copy"))]
     fn handle_local_move_destinations_response(
         &mut self,
         generation: u64,
@@ -32439,7 +32540,7 @@ impl AppController {
         if generation != self.local_move_generation
             || !matches!(
                 self.view.local_file_popup.as_ref(),
-                Some(LocalFilePopupView::Move { .. })
+                Some(LocalFilePopupView::Move { .. } | LocalFilePopupView::Copy { .. })
             )
         {
             return;
@@ -32471,14 +32572,24 @@ impl AppController {
                     selection.destination_directory.clone_from(&listing.path);
                     selection.destination_rows = exact_rows;
                 }
-                if let Some(LocalFilePopupView::Move {
-                    destination,
-                    directories,
-                    selected,
-                    pending,
-                    error,
-                    ..
-                }) = self.view.local_file_popup.as_mut()
+                if let Some(
+                    LocalFilePopupView::Move {
+                        destination,
+                        directories,
+                        selected,
+                        pending,
+                        error,
+                        ..
+                    }
+                    | LocalFilePopupView::Copy {
+                        destination,
+                        directories,
+                        selected,
+                        pending,
+                        error,
+                        ..
+                    },
+                ) = self.view.local_file_popup.as_mut()
                 {
                     *destination = listing.path.display().to_string();
                     *directories = rows;
@@ -32488,12 +32599,14 @@ impl AppController {
                 }
                 if listing.truncated {
                     self.view.status_line =
-                        "The Local move destination list reached its safety bound".to_owned();
+                        "The Local destination list reached its safety bound".to_owned();
                 }
             }
             Err(listing_error) => {
-                if let Some(LocalFilePopupView::Move { pending, error, .. }) =
-                    self.view.local_file_popup.as_mut()
+                if let Some(
+                    LocalFilePopupView::Move { pending, error, .. }
+                    | LocalFilePopupView::Copy { pending, error, .. },
+                ) = self.view.local_file_popup.as_mut()
                 {
                     *pending = false;
                     *error = Some(listing_error);
@@ -32540,10 +32653,17 @@ impl AppController {
         planned: &[LocalMoveMapping],
         result: Result<LocalMoveReport, LocalMoveError>,
     ) {
-        if generation != self.local_move_generation || !self.local_move_execution_pending {
+        if generation != self.local_move_generation
+            || !self.local_move_execution_pending
+            || !matches!(
+                self.view.local_file_popup,
+                Some(LocalFilePopupView::Move { .. })
+            )
+        {
             return;
         }
         self.local_move_execution_pending = false;
+        self.view.local_file_progress = None;
         let source_directory = self
             .local_move_selection
             .as_ref()
@@ -32916,13 +33036,13 @@ impl AppController {
         }
     }
 
-    /// Reports whether an approved Local move may currently mutate the filesystem.
+    /// Reports whether an approved Local transfer may currently mutate the filesystem.
     fn local_move_is_executing(&self) -> bool {
-        #[cfg(feature = "local-move")]
+        #[cfg(any(feature = "local-move", feature = "local-copy"))]
         {
             self.local_move_execution_pending
         }
-        #[cfg(not(feature = "local-move"))]
+        #[cfg(not(any(feature = "local-move", feature = "local-copy")))]
         {
             false
         }
@@ -32934,21 +33054,21 @@ impl AppController {
             self.view.local_file_popup.as_ref(),
             Some(LocalFilePopupView::DownloadedTrash { .. })
         );
-        #[cfg(feature = "local-move")]
+        #[cfg(any(feature = "local-move", feature = "local-copy"))]
         if self.local_move_execution_pending
             && matches!(
                 self.view.local_file_popup.as_ref(),
-                Some(LocalFilePopupView::Move { .. })
+                Some(LocalFilePopupView::Move { .. } | LocalFilePopupView::Copy { .. })
             )
         {
             self.view.status_line =
-                "Wait for the Local move to finish before closing it".to_owned();
+                "Wait for the Local transfer to finish before closing it".to_owned();
             return;
         }
-        #[cfg(feature = "local-move")]
+        #[cfg(any(feature = "local-move", feature = "local-copy"))]
         if matches!(
             self.view.local_file_popup.as_ref(),
-            Some(LocalFilePopupView::Move { .. })
+            Some(LocalFilePopupView::Move { .. } | LocalFilePopupView::Copy { .. })
         ) {
             self.local_move_generation = self.local_move_generation.wrapping_add(1);
             self.local_move_selection = None;
@@ -32967,24 +33087,38 @@ impl AppController {
         self.view.status_line = "This build omits the `local` feature".to_owned();
     }
 
-    #[cfg(not(any(feature = "local-move", feature = "audio-quality")))]
+    #[cfg(not(any(
+        feature = "local-move",
+        feature = "local-copy",
+        feature = "audio-quality"
+    )))]
     fn extend_local_move_selection(&mut self, _direction: i32) {
         self.view.status_line = "This build omits the `local` feature".to_owned();
     }
 
-    #[cfg(not(feature = "local-move"))]
+    #[cfg(not(any(feature = "local-move", feature = "local-copy")))]
     fn select_local_move_destination(&mut self, _index: usize) {}
 
-    #[cfg(not(feature = "local-move"))]
+    #[cfg(not(any(feature = "local-move", feature = "local-copy")))]
     fn move_local_move_destination(&mut self, _direction: i32) {}
 
-    #[cfg(not(feature = "local-move"))]
+    #[cfg(not(any(feature = "local-move", feature = "local-copy")))]
     fn activate_local_move_destination(&mut self) {}
 
     #[cfg(not(feature = "local-move"))]
     fn confirm_local_move_here(&mut self) {
         self.view.status_line = "This build omits the `local` feature".to_owned();
     }
+
+    /// Keeps serialized Copy actions harmless when copying is not compiled.
+    #[cfg(not(feature = "local-copy"))]
+    fn begin_local_copy(&mut self) {
+        self.view.status_line = "This build omits the `local-copy` feature".to_owned();
+    }
+
+    /// Disabled Copy confirmation cannot mutate the filesystem.
+    #[cfg(not(feature = "local-copy"))]
+    fn confirm_local_copy_here(&mut self) {}
 
     /// Opens preferences unless their existing draft is parked behind a child editor.
     fn open_preferences(&mut self) {
@@ -34508,10 +34642,17 @@ impl AppController {
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     self.view.local_browse_pending = false;
-                    #[cfg(feature = "local-move")]
+                    #[cfg(any(feature = "local-move", feature = "local-copy"))]
                     if self.local_move_execution_pending {
                         self.local_move_execution_pending = false;
-                        self.local_move_journal_pending = true;
+                        self.view.local_file_progress = None;
+                        #[cfg(feature = "local-move")]
+                        if matches!(
+                            self.view.local_file_popup,
+                            Some(LocalFilePopupView::Move { .. })
+                        ) {
+                            self.local_move_journal_pending = true;
+                        }
                         if let Some(LocalFilePopupView::Move { pending, error, .. }) =
                             self.view.local_file_popup.as_mut()
                         {
@@ -34520,6 +34661,12 @@ impl AppController {
                                 "The Local filesystem worker stopped during the move; its durable intent will be reconciled on restart"
                                     .to_owned(),
                             );
+                        }
+                        if let Some(LocalFilePopupView::Copy { pending, error, .. }) =
+                            self.view.local_file_popup.as_mut()
+                        {
+                            *pending = false;
+                            *error = Some("The Local filesystem worker stopped during Copy. Originals are unchanged; inspect the destination for completed or staged copies before retrying.".to_owned());
                         }
                     }
                     if report_disconnect && !self.local_browse_disconnect_reported {
@@ -34548,14 +34695,27 @@ impl AppController {
             let _ = handle.join();
         }
         self.drain_local_browse_responses(false);
-        #[cfg(feature = "local-move")]
+        #[cfg(any(feature = "local-move", feature = "local-copy"))]
         if self.local_move_execution_pending {
             self.local_move_execution_pending = false;
-            self.local_move_journal_pending = true;
-            let message = "The Local filesystem worker stopped without reporting the accepted move. Its durable intent will be reconciled on the next startup."
-                .to_owned();
-            self.local_move_persistence_failure = Some(message.clone());
-            self.show_error_message("Local move completion is unknown", message);
+            self.view.local_file_progress = None;
+            #[cfg(feature = "local-move")]
+            if matches!(
+                self.view.local_file_popup,
+                Some(LocalFilePopupView::Move { .. })
+            ) {
+                self.local_move_journal_pending = true;
+                let message = "The Local filesystem worker stopped without reporting the accepted move. Its durable intent will be reconciled on the next startup.".to_owned();
+                self.local_move_persistence_failure = Some(message.clone());
+                self.show_error_message("Local move completion is unknown", message);
+            }
+            #[cfg(feature = "local-copy")]
+            if matches!(
+                self.view.local_file_popup,
+                Some(LocalFilePopupView::Copy { .. })
+            ) {
+                self.show_error_message("Local copy completion is unknown", "Originals are unchanged; inspect the destination for completed or staged copies before retrying.");
+            }
         }
     }
 
@@ -35025,6 +35185,17 @@ impl UiController for AppController {
     }
 
     fn dispatch(&mut self, action: UiAction) {
+        // Filesystem work runs on the worker so progress can repaint, but its
+        // accepted operation owns the UI until completion, including queued IPC.
+        if self.local_move_is_executing()
+            && !matches!(
+                action,
+                UiAction::SetTerminalWindowPixels { .. } | UiAction::SetExternalOpenerAvailable(_)
+            )
+        {
+            self.view.status_line = "Wait for the Local transfer to finish".to_owned();
+            return;
+        }
         self.synchronize_preferences_action_focus(&action);
         if !self.view.external_opener_available
             && self.view.action_requires_external_opener(&action)
@@ -36391,6 +36562,8 @@ impl UiController for AppController {
             UiAction::RequestDownloadedTrash => self.request_downloaded_trash(),
             UiAction::ConfirmDownloadedTrash => self.confirm_downloaded_trash(),
             UiAction::BeginLocalMove => self.begin_local_move(),
+            UiAction::BeginLocalCopy => self.begin_local_copy(),
+            UiAction::ConfirmLocalCopyHere => self.confirm_local_copy_here(),
             UiAction::ExtendLocalMoveSelection(direction) => {
                 self.extend_local_move_selection(direction);
             }
@@ -36817,6 +36990,26 @@ fn local_archive_display_path(
     }
 }
 
+/// Sends bounded-rate progress without flooding the UI channel on fast storage.
+#[cfg(any(feature = "local-move", feature = "local-copy"))]
+fn local_transfer_progress_sender(
+    responses: &Sender<LocalBrowseResponse>,
+    generation: u64,
+) -> impl FnMut(crate::local_move::LocalTransferProgress) + '_ {
+    let mut last_sent: Option<Instant> = None;
+    move |progress| {
+        if last_sent.is_none_or(|last| last.elapsed() >= Duration::from_millis(50))
+            || progress.completed_entries == progress.total_entries
+        {
+            let _ = responses.send(LocalBrowseResponse::TransferProgress {
+                generation,
+                progress,
+            });
+            last_sent = Some(Instant::now());
+        }
+    }
+}
+
 /// Runs foreground Local listings independently of recursive and remote work.
 fn local_browse_worker(
     requests: Receiver<LocalBrowseRequest>,
@@ -36869,7 +37062,7 @@ fn local_browse_worker(
                 .map_err(|error| error.to_string());
                 LocalBrowseResponse::OpenArchive { generation, result }
             }
-            #[cfg(feature = "local-move")]
+            #[cfg(any(feature = "local-move", feature = "local-copy"))]
             LocalBrowseRequest::MoveDestinations {
                 generation,
                 directory,
@@ -36881,13 +37074,35 @@ fn local_browse_worker(
                 .map_err(|error| error.to_string());
                 LocalBrowseResponse::MoveDestinations { generation, result }
             }
+            #[cfg(feature = "local-copy")]
+            LocalBrowseRequest::Copy {
+                generation,
+                selection,
+            } => {
+                let result = crate::local_move::validate_local_copy(
+                    &selection.source_directory,
+                    &selection.sources,
+                    &selection.destination_directory,
+                    LocalMoveLimits::default(),
+                )
+                .and_then(|plan| {
+                    crate::local_move::execute_local_copy_with_progress(
+                        &plan,
+                        local_transfer_progress_sender(&responses, generation),
+                    )
+                });
+                LocalBrowseResponse::Copy { generation, result }
+            }
             #[cfg(feature = "local-move")]
             LocalBrowseRequest::Move { generation, plan } => {
                 let planned = plan.mappings();
                 LocalBrowseResponse::Move {
                     generation,
                     planned,
-                    result: crate::local_move::execute_local_move(&plan),
+                    result: crate::local_move::execute_local_move_with_progress(
+                        &plan,
+                        local_transfer_progress_sender(&responses, generation),
+                    ),
                 }
             }
             LocalBrowseRequest::Shutdown => break,
@@ -46494,6 +46709,9 @@ mod tests {
     mod end_pause_tests;
     #[path = "local_activation.rs"]
     mod local_activation_tests;
+    #[cfg(feature = "local-copy")]
+    #[path = "local_copy.rs"]
+    mod local_copy_tests;
     #[path = "local_folder_notes.rs"]
     mod local_folder_note_tests;
     #[path = "local_sort.rs"]
@@ -62706,9 +62924,16 @@ mod tests {
                 plan,
             })
             .expect("send move");
-        let response = response_receiver
-            .recv_timeout(Duration::from_secs(2))
-            .expect("worker response");
+        let response = loop {
+            let response = response_receiver
+                .recv_timeout(Duration::from_secs(2))
+                .expect("worker response");
+            if let LocalBrowseResponse::TransferProgress { generation, .. } = response {
+                assert_eq!(generation, 12);
+                continue;
+            }
+            break response;
+        };
         let LocalBrowseResponse::Move {
             generation, result, ..
         } = response

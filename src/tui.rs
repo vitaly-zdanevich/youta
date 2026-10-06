@@ -1754,6 +1754,7 @@ fn event_wait(view: &ViewModel, settings: &UiSettings) -> Duration {
         playback_wait
     };
     let wait = if view.local_browse_pending
+        || view.local_file_progress.is_some()
         || view.local_artwork_pending
         || matches!(view.waveform, WaveformView::Loading { .. })
     {
@@ -2725,8 +2726,10 @@ fn render_frame(
     hit_map.local_file_buttons.clear();
     hit_map.local_move_rows = Rect::default();
     hit_map.local_move_first_index = 0;
-    if let Some(popup) = view.local_file_popup.as_ref() {
-        render_local_file_popup(frame, popup, &theme, hit_map);
+    if view.local_file_progress.is_none()
+        && let Some(popup) = view.local_file_popup.as_ref()
+    {
+        render_local_file_popup(frame, popup, None, &theme, hit_map);
     }
     #[cfg(feature = "yt-dlp")]
     {
@@ -2843,6 +2846,12 @@ fn render_frame(
             &theme,
             hit_map,
         );
+    }
+    // A foreground transfer owns the top modal layer even if background work reports an error.
+    if let Some(progress) = view.local_file_progress.as_ref()
+        && let Some(popup) = view.local_file_popup.as_ref()
+    {
+        render_local_file_popup(frame, popup, Some(progress), &theme, hit_map);
     }
     if view.physical_linux_console {
         normalize_linux_console_buffer(frame.buffer_mut());
@@ -5028,6 +5037,17 @@ fn render_information_panel(
                 theme.accent
             },
             UiAction::AnalyzeLocalAudioQuality,
+        );
+    }
+    if cfg!(feature = "local-copy") && kind == InformationPanelKind::Local && details.local_copyable
+    {
+        push_right_detail_button(
+            &mut lines,
+            &mut right_buttons,
+            inner.width,
+            button("c", "Copy", show_hotkeys),
+            theme.accent,
+            UiAction::BeginLocalCopy,
         );
     }
     if cfg!(feature = "local-move") && kind == InformationPanelKind::Local && details.local_movable
@@ -8084,7 +8104,11 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
     let area = centered_rect(76, 92, frame.area());
     frame.render_widget(Clear, area);
     let mut local_help =
-        "  Local: Esc parent     PageUp/Down page     H all files     Z size".to_owned();
+        "  Local: Esc parent     PageUp/Down page   H all files   Z size".to_owned();
+    // This row has room for Copy; extending the full action row would wrap compact help.
+    if cfg!(feature = "local-copy") {
+        local_help.push_str("  c copy");
+    }
     let mut local_actions = Vec::new();
     if cfg!(feature = "local-rename") {
         local_actions.push("r rename");
@@ -8092,7 +8116,11 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
     if cfg!(feature = "local-move") {
         local_actions.push("m move");
     }
-    if cfg!(any(feature = "local-move", feature = "audio-quality")) {
+    if cfg!(any(
+        feature = "local-copy",
+        feature = "local-move",
+        feature = "audio-quality"
+    )) {
         local_actions.push("Shift+J/K");
     }
     if cfg!(feature = "local-trash") {
@@ -13628,6 +13656,7 @@ fn render_unsubscribe_popup(
 fn render_local_file_popup(
     frame: &mut Frame<'_>,
     popup: &LocalFilePopupView,
+    progress: Option<&LocalFileProgressView>,
     theme: &Theme,
     hit_map: &mut HitMap,
 ) {
@@ -13638,10 +13667,20 @@ fn render_local_file_popup(
         selected,
         pending,
         error,
+    }
+    | LocalFilePopupView::Copy {
+        source_names,
+        destination,
+        directories,
+        selected,
+        pending,
+        error,
     } = popup
     {
-        render_local_move_popup(
+        render_local_transfer_popup(
             frame,
+            matches!(popup, LocalFilePopupView::Copy { .. }),
+            progress,
             source_names,
             destination,
             directories,
@@ -13676,7 +13715,9 @@ fn render_local_file_popup(
             "[Enter] Move to Trash",
             UiAction::ConfirmDownloadedTrash,
         ),
-        LocalFilePopupView::Move { .. } => unreachable!("handled above"),
+        LocalFilePopupView::Move { .. } | LocalFilePopupView::Copy { .. } => {
+            unreachable!("handled above")
+        }
     };
     let (title, area, message) = match popup {
         LocalFilePopupView::Rename { .. } => (
@@ -13698,7 +13739,9 @@ fn render_local_file_popup(
                 wrapped_message.join("\n"),
             )
         }
-        LocalFilePopupView::Move { .. } => unreachable!("handled above"),
+        LocalFilePopupView::Move { .. } | LocalFilePopupView::Copy { .. } => {
+            unreachable!("handled above")
+        }
     };
     frame.render_widget(Clear, area);
     frame.render_widget(panel_block(title, theme), area);
@@ -14126,10 +14169,13 @@ fn render_channel_download_checkbox(
 
 #[allow(
     clippy::too_many_arguments,
-    reason = "the Move popup keeps controller-owned destination state explicit"
+    reason = "the transfer popup keeps controller-owned destination state explicit"
 )]
-fn render_local_move_popup(
+/// Renders Copy and Move from the same destination state, keeping confirmation mode-specific.
+fn render_local_transfer_popup(
     frame: &mut Frame<'_>,
+    copy: bool,
+    progress: Option<&LocalFileProgressView>,
     source_names: &[String],
     destination: &str,
     directories: &[LocalMoveDestinationView],
@@ -14143,7 +14189,10 @@ fn render_local_move_popup(
     let height = frame.area().height.saturating_sub(4).clamp(1, 34);
     let area = centered_sized_rect(width, height, frame.area());
     frame.render_widget(Clear, area);
-    frame.render_widget(panel_block(" Move ", theme), area);
+    frame.render_widget(
+        panel_block(if copy { " Copy " } else { " Move " }, theme),
+        area,
+    );
     let inner = area.inner(ratatui::layout::Margin {
         horizontal: 2,
         vertical: 1,
@@ -14156,7 +14205,8 @@ fn render_local_move_popup(
         "Nothing selected".to_owned()
     } else {
         format!(
-            "Moving {} entr{}: {}",
+            "{} {} entr{}: {}",
+            if copy { "Copying" } else { "Moving" },
             source_names.len(),
             if source_names.len() == 1 { "y" } else { "ies" },
             source_names.join(", ")
@@ -14186,6 +14236,15 @@ fn render_local_move_popup(
         sections[1],
     );
 
+    if let Some(progress) = progress {
+        render_local_transfer_progress(frame, sections[2], progress, theme);
+        frame.render_widget(
+            Paragraph::new("Please wait; navigation is paused until the transfer finishes.")
+                .style(theme.muted),
+            sections[4],
+        );
+        return;
+    }
     let selected = selected.min(directories.len().saturating_sub(1));
     let visible_rows = usize::from(sections[2].height).max(usize::from(!sections[2].is_empty()));
     let first_index = selected
@@ -14212,7 +14271,7 @@ fn render_local_move_popup(
         );
     } else if directories.is_empty() {
         frame.render_widget(
-            Paragraph::new("No child folders; move into the displayed destination or go back.")
+            Paragraph::new("No child folders; confirm the displayed destination or go back.")
                 .style(theme.muted)
                 .wrap(Wrap { trim: false }),
             sections[2],
@@ -14229,25 +14288,33 @@ fn render_local_move_popup(
             sections[3],
         );
     }
-    let controls = "[Enter] Open folder   [M] Move here   [Esc] Cancel";
+    let confirm_label = if copy {
+        "[C] Copy here"
+    } else {
+        "[M] Move here"
+    };
+    let controls = format!("[Enter] Open folder   {confirm_label}   [Esc] Cancel");
     frame.render_widget(
-        Paragraph::new(controls)
+        Paragraph::new(controls.as_str())
             .alignment(Alignment::Center)
             .style(theme.accent),
         sections[4],
     );
-    let start = centered_line_x(sections[4], terminal_text_width(controls));
+    let start = centered_line_x(sections[4], terminal_text_width(&controls));
     let open_label = "[Enter] Open folder";
-    let move_label = "[M] Move here";
     let cancel_label = "[Esc] Cancel";
     let open_width = terminal_text_width(open_label);
-    let move_width = terminal_text_width(move_label);
+    let move_width = terminal_text_width(confirm_label);
     hit_map.local_file_buttons.push((
         UiAction::ActivateLocalMoveDestination,
         Rect::new(start, sections[4].y, open_width, 1),
     ));
     hit_map.local_file_buttons.push((
-        UiAction::ConfirmLocalMoveHere,
+        if copy {
+            UiAction::ConfirmLocalCopyHere
+        } else {
+            UiAction::ConfirmLocalMoveHere
+        },
         Rect::new(
             start.saturating_add(open_width).saturating_add(3),
             sections[4].y,
@@ -14267,6 +14334,64 @@ fn render_local_move_popup(
             1,
         ),
     ));
+}
+
+/// Shows bounded byte progress, falling back to entries for metadata-only transfers.
+fn render_local_transfer_progress(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    progress: &LocalFileProgressView,
+    theme: &Theme,
+) {
+    let label = if progress.total_bytes.is_none()
+        && progress.completed_bytes == 0
+        && progress.completed_entries == 0
+    {
+        "Preparing...".to_owned()
+    } else {
+        let bytes = progress.total_bytes.map_or_else(
+            || human_bytes(progress.completed_bytes),
+            |total| {
+                format!(
+                    "{} / {}",
+                    human_bytes(progress.completed_bytes),
+                    human_bytes(total)
+                )
+            },
+        );
+        format!(
+            "{bytes}   {} / {} entries",
+            progress.completed_entries, progress.total_entries
+        )
+    };
+    let ratio = progress
+        .total_bytes
+        .filter(|total| *total > 0)
+        .map(|total| progress.completed_bytes.min(total) as f64 / total as f64)
+        .or_else(|| {
+            (progress.total_entries > 0).then(|| {
+                progress.completed_entries.min(progress.total_entries) as f64
+                    / progress.total_entries as f64
+            })
+        });
+    let sections = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .split(area);
+    frame.render_widget(
+        Paragraph::new(label)
+            .style(theme.base)
+            .wrap(Wrap { trim: false }),
+        sections[0],
+    );
+    if let Some(ratio) = ratio {
+        frame.render_widget(
+            Gauge::default().gauge_style(theme.progress).ratio(ratio),
+            sections[1],
+        );
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -14827,6 +14952,9 @@ fn key_action_with_page_rows(
 }
 
 fn mouse_action(mouse: MouseEvent, hit_map: &HitMap, view: &ViewModel) -> Option<UiAction> {
+    if view.local_file_progress.is_some() {
+        return None;
+    }
     mouse_action_unfiltered(mouse, hit_map, view).filter(|action| {
         view.external_opener_available || !view.action_requires_external_opener(action)
     })
@@ -15328,7 +15456,7 @@ fn mouse_action_unfiltered(
             MouseEventKind::Down(MouseButton::Left) => {
                 if matches!(
                     view.local_file_popup.as_ref(),
-                    Some(LocalFilePopupView::Move { .. })
+                    Some(LocalFilePopupView::Move { .. } | LocalFilePopupView::Copy { .. })
                 ) && contains(hit_map.local_move_rows, mouse.column, mouse.row)
                 {
                     let index = hit_map.local_move_first_index.saturating_add(usize::from(
@@ -15346,7 +15474,7 @@ fn mouse_action_unfiltered(
             MouseEventKind::ScrollDown
                 if matches!(
                     view.local_file_popup.as_ref(),
-                    Some(LocalFilePopupView::Move { .. })
+                    Some(LocalFilePopupView::Move { .. } | LocalFilePopupView::Copy { .. })
                 ) =>
             {
                 Some(UiAction::MoveLocalMoveDestination(1))
@@ -15354,7 +15482,7 @@ fn mouse_action_unfiltered(
             MouseEventKind::ScrollUp
                 if matches!(
                     view.local_file_popup.as_ref(),
-                    Some(LocalFilePopupView::Move { .. })
+                    Some(LocalFilePopupView::Move { .. } | LocalFilePopupView::Copy { .. })
                 ) =>
             {
                 Some(UiAction::MoveLocalMoveDestination(-1))
@@ -16973,6 +17101,23 @@ for encoded, expected in json.load(sys.stdin):
 
         view.local_browse_pending = false;
         assert_eq!(event_wait(&view, &settings), Duration::from_secs(2));
+    }
+
+    /// Foreground file transfer progress stays responsive even with paused playback.
+    #[test]
+    fn local_transfer_progress_uses_the_interactive_response_budget() {
+        let settings = UiSettings {
+            idle_tick: Duration::from_secs(2),
+            ..UiSettings::default()
+        };
+        let view = ViewModel {
+            local_file_progress: Some(LocalFileProgressView::default()),
+            ..ViewModel::default()
+        };
+        assert_eq!(
+            event_wait(&view, &settings),
+            LOCAL_BROWSE_RESPONSE_POLL_INTERVAL
+        );
     }
 
     #[test]
@@ -18827,6 +18972,11 @@ for encoded, expected in json.load(sys.stdin):
         );
         assert!(rendered.contains("Details: Alt+←/→ history"));
         assert!(rendered.contains("Ctrl+←/→ 20 s"));
+        assert_eq!(
+            rendered.contains("c copy"),
+            cfg!(feature = "local-copy"),
+            "{rendered}"
+        );
         assert!(rendered.contains("Alt+↑/↓ (Linux TTY: Alt+u/d)"));
         assert!(rendered.contains("Backspace back"));
         assert!(rendered.contains("speed 10%"));
@@ -37888,6 +38038,144 @@ prose 07:25 remains clickable but is not a chapter";
                 .iter()
                 .any(|(action, _)| action == &UiAction::ConfirmLocalTrash)
         );
+    }
+
+    /// Copy is rendered as an independent capability without requiring Move support.
+    #[test]
+    fn local_copy_details_action_is_feature_gated_and_clickable() {
+        for copyable in [false, true] {
+            let view = ViewModel {
+                screen: Screen::Local,
+                details: Some(DetailView {
+                    title: "Album".to_owned(),
+                    local_copyable: copyable,
+                    ..DetailView::default()
+                }),
+                ..ViewModel::default()
+            };
+            let mut terminal = Terminal::new(TestBackend::new(100, 32)).unwrap();
+            let mut hit_map = HitMap::default();
+            terminal
+                .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+                .unwrap();
+            let target = hit_map
+                .detail_buttons
+                .iter()
+                .find(|(action, _)| *action == UiAction::BeginLocalCopy);
+            assert_eq!(target.is_some(), copyable && cfg!(feature = "local-copy"));
+            if let Some((_, area)) = target {
+                assert_eq!(
+                    mouse_action(
+                        MouseEvent {
+                            kind: MouseEventKind::Down(MouseButton::Left),
+                            column: area.x,
+                            row: area.y,
+                            modifiers: KeyModifiers::NONE
+                        },
+                        &hit_map,
+                        &view
+                    ),
+                    Some(UiAction::BeginLocalCopy)
+                );
+                assert_eq!(
+                    key_action(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE), &view),
+                    Some(UiAction::BeginLocalCopy)
+                );
+            }
+        }
+    }
+
+    /// Copy shares destination selection but cannot confirm a move or interact while transferring.
+    #[test]
+    fn local_copy_popup_renders_navigation_and_blocking_progress() {
+        let mut view = ViewModel {
+            screen: Screen::Local,
+            local_file_popup: Some(LocalFilePopupView::Copy {
+                source_names: vec!["Album".to_owned()],
+                destination: "/fixture/target".to_owned(),
+                directories: vec![LocalMoveDestinationView {
+                    name: "..".to_owned(),
+                    path: "/fixture".to_owned(),
+                }],
+                selected: 0,
+                pending: false,
+                error: None,
+            }),
+            ..ViewModel::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(120, 32)).unwrap();
+        let mut hit_map = HitMap::default();
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .unwrap();
+        assert!(rendered_text(&terminal).contains("[C] Copy here"));
+        assert!(!rendered_text(&terminal).contains("[M] Move here"));
+        let area = hit_map
+            .local_file_buttons
+            .iter()
+            .find(|(action, _)| *action == UiAction::ConfirmLocalCopyHere)
+            .unwrap()
+            .1;
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: area.x,
+            row: area.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(
+            mouse_action(click, &hit_map, &view),
+            Some(UiAction::ConfirmLocalCopyHere)
+        );
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::ScrollDown,
+                    ..click
+                },
+                &hit_map,
+                &view
+            ),
+            Some(UiAction::MoveLocalMoveDestination(1))
+        );
+        for progress in [
+            LocalFileProgressView::default(),
+            LocalFileProgressView {
+                completed_bytes: 50,
+                total_bytes: Some(100),
+                completed_entries: 1,
+                total_entries: 2,
+            },
+            LocalFileProgressView {
+                completed_bytes: 50,
+                total_bytes: None,
+                completed_entries: 0,
+                total_entries: 2,
+            },
+        ] {
+            view.local_file_progress = Some(progress.clone());
+            view.error_popup = Some(ErrorPopupView {
+                report: "Unrelated background error".to_owned(),
+                ..ErrorPopupView::default()
+            });
+            terminal
+                .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+                .unwrap();
+            let rendered = rendered_text(&terminal);
+            assert!(rendered.contains(if progress.total_bytes.is_some() {
+                "50 B / 100 B"
+            } else if progress.completed_bytes > 0 {
+                "50 B   0 / 2 entries"
+            } else {
+                "Preparing..."
+            }));
+            assert!(hit_map.local_file_buttons.is_empty());
+            assert!(hit_map.local_move_rows.is_empty());
+            assert_eq!(mouse_action(click, &hit_map, &view), None);
+            assert_eq!(
+                key_action(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &view),
+                None
+            );
+        }
     }
 
     #[cfg(feature = "local-move")]

@@ -287,6 +287,7 @@ jobs:
           cargo check --locked --no-default-features --features tui,local-rename
           cargo check --locked --no-default-features --features tui,local-trash
           cargo check --locked --no-default-features --features tui,local-move
+          cargo check --locked --no-default-features --features tui,local-copy
           cargo check --locked --no-default-features --features tui,local-archives
           cargo check --locked --no-default-features --features images,local-artwork
           cargo check --locked --no-default-features --features tui,local

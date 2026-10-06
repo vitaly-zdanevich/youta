@@ -93,7 +93,11 @@ pub mod local_waveform;
 #[cfg(feature = "tui")]
 pub mod git_sync;
 
-#[cfg(any(feature = "local-move", feature = "local-rename"))]
+#[cfg(any(
+    feature = "local-move",
+    feature = "local-rename",
+    feature = "local-copy"
+))]
 pub mod local_move;
 
 #[cfg(feature = "acoustid")]

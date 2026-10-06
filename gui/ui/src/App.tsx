@@ -71,6 +71,10 @@ export function App() {
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
+		if (view?.local_file_progress) {
+			event.preventDefault();
+			return;
+		}
       // A text field or slider owns its own keys.
       const target = event.target;
       if (
@@ -109,7 +113,7 @@ export function App() {
 
     document.addEventListener("keydown", onKeyDown);
     return () => document.removeEventListener("keydown", onKeyDown);
-  }, [pageRows]);
+  }, [pageRows, view?.local_file_progress]);
 
   if (failure !== null) {
     return (
@@ -240,7 +244,7 @@ export function App() {
 		{view.s3_credentials_editor ? <S3CredentialsPopup editor={view.s3_credentials_editor} /> : null}
       {view.rss_subscription_open ? <CredentialEditorNotice editor="rss_subscription" /> : null}
       {view.preferences_popup ? <PreferencesPopup popup={view.preferences_popup} archiveSupported={sources.some((source) => source.id === 'ArchiveOrg')} /> : null}
-      {view.local_file_popup ? <LocalFilePopup popup={view.local_file_popup} /> : null}
+		{view.local_file_popup ? <LocalFilePopup popup={view.local_file_popup} progress={view.local_file_progress} /> : null}
 		{view.channel_download_popup ? (
 			<ChannelDownloadPopup popup={view.channel_download_popup} />
 		) : null}
