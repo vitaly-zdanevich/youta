@@ -163,6 +163,12 @@ impl<C> BandcampResolverOwner<C> {
         None
     }
 
+    /// Reports current resolution ownership, excluding cancelled worker activity.
+    #[must_use]
+    pub(super) fn is_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
     /// Revokes pending ownership and reports whether the UI activity should clear.
     pub(super) fn cancel(&mut self) -> bool {
         if self.pending.take().is_none() {

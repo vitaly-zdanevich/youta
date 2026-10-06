@@ -3017,6 +3017,12 @@ pub struct ViewModel {
     pub search_animation_frame: usize,
     /// Whether accepted media is waiting for authoritative playback start.
     pub playback_starting: bool,
+    /// A current playback intent is resolving before the backend accepts media.
+    ///
+    /// This terminal-only projection preserves the identity of audio already
+    /// playing while an independent resolver prepares its replacement.
+    #[serde(skip)]
+    pub playback_preparing: bool,
     /// A retained EOF is awaiting its authoritative completion event.
     ///
     /// Keeps terminal response polling at the playing cadence during queue
@@ -3302,6 +3308,12 @@ pub struct ViewModel {
 }
 
 impl ViewModel {
+    /// Whether playback resolution or an accepted backend load is still pending.
+    #[must_use]
+    pub fn playback_activity_pending(&self) -> bool {
+        self.playback_starting || self.playback_preparing
+    }
+
     /// Resolves indexed metadata destinations before applying terminal URL policy.
     pub(crate) fn action_requires_external_opener(&self, action: &UiAction) -> bool {
         if let UiAction::ActivateDetailLink(index) = action
@@ -3466,6 +3478,7 @@ impl Default for ViewModel {
             local_fingerprint_animation_frame: 0,
             search_animation_frame: 0,
             playback_starting: false,
+            playback_preparing: false,
             playback_end_releasing: false,
             playback_start_animation_frame: 0,
             playing_media_id: None,

@@ -644,6 +644,84 @@ mod tests {
         }
     }
 
+    /// A pending replacement stays visible across the previous track's EOF.
+    #[test]
+    fn soundcloud_playback_preparation_survives_old_eof_until_the_new_audio_starts() {
+        let (started_tx, started_rx) = bounded(2);
+        let (release_tx, release_rx) = bounded(2);
+        let (mut app, _, player) = fixture(
+            vec![metadata("requested", true)],
+            Some((started_tx, release_rx)),
+        );
+        let old = item("old");
+        app.playback_queue.items = vec![old.clone(), item("requested")];
+        app.playback_queue.current_index = Some(0);
+        app.current_media = Some(old.media.id.clone());
+        app.view.playing_media_id = app.current_media.clone();
+        app.playback_phase = PlaybackPhase::Playing;
+
+        app.dispatch(UiAction::ActivateQueuePopupRow(1));
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        assert!(app.view.playback_activity_pending());
+        assert!(!app.view.playback_starting);
+        assert_eq!(app.view.playing_media_id.as_ref(), Some(&old.media.id));
+        app.tick();
+        assert_eq!(app.view.playback_start_animation_frame, 1);
+        player
+            .lock()
+            .unwrap()
+            .events
+            .push_back(PlaybackEvent::Ended(PlaybackEnd {
+                reason: PlaybackEndReason::Eof,
+                error: None,
+                file_error: None,
+                diagnostic: None,
+            }));
+        app.tick();
+        assert!(app.view.playback_activity_pending());
+        assert!(!app.view.playback_starting);
+
+        release_tx.send(()).unwrap();
+        finish(&mut app);
+        app.tick();
+        assert!(app.view.playback_activity_pending());
+        assert!(app.view.playback_starting);
+        player
+            .lock()
+            .unwrap()
+            .events
+            .push_back(PlaybackEvent::PlaybackStarted);
+        app.tick();
+        assert!(!app.view.playback_activity_pending());
+        assert_eq!(app.view.playback_start_animation_frame, 0);
+        assert_eq!(app.view.playing_media_id, Some(item("requested").media.id));
+    }
+
+    /// A cancelled resolver occupying its worker lane is no longer UI activity.
+    #[test]
+    fn soundcloud_playback_preparation_ignores_a_cancelled_worker() {
+        let (started_tx, started_rx) = bounded(2);
+        let (release_tx, release_rx) = bounded(2);
+        let (mut app, _, player) = fixture(
+            vec![metadata("requested", true)],
+            Some((started_tx, release_rx)),
+        );
+        app.playback_queue.items = vec![item("requested")];
+        app.dispatch(UiAction::ActivateQueuePopupRow(0));
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(app.view.playback_activity_pending());
+
+        app.cancel_pending_soundcloud_playback();
+        app.tick();
+
+        assert!(app.soundcloud.playback.worker.is_some());
+        assert!(!app.view.playback_activity_pending());
+        assert_eq!(app.view.playback_start_animation_frame, 0);
+        assert!(player.lock().unwrap().inputs.is_empty());
+        release_tx.send(()).unwrap();
+    }
+
     /// Navigation retains rich accepted metadata, not a failed replacement or another identity.
     #[test]
     fn soundcloud_now_playing_metadata_is_rich_identity_bound_and_accepted_only() {

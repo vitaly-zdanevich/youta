@@ -7083,9 +7083,78 @@ impl AppController {
         self.view.playback_start_animation_frame = 0;
     }
 
+    /// Projects current resolver ownership without replacing accepted playing media.
+    ///
+    /// History follows its exact visible row; `SoundCloud`'s independently owned
+    /// intent survives navigation and a previous track ending. Recompute after
+    /// actions and ticks so obsolete workers cannot retain terminal feedback.
+    fn refresh_playback_preparation_activity(&mut self) {
+        let history_pending = !self.provider_disconnect_reported
+            && self.view.screen == Screen::History
+            && self.pending_history_replay.as_ref().is_some_and(|pending| {
+                pending.generation == self.search_generation
+                    && self
+                        .history_entries
+                        .get(self.view.selected)
+                        .is_some_and(|history| history.entry.id == pending.entry.id)
+            });
+        #[cfg(feature = "soundcloud")]
+        let preparing = history_pending || self.soundcloud_playback_pending();
+        #[cfg(not(feature = "soundcloud"))]
+        let preparing = history_pending;
+        let was_pending = self.view.playback_activity_pending();
+        self.view.playback_preparing = preparing
+            && !self.view.quitting
+            && !self.diagnostic_only
+            && self.shutdown_persistence_succeeded.is_none();
+        if !self.view.playback_activity_pending() || !was_pending {
+            self.view.playback_start_animation_frame = 0;
+        }
+    }
+
+    /// Retires only preparations whose shared provider response lane has closed.
+    ///
+    /// Accepted backend loads and independently resolving or decrypting jobs keep
+    /// their feedback and ownership; current audio is never stopped here.
+    fn retire_disconnected_playback_preparations(&mut self) {
+        self.pending_history_replay = None;
+        let abandoned = self.pending_playlist_replay.take().is_some();
+        #[cfg(feature = "bbc-radio")]
+        let abandoned = self.pending_bbc_playback.take().is_some() || abandoned;
+        #[cfg(feature = "tracker-music")]
+        let abandoned = self
+            .pending_tracker_preparation
+            .take()
+            .is_some_and(|pending| {
+                !matches!(pending.owner, TrackerPreparationOwner::CanceledAutoplay)
+            })
+            || abandoned;
+        #[cfg(feature = "yandex-music")]
+        let abandoned = if self.yandex_music_playback_thread.is_none() {
+            self.pending_yandex_music_playback.take().is_some() || abandoned
+        } else {
+            abandoned
+        };
+        #[cfg(feature = "bandcamp")]
+        let independent = self.bandcamp_resolution.is_pending();
+        #[cfg(not(feature = "bandcamp"))]
+        let independent = false;
+        #[cfg(feature = "yandex-music")]
+        let independent = independent || self.pending_yandex_music_playback.is_some();
+        if abandoned
+            && !independent
+            && !matches!(
+                self.playback_phase,
+                PlaybackPhase::Loading | PlaybackPhase::Loaded
+            )
+        {
+            self.clear_playback_start_activity();
+        }
+    }
+
     /// Advances the playback-start animation once per existing controller tick.
     fn advance_playback_start_animation(&mut self) {
-        if self.view.playback_starting {
+        if self.view.playback_activity_pending() {
             self.view.playback_start_animation_frame =
                 self.view.playback_start_animation_frame.wrapping_add(1);
         }
@@ -31583,6 +31652,7 @@ impl AppController {
         self.quit_on_error_dismiss = true;
         self.clear_search_activity();
         self.clear_playback_start_activity();
+        self.refresh_playback_preparation_activity();
         self.view.playing_media_id = None;
         self.view.quitting = false;
         self.view.help_open = false;
@@ -35126,6 +35196,7 @@ impl AppController {
         }
         self.clear_search_activity();
         self.clear_playback_start_activity();
+        self.refresh_playback_preparation_activity();
         #[cfg(feature = "summary")]
         self.shutdown_video_summary_worker();
         #[cfg(feature = "youtube-captions")]
@@ -36675,6 +36746,7 @@ impl UiController for AppController {
                 "Quit cancelled because state could not be saved; dismiss the popup and press Quit to retry"
                     .to_owned();
         }
+        self.refresh_playback_preparation_activity();
     }
 
     fn take_clipboard_request(&mut self) -> Option<ClipboardRequest> {
@@ -36854,6 +36926,7 @@ impl UiController for AppController {
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     self.clear_search_activity();
+                    self.retire_disconnected_playback_preparations();
                     self.pending_subscription_refresh = None;
                     self.clear_subscription_loading_state();
                     self.clear_scheduled_subscription_video_metadata();
@@ -36919,6 +36992,7 @@ impl UiController for AppController {
         if self.session_dirty && self.last_session_save.elapsed() >= Duration::from_secs(30) {
             self.save_session();
         }
+        self.refresh_playback_preparation_activity();
     }
 }
 
@@ -81027,6 +81101,262 @@ mod tests {
         assert_eq!(controller.playback_phase, PlaybackPhase::Idle);
         assert!(!controller.view.playback_starting);
         assert_eq!(controller.view.playing_media_id, None);
+    }
+
+    /// History resolution animates immediately without retiring current audio.
+    #[test]
+    fn history_playback_preparation_tracks_resolution_navigation_and_disconnect() {
+        for outcome in ["failed", "navigation", "disconnected"] {
+            let (mut controller, _) = controller_with_mock_statuses([]);
+            controller.diagnostic_helpers_cache = Some(Vec::new());
+            let (requests, captured_requests) = unbounded();
+            controller.provider_requests = Some(requests);
+            let (responses, provider_responses) = unbounded();
+            controller.provider_responses = provider_responses;
+            controller
+                .store
+                .insert_history(&HistoryEntry {
+                    id: 0,
+                    media_id: MediaId::new(SourceKind::ApplePodcasts, "4004"),
+                    title: "Pending History episode".to_owned(),
+                    replay_locator: Some(
+                        "https://podcasts.apple.com/us/podcast/fixture-show/id2002?i=4004"
+                            .to_owned(),
+                    ),
+                    started_at: 1,
+                    last_played_at: 2,
+                    position_seconds: 0,
+                    duration_seconds: Some(120),
+                    finished: false,
+                })
+                .expect("History fixture");
+            controller.dispatch(UiAction::ShowScreen(Screen::History));
+            let previous = fixture_direct_item("already playing").media.id;
+            controller.current_media = Some(previous.clone());
+            controller.view.playing_media_id = Some(previous.clone());
+            controller.playback_phase = PlaybackPhase::Playing;
+
+            controller.dispatch(UiAction::ActivateSelection);
+
+            let generation = match captured_requests
+                .try_recv()
+                .expect("History resolver request")
+            {
+                ProviderRequest::ResolveApple { generation, .. } => generation,
+                _ => panic!("expected the History episode resolver"),
+            };
+            assert!(controller.view.playback_activity_pending(), "{outcome}");
+            assert!(!controller.view.playback_starting);
+            assert_eq!(controller.view.playing_media_id.as_ref(), Some(&previous));
+            controller.tick();
+            assert_eq!(controller.view.playback_start_animation_frame, 1);
+            match outcome {
+                "failed" => responses
+                    .send(ProviderResponse::Apple {
+                        generation,
+                        result: Err("fixture resolution failed".to_owned()),
+                    })
+                    .expect("mock provider response"),
+                "navigation" => controller.dispatch(UiAction::ShowScreen(Screen::Statistics)),
+                "disconnected" => drop(responses),
+                _ => unreachable!("all fixture outcomes are listed above"),
+            }
+            controller.tick();
+
+            assert!(!controller.view.playback_activity_pending(), "{outcome}");
+            assert_eq!(controller.view.playback_start_animation_frame, 0);
+            assert_eq!(controller.view.playing_media_id.as_ref(), Some(&previous));
+            assert_eq!(controller.current_media.as_ref(), Some(&previous));
+        }
+    }
+
+    /// Retains a mock playlist request after its provider response lane has closed.
+    fn fixture_disconnected_playlist_preparation(controller: &mut AppController) {
+        let mut entry = fixture_youtube_playlist_entry("dQw4w9WgXcQ", "Pending episode");
+        entry.media.id = MediaId::new(SourceKind::ApplePodcasts, "4004");
+        entry.media.webpage_url =
+            url::Url::parse("https://podcasts.apple.com/us/podcast/fixture-show/id2002?i=4004")
+                .expect("fixture episode page");
+        entry.media.replay_locator = entry.media.webpage_url.to_string();
+        controller.pending_playlist_replay = Some(PendingPlaylistReplay {
+            generation: controller.search_generation,
+            owner: PlaylistReplaySelection {
+                playlist_id: "fixture-playlist".to_owned(),
+                index: 0,
+                entry,
+            },
+            start_at_seconds: None,
+        });
+        let (responses, provider_responses) = unbounded();
+        drop(responses);
+        controller.provider_responses = provider_responses;
+        controller.diagnostic_helpers_cache = Some(Vec::new());
+    }
+
+    /// Shared-worker failure ends preparation feedback without stopping current audio.
+    #[test]
+    fn provider_disconnect_clears_abandoned_playback_preparation() {
+        for source in [
+            "playlist",
+            #[cfg(feature = "bbc-radio")]
+            "bbc",
+            #[cfg(feature = "tracker-music")]
+            "tracker",
+            #[cfg(feature = "yandex-music")]
+            "yandex",
+        ] {
+            let (mut controller, _) = controller_with_mock_statuses([]);
+            fixture_disconnected_playlist_preparation(&mut controller);
+            match source {
+                #[cfg(feature = "bbc-radio")]
+                "bbc" => {
+                    controller.pending_playlist_replay = None;
+                    controller.pending_bbc_playback = Some(PendingBbcPlayback {
+                        generation: controller.bbc_playback_generation,
+                        item: fixture_direct_item("pending BBC stream"),
+                        queue_cursor_already_positioned: false,
+                        origin: None,
+                    });
+                }
+                #[cfg(feature = "tracker-music")]
+                "tracker" => {
+                    controller.pending_playlist_replay = None;
+                    controller.pending_tracker_preparation = Some(PendingTrackerPreparation {
+                        generation: controller.search_generation,
+                        item_key: "fixture-module".to_owned(),
+                        owner: TrackerPreparationOwner::Manual,
+                    });
+                }
+                #[cfg(feature = "yandex-music")]
+                "yandex" => {
+                    controller.pending_playlist_replay = None;
+                    controller.pending_yandex_music_playback = Some(PendingYandexMusicPlayback {
+                        generation: controller.yandex_music_generation,
+                        track_id: "pending-track".to_owned(),
+                        item: fixture_direct_item("pending Yandex track"),
+                        queue_cursor_already_positioned: false,
+                        origin: None,
+                    });
+                }
+                _ => {}
+            }
+            let current = fixture_direct_item("already playing").media.id;
+            controller.current_media = Some(current.clone());
+            controller.view.playing_media_id = Some(current.clone());
+            controller.playback_phase = PlaybackPhase::Playing;
+            controller.view.playback_starting = true;
+            controller.view.playback_start_animation_frame = 3;
+
+            controller.tick();
+
+            assert!(!controller.view.playback_activity_pending(), "{source}");
+            assert_eq!(controller.view.playback_start_animation_frame, 0);
+            assert!(controller.pending_playlist_replay.is_none());
+            #[cfg(feature = "bbc-radio")]
+            assert!(controller.pending_bbc_playback.is_none());
+            #[cfg(feature = "tracker-music")]
+            assert!(controller.pending_tracker_preparation.is_none());
+            #[cfg(feature = "yandex-music")]
+            assert!(controller.pending_yandex_music_playback.is_none());
+            assert_eq!(controller.playback_phase, PlaybackPhase::Playing);
+            assert_eq!(controller.current_media.as_ref(), Some(&current));
+            assert_eq!(controller.view.playing_media_id.as_ref(), Some(&current));
+        }
+    }
+
+    /// A failed resolver cannot retire another item already accepted by the player.
+    #[test]
+    fn provider_disconnect_preserves_accepted_backend_startup() {
+        for phase in [PlaybackPhase::Loading, PlaybackPhase::Loaded] {
+            let (mut controller, _) = controller_with_mock_statuses([]);
+            controller.play_queue_item(fixture_direct_item("accepted audio"), false);
+            controller.playback_phase = phase;
+            let accepted = controller.current_media.clone();
+            fixture_disconnected_playlist_preparation(&mut controller);
+
+            controller.tick();
+
+            assert!(controller.pending_playlist_replay.is_none());
+            assert!(controller.view.playback_activity_pending(), "{phase:?}");
+            assert_eq!(controller.playback_phase, phase);
+            assert_eq!(controller.current_media, accepted);
+            assert!(controller.view.playing_media_id.is_none());
+        }
+    }
+
+    /// Bandcamp owns a separate worker whose live request survives shared-worker failure.
+    #[cfg(feature = "bandcamp")]
+    #[test]
+    fn provider_disconnect_preserves_independent_bandcamp_preparation() {
+        /// Keeps a mock resolution pending until the activity snapshot is captured.
+        struct HeldResolution(Receiver<()>);
+
+        impl BandcampResolveClient for HeldResolution {
+            fn resolve(
+                &self,
+                _source: &BandcampMediaUrl,
+                _format: BandcampAudioFormat,
+                _purpose: BandcampResolvePurpose,
+            ) -> PlaybackResult<BandcampResolution> {
+                let _ = self.0.recv_timeout(Duration::from_secs(5));
+                Err(PlaybackError::Protocol(
+                    "released fixture resolver".to_owned(),
+                ))
+            }
+        }
+
+        let (mut controller, _) = controller_with_mock_statuses([]);
+        fixture_disconnected_playlist_preparation(&mut controller);
+        let (release, released) = bounded(1);
+        controller.bandcamp_resolution =
+            BandcampResolverOwner::new(Box::new(HeldResolution(released)));
+        controller.request_bandcamp_resolution(
+            bandcamp_summary_fixture(
+                "fixture-artist",
+                "pending-track",
+                "Pending independent track",
+                BandcampReleaseKind::Track,
+            ),
+            BandcampResolutionOwner::SearchSelection,
+            None,
+        );
+
+        controller.tick();
+
+        let still_animating = controller.view.playback_activity_pending();
+        let still_owned = controller.bandcamp_resolution.cancel();
+        release.send(()).expect("release mock resolver");
+        assert!(controller.pending_playlist_replay.is_none());
+        assert!(still_animating);
+        assert!(still_owned);
+    }
+
+    /// Decrypting Yandex audio uses its own response lane after provider resolution.
+    #[cfg(feature = "yandex-music")]
+    #[test]
+    fn provider_disconnect_preserves_independent_yandex_media_preparation() {
+        let (mut controller, _) = controller_with_mock_statuses([]);
+        fixture_disconnected_playlist_preparation(&mut controller);
+        controller.pending_yandex_music_playback = Some(PendingYandexMusicPlayback {
+            generation: controller.yandex_music_generation,
+            track_id: "decrypting-track".to_owned(),
+            item: fixture_direct_item("decrypting Yandex track"),
+            queue_cursor_already_positioned: false,
+            origin: None,
+        });
+        let (release, released) = bounded(1);
+        controller.yandex_music_playback_thread = Some(thread::spawn(move || {
+            let _ = released.recv_timeout(Duration::from_secs(5));
+        }));
+        controller.view.playback_starting = true;
+
+        controller.tick();
+
+        release.send(()).expect("release mock media job");
+        assert!(controller.pending_playlist_replay.is_none());
+        assert!(controller.pending_yandex_music_playback.is_some());
+        assert!(controller.yandex_music_playback_thread.is_some());
+        assert!(controller.view.playback_activity_pending());
     }
 
     #[test]

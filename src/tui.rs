@@ -1762,7 +1762,7 @@ fn event_wait(view: &ViewModel, settings: &UiSettings) -> Duration {
     } else if view.search_activity.is_some()
         || view.subscriptions.loading
         || view.subscriptions.metadata_pending
-        || view.playback_starting
+        || view.playback_activity_pending()
         || view.playback_end_releasing
         || (cfg!(feature = "invidious")
             && view
@@ -2388,7 +2388,12 @@ fn render_fullscreen_thumbnail_overlay(
         .as_ref()
         .filter(|thumbnail| Some(*thumbnail) != visible_thumbnail_url);
     let visible_local_video = details.local_video_thumbnail.as_ref();
-    let area = frame.area();
+    let mut area = frame.area();
+    // Image protocols own complete rows and may suppress ordinary cell output.
+    // Leave the activity row outside the image instead of painting over its pixels.
+    area.height = area
+        .height
+        .saturating_sub(u16::from(view.playback_activity_pending()));
 
     if let Some(local_video) = visible_local_video {
         renderer.synchronize_local_video_fullscreen(local_video, area);
@@ -2491,6 +2496,7 @@ fn render_frame(
         }
         *hit_map = HitMap::default();
         render_ascii_visualizer(frame, visualizer, &theme);
+        render_playback_start_activity(frame, view, &theme);
         return;
     }
     let sections = main_frame_sections(frame.area(), view);
@@ -2593,7 +2599,8 @@ fn render_frame(
     }
     render_seek_bar(frame, sections[3], view, settings, &theme, hit_map);
     if let Some(notice) = footer_notice {
-        render_footer_notice(frame, sections[4], notice, &theme);
+        let notice_area = playback_activity_text_area(sections[4], frame.area(), view);
+        render_footer_notice(frame, notice_area, notice, &theme);
     }
     if thumbnail_is_fullscreen && let Some(renderer) = thumbnail_renderer.as_deref_mut() {
         render_fullscreen_thumbnail_overlay(frame, view, &theme, hit_map, renderer);
@@ -2853,6 +2860,7 @@ fn render_frame(
     {
         render_local_file_popup(frame, popup, Some(progress), &theme, hit_map);
     }
+    render_playback_start_activity(frame, view, &theme);
     if view.physical_linux_console {
         normalize_linux_console_buffer(frame.buffer_mut());
     }
@@ -7495,6 +7503,8 @@ fn render_seek_bar(
     } else {
         area
     };
+    let terminal_area = frame.area();
+    let status_text_area = |area| playback_activity_text_area(area, terminal_area, view);
     let duration = view.playback.duration.unwrap_or(Duration::ZERO);
     let ratio = if duration.is_zero() {
         0.0
@@ -7599,7 +7609,7 @@ fn render_seek_bar(
             );
             render_seek_status(
                 frame,
-                status_area,
+                status_text_area(status_area),
                 &label,
                 title_offset,
                 title_width,
@@ -7617,7 +7627,7 @@ fn render_seek_bar(
         };
         render_seek_status(
             frame,
-            status_area,
+            status_text_area(status_area),
             &label,
             title_offset,
             title_width,
@@ -7650,7 +7660,7 @@ fn render_seek_bar(
         );
         render_seek_status(
             frame,
-            status_area,
+            status_text_area(status_area),
             &label,
             title_offset,
             title_width,
@@ -7685,7 +7695,7 @@ fn render_seek_bar(
         }
         render_seek_status(
             frame,
-            status_area,
+            status_text_area(status_area),
             &label,
             title_offset,
             title_width,
@@ -7694,6 +7704,7 @@ fn render_seek_bar(
         );
         hit_map.seek_bar = track_area;
     } else {
+        let area = status_text_area(area);
         let visible_label = truncate_terminal_text(&label, usize::from(area.width));
         let gauge = Gauge::default()
             .gauge_style(theme.progress)
@@ -8105,6 +8116,42 @@ fn restore_seek_label(frame: &mut Frame<'_>, area: Rect, label: &str) {
     // A raw span has no foreground or background fields, so `set_span`
     // replaces the glyphs while preserving the played/cached cell styles.
     frame.buffer_mut().set_span(x, y, &label, width);
+}
+
+/// Reserves the spinner and a gap only for text on the terminal's last line.
+///
+/// Sharing the existing player/notice row keeps result-page capacity unchanged.
+/// The same rectangle drives rendering and title hit testing on narrow displays.
+fn playback_activity_text_area(area: Rect, terminal: Rect, view: &ViewModel) -> Rect {
+    if !view.playback_activity_pending()
+        || area.is_empty()
+        || area.height != 1
+        || area.x != terminal.x
+        || area.bottom() != terminal.bottom()
+    {
+        return area;
+    }
+    let reserved = area.width.min(2);
+    Rect::new(
+        area.x.saturating_add(reserved),
+        area.y,
+        area.width.saturating_sub(reserved),
+        area.height,
+    )
+}
+
+/// Draws TTY-safe playback feedback at the physical bottom-left without a new row.
+fn render_playback_start_activity(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
+    let area = frame.area();
+    if !view.playback_activity_pending() || area.is_empty() {
+        return;
+    }
+    let symbol =
+        ASCII_ACTIVITY_FRAMES[view.playback_start_animation_frame % ASCII_ACTIVITY_FRAMES.len()];
+    frame.render_widget(
+        Paragraph::new(format!("{symbol} ")).style(theme.accent.add_modifier(Modifier::BOLD)),
+        Rect::new(area.x, area.bottom() - 1, area.width.min(2), 1),
+    );
 }
 
 /// Renders a transient one-line notice without restoring the removed shortcut footer.
@@ -17055,6 +17102,9 @@ for encoded, expected in json.load(sys.stdin):
         view.playback_starting = true;
         assert_eq!(event_wait(&view, &settings), Duration::from_millis(250));
         view.playback_starting = false;
+        view.playback_preparing = true;
+        assert_eq!(event_wait(&view, &settings), Duration::from_millis(250));
+        view.playback_preparing = false;
         view.playback.paused = false;
         assert_eq!(event_wait(&view, &settings), Duration::from_millis(250));
         #[cfg(feature = "ascii-visualizer")]
@@ -34585,11 +34635,97 @@ for encoded, expected in json.load(sys.stdin):
     }
 
     #[test]
-    fn transient_footer_notice_never_inherits_playback_start_animation() {
+    fn playback_start_animation_cycles_at_bottom_left_without_an_extra_row() {
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).expect("terminal");
+        let mut hit_map = HitMap::default();
+        let mut view = ViewModel::default();
+        let idle_sections = main_frame_sections(Rect::new(0, 0, 80, 12), &view);
+        view.playback_starting = true;
+
+        for (index, expected) in ["|", "/", "-", "\\", "|"].into_iter().enumerate() {
+            view.playback_start_animation_frame = index;
+            terminal
+                .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+                .expect("draw playback activity");
+
+            let buffer = terminal.backend().buffer();
+            assert_eq!(buffer[(0, 11)].symbol(), expected);
+            assert_eq!(buffer[(1, 11)].symbol(), " ");
+            assert!(rendered_text(&terminal).contains("0:00 / --:--"));
+            assert_eq!(main_frame_sections(buffer.area, &view), idle_sections);
+            assert!(hit_map.buttons.is_empty());
+        }
+
+        view.playback_starting = false;
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw after playback starts or fails");
+        assert_eq!(terminal.backend().buffer()[(0, 11)].symbol(), " ");
+    }
+
+    #[test]
+    fn playback_start_animation_preserves_the_visible_title_mouse_target() {
+        let mut terminal = Terminal::new(TestBackend::new(48, 12)).expect("terminal");
+        let mut hit_map = HitMap::default();
+        let mut view = ViewModel {
+            playback_starting: true,
+            ..ViewModel::default()
+        };
+        view.playback.idle = false;
+        view.playback.title = Some("A long fixture track title that does not fit".to_owned());
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw narrow playback status");
+
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(0, 11)].symbol(), "|");
+        assert_eq!(buffer[(1, 11)].symbol(), " ");
+        assert_eq!(buffer[(2, 11)].symbol(), "0");
+        let target = hit_map
+            .now_playing
+            .expect("visible title remains clickable");
+        let visible_title = (target.x..target.right())
+            .map(|x| buffer[(x, target.y)].symbol())
+            .collect::<String>();
+        assert!(target.width > 3, "visible title: {visible_title:?}");
+        assert_eq!(
+            visible_title,
+            truncate_terminal_text(
+                view.playback.title.as_deref().expect("fixture title"),
+                usize::from(target.width),
+            ),
+            "the mouse target must contain the visible title, including its truncation suffix"
+        );
+        assert_eq!(target.y, 11);
+        assert!(target.x >= 2);
+        assert!(target.right() <= 48);
+    }
+
+    #[test]
+    fn playback_start_animation_handles_tiny_terminal_sizes() {
+        for (width, height) in [(0, 0), (0, 1), (1, 1), (2, 1), (3, 1), (40, 1), (40, 2)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+            let mut hit_map = HitMap::default();
+            let view = ViewModel {
+                playback_starting: true,
+                ..ViewModel::default()
+            };
+            terminal
+                .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+                .expect("draw tiny terminal");
+
+            if width > 0 && height > 0 {
+                assert_eq!(terminal.backend().buffer()[(0, height - 1)].symbol(), "|");
+            }
+        }
+    }
+
+    #[test]
+    fn playback_start_animation_shares_the_last_line_with_a_transient_notice() {
         let backend = TestBackend::new(80, 12);
         let mut terminal = Terminal::new(backend).expect("terminal");
         let mut hit_map = HitMap::default();
-        let view = ViewModel {
+        let mut view = ViewModel {
             playback_starting: true,
             playback_start_animation_frame: 0,
             transient_footer_notice: Some("Run rc-service gpm start.".to_owned()),
@@ -34606,9 +34742,151 @@ for encoded, expected in json.load(sys.stdin):
         let footer = (area.x..area.right())
             .map(|x| buffer[(x, footer_y)].symbol())
             .collect::<String>();
-        assert!(footer.starts_with("Run rc-service gpm start."));
-        assert!(!footer.starts_with("| "));
+        assert!(footer.starts_with("| Run rc-service gpm start."));
         assert!(hit_map.buttons.is_empty());
+
+        view.playback_starting = false;
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .expect("draw notice after playback activity ends");
+        let buffer = terminal.backend().buffer();
+        let footer = (area.x..area.right())
+            .map(|x| buffer[(x, footer_y)].symbol())
+            .collect::<String>();
+        assert!(footer.starts_with("Run rc-service gpm start."));
+    }
+
+    /// The one-row gauge and alternate timelines preserve their visible title targets.
+    #[test]
+    fn playback_start_animation_preserves_title_targets_for_all_seek_layouts() {
+        for (layout, height, expected_seek) in [
+            ("compact", 1, Rect::new(2, 0, 46, 1)),
+            ("live", 2, Rect::default()),
+            ("waveform", WAVEFORM_PLAYER_ROWS, Rect::default()),
+            ("chapters", 3, Rect::new(0, 1, 48, 1)),
+        ] {
+            let mut terminal = Terminal::new(TestBackend::new(48, height)).expect("terminal");
+            let mut hit_map = HitMap::default();
+            let mut view = ViewModel {
+                playback_starting: true,
+                playback: PlaybackStatus {
+                    idle: false,
+                    paused: false,
+                    duration: Some(Duration::from_secs(300)),
+                    title: Some("Fixture title continuing beyond the terminal edge".to_owned()),
+                    ..PlaybackStatus::default()
+                },
+                ..ViewModel::default()
+            };
+            match layout {
+                "live" => view.playback.live = true,
+                "waveform" => {
+                    view.waveform_visible = true;
+                    view.waveform = ready_waveform(
+                        MediaId::new(SourceKind::Local, "/music/spinner.flac"),
+                        Duration::from_secs(300),
+                        &[0, 8_192, 16_384, 32_767],
+                    );
+                }
+                "chapters" => {
+                    view.playback_chapters = chapter_navigation_fixture().playback_chapters
+                }
+                _ => {}
+            }
+            let theme = Theme::new(false);
+            terminal
+                .draw(|frame| {
+                    render_seek_bar(
+                        frame,
+                        frame.area(),
+                        &view,
+                        &UiSettings::default(),
+                        &theme,
+                        &mut hit_map,
+                    );
+                    render_playback_start_activity(frame, &view, &theme);
+                })
+                .expect("draw seek layout with playback activity");
+
+            let buffer = terminal.backend().buffer();
+            assert_eq!(buffer[(0, height - 1)].symbol(), "|", "{layout}");
+            assert_eq!(buffer[(1, height - 1)].symbol(), " ", "{layout}");
+            assert_eq!(hit_map.seek_bar, expected_seek, "{layout}");
+            let target = hit_map
+                .now_playing
+                .expect("visible title remains clickable");
+            assert_eq!(target.y, height - 1, "{layout}");
+            assert!(
+                target.x >= 2 && target.right() <= 48,
+                "{layout}: {target:?}"
+            );
+            assert!(target.width > 3, "{layout}: {target:?}");
+            let visible_title = (target.x..target.right())
+                .map(|x| buffer[(x, target.y)].symbol())
+                .collect::<String>();
+            assert_eq!(
+                visible_title,
+                truncate_terminal_text(
+                    view.playback.title.as_deref().expect("fixture title"),
+                    usize::from(target.width),
+                ),
+                "{layout}: the title hitbox must follow the visible text"
+            );
+            if layout == "waveform" {
+                assert_eq!(
+                    hit_map.waveform_seek.expect("ready waveform target").area,
+                    Rect::new(0, 0, 48, WAVEFORM_ROWS),
+                );
+            }
+        }
+    }
+
+    /// Fullscreen image protocols must never claim the spinner's terminal row.
+    #[test]
+    fn playback_start_animation_keeps_fullscreen_artwork_above_the_last_line() {
+        for playback_starting in [false, true] {
+            let mut terminal = Terminal::new(TestBackend::new(80, 12)).expect("terminal");
+            let image_url = url::Url::parse("https://images.example/spinner.jpg")
+                .expect("fixture thumbnail URL");
+            let view = ViewModel {
+                playback_starting,
+                details: Some(DetailView {
+                    thumbnail_url: Some(image_url.clone()),
+                    thumbnail_expanded: true,
+                    ..DetailView::default()
+                }),
+                ..ViewModel::default()
+            };
+            let mut hit_map = HitMap::default();
+            let mut thumbnails = MockThumbnailRenderer {
+                enabled: true,
+                rendered_artwork: true,
+                prepared_artwork_size: Some(Size::new(80, 12)),
+                ..MockThumbnailRenderer::default()
+            };
+            terminal
+                .draw(|frame| {
+                    render_frame(
+                        frame,
+                        &view,
+                        &UiSettings::default(),
+                        &mut hit_map,
+                        Some(&mut thumbnails),
+                    );
+                })
+                .expect("draw fullscreen artwork with playback activity");
+
+            let artwork_area = Rect::new(0, 0, 80, 12 - u16::from(playback_starting));
+            assert_eq!(
+                thumbnails.synchronized,
+                vec![(Some(image_url), artwork_area)]
+            );
+            assert_eq!(thumbnails.rendered_areas, vec![artwork_area]);
+            assert_eq!(hit_map.thumbnail_area, Some(artwork_area));
+            if playback_starting {
+                assert_eq!(terminal.backend().buffer()[(0, 11)].symbol(), "|");
+            }
+        }
     }
 
     #[test]
