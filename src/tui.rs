@@ -8192,7 +8192,7 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
         "  F8 pointer: arrows move, Enter clicks, Esc/F8 exits.",
         "  Linux /dev/ttyN: physical mouse input requires a running GPM daemon.",
         "Playback",
-        "  Space pause     ←/→ 5 s     0–9 seek by 10%",
+        "  Space pause     ←/→ 5 s     Ctrl+←/→ 20 s     0–9 seek by 10%",
         "  ↑/↓ volume </> speed 10% [ prev chapter ] next chapter T chapter times",
         "  {/} previous / next item in the queue or its source list",
         "  r repeat     A autoplay next item from same source list   w waveform",
@@ -18826,6 +18826,7 @@ for encoded, expected in json.load(sys.stdin):
             "the reserved roadmap shortcut must remain discoverable"
         );
         assert!(rendered.contains("Details: Alt+←/→ history"));
+        assert!(rendered.contains("Ctrl+←/→ 20 s"));
         assert!(rendered.contains("Alt+↑/↓ (Linux TTY: Alt+u/d)"));
         assert!(rendered.contains("Backspace back"));
         assert!(rendered.contains("speed 10%"));
@@ -18912,6 +18913,14 @@ for encoded, expected in json.load(sys.stdin):
         assert_eq!(
             key_action(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &view),
             Some(UiAction::SeekRelative(5))
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL), &view),
+            Some(UiAction::SeekRelative(-20))
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL), &view),
+            Some(UiAction::SeekRelative(20))
         );
         let five = KeyEvent::new(KeyCode::Char('5'), KeyModifiers::NONE);
         assert_eq!(key_action(five, &view), Some(UiAction::SeekPercent(50.0)));
@@ -24020,6 +24029,15 @@ for encoded, expected in json.load(sys.stdin):
             }),
             ..ViewModel::default()
         };
+        let mut playing_view = view.clone();
+        playing_view.playback.idle = false;
+        for code in [KeyCode::Left, KeyCode::Right] {
+            assert_eq!(
+                key_action(KeyEvent::new(code, KeyModifiers::CONTROL), &playing_view),
+                None,
+                "Preferences must consume Ctrl+arrows without seeking"
+            );
+        }
         let mut hit_map = HitMap::default();
         terminal
             .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))

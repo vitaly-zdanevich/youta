@@ -149,6 +149,125 @@ mod wire_tests {
     #[cfg(feature = "evernote")]
     use crate::view::{EvernoteNoteField, EvernoteNotePhase, EvernoteNotePopupView};
 
+    /// Ctrl accelerates arrow seeking while Alt retains navigation precedence.
+    #[test]
+    fn ctrl_arrow_seek_preserves_plain_arrows_and_alt_history() {
+        for paused in [false, true] {
+            let view = ViewModel {
+                playback: PlaybackStatus {
+                    idle: false,
+                    paused,
+                    ..PlaybackStatus::default()
+                },
+                ..ViewModel::default()
+            };
+            for (key, direction, navigation) in [
+                (Key::Left, -1, UiAction::GoBack),
+                (Key::Right, 1, UiAction::GoForward),
+            ] {
+                for ctrl in [false, true] {
+                    for shift in [false, true] {
+                        let press = KeyPress {
+                            key,
+                            ctrl,
+                            alt: false,
+                            shift,
+                        };
+                        assert_eq!(
+                            key_action(press, &view, None, None),
+                            Some(UiAction::SeekRelative(
+                                direction * if ctrl { 20 } else { 5 }
+                            ))
+                        );
+                        assert_eq!(
+                            key_action(KeyPress { alt: true, ..press }, &view, None, None),
+                            Some(navigation.clone())
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Faster seeking respects the same idle and live-buffer constraints as plain arrows.
+    #[test]
+    fn ctrl_arrow_seek_requires_a_seekable_timeline() {
+        for idle in [false, true] {
+            for live in [false, true] {
+                for buffered in [false, true] {
+                    let view = ViewModel {
+                        playback: PlaybackStatus {
+                            idle,
+                            live,
+                            live_seekable_range: buffered.then_some(
+                                crate::playback::BufferedRange {
+                                    start: std::time::Duration::from_secs(100),
+                                    end: std::time::Duration::from_secs(200),
+                                },
+                            ),
+                            ..PlaybackStatus::default()
+                        },
+                        ..ViewModel::default()
+                    };
+                    for (key, seconds) in [(Key::Left, -20), (Key::Right, 20)] {
+                        assert_eq!(
+                            key_action(
+                                KeyPress {
+                                    ctrl: true,
+                                    ..KeyPress::new(key)
+                                },
+                                &view,
+                                None,
+                                None
+                            ),
+                            (!idle && (!live || buffered))
+                                .then_some(UiAction::SeekRelative(seconds))
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Editing and modal owners consume Ctrl+arrows before global playback shortcuts.
+    #[test]
+    fn ctrl_arrow_seek_does_not_escape_editors_or_popups() {
+        let mut view = ViewModel {
+            playback: PlaybackStatus {
+                idle: false,
+                ..PlaybackStatus::default()
+            },
+            ..ViewModel::default()
+        };
+        for (key, direction, motion) in [
+            (Key::Left, -1, crate::view::PrivateNoteCursorMotion::Left),
+            (Key::Right, 1, crate::view::PrivateNoteCursorMotion::Right),
+        ] {
+            let press = KeyPress {
+                ctrl: true,
+                ..KeyPress::new(key)
+            };
+            view.search_editing = true;
+            assert_eq!(
+                key_action(press, &view, None, None),
+                Some(UiAction::MoveSearchCursor(direction))
+            );
+            view.search_editing = false;
+            view.private_note_popup = Some(crate::view::PrivateNotePopupView::default());
+            assert_eq!(
+                key_action(press, &view, None, None),
+                Some(UiAction::MovePrivateNoteCursor(motion))
+            );
+            view.private_note_popup = None;
+            view.help_open = true;
+            assert_eq!(key_action(press, &view, None, None), None);
+            view.help_open = false;
+            view.text_selection_mode = true;
+            assert_eq!(key_action(press, &view, None, None), None);
+            view.text_selection_mode = false;
+        }
+    }
+
     /// Switching fields must not offer a metadata backend omitted from this build.
     #[test]
     fn youtube_setup_field_switches_only_to_compiled_providers() {
@@ -1336,6 +1455,9 @@ fn subscription_items_active(view: &ViewModel) -> bool {
 }
 
 /// Maps one key using the current rendered main-list page capacity.
+///
+/// Outside modal editors, Ctrl increases arrow seeking from five to twenty
+/// seconds. Alt retains priority for backward/forward navigation.
 pub fn key_action(
     key: KeyPress,
     view: &ViewModel,
@@ -2777,8 +2899,12 @@ fn unfiltered_key_action(
         Key::Char(' ') => Some(UiAction::TogglePause),
         Key::Left if alt => Some(UiAction::GoBack),
         Key::Right if alt => Some(UiAction::GoForward),
-        Key::Left if view.playback.seeking_available() => Some(UiAction::SeekRelative(-5)),
-        Key::Right if view.playback.seeking_available() => Some(UiAction::SeekRelative(5)),
+        Key::Left if view.playback.seeking_available() => {
+            Some(UiAction::SeekRelative(if key.ctrl { -20 } else { -5 }))
+        }
+        Key::Right if view.playback.seeking_available() => {
+            Some(UiAction::SeekRelative(if key.ctrl { 20 } else { 5 }))
+        }
         Key::Up => Some(UiAction::ChangeVolume(5)),
         Key::Down => Some(UiAction::ChangeVolume(-5)),
         Key::Char('<') | Key::Char(',') => Some(UiAction::ChangeSpeed(-0.1)),

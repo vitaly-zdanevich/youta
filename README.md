@@ -250,6 +250,12 @@ chapters, or a local waveform sends IPC commands to the same player process.
 The backend requires `mpv` 0.38 or newer so resume positions and extractor
 options can be applied atomically through `loadfile` per-file options.
 
+In normal playback controls, `Left` / `Right` seek backward / forward five
+seconds; `Ctrl+Left` / `Ctrl+Right` seek backward / forward 20 seconds when
+seeking is available. Both front-ends share these shortcuts. `Alt+Left` /
+`Alt+Right` remain back / forward navigation, and editors and modal views
+retain their own key handling.
+
 Youta prepares the selected YouTube video's audio by default so `Enter` can
 start playback without first waiting for a complete foreground resolution.
 Selection must remain unchanged for 200 ms before one bounded worker invokes

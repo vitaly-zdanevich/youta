@@ -82225,6 +82225,19 @@ mod tests {
         });
         state.lock().expect("mock state").commands.clear();
 
+        for key in [crate::keymap::Key::Left, crate::keymap::Key::Right] {
+            let action = crate::keymap::key_action(
+                crate::keymap::KeyPress {
+                    ctrl: true,
+                    ..crate::keymap::KeyPress::new(key)
+                },
+                &controller.view,
+                None,
+                None,
+            )
+            .expect("Ctrl+arrow seeks a buffered timeline");
+            controller.dispatch(action);
+        }
         controller.dispatch(UiAction::SeekRelative(-80));
         controller.dispatch(UiAction::SeekRelative(500));
         controller.dispatch(UiAction::SeekPercent(25.0));
@@ -82232,6 +82245,8 @@ mod tests {
         assert_eq!(
             state.lock().expect("mock state").commands,
             [
+                PlayerCommand::SeekAbsolute(Duration::from_secs(1_040)),
+                PlayerCommand::SeekAbsolute(Duration::from_secs(1_080)),
                 PlayerCommand::SeekAbsolute(Duration::from_secs(1_000)),
                 PlayerCommand::SeekAbsolute(Duration::from_millis(1_119_999)),
                 PlayerCommand::SeekAbsolute(Duration::from_secs(1_030)),

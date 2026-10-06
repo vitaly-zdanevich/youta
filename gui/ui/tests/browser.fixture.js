@@ -540,6 +540,37 @@
 		}
 		snapshot(previous);
 	}
+	/** The browser forwards arrow modifiers; Rust alone decides navigation and seek distances. */
+	async function checkArrowShortcuts() {
+		for (const [name, shared] of [['ArrowLeft', 'Left'], ['ArrowRight', 'Right']]) {
+			for (const [label, ctrl, alt] of [['plain', false, false], ['Ctrl', true, false], ['Alt', false, true]]) {
+				const start = calls.length;
+				const event = new KeyboardEvent('keydown', { key: name, ctrlKey: ctrl, altKey: alt,
+					bubbles: true, cancelable: true });
+				document.dispatchEvent(event);
+				await until(() => calls.slice(start).some((call) => call.command === 'key'), `${label}+${name} IPC`);
+				const forwarded = calls.slice(start).filter((call) => call.command === 'key');
+				assert(forwarded.length === 1, `${label}+${name} forwards exactly one key`);
+				const press = forwarded[0].args.press;
+				assert(press.key === shared && press.ctrl === ctrl && press.alt === alt && press.shift === false,
+					`${label}+${name} preserves its shared key and modifiers`);
+				assert(event.defaultPrevented && !calls.slice(start).some((call) => call.command === 'dispatch'),
+					`${label}+${name} suppresses browser defaults without duplicating Rust actions`);
+			}
+		}
+		snapshot({ help_open: true });
+		await until(() => dialog()?.textContent.includes('The same map serves the terminal front-end'), 'keyboard help');
+		for (const [keys, meaning] of [
+			['Left / Right', 'seek backward / forward 5 seconds'],
+			['Ctrl+Left / Ctrl+Right', 'seek backward / forward 20 seconds'],
+			['Alt+Left / Alt+Right', 'back / forward'],
+		]) {
+			const row = [...dialog().querySelectorAll('dt')].find((node) => node.textContent === keys);
+			assert(row?.nextElementSibling.textContent === meaning, `Keyboard help explains ${keys}: ${meaning}`);
+		}
+		snapshot({ help_open: false });
+		await until(() => !dialog(), 'closed keyboard help');
+	}
 	/** Focus snapshots and native checkbox/button keys must agree with the shared keymap. */
 	async function checkPreferencesFocus() {
 		const preferences = { ...clone(defaults.PreferencesPopupView), selected_field: 'SubscriptionsLayout',
@@ -632,6 +663,7 @@
 		await checkLocalFullPath();
 		await checkLocalTrackMetadata();
 		await checkLocalActionOrder();
+		await checkArrowShortcuts();
 		await checkPreferencesFocus();
 		await checkUnsubscribeConfirmation();
 		await checkProviderSettings();

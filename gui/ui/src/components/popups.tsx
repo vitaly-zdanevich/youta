@@ -136,6 +136,7 @@ export function HelpPopup({
         ["j · k · ↑ · ↓", "move the selection"],
         ["Enter", "open or play"],
         ["Backspace", "back"],
+		['Alt+Left / Alt+Right', 'back / forward'],
         [
           playbackHistoryEnabled ? "F2 · F3 · F4 · F5" : "F2 · F4 · F5",
           playbackHistoryEnabled
@@ -151,7 +152,8 @@ export function HelpPopup({
       "Playback",
       [
         ["Space", "pause"],
-        ["← · →", "seek 5 seconds"],
+		['Left / Right', 'seek backward / forward 5 seconds'],
+		['Ctrl+Left / Ctrl+Right', 'seek backward / forward 20 seconds'],
         ["0–9", "seek by ten percent"],
         ["↑ · ↓", "volume"],
         ["< · >", "speed"],
