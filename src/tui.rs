@@ -3395,7 +3395,11 @@ fn render_body(
         list_area,
         search_title.trim(),
         &view.rows,
-        true,
+        if view.screen == Screen::Search {
+            RowSourceLabels::YouTubeSearch
+        } else {
+            RowSourceLabels::All
+        },
         view.selected,
         view.playing_media_id.as_ref(),
         view.playback.paused,
@@ -3532,6 +3536,29 @@ fn render_web_controls(
     }
 }
 
+/// Source-label policy, independent of the identity used for row styling.
+#[derive(Clone, Copy)]
+enum RowSourceLabels {
+    /// A subscription feed already identifies its source and needs no marker padding.
+    Hidden,
+    /// Mixed-source lists retain their complete source labels and markers.
+    All,
+    /// The YT tab identifies `YouTube`, but foreign sources and channel kinds remain useful.
+    YouTubeSearch,
+}
+
+impl RowSourceLabels {
+    /// Omits only redundant provider text, preserving the row's stored source.
+    fn label(self, row: &RowView) -> &str {
+        match (self, row.source.as_str()) {
+            (Self::Hidden, _) | (Self::YouTubeSearch, "YouTube") => "",
+            (Self::YouTubeSearch, "YouTube channel") if row.subtitle == "channel" => "",
+            (Self::YouTubeSearch, "YouTube channel") => "channel",
+            _ => &row.source,
+        }
+    }
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "the renderer keeps list data and presentation state explicit"
@@ -3541,7 +3568,7 @@ fn render_row_list(
     area: Rect,
     title: &str,
     rows: &[RowView],
-    show_source: bool,
+    source_labels: RowSourceLabels,
     selected_index: usize,
     playing_media_id: Option<&MediaId>,
     playback_paused: bool,
@@ -3550,6 +3577,7 @@ fn render_row_list(
     heading_style: Style,
     theme: &Theme,
 ) -> (Rect, usize) {
+    let show_source = !matches!(source_labels, RowSourceLabels::Hidden);
     let rows_area = render_main_panel_heading(frame, area, title, heading_style);
     let row_height = row_list_height(rows);
     let visible_rows =
@@ -3744,8 +3772,9 @@ fn render_row_list(
             if !row.compact && (show_source || playing) {
                 subtitle_spans.push(Span::styled("    ", row_style));
             }
-            if !row.compact && show_source && !row.source.is_empty() {
-                subtitle_spans.push(Span::styled(&row.source, source_style));
+            let source_label = source_labels.label(row);
+            if !row.compact && !source_label.is_empty() {
+                subtitle_spans.push(Span::styled(source_label, source_style));
                 if !row.subtitle.is_empty() || !progress.is_empty() {
                     subtitle_spans.push(Span::styled(" · ", row_style));
                 }
@@ -3826,7 +3855,7 @@ fn render_subscriptions_body(
                 list_sections[0],
                 &subscription_items_heading(subscriptions),
                 &subscriptions.items,
-                false,
+                RowSourceLabels::Hidden,
                 subscriptions.selected_item,
                 view.playing_media_id.as_ref(),
                 view.playback.paused,
@@ -3983,7 +4012,7 @@ fn render_subscriptions_body(
                     sections[0],
                     &heading,
                     &subscriptions.items,
-                    false,
+                    RowSourceLabels::Hidden,
                     subscriptions.selected_item,
                     view.playing_media_id.as_ref(),
                     view.playback.paused,
@@ -4035,7 +4064,7 @@ fn render_subscription_source_list(
         sections[0],
         "Sources",
         &view.subscriptions.sources,
-        true,
+        RowSourceLabels::All,
         view.subscriptions.selected_source,
         view.playing_media_id.as_ref(),
         view.playback.paused,
@@ -18645,7 +18674,7 @@ for encoded, expected in json.load(sys.stdin):
                     frame.area(),
                     "",
                     &rows,
-                    true,
+                    RowSourceLabels::All,
                     0,
                     None,
                     false,
@@ -18711,7 +18740,7 @@ for encoded, expected in json.load(sys.stdin):
                     frame.area(),
                     "",
                     &rows,
-                    true,
+                    RowSourceLabels::All,
                     0,
                     None,
                     false,
@@ -22451,6 +22480,139 @@ for encoded, expected in json.load(sys.stdin):
             },
             subscribed: !video,
             ..RowView::default()
+        }
+    }
+
+    /// The YT tab supplies source context without changing row identity or markers.
+    #[test]
+    fn youtube_search_rows_omit_redundant_source_labels_only_in_yt_tab() {
+        let playing = MediaId::new(SourceKind::YouTube, "dQw4w9WgXcQ");
+        for screen in [
+            Screen::Search,
+            Screen::History,
+            Screen::Playlists,
+            Screen::YouTubeMusic,
+        ] {
+            let mut terminal = Terminal::new(TestBackend::new(260, 18)).expect("terminal");
+            let view = ViewModel {
+                screen,
+                search_query: "minsk".to_owned(),
+                selected: 1,
+                playing_media_id: Some(playing.clone()),
+                playback: crate::playback::PlaybackStatus {
+                    paused: true,
+                    ..crate::playback::PlaybackStatus::default()
+                },
+                rows: vec![
+                    RowView {
+                        media_id: Some(playing.clone()),
+                        title: "Mock video".to_owned(),
+                        subtitle: "DoTravel · 81,100 subscribers · 2025 April 30 · 8:43".to_owned(),
+                        source: "YouTube".to_owned(),
+                        subscribed: true,
+                        playback_started: true,
+                        watched_percent: 28,
+                        ..RowView::default()
+                    },
+                    RowView {
+                        title: "Mock channel".to_owned(),
+                        subtitle: "81,100 subscribers".to_owned(),
+                        source: "YouTube channel".to_owned(),
+                        ..RowView::default()
+                    },
+                    RowView {
+                        title: "Direct source item".to_owned(),
+                        subtitle: "Artist".to_owned(),
+                        source: "Bandcamp".to_owned(),
+                        ..RowView::default()
+                    },
+                    RowView {
+                        title: "Channel without subscriber count".to_owned(),
+                        subtitle: "channel".to_owned(),
+                        source: "YouTube channel".to_owned(),
+                        ..RowView::default()
+                    },
+                ],
+                ..ViewModel::default()
+            };
+            let mut hits = HitMap::default();
+            terminal
+                .draw(|frame| {
+                    render_body(
+                        frame,
+                        frame.area(),
+                        &view,
+                        true,
+                        0,
+                        &Theme::new(false),
+                        &mut hits,
+                        None,
+                    )
+                })
+                .expect("draw source labels");
+            let buffer = terminal.backend().buffer();
+            let line = |offset| {
+                (hits.rows.x..hits.rows.right())
+                    .map(|x| buffer[(x, hits.rows.y + offset)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            };
+            assert_eq!(line(0), "|| ◆ Mock video");
+            assert_eq!(
+                line(1),
+                format!(
+                    "    {}DoTravel · 81,100 subscribers · 2025 April 30 · 8:43 28%",
+                    if screen == Screen::Search {
+                        ""
+                    } else {
+                        "YouTube · "
+                    }
+                )
+            );
+            assert_eq!(
+                line(3),
+                format!(
+                    "    {}81,100 subscribers",
+                    if screen == Screen::Search {
+                        "channel · "
+                    } else {
+                        "YouTube channel · "
+                    }
+                )
+            );
+            assert_eq!(
+                line(5),
+                "    Bandcamp · Artist",
+                "foreign-source direct items retain their identity"
+            );
+            assert_eq!(
+                line(7),
+                if screen == Screen::Search {
+                    "    channel"
+                } else {
+                    "    YouTube channel · channel"
+                },
+                "a missing subscriber count must not duplicate the channel label"
+            );
+            assert_eq!(
+                view.rows[0].source, "YouTube",
+                "source metadata must not be erased"
+            );
+            assert_eq!(hits.rows_row_height, 2);
+            assert_eq!(
+                mouse_action(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: hits.rows.x,
+                        row: hits.rows.y + 3,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    &hits,
+                    &view
+                ),
+                Some(UiAction::SelectRow(1))
+            );
         }
     }
 
