@@ -329,6 +329,7 @@ fn preferences() -> PreferencesPopupView {
         youtube_thumbnail_size: youta::config::YouTubeThumbnailSize::default(),
         show_local_folder_sizes: false,
         show_full_local_paths: false,
+        natural_local_sort: false,
         show_images_in_tty: false,
         bandcamp_audio_format: youta::config::BandcampAudioFormat::default(),
         config_path: String::new(),

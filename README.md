@@ -107,6 +107,12 @@ Local paths inside your home folder display as `~/…` by default. Enable
 to show `/home/username/…` instead. Playback and saved folder locations always
 retain their full paths.
 
+Enable **Natural Local filename sorting (1, 2, 10)** in Preferences
+(`ui.natural_local_sort = true`) to sort numbered files and folders numerically.
+The default remains filename order (`1, 10, 100, 2`). Folders stay first unless
+size sorting is active; equal sizes use the chosen filename order. This also
+applies inside local archives. Saving the preference keeps the same file selected.
+
 Youta never reorganizes folders automatically. Only explicit Rename, Move to
 Trash, and Move actions change selected entries. A durable move journal lets
 startup finish or reconcile interrupted moves without guessing which copy is
@@ -2105,6 +2111,7 @@ subscriptions_layout = 'drill-down' # drill-down or split
 show_youtube_shorts = true
 show_local_folder_sizes = true
 show_full_local_paths = false
+natural_local_sort = false
 youtube_thumbnail_size = 'automatic'
 nyan_cat_seekbar = false
 
@@ -2126,6 +2133,7 @@ codex_executable = 'codex'
 `YOUTA_UI__NYAN_CAT_SEEKBAR=true` override the corresponding TOML values.
 `YOUTA_UI__SHOW_LOCAL_FOLDER_SIZES=false` disables recursive size
 work, hides cached folder sizes, and removes the Local size-sort control.
+`YOUTA_UI__NATURAL_LOCAL_SORT=true` enables numeric filename ordering in Local.
 `YOUTA_UI__YOUTUBE_THUMBNAIL_SIZE=high` selects the strict 480×360 YouTube
 video-thumbnail entry. `YOUTA_PERSISTENCE__SAVE_PLAYBACK_HISTORY=false` stops
 new playback History entries and hides the History tab. It does not delete

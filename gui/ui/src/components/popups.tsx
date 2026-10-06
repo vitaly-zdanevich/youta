@@ -1732,6 +1732,7 @@ export function PreferencesPopup({ popup, archiveSupported }: {
 	add('YouTubeThumbnails', 'YouTube thumbnail size', popup.youtube_thumbnail_size, 'CycleYouTubeThumbnailSize');
 	toggle('LocalFolderSizes', 'Show Local folder sizes', popup.show_local_folder_sizes, 'ToggleLocalFolderSizes');
 	toggle('FullLocalPaths', 'Show full Local paths', popup.show_full_local_paths, 'ToggleFullLocalPaths');
+	toggle('NaturalLocalSort', 'Natural Local filename sorting (1, 2, 10)', popup.natural_local_sort, 'ToggleNaturalLocalSort');
 	toggle('TtyImages', 'Show artwork on a Linux console', popup.show_images_in_tty, 'ToggleTtyImages');
 	add('BandcampAudio', 'Bandcamp audio format', popup.bandcamp_audio_format, 'CycleBandcampAudioFormat');
 	add('VideoSummaries', 'Video summaries', popup.video_summary_backend === 'codex' ? 'Codex CLI' : 'off',
@@ -1776,9 +1777,9 @@ export function PreferencesPopup({ popup, archiveSupported }: {
 								}}
 							>
 								{label ? <span className='text-ink-dim'>{label}</span> : null}
-								{field === 'HourlyDownloads' ? (
+								{field === 'HourlyDownloads' || field === 'NaturalLocalSort' ? (
 									<input type='checkbox' data-youta-preferences='true'
-										aria-label={label} checked={popup.download_new_episodes_every_hour}
+										aria-label={label} checked={on ?? false}
 										onChange={() => void dispatch(action)} className='accent-accent' />
 								) : (
 									<PopupButton emphasis={on ?? false} onClick={() => void dispatch(action)}>{value}</PopupButton>

@@ -1176,6 +1176,8 @@ pub enum PreferencesField {
     LocalFolderSizes,
     /// Display complete local paths instead of abbreviating the home directory.
     FullLocalPaths,
+    /// Compare numeric parts of Local names by value rather than alphabetically.
+    NaturalLocalSort,
     /// Render artwork on a Linux virtual console.
     TtyImages,
     /// Choose a Bandcamp audio encoding.
@@ -1207,6 +1209,7 @@ impl PreferencesField {
             Self::YouTubeThumbnails => UiAction::CycleYouTubeThumbnailSize,
             Self::LocalFolderSizes => UiAction::ToggleLocalFolderSizes,
             Self::FullLocalPaths => UiAction::ToggleFullLocalPaths,
+            Self::NaturalLocalSort => UiAction::ToggleNaturalLocalSort,
             Self::TtyImages => UiAction::ToggleTtyImages,
             Self::BandcampAudio => UiAction::CycleBandcampAudioFormat,
             Self::VideoSummaries => UiAction::CycleVideoSummaryBackend,
@@ -1232,6 +1235,7 @@ impl PreferencesField {
             UiAction::CycleYouTubeThumbnailSize => Self::YouTubeThumbnails,
             UiAction::ToggleLocalFolderSizes => Self::LocalFolderSizes,
             UiAction::ToggleFullLocalPaths => Self::FullLocalPaths,
+            UiAction::ToggleNaturalLocalSort => Self::NaturalLocalSort,
             UiAction::ToggleTtyImages => Self::TtyImages,
             UiAction::CycleBandcampAudioFormat => Self::BandcampAudio,
             UiAction::CycleVideoSummaryBackend => Self::VideoSummaries,
@@ -1288,6 +1292,8 @@ pub struct PreferencesPopupView {
     pub show_local_folder_sizes: bool,
     /// Draft full local-path display behavior saved only on confirmation.
     pub show_full_local_paths: bool,
+    /// Draft numeric ordering of Local names, saved only on confirmation.
+    pub natural_local_sort: bool,
     /// Draft physical-Linux-TTY artwork behavior saved only on confirmation.
     pub show_images_in_tty: bool,
     /// Draft preferred Bandcamp playback encoding.
@@ -1323,6 +1329,7 @@ impl PreferencesPopupView {
             (Field::YouTubeThumbnails, cfg!(feature = "images")),
             (Field::LocalFolderSizes, true),
             (Field::FullLocalPaths, true),
+            (Field::NaturalLocalSort, true),
             (Field::TtyImages, cfg!(feature = "images")),
             (Field::BandcampAudio, cfg!(feature = "bandcamp")),
             (Field::VideoSummaries, self.video_summary_supported),
@@ -4357,6 +4364,8 @@ pub enum UiAction {
     ToggleLocalFolderSizes,
     /// Toggle full local paths instead of home-relative display in the draft.
     ToggleFullLocalPaths,
+    /// Toggle numeric ordering of Local names in the preferences draft.
+    ToggleNaturalLocalSort,
     /// Toggle half-block artwork on a physical Linux TTY in the draft.
     ToggleTtyImages,
     /// Cycle the preferred Bandcamp playback encoding in the draft.
@@ -4549,6 +4558,23 @@ pub trait UiController {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Both frontends use one stable action and focus identifier for numeric ordering.
+    #[test]
+    fn natural_local_sort_preference_has_shared_action_and_focus_ids() {
+        assert_eq!(
+            PreferencesField::from_action(&UiAction::ToggleNaturalLocalSort),
+            Some(PreferencesField::NaturalLocalSort)
+        );
+        assert_eq!(
+            serde_json::to_value(UiAction::ToggleNaturalLocalSort).unwrap(),
+            serde_json::json!("ToggleNaturalLocalSort")
+        );
+        assert_eq!(
+            serde_json::from_str::<PreferencesField>("\"NaturalLocalSort\"").unwrap(),
+            PreferencesField::NaturalLocalSort
+        );
+    }
 
     /// Both frontends share stable action and focus identifiers for local-path display.
     #[test]

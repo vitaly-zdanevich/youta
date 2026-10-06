@@ -536,6 +536,23 @@
 		await until(() => dialog()?.querySelector('[data-preferences-focused=true]')?.dataset.preferencesField === 'FullLocalPaths', 'Local path Preferences focus');
 		assert(button('on', dialog().querySelector('[data-preferences-field=FullLocalPaths]')), 'The Local path toggle reflects the updated draft');
 		await key(' ', { Char: ' ' });
+		const naturalSort = dialog().querySelector('[data-preferences-field=NaturalLocalSort]');
+		assert(naturalSort?.textContent.includes('Natural Local filename sorting (1, 2, 10)'), 'Preferences explains numeric filename ordering');
+		assert(naturalSort.previousElementSibling?.dataset.preferencesField === 'FullLocalPaths', 'Natural Local sorting follows full Local paths');
+		const naturalCheckbox = naturalSort.querySelector('input[type=checkbox]');
+		assert(naturalCheckbox && !naturalCheckbox.checked, 'Natural Local sorting is disabled by default');
+		await action('ToggleNaturalLocalSort', () => naturalCheckbox.click(), 'Natural Local sorting uses the shared toggle action');
+		snapshot({ preferences_popup: { ...preferences, selected_field: 'NaturalLocalSort', natural_local_sort: true } });
+		await until(() => dialog()?.querySelector('[data-preferences-focused=true]')?.dataset.preferencesField === 'NaturalLocalSort', 'Natural Local sorting Preferences focus');
+		assert(dialog().querySelector('[data-preferences-field=NaturalLocalSort] input').checked, 'Natural Local sorting reflects the updated draft');
+		for (const [name, wire] of [['ArrowDown', 'Down'], ['ArrowUp', 'Up'], [' ', { Char: ' ' }]]) {
+			const before = calls.length;
+			const event = new KeyboardEvent('keydown', { key: name, bubbles: true, cancelable: true });
+			dialog().querySelector('[data-preferences-field=NaturalLocalSort] input').dispatchEvent(event);
+			await until(() => calls.slice(before).some((call) => call.command === 'key' && JSON.stringify(call.args.press.key) === JSON.stringify(wire)), `Natural Local sorting forwards ${name}`);
+			assert(event.defaultPrevented, `Natural Local sorting ${name} prevents duplicate native activation`);
+			assert(!calls.slice(before).some((call) => call.command === 'dispatch'), `Natural Local sorting ${name} reaches only the shared keymap`);
+		}
 		const checkbox = dialog().querySelector('input[type=checkbox]');
 		await action({ SelectPreferencesField: 'HourlyDownloads' }, () => checkbox.focus(), 'Focusing a Preferences checkbox selects its shared control without toggling');
 		snapshot({ preferences_popup: { ...preferences, selected_field: 'HourlyDownloads' } });

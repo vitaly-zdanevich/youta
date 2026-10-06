@@ -200,6 +200,7 @@ export type UnitUiAction =
 	| 'ToggleHourlyAutoDownload'
 	| 'ToggleLocalFolderSizes'
 	| 'ToggleFullLocalPaths'
+	| 'ToggleNaturalLocalSort'
 	| 'ToggleNyanCatSeekbar'
 	| 'TogglePause'
 	| 'TogglePlaybackHistorySaving'

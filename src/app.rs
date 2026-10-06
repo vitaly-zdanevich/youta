@@ -100,11 +100,12 @@ use crate::commons_upload::{
 use crate::config::WikimediaCommonsAuthMethod;
 use crate::config::{
     BANDCAMP_AUDIO_FORMAT_ENV, BandcampAudioFormat, Config, FULL_LOCAL_PATHS_ENV,
-    LOCAL_FOLDER_SIZES_ENV, NYAN_CAT_SEEKBAR_ENV, PersistenceBackend, SAVE_PLAYBACK_HISTORY_ENV,
-    SKIP_ADVERTISEMENT_CHAPTERS_ENV, SPONSORBLOCK_ENABLED_ENV, SUBSCRIPTIONS_AUTO_DOWNLOAD_ENV,
-    SUBSCRIPTIONS_LAYOUT_ENV, SubscriptionsLayout, TTY_IMAGES_ENV, VIDEO_SUMMARY_BACKEND_ENV,
-    VideoSummaryBackend, YOUTUBE_PREWARM_ENV, YOUTUBE_THUMBNAIL_SIZE_ENV, YouTubeBackend,
-    YouTubeProviderSetting, YouTubeThumbnailSize, tui_preference_environment_variable_is_relevant,
+    LOCAL_FOLDER_SIZES_ENV, NATURAL_LOCAL_SORT_ENV, NYAN_CAT_SEEKBAR_ENV, PersistenceBackend,
+    SAVE_PLAYBACK_HISTORY_ENV, SKIP_ADVERTISEMENT_CHAPTERS_ENV, SPONSORBLOCK_ENABLED_ENV,
+    SUBSCRIPTIONS_AUTO_DOWNLOAD_ENV, SUBSCRIPTIONS_LAYOUT_ENV, SubscriptionsLayout, TTY_IMAGES_ENV,
+    VIDEO_SUMMARY_BACKEND_ENV, VideoSummaryBackend, YOUTUBE_PREWARM_ENV,
+    YOUTUBE_THUMBNAIL_SIZE_ENV, YouTubeBackend, YouTubeProviderSetting, YouTubeThumbnailSize,
+    tui_preference_environment_variable_is_relevant,
 };
 #[cfg(feature = "yt-dlp")]
 use crate::diagnostics::ExternalHelperProbeStatus;
@@ -15756,6 +15757,7 @@ impl AppController {
                 cache_directory: self.config.cache_dir().join("local-archives"),
                 options: crate::local_browser::LocalBrowseOptions {
                     show_all_files: self.view.show_all_local_files,
+                    natural_sort: self.config.ui.natural_local_sort,
                 },
             },
             "Could not open the local archive",
@@ -15925,6 +15927,7 @@ impl AppController {
                 preferred_child: reselect_child,
                 options: crate::local_browser::LocalBrowseOptions {
                     show_all_files: self.view.show_all_local_files,
+                    natural_sort: self.config.ui.natural_local_sort,
                 },
             },
             "Could not open the local folder",
@@ -16278,6 +16281,7 @@ impl AppController {
     /// Applies the selected deterministic Local ordering to the listing.
     fn sort_local_listing(&mut self) {
         let sizes_enabled = self.config.ui.show_local_folder_sizes;
+        let natural_sort = self.config.ui.natural_local_sort;
         let mode = if sizes_enabled {
             self.view.local_size_sort
         } else {
@@ -16292,11 +16296,13 @@ impl AppController {
             return;
         };
         listing.entries.sort_by(|left, right| {
+            let compare_names =
+                || crate::local_browser::compare_local_names(&left.name, &right.name, natural_sort);
             if mode == LocalSizeSort::Off {
                 return right
                     .is_directory()
                     .cmp(&left.is_directory())
-                    .then_with(|| left.name.cmp(&right.name));
+                    .then_with(compare_names);
             }
             let known_size = |entry: &crate::local_browser::LocalEntry| {
                 if entry.is_directory() {
@@ -16320,11 +16326,11 @@ impl AppController {
                         LocalSizeSort::Descending => right_size.cmp(&left_size),
                         LocalSizeSort::Off => std::cmp::Ordering::Equal,
                     };
-                    size_order.then_with(|| left.name.cmp(&right.name))
+                    size_order.then_with(compare_names)
                 }
                 (Some(_), None) => std::cmp::Ordering::Less,
                 (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => left.name.cmp(&right.name),
+                (None, None) => compare_names(),
             }
         });
     }
@@ -32923,6 +32929,7 @@ impl AppController {
             YOUTUBE_THUMBNAIL_SIZE_ENV,
             LOCAL_FOLDER_SIZES_ENV,
             FULL_LOCAL_PATHS_ENV,
+            NATURAL_LOCAL_SORT_ENV,
             TTY_IMAGES_ENV,
             BANDCAMP_AUDIO_FORMAT_ENV,
             SAVE_PLAYBACK_HISTORY_ENV,
@@ -32956,6 +32963,7 @@ impl AppController {
             youtube_thumbnail_size: self.config.ui.youtube_thumbnail_size,
             show_local_folder_sizes: self.config.ui.show_local_folder_sizes,
             show_full_local_paths: self.config.ui.show_full_local_paths,
+            natural_local_sort: self.config.ui.natural_local_sort,
             show_images_in_tty: self.config.ui.show_images_in_tty,
             bandcamp_audio_format: self.config.providers.bandcamp_audio_format,
             save_playback_history: self.config.persistence.save_playback_history,
@@ -33226,6 +33234,20 @@ impl AppController {
             return;
         }
         preferences.show_full_local_paths = !preferences.show_full_local_paths;
+        preferences.validation_error = None;
+    }
+
+    /// Changes only the numeric Local ordering draft until Preferences is saved.
+    fn toggle_draft_natural_local_sort(&mut self) {
+        let Some(preferences) = self.view.preferences_popup.as_mut() else {
+            return;
+        };
+        if preferences.environment_override.is_some() {
+            preferences.validation_error =
+                Some("an environment variable controls this preference".to_owned());
+            return;
+        }
+        preferences.natural_local_sort = !preferences.natural_local_sort;
         preferences.validation_error = None;
     }
 
@@ -34140,6 +34162,7 @@ impl AppController {
         let youtube_thumbnail_size = preferences.youtube_thumbnail_size;
         let show_local_folder_sizes = preferences.show_local_folder_sizes;
         let show_full_local_paths = preferences.show_full_local_paths;
+        let natural_local_sort = preferences.natural_local_sort;
         #[cfg(feature = "images")]
         let show_images_in_tty = preferences.show_images_in_tty;
         #[cfg(not(feature = "images"))]
@@ -34163,6 +34186,7 @@ impl AppController {
             self.config.ui.show_local_folder_sizes != show_local_folder_sizes;
         let local_path_preference_changed =
             self.config.ui.show_full_local_paths != show_full_local_paths;
+        let local_sort_preference_changed = self.config.ui.natural_local_sort != natural_local_sort;
         let youtube_thumbnail_preference_changed =
             self.config.ui.youtube_thumbnail_size != youtube_thumbnail_size;
         if let Err(error) = self.config.save_tui_preferences(
@@ -34173,6 +34197,7 @@ impl AppController {
             youtube_prewarm,
             show_local_folder_sizes,
             show_full_local_paths,
+            natural_local_sort,
             show_images_in_tty,
             youtube_thumbnail_size,
             save_playback_history,
@@ -34233,18 +34258,32 @@ impl AppController {
             }
         }
         if local_folder_size_preference_changed {
-            let selected_path = self.selected_local_path();
+            let selected_path = (self.view.screen == Screen::Local)
+                .then(|| self.selected_local_path())
+                .flatten();
             self.invalidate_local_folder_sizes();
             self.view.local_folder_sizes_enabled = show_local_folder_sizes;
             if !show_local_folder_sizes {
                 self.view.local_size_sort = LocalSizeSort::Off;
             }
             self.sort_local_listing();
-            self.select_local_path(selected_path.as_deref());
             if self.view.screen == Screen::Local {
+                self.select_local_path(selected_path.as_deref());
                 self.refresh_local_browser_rows();
             }
             self.schedule_local_folder_sizes();
+        }
+        if local_sort_preference_changed && !local_folder_size_preference_changed {
+            // Reorder the accepted snapshot without rescanning or changing the
+            // captured playback queue. Other screens own their selection index.
+            let selected_path = (self.view.screen == Screen::Local)
+                .then(|| self.selected_local_path())
+                .flatten();
+            self.sort_local_listing();
+            if self.view.screen == Screen::Local {
+                self.select_local_path(selected_path.as_deref());
+                self.refresh_local_browser_rows_without_detail();
+            }
         }
         self.view.show_images_in_tty = show_images_in_tty;
         if local_path_preference_changed {
@@ -36248,6 +36287,7 @@ impl UiController for AppController {
             }
             UiAction::ToggleLocalFolderSizes => self.toggle_draft_local_folder_sizes(),
             UiAction::ToggleFullLocalPaths => self.toggle_draft_full_local_paths(),
+            UiAction::ToggleNaturalLocalSort => self.toggle_draft_natural_local_sort(),
             UiAction::ToggleTtyImages => self.toggle_draft_tty_images(),
             UiAction::CycleBandcampAudioFormat => {
                 self.cycle_draft_bandcamp_audio_format();
@@ -46378,6 +46418,8 @@ mod tests {
     mod download_choice_tests;
     #[path = "end_pause.rs"]
     mod end_pause_tests;
+    #[path = "local_sort.rs"]
+    mod local_sort_tests;
     #[path = "local_track_metadata.rs"]
     mod local_track_metadata_tests;
     #[cfg(feature = "yt-dlp")]
@@ -62944,6 +62986,7 @@ mod tests {
             crate::local_browser::LocalBrowseLimits::default(),
             crate::local_browser::LocalBrowseOptions {
                 show_all_files: true,
+                natural_sort: false,
             },
         )
         .expect("show-all Local listing");
@@ -62987,6 +63030,7 @@ mod tests {
             crate::local_browser::LocalBrowseLimits::default(),
             crate::local_browser::LocalBrowseOptions {
                 show_all_files: true,
+                natural_sort: false,
             },
         )
         .expect("show-all Local listing");

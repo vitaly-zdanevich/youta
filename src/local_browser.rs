@@ -5,6 +5,7 @@
 //! provide an explicit [`LocalFileActions`] implementation before rename or
 //! Trash operations can run.
 
+use std::cmp::Ordering;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
@@ -52,6 +53,63 @@ impl Default for LocalBrowseLimits {
 pub struct LocalBrowseOptions {
     /// Whether otherwise unsupported regular files should be returned.
     pub show_all_files: bool,
+    /// Order filename digit runs numerically while retaining directories first.
+    pub natural_sort: bool,
+}
+
+/// Compares exact filenames using the selected Local name-order preference.
+///
+/// Natural ordering compares ASCII digit runs by their numeric magnitude without
+/// parsing integers, allocating, or replacing non-UTF-8 bytes. Case, whitespace,
+/// and other bytes remain significant. Numerically equal spellings fall back to
+/// the original filename order so zero-padded names have deterministic positions.
+/// Disabling the preference preserves the platform's existing [`OsStr`] order.
+#[must_use]
+pub fn compare_local_names(left: &OsStr, right: &OsStr, natural: bool) -> Ordering {
+    if !natural {
+        return left.cmp(right);
+    }
+    let (mut left_bytes, mut right_bytes) = (left.as_encoded_bytes(), right.as_encoded_bytes());
+    while let (Some(&a), Some(&b)) = (left_bytes.first(), right_bytes.first()) {
+        if a.is_ascii_digit() && b.is_ascii_digit() {
+            let left_len = left_bytes
+                .iter()
+                .take_while(|byte| byte.is_ascii_digit())
+                .count();
+            let right_len = right_bytes
+                .iter()
+                .take_while(|byte| byte.is_ascii_digit())
+                .count();
+            let left_digits = &left_bytes[..left_len];
+            let right_digits = &right_bytes[..right_len];
+            let left_number =
+                &left_digits[left_digits.iter().take_while(|byte| **byte == b'0').count()..];
+            let right_number = &right_digits[right_digits
+                .iter()
+                .take_while(|byte| **byte == b'0')
+                .count()..];
+            let order = left_number
+                .len()
+                .cmp(&right_number.len())
+                .then_with(|| left_number.cmp(right_number));
+            if order != Ordering::Equal {
+                return order;
+            }
+            left_bytes = &left_bytes[left_len..];
+            right_bytes = &right_bytes[right_len..];
+        } else {
+            let order = a.cmp(&b);
+            if order != Ordering::Equal {
+                return order;
+            }
+            left_bytes = &left_bytes[1..];
+            right_bytes = &right_bytes[1..];
+        }
+    }
+    left_bytes
+        .len()
+        .cmp(&right_bytes.len())
+        .then_with(|| left.cmp(right))
 }
 
 /// Resource limits applied to one recursive folder-size measurement.
@@ -505,10 +563,12 @@ pub fn list_local_directory(
     list_local_directory_with_options(path, limits, LocalBrowseOptions::default())
 }
 
-/// Lists local entries using explicit visibility options.
+/// Lists local entries using explicit visibility and filename-order options.
 ///
 /// This is the opt-in counterpart to [`list_local_directory`]. Its default
 /// options produce the same media-and-directory-only listing as that function.
+/// Natural ordering compares numbered names within the directory and file groups;
+/// it does not change visibility, resource limits, or the returned file identities.
 ///
 /// # Errors
 ///
@@ -554,7 +614,7 @@ pub fn list_local_directory_with_preferred_child(
     )
 }
 
-/// Lists local entries with a preferred-child hint and visibility options.
+/// Lists local entries with a preferred-child hint and explicit listing options.
 ///
 /// When `options.show_all_files` is enabled, an otherwise unsupported regular
 /// file is also eligible for the preferred-child reservation. All safety and
@@ -642,7 +702,7 @@ pub fn list_local_directory_with_preferred_child_and_options(
         let right_directory = right.kind == LocalEntryKind::Directory;
         right_directory
             .cmp(&left_directory)
-            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| compare_local_names(&left.name, &right.name, options.natural_sort))
     });
 
     Ok(LocalDirectoryListing {
@@ -1187,6 +1247,138 @@ mod tests {
         assert!(!is_local_text_file(Path::new("README.backup")));
     }
 
+    /// Natural ordering is opt-in and applies within both directory and file groups.
+    #[test]
+    fn natural_sort_lists_numeric_names_with_directories_first() {
+        let fixture = Fixture::new();
+        for directory in ["disc10", "disc2", "disc1"] {
+            fs::create_dir(fixture.path().join(directory)).unwrap();
+        }
+        for filename in ["100.mp3", "10.mp3", "2.mp3", "1.mp3"] {
+            write_file(&fixture.path().join(filename), b"audio");
+        }
+        for (natural_sort, expected) in [
+            (
+                false,
+                [
+                    "disc1", "disc10", "disc2", "1.mp3", "10.mp3", "100.mp3", "2.mp3",
+                ],
+            ),
+            (
+                true,
+                [
+                    "disc1", "disc2", "disc10", "1.mp3", "2.mp3", "10.mp3", "100.mp3",
+                ],
+            ),
+        ] {
+            let listing = list_local_directory_with_options(
+                fixture.path(),
+                LocalBrowseLimits::default(),
+                LocalBrowseOptions {
+                    natural_sort,
+                    ..LocalBrowseOptions::default()
+                },
+            )
+            .unwrap();
+            let names: Vec<_> = listing
+                .entries
+                .iter()
+                .map(LocalEntry::display_name)
+                .collect();
+            assert_eq!(names, expected, "natural_sort={natural_sort}");
+            assert!(
+                listing
+                    .entries
+                    .iter()
+                    .all(|entry| entry.path.file_name() == Some(entry.name.as_os_str()))
+            );
+        }
+    }
+
+    /// Numeric runs never overflow, and equal numbers retain an exact-name tie break.
+    #[test]
+    fn natural_sort_handles_multiple_runs_zeroes_and_large_numbers() {
+        for (left, right) in [
+            ("disc2-track9.flac", "disc2-track10.flac"),
+            ("disc2-track100.flac", "disc10-track1.flac"),
+            ("0.mp3", "000.mp3"),
+            ("02.mp3", "2.mp3"),
+            ("track02-a.mp3", "track2-b.mp3"),
+            ("A10.mp3", "a2.mp3"),
+            (" 10.mp3", "2.mp3"),
+            ("трек2.mp3", "трек10.mp3"),
+        ] {
+            assert_eq!(
+                compare_local_names(OsStr::new(left), OsStr::new(right), true),
+                Ordering::Less,
+                "{left} < {right}"
+            );
+            assert_eq!(
+                compare_local_names(OsStr::new(right), OsStr::new(left), true),
+                Ordering::Greater
+            );
+        }
+        let smaller = format!("{}.mp3", "9".repeat(200));
+        let larger = format!("1{}.mp3", "0".repeat(200));
+        assert_eq!(
+            compare_local_names(OsStr::new(&smaller), OsStr::new(&larger), true),
+            Ordering::Less
+        );
+    }
+
+    /// Natural comparison remains a total order even around zero-padded numeric ties.
+    #[test]
+    fn natural_sort_comparison_is_consistent() {
+        let names: Vec<_> = [
+            "", "0", "00", "1", "01", "2", "10", "a1", "a01", "a1b", "a01a", "a2", "a10",
+        ]
+        .into_iter()
+        .map(OsStr::new)
+        .collect();
+        for &left in &names {
+            for &right in &names {
+                let order = compare_local_names(left, right, true);
+                assert_eq!(order.reverse(), compare_local_names(right, left, true));
+                assert_eq!(order == Ordering::Equal, left == right);
+                assert_eq!(compare_local_names(left, right, false), left.cmp(right));
+                for &third in &names {
+                    if order.is_le() && compare_local_names(right, third, true).is_le() {
+                        assert!(compare_local_names(left, third, true).is_le());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Unix filenames retain their non-UTF-8 bytes instead of comparing replacement text.
+    #[cfg(unix)]
+    #[test]
+    fn natural_sort_preserves_non_utf8_names() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let two = OsString::from_vec(b"track\xff2.mp3".to_vec());
+        let ten = OsString::from_vec(b"track\xff10.mp3".to_vec());
+        let other = OsString::from_vec(b"track\xfe2.mp3".to_vec());
+        assert_eq!(compare_local_names(&two, &ten, true), Ordering::Less);
+        assert_ne!(compare_local_names(&two, &other, true), Ordering::Equal);
+        let fixture = Fixture::new();
+        for name in [&ten, &two] {
+            write_file(&fixture.path().join(name), b"audio");
+        }
+        let listing = list_local_directory_with_options(
+            fixture.path(),
+            LocalBrowseLimits::default(),
+            LocalBrowseOptions {
+                natural_sort: true,
+                ..LocalBrowseOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(listing.entries[0].name, two);
+        assert_eq!(listing.entries[1].name, ten);
+        assert_eq!(listing.entries[0].path, fixture.path().join(&two));
+    }
+
     #[test]
     fn lists_supported_entries_nonrecursively_with_directories_first() {
         let fixture = Fixture::new();
@@ -1261,6 +1453,7 @@ mod tests {
             LocalBrowseLimits::default(),
             LocalBrowseOptions {
                 show_all_files: true,
+                ..LocalBrowseOptions::default()
             },
         )
         .expect("show-all listing");
@@ -1307,6 +1500,7 @@ mod tests {
             LocalBrowseLimits::default(),
             LocalBrowseOptions {
                 show_all_files: true,
+                ..LocalBrowseOptions::default()
             },
         )
         .expect("show-all listing");
@@ -1458,6 +1652,7 @@ mod tests {
             Some(&preferred),
             LocalBrowseOptions {
                 show_all_files: true,
+                ..LocalBrowseOptions::default()
             },
         )
         .expect("show-all listing with reserved preferred child");
@@ -1484,6 +1679,7 @@ mod tests {
             LocalBrowseLimits::default(),
             LocalBrowseOptions {
                 show_all_files: true,
+                ..LocalBrowseOptions::default()
             },
         )
         .expect("show-all listing");

@@ -452,6 +452,14 @@ Toggle showing all Local files.
 .B Z
 Cycle Local folder-size sorting off, ascending, and descending when folder
 size measurement is enabled.
+.PP
+Preferences includes
+.B Natural Local filename sorting (1, 2, 10)
+to order numbered files and folders numerically, including inside local archives.
+It is off by default. Folders stay first unless size sorting is active;
+equal sizes use the selected filename order. Saving keeps the same entry selected.
+The configuration key is
+.BR ui.natural_local_sort .
 .TP
 .B f
 Fingerprint selected supported Local audio through Chromaprint and AcoustID.

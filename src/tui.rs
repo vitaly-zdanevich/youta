@@ -12901,7 +12901,7 @@ fn render_preferences_content(
             Constraint::Length(2),
             // Download and playback source policies remain independent controls.
             Constraint::Length(5),
-            Constraint::Length(3),
+            Constraint::Length(4),
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(2),
@@ -13324,6 +13324,36 @@ fn render_preferences_content(
             centered_line_x(full_paths_area, terminal_text_width(&full_paths_label)),
             full_paths_area.y,
             terminal_text_width(&full_paths_label).min(full_paths_area.width),
+            1,
+        ),
+    ));
+
+    let natural_sort_label = format!(
+        "Natural Local filename sorting (1, 2, 10): {}",
+        if preferences.natural_local_sort {
+            "on"
+        } else {
+            "off"
+        }
+    );
+    let natural_sort_area = Rect::new(
+        sections[6].x,
+        sections[6].y.saturating_add(3),
+        sections[6].width,
+        1,
+    );
+    frame.render_widget(
+        Paragraph::new(natural_sort_label.clone())
+            .style(theme.base)
+            .alignment(Alignment::Center),
+        natural_sort_area,
+    );
+    hit_map.preferences_buttons.push((
+        UiAction::ToggleNaturalLocalSort,
+        Rect::new(
+            centered_line_x(natural_sort_area, terminal_text_width(&natural_sort_label)),
+            natural_sort_area.y,
+            terminal_text_width(&natural_sort_label).min(natural_sort_area.width),
             1,
         ),
     ));
@@ -23895,6 +23925,7 @@ for encoded, expected in json.load(sys.stdin):
                 show_images_in_tty: true,
                 show_local_folder_sizes: true,
                 show_full_local_paths: false,
+                natural_local_sort: false,
                 bandcamp_audio_format: BandcampAudioFormat::BestAvailable,
                 video_summary_backend: VideoSummaryBackend::Codex,
                 video_summary_supported: true,
@@ -24483,93 +24514,107 @@ for encoded, expected in json.load(sys.stdin):
         }));
     }
 
-    /// Local path presentation remains accessible through shared focus and mouse routing.
+    /// Local presentation preferences use shared focus, mouse routing, and draft values.
     #[test]
-    fn full_local_paths_preference_supports_keyboard_and_mouse() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut controller = crate::app::AppController::new(
-            crate::config::Config::for_dir(directory.path().join("youta")),
-            crate::persistence::StateStore::open_in_memory().unwrap(),
-            None,
-            None,
-        );
-        controller.dispatch(UiAction::OpenPreferences);
-        controller.dispatch(UiAction::SelectPreferencesField(
-            PreferencesField::LocalFolderSizes,
-        ));
-        let next = key_action(
-            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
-            controller.view(),
-        )
-        .expect("move to full Local paths");
-        controller.dispatch(next);
-        let preferences = controller.view().preferences_popup.as_ref().unwrap();
-        assert_eq!(preferences.selected_field, PreferencesField::FullLocalPaths);
-        assert!(!preferences.show_full_local_paths);
-
-        let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
-        let mut hit_map = HitMap::default();
-        terminal
-            .draw(|frame| {
-                render(
-                    frame,
-                    controller.view(),
-                    &UiSettings::default(),
-                    &mut hit_map,
-                );
-            })
-            .unwrap();
-        assert!(rendered_text(&terminal).contains("Show full Local paths: off"));
-        let (_, target) = hit_map
-            .preferences_buttons
-            .iter()
-            .find(|(action, _)| action == &UiAction::ToggleFullLocalPaths)
-            .expect("full Local paths click target");
-        assert_eq!(
-            mouse_action(
-                MouseEvent {
-                    kind: MouseEventKind::Down(MouseButton::Left),
-                    column: target.x,
-                    row: target.y,
-                    modifiers: KeyModifiers::NONE,
-                },
-                &hit_map,
-                controller.view(),
+    fn local_display_preferences_support_keyboard_and_mouse() {
+        for (previous_field, selected_field, action, label) in [
+            (
+                PreferencesField::LocalFolderSizes,
+                PreferencesField::FullLocalPaths,
+                UiAction::ToggleFullLocalPaths,
+                "Show full Local paths",
             ),
-            Some(UiAction::ToggleFullLocalPaths)
-        );
-        let toggle = key_action(
-            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
-            controller.view(),
-        );
-        assert_eq!(toggle, Some(UiAction::ToggleFullLocalPaths));
-        controller.dispatch(toggle.unwrap());
-        terminal
-            .draw(|frame| {
-                render(
-                    frame,
+            (
+                PreferencesField::FullLocalPaths,
+                PreferencesField::NaturalLocalSort,
+                UiAction::ToggleNaturalLocalSort,
+                "Natural Local filename sorting (1, 2, 10)",
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut controller = crate::app::AppController::new(
+                crate::config::Config::for_dir(directory.path().join("youta")),
+                crate::persistence::StateStore::open_in_memory().unwrap(),
+                None,
+                None,
+            );
+            controller.dispatch(UiAction::OpenPreferences);
+            controller.dispatch(UiAction::SelectPreferencesField(previous_field));
+            let next = key_action(
+                KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+                controller.view(),
+            )
+            .expect("move to the next Local preference");
+            controller.dispatch(next);
+            let preferences = controller.view().preferences_popup.as_ref().unwrap();
+            assert_eq!(preferences.selected_field, selected_field);
+            assert!(!preferences.show_full_local_paths);
+            assert!(!preferences.natural_local_sort);
+
+            let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
+            let mut hit_map = HitMap::default();
+            terminal
+                .draw(|frame| {
+                    render(
+                        frame,
+                        controller.view(),
+                        &UiSettings::default(),
+                        &mut hit_map,
+                    );
+                })
+                .unwrap();
+            assert!(rendered_text(&terminal).contains(&format!("{label}: off")));
+            let (_, target) = hit_map
+                .preferences_buttons
+                .iter()
+                .find(|(candidate, _)| candidate == &action)
+                .expect("Local preference click target");
+            assert_eq!(
+                mouse_action(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: target.x,
+                        row: target.y,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    &hit_map,
                     controller.view(),
-                    &UiSettings::default(),
-                    &mut hit_map,
-                );
-            })
-            .unwrap();
-        assert!(rendered_text(&terminal).contains("Show full Local paths: on"));
-        let previous = key_action(
-            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
-            controller.view(),
-        )
-        .expect("return to Local folder sizes");
-        controller.dispatch(previous);
-        assert_eq!(
-            controller
-                .view()
-                .preferences_popup
-                .as_ref()
-                .unwrap()
-                .selected_field,
-            PreferencesField::LocalFolderSizes
-        );
+                ),
+                Some(action.clone())
+            );
+            let toggle = key_action(
+                KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+                controller.view(),
+            );
+            assert_eq!(toggle, Some(action));
+            controller.dispatch(toggle.unwrap());
+            terminal
+                .draw(|frame| {
+                    render(
+                        frame,
+                        controller.view(),
+                        &UiSettings::default(),
+                        &mut hit_map,
+                    );
+                })
+                .unwrap();
+            assert!(rendered_text(&terminal).contains(&format!("{label}: on")));
+            let previous = key_action(
+                KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+                controller.view(),
+            )
+            .expect("return to the previous Local preference");
+            controller.dispatch(previous);
+            assert_eq!(
+                controller
+                    .view()
+                    .preferences_popup
+                    .as_ref()
+                    .unwrap()
+                    .selected_field,
+                previous_field
+            );
+        }
     }
 
     #[test]
@@ -24652,6 +24697,7 @@ for encoded, expected in json.load(sys.stdin):
                 show_images_in_tty: true,
                 show_local_folder_sizes: true,
                 show_full_local_paths: false,
+                natural_local_sort: false,
                 bandcamp_audio_format: BandcampAudioFormat::BestAvailable,
                 video_summary_backend: VideoSummaryBackend::Off,
                 video_summary_supported: true,
@@ -24711,6 +24757,7 @@ for encoded, expected in json.load(sys.stdin):
                 show_images_in_tty: true,
                 show_local_folder_sizes: true,
                 show_full_local_paths: false,
+                natural_local_sort: false,
                 bandcamp_audio_format: BandcampAudioFormat::BestAvailable,
                 video_summary_backend: VideoSummaryBackend::Off,
                 video_summary_supported: true,
