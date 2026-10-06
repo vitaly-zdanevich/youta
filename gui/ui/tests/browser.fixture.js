@@ -497,6 +497,27 @@
 		}
 		snapshot(previous);
 	}
+	/** Local track metadata stays in the shared description and missing tags remain absent. */
+	async function checkLocalTrackMetadata() {
+		const previous = clone(view);
+		for (const [label, description] of [
+			['number', 'Album: Fixture album\nTrack: 3\n\nFull path:\n/fixture/music/audio.flac'],
+			['number and total', 'Album: Fixture album\nTrack: 3/12\n\nFull path:\n/fixture/music/audio.flac'],
+			['missing', 'Album: Fixture album\n\nFull path:\n/fixture/music/audio.flac'],
+		]) {
+			const title = `Local track metadata: ${label}`;
+			snapshot({ screen: 'Local', details: { ...clone(defaults.DetailView),
+				title, source: 'Local', description,
+				media_id: { source: 'local', external_id: '/fixture/music/audio.flac' },
+			} });
+			await until(() => document.querySelector('[aria-label=Details] h2')?.textContent === title, title);
+			const panel = document.querySelector('[aria-label=Details]');
+			assert(panel.querySelector('[data-description]')?.textContent === description,
+				`Local Details preserves the shared track metadata description: ${label}`);
+			if (label === 'missing') assert(!panel.textContent.includes('Track:'), 'Missing Local track metadata does not fabricate a field');
+		}
+		snapshot(previous);
+	}
 	/** Focus snapshots and native checkbox/button keys must agree with the shared keymap. */
 	async function checkPreferencesFocus() {
 		const preferences = { ...clone(defaults.PreferencesPopupView), selected_field: 'SubscriptionsLayout',
@@ -570,6 +591,7 @@
 		snapshot(beforeTabMarkers);
 		await checkRadioPresentation();
 		await checkLocalFullPath();
+		await checkLocalTrackMetadata();
 		await checkPreferencesFocus();
 		await checkUnsubscribeConfirmation();
 		await checkProviderSettings();

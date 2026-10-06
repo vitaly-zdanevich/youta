@@ -113,6 +113,9 @@ local video lazily extracts its midpoint frame through a bounded `ffmpeg`
 worker and reuses the persistent thumbnail cache on later visits. A
 display-only fallback repairs strong Windows-1251 text that legacy MP3 tags
 incorrectly declare as Latin-1; Unicode tags and media files are never rewritten.
+When tags provide a track number, Details shows `Track: 3`, or `Track: 3/12`
+when the total is also available. Missing track numbers are omitted, not
+guessed from filenames.
 
 The default-on `local-archives` feature presents ZIP and RAR files as read-only
 folders. `Enter` opens an archive or nested archive; `Esc` returns to its

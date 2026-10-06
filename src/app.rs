@@ -1262,6 +1262,10 @@ struct LocalMediaItem {
     title: String,
     artist: Option<String>,
     album: Option<String>,
+    /// Positive track number supplied by embedded metadata, never a filename.
+    track_number: Option<u32>,
+    /// Positive total supplied by metadata, displayed only with a track number.
+    track_total: Option<u32>,
     genre: Option<String>,
     comment: Option<String>,
     metadata_url: Option<String>,
@@ -41192,6 +41196,8 @@ fn local_media_item_stub(path: PathBuf, known_size_bytes: Option<u64>) -> LocalM
         title,
         artist: None,
         album: None,
+        track_number: None,
+        track_total: None,
         genre: None,
         comment: None,
         metadata_url: None,
@@ -41362,6 +41368,8 @@ fn apply_local_id3v2_tag(item: &mut LocalMediaItem, tag: &lofty::id3::v2::Id3v2T
         generic.album().as_deref(),
         local_id3v2_text_encoding(tag, "TALB"),
     );
+    // Generic conversion validates number-pair positions before exposing them.
+    apply_local_track_metadata(item, &generic);
     item.genre = normalized_local_id3v2_value(
         generic.genre().as_deref(),
         local_id3v2_text_encoding(tag, "TCON"),
@@ -41409,6 +41417,7 @@ fn apply_local_id3v1_tag(item: &mut LocalMediaItem, tag: &lofty::id3::v1::Id3v1T
     }
     item.artist = normalized_legacy_windows_1251_value(tag.artist.as_deref());
     item.album = normalized_legacy_windows_1251_value(tag.album.as_deref());
+    apply_local_track_metadata(item, tag);
     item.genre = trimmed_tag_value(tag.genre().as_deref());
     item.comment = normalized_legacy_windows_1251_value(tag.comment.as_deref());
 }
@@ -41475,6 +41484,7 @@ fn apply_local_vorbis_comments(item: &mut LocalMediaItem, tag: &lofty::ogg::Vorb
     item.artist = joined_tag_values(tag.get_all("ARTISTS"))
         .or_else(|| joined_tag_values(tag.get_all("ARTIST")));
     item.album = trimmed_tag_value(tag.get("ALBUM"));
+    apply_local_track_metadata(item, tag);
     item.genre = joined_tag_values(tag.get_all("GENRE"));
     item.comment = joined_tag_values(tag.get_all("COMMENT"));
     item.metadata_url = trimmed_tag_value(tag.get("URL"));
@@ -41492,9 +41502,17 @@ fn apply_local_generic_tag(item: &mut LocalMediaItem, tag: &lofty::tag::Tag) {
     item.artist = trimmed_tag_value(tag.get_string(ItemKey::TrackArtists))
         .or_else(|| trimmed_tag_value(tag.artist().as_deref()));
     item.album = trimmed_tag_value(tag.album().as_deref());
+    apply_local_track_metadata(item, tag);
     item.genre = trimmed_tag_value(tag.genre().as_deref());
     item.comment = trimmed_tag_value(tag.comment().as_deref());
     apply_local_generic_identifiers(item, tag);
+}
+
+/// Retains only positive track values parsed by Lofty's format-aware accessors.
+#[cfg(feature = "local-metadata")]
+fn apply_local_track_metadata(item: &mut LocalMediaItem, tag: &impl lofty::tag::Accessor) {
+    item.track_number = tag.track().filter(|number| *number > 0);
+    item.track_total = tag.track_total().filter(|total| *total > 0);
 }
 
 /// Applies URL and identifier values without any character-set repair.
@@ -41621,6 +41639,12 @@ fn local_media_description_with_path(item: &LocalMediaItem, path_label: &str) ->
     }
     if let Some(album) = &item.album {
         lines.push(format!("Album: {album}"));
+    }
+    if let Some(number) = item.track_number {
+        lines.push(match item.track_total {
+            Some(total) => format!("Track: {number}/{total}"),
+            None => format!("Track: {number}"),
+        });
     }
     if let Some(genre) = &item.genre {
         lines.push(format!("Genre: {genre}"));
@@ -46354,6 +46378,8 @@ mod tests {
     mod download_choice_tests;
     #[path = "end_pause.rs"]
     mod end_pause_tests;
+    #[path = "local_track_metadata.rs"]
+    mod local_track_metadata_tests;
     #[cfg(feature = "yt-dlp")]
     #[path = "manual_download_queue.rs"]
     mod manual_download_queue_tests;
@@ -68521,6 +68547,8 @@ mod tests {
             title: "mock".to_owned(),
             artist: None,
             album: None,
+            track_number: None,
+            track_total: None,
             genre: None,
             comment: None,
             metadata_url: None,
@@ -75801,6 +75829,8 @@ mod tests {
             title: "Local".to_owned(),
             artist: Some("Artist One; Artist Two".to_owned()),
             album: Some("Album".to_owned()),
+            track_number: None,
+            track_total: None,
             genre: Some("Trip hop".to_owned()),
             comment: Some("Visit the artist website".to_owned()),
             metadata_url: Some("https://artist.example".to_owned()),
