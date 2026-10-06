@@ -242,7 +242,7 @@ impl AppController {
         });
         self.queue_archive_zip_request(parent, archive, true);
         self.begin_search_activity(SearchActivity::ArchiveOrg);
-        self.view.status_line = "Opening archive.org ZIP…".into();
+        self.view.status_line = "Opening archive.org ZIP...".into();
         self.update_archive_back_available();
     }
 
@@ -339,7 +339,7 @@ impl AppController {
                 false,
             );
             self.begin_search_activity(SearchActivity::ArchiveOrg);
-            self.view.status_line = "Opening enclosing archive.org item…".into();
+            self.view.status_line = "Opening enclosing archive.org item...".into();
         }
         true
     }

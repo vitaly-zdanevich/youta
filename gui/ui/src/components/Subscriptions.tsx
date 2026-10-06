@@ -373,7 +373,7 @@ export function Subscriptions({
               credential, so the window can ask for it to be opened but never
               draws it. */}
           <PaneButton onClick={() => void dispatch("OpenRssSubscriptionPopup")}>
-            Add RSS feed…
+            Add RSS feed...
           </PaneButton>
         </Pane>
       ) : null}
@@ -389,14 +389,14 @@ export function Subscriptions({
           playing={playing}
           onSelect={(index) => void dispatch({ SelectSubscriptionItem: index })}
           empty={
-			refreshing ? `Loading ${noun}…` : `No ${noun} loaded for this source.`
+			refreshing ? `Loading ${noun}...` : `No ${noun} loaded for this source.`
           }
         >
 		<PaneButton
 			focusAfterCommand
 			onClick={() => void dispatch("RefreshSubscriptionVideos")}
 		>
-			{refreshing ? `Refreshing ${noun}…` : `Refresh ${noun}`}
+			{refreshing ? `Refreshing ${noun}...` : `Refresh ${noun}`}
 		</PaneButton>
           {subscriptions.source_kind === "you-tube" ? (
             <PaneButton
@@ -413,7 +413,7 @@ export function Subscriptions({
           ) : null}
 			{subscriptions.loading_more ? (
 				<span role='status' className="self-center text-[11px] whitespace-nowrap text-ink-faint">
-					Loading more…
+					Loading more...
 				</span>
 			) : null}
         </Pane>

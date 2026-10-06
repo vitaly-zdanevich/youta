@@ -66,7 +66,7 @@ impl AppController {
         });
         // Resolving a new intent must not hide or replace the currently playing
         // item. The common loader starts playback activity only after acceptance.
-        self.view.status_line = "Checking public SoundCloud playback availability…".to_owned();
+        self.view.status_line = "Checking public SoundCloud playback availability...".to_owned();
         self.poll_soundcloud_playback();
     }
 

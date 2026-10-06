@@ -171,7 +171,7 @@ impl AppController {
             },
         });
         self.begin_search_activity(SearchActivity::SoundCloud);
-        self.view.status_line = "Searching SoundCloud through Soundcloak…".to_owned();
+        self.view.status_line = "Searching SoundCloud through Soundcloak...".to_owned();
         self.poll_soundcloud_worker();
     }
 
@@ -373,7 +373,7 @@ impl AppController {
                 self.view.rows.clear();
                 self.view.details = None;
                 self.begin_search_activity(SearchActivity::SoundCloud);
-                self.view.status_line = "Restoring SoundCloud search…".to_owned();
+                self.view.status_line = "Restoring SoundCloud search...".to_owned();
                 return;
             }
             self.refresh_soundcloud_rows();
@@ -410,7 +410,7 @@ impl AppController {
         });
         if self.soundcloud.next_page.is_some() || self.soundcloud_catalog_has_more() {
             self.view.rows.push(RowView {
-                title: "Load more tracks…".to_owned(),
+                title: "Load more tracks...".to_owned(),
                 compact: true,
                 ..RowView::default()
             });

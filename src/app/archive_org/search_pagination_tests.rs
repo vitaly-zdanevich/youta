@@ -70,7 +70,7 @@ fn archive_search_page_capacity_controls_first_http_request() {
         answer(&mut app);
         assert_eq!(app.archive_org.items.len(), expected);
         assert_eq!(app.view.rows.len(), expected + 1);
-        assert_eq!(app.view.rows.last().unwrap().title, "Load more items…");
+        assert_eq!(app.view.rows.last().unwrap().title, "Load more items...");
     }
 }
 
@@ -93,7 +93,7 @@ fn archive_load_more_turns_one_screen_and_selects_its_last_row() {
             "focus the new continuation at the screen bottom"
         );
         assert_eq!(app.archive_org_selected, loaded);
-        assert_eq!(app.view.rows[loaded].title, "Load more items…");
+        assert_eq!(app.view.rows[loaded].title, "Load more items...");
         assert_eq!(
             app.archive_org.items[loaded - 10].identifier,
             format!("item-{}", loaded - 10)
@@ -143,7 +143,7 @@ fn archive_load_more_final_page_selects_last_item_without_load_more() {
         app.view
             .rows
             .iter()
-            .all(|row| row.title != "Load more items…")
+            .all(|row| row.title != "Load more items...")
     );
 }
 

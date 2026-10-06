@@ -63,7 +63,7 @@ impl AppController {
                     generation,
                     title: "Download from archive.org".to_owned(),
                     explanation: format!(
-                        "{}\nLoading available original files and Archive-generated encodings…",
+                        "{}\nLoading available original files and Archive-generated encodings...",
                         item.media.title
                     ),
                     options: Vec::new(),

@@ -1512,7 +1512,7 @@ fn subscription_continuation_has_a_static_indicator_without_animating_refresh() 
     for required in [
         "subscriptions.loading && !subscriptions.loading_more",
         "subscriptions.loading_more ?",
-        "Loading more…",
+        "Loading more...",
         "role='status'",
     ] {
         assert!(
@@ -1806,7 +1806,7 @@ fn the_window_audio_quality_popup_keeps_progress_copy_cancel_and_close_actions()
         "popup.total",
         "popup.report",
         "popup.action_status",
-        "Discovering audio files…",
+        "Discovering audio files...",
         "role=\"status\"",
         "CopyAudioQualityReport",
         "CancelAudioQualityAnalysis",

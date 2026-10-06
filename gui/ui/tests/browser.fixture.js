@@ -162,8 +162,8 @@
 		};
 		const preferences = { ...clone(defaults.PreferencesPopupView), youtube_provider_settings_supported: true };
 		snapshot({ preferences_popup: preferences });
-		await until(() => button('YouTube API / Invidious…', dialog()), 'provider settings in Preferences');
-		await action('OpenYouTubeProviderSettings', () => button('YouTube API / Invidious…', dialog()).click(), 'Preferences opens the shared provider editor');
+		await until(() => button('YouTube API / Invidious...', dialog()), 'provider settings in Preferences');
+		await action('OpenYouTubeProviderSettings', () => button('YouTube API / Invidious...', dialog()).click(), 'Preferences opens the shared provider editor');
 		const editor = { selected_field: 'ApiKey', api_key_length: 23, invidious_url_length: 0,
 			invidious_url: null, invidious_instances: null, validation_failed: false, from_preferences: true,
 			official_supported: true, invidious_supported: true };
@@ -237,7 +237,7 @@
 		assert(!button(aboutUrl, dialog()), 'Builds without Invidious omit the article link');
 		snapshot({ youtube_provider_editor: null, preferences_popup: { ...preferences, youtube_provider_settings_supported: false } });
 		await until(() => dialog()?.textContent.includes('Preferences'), 'restored preferences');
-		assert(!button('YouTube API / Invidious…', dialog()), 'Unsupported builds hide provider settings in Preferences');
+		assert(!button('YouTube API / Invidious...', dialog()), 'Unsupported builds hide provider settings in Preferences');
 		snapshot({ preferences_popup: null, external_opener_available: defaults.ViewModel.external_opener_available });
 		await until(() => !dialog(), 'closed provider fixtures');
 	}
@@ -529,7 +529,7 @@
 			} });
 			await until(() => document.querySelector('[aria-label=Details] h2')?.textContent === title, title);
 			const panel = document.querySelector('[aria-label=Details]');
-			const move = button('Move…', panel);
+			const move = button('Move...', panel);
 			const rename = button('Rename', panel);
 			assert(Boolean(move) === movable, `Move follows its capability: ${title}`);
 			assert(Boolean(rename) === renamable, `Rename follows its capability: ${title}`);
@@ -552,7 +552,7 @@
 			const copy = button('Copy', panel);
 			assert(Boolean(copy) === copyable, `Copy follows its own capability: ${copyable}`);
 			if (copy) {
-				assert(copy.nextElementSibling === button('Move…', panel), 'Copy precedes the adjacent Move and Rename actions');
+				assert(copy.nextElementSibling === button('Move...', panel), 'Copy precedes the adjacent Move and Rename actions');
 				await action('BeginLocalCopy', () => copy.click(), 'Copy opens the shared destination workflow');
 			}
 		}
@@ -1096,7 +1096,7 @@
 		const beforeDisabledClick = calls.length;
 		dialog().querySelector('[role=checkbox]').click();
 		assert(dialog().querySelector('[role=checkbox]').disabled && calls.length === beforeDisabledClick, 'Audio-only source cannot request video from its disabled checkbox');
-		await action('OpenS3Credentials', () => button('Session keys…', dialog()).click(), 'S3 review offers explicit session-key replacement');
+		await action('OpenS3Credentials', () => button('Session keys...', dialog()).click(), 'S3 review offers explicit session-key replacement');
 		snapshot({ s3_credentials_editor: { access_key_length: 16, secret_key_length: 32, session_token_length: 48,
 			selected_field: 'SessionToken', validation_failed: false }, s3_upload_popup: { ...s3, generation: 56 } });
 		await until(() => dialog()?.textContent.includes('Session token (optional)'), 'S3 credential editor');

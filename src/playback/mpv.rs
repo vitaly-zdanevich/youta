@@ -516,9 +516,9 @@ mod backend {
         }
         let mut bounded = message
             .chars()
-            .take(MAX_DIAGNOSTIC_CHARS.saturating_sub(1))
+            .take(MAX_DIAGNOSTIC_CHARS.saturating_sub(3))
             .collect::<String>();
-        bounded.push('…');
+        bounded.push_str("...");
         bounded
     }
 
@@ -552,10 +552,10 @@ mod backend {
             return None;
         }
         if truncated {
-            while normalized.len().saturating_add('…'.len_utf8()) > MAX_STREAM_TITLE_BYTES {
+            while normalized.len().saturating_add("...".len()) > MAX_STREAM_TITLE_BYTES {
                 normalized.pop();
             }
-            normalized.push('…');
+            normalized.push_str("...");
         }
         Some(normalized)
     }
@@ -2662,6 +2662,17 @@ mod backend {
             server_thread.join().expect("mock status server");
         }
 
+        /// Authored truncation markers remain ASCII without changing original punctuation.
+        #[test]
+        fn ascii_ellipsis_diagnostics_keep_the_character_limit() {
+            let bounded = bounded_text(&"é".repeat(MAX_DIAGNOSTIC_CHARS + 1));
+            assert_eq!(bounded.chars().count(), MAX_DIAGNOSTIC_CHARS);
+            assert!(bounded.ends_with("..."));
+            let exact = "é".repeat(MAX_DIAGNOSTIC_CHARS);
+            assert_eq!(bounded_text(&exact), exact);
+            assert_eq!(bounded_text("Original\u{2026}text"), "Original\u{2026}text");
+        }
+
         #[test]
         fn icy_property_changes_are_normalized_bounded_and_clearable() {
             let (client, _server) = UnixStream::pair().expect("mock IPC pair");
@@ -2686,7 +2697,7 @@ mod backend {
                 .as_deref()
                 .expect("oversized title remains available in bounded form");
             assert!(bounded.len() <= MAX_STREAM_TITLE_BYTES);
-            assert!(bounded.ends_with('…'));
+            assert!(bounded.ends_with("..."));
 
             ipc.handle_event(&json!({
                 "event": "property-change",

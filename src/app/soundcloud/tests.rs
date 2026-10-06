@@ -420,7 +420,7 @@ fn soundcloud_results_ignore_stale_completions_and_do_not_replace_another_tab() 
     assert_eq!(controller.soundcloud.items.len(), 1);
     controller.show_screen(Screen::SoundCloud);
     assert_eq!(controller.view.rows.len(), 2);
-    assert_eq!(controller.view.rows[1].title, "Load more tracks…");
+    assert_eq!(controller.view.rows[1].title, "Load more tracks...");
     controller.select_row(1);
     assert!(controller.selected_queue_item().is_err());
     assert!(controller.view.details.is_none());
@@ -793,7 +793,7 @@ fn soundcloud_first_request_uses_bounded_visible_capacity() {
         finish_soundcloud_page(&mut app);
         assert_eq!(app.soundcloud.items.len(), expected);
         assert_eq!(app.view.rows.len(), expected + 1);
-        assert_eq!(app.view.rows.last().unwrap().title, "Load more tracks…");
+        assert_eq!(app.view.rows.last().unwrap().title, "Load more tracks...");
         let urls = requests.0.lock().unwrap();
         assert_eq!(urls.len(), 1);
         let pairs = urls[0].query_pairs().collect::<HashMap<_, _>>();
@@ -817,7 +817,7 @@ fn soundcloud_load_more_turns_one_page_and_keeps_its_stride_after_resize() {
         let loaded = page * 10;
         assert_eq!(app.view.selected, loaded);
         assert_eq!(app.soundcloud.selected, loaded);
-        assert_eq!(app.view.rows[loaded].title, "Load more tracks…");
+        assert_eq!(app.view.rows[loaded].title, "Load more tracks...");
         assert_eq!(
             app.soundcloud.items[loaded - 10].title,
             format!("Track {}", loaded - 10)

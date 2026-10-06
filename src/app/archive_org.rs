@@ -786,7 +786,7 @@ impl AppController {
                 .collect();
             if self.archive_org.next_page.is_some() {
                 rows.push(RowView {
-                    title: "Load more items…".to_owned(),
+                    title: "Load more items...".to_owned(),
                     source: "archive.org".to_owned(),
                     compact: true,
                     ..RowView::default()
@@ -1054,7 +1054,7 @@ impl AppController {
                         false,
                     );
                     self.begin_search_activity(SearchActivity::ArchiveOrg);
-                    self.view.status_line = "Opening archive.org item…".to_owned();
+                    self.view.status_line = "Opening archive.org item...".to_owned();
                     self.update_archive_back_available();
                 }
             }

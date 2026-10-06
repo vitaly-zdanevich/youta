@@ -221,7 +221,7 @@ fn action_of(id: &MenuId) -> Option<UiAction> {
 /// actually copied. Replacing Tauri's default macOS menu without them would
 /// take Cmd+C away silently.
 pub fn menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
-    let preferences = item(app, &UiAction::OpenPreferences, "Preferences…")?;
+    let preferences = item(app, &UiAction::OpenPreferences, "Preferences...")?;
     let about = about_metadata(app.package_info().version.to_string());
 
     let file = Submenu::with_items(

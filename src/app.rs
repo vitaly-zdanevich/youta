@@ -534,7 +534,9 @@ fn optional_trimmed_text(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_owned())
 }
 
-/// Produces one whitespace-normalized, character-bounded list excerpt.
+/// Produces one whitespace-normalized list excerpt with a bounded content prefix.
+///
+/// Omitted content is marked with three ASCII periods after the prefix limit.
 fn one_line_excerpt(value: &str, maximum_characters: usize) -> String {
     let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut characters = normalized.chars();
@@ -543,7 +545,7 @@ fn one_line_excerpt(value: &str, maximum_characters: usize) -> String {
         .take(maximum_characters)
         .collect::<String>();
     if characters.next().is_some() {
-        excerpt.push('…');
+        excerpt.push_str("...");
     }
     excerpt
 }
@@ -1101,7 +1103,7 @@ pub enum LocalInputError {
     HomeUnavailable,
     /// `~name` expansion is intentionally unsupported because it can target a
     /// different user's files.
-    #[error("only `~` and `~/…` home paths are supported")]
+    #[error("only `~` and `~/...` home paths are supported")]
     UnsupportedTilde,
     /// A `file://` URL did not map to a path on this platform.
     #[error("the file URL cannot be converted to a local path")]
@@ -3562,7 +3564,7 @@ struct DownloadOutputBuffer {
 impl DownloadOutputBuffer {
     fn push_diagnostic(&mut self, stream: &str, line: &str, truncated: bool) {
         let suffix = if truncated {
-            " …[line truncated]"
+            " ...[line truncated]"
         } else {
             ""
         };
@@ -4411,9 +4413,9 @@ const MAX_RSS_SUBSCRIPTION_URL_BYTES: usize = 8 * 1024;
 #[cfg(feature = "apple-podcasts")]
 const DEFAULT_APPLE_PODCASTS_STOREFRONT: &str = "us";
 /// Stable marker for a linked video whose provider details are still pending.
-const LINKED_VIDEO_LOADING_TITLE: &str = "Loading linked YouTube video…";
+const LINKED_VIDEO_LOADING_TITLE: &str = "Loading linked YouTube video...";
 /// Stable marker rendered below the pending linked-video title.
-const LINKED_VIDEO_LOADING_DESCRIPTION: &str = "Loading video details…";
+const LINKED_VIDEO_LOADING_DESCRIPTION: &str = "Loading video details...";
 /// Maximum diagnostics retained while one remote issue result awaits review.
 const MAX_DEFERRED_DIAGNOSTIC_REPORTS: usize = 8;
 
@@ -7458,10 +7460,11 @@ impl AppController {
             self.view.status_line =
                 format!("Using {provider_name}; returned to unsaved preferences");
         } else if self.view.screen == Screen::Subscriptions {
-            self.view.status_line = format!("Using {provider_name}; retrying subscription videos…");
+            self.view.status_line =
+                format!("Using {provider_name}; retrying subscription videos...");
             self.load_selected_subscription_videos();
         } else {
-            self.view.status_line = format!("Using {provider_name}; retrying YouTube search…");
+            self.view.status_line = format!("Using {provider_name}; retrying YouTube search...");
             self.submit_youtube_search(1);
         }
     }
@@ -7746,7 +7749,7 @@ impl AppController {
         self.youtube_results = vec![SearchItem::Video(VideoSummary {
             video_id: direct.video_id.clone(),
             title: format!("YouTube video {}", direct.video_id),
-            channel_name: "loading…".to_owned(),
+            channel_name: "loading...".to_owned(),
             channel_id: String::new(),
             description: String::new(),
             duration_seconds: None,
@@ -7764,8 +7767,8 @@ impl AppController {
         self.request_selected_details();
         self.refresh_selected_playlist_state();
         self.view.status_line = direct.start_seconds.map_or_else(
-            || format!("Loading YouTube video {}…", direct.video_id),
-            |seconds| format!("Loading YouTube video at {}…", format_seconds(seconds)),
+            || format!("Loading YouTube video {}...", direct.video_id),
+            |seconds| format!("Loading YouTube video at {}...", format_seconds(seconds)),
         );
     }
 
@@ -7774,7 +7777,7 @@ impl AppController {
         self.youtube_music_results = vec![SearchItem::Video(VideoSummary {
             video_id: direct.video_id.clone(),
             title: format!("YouTube Music track {}", direct.video_id),
-            channel_name: "loading…".to_owned(),
+            channel_name: "loading...".to_owned(),
             channel_id: String::new(),
             description: String::new(),
             duration_seconds: None,
@@ -7878,7 +7881,7 @@ impl AppController {
                 return;
             }
             self.begin_search_activity(SearchActivity::ApplePodcasts);
-            "Resolving Apple Podcasts metadata and RSS link…".to_owned()
+            "Resolving Apple Podcasts metadata and RSS link...".to_owned()
         } else if requires_first_class_direct_resolution(&direct.source) {
             if !self.send_provider_request(
                 ProviderRequest::ResolveFirstClass {
@@ -7890,7 +7893,7 @@ impl AppController {
                 return;
             }
             format!(
-                "Resolving {} metadata…",
+                "Resolving {} metadata...",
                 direct_source_label(&direct.source)
             )
         } else if direct.source == SourceKind::RemoteFiles {
@@ -7968,7 +7971,7 @@ impl AppController {
             title: self.local_display_path(&local.path),
             source: "Local".to_owned(),
             description: if local.directory {
-                "Scanning supported audio, video, and tracker-module files in place…".to_owned()
+                "Scanning supported audio, video, and tracker-module files in place...".to_owned()
             } else {
                 "Local media is read in place. Youta does not move or modify it.".to_owned()
             },
@@ -7989,12 +7992,12 @@ impl AppController {
             }
             self.view.rows = vec![RowView {
                 title: self.local_display_path(&local.path),
-                subtitle: "scanning directory…".to_owned(),
+                subtitle: "scanning directory...".to_owned(),
                 source: "Local folder".to_owned(),
                 ..RowView::default()
             }];
             self.view.status_line = format!(
-                "Scanning {} in the background…",
+                "Scanning {} in the background...",
                 self.local_display_path(&local.path)
             );
         } else {
@@ -8034,7 +8037,7 @@ impl AppController {
         }
         self.begin_search_activity(SearchActivity::TrackerArchives);
         self.view.status_line =
-            "Searching enabled MOD/tracker archives (separate from YouTube)…".to_owned();
+            "Searching enabled MOD/tracker archives (separate from YouTube)...".to_owned();
     }
 
     #[cfg(feature = "youtube-music")]
@@ -8061,7 +8064,7 @@ impl AppController {
             return;
         }
         self.begin_search_activity(SearchActivity::YouTubeMusic);
-        self.view.status_line = "Searching YouTube Music through yt-dlp…".to_owned();
+        self.view.status_line = "Searching YouTube Music through yt-dlp...".to_owned();
     }
 
     #[cfg(not(feature = "youtube-music"))]
@@ -8209,7 +8212,7 @@ impl AppController {
             "Could not load Yandex Music recommendations",
         ) {
             self.begin_search_activity(SearchActivity::YandexMusic);
-            self.view.status_line = "Loading My Wave recommendations…".to_owned();
+            self.view.status_line = "Loading My Wave recommendations...".to_owned();
         }
     }
 
@@ -8249,7 +8252,7 @@ impl AppController {
         ) {
             self.begin_search_activity(SearchActivity::YandexMusic);
             self.view.status_line = format!(
-                "Searching Yandex Music {}…",
+                "Searching Yandex Music {}...",
                 self.view
                     .yandex_music_search_kind
                     .label()
@@ -8305,7 +8308,7 @@ impl AppController {
             "Could not configure Yandex Music",
         ) {
             self.begin_search_activity(SearchActivity::YandexMusic);
-            self.view.status_line = "Validating Yandex Music and loading My Wave…".to_owned();
+            self.view.status_line = "Validating Yandex Music and loading My Wave...".to_owned();
         } else {
             self.pending_yandex_music_token = None;
             if let Some(popup) = self.view.yandex_music_setup_popup.as_mut() {
@@ -8842,7 +8845,7 @@ impl AppController {
         ) {
             self.push_yandex_music_navigation_snapshot();
             self.begin_search_activity(SearchActivity::YandexMusic);
-            self.view.status_line = "Loading album tracks…".to_owned();
+            self.view.status_line = "Loading album tracks...".to_owned();
         }
     }
 
@@ -8908,7 +8911,7 @@ impl AppController {
         ) {
             self.push_yandex_music_navigation_snapshot();
             self.begin_search_activity(SearchActivity::YandexMusic);
-            self.view.status_line = "Loading artist tracks and albums…".to_owned();
+            self.view.status_line = "Loading artist tracks and albums...".to_owned();
         }
     }
 
@@ -9118,7 +9121,7 @@ impl AppController {
                     active: true,
                     ..DownloadView::default()
                 });
-                self.view.status_line = format!("Downloading {batch_title} in original quality…");
+                self.view.status_line = format!("Downloading {batch_title} in original quality...");
                 Ok(generation)
             }
             Err(error) => {
@@ -9158,7 +9161,7 @@ impl AppController {
             "Could not resolve the Yandex Music track",
         ) {
             self.begin_playback_start_activity();
-            self.view.status_line = "Resolving highest-quality Yandex audio…".to_owned();
+            self.view.status_line = "Resolving highest-quality Yandex audio...".to_owned();
         } else {
             self.pending_yandex_music_playback = None;
         }
@@ -9275,7 +9278,7 @@ impl AppController {
                 self.yandex_music_playback_thread = Some(handle);
                 self.yandex_music_playback_cancel = Some(cancellation);
                 self.view.status_line =
-                    "Decrypting highest-quality Yandex audio for playback…".to_owned();
+                    "Decrypting highest-quality Yandex audio for playback...".to_owned();
             }
             Err(error) => {
                 self.clear_playback_start_activity();
@@ -9330,7 +9333,7 @@ impl AppController {
             YandexMusicReactionWorkerRequest::Synchronize(pending),
             "Could not send the Yandex Music reaction",
         ) {
-            self.view.status_line = "Updating Yandex Music reaction…".to_owned();
+            self.view.status_line = "Updating Yandex Music reaction...".to_owned();
         }
     }
 
@@ -9684,7 +9687,7 @@ impl AppController {
             return;
         }
         self.begin_search_activity(SearchActivity::Bandcamp);
-        self.view.status_line = format!("Searching public Bandcamp page {page}…");
+        self.view.status_line = format!("Searching public Bandcamp page {page}...");
     }
 
     /// Reports that Bandcamp support is absent in a minimal build.
@@ -9742,7 +9745,7 @@ impl AppController {
         }
         self.begin_search_activity(SearchActivity::ApplePodcasts);
         self.view.status_line = format!(
-            "Refreshing Apple Podcasts shows in the public {} storefront…",
+            "Refreshing Apple Podcasts shows in the public {} storefront...",
             self.apple_podcasts_storefront.to_ascii_uppercase()
         );
     }
@@ -9782,7 +9785,7 @@ impl AppController {
             return;
         }
         self.begin_search_activity(SearchActivity::LibriVox);
-        self.view.status_line = "Searching LibriVox’s public-domain catalogue…".to_owned();
+        self.view.status_line = "Searching LibriVox’s public-domain catalogue...".to_owned();
     }
 
     /// Reports that LibriVox support is absent in a minimal build.
@@ -9854,7 +9857,7 @@ impl AppController {
         }
         self.begin_search_activity(SearchActivity::YouTube);
         self.view.status_line = format!(
-            "Searching YouTube {}…",
+            "Searching YouTube {}...",
             match self.view.search_kind {
                 SearchKind::Videos => "videos",
                 SearchKind::Channels => "channels",
@@ -10743,7 +10746,7 @@ impl AppController {
         if generation == self.channel_details_generation
             && self.visible_channel_id() == Some(channel_id.as_str())
         {
-            self.view.status_line = "Loading channel info…".to_owned();
+            self.view.status_line = "Loading channel info...".to_owned();
         }
     }
 
@@ -11633,7 +11636,7 @@ impl AppController {
                     skip_shorts,
                 });
                 self.view.status_line =
-                    format!("Preparing a podcast feed for {channel_name} with yt-dlp…");
+                    format!("Preparing a podcast feed for {channel_name} with yt-dlp...");
                 Ok(())
             }
             Err(error) => Err(format!("Cannot start YouTube podcast-feed worker: {error}")),
@@ -12209,7 +12212,7 @@ impl AppController {
         if let Some(details) = self.view.details.as_mut()
             && !is_yandex_music_wikidata_property(property_id)
         {
-            details.wikidata = format!("loading {property_id} lazily…");
+            details.wikidata = format!("loading {property_id} lazily...");
         }
         let sent = self.send_provider_request(
             ProviderRequest::Wikidata {
@@ -13372,7 +13375,7 @@ impl AppController {
                                 let next_page =
                                     staged.next_page.expect("continuation was checked above");
                                 self.view.status_line = format!(
-                                    "Refreshing {} through page {}…",
+                                    "Refreshing {} through page {}...",
                                     self.view.subscriptions.source_title, request.page
                                 );
                                 self.request_subscription_videos(
@@ -13693,7 +13696,7 @@ impl AppController {
                             && self.visible_channel_id() == Some(channel_id.as_str())
                         {
                             if let Some(details) = self.view.details.as_mut().filter(|details| {
-                                details.description == "Loading channel description…"
+                                details.description == "Loading channel description..."
                             }) {
                                 details.description.clear();
                             }
@@ -14885,7 +14888,7 @@ impl AppController {
         self.view.rows = vec![RowView {
             media_id: Some(media_id.clone()),
             title: url.clone(),
-            subtitle: "resolving public Apple page…".to_owned(),
+            subtitle: "resolving public Apple page...".to_owned(),
             source: "Apple Podcasts".to_owned(),
             compact: true,
             ..RowView::default()
@@ -14906,7 +14909,7 @@ impl AppController {
             }],
             ..DetailView::default()
         });
-        self.view.status_line = "Resolving Apple Podcasts metadata and RSS link…".to_owned();
+        self.view.status_line = "Resolving Apple Podcasts metadata and RSS link...".to_owned();
     }
 
     /// Clears a direct Apple route in builds without the provider.
@@ -15121,7 +15124,7 @@ impl AppController {
             return;
         }
         self.begin_search_activity(SearchActivity::LibriVox);
-        self.view.status_line = format!("Loading {}…", book.title);
+        self.view.status_line = format!("Loading {}...", book.title);
     }
 
     /// Opens one exact LibriVox author through a Details internal link.
@@ -15153,7 +15156,7 @@ impl AppController {
             return;
         }
         self.begin_search_activity(SearchActivity::LibriVox);
-        self.view.status_line = "Loading LibriVox author and books…".to_owned();
+        self.view.status_line = "Loading LibriVox author and books...".to_owned();
     }
 
     /// Requests the next bounded bibliography page for the active author.
@@ -15190,7 +15193,7 @@ impl AppController {
             return;
         }
         self.begin_search_activity(SearchActivity::LibriVox);
-        self.view.status_line = "Loading more books by this LibriVox author…".to_owned();
+        self.view.status_line = "Loading more books by this LibriVox author...".to_owned();
     }
 
     /// Reports the omitted LibriVox provider for internal-link actions.
@@ -15216,7 +15219,7 @@ impl AppController {
                     .is_some_and(|details| details.next_offset.is_some())
                 {
                     rows.push(RowView {
-                        title: "Load more books…".to_owned(),
+                        title: "Load more books...".to_owned(),
                         subtitle: "Next bounded LibriVox author page".to_owned(),
                         source: "LibriVox".to_owned(),
                         compact: true,
@@ -15264,7 +15267,7 @@ impl AppController {
                 .or_else(|| {
                     self.active_librivox_author.as_ref().and_then(|details| {
                         details.next_offset.map(|_| DetailView {
-                            title: "Load more books…".to_owned(),
+                            title: "Load more books...".to_owned(),
                             source: "LibriVox".to_owned(),
                             channel_name: details.author.display_name.clone(),
                             description:
@@ -15781,7 +15784,7 @@ impl AppController {
             || source.display().to_string(),
             |name| name.to_string_lossy().into_owned(),
         );
-        let status_line = format!("Opening {name}…");
+        let status_line = format!("Opening {name}...");
         if self.send_local_browse_request(
             LocalBrowseRequest::OpenArchive {
                 generation: self.local_generation,
@@ -15980,7 +15983,7 @@ impl AppController {
         self.view.details = None;
         self.view.private_note_available = false;
         self.view.local_path = self.local_location_path(&directory);
-        let status_line = format!("Reading {}…", self.local_display_path(&directory));
+        let status_line = format!("Reading {}...", self.local_display_path(&directory));
         self.view.local_browse_pending = false;
         if self.send_local_browse_request(
             LocalBrowseRequest::Browse {
@@ -19092,13 +19095,13 @@ impl AppController {
                 .then_some(self.video_summary_popup_revision);
         self.pending_clipboard_request = Some(ClipboardRequest { text, subject });
         self.view.status_line = match subject {
-            ClipboardSubject::Link => "Copying the link…".to_owned(),
-            ClipboardSubject::DetailsText(count) => format!("Copying {count} characters…"),
+            ClipboardSubject::Link => "Copying the link...".to_owned(),
+            ClipboardSubject::DetailsText(count) => format!("Copying {count} characters..."),
             ClipboardSubject::AudioQualityReport(count) => {
-                format!("Copying an audio quality report ({count} characters)…")
+                format!("Copying an audio quality report ({count} characters)...")
             }
             ClipboardSubject::VideoSummary(count) => {
-                format!("Copying a video summary ({count} characters)…")
+                format!("Copying a video summary ({count} characters)...")
             }
         };
     }
@@ -20974,7 +20977,7 @@ impl AppController {
                     self.load_selected_subscription_videos();
                     if self.view.subscriptions.loading {
                         self.view.status_line = format!(
-                            "Loading {} for {}…",
+                            "Loading {} for {}...",
                             subscription_item_kind_label(self.view.subscriptions.source_kind),
                             self.view.subscriptions.source_title
                         );
@@ -21084,7 +21087,7 @@ impl AppController {
             Ok(()) => {
                 self.begin_playback_start_activity();
                 self.view.status_line = format!(
-                    "Resolving Bandcamp audio as {}…",
+                    "Resolving Bandcamp audio as {}...",
                     self.config.providers.bandcamp_audio_format.label()
                 );
             }
@@ -21266,7 +21269,7 @@ impl AppController {
         });
         self.active_apple_podcast_show = Some(show);
         self.begin_search_activity(SearchActivity::ApplePodcasts);
-        self.view.status_line = "Loading Apple’s bounded associated episode list…".to_owned();
+        self.view.status_line = "Loading Apple’s bounded associated episode list...".to_owned();
     }
 
     /// Opens the selected Apple show or plays the selected resolved episode.
@@ -21481,7 +21484,7 @@ impl AppController {
             return;
         }
         self.view.status_line = format!(
-            "Resolving {} for History playback…",
+            "Resolving {} for History playback...",
             direct_source_label(&source)
         );
     }
@@ -21541,7 +21544,7 @@ impl AppController {
     fn open_local_text_file(&mut self, path: PathBuf) {
         let context = TextFileOpenContext::current(self.view.physical_linux_console);
         self.pending_text_file_open = Some(plan_text_file_open(&path, &context));
-        self.view.status_line = format!("Opening {}…", self.local_display_path(&path));
+        self.view.status_line = format!("Opening {}...", self.local_display_path(&path));
     }
 
     /// Reports the omitted capability in builds without Local browsing.
@@ -21770,9 +21773,9 @@ impl AppController {
         });
         self.begin_playback_start_activity();
         self.view.status_line = if autoplay {
-            format!("Autoplay is downloading and inspecting {title}…")
+            format!("Autoplay is downloading and inspecting {title}...")
         } else {
-            format!("Downloading and inspecting {title}…")
+            format!("Downloading and inspecting {title}...")
         };
         true
     }
@@ -22531,10 +22534,10 @@ impl AppController {
             ..DetailView::default()
         });
         self.view.status_line = start_seconds.map_or_else(
-            || "Loading linked YouTube video…".to_owned(),
+            || "Loading linked YouTube video...".to_owned(),
             |seconds| {
                 format!(
-                    "Loading linked YouTube video at {}…",
+                    "Loading linked YouTube video at {}...",
                     format_seconds(seconds)
                 )
             },
@@ -23282,16 +23285,16 @@ impl AppController {
                 popup.pending = true;
                 popup.summary = if self.pending_local_audio_quality_batch.is_some() {
                     if total == 0 {
-                        "Cancelling while collecting audio files…".to_owned()
+                        "Cancelling while collecting audio files...".to_owned()
                     } else {
-                        format!("Cancelling after {completed} of {total}…")
+                        format!("Cancelling after {completed} of {total}...")
                     }
                 } else {
-                    "Cancelling audio quality analysis…".to_owned()
+                    "Cancelling audio quality analysis...".to_owned()
                 };
             }
             self.apply_local_audio_quality_details();
-            self.view.status_line = "Cancelling audio quality analysis…".to_owned();
+            self.view.status_line = "Cancelling audio quality analysis...".to_owned();
             return;
         }
 
@@ -23506,7 +23509,7 @@ impl AppController {
             self.selected_local_audio_declared_encoding(&key.path)
         else {
             self.request_local_media_metadata(key.path);
-            self.view.status_line = "Reading local audio metadata before analysis…".to_owned();
+            self.view.status_line = "Reading local audio metadata before analysis...".to_owned();
             return;
         };
         if self.local_audio_quality_requests.is_none() {
@@ -23559,9 +23562,9 @@ impl AppController {
         if self.local_audio_quality_popup_owner_generation == Some(generation)
             && let Some(popup) = self.view.audio_quality_popup.as_mut()
         {
-            popup.summary = "Analyzing 1 audio file…".to_owned();
+            popup.summary = "Analyzing 1 audio file...".to_owned();
         }
-        self.view.status_line = "Analyzing local audio quality…".to_owned();
+        self.view.status_line = "Analyzing local audio quality...".to_owned();
     }
 
     /// Starts or cancels one explicit identity-bound local quality analysis.
@@ -23616,7 +23619,7 @@ impl AppController {
         let generation = self.local_audio_quality_generation;
         self.replace_local_audio_quality_popup(
             Some(generation),
-            "Reading local audio metadata…",
+            "Reading local audio metadata...",
             1,
             String::new(),
             true,
@@ -23632,7 +23635,7 @@ impl AppController {
             details.local_audio_quality_available = true;
             details.local_audio_quality_pending = true;
         }
-        self.view.status_line = "Reading local audio metadata before analysis…".to_owned();
+        self.view.status_line = "Reading local audio metadata before analysis...".to_owned();
         self.start_pending_local_audio_quality();
     }
 
@@ -23649,7 +23652,7 @@ impl AppController {
         let generation = self.local_audio_quality_generation;
         self.replace_local_audio_quality_popup(
             Some(generation),
-            "Collecting audio files…",
+            "Collecting audio files...",
             0,
             String::new(),
             true,
@@ -23685,7 +23688,7 @@ impl AppController {
             return;
         }
         self.apply_local_audio_quality_details();
-        self.view.status_line = "Collecting local audio files for analysis…".to_owned();
+        self.view.status_line = "Collecting local audio files for analysis...".to_owned();
     }
 
     /// Returns the exact selected local audio file and its replacement identity.
@@ -23997,7 +24000,7 @@ impl AppController {
         if let Some(details) = self.view.details.as_mut() {
             details.local_fingerprint_pending = true;
         }
-        self.view.status_line = "Fingerprinting local audio…".to_owned();
+        self.view.status_line = "Fingerprinting local audio...".to_owned();
     }
 
     /// Applies or clears MusicBrainz-owned Wikidata state for Local Details.
@@ -24825,14 +24828,14 @@ impl AppController {
                         popup.total = total;
                         popup.summary = if cancel_requested {
                             if total == 0 {
-                                "Cancelling while collecting audio files…".to_owned()
+                                "Cancelling while collecting audio files...".to_owned()
                             } else {
-                                format!("Cancelling after {completed} of {total}…")
+                                format!("Cancelling after {completed} of {total}...")
                             }
                         } else if total == 0 {
                             "No supported audio files were found".to_owned()
                         } else {
-                            format!("Analyzing 0 of {total} audio files…")
+                            format!("Analyzing 0 of {total} audio files...")
                         };
                     }
                 }
@@ -24903,7 +24906,7 @@ impl AppController {
                         popup.completed = completed;
                         popup.total = total;
                         popup.summary = if cancel_requested {
-                            format!("Cancelling after {completed} of {total}…")
+                            format!("Cancelling after {completed} of {total}...")
                         } else {
                             format!(
                                 "Analyzed {completed} of {total}: {succeeded_count} succeeded, {failed_count} failed{}",
@@ -26240,7 +26243,7 @@ impl AppController {
                 #[cfg(feature = "waveform")]
                 self.refresh_local_waveform_playback_match();
                 self.view.playback_chapters = chapters;
-                self.view.status_line = format!("Loading {}…", item.media.title);
+                self.view.status_line = format!("Loading {}...", item.media.title);
                 if !live_stream
                     && self.playback_queue.repeat_one
                     && let Some(player) = self.player.as_mut()
@@ -26615,7 +26618,7 @@ impl AppController {
                         self.playback_phase = PlaybackPhase::Loaded;
                         self.ignore_replaced_stop = false;
                         let title = self.current_playback_title();
-                        self.view.status_line = format!("Loaded {title}; starting audio…");
+                        self.view.status_line = format!("Loaded {title}; starting audio...");
                     }
                 }
                 Ok(Some(PlaybackEvent::PlaybackStarted)) => {
@@ -26769,7 +26772,7 @@ impl AppController {
                     {
                         self.local_waveform_follow_from = None;
                     }
-                    self.view.status_line = "Resolving SoundCloud playback…".to_owned();
+                    self.view.status_line = "Resolving SoundCloud playback...".to_owned();
                     return;
                 }
                 #[cfg(feature = "archive-org")]
@@ -26962,10 +26965,10 @@ impl AppController {
                 self.view.playback.buffered_ranges.clear();
                 self.view.status_line = match next_kind {
                     PlaybackLoadKind::YouTubeCanonical => {
-                        format!("Retrying {title} through YouTube…")
+                        format!("Retrying {title} through YouTube...")
                     }
                     PlaybackLoadKind::YouTubeChecked => {
-                        format!("Retrying {title} after validating alternate YouTube formats…")
+                        format!("Retrying {title} after validating alternate YouTube formats...")
                     }
                     PlaybackLoadKind::Regular | PlaybackLoadKind::YouTubeDirect => {
                         unreachable!("the fallback target is canonical or checked")
@@ -27410,7 +27413,7 @@ impl AppController {
                         self.view.details = None;
                         self.view.status_line =
                             if self.config.providers.yandex_music_token.is_some() {
-                                "Loading My Wave recommendations…".to_owned()
+                                "Loading My Wave recommendations...".to_owned()
                             } else {
                                 "Yandex Music needs an OAuth access token".to_owned()
                             };
@@ -27987,7 +27990,7 @@ impl AppController {
         });
         self.begin_playback_start_activity();
         self.view.status_line =
-            "Resolving the highest BBC audio quality available in this region…".to_owned();
+            "Resolving the highest BBC audio quality available in this region...".to_owned();
     }
 
     /// Applies only the manifest belonging to the latest BBC playback action.
@@ -28866,7 +28869,7 @@ impl AppController {
         }
         self.begin_playback_start_activity();
         self.view.status_line = format!(
-            "Resolving {} for playlist playback…",
+            "Resolving {} for playlist playback...",
             direct_source_label(&source)
         );
     }
@@ -29113,7 +29116,7 @@ impl AppController {
         } else {
             subscription.description.clone().unwrap_or_else(|| {
                 if subscription.kind == SubscriptionKind::YouTube {
-                    "Loading channel description…".to_owned()
+                    "Loading channel description...".to_owned()
                 } else {
                     "Press Enter to load episodes".to_owned()
                 }
@@ -29122,7 +29125,7 @@ impl AppController {
         #[cfg(not(feature = "rss"))]
         let description = subscription.description.clone().unwrap_or_else(|| {
             if subscription.kind == SubscriptionKind::YouTube {
-                "Loading channel description…".to_owned()
+                "Loading channel description...".to_owned()
             } else {
                 "Press Enter to load episodes".to_owned()
             }
@@ -29610,7 +29613,7 @@ impl AppController {
         self.view.subscriptions.loading = true;
         self.view.subscriptions.loading_more = false;
         self.view.status_line = format!(
-            "Loading episodes for {}…",
+            "Loading episodes for {}...",
             self.view.subscriptions.source_title
         );
     }
@@ -29644,7 +29647,7 @@ impl AppController {
         self.request_rss_subscription(source_url);
         if self.view.subscriptions.loading {
             self.view.status_line = format!(
-                "Refreshing episodes for {}…",
+                "Refreshing episodes for {}...",
                 self.view.subscriptions.source_title
             );
         } else {
@@ -29795,7 +29798,7 @@ impl AppController {
         self.view.subscriptions.loading = true;
         self.view.subscriptions.loading_more = page > 1;
         self.view.status_line = format!(
-            "Loading videos for {}…",
+            "Loading videos for {}...",
             self.view.subscriptions.source_title
         );
     }
@@ -29872,7 +29875,7 @@ impl AppController {
         self.request_subscription_videos(channel_id, 1);
         if self.view.subscriptions.loading {
             self.view.status_line = format!(
-                "Refreshing videos for {}…",
+                "Refreshing videos for {}...",
                 self.view.subscriptions.source_title
             );
         } else {
@@ -30995,7 +30998,7 @@ impl AppController {
                 if let Some(details) = self.view.details.as_mut() {
                     details.loading_wikidata_item = Some(item_id.clone());
                 }
-                self.view.status_line = format!("Loading Wikidata properties for {item_id}…");
+                self.view.status_line = format!("Loading Wikidata properties for {item_id}...");
             } else {
                 if let Some(details) = self.view.details.as_mut() {
                     details.loading_wikidata_item = None;
@@ -31668,7 +31671,7 @@ impl AppController {
         let generation = self.diagnostic_report_generation;
         if let Some(error) = self.view.error_popup.as_mut() {
             error.github_issue_submission = GitHubIssueSubmissionView::Submitting;
-            error.action_status = Some("Submitting GitHub issue…".to_owned());
+            error.action_status = Some("Submitting GitHub issue...".to_owned());
         }
         self.pending_github_issue_submission = Some(generation);
         self.pinned_github_issue_submission_generation = Some(generation);
@@ -33689,7 +33692,7 @@ impl AppController {
                     state: YouTubeCaptionsPopupState::Loading,
                     ..YouTubeCaptionsPopupView::default()
                 });
-                self.view.status_line = "Loading bounded YouTube captions…".to_owned();
+                self.view.status_line = "Loading bounded YouTube captions...".to_owned();
             }
             Err(error) => self.show_error("Could not start the YouTube caption worker", &error),
         }
@@ -34020,7 +34023,7 @@ impl AppController {
                 video_id: video_id.clone(),
                 cancellation: cancellation.clone(),
             });
-            self.view.status_line = "Fetching bounded YouTube captions…".to_owned();
+            self.view.status_line = "Fetching bounded YouTube captions...".to_owned();
             match sender.try_send(VideoSummaryWorkerRequest::Generate {
                 generation,
                 video_id,
@@ -34197,7 +34200,7 @@ impl AppController {
                 popup.caption_source = caption_source;
                 popup.state = VideoSummaryPopupState::Generating;
                 popup.action_status = None;
-                self.view.status_line = "Generating a bounded summary with Codex…".to_owned();
+                self.view.status_line = "Generating a bounded summary with Codex...".to_owned();
             }
             VideoSummaryWorkerResponse::Finished { generation, result } => {
                 if self
@@ -34610,7 +34613,7 @@ impl AppController {
         ) {
             Ok(()) => {
                 self.url_open_pending = self.url_open_pending.saturating_add(1);
-                self.view.status_line = format!("Opening selected webpage with {opener_name}…");
+                self.view.status_line = format!("Opening selected webpage with {opener_name}...");
             }
             Err(error) => self.show_error("Cannot start webpage opener", &error),
         }
@@ -37175,7 +37178,7 @@ fn truncate_local_audio_quality_field(value: &mut String, maximum_bytes: usize) 
     if value.len() <= maximum_bytes {
         return;
     }
-    const ELLIPSIS: &str = "…";
+    const ELLIPSIS: &str = "...";
     let retained = maximum_bytes.saturating_sub(ELLIPSIS.len());
     truncate_utf8_bytes(value, retained);
     if maximum_bytes >= ELLIPSIS.len() {
@@ -42510,7 +42513,7 @@ fn preliminary_detail_with_thumbnail_size(
                     .clone()
                     .or_else(|| video.published_at.map(format_unix_utc_date))
                     .unwrap_or_else(|| "unknown".to_owned()),
-                license: "loading…".to_owned(),
+                license: "loading...".to_owned(),
                 wikidata: "not loaded".to_owned(),
                 thumbnail_url,
                 expanded_thumbnail_url,
@@ -46768,6 +46771,32 @@ mod tests {
 
     use super::*;
 
+    /// List excerpts use ASCII omission markers without rewriting source punctuation.
+    #[test]
+    fn ascii_ellipsis_excerpt_preserves_content_and_whitespace() {
+        assert_eq!(one_line_excerpt("  one\n two  three ", 7), "one two...");
+        assert_eq!(one_line_excerpt("short", 5), "short");
+        assert_eq!(
+            one_line_excerpt("Original\u{2026}text", 30),
+            "Original\u{2026}text"
+        );
+        assert_eq!(one_line_excerpt("text", 0), "...");
+    }
+
+    /// Bounded analysis fields retain their UTF-8 byte budgets after the suffix change.
+    #[cfg(feature = "audio-quality")]
+    #[test]
+    fn ascii_ellipsis_audio_quality_field_preserves_byte_limits() {
+        for maximum in 0..=12 {
+            let mut value = "é".repeat(10);
+            truncate_local_audio_quality_field(&mut value, maximum);
+            assert!(value.len() <= maximum);
+            if maximum >= 3 {
+                assert!(value.ends_with("..."));
+            }
+        }
+    }
+
     /// Returns `path` as this platform spells an absolute path.
     ///
     /// `/music` is absolute only where the filesystem has one root; on Windows
@@ -47236,7 +47265,7 @@ mod tests {
         });
         assert_eq!(controller.librivox_books.len(), 1);
         assert_eq!(controller.view.rows.len(), 2, "book plus load-more row");
-        assert_eq!(controller.view.rows[1].title, "Load more books…");
+        assert_eq!(controller.view.rows[1].title, "Load more books...");
 
         controller.view.selected = 1;
         controller.activate_librivox_selection();
@@ -63329,7 +63358,7 @@ mod tests {
         assert_eq!(plan.lifecycle, TextFileOpenLifecycle::Detached);
         assert_eq!(
             controller.view.status_line,
-            format!("Opening {}…", notes.display())
+            format!("Opening {}...", notes.display())
         );
     }
 
@@ -63412,7 +63441,7 @@ mod tests {
         );
         assert!(state.lock().expect("mock player state").played.is_empty());
         assert!(controller.view.local_browse_pending);
-        assert_eq!(controller.view.status_line, "Opening album.zip…");
+        assert_eq!(controller.view.status_line, "Opening album.zip...");
     }
 
     #[cfg(feature = "local-archives")]
@@ -73608,7 +73637,7 @@ mod tests {
         controller.view.playback.idle = false;
         controller.view.details = Some(DetailView {
             title: "Fixture".to_owned(),
-            wikidata: "loading P1651 lazily…".to_owned(),
+            wikidata: "loading P1651 lazily...".to_owned(),
             ..DetailView::default()
         });
         controller.wikidata_generation = 7;
@@ -83070,7 +83099,7 @@ mod tests {
         assert_eq!(controller.playback_phase, PlaybackPhase::Loaded);
         assert_eq!(
             controller.view.status_line,
-            "Loaded silent; starting audio…"
+            "Loaded silent; starting audio..."
         );
         assert!(controller.view.playback.paused);
         assert!(controller.view.playback.buffering);

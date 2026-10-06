@@ -514,7 +514,7 @@ impl ThumbnailRenderer for TerminalThumbnailRenderer {
         match self.manager.state().clone() {
             ThumbnailState::Loading => {
                 frame.render_widget(
-                    Paragraph::new("Loading thumbnail…")
+                    Paragraph::new("Loading thumbnail...")
                         .style(theme.muted)
                         .alignment(Alignment::Center),
                     area,
@@ -2403,7 +2403,7 @@ fn render_fullscreen_thumbnail_overlay(
         let status_area = centered_sized_rect(status_width, 1, area);
         frame.render_widget(Clear, status_area);
         frame.render_widget(
-            Paragraph::new("Loading enlarged thumbnail…")
+            Paragraph::new("Loading enlarged thumbnail...")
                 .style(theme.muted)
                 .alignment(Alignment::Center),
             status_area,
@@ -4198,7 +4198,7 @@ fn render_subscription_item_buttons(
         x = x.saturating_add(width).saturating_add(2);
     }
     if loading_more {
-        let label = "Loading more…";
+        let label = "Loading more...";
         let available = area.right().saturating_sub(x);
         let width = terminal_text_width(label).min(available);
         if width > 0 {
@@ -6204,7 +6204,7 @@ fn render_information_panel(
         expanded_wikidata_entity.map_or_else(
             || {
                 if details.loading_wikidata_item.as_deref() == Some(item_id) {
-                    "Loading Wikidata properties…"
+                    "Loading Wikidata properties..."
                 } else {
                     "Wikidata properties are unavailable."
                 }
@@ -7962,27 +7962,25 @@ fn format_timeline_timestamp(seconds: u64, show_hours: bool) -> String {
     }
 }
 
+/// Fits whole graphemes into terminal cells, reserving up to three ASCII truncation dots.
 fn truncate_terminal_text(value: &str, maximum_width: usize) -> String {
     if Span::raw(value).width() <= maximum_width {
         return value.to_owned();
     }
-    if maximum_width == 0 {
-        return String::new();
-    }
-    if maximum_width == 1 {
-        return "…".to_owned();
+    if maximum_width <= 3 {
+        return ".".repeat(maximum_width);
     }
     let mut output = String::new();
     let mut width = 0_usize;
-    for character in value.chars() {
-        let character_width = Span::raw(character.to_string()).width();
-        if width.saturating_add(character_width) >= maximum_width {
+    for grapheme in value.graphemes(true) {
+        let grapheme_width = Span::raw(grapheme).width();
+        if width.saturating_add(grapheme_width) > maximum_width - 3 {
             break;
         }
-        output.push(character);
-        width = width.saturating_add(character_width);
+        output.push_str(grapheme);
+        width = width.saturating_add(grapheme_width);
     }
-    output.push('…');
+    output.push_str("...");
     output
 }
 
@@ -8327,7 +8325,7 @@ fn render_project_history_popup(
     content.push(Line::raw(""));
     let remote_status = match &popup.remote_state {
         ProjectHistoryRemoteState::Embedded => "Showing history embedded at build time.".to_owned(),
-        ProjectHistoryRemoteState::Checking => "Checking GitHub for newer commits…".to_owned(),
+        ProjectHistoryRemoteState::Checking => "Checking GitHub for newer commits...".to_owned(),
         ProjectHistoryRemoteState::UpToDate => "GitHub: embedded history is up to date.".to_owned(),
         ProjectHistoryRemoteState::Updated => {
             "GitHub: newer commits are cached in RAM for this process.".to_owned()
@@ -8464,7 +8462,7 @@ fn yt_dlp_version_encodes_release_date(version: &str, released_on: &str) -> bool
 /// Formats one independently updating version row without exposing diagnostics.
 fn yt_dlp_version_lookup_text(lookup: &YtDlpVersionLookupView) -> String {
     match lookup {
-        YtDlpVersionLookupView::Loading => "Loading…".to_owned(),
+        YtDlpVersionLookupView::Loading => "Loading...".to_owned(),
         YtDlpVersionLookupView::Available {
             version,
             released_on: Some(released_on),
@@ -8662,7 +8660,7 @@ fn github_issue_submission_notice(state: &GitHubIssueSubmissionView) -> Option<S
                 .to_owned(),
         ),
         GitHubIssueSubmissionView::Submitting => {
-            Some("Submitting the public GitHub issue…".to_owned())
+            Some("Submitting the public GitHub issue...".to_owned())
         }
         GitHubIssueSubmissionView::Submitted { url } => {
             Some(format!("GitHub issue created:\n{url}"))
@@ -8711,7 +8709,7 @@ fn render_audio_quality_popup(
         .split(inner);
     let summary = if popup.summary.trim().is_empty() {
         if popup.pending {
-            "Preparing audio files…"
+            "Preparing audio files..."
         } else {
             "Analysis finished."
         }
@@ -8719,7 +8717,7 @@ fn render_audio_quality_popup(
         popup.summary.trim()
     };
     let progress = if popup.pending && popup.total == 0 {
-        "Discovering audio files…".to_owned()
+        "Discovering audio files...".to_owned()
     } else {
         format!("{} / {} complete", popup.completed, popup.total)
     };
@@ -8743,7 +8741,7 @@ fn render_audio_quality_popup(
     };
     let visible_body = if popup.report.is_empty() {
         if popup.pending {
-            "Waiting for the first result…"
+            "Waiting for the first result..."
         } else {
             "No audio-quality results."
         }
@@ -8884,14 +8882,14 @@ fn render_video_summary_popup(
         ])
         .split(inner);
     let state_label = match &popup.state {
-        VideoSummaryPopupState::FetchingCaptions => "Fetching and normalizing captions…",
-        VideoSummaryPopupState::Generating => "Generating summary with Codex…",
+        VideoSummaryPopupState::FetchingCaptions => "Fetching and normalizing captions...",
+        VideoSummaryPopupState::Generating => "Generating summary with Codex...",
         VideoSummaryPopupState::Ready => "Summary ready.",
         VideoSummaryPopupState::Cancelled => "Summary generation cancelled.",
         VideoSummaryPopupState::Failed(_) => "Summary generation failed.",
     };
     let caption_source = if popup.caption_source.trim().is_empty() {
-        "Captions: determining source…".to_owned()
+        "Captions: determining source...".to_owned()
     } else {
         format!("Captions: {}", popup.caption_source.trim())
     };
@@ -9211,7 +9209,7 @@ fn render_youtube_captions_popup(
         sections[0],
     );
     let source = if popup.caption_source.is_empty() {
-        "Selecting a caption track…"
+        "Selecting a caption track..."
     } else {
         popup.caption_source.as_str()
     };
@@ -9223,7 +9221,7 @@ fn render_youtube_captions_popup(
 
     match &popup.state {
         YouTubeCaptionsPopupState::Loading => frame.render_widget(
-            Paragraph::new("Loading and normalizing captions…")
+            Paragraph::new("Loading and normalizing captions...")
                 .style(theme.muted)
                 .alignment(Alignment::Center),
             sections[3],
@@ -9340,9 +9338,9 @@ fn render_video_comments_popup(
     match &popup.state {
         VideoCommentsPopupState::Loading => {
             let message = if popup.source == SourceKind::SoundCloud {
-                "Loading recent comments…"
+                "Loading recent comments..."
             } else {
-                "Loading top comments…"
+                "Loading top comments..."
             };
             content.push(Line::styled(message, theme.muted));
         }
@@ -9650,7 +9648,7 @@ fn render_podcast_feed_options_popup(
     frame.render_widget(Clear, area);
     let title = match popup.phase {
         PodcastFeedOptionsPhase::Review => " Create podcast feed? ",
-        PodcastFeedOptionsPhase::Preparing => " Preparing podcast feed… ",
+        PodcastFeedOptionsPhase::Preparing => " Preparing podcast feed... ",
         PodcastFeedOptionsPhase::Failed => " Could not create podcast feed ",
     };
     frame.render_widget(panel_block(title, theme), area);
@@ -9709,7 +9707,7 @@ fn render_podcast_feed_options_popup(
             let animation = frames[(popup.animation_frame / 4) % frames.len()];
             frame.render_widget(
                 Paragraph::new(format!(
-                    "{animation} Reading channel metadata and episode dates…"
+                    "{animation} Reading channel metadata and episode dates..."
                 ))
                 .style(theme.muted),
                 sections[1],
@@ -10415,7 +10413,7 @@ fn render_invidious_instance_picker(
         let spinner =
             ASCII_ACTIVITY_FRAMES[usize::from(picker.loading_frame) % ASCII_ACTIVITY_FRAMES.len()];
         frame.render_widget(
-            Paragraph::new(format!("{spinner} Loading public instances…"))
+            Paragraph::new(format!("{spinner} Loading public instances..."))
                 .style(theme.base)
                 .wrap(Wrap { trim: true }),
             list,
@@ -10514,7 +10512,7 @@ fn render_yandex_music_setup_popup(
     frame.render_widget(
         panel_block(
             if setup.validating {
-                " Validating Yandex Music… "
+                " Validating Yandex Music... "
             } else {
                 " Configure Yandex Music "
             },
@@ -10636,7 +10634,7 @@ fn render_yandex_music_setup_popup(
         "{}Token saves to: {}\nPlaintext credential; Unix permissions: directories 0700, files 0600. \
          YOUTA_PROVIDERS__YANDEX_MUSIC_TOKEN overrides the saved value.{}",
         if setup.validating {
-            "Validating the candidate token before saving…\n"
+            "Validating the candidate token before saving...\n"
         } else {
             ""
         },
@@ -10658,7 +10656,7 @@ fn render_yandex_music_setup_popup(
     );
 
     let submit_label = if setup.validating {
-        "[Enter] Validating…"
+        "[Enter] Validating..."
     } else {
         "[Enter] Save and load"
     };
@@ -10889,7 +10887,7 @@ fn render_commons_upload_popup(
             let frames = ["·  ", "·· ", "···", " ··", "  ·", "   "];
             frames[(popup.animation_frame / 4) % frames.len()]
         }
-        CommonsUploadPhase::Uploading => "Uploading Opus to Wikimedia Commons…",
+        CommonsUploadPhase::Uploading => "Uploading Opus to Wikimedia Commons...",
         CommonsUploadPhase::Complete => "Thanks for preserving the history",
     };
     frame.render_widget(
@@ -11284,7 +11282,7 @@ fn render_s3_upload_popup(
         UiAction::DismissS3Upload,
     ));
     if editable {
-        buttons.push(("Session keys…", UiAction::OpenS3Credentials));
+        buttons.push(("Session keys...", UiAction::OpenS3Credentials));
     }
     render_archive_popup_buttons(
         frame,
@@ -13500,7 +13498,7 @@ fn render_preferences_content(
         // The summary row already reserves a blank line, so provider settings
         // remain visible without taking space from narrow-terminal notes.
         let provider_area = Rect::new(sections[9].x, sections[9].y + 1, sections[9].width, 1);
-        let label = button("Y", "YouTube API / Invidious…", show_hotkeys);
+        let label = button("Y", "YouTube API / Invidious...", show_hotkeys);
         frame.render_widget(
             Paragraph::new(label.clone())
                 .style(theme.accent)
@@ -14266,7 +14264,7 @@ fn render_local_transfer_popup(
         .collect::<Vec<_>>();
     if pending && directories.is_empty() {
         frame.render_widget(
-            Paragraph::new("Reading destination folders…").style(theme.muted),
+            Paragraph::new("Reading destination folders...").style(theme.muted),
             sections[2],
         );
     } else if directories.is_empty() {
@@ -14498,33 +14496,23 @@ fn rename_cursor_boundary(value: &str, requested: usize) -> usize {
         .unwrap_or_default()
 }
 
+/// Masks the credential character count without exceeding the ASCII suffix's cell budget.
 fn masked_setup_value(value: &str, width: usize) -> String {
     let length = value.chars().count();
     if length <= width {
         return "*".repeat(length);
     }
-    if width == 0 {
-        return String::new();
-    }
-    if width == 1 {
-        return "…".to_owned();
-    }
-    format!("{}…", "*".repeat(width - 1))
+    let suffix_width = width.min(3);
+    format!(
+        "{}{}",
+        "*".repeat(width - suffix_width),
+        ".".repeat(suffix_width)
+    )
 }
 
+/// Keeps visible setup text within the same grapheme-safe display budget as other labels.
 fn truncate_setup_value(value: &str, width: usize) -> String {
-    let mut characters = value.chars();
-    let prefix = characters.by_ref().take(width).collect::<String>();
-    if characters.next().is_none() {
-        return prefix;
-    }
-    if width == 0 {
-        return String::new();
-    }
-    if width == 1 {
-        return "…".to_owned();
-    }
-    format!("{}…", prefix.chars().take(width - 1).collect::<String>())
+    truncate_terminal_text(value, width)
 }
 
 /// Compact action rendered immediately after an internally navigable video URL.
@@ -19593,7 +19581,7 @@ for encoded, expected in json.load(sys.stdin):
                         ..RowView::default()
                     })
                     .chain(std::iter::once(RowView {
-                        title: "Load more items…".to_owned(),
+                        title: "Load more items...".to_owned(),
                         compact: true,
                         ..RowView::default()
                     }))
@@ -19619,7 +19607,7 @@ for encoded, expected in json.load(sys.stdin):
                             })
                             .collect::<String>();
                         assert!(
-                            last_row.contains("Load more items…"),
+                            last_row.contains("Load more items..."),
                             "continuation must occupy the last results line: {width}x{height}, extra={extra}, {last_row:?}"
                         );
                     }
@@ -19657,7 +19645,7 @@ for encoded, expected in json.load(sys.stdin):
                         ..RowView::default()
                     })
                     .chain(std::iter::once(RowView {
-                        title: "Load more items…".to_owned(),
+                        title: "Load more items...".to_owned(),
                         compact: true,
                         ..RowView::default()
                     }))
@@ -19675,7 +19663,7 @@ for encoded, expected in json.load(sys.stdin):
                         terminal.backend().buffer()[(column, hit_map.rows.bottom() - 1)].symbol()
                     })
                     .collect::<String>();
-                assert!(last_row.contains("Load more items…"));
+                assert!(last_row.contains("Load more items..."));
             }
         }
     }
@@ -19697,7 +19685,7 @@ for encoded, expected in json.load(sys.stdin):
                         ..RowView::default()
                     })
                     .chain(std::iter::once(RowView {
-                        title: "Load more tracks…".into(),
+                        title: "Load more tracks...".into(),
                         compact: true,
                         ..RowView::default()
                     }))
@@ -19720,7 +19708,7 @@ for encoded, expected in json.load(sys.stdin):
                                 terminal.backend().buffer()[(x, hit_map.rows.bottom() - 1)].symbol()
                             })
                             .collect::<String>();
-                        assert!(last.contains("Load more tracks…"));
+                        assert!(last.contains("Load more tracks..."));
                     }
                 }
             }
@@ -22767,7 +22755,7 @@ for encoded, expected in json.load(sys.stdin):
         let rendered = rendered_text(&terminal);
         assert!(rendered.contains("[R] Refresh"));
         assert!(!rendered.contains("[R] Refresh -"));
-        assert!(rendered.contains("Loading more…"));
+        assert!(rendered.contains("Loading more..."));
         view.subscriptions.loading_more = false;
         view.subscriptions.loading = false;
 
@@ -24241,7 +24229,7 @@ for encoded, expected in json.load(sys.stdin):
         assert!(rendered.contains("[b] Bandcamp audio: Best available"));
         assert!(rendered.contains("[c] Video summaries: Codex CLI"));
         assert_eq!(
-            rendered.contains("[Y] YouTube API / Invidious…"),
+            rendered.contains("[Y] YouTube API / Invidious..."),
             cfg!(any(feature = "youtube-official", feature = "invidious"))
         );
         assert_eq!(
@@ -24575,7 +24563,7 @@ for encoded, expected in json.load(sys.stdin):
             #[cfg(any(feature = "youtube-official", feature = "invidious"))]
             (
                 UiAction::OpenYouTubeProviderSettings,
-                "[Y] YouTube API / Invidious…",
+                "[Y] YouTube API / Invidious...",
             ),
             (UiAction::SubmitPreferences, "[Enter] Save"),
             (UiAction::DismissPreferences, "[Esc] Cancel"),
@@ -24671,10 +24659,10 @@ for encoded, expected in json.load(sys.stdin):
         #[cfg(feature = "archive-org")]
         assert!(!rendered.contains("[F] archive.org format"));
         assert_eq!(
-            rendered.contains("YouTube API / Invidious…"),
+            rendered.contains("YouTube API / Invidious..."),
             cfg!(any(feature = "youtube-official", feature = "invidious"))
         );
-        assert!(!rendered.contains("[Y] YouTube API / Invidious…"));
+        assert!(!rendered.contains("[Y] YouTube API / Invidious..."));
 
         let auto_download_target = hit_map
             .preferences_buttons
@@ -24691,7 +24679,7 @@ for encoded, expected in json.load(sys.stdin):
         terminal
             .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
             .expect("draw preferences without a YouTube metadata provider");
-        assert!(!rendered_text(&terminal).contains("YouTube API / Invidious…"));
+        assert!(!rendered_text(&terminal).contains("YouTube API / Invidious..."));
         assert_eq!(
             key_action(
                 KeyEvent::new(KeyCode::Char('Y'), KeyModifiers::SHIFT),
@@ -24971,7 +24959,7 @@ for encoded, expected in json.load(sys.stdin):
             "Enter to save.",
             "Save playback history: off",
             #[cfg(any(feature = "youtube-official", feature = "invidious"))]
-            "[Y] YouTube API / Invidious…",
+            "[Y] YouTube API / Invidious...",
             "[Enter] Save   [Esc] Cancel",
         ] {
             assert!(
@@ -29759,8 +29747,8 @@ for encoded, expected in json.load(sys.stdin):
             .unwrap();
         let rendered = rendered_text(&terminal);
         assert!(rendered.contains("SoundCloud comments"));
-        assert!(rendered.contains("Loading recent comments…"));
-        assert!(!rendered.contains("Loading top comments…"));
+        assert!(rendered.contains("Loading recent comments..."));
+        assert!(!rendered.contains("Loading top comments..."));
     }
 
     /// Only visible SoundCloud author labels navigate; body/date text stays inert.
@@ -32993,7 +32981,7 @@ for encoded, expected in json.load(sys.stdin):
             })
             .expect("draw loading frame");
         assert_eq!(thumbnails.manager.state(), &ThumbnailState::Loading);
-        assert!(rendered_text(&terminal).contains("Loading thumbnail…"));
+        assert!(rendered_text(&terminal).contains("Loading thumbnail..."));
         assert_eq!(
             observed
                 .recv_timeout(Duration::from_secs(1))
@@ -33020,7 +33008,7 @@ for encoded, expected in json.load(sys.stdin):
         assert_eq!(thumbnails.manager.state(), &ThumbnailState::Ready);
         let rendered = rendered_text(&terminal);
         assert!(
-            !rendered.contains("Loading thumbnail…"),
+            !rendered.contains("Loading thumbnail..."),
             "the ready image must replace the loading label"
         );
         terminal
@@ -33059,7 +33047,7 @@ for encoded, expected in json.load(sys.stdin):
             })
             .expect("draw replacement loading frame");
         assert_eq!(thumbnails.manager.state(), &ThumbnailState::Loading);
-        assert!(rendered_text(&terminal).contains("Loading thumbnail…"));
+        assert!(rendered_text(&terminal).contains("Loading thumbnail..."));
         assert_eq!(
             observed
                 .recv_timeout(Duration::from_secs(1))
@@ -33086,7 +33074,7 @@ for encoded, expected in json.load(sys.stdin):
             &ThumbnailState::Failed(ThumbnailFailure::DownloadFailed)
         );
         let rendered = rendered_text(&terminal);
-        assert!(!rendered.contains("Loading thumbnail…"));
+        assert!(!rendered.contains("Loading thumbnail..."));
         assert!(rendered.contains("Thumbnail unavailable: thumbnail download failed"));
     }
 
@@ -33827,7 +33815,7 @@ for encoded, expected in json.load(sys.stdin):
                 })
                 .expect("resume thumbnail after note popup");
         }
-        assert!(!rendered_text(&terminal).contains("Loading thumbnail…"));
+        assert!(!rendered_text(&terminal).contains("Loading thumbnail..."));
         assert_eq!(
             observed.try_recv(),
             Err(TryRecvError::Empty),
@@ -33879,7 +33867,7 @@ for encoded, expected in json.load(sys.stdin):
                 })
                 .expect("draw cold subscription artwork");
             assert_eq!(thumbnails.manager.state(), &ThumbnailState::Loading);
-            assert!(rendered_text(&terminal).contains("Loading thumbnail…"));
+            assert!(rendered_text(&terminal).contains("Loading thumbnail..."));
             assert_eq!(
                 observed
                     .recv_timeout(Duration::from_secs(1))
@@ -33915,7 +33903,7 @@ for encoded, expected in json.load(sys.stdin):
             "the A→B→A transition must restore A synchronously"
         );
         assert!(
-            !rendered_text(&terminal).contains("Loading thumbnail…"),
+            !rendered_text(&terminal).contains("Loading thumbnail..."),
             "revisited prepared artwork must not expose a loading placeholder"
         );
         assert_eq!(
@@ -34564,7 +34552,123 @@ for encoded, expected in json.load(sys.stdin):
         assert_eq!(current.start, 0);
         assert_eq!(current.width, 18);
         assert!(current.text.starts_with("Текущая"));
-        assert!(current.text.ends_with('…'));
+        assert!(current.text.ends_with("..."));
+    }
+
+    /// ASCII truncation reserves its full suffix without splitting terminal graphemes.
+    #[test]
+    fn ascii_ellipsis_truncation_reserves_three_display_cells() {
+        for (width, expected) in ["", ".", "..", "...", "a...", "ab..."]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(truncate_terminal_text("abcdef", width), expected);
+            assert_eq!(truncate_setup_value("abcdef", width), expected);
+        }
+        for (value, width, expected) in [
+            ("界abcdef", 4, "..."),
+            ("界abcdef", 5, "界..."),
+            ("e\u{301}abcdef", 4, "e\u{301}..."),
+            ("👩‍💻abcdef", 5, "👩‍💻..."),
+            ("界e\u{301}", 3, "界e\u{301}"),
+            ("e\u{301}", 1, "e\u{301}"),
+            ("👩‍💻", 2, "👩‍💻"),
+            ("abcdef", 6, "abcdef"),
+            ("Provider…title", 20, "Provider…title"),
+        ] {
+            for truncate in [truncate_terminal_text, truncate_setup_value] {
+                let rendered = truncate(value, width);
+                assert_eq!(rendered, expected, "{value:?} in {width} columns");
+                assert!(Span::raw(rendered).width() <= width);
+            }
+        }
+    }
+
+    /// Narrow credential fields expose only mask cells and the bounded ASCII suffix.
+    #[test]
+    fn ascii_ellipsis_masked_fields_fit_narrow_widths() {
+        for (width, expected) in ["", ".", "..", "...", "*...", "**..."]
+            .into_iter()
+            .enumerate()
+        {
+            let rendered = masked_setup_value("secret", width);
+            assert_eq!(rendered, expected);
+            assert!(rendered.len() <= width);
+        }
+        assert_eq!(masked_setup_value("secret", 6), "******");
+        assert_eq!(masked_setup_value("界e\u{301}", 3), "***");
+        assert_eq!(masked_setup_value("", 0), "");
+    }
+
+    /// Authored ASCII labels are measured before the Preferences click target is recorded.
+    #[test]
+    fn ascii_ellipsis_labels_keep_measured_click_targets() {
+        for width in [80, 120] {
+            let view = ViewModel {
+                preferences_popup: Some(PreferencesPopupView {
+                    youtube_provider_settings_supported: true,
+                    selected_field: PreferencesField::YouTubeProvider,
+                    subscriptions_layout: SubscriptionsLayout::DrillDown,
+                    save_playback_history: true,
+                    skip_advertisement_chapters: false,
+                    sponsorblock_enabled: false,
+                    sponsorblock_supported: false,
+                    nyan_cat_seekbar: false,
+                    nyan_cat_supported: false,
+                    youtube_prewarm: false,
+                    download_new_episodes_every_hour: false,
+                    download_mode: crate::config::DownloadMode::AskEachTime,
+                    archive_download_preference:
+                        crate::config::ArchiveDownloadPreference::AskEachTime,
+                    archive_playback_preference:
+                        crate::config::ArchivePlaybackPreference::AskEachTime,
+                    archive_playback_supported: false,
+                    auto_download_supported: false,
+                    auto_download_status: None,
+                    youtube_thumbnail_size: YouTubeThumbnailSize::Standard,
+                    show_images_in_tty: false,
+                    show_local_folder_sizes: false,
+                    show_full_local_paths: false,
+                    natural_local_sort: false,
+                    bandcamp_audio_format: BandcampAudioFormat::BestAvailable,
+                    video_summary_backend: VideoSummaryBackend::Codex,
+                    video_summary_supported: false,
+                    config_path: "/fixture/config.toml".to_owned(),
+                    environment_override: None,
+                    validation_error: None,
+                }),
+                ..ViewModel::default()
+            };
+            let mut terminal = Terminal::new(TestBackend::new(width, 40)).unwrap();
+            let mut hit_map = HitMap::default();
+            terminal
+                .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+                .unwrap();
+            let label = "[Y] YouTube API / Invidious...";
+            assert!(rendered_text(&terminal).contains(label));
+            let target = hit_map
+                .preferences_buttons
+                .iter()
+                .find(|(action, _)| *action == UiAction::OpenYouTubeProviderSettings)
+                .unwrap()
+                .1;
+            assert_eq!(target.width, terminal_text_width(label));
+            for column in [target.x, target.right() - 1] {
+                assert_eq!(
+                    mouse_action(
+                        MouseEvent {
+                            kind: MouseEventKind::Down(MouseButton::Left),
+                            column,
+                            row: target.y,
+                            modifiers: KeyModifiers::NONE
+                        },
+                        &hit_map,
+                        &view
+                    ),
+                    Some(UiAction::OpenYouTubeProviderSettings)
+                );
+            }
+        }
     }
 
     /// Supplies adjacent chapters with a stable current selection for layout tests.
@@ -35625,11 +35729,11 @@ prose 07:25 remains clickable but is not a chapter";
             .expect("draw unknown-duration chapter");
         let rendered = rendered_text(&terminal);
         assert!(
-            rendered.starts_with("0:11 Se…"),
+            rendered.starts_with("0:11 ..."),
             "a narrow unknown-duration timeline must retain the active timestamp: {rendered}"
         );
         assert!(
-            rendered.contains('…'),
+            rendered.contains("..."),
             "the active chapter title must be truncated explicitly: {rendered}"
         );
         assert_eq!(
@@ -36338,7 +36442,7 @@ prose 07:25 remains clickable but is not a chapter";
         assert!(rendered.contains("A 403 can be temporary or authentication-related."));
         assert!(rendered.contains("Installed: 2026.07.04"));
         assert!(!rendered.contains("released 2026-07-04"));
-        assert!(rendered.contains("GitHub latest: Loading…"));
+        assert!(rendered.contains("GitHub latest: Loading..."));
         assert!(
             rendered.contains(
                 "Gentoo latest stable (amd64): Unavailable (package metadata unavailable)"
@@ -38971,10 +39075,10 @@ prose 07:25 remains clickable but is not a chapter";
             .draw(|frame| render(frame, &options, &UiSettings::default(), &mut hit_map))
             .expect("draw feed preparation");
         let rendered = rendered_text(&options_terminal);
-        assert!(rendered.contains("Preparing podcast feed…"));
+        assert!(rendered.contains("Preparing podcast feed..."));
         assert!(!rendered.contains("Source:"));
         assert!(!rendered.contains("Selected item:"));
-        assert!(rendered.contains("Reading channel metadata and episode dates…"));
+        assert!(rendered.contains("Reading channel metadata and episode dates..."));
         assert!(rendered.contains("[Esc] Hide"));
         assert!(!rendered.contains("[Enter] Create feed"));
 

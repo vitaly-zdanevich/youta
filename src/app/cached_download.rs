@@ -307,7 +307,7 @@ impl AppController {
             active: true,
             ..DownloadView::default()
         });
-        self.view.status_line = format!("Checking the playback cache for {}…", item.media.title);
+        self.view.status_line = format!("Checking the playback cache for {}...", item.media.title);
     }
 
     /// Consumes one cache outcome; a miss starts the captured normal download once.

@@ -444,7 +444,7 @@ export function S3UploadPopup({ popup }: { popup: S3UploadPopupView }) {
 			footer={<>
 				{editable ? <PopupButton emphasis onClick={() => void dispatch({ SubmitS3Upload: popup.generation })}>Upload</PopupButton> : null}
 				<PopupButton onClick={() => void dispatch('DismissS3Upload')}>{terminal ? 'Close' : 'Cancel'}</PopupButton>
-				{editable ? <PopupButton onClick={() => void dispatch('OpenS3Credentials')}>Session keys…</PopupButton> : null}
+				{editable ? <PopupButton onClick={() => void dispatch('OpenS3Credentials')}>Session keys...</PopupButton> : null}
 			</>}>
 			<Body><div className='grid gap-3'>
 				<p className='text-ink-dim'>Bucket permissions apply. Existing objects are not overwritten. Tab changes fields; F1 opens session keys, F2 toggles video, Ctrl+S uploads.</p>
@@ -973,11 +973,11 @@ export function EvernoteCredentialsPopup({
 export function AudioQualityPopup({ popup }: { popup: AudioQualityPopupView }) {
   const dismiss = popup.pending ? "CancelAudioQualityAnalysis" : "DismissAudioQualityPopup";
   const progress = popup.pending && popup.total === 0
-    ? "Discovering audio files…"
+    ? "Discovering audio files..."
     : `${popup.completed} / ${popup.total} complete`;
   const report = popup.report.length === 0
     ? popup.pending
-      ? "Waiting for the first result…"
+      ? "Waiting for the first result..."
       : "No audio-quality results."
     : popup.report;
 
@@ -1018,7 +1018,7 @@ export function AudioQualityPopup({ popup }: { popup: AudioQualityPopupView }) {
           title={popup.summary || undefined}
           className="truncate border-b border-line px-[18px] py-[9px] text-xs text-ink-dim"
         >
-          {popup.summary || (popup.pending ? "Preparing audio files…" : "Analysis finished.")}
+          {popup.summary || (popup.pending ? "Preparing audio files..." : "Analysis finished.")}
         </p>
         <ScrollingText
           popup="audio_quality"
@@ -1044,9 +1044,9 @@ export function VideoSummaryPopup({ popup }: { popup: VideoSummaryPopupView }) {
   const failed = typeof state === "object";
   const progress =
     state === "FetchingCaptions"
-      ? "Retrieving captions…"
+      ? "Retrieving captions..."
       : state === "Generating"
-        ? "Generating with Codex…"
+        ? "Generating with Codex..."
         : ready
           ? "Summary ready"
           : state === "Cancelled"
@@ -1142,7 +1142,7 @@ export function YouTubeCaptionsPopup({ popup }: { popup: YouTubeCaptionsPopupVie
 		>
 			<div className='grid h-full min-h-0 grid-rows-[auto_auto_minmax(0,1fr)]'>
 				<p className='truncate border-b border-line px-[18px] py-[7px] text-xs text-ink-dim'>
-					{popup.caption_source || 'Selecting a caption track…'}
+					{popup.caption_source || 'Selecting a caption track...'}
 				</p>
 				<label className='grid grid-cols-[auto_minmax(0,1fr)] items-center gap-2 border-b border-line px-[18px] py-[8px] text-xs text-ink-dim'>
 					Search
@@ -1157,7 +1157,7 @@ export function YouTubeCaptionsPopup({ popup }: { popup: YouTubeCaptionsPopupVie
 				</label>
 				<div className='min-h-0 overflow-y-auto px-[10px] py-[8px] text-xs'>
 					{popup.state === 'Loading' ? (
-						<p className='p-4 text-center text-ink-dim'>Loading and normalizing captions…</p>
+						<p className='p-4 text-center text-ink-dim'>Loading and normalizing captions...</p>
 					) : typeof popup.state === 'object' ? (
 						<p role='alert' className='p-4 text-accent'>Could not load captions: {popup.state.Failed}</p>
 					) : popup.cues.length === 0 ? (
@@ -1239,7 +1239,7 @@ function ytDlpVersionEncodesReleaseDate(version: string, releasedOn: string) {
 /** Formats one independently updating yt-dlp version lookup. */
 function ytDlpLookupText(lookup: YtDlpVersionLookupView) {
   if (lookup === "Loading") {
-    return "Loading…";
+    return "Loading...";
   }
   if ("Unavailable" in lookup) {
     const reason = lookup.Unavailable.reason.trim();
@@ -1312,7 +1312,7 @@ function GitHubIssueSubmissionNotice({
   if (state === "Submitting") {
     return (
       <p className="border-b border-line px-[18px] py-[10px] text-[11px] leading-[17px] text-ink-dim">
-        Submitting the public GitHub issue… This dialog cannot be closed until the request
+        Submitting the public GitHub issue... This dialog cannot be closed until the request
         finishes.
       </p>
     );
@@ -1405,7 +1405,7 @@ export function ErrorPopup({
               </>
             ) : submitting ? (
               <PopupButton disabled onClick={() => undefined}>
-                Submitting…
+                Submitting...
               </PopupButton>
             ) : null}
             {requestable && externalOpener ? (
@@ -1460,7 +1460,7 @@ export function VideoCommentsPopup({ popup }: { popup: VideoCommentsPopupView })
     >
       {state === "Loading" ? (
         <Body>
-          <p className="text-ink-faint">Loading…</p>
+          <p className="text-ink-faint">Loading...</p>
         </Body>
       ) : state === "Empty" ? (
         <Body>
@@ -1548,7 +1548,7 @@ export function PodcastFeedOptionsPopup({
 	const title = reviewing
 		? 'Create podcast feed?'
 		: popup.phase === 'Preparing'
-			? 'Preparing podcast feed…'
+			? 'Preparing podcast feed...'
 			: 'Could not create podcast feed';
 	return (
 		<Popup
@@ -1741,7 +1741,7 @@ export function PreferencesPopup({ popup, archiveSupported }: {
 	add('BandcampAudio', 'Bandcamp audio format', popup.bandcamp_audio_format, 'CycleBandcampAudioFormat');
 	add('VideoSummaries', 'Video summaries', popup.video_summary_backend === 'codex' ? 'Codex CLI' : 'off',
 		'CycleVideoSummaryBackend', popup.video_summary_supported, popup.video_summary_backend === 'codex');
-	add('YouTubeProvider', '', 'YouTube API / Invidious…', 'OpenYouTubeProviderSettings', popup.youtube_provider_settings_supported);
+	add('YouTubeProvider', '', 'YouTube API / Invidious...', 'OpenYouTubeProviderSettings', popup.youtube_provider_settings_supported);
 	return (
 		<Popup
 			title='Preferences'
@@ -2108,7 +2108,7 @@ export function LocalFilePopup({ popup, progress }: { popup: LocalFilePopupView;
             {mode} here
           </PopupButton>
           <PopupButton disabled={busy} onClick={dismiss}>Cancel</PopupButton>
-          {busy ? <span>{copying ? 'Copying...' : 'Moving...'}</span> : pending ? <span>Listing…</span> : null}
+          {busy ? <span>{copying ? 'Copying...' : 'Moving...'}</span> : pending ? <span>Listing...</span> : null}
         </>
       }
     >
@@ -2233,7 +2233,7 @@ export function YouTubeProviderPopup({ editor, externalOpenerAvailable }: {
 						{picker.loading ? (
 							<p role='status' className='m-0 text-ink-dim'>
 								<span aria-hidden>{['|', '/', '-', '\\'][picker.loading_frame % 4]} </span>
-								Loading public instances…
+								Loading public instances...
 							</p>
 						) : picker.error ? (
 							<p role='alert' className='m-0 whitespace-pre-wrap break-words text-accent'>{picker.error}</p>

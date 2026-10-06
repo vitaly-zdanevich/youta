@@ -328,7 +328,7 @@ fn web_metadata_description(filename: &str, metadata: Option<&WebMediaMetadata>)
             lines.push(format!("Channels: {value}"));
         }
     } else {
-        lines.push("Loading metadata…".to_owned());
+        lines.push("Loading metadata...".to_owned());
     }
     lines.push(String::new());
     lines.push("Audio only. With Autoplay enabled, playback continues through this folder in the displayed order.".to_owned());

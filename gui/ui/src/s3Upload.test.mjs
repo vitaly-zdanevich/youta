@@ -61,7 +61,7 @@ test('S3 review shows exact destination and only explicitly submits the live gen
 		assert.ok(text(tree).includes('Existing objects are not overwritten'));
 		assert.ok(text(tree).includes('AWS_PROFILE'));
 		assert.ok(!text(tree).includes('public link'));
-		buttons.find((node) => text(node) === 'Session keys…').props.onClick();
+		buttons.find((node) => text(node) === 'Session keys...').props.onClick();
 		assert.deepEqual(actions.pop(), ['OpenS3Credentials']);
 		for (const field of ['Bucket', 'Region', 'ObjectKey', 'Profile']) {
 			buttons.find((node) => node.props['data-s3-field'] === field).props.onClick();
@@ -80,7 +80,7 @@ test('S3 busy and terminal states do not offer a retry and video respects capabi
 			result_location: phase === 'Complete' ? 's3://fixture-bucket/audio/fixture.opus' : null,
 		} });
 		const buttons = nodes(tree).filter((node) => node.type === 'button');
-		assert.ok(!buttons.some((node) => ['Upload', 'Session keys…'].includes(text(node))));
+		assert.ok(!buttons.some((node) => ['Upload', 'Session keys...'].includes(text(node))));
 		assert.ok(buttons.filter((node) => node.props['data-s3-field']).every((node) => node.props.disabled));
 		assert.ok(!buttons.some((node) => text(node).includes('Open')));
 		if (phase === 'Uploading') assert.ok(text(tree).includes('50%'));

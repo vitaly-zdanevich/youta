@@ -56,7 +56,7 @@ impl AppController {
                 selected: self.view.selected,
             });
             self.begin_search_activity(SearchActivity::ArchiveOrg);
-            self.view.status_line = "Locating playing archive.org file…".into();
+            self.view.status_line = "Locating playing archive.org file...".into();
             self.update_archive_back_available();
         }
         true
@@ -131,7 +131,7 @@ impl AppController {
                     selected: self.view.selected,
                 });
                 self.begin_search_activity(SearchActivity::ArchiveOrg);
-                self.view.status_line = "Locating playing archive.org ZIP member…".into();
+                self.view.status_line = "Locating playing archive.org ZIP member...".into();
             }
             return true;
         }

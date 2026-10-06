@@ -96,7 +96,7 @@ impl AppController {
         });
         if let Some(details) = self.view.details.as_mut() {
             details.wikidata = if sent {
-                "loading P3040 lazily…"
+                "loading P3040 lazily..."
             } else {
                 "provider worker unavailable"
             }

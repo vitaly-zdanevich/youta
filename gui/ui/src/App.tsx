@@ -124,7 +124,7 @@ export function App() {
   }
 
   if (view === null) {
-    return <div className="grid h-full place-items-center text-xs text-ink-faint">Starting…</div>;
+    return <div className="grid h-full place-items-center text-xs text-ink-faint">Starting...</div>;
   }
 
   const visibleSources = view.playback_history_enabled

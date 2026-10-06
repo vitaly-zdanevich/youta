@@ -1739,7 +1739,7 @@ fn truncate_utf8_to_limit(value: &str, maximum: usize) -> String {
     if value.len() <= maximum {
         return value.to_owned();
     }
-    let suffix = "…";
+    let suffix = "...";
     if maximum < suffix.len() {
         return String::new();
     }
@@ -2705,6 +2705,26 @@ impl Drop for PrivateWorkspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Three ASCII periods retain the existing UTF-8 byte ceiling, including tiny limits.
+    #[test]
+    fn ascii_ellipsis_summary_truncation_preserves_byte_limits() {
+        let source = "é".repeat(10);
+        for maximum in 0..=12 {
+            let truncated = truncate_utf8_to_limit(&source, maximum);
+            assert!(truncated.len() <= maximum);
+            if maximum < 3 {
+                assert!(truncated.is_empty());
+            } else {
+                assert!(truncated.ends_with("..."));
+            }
+        }
+        assert_eq!(truncate_utf8_to_limit("éé", 4), "éé");
+        assert_eq!(
+            truncate_utf8_to_limit("Original\u{2026}text", 30),
+            "Original\u{2026}text"
+        );
+    }
     #[cfg(unix)]
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     #[cfg(unix)]

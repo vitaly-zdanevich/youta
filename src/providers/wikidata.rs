@@ -2040,7 +2040,7 @@ fn bounded_display(text: &str) -> Result<(Option<String>, OmissionState), Provid
     let boundary = normalized
         .char_indices()
         .map(|(index, _)| index)
-        .take_while(|index| *index <= MAX_VALUE_BYTES.saturating_sub('…'.len_utf8()))
+        .take_while(|index| *index <= MAX_VALUE_BYTES.saturating_sub("...".len()))
         .last()
         .unwrap_or(0);
     if boundary == 0 {
@@ -2049,7 +2049,7 @@ fn bounded_display(text: &str) -> Result<(Option<String>, OmissionState), Provid
         ));
     }
     let mut bounded = normalized[..boundary].to_owned();
-    bounded.push('…');
+    bounded.push_str("...");
     Ok((
         Some(bounded),
         OmissionState {
@@ -2805,6 +2805,23 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    /// Generated omission markers are ASCII while original Wikidata text stays intact.
+    #[test]
+    fn ascii_ellipsis_wikidata_display_preserves_byte_limits() {
+        let (display, omissions) = bounded_display(&"é".repeat(MAX_VALUE_BYTES)).unwrap();
+        let display = display.unwrap();
+        assert!(display.len() <= MAX_VALUE_BYTES);
+        assert!(display.ends_with("..."));
+        assert!(omissions.hard_bounds_reached);
+        assert_eq!(
+            bounded_display("Original\u{2026}text")
+                .unwrap()
+                .0
+                .as_deref(),
+            Some("Original\u{2026}text")
+        );
+    }
 
     const ENTITY_STATEMENTS_FIXTURE: &str = r#"{
       "entities": {

@@ -149,8 +149,8 @@ fn escape_terminal_controls(input: &str) -> String {
 
 /// Bounds escaped helper text while reserving room for truthful suffixes.
 fn bounded_helper_detail(input: &str, capture_truncated: bool) -> String {
-    const CAPTURE_SUFFIX: &str = "\n… helper output truncated";
-    const DISPLAY_SUFFIX: &str = "\n… helper detail truncated";
+    const CAPTURE_SUFFIX: &str = "\n... helper output truncated";
+    const DISPLAY_SUFFIX: &str = "\n... helper detail truncated";
 
     let capture_suffix = if capture_truncated {
         CAPTURE_SUFFIX
@@ -1338,9 +1338,9 @@ fn bounded_issue_title(title: &str) -> String {
 
     let mut shortened = bounded
         .chars()
-        .take(MAX_ISSUE_TITLE_CHARS.saturating_sub(1))
+        .take(MAX_ISSUE_TITLE_CHARS.saturating_sub(3))
         .collect::<String>();
-    shortened.push('…');
+    shortened.push_str("...");
     shortened
 }
 
@@ -1805,7 +1805,7 @@ mod tests {
         assert!(!title.contains("secret"));
         assert!(title.contains("<redacted>"));
         assert_eq!(title.chars().count(), MAX_ISSUE_TITLE_CHARS);
-        assert!(title.ends_with('…'));
+        assert!(title.ends_with("..."));
     }
 
     #[test]

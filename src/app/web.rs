@@ -92,7 +92,7 @@ impl AppController {
         self.web.restore_row = restore_row;
         self.web.listing = None;
         self.web.selected = 0;
-        "Loading Web folder… Audio only".clone_into(&mut self.web.message);
+        "Loading Web folder... Audio only".clone_into(&mut self.web.message);
         self.view.search_editing = false;
         self.populate_web();
         self.start_web_worker();

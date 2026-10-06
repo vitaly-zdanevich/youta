@@ -74,7 +74,7 @@ impl AppController {
             return true;
         }
         self.begin_search_activity(SearchActivity::LibriVox);
-        self.view.status_line = format!("Loading the book for {}…", item.media.title);
+        self.view.status_line = format!("Loading the book for {}...", item.media.title);
         true
     }
 

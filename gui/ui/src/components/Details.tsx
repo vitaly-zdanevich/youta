@@ -253,7 +253,7 @@ function Links({
                   onClick={() => void dispatch({ ToggleWikidataStatements: index })}
                   className="rounded-[3px] text-[11px] text-ink-faint hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-accent"
                 >
-                  {loading ? "loading…" : expanded ? "▾ statements" : "▸ statements"}
+                  {loading ? "loading..." : expanded ? "▾ statements" : "▸ statements"}
                 </button>
               ) : null}
             </span>
@@ -501,7 +501,7 @@ export function Details({ view, kind }: { view: ViewModel; kind: InformationPane
 			<Action onClick={() => void dispatch('BeginLocalCopy')}>Copy</Action>
 		) : null}
 		{details.local_movable ? (
-			<Action onClick={() => void dispatch('BeginLocalMove')}>Move…</Action>
+			<Action onClick={() => void dispatch('BeginLocalMove')}>Move...</Action>
 		) : null}
 		{details.local_renamable ? (
 			<Action onClick={() => void dispatch('BeginLocalRename')}>Rename</Action>
@@ -511,7 +511,7 @@ export function Details({ view, kind }: { view: ViewModel; kind: InformationPane
         ) : null}
         {details.local_fingerprint_available ? (
           <Action onClick={() => void dispatch("FingerprintLocalAudio")}>
-            {details.local_fingerprint_pending ? "Identifying…" : "Identify"}
+            {details.local_fingerprint_pending ? "Identifying..." : "Identify"}
           </Action>
         ) : null}
         {view.audio_quality_supported &&
