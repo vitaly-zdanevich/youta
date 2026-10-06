@@ -74,11 +74,14 @@ mod tests {
             "2026 August 26 02:05"
         );
         assert_eq!(format_timestamp(None, &offset), "unavailable");
+        // Windows SystemTime uses 100 ns ticks; one microsecond remains fractional
+        // and representably before the epoch on every supported platform.
+        let before_epoch = UNIX_EPOCH
+            .checked_sub(Duration::from_micros(1))
+            .expect("representable pre-epoch fixture");
+        assert!(before_epoch < UNIX_EPOCH);
         assert_eq!(
-            format_timestamp(
-                UNIX_EPOCH.checked_sub(Duration::from_nanos(1)),
-                &chrono::Utc
-            ),
+            format_timestamp(Some(before_epoch), &chrono::Utc),
             "1969 December 31 23:59"
         );
         if let Some(out_of_range) = UNIX_EPOCH.checked_add(Duration::from_secs(10_000_000_000_000))

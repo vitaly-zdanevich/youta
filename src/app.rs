@@ -53106,12 +53106,13 @@ mod tests {
         assert!(!popup.captions_available);
     }
 
+    /// Snapshots retain the current path presentation without abbreviating replay identity.
     #[test]
     fn local_playlist_snapshot_preserves_the_primary_visible_description() {
         let temporary = crate::test_support::canonical_tempdir("temporary local description");
         let path = temporary.path().join("described.flac");
         std::fs::write(&path, b"fixture local audio").expect("local fixture");
-        let mut item = local_media_item_stub(path, Some(19));
+        let mut item = local_media_item_stub(path.clone(), Some(19));
         item.artist = Some("Fixture artist".to_owned());
         item.album = Some("Fixture album".to_owned());
         item.genre = Some("Fixture genre".to_owned());
@@ -53121,26 +53122,51 @@ mod tests {
         item.sample_rate_hz = Some(44_100);
         item.channels = Some(2);
         item.technical_metadata_probed = true;
-        let expected = local_media_description(&item);
         let (mut controller, _) = controller_with_mock_statuses([]);
         controller.view.screen = Screen::Search;
         controller.local_results = vec![item];
         controller.view.selected = 0;
-        controller.update_non_youtube_detail();
-        assert_eq!(
-            controller
-                .view
-                .details
-                .as_ref()
-                .map(|details| details.description.as_str()),
-            Some(expected.as_str())
-        );
-
-        let snapshot = controller
-            .selected_playlist_snapshot()
-            .expect("local playlist snapshot");
-
-        assert_eq!(snapshot.description.as_deref(), Some(expected.as_str()));
+        let home = directories::BaseDirs::new().expect("test home directory");
+        let relative = Path::new("youta-path-display-fixture").join("described.flac");
+        let home_path = home.home_dir().join(&relative);
+        // The metadata-only home fixture covers abbreviation even when /tmp is
+        // outside home. No file is created in the user's home directory.
+        for path in [path, home_path.clone()] {
+            controller.local_results[0].path = path.clone();
+            for show_full in [false, true] {
+                controller.config.ui.show_full_local_paths = show_full;
+                let label =
+                    local_path_display::display_path(&path, Some(home.home_dir()), show_full);
+                if path == home_path {
+                    assert_eq!(
+                        label,
+                        if show_full {
+                            path.display().to_string()
+                        } else {
+                            Path::new("~").join(&relative).display().to_string()
+                        }
+                    );
+                }
+                let expected = local_media_description_with_location(
+                    &controller.local_results[0],
+                    local_file_dates::path_description(&path, &label),
+                );
+                controller.update_non_youtube_detail();
+                assert_eq!(
+                    controller
+                        .view
+                        .details
+                        .as_ref()
+                        .map(|details| details.description.as_str()),
+                    Some(expected.as_str())
+                );
+                let snapshot = controller
+                    .selected_playlist_snapshot()
+                    .expect("local playlist snapshot");
+                assert_eq!(snapshot.description.as_deref(), Some(expected.as_str()));
+                assert_eq!(snapshot.id, local_media_id(&path));
+            }
+        }
     }
 
     #[test]
@@ -64458,6 +64484,7 @@ mod tests {
         );
     }
 
+    /// Status follows the display preference while the editor always receives the full path.
     #[cfg(feature = "local-browser")]
     #[test]
     fn activating_a_local_text_entry_schedules_its_system_editor_plan() {
@@ -64477,29 +64504,55 @@ mod tests {
         controller.view.screen = Screen::Local;
         controller.view.physical_linux_console = false;
         controller.local_listing = Some(listing);
-        controller.refresh_local_browser_rows();
-        controller.view.selected = controller
-            .view
-            .rows
-            .iter()
-            .position(|row| row.title == "notes.txt")
-            .expect("visible text row");
-
-        controller.activate_local_browser_selection();
-
-        let plan = controller
-            .pending_text_file_open
-            .as_ref()
-            .expect("scheduled text-file opener");
-        assert_eq!(
-            plan.arguments.last().map(|argument| argument.as_os_str()),
-            Some(notes.as_os_str())
-        );
-        assert_eq!(plan.lifecycle, TextFileOpenLifecycle::Detached);
-        assert_eq!(
-            controller.view.status_line,
-            format!("Opening {}...", notes.display())
-        );
+        let home = directories::BaseDirs::new().expect("test home directory");
+        let relative = Path::new("youta-path-display-fixture").join("notes.txt");
+        let home_path = home.home_dir().join(&relative);
+        // Reuse the discovered text entry for a metadata-only home fixture too;
+        // planning an editor must neither create nor open that synthetic file.
+        for notes in [notes, home_path.clone()] {
+            let listing = controller.local_listing.as_mut().expect("Local listing");
+            listing.path = notes.parent().expect("fixture parent").to_owned();
+            listing.parent = listing.path.parent().map(Path::to_owned);
+            listing
+                .entries
+                .iter_mut()
+                .find(|entry| entry.name == "notes.txt")
+                .expect("text fixture")
+                .path = notes.clone();
+            controller.refresh_local_browser_rows();
+            controller.view.selected = controller
+                .view
+                .rows
+                .iter()
+                .position(|row| row.title == "notes.txt")
+                .expect("visible text row");
+            for show_full in [false, true] {
+                controller.config.ui.show_full_local_paths = show_full;
+                controller.activate_local_browser_selection();
+                let plan = controller
+                    .pending_text_file_open
+                    .as_ref()
+                    .expect("scheduled text-file opener");
+                assert_eq!(
+                    plan.arguments.last().map(|argument| argument.as_os_str()),
+                    Some(notes.as_os_str())
+                );
+                assert_eq!(plan.lifecycle, TextFileOpenLifecycle::Detached);
+                let label =
+                    local_path_display::display_path(&notes, Some(home.home_dir()), show_full);
+                if notes == home_path {
+                    assert_eq!(
+                        label,
+                        if show_full {
+                            notes.display().to_string()
+                        } else {
+                            Path::new("~").join(&relative).display().to_string()
+                        }
+                    );
+                }
+                assert_eq!(controller.view.status_line, format!("Opening {label}..."));
+            }
+        }
     }
 
     #[cfg(feature = "local-browser")]
