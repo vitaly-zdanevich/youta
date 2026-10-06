@@ -604,7 +604,7 @@
 				details: { ...clone(defaults.DetailView), title, source: 'Local',
 					media_id: folder ? null : { source: 'local', external_id: 'file:///private/library/track.flac' } } });
 			await until(() => document.querySelector('[aria-label=Details] h2')?.textContent === title, title);
-			const upload = button('Upload to archive.org');
+			const upload = button('[I] To archive.org');
 			assert(Boolean(upload) === (supported && available), `Archive Local button follows shared capability: ${title}`);
 			if (upload) await action('OpenArchiveUpload', () => upload.click(), 'Local file opens explicit Archive upload review');
 		}
@@ -1091,8 +1091,11 @@
 		await key('U', { Char: 'U' }, { shiftKey: true });
 		snapshot({ commons_upload_available: false });
 		await until(() => !button('[U] To Commons'), 'unavailable Commons action remains hidden');
-		await until(() => button('Upload to archive.org'), 'Archive upload action');
-		await action('OpenArchiveUpload', () => button('Upload to archive.org').click(), 'Archive Details action opens publication review');
+		await until(() => button('[I] To archive.org'), 'Archive upload action with uppercase shortcut');
+		assert(!button('Upload to archive.org'), 'Archive no longer uses its old Details button label');
+		await action('OpenArchiveUpload', () => button('[I] To archive.org').click(), 'Archive Details action opens publication review');
+		// Forward uppercase I unchanged; review and publication remain shared-reducer actions.
+		await key('I', { Char: 'I' }, { shiftKey: true });
 		const archive = { ...clone(defaults.ArchiveUploadPopupView), generation: 7, selected_field: 'Description', phase: 'Review', video_available: true,
 			draft: { source: 'YouTube', identifier: 'fixture-review', title: 'Fixture title', description: 'Full description\nAnother line', creator: 'Fixture creator',
 				source_url: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ', upload_video: false } };
@@ -1148,7 +1151,7 @@
 		assert(!button('Upload', dialog()) && !button('Open item', dialog()), 'S3 completion is read-only and does not imply a public web link');
 		snapshot({ s3_upload_popup: null, s3_upload_supported: false, s3_upload_available: false,
 			archive_upload_supported: false, archive_upload_available: false });
-		await until(() => !dialog() && !button('Upload to S3') && !button('Upload to archive.org'), 'feature-trimmed Details');
+		await until(() => !dialog() && !button('Upload to S3') && !button('[I] To archive.org'), 'feature-trimmed Details');
 		checks.push('Feature-trimmed snapshots expose neither upload action');
 		assert(failures.length === 0, 'The full browser journey reports no frontend runtime failures');
 	}

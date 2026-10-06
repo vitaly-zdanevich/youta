@@ -117,6 +117,8 @@ test('S3 controls are feature-gated and mounted with a length-only credential co
 	assert.match(app, /<S3UploadPopup popup=\{view\.s3_upload_popup\}/);
 	assert.match(app, /<S3CredentialsPopup editor=\{view\.s3_credentials_editor\}/);
 	assert.ok(details.includes('view.s3_upload_supported && view.s3_upload_available'));
-	assert.ok(details.indexOf('>Upload to archive.org</Action>') < details.indexOf('>Upload to S3</Action>'));
+	const archive = details.indexOf('>[I] To archive.org</Action>');
+	assert.ok(archive >= 0, 'Archive action retains its compact label and shortcut');
+	assert.ok(archive < details.indexOf('>Upload to S3</Action>'));
 	assert.ok(source.includes("['M', 'upload selected media to S3']"));
 });

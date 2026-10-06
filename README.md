@@ -2484,8 +2484,8 @@ has no HTTPS endpoint.
 ## Internet Archive uploads
 
 Select a YouTube video or supported Local media file and choose
-`Upload to archive.org`, or press uppercase `I` (shown in Help, not in the button
-label). Review the fresh item identifier,
+`[I] To archive.org`, or press uppercase `I` (also listed in Help).
+Review the fresh item identifier,
 title, description and creator before publishing. For YouTube, the original URL is
 attached automatically as source metadata, without an extra field in the popup.
 Local reviews omit private filesystem paths from public metadata. Folders and

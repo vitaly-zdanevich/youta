@@ -489,7 +489,7 @@ export function Details({ view, kind }: { view: ViewModel; kind: InformationPane
 			<Action onClick={() => void dispatch('OpenEvernoteNote')}>Save audio to Evernote</Action>
 		) : null}
 		{view.archive_upload_supported && view.archive_upload_available ? (
-			<Action onClick={() => void dispatch('OpenArchiveUpload')}>Upload to archive.org</Action>
+			<Action onClick={() => void dispatch('OpenArchiveUpload')}>[I] To archive.org</Action>
 		) : null}
 		{view.s3_upload_supported && view.s3_upload_available ? (
 			<Action onClick={() => void dispatch('OpenS3Upload')}>Upload to S3</Action>

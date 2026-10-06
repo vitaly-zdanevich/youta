@@ -122,8 +122,8 @@ test('Archive upload progress cannot submit again and can cancel or open the res
 
 test('Archive Details control follows Commons and Evernote and trusts the selected upload capability', async () => {
 	const details = await readFile(new URL('./components/Details.tsx', import.meta.url), 'utf8');
-	const guard = details.match(/\{([^\n]+) \? \(\s*<Action onClick=\{\(\) => void dispatch\('OpenArchiveUpload'\)\}>Upload to archive\.org<\/Action>/)?.[1];
-	assert.ok(guard, 'Archive action must keep its explicit capability guard');
+	const guard = details.match(/\{([^\n]+) \? \(\s*<Action onClick=\{\(\) => void dispatch\('OpenArchiveUpload'\)\}>\[I\] To archive\.org<\/Action>/)?.[1];
+	assert.ok(guard, 'Archive action must show its compact label and shortcut with the existing capability guard');
 	for (const archive_upload_supported of [false, true]) {
 		for (const archive_upload_available of [false, true]) {
 			for (const isYouTube of [false, true]) {
@@ -136,8 +136,8 @@ test('Archive Details control follows Commons and Evernote and trusts the select
 	const commons = details.indexOf('>[U] To Commons</Action>');
 	assert.ok(commons >= 0, 'Commons shows its compact label and uppercase shortcut');
 	assert.ok(commons < details.indexOf('>Save audio to Evernote</Action>'));
-	assert.ok(details.indexOf('>Save audio to Evernote</Action>') < details.indexOf('>Upload to archive.org</Action>'));
-	assert.ok(!details.includes('[I] Upload to archive.org'));
+	assert.ok(details.indexOf('>Save audio to Evernote</Action>') < details.indexOf('>[I] To archive.org</Action>'));
+	assert.ok(!details.includes('Upload to archive.org'));
 });
 
 test('Archive window mounts the public popup and a credentials projection containing no keys', async () => {

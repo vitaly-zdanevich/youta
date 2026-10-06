@@ -4869,7 +4869,7 @@ fn render_information_panel(
             &mut lines,
             &mut right_buttons,
             inner.width,
-            "Upload to archive.org".to_owned(),
+            button("I", "To archive.org", show_hotkeys),
             theme.accent,
             UiAction::OpenArchiveUpload,
         );
@@ -23597,7 +23597,7 @@ for encoded, expected in json.load(sys.stdin):
 
     #[cfg(feature = "archive-upload")]
     #[test]
-    fn archive_upload_button_is_plain_and_follows_existing_export_actions() {
+    fn archive_upload_button_shows_shortcut_and_follows_existing_export_actions() {
         let mut view = ViewModel {
             archive_upload_available: true,
             details: Some(DetailView {
@@ -23621,8 +23621,8 @@ for encoded, expected in json.load(sys.stdin):
             .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
             .unwrap();
         let rendered = rendered_text(&terminal);
-        assert!(rendered.contains("Upload to archive.org"));
-        assert!(!rendered.contains("[I] Upload to archive.org"));
+        assert!(rendered.contains("[I] To archive.org"));
+        assert!(!rendered.contains("Upload to archive.org"));
         let archive = hit_map
             .detail_buttons
             .iter()
@@ -23647,17 +23647,39 @@ for encoded, expected in json.load(sys.stdin):
                 < archive
         );
         let _ = archive;
+        terminal
+            .draw(|frame| {
+                render(
+                    frame,
+                    &view,
+                    &UiSettings {
+                        show_hotkeys: false,
+                        ..UiSettings::default()
+                    },
+                    &mut hit_map,
+                );
+            })
+            .unwrap();
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("To archive.org"));
+        assert!(!rendered.contains("[I] To archive.org"));
+        assert!(
+            hit_map
+                .detail_buttons
+                .iter()
+                .any(|(action, _)| action == &UiAction::OpenArchiveUpload)
+        );
         view.archive_upload_available = false;
         terminal
             .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
             .unwrap();
-        assert!(!rendered_text(&terminal).contains("Upload to archive.org"));
+        assert!(!rendered_text(&terminal).contains("To archive.org"));
     }
 
     /// Local files reuse the publication review; folder and unavailable projections stay inert.
     #[cfg(feature = "archive-upload")]
     #[test]
-    fn archive_upload_local_details_reuse_the_capability_and_plain_button() {
+    fn archive_upload_local_details_reuse_the_capability_and_shortcut_button() {
         for (name, media_id, available) in [
             (
                 "track.flac",
@@ -23704,7 +23726,10 @@ for encoded, expected in json.load(sys.stdin):
                     .iter()
                     .find(|(action, _)| *action == UiAction::OpenArchiveUpload);
                 assert_eq!(target.is_some(), supported && available);
-                assert!(!rendered_text(&terminal).contains("[I] Upload to archive.org"));
+                assert_eq!(
+                    rendered_text(&terminal).contains("[I] To archive.org"),
+                    supported && available
+                );
                 if let Some((_, area)) = target {
                     assert_eq!(
                         mouse_action(
