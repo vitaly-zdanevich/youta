@@ -4881,6 +4881,10 @@ fn render_information_panel(
         return;
     };
 
+    let youtube_details = details
+        .media_id
+        .as_ref()
+        .is_some_and(|media_id| media_id.source == SourceKind::YouTube);
     let archive_org_details = details
         .media_id
         .as_ref()
@@ -4907,7 +4911,7 @@ fn render_information_panel(
         Vec::new()
     };
     let mut right_buttons = Vec::with_capacity(5);
-    if show_text_selection && view.public_comments_available() {
+    if show_text_selection && !youtube_details && view.public_comments_available() {
         push_right_detail_button(
             &mut lines,
             &mut right_buttons,
@@ -4923,16 +4927,6 @@ fn render_information_panel(
             ),
             theme.accent,
             UiAction::OpenVideoComments,
-        );
-    }
-    if show_text_selection && kind == InformationPanelKind::Video && view.video_summary_available {
-        push_right_detail_button(
-            &mut lines,
-            &mut right_buttons,
-            inner.width,
-            button("G", "Summarize", show_hotkeys),
-            theme.accent,
-            UiAction::GenerateVideoSummary,
         );
     }
     #[cfg(feature = "commons-upload")]
@@ -5370,6 +5364,34 @@ fn render_information_panel(
             UiAction::EditPrivateNote,
         )
     });
+    // Pair reading actions with preservation/browser controls when space permits;
+    // the shared helper appends separate rows when their full labels cannot fit.
+    let youtube_comments_button =
+        (show_text_selection && youtube_details && view.public_comments_available()).then(|| {
+            push_left_detail_button(
+                &mut lines,
+                &right_buttons,
+                &mut next_left_row,
+                inner.width,
+                button("F6", "Twenty comments", show_hotkeys),
+                theme.accent,
+                UiAction::OpenVideoComments,
+            )
+        });
+    let summary_button = (show_text_selection
+        && kind == InformationPanelKind::Video
+        && view.video_summary_available)
+        .then(|| {
+            push_left_detail_button(
+                &mut lines,
+                &right_buttons,
+                &mut next_left_row,
+                inner.width,
+                button("G", "Summarize", show_hotkeys),
+                theme.accent,
+                UiAction::GenerateVideoSummary,
+            )
+        });
     let local_visibility_button = (kind == InformationPanelKind::Local).then(|| {
         push_left_detail_button(
             &mut lines,
@@ -5727,6 +5749,8 @@ fn render_information_panel(
         playlist_button,
         edit_playlist_button,
         private_note_button,
+        youtube_comments_button,
+        summary_button,
         #[cfg(feature = "lan-sharing")]
         local_share_button,
         #[cfg(feature = "lan-sharing")]
@@ -28001,18 +28025,15 @@ for encoded, expected in json.load(sys.stdin):
         let todo_area = area_for(&UiAction::ToggleTodoPlaylist);
         let comments_area = area_for(&UiAction::OpenVideoComments);
         assert_eq!(
-            todo_area.y, comments_area.y,
-            "unrelated right-control rows should remain available for compact pairing"
-        );
-        assert!(
-            todo_area.right().saturating_add(2) <= comments_area.x,
-            "paired controls must retain a two-cell gap"
+            todo_area.x, comments_area.x,
+            "YouTube comments belong to the left action column"
         );
 
         let ordered_actions = [
             UiAction::ToggleTodoPlaylist,
             UiAction::OpenPlaylistPopup,
             UiAction::EditPrivateNote,
+            UiAction::OpenVideoComments,
         ];
         let ordered_areas = ordered_actions.each_ref().map(area_for);
         assert!(
@@ -28087,12 +28108,15 @@ for encoded, expected in json.load(sys.stdin):
             UiAction::ToggleTodoPlaylist,
             UiAction::OpenPlaylistPopup,
             UiAction::EditPrivateNote,
+            UiAction::OpenVideoComments,
+            UiAction::GenerateVideoSummary,
         ];
         let areas = left.each_ref().map(area_for);
         assert!(
             areas.windows(2).all(|pair| pair[1].y == pair[0].bottom()),
             "left actions must use consecutive rows: {areas:?}"
         );
+        assert!(areas.iter().all(|area| area.x == hit_map.details_panel.x));
         let channel = area_for(&UiAction::OpenChannelInBrowser);
         let video = area_for(&UiAction::OpenInBrowser);
         assert_eq!(
@@ -28140,6 +28164,175 @@ for encoded, expected in json.load(sys.stdin):
                         || area.intersection(*other_area).is_empty()),
                 "buttons must not overlap"
             );
+        }
+    }
+
+    /// Five paired rows plus Subscribe replace seven right rows plus Subscribe.
+    #[cfg(all(
+        feature = "commons-upload",
+        feature = "evernote",
+        feature = "archive-upload"
+    ))]
+    #[test]
+    fn youtube_left_comments_and_summary_save_two_compact_rows_with_or_without_hotkeys() {
+        let media_id = MediaId::new(SourceKind::YouTube, "compact-fixture");
+        let view = ViewModel {
+            video_comments_available: true,
+            video_summary_available: true,
+            commons_upload_available: true,
+            evernote_available: true,
+            archive_upload_supported: true,
+            archive_upload_available: true,
+            private_note_available: true,
+            external_opener_available: true,
+            playlist_item: Some(PlaylistItemView {
+                media_id: media_id.clone(),
+                title: "Fixture".into(),
+                in_todo: false,
+            }),
+            details: Some(DetailView {
+                media_id: Some(media_id),
+                source: "YouTube".into(),
+                channel_id: "UCfixture".into(),
+                channel_webpage_url: Some(
+                    url::Url::parse("https://www.youtube.com/@fixture").unwrap(),
+                ),
+                webpage_url: Some(
+                    url::Url::parse("https://www.youtube.com/watch?v=compact-fixture").unwrap(),
+                ),
+                description: "Description starts here.".into(),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        for show_hotkeys in [true, false] {
+            let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+            let mut hits = HitMap::default();
+            terminal
+                .draw(|frame| {
+                    render_details(
+                        frame,
+                        frame.area(),
+                        &view,
+                        show_hotkeys,
+                        0,
+                        &Theme::new(false),
+                        &mut hits,
+                        None,
+                    )
+                })
+                .unwrap();
+            for (action, key, label, row) in [
+                (UiAction::OpenVideoComments, "F6", "Twenty comments", 3),
+                (UiAction::GenerateVideoSummary, "G", "Summarize", 4),
+            ] {
+                let (_, area) = hits
+                    .detail_buttons
+                    .iter()
+                    .find(|(candidate, _)| *candidate == action)
+                    .unwrap();
+                assert_eq!(area.x, hits.details_panel.x);
+                assert_eq!(area.y, hits.details_panel.y + row);
+                let expected = button(key, label, show_hotkeys);
+                assert_eq!(area.width, terminal_text_width(&expected));
+                let actual = (area.x..area.right())
+                    .map(|x| terminal.backend().buffer()[(x, area.y)].symbol())
+                    .collect::<String>();
+                assert_eq!(actual, expected);
+            }
+            let description = hits
+                .detail_text_rows
+                .iter()
+                .find(|row| row.cells.concat() == "Description starts here.")
+                .unwrap();
+            assert_eq!(
+                description.y,
+                hits.details_panel.y + 6,
+                "moving both actions must reclaim two of the previous eight control rows"
+            );
+            assert_eq!(
+                hits.detail_buttons.len(),
+                11,
+                "all controls must remain visible exactly once"
+            );
+            for (action, area) in &hits.detail_buttons {
+                assert_eq!(area.intersection(hits.details_panel), *area);
+                assert!(hits.detail_buttons.iter().all(
+                    |(other, target)| action == other || area.intersection(*target).is_empty()
+                ));
+                for x in [area.x, area.right() - 1] {
+                    assert_eq!(
+                        mouse_action(
+                            MouseEvent {
+                                kind: MouseEventKind::Down(MouseButton::Left),
+                                column: x,
+                                row: area.y,
+                                modifiers: KeyModifiers::NONE
+                            },
+                            &hits,
+                            &view
+                        ),
+                        Some(action.clone())
+                    );
+                }
+            }
+        }
+    }
+
+    /// Only the typed YouTube provider changes columns; other public-comment layouts stay put.
+    #[test]
+    fn compact_comments_column_follows_provider_identity_not_display_text() {
+        for (screen, source, expected_left) in [
+            (Screen::Search, SourceKind::YouTube, Some(true)),
+            (Screen::Local, SourceKind::Local, None),
+            #[cfg(feature = "archive-org")]
+            (Screen::ArchiveOrg, SourceKind::ArchiveOrg, Some(false)),
+            #[cfg(feature = "soundcloud")]
+            (Screen::SoundCloud, SourceKind::SoundCloud, Some(false)),
+        ] {
+            let view = ViewModel {
+                screen,
+                video_comments_available: true,
+                external_opener_available: false,
+                details: Some(DetailView {
+                    media_id: Some(MediaId::new(source, "fixture")),
+                    source: "YouTube".into(),
+                    ..DetailView::default()
+                }),
+                ..ViewModel::default()
+            };
+            let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+            let mut hits = HitMap::default();
+            terminal
+                .draw(|frame| {
+                    render_details(
+                        frame,
+                        frame.area(),
+                        &view,
+                        true,
+                        0,
+                        &Theme::new(false),
+                        &mut hits,
+                        None,
+                    )
+                })
+                .unwrap();
+            let target = hits
+                .detail_buttons
+                .iter()
+                .find(|(action, _)| *action == UiAction::OpenVideoComments);
+            if let Some(left) = expected_left {
+                let (_, area) = target.expect("available public comments");
+                assert_eq!(area.x == hits.details_panel.x, left, "{screen:?}");
+                if !left {
+                    assert_eq!(area.right(), hits.details_panel.right());
+                }
+            } else {
+                assert!(
+                    target.is_none(),
+                    "unsupported sources must not inherit YouTube controls"
+                );
+            }
         }
     }
 
@@ -28393,12 +28586,12 @@ for encoded, expected in json.load(sys.stdin):
 
         let thumbnail_area = hit_map.thumbnail_area.expect("ready artwork hitbox");
         let expected_actions = [
-            UiAction::ToggleTodoPlaylist,
-            UiAction::OpenVideoComments,
             UiAction::OpenChannelInBrowser,
             UiAction::OpenInBrowser,
+            UiAction::ToggleTodoPlaylist,
             UiAction::OpenPlaylistPopup,
             UiAction::EditPrivateNote,
+            UiAction::OpenVideoComments,
             UiAction::ToggleSubscription,
         ];
         let mut action_areas = expected_actions
@@ -28441,12 +28634,12 @@ for encoded, expected in json.load(sys.stdin):
             "every action must retain a two-cell gutter to the right of the artwork"
         );
         let expected_labels = [
-            "[l] Add to todo".to_owned(),
-            "[F6] Twenty comments".to_owned(),
             "[O] open channel https://www.youtube.com/@fixture".to_owned(),
             "[o] open video".to_owned(),
+            "[l] Add to todo".to_owned(),
             "[P] Playlist".to_owned(),
             "[n] Add private note".to_owned(),
+            "[F6] Twenty comments".to_owned(),
             "[s] Subscribe (locally)".to_owned(),
         ];
         for ((expected, expected_label), area) in expected_actions
@@ -28547,6 +28740,7 @@ for encoded, expected in json.load(sys.stdin):
         let media_id = MediaId::new(SourceKind::YouTube, "fixture-video");
         let view = ViewModel {
             video_comments_available: true,
+            video_summary_available: true,
             private_note_available: true,
             playlist_item: Some(PlaylistItemView {
                 media_id: media_id.clone(),
@@ -28575,6 +28769,8 @@ for encoded, expected in json.load(sys.stdin):
             UiAction::ToggleTodoPlaylist,
             UiAction::OpenPlaylistPopup,
             UiAction::EditPrivateNote,
+            UiAction::OpenVideoComments,
+            UiAction::GenerateVideoSummary,
         ];
         let placements = actions.each_ref().map(|expected| {
             let (_, area) = hit_map
@@ -28582,6 +28778,15 @@ for encoded, expected in json.load(sys.stdin):
                 .iter()
                 .find(|(action, _)| action == expected)
                 .expect("left-side detail action");
+            assert_eq!(area.x, hit_map.details_panel.x);
+            assert_eq!(area.intersection(hit_map.details_panel), *area);
+            assert!(
+                hit_map
+                    .detail_buttons
+                    .iter()
+                    .all(|(other, target)| expected == other
+                        || area.intersection(*target).is_empty())
+            );
             assert_eq!(
                 mouse_action(
                     MouseEvent {
@@ -28603,7 +28808,13 @@ for encoded, expected in json.load(sys.stdin):
             "left-side actions must retain their logical order on narrow panes"
         );
         let rendered = rendered_text(&terminal);
-        for label in ["[l] Add to todo", "[P] Playlist", "[n] Add private note"] {
+        for label in [
+            "[l] Add to todo",
+            "[P] Playlist",
+            "[n] Add private note",
+            "[F6] Twenty comments",
+            "[G] Summarize",
+        ] {
             assert!(rendered.contains(label), "missing rendered label {label:?}");
         }
     }
