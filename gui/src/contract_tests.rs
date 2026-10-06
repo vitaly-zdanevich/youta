@@ -1640,12 +1640,12 @@ fn the_window_renders_dearrow_title_before_the_original_description() {
 
 #[cfg(feature = "commons-upload")]
 #[test]
-fn the_window_exposes_commons_review_without_putting_the_hotkey_on_the_button() {
+fn the_window_exposes_commons_review_with_its_uppercase_hotkey() {
     let details = source_named("components/Details.tsx");
     for required in [
         "view.commons_upload_available",
-        "dispatch(\"OpenCommonsUpload\")",
-        ">Upload to Commons</Action>",
+        "dispatch('OpenCommonsUpload')",
+        ">[U] To Commons</Action>",
     ] {
         assert!(
             details.contains(required),
@@ -1653,10 +1653,8 @@ fn the_window_exposes_commons_review_without_putting_the_hotkey_on_the_button() 
         );
     }
     assert!(
-        !details.contains("Upload to Commons (U)")
-            && !details.contains("[U] Upload to Commons")
-            && !details.contains("<u>U</u>pload to Commons"),
-        "the Commons button must not render its hotkey"
+        !details.contains("Upload to Commons"),
+        "the Commons button must use the compact label"
     );
 
     let popups = source_named("components/popups.tsx");
@@ -1736,7 +1734,7 @@ fn the_window_exposes_evernote_review_without_putting_the_hotkey_on_the_button()
 fn the_window_places_evernote_after_commons() {
     let details = source_named("components/Details.tsx");
     let commons = details
-        .find(">Upload to Commons</Action>")
+        .find(">[U] To Commons</Action>")
         .expect("Commons action");
     let evernote = details
         .find(">Save audio to Evernote</Action>")

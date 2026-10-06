@@ -2587,8 +2587,8 @@ See [S3 conditional writes and multipart cleanup](https://docs.aws.amazon.com/Am
 
 The default-on `commons-upload` feature adds a reviewed audio upload for exact
 YouTube, Yandex Music, and Apple Podcasts selections. The Details button is
-spelled `Upload to Commons`; its uppercase `U` shortcut is documented only in
-Help. Distributors and local builders can omit the client, multipart support,
+`[U] To Commons`, showing its existing uppercase `U` shortcut (also listed in
+Help). Distributors and local builders can omit the client, multipart support,
 and its UI with `--no-default-features` or by leaving `commons-upload` out of a
 custom feature set.
 

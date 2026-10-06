@@ -133,7 +133,9 @@ test('Archive Details control follows Commons and Evernote and trusts the select
 			}
 		}
 	}
-	assert.ok(details.indexOf('>Upload to Commons</Action>') < details.indexOf('>Save audio to Evernote</Action>'));
+	const commons = details.indexOf('>[U] To Commons</Action>');
+	assert.ok(commons >= 0, 'Commons shows its compact label and uppercase shortcut');
+	assert.ok(commons < details.indexOf('>Save audio to Evernote</Action>'));
 	assert.ok(details.indexOf('>Save audio to Evernote</Action>') < details.indexOf('>Upload to archive.org</Action>'));
 	assert.ok(!details.includes('[I] Upload to archive.org'));
 });

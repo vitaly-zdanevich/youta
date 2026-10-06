@@ -1082,7 +1082,15 @@
 		// inferring transitions from labels or turning a click into a real upload.
 		const youtubeId = { source: 'you-tube', external_id: 'dQw4w9WgXcQ' };
 		snapshot({ screen: 'Search', rows: [], details: { ...details('Fixture YouTube video', youtubeId), source: 'YouTube' },
-			archive_upload_supported: true, archive_upload_available: true, s3_upload_supported: true, s3_upload_available: true });
+			commons_upload_available: true, archive_upload_supported: true, archive_upload_available: true,
+			s3_upload_supported: true, s3_upload_available: true });
+		const commons = await until(() => button('[U] To Commons'), 'compact Commons action with uppercase shortcut');
+		assert(!button('Upload to Commons'), 'Commons no longer uses its old button label');
+		await action('OpenCommonsUpload', () => commons.click(), 'To Commons retains its existing review action');
+		// Forward uppercase U unchanged; the Rust keymap, not this fixture, selects the action.
+		await key('U', { Char: 'U' }, { shiftKey: true });
+		snapshot({ commons_upload_available: false });
+		await until(() => !button('[U] To Commons'), 'unavailable Commons action remains hidden');
 		await until(() => button('Upload to archive.org'), 'Archive upload action');
 		await action('OpenArchiveUpload', () => button('Upload to archive.org').click(), 'Archive Details action opens publication review');
 		const archive = { ...clone(defaults.ArchiveUploadPopupView), generation: 7, selected_field: 'Description', phase: 'Review', video_available: true,

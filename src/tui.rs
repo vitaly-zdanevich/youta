@@ -4841,7 +4841,7 @@ fn render_information_panel(
             &mut lines,
             &mut right_buttons,
             inner.width,
-            "Upload to Commons".to_owned(),
+            button("U", "To Commons", show_hotkeys),
             theme.accent,
             UiAction::OpenCommonsUpload,
         );
@@ -30436,7 +30436,7 @@ for encoded, expected in json.load(sys.stdin):
 
     #[cfg(feature = "commons-upload")]
     #[test]
-    fn details_commons_button_never_renders_its_help_only_hotkey() {
+    fn details_commons_button_shows_short_label_and_respects_hotkey_visibility() {
         let backend = TestBackend::new(140, 32);
         let mut terminal = Terminal::new(backend).expect("terminal");
         let view = ViewModel {
@@ -30449,18 +30449,37 @@ for encoded, expected in json.load(sys.stdin):
         };
         let mut hit_map = HitMap::default();
 
-        terminal
-            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
-            .expect("draw Commons action");
-        let rendered = rendered_text(&terminal);
-        assert!(rendered.contains("Upload to Commons"));
-        assert!(!rendered.contains("[U] Upload to Commons"));
-        assert!(
-            hit_map
+        for show_hotkeys in [true, false] {
+            let settings = UiSettings {
+                show_hotkeys,
+                ..UiSettings::default()
+            };
+            terminal
+                .draw(|frame| render(frame, &view, &settings, &mut hit_map))
+                .expect("draw Commons action");
+            let rendered = rendered_text(&terminal);
+            assert!(rendered.contains("To Commons"));
+            assert!(!rendered.contains("Upload to Commons"));
+            assert_eq!(rendered.contains("[U] To Commons"), show_hotkeys);
+            let (_, area) = hit_map
                 .detail_buttons
                 .iter()
-                .any(|(action, _)| action == &UiAction::OpenCommonsUpload)
-        );
+                .find(|(action, _)| action == &UiAction::OpenCommonsUpload)
+                .expect("Commons button remains clickable");
+            assert_eq!(
+                mouse_action(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: area.x,
+                        row: area.y,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    &hit_map,
+                    &view,
+                ),
+                Some(UiAction::OpenCommonsUpload)
+            );
+        }
     }
 
     #[cfg(feature = "evernote")]

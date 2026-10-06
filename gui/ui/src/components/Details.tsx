@@ -483,7 +483,7 @@ export function Details({ view, kind }: { view: ViewModel; kind: InformationPane
           <Action onClick={() => void dispatch("Download")}>Download</Action>
         ) : null}
         {view.commons_upload_available ? (
-          <Action onClick={() => void dispatch("OpenCommonsUpload")}>Upload to Commons</Action>
+			<Action onClick={() => void dispatch('OpenCommonsUpload')}>[U] To Commons</Action>
         ) : null}
 		{view.evernote_available && details.media_id?.source !== 'radio' ? (
 			<Action onClick={() => void dispatch('OpenEvernoteNote')}>Save audio to Evernote</Action>
