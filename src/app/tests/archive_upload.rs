@@ -8,6 +8,7 @@ use crate::view::ArchiveUploadPhase;
 #[derive(Default)]
 struct FakeArchiveUpload {
     jobs: Mutex<Vec<(String, bool)>>,
+    locations: Mutex<Vec<String>>,
     wait_for_cancel: AtomicBool,
     reject_credentials: AtomicBool,
     discover_credentials: AtomicBool,
@@ -33,6 +34,7 @@ impl ArchiveUploadService for FakeArchiveUpload {
         cancellation: &Arc<AtomicBool>,
         progress: &mut dyn FnMut(ArchiveUploadPhase, u64, Option<u64>),
     ) -> Result<ArchiveUploadResult, String> {
+        self.locations.lock().unwrap().push(job.playback_location);
         self.jobs
             .lock()
             .unwrap()
@@ -106,6 +108,178 @@ fn finish(controller: &mut AppController) {
         );
         thread::sleep(Duration::from_millis(1));
     }
+}
+
+/// Supplies a selected local row without depending on any installed media helper.
+fn select_local_file(controller: &mut AppController, path: &Path, video: bool) {
+    controller.config.providers.ffprobe_executable = path.with_extension("missing-ffprobe");
+    controller.view.screen = Screen::Local;
+    controller.view.selected = 0;
+    controller.local_listing = Some(crate::local_browser::LocalDirectoryListing {
+        path: path.parent().unwrap().to_owned(),
+        parent: None,
+        entries: vec![crate::local_browser::LocalEntry {
+            name: path.file_name().unwrap().to_owned(),
+            path: path.to_owned(),
+            kind: if video {
+                crate::local_browser::LocalEntryKind::Video
+            } else {
+                crate::local_browser::LocalEntryKind::Audio
+            },
+            size_bytes: Some(9),
+            image_dimensions: None,
+            directory_identity: None,
+        }],
+        truncated: false,
+        inspected_entries: 1,
+    });
+}
+
+#[test]
+fn archive_local_review_is_available_private_and_requires_confirmation() {
+    let (mut controller, service, directory) = controller();
+    let path = directory.path().join("song.opus");
+    std::fs::write(&path, b"mock Opus").unwrap();
+    select_local_file(&mut controller, &path, false);
+    controller.config.archive_upload.upload_video = true;
+    controller.view.details = Some(DetailView {
+        media_id: Some(local_media_id(&path)),
+        description: format!("Full path: {}", path.display()),
+        ..DetailView::default()
+    });
+    controller.refresh_selected_playlist_state();
+    assert!(controller.view.archive_upload_available);
+    controller.dispatch(UiAction::OpenArchiveUpload);
+    let popup = controller.view.archive_upload_popup.as_ref().unwrap();
+    assert_eq!(popup.draft.title, "song");
+    assert!(popup.draft.description.is_empty());
+    assert!(popup.draft.source_url.is_empty());
+    assert!(!popup.draft.upload_video);
+    assert!(!serde_json::to_string(popup).unwrap().contains("file://"));
+    assert!(
+        !serde_json::to_string(popup)
+            .unwrap()
+            .contains(&path.to_string_lossy().to_string())
+    );
+    controller.dispatch(UiAction::ToggleArchiveUploadVideo);
+    assert!(
+        !controller
+            .view
+            .archive_upload_popup
+            .as_ref()
+            .unwrap()
+            .draft
+            .upload_video
+    );
+    assert!(controller.config.archive_upload.upload_video);
+    assert!(service.jobs.lock().unwrap().is_empty());
+    assert_eq!(service.discovery_count.load(Ordering::Relaxed), 0);
+
+    controller.archive_upload.credentials =
+        Some(ArchiveUploadCredentials::new("access".into(), "secret".into()).unwrap());
+    let another_path = directory.path().join("another.opus");
+    std::fs::write(&another_path, b"not selected for upload").unwrap();
+    select_local_file(&mut controller, &another_path, false);
+    confirm(&mut controller);
+    finish(&mut controller);
+    assert_eq!(
+        service.jobs.lock().unwrap().as_slice(),
+        &[(local_media_id(&path).external_id, false)]
+    );
+    assert_eq!(
+        service.locations.lock().unwrap().as_slice(),
+        &[url::Url::from_file_path(&path).unwrap().to_string()]
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), b"mock Opus");
+}
+
+#[test]
+fn archive_local_video_uses_the_reviewed_video_preference() {
+    let (mut controller, service, directory) = controller();
+    let path = directory.path().join("movie.mp4");
+    std::fs::write(&path, b"mock film").unwrap();
+    select_local_file(&mut controller, &path, true);
+    controller.config.archive_upload.upload_video = true;
+    controller.dispatch(UiAction::OpenArchiveUpload);
+    assert!(
+        controller
+            .view
+            .archive_upload_popup
+            .as_ref()
+            .unwrap()
+            .draft
+            .upload_video
+    );
+    controller.dispatch(UiAction::ToggleArchiveUploadVideo);
+    assert!(
+        !controller
+            .view
+            .archive_upload_popup
+            .as_ref()
+            .unwrap()
+            .draft
+            .upload_video
+    );
+    assert!(service.jobs.lock().unwrap().is_empty());
+}
+
+#[test]
+fn archive_local_folders_and_missing_files_cannot_open_upload() {
+    let (mut controller, service, directory) = controller();
+    for path in [
+        directory.path().to_owned(),
+        directory.path().join("missing.mp3"),
+    ] {
+        select_local_file(&mut controller, &path, false);
+        controller.refresh_selected_playlist_state();
+        assert!(!controller.view.archive_upload_available);
+        controller.dispatch(UiAction::OpenArchiveUpload);
+        assert!(controller.view.archive_upload_popup.is_none());
+    }
+    assert!(service.jobs.lock().unwrap().is_empty());
+    assert_eq!(service.discovery_count.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn archive_local_private_provenance_is_rejected_before_credentials() {
+    let (mut controller, service, directory) = controller();
+    let path = directory.path().join("song.opus");
+    std::fs::write(&path, b"mock Opus").unwrap();
+    select_local_file(&mut controller, &path, false);
+    controller.dispatch(UiAction::OpenArchiveUpload);
+    controller
+        .view
+        .archive_upload_popup
+        .as_mut()
+        .unwrap()
+        .draft
+        .source_url = url::Url::from_file_path(&path).unwrap().to_string();
+    confirm(&mut controller);
+    assert!(
+        controller
+            .view
+            .archive_upload_popup
+            .as_ref()
+            .unwrap()
+            .validation_error
+            .is_some()
+    );
+    assert_eq!(service.discovery_count.load(Ordering::Relaxed), 0);
+    assert!(service.jobs.lock().unwrap().is_empty());
+}
+
+#[test]
+fn archive_live_sources_have_no_upload_capability() {
+    let (mut controller, service, _directory) = controller();
+    let mut video = fixture_download_video();
+    video.live = true;
+    controller.youtube_results = vec![SearchItem::Video(video)];
+    controller.refresh_youtube_rows();
+    controller.refresh_selected_playlist_state();
+    assert!(!controller.view.archive_upload_available);
+    controller.dispatch(UiAction::OpenArchiveUpload);
+    assert!(controller.view.archive_upload_popup.is_none());
+    assert_eq!(service.discovery_count.load(Ordering::Relaxed), 0);
 }
 
 #[test]

@@ -192,7 +192,7 @@ export function HelpPopup({
 				] satisfies Array<[string, string]>)
 			: []),
 		...(archiveUploadSupported
-			? ([['I', 'upload selected YouTube media to archive.org']] satisfies Array<[string, string]>)
+			? ([['I', 'upload selected YouTube or Local media to archive.org']] satisfies Array<[string, string]>)
 			: []),
 		...(s3UploadSupported
 			? ([['M', 'upload selected media to S3']] satisfies Array<[string, string]>)
@@ -510,7 +510,7 @@ export function ArchiveUploadPopup({ popup }: { popup: ArchiveUploadPopupView })
 		? Math.min(100, Math.round(popup.uploaded_bytes / popup.total_bytes * 100)) : null;
 	const status = popup.phase === 'Uploading'
 		? `Uploading ${percent === null ? '' : `${percent}% · `}${humanBytes(popup.uploaded_bytes)}${popup.total_bytes === null ? '' : ` / ${humanBytes(popup.total_bytes)}`}`
-		: popup.phase === 'Preparing' ? `Preparing ${popup.draft.upload_video ? 'video' : 'Opus audio'}${'.'.repeat(Math.floor(popup.animation_frame / 4) % 3 + 1)}`
+		: popup.phase === 'Preparing' ? `Preparing ${popup.video_available && popup.draft.upload_video ? 'video' : 'Opus audio'}${'.'.repeat(Math.floor(popup.animation_frame / 4) % 3 + 1)}`
 		: popup.phase === 'Cancelling' ? 'Cancelling local work; already uploaded remote data may remain.'
 		: complete ? 'Upload accepted; archive.org may still be processing.'
 		: popup.phase === 'Cancelled' ? 'Cancelled. Already uploaded remote data may remain.'
@@ -526,16 +526,16 @@ export function ArchiveUploadPopup({ popup }: { popup: ArchiveUploadPopupView })
 				<PopupButton onClick={() => void dispatch('DismissArchiveUpload')}>{terminal ? 'Close' : 'Cancel'}</PopupButton>
 			</>}>
 			<Body><div className='grid gap-3'>
-				<p className='text-ink-dim'>Opus audio by default. Tab changes fields; Enter adds a description line. F2 toggles video; Ctrl+S uploads.</p>
+				<p className='text-ink-dim'>{popup.draft.source === 'Local' ? 'Source: Local file. ' : ''}Opus audio by default. Tab changes fields; Enter adds a description line. {popup.video_available ? 'F2 toggles video; ' : ''}Ctrl+S uploads.</p>
 				{(['Identifier', 'Title', 'Description', 'Creator'] as const).map((field) => (
 					<ArchiveUploadFieldInput key={field} field={field}
 						value={popup.draft[field.toLowerCase() as 'identifier' | 'title' | 'description' | 'creator']}
 						selected={popup.selected_field === field} disabled={!editable} />
 				))}
 
-				<button type='button' role='checkbox' aria-checked={popup.draft.upload_video} disabled={!editable}
-					onClick={() => void dispatch('ToggleArchiveUploadVideo')} className='text-left'>
-					{popup.draft.upload_video ? '☑' : '☐'} Upload video (remembered)
+				<button type='button' role='checkbox' aria-checked={popup.video_available && popup.draft.upload_video} disabled={!editable || !popup.video_available}
+					onClick={() => void dispatch('ToggleArchiveUploadVideo')} className='text-left disabled:text-ink-faint'>
+					{popup.video_available && popup.draft.upload_video ? '☑' : '☐'} Upload video{popup.video_available ? ' (remembered)' : ' (unavailable for this source)'}
 				</button>
 
 				<p role='status' className='whitespace-pre-wrap'>{status}</p>

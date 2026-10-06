@@ -16,6 +16,8 @@ use crate::playback::ytdlp::{
     build_download_command, parse_download_event,
 };
 
+pub(crate) mod local;
+
 /// A private staged file whose temporary directory is removed when this guard drops.
 #[derive(Debug)]
 pub struct PreparedArchiveMedia {
@@ -67,6 +69,111 @@ pub fn prepare_archive_media(
         MAX_STAGING_BYTES,
         MAX_PREPARATION_TIME,
     )
+}
+
+/// Stages one reviewed Local file as Opus audio or stream-copy-only MKV video.
+///
+/// The locator must match the selected Local identity. Helpers only read a
+/// bounded private copy, and the public filename never derives from a path or
+/// title. Keep the returned guard alive until the explicit upload completes.
+///
+/// # Errors
+/// Rejects nonlocal or mismatched selections, unsupported kinds, changed inputs,
+/// cancellation, staging limits, or preparation-helper failures.
+pub fn prepare_local_archive_media(
+    config: &Config,
+    media: &MediaItem,
+    playback_location: &str,
+    upload_video: bool,
+    cancellation: &Arc<AtomicBool>,
+    progress: impl FnMut(u64, Option<u64>),
+) -> Result<PreparedArchiveMedia, String> {
+    prepare_local_with_limits(
+        config,
+        media,
+        playback_location,
+        upload_video,
+        cancellation,
+        progress,
+        MAX_STAGING_BYTES,
+        MAX_PREPARATION_TIME,
+    )
+}
+
+/// Accepts only matching, finite Local media; no provider/network fallback exists.
+fn prepare_local_with_limits(
+    config: &Config,
+    media: &MediaItem,
+    playback_location: &str,
+    upload_video: bool,
+    cancellation: &Arc<AtomicBool>,
+    progress: impl FnMut(u64, Option<u64>),
+    max_bytes: u64,
+    deadline: Duration,
+) -> Result<PreparedArchiveMedia, String> {
+    use crate::domain::MediaKind;
+    let started = Instant::now();
+    local::check_work(cancellation, started, deadline)?;
+    if media.id.source != SourceKind::Local
+        || !matches!(media.kind, MediaKind::Audio | MediaKind::Video)
+    {
+        return Err(
+            "Archive local preparation requires a selected Local audio or video file".into(),
+        );
+    }
+    if upload_video && media.kind != MediaKind::Video {
+        return Err("This selection has no supported video to upload".into());
+    }
+    let source = local_source_path(playback_location)
+        .ok_or("The selected Local media location is invalid")?;
+    if local_source_path(&media.id.external_id).as_ref() != Some(&source)
+        || local_source_path(media.webpage_url.as_str()).as_ref() != Some(&source)
+    {
+        return Err(
+            "The selected Local media identity does not match its playback location".into(),
+        );
+    }
+    prepare_staged_media(
+        "media",
+        upload_video,
+        cancellation,
+        progress,
+        max_bytes,
+        deadline,
+        |directory, progress| {
+            local::prepare_local_plan(
+                config,
+                &source,
+                directory,
+                upload_video,
+                cancellation,
+                progress,
+                max_bytes,
+                started,
+                deadline,
+            )
+        },
+    )
+}
+
+/// Decodes an absolute local locator without accepting remote file authorities.
+fn local_source_path(location: &str) -> Option<PathBuf> {
+    if location.len() > 16 * 1024 || location.chars().any(char::is_control) {
+        return None;
+    }
+    if Path::new(location).is_absolute() {
+        return Some(PathBuf::from(location));
+    }
+    let url = url::Url::parse(location).ok()?;
+    (url.scheme() == "file"
+        && (url.host_str().is_none() || url.host_str() == Some("localhost"))
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none())
+    .then(|| url.to_file_path().ok())
+    .flatten()
+    .filter(|path| path.is_absolute())
 }
 
 /// Upload-only sorting keeps resolution and frame rate ahead of codec preferences.
@@ -569,6 +676,241 @@ fn consume_line(line: &[u8], state: &Mutex<OutputState>) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn local_media(path: &Path, kind: crate::domain::MediaKind) -> MediaItem {
+        let mut selected = media();
+        selected.webpage_url = url::Url::from_file_path(path).unwrap();
+        selected.id = crate::domain::MediaId::new(SourceKind::Local, selected.webpage_url.as_str());
+        selected.kind = kind;
+        selected.title = "../private/音楽 filename".into();
+        selected
+    }
+
+    #[test]
+    fn local_archive_opus_staging_preserves_source_and_private_filename() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("private 音楽.opus");
+        std::fs::write(&path, b"original local opus").unwrap();
+        let mut config = Config::for_dir(directory.path().join("config"));
+        config.providers.yt_dlp_executable = PathBuf::from("must-not-run-yt-dlp");
+        config.providers.ffmpeg_executable = PathBuf::from("must-not-run-ffmpeg");
+        let selected = local_media(&path, crate::domain::MediaKind::Audio);
+        for location in [path.to_str().unwrap(), selected.webpage_url.as_str()] {
+            let prepared = prepare_local_archive_media(
+                &config,
+                &selected,
+                location,
+                false,
+                &Arc::new(AtomicBool::new(false)),
+                |_, _| {},
+            )
+            .unwrap();
+            assert_eq!(prepared.filename(), "media.opus");
+            assert_eq!(
+                std::fs::read(prepared.path()).unwrap(),
+                b"original local opus"
+            );
+            let temporary_path = prepared.path().to_owned();
+            assert_ne!(temporary_path, path);
+            drop(prepared);
+            assert!(!temporary_path.exists());
+            assert_eq!(std::fs::read(&path).unwrap(), b"original local opus");
+        }
+    }
+
+    #[test]
+    fn local_archive_rejects_wrong_identity_and_nonlocal_sources() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("private.opus");
+        std::fs::write(&path, b"original local opus").unwrap();
+        let config = Config::for_dir(directory.path().join("config"));
+        let selected = local_media(&path, crate::domain::MediaKind::Audio);
+        for location in [
+            "https://example.test/private.opus",
+            "relative.opus",
+            "file://remote/private.opus",
+            "file:///private.opus?secret=value",
+            directory.path().to_str().unwrap(),
+        ] {
+            assert!(
+                prepare_local_archive_media(
+                    &config,
+                    &selected,
+                    location,
+                    false,
+                    &Arc::new(AtomicBool::new(false)),
+                    |_, _| {}
+                )
+                .is_err(),
+                "{location}"
+            );
+        }
+        let mut invalid = vec![media(), selected.clone(), selected.clone()];
+        invalid[1].kind = crate::domain::MediaKind::Folder;
+        invalid[2].id.external_id = directory
+            .path()
+            .join("different.opus")
+            .to_string_lossy()
+            .into_owned();
+        for selected in invalid {
+            assert!(
+                prepare_local_archive_media(
+                    &config,
+                    &selected,
+                    path.to_str().unwrap(),
+                    false,
+                    &Arc::new(AtomicBool::new(false)),
+                    |_, _| {}
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            prepare_local_archive_media(
+                &config,
+                &selected,
+                path.to_str().unwrap(),
+                true,
+                &Arc::new(AtomicBool::new(false)),
+                |_, _| {}
+            )
+            .is_err()
+        );
+        assert!(
+            prepare_archive_media(
+                &config,
+                &selected,
+                false,
+                &Arc::new(AtomicBool::new(false)),
+                |_, _| {}
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn local_archive_cancellation_and_size_limit_preserve_original() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("private.opus");
+        let bytes = vec![0x5a; 192 * 1024];
+        std::fs::write(&path, &bytes).unwrap();
+        let selected = local_media(&path, crate::domain::MediaKind::Audio);
+        let config = Config::for_dir(directory.path().join("config"));
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let mut progress = Vec::new();
+        let error = prepare_local_archive_media(
+            &config,
+            &selected,
+            path.to_str().unwrap(),
+            false,
+            &cancellation,
+            |bytes, total| {
+                progress.push((bytes, total));
+                cancellation.store(true, Ordering::Relaxed);
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("canceled"), "{error}");
+        assert_eq!(progress, [(64 * 1024, Some(bytes.len() as u64))]);
+        let error = prepare_local_with_limits(
+            &config,
+            &selected,
+            path.to_str().unwrap(),
+            false,
+            &Arc::new(AtomicBool::new(false)),
+            |_, _| {},
+            4,
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert!(error.contains("size limit"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_archive_rejects_symlinks_fifos_and_changed_inputs() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap();
+        let original = directory.path().join("original.opus");
+        let linked = directory.path().join("linked.opus");
+        let fifo = directory.path().join("fifo.opus");
+        std::fs::write(&original, vec![0x5a; 192 * 1024]).unwrap();
+        symlink(&original, &linked).unwrap();
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            &fifo,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        )
+        .unwrap();
+        let config = Config::for_dir(directory.path().join("config"));
+        for path in [&linked, &fifo] {
+            let error = prepare_local_archive_media(
+                &config,
+                &local_media(path, crate::domain::MediaKind::Audio),
+                path.to_str().unwrap(),
+                false,
+                &Arc::new(AtomicBool::new(false)),
+                |_, _| {},
+            )
+            .unwrap_err();
+            assert!(error.contains("regular file"), "{error}");
+        }
+        let mut replaced = false;
+        let error = prepare_local_archive_media(
+            &config,
+            &local_media(&original, crate::domain::MediaKind::Audio),
+            original.to_str().unwrap(),
+            false,
+            &Arc::new(AtomicBool::new(false)),
+            |_, _| {
+                if !replaced {
+                    replaced = true;
+                    std::fs::rename(&original, directory.path().join("saved-original.opus"))
+                        .unwrap();
+                    std::fs::write(&original, vec![0x5a; 192 * 1024]).unwrap();
+                }
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("changed"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_archive_audio_modules_and_video_use_private_configured_ffmpeg() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let helper = directory.path().join("ffmpeg-fixture");
+        std::fs::write(&helper, "#!/bin/sh\nset -eu\nseen_copy=0; seen_opus=0; for argument in \"$@\"; do case \"$argument\" in copy) seen_copy=1;; libopus) seen_opus=1;; *private*) exit 9;; esac; output=$argument; done\ncase \"$output\" in *.mkv) [ \"$seen_copy\" = 1 ]; [ \"$seen_opus\" = 0 ];; *.opus) [ \"$seen_copy\" = 0 ]; [ \"$seen_opus\" = 1 ];; *) exit 8;; esac\nprintf 'prepared media' > \"$output\"\n").unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut config = Config::for_dir(directory.path().join("config"));
+        config.providers.ffmpeg_executable = helper;
+        config.providers.yt_dlp_executable = PathBuf::from("must-not-run-yt-dlp");
+        for (extension, kind, video) in [
+            ("flac", crate::domain::MediaKind::Audio, false),
+            ("mod", crate::domain::MediaKind::Audio, false),
+            ("mov", crate::domain::MediaKind::Video, true),
+        ] {
+            let path = directory.path().join(format!("private.{extension}"));
+            std::fs::write(&path, b"original media").unwrap();
+            let prepared = prepare_local_archive_media(
+                &config,
+                &local_media(&path, kind),
+                path.to_str().unwrap(),
+                video,
+                &Arc::new(AtomicBool::new(false)),
+                |_, _| {},
+            )
+            .unwrap();
+            assert_eq!(
+                prepared.filename(),
+                if video { "media.mkv" } else { "media.opus" }
+            );
+            assert_eq!(std::fs::read(prepared.path()).unwrap(), b"prepared media");
+            assert_eq!(std::fs::read(&path).unwrap(), b"original media");
+        }
+    }
     use crate::domain::{MediaId, MediaKind, MediaLicense, MediaStatistics, SourceKind};
 
     fn media() -> MediaItem {

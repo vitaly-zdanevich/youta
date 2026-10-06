@@ -919,6 +919,8 @@ export interface S3CredentialsEditorView {
 
 /** Public metadata reviewed before creating an Archive.org item. */
 export interface ArchiveUploadDraft {
+	/** Public source kind; Local drafts do not carry private filesystem paths. */
+	source: 'YouTube' | 'Local';
 	identifier: string;
 	title: string;
 	description: string;
@@ -936,6 +938,7 @@ export type ArchiveUploadPhase = 'Review' | 'Preparing' | 'Uploading' | 'Cancell
 export interface ArchiveUploadPopupView {
 	generation: number;
 	draft: ArchiveUploadDraft;
+	video_available: boolean;
 	selected_field: ArchiveUploadField;
 	phase: ArchiveUploadPhase;
 	animation_frame: number;

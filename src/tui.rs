@@ -4864,14 +4864,7 @@ fn render_information_panel(
         );
     }
     #[cfg(feature = "archive-upload")]
-    if show_text_selection
-        && view.archive_upload_supported
-        && view.archive_upload_available
-        && details
-            .media_id
-            .as_ref()
-            .is_some_and(|id| id.source == SourceKind::YouTube)
-    {
+    if show_text_selection && view.archive_upload_supported && view.archive_upload_available {
         push_right_detail_button(
             &mut lines,
             &mut right_buttons,
@@ -11408,8 +11401,24 @@ fn render_archive_upload_popup(
         Constraint::Length(1),
     ])
     .split(inner);
-    frame.render_widget(Paragraph::new("Opus audio by default. Tab fields · Enter description newline · F2 video · Ctrl+S Upload")
-        .style(theme.muted).wrap(Wrap { trim: false }), sections[0]);
+    let source_hint = if popup.draft.source == crate::archive_upload::ArchiveUploadSource::Local {
+        "Source: Local file. "
+    } else {
+        ""
+    };
+    let video_hint = if popup.video_available {
+        "F2 video · "
+    } else {
+        ""
+    };
+    frame.render_widget(
+        Paragraph::new(format!(
+            "{source_hint}Opus audio by default. Tab fields · Enter description newline · {video_hint}Ctrl+S Upload"
+        ))
+        .style(theme.muted)
+        .wrap(Wrap { trim: false }),
+        sections[0],
+    );
     let editable = popup.phase.is_editable();
     for (field, label, value, area) in [
         (
@@ -11482,8 +11491,17 @@ fn render_archive_upload_popup(
     if !video_area.is_empty() {
         let area = video_area;
         let text = format!(
-            "[{}] Upload video (remembered)",
-            if popup.draft.upload_video { "x" } else { " " }
+            "[{}] Upload video ({})",
+            if popup.video_available && popup.draft.upload_video {
+                "x"
+            } else {
+                " "
+            },
+            if popup.video_available {
+                "remembered"
+            } else {
+                "unavailable for this source"
+            }
         );
         let target = Rect::new(
             area.x,
@@ -11492,10 +11510,14 @@ fn render_archive_upload_popup(
             1,
         );
         frame.render_widget(
-            Paragraph::new(text).style(if editable { theme.accent } else { theme.muted }),
+            Paragraph::new(text).style(if editable && popup.video_available {
+                theme.accent
+            } else {
+                theme.muted
+            }),
             target,
         );
-        if editable {
+        if editable && popup.video_available {
             hit_map
                 .archive_upload_buttons
                 .push((UiAction::ToggleArchiveUploadVideo, target));
@@ -11507,7 +11529,7 @@ fn render_archive_upload_popup(
         }
         ArchiveUploadPhase::Preparing => format!(
             "Preparing {}{}",
-            if popup.draft.upload_video {
+            if popup.video_available && popup.draft.upload_video {
                 "video"
             } else {
                 "Opus audio"
@@ -23442,6 +23464,7 @@ for encoded, expected in json.load(sys.stdin):
             external_opener_available: true,
             archive_upload_popup: Some(ArchiveUploadPopupView {
                 generation: 42,
+                video_available: true,
                 selected_field: ArchiveUploadField::Description,
                 draft: crate::archive_upload::ArchiveUploadDraft {
                     identifier: "fixture-item".to_owned(),
@@ -23629,6 +23652,117 @@ for encoded, expected in json.load(sys.stdin):
             .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
             .unwrap();
         assert!(!rendered_text(&terminal).contains("Upload to archive.org"));
+    }
+
+    /// Local files reuse the publication review; folder and unavailable projections stay inert.
+    #[cfg(feature = "archive-upload")]
+    #[test]
+    fn archive_upload_local_details_reuse_the_capability_and_plain_button() {
+        for (name, media_id, available) in [
+            (
+                "track.flac",
+                Some(MediaId::new(
+                    SourceKind::Local,
+                    "file:///fixture/track.flac",
+                )),
+                true,
+            ),
+            (
+                "video.mkv",
+                Some(MediaId::new(SourceKind::Local, "file:///fixture/video.mkv")),
+                true,
+            ),
+            ("Album", None, false),
+            (
+                "track.flac",
+                Some(MediaId::new(
+                    SourceKind::Local,
+                    "file:///fixture/track.flac",
+                )),
+                false,
+            ),
+        ] {
+            for supported in [false, true] {
+                let view = ViewModel {
+                    screen: Screen::Local,
+                    archive_upload_supported: supported,
+                    archive_upload_available: available,
+                    details: Some(DetailView {
+                        title: name.to_owned(),
+                        media_id: media_id.clone(),
+                        ..DetailView::default()
+                    }),
+                    ..ViewModel::default()
+                };
+                let mut terminal = Terminal::new(TestBackend::new(120, 32)).unwrap();
+                let mut hit_map = HitMap::default();
+                terminal
+                    .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+                    .unwrap();
+                let target = hit_map
+                    .detail_buttons
+                    .iter()
+                    .find(|(action, _)| *action == UiAction::OpenArchiveUpload);
+                assert_eq!(target.is_some(), supported && available);
+                assert!(!rendered_text(&terminal).contains("[I] Upload to archive.org"));
+                if let Some((_, area)) = target {
+                    assert_eq!(
+                        mouse_action(
+                            MouseEvent {
+                                kind: MouseEventKind::Down(MouseButton::Left),
+                                column: area.x,
+                                row: area.y,
+                                modifiers: KeyModifiers::NONE
+                            },
+                            &hit_map,
+                            &view
+                        ),
+                        Some(UiAction::OpenArchiveUpload)
+                    );
+                }
+            }
+        }
+    }
+
+    /// An audio-only review never displays a stale remembered video choice as actionable.
+    #[cfg(feature = "archive-upload")]
+    #[test]
+    fn archive_upload_local_audio_mutes_video_and_prepares_opus() {
+        for phase in [ArchiveUploadPhase::Review, ArchiveUploadPhase::Preparing] {
+            let view = ViewModel {
+                screen: Screen::Local,
+                archive_upload_popup: Some(ArchiveUploadPopupView {
+                    phase,
+                    video_available: false,
+                    draft: crate::archive_upload::ArchiveUploadDraft {
+                        source: crate::archive_upload::ArchiveUploadSource::Local,
+                        upload_video: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }),
+                ..ViewModel::default()
+            };
+            let mut terminal = Terminal::new(TestBackend::new(120, 34)).unwrap();
+            let mut hit_map = HitMap::default();
+            terminal
+                .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+                .unwrap();
+            let rendered = rendered_text(&terminal);
+            assert!(rendered.contains("Source: Local file."));
+            assert!(!rendered.contains("F2 video"));
+            assert!(rendered.contains("[ ] Upload video (unavailable for this source)"));
+            assert!(!rendered.contains("[x] Upload video"));
+            assert!(
+                hit_map
+                    .archive_upload_buttons
+                    .iter()
+                    .all(|(action, _)| *action != UiAction::ToggleArchiveUploadVideo)
+            );
+            if phase == ArchiveUploadPhase::Preparing {
+                assert!(rendered.contains("Preparing Opus audio"));
+            }
+        }
     }
 
     /// Terminal phases never offer a second publication, and targets remain within the frame.

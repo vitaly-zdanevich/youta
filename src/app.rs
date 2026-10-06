@@ -17421,7 +17421,11 @@ impl AppController {
     }
 
     /// Returns the selected exportable remote item or exact local file.
-    #[cfg(any(feature = "evernote", feature = "s3-upload"))]
+    #[cfg(any(
+        feature = "evernote",
+        feature = "s3-upload",
+        feature = "archive-upload"
+    ))]
     fn selected_export_queue_item(&self) -> Result<QueueItem, String> {
         if self.view.screen != Screen::Local {
             return self.selected_queue_item();
@@ -17846,9 +17850,7 @@ impl AppController {
         }
         #[cfg(feature = "archive-upload")]
         {
-            self.view.archive_upload_available = self
-                .selected_queue_item()
-                .is_ok_and(|item| item.media.id.source == SourceKind::YouTube);
+            self.view.archive_upload_available = self.archive_upload_is_available();
         }
         #[cfg(feature = "commons-upload")]
         {

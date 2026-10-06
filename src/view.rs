@@ -2645,6 +2645,8 @@ pub struct ArchiveUploadPopupView {
     pub generation: u64,
     /// Editable public metadata and explicit upload choices.
     pub draft: ArchiveUploadDraft,
+    /// Whether this captured source can include video instead of Opus-only audio.
+    pub video_available: bool,
     /// Field currently receiving keyboard input.
     pub selected_field: ArchiveUploadField,
     /// Current preparation, publication, or cancellation phase.

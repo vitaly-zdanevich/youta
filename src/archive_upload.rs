@@ -31,6 +31,16 @@ const UPLOAD_TIMEOUT: Duration = Duration::from_hours(2);
 const STREAM_CHUNK_BYTES: usize = 64 * 1024;
 const IAS3_ENDPOINT: &str = "https://s3.us.archive.org/";
 
+/// The reviewed origin determines whether public source provenance is permitted.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ArchiveUploadSource {
+    /// Canonical public watch URL; also the default for older serialized drafts.
+    #[default]
+    YouTube,
+    /// Private local selection, whose filesystem location is never publication metadata.
+    Local,
+}
+
 /// Editable publication metadata; defaults are deliberately not publishable.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ArchiveUploadDraft {
@@ -42,7 +52,10 @@ pub struct ArchiveUploadDraft {
     pub description: String,
     /// Optional public creator; an empty value omits this metadata field.
     pub creator: String,
-    /// Immutable canonical `YouTube` watch URL supplied by the controller.
+    /// Immutable origin supplied by the controller, not an editable metadata field.
+    #[serde(default)]
+    pub source: ArchiveUploadSource,
+    /// Canonical `YouTube` watch URL, or empty for a private Local selection.
     pub source_url: String,
     /// Whether prepared media includes video instead of the default Opus audio.
     pub upload_video: bool,
@@ -61,21 +74,34 @@ impl ArchiveUploadDraft {
     ) -> Result<Self, String> {
         let source_url: String = source_url.into();
         let video_id = canonical_youtube_id(&source_url)?;
-        let mut random = [0_u8; 16];
-        getrandom::fill(&mut random)
-            .map_err(|_| "Could not generate a secure Archive item identifier".to_string())?;
-        let mut suffix = String::with_capacity(32);
-        for byte in random {
-            let hex = b"0123456789abcdef";
-            suffix.push(char::from(hex[usize::from(byte >> 4)]));
-            suffix.push(char::from(hex[usize::from(byte & 15)]));
-        }
+        let suffix = identifier_suffix()?;
         let draft = Self {
             identifier: format!("youtube-{video_id}-{suffix}"),
             title,
             description,
             creator: creator.unwrap_or_default(),
             source_url,
+            ..Self::default()
+        };
+        draft.validate_metadata()?;
+        Ok(draft)
+    }
+
+    /// Creates a review draft without recording a private source path or URL.
+    ///
+    /// # Errors
+    /// Rejects invalid metadata or an unavailable operating-system random source.
+    pub fn new_local(
+        title: String,
+        description: String,
+        creator: Option<String>,
+    ) -> Result<Self, String> {
+        let draft = Self {
+            identifier: format!("local-{}", identifier_suffix()?),
+            title,
+            description,
+            creator: creator.unwrap_or_default(),
+            source: ArchiveUploadSource::Local,
             ..Self::default()
         };
         draft.validate_metadata()?;
@@ -115,7 +141,17 @@ impl ArchiveUploadDraft {
         {
             return Err("Archive metadata contains a character that XML cannot represent".into());
         }
-        canonical_youtube_id(&self.source_url)?;
+        match self.source {
+            ArchiveUploadSource::YouTube => {
+                canonical_youtube_id(&self.source_url)?;
+            }
+            ArchiveUploadSource::Local if !self.source_url.is_empty() => {
+                return Err(
+                    "Local Archive uploads must not include public source provenance".into(),
+                );
+            }
+            ArchiveUploadSource::Local => {}
+        }
         Ok(())
     }
 
@@ -126,6 +162,20 @@ impl ArchiveUploadDraft {
     pub fn validate(&self) -> Result<(), String> {
         self.validate_metadata()
     }
+}
+
+/// Uses the same collision-resistant suffix for both supported review origins.
+fn identifier_suffix() -> Result<String, String> {
+    let mut random = [0_u8; 16];
+    getrandom::fill(&mut random)
+        .map_err(|_| "Could not generate a secure Archive item identifier".to_string())?;
+    let mut suffix = String::with_capacity(32);
+    for byte in random {
+        let hex = b"0123456789abcdef";
+        suffix.push(char::from(hex[usize::from(byte >> 4)]));
+        suffix.push(char::from(hex[usize::from(byte & 15)]));
+    }
+    Ok(suffix)
 }
 
 /// Only exact, credential-free canonical watch URLs can identify the source.
@@ -475,8 +525,10 @@ impl ArchiveUploadClient {
             .header(
                 "x-archive-meta-description",
                 metadata_header(&draft.description),
-            )
-            .header("x-archive-meta-source", metadata_header(&draft.source_url));
+            );
+        if draft.source == ArchiveUploadSource::YouTube {
+            request = request.header("x-archive-meta-source", metadata_header(&draft.source_url));
+        }
         if !draft.creator.trim().is_empty() {
             request = request.header("x-archive-meta-creator", metadata_header(&draft.creator));
         }
@@ -882,6 +934,94 @@ mod tests {
                 .get("rights_confirmed")
                 .is_none()
         );
+    }
+
+    /// Local provenance is private and must never become public item metadata.
+    fn local_draft() -> ArchiveUploadDraft {
+        serde_json::from_value(serde_json::json!({
+            "source": "Local",
+            "identifier": "local-0123456789abcdef0123456789abcdef",
+            "title": "Local audio",
+            "description": "Reviewed description",
+            "creator": "Artist",
+            "source_url": "",
+            "upload_video": false
+        }))
+        .expect("local draft fixture")
+    }
+
+    #[test]
+    fn local_drafts_require_empty_public_provenance() {
+        let mut draft = local_draft();
+        assert!(draft.validate().is_ok());
+        for source in [
+            "file:///private/music.opus",
+            "/private/music.opus",
+            source().as_str(),
+        ] {
+            draft.source_url = source.into();
+            assert!(draft.validate().is_err(), "local provenance accepted");
+        }
+        let mut youtube = confirmed_draft();
+        youtube.source_url.clear();
+        assert!(youtube.validate().is_err());
+    }
+
+    #[test]
+    fn new_local_drafts_have_distinct_private_origins_and_legacy_defaults_stay_youtube() {
+        let first =
+            ArchiveUploadDraft::new_local("Local audio".into(), String::new(), None).unwrap();
+        let second =
+            ArchiveUploadDraft::new_local("Local audio".into(), String::new(), None).unwrap();
+        assert_eq!(first.source, ArchiveUploadSource::Local);
+        assert!(first.source_url.is_empty());
+        assert!(first.identifier.starts_with("local-"));
+        assert_eq!(first.identifier.len(), "local-".len() + 32);
+        assert_ne!(first.identifier, second.identifier);
+        assert!(first.validate().is_ok());
+        let mut legacy = serde_json::to_value(confirmed_draft()).unwrap();
+        legacy.as_object_mut().unwrap().remove("source");
+        let legacy: ArchiveUploadDraft = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy.source, ArchiveUploadSource::YouTube);
+        assert!(legacy.validate().is_ok());
+        assert!(
+            ArchiveUploadDraft::new(
+                Url::parse("file:///private/audio.opus").unwrap(),
+                "Audio".into(),
+                String::new(),
+                None
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn local_upload_omits_source_header_and_preserves_input() {
+        let server = Server::new(vec![(404, None), (200, None)]);
+        let file = prepared_file(b"local fixture bytes");
+        server
+            .client()
+            .upload_file(
+                &fake_credentials(),
+                &local_draft(),
+                file.path(),
+                "media.opus",
+                &Arc::new(AtomicBool::new(false)),
+                |_| {},
+            )
+            .expect("local upload fixture");
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2);
+        let request = String::from_utf8_lossy(&requests[1]);
+        assert!(
+            !request
+                .to_ascii_lowercase()
+                .contains("x-archive-meta-source:")
+        );
+        assert!(!request.contains("file://"));
+        assert!(!request.contains(file.path().to_str().unwrap()));
+        assert!(request.starts_with("PUT /local-0123456789abcdef0123456789abcdef/media.opus "));
+        assert_eq!(std::fs::read(file.path()).unwrap(), b"local fixture bytes");
     }
 
     #[test]

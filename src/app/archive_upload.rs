@@ -3,7 +3,7 @@
 use super::*;
 use crate::archive_upload::{
     ArchiveUploadClient, ArchiveUploadCredentials, ArchiveUploadDraft, ArchiveUploadResult,
-    discover_archive_upload_credentials,
+    ArchiveUploadSource, discover_archive_upload_credentials,
 };
 use crate::view::{
     ArchiveCredentialsPopupView, ArchiveUploadField, ArchiveUploadPhase, ArchiveUploadPopupView,
@@ -15,6 +15,7 @@ const CREDENTIALS_GUIDE: &str = "https://archive.org/account/s3.php";
 pub(super) struct ArchiveUploadJob {
     pub(super) config: Config,
     pub(super) media: MediaItem,
+    pub(super) playback_location: String,
     pub(super) draft: ArchiveUploadDraft,
     pub(super) credentials: ArchiveUploadCredentials,
 }
@@ -43,13 +44,24 @@ impl ArchiveUploadService for SystemArchiveUploadService {
         cancellation: &Arc<AtomicBool>,
         progress: &mut dyn FnMut(ArchiveUploadPhase, u64, Option<u64>),
     ) -> Result<ArchiveUploadResult, String> {
-        let prepared = crate::archive_upload_media::prepare_archive_media(
-            &job.config,
-            &job.media,
-            job.draft.upload_video,
-            cancellation,
-            |bytes, total| progress(ArchiveUploadPhase::Preparing, bytes, total),
-        )?;
+        let prepared = if job.media.id.source == SourceKind::Local {
+            crate::archive_upload_media::prepare_local_archive_media(
+                &job.config,
+                &job.media,
+                &job.playback_location,
+                job.draft.upload_video,
+                cancellation,
+                |bytes, total| progress(ArchiveUploadPhase::Preparing, bytes, total),
+            )?
+        } else {
+            crate::archive_upload_media::prepare_archive_media(
+                &job.config,
+                &job.media,
+                job.draft.upload_video,
+                cancellation,
+                |bytes, total| progress(ArchiveUploadPhase::Preparing, bytes, total),
+            )?
+        };
         if cancellation.load(AtomicOrdering::Relaxed) {
             return Err("Archive upload cancelled before publication".to_owned());
         }
@@ -85,7 +97,7 @@ pub(super) struct ArchiveUploadState {
     pub(super) credentials: Option<ArchiveUploadCredentials>,
     /// Failed publication requires explicit replacement rather than rediscovering the same keys.
     require_manual_credentials: bool,
-    selection: Option<MediaItem>,
+    selection: Option<QueueItem>,
     generation: u64,
     worker: Option<ArchiveUploadWorker>,
 }
@@ -104,6 +116,18 @@ impl Default for ArchiveUploadState {
 }
 
 impl AppController {
+    /// Checks the current row without spawning media probes during a UI refresh.
+    pub(super) fn archive_upload_is_available(&self) -> bool {
+        if self.view.screen == Screen::Local {
+            return self
+                .local_entry_index()
+                .and_then(|index| self.local_listing.as_ref()?.entries.get(index))
+                .is_some_and(|entry| entry.kind.is_playable() && entry.path.is_file());
+        }
+        self.selected_queue_item()
+            .is_ok_and(|item| archive_upload_video_available(&item).is_some())
+    }
+
     /// Only a fresh, unobscured review may accept metadata or upload-option changes.
     pub(super) fn archive_upload_review_is_editable(&self) -> bool {
         self.archive_upload.worker.is_none()
@@ -130,24 +154,28 @@ impl AppController {
         }
     }
 
-    /// Captures one YouTube item before opening an editable, non-publishing review.
+    /// Captures one YouTube or local item before an editable, non-publishing review.
     pub(super) fn open_archive_upload(&mut self) {
         if self.archive_upload.worker.is_some() || self.view.archive_credentials_popup.is_some() {
             return;
         }
-        let mut media = match self.selected_queue_item() {
-            Ok(item) if item.media.id.source == SourceKind::YouTube => item.media,
+        let mut item = match self.selected_export_queue_item() {
+            Ok(item) if archive_upload_video_available(&item).is_some() => item,
             _ => {
                 self.view.status_line =
-                    "Select a YouTube video to upload to archive.org".to_owned();
+                    "Select a YouTube video or local media file to upload to archive.org"
+                        .to_owned();
                 return;
             }
         };
-        if let Some(details) = self
-            .view
-            .details
-            .as_ref()
-            .filter(|details| details.media_id.as_ref() == Some(&media.id))
+        let video_available = archive_upload_video_available(&item).unwrap_or(false);
+        let media = &mut item.media;
+        if media.id.source == SourceKind::YouTube
+            && let Some(details) = self
+                .view
+                .details
+                .as_ref()
+                .filter(|details| details.media_id.as_ref() == Some(&media.id))
         {
             if !details.description.is_empty() {
                 media.description = Some(details.description.clone());
@@ -156,25 +184,32 @@ impl AppController {
                 media.creator = Some(details.channel_name.clone());
             }
         }
-        let mut draft = match ArchiveUploadDraft::new(
-            media.webpage_url.clone(),
-            media.title.clone(),
-            media.description.clone().unwrap_or_default(),
-            media.creator.clone(),
-        ) {
+        // Local details contain filesystem paths, which are never public metadata.
+        let draft = if media.id.source == SourceKind::Local {
+            ArchiveUploadDraft::new_local(media.title.clone(), String::new(), media.creator.clone())
+        } else {
+            ArchiveUploadDraft::new(
+                media.webpage_url.clone(),
+                media.title.clone(),
+                media.description.clone().unwrap_or_default(),
+                media.creator.clone(),
+            )
+        };
+        let mut draft = match draft {
             Ok(draft) => draft,
             Err(error) => {
                 self.view.status_line = error;
                 return;
             }
         };
-        draft.upload_video = self.config.archive_upload.upload_video;
+        draft.upload_video = video_available && self.config.archive_upload.upload_video;
         self.archive_upload.generation = self.archive_upload.generation.wrapping_add(1);
-        self.archive_upload.selection = Some(media);
+        self.archive_upload.selection = Some(item);
         self.view.archive_credentials_popup = None;
         self.view.archive_upload_popup = Some(ArchiveUploadPopupView {
             generation: self.archive_upload.generation,
             draft,
+            video_available,
             ..ArchiveUploadPopupView::default()
         });
         self.view.status_line =
@@ -190,7 +225,7 @@ impl AppController {
             .view
             .archive_upload_popup
             .as_ref()
-            .filter(|popup| popup.phase == ArchiveUploadPhase::Review)
+            .filter(|popup| popup.phase == ArchiveUploadPhase::Review && popup.video_available)
         else {
             return;
         };
@@ -266,11 +301,20 @@ impl AppController {
             return;
         };
         let draft = popup.draft.clone();
-        let Some(media) = self.archive_upload.selection.clone() else {
+        let Some(item) = self.archive_upload.selection.clone() else {
             return;
         };
         let validation = draft.validate().and_then(|()| {
-            if draft.source_url == media.webpage_url.as_str() {
+            let source_matches = match (&item.media.id.source, draft.source) {
+                (SourceKind::YouTube, ArchiveUploadSource::YouTube) => {
+                    draft.source_url == item.media.webpage_url.as_str()
+                }
+                (SourceKind::Local, ArchiveUploadSource::Local) => draft.source_url.is_empty(),
+                _ => false,
+            };
+            let format_matches = archive_upload_video_available(&item)
+                .is_some_and(|video_available| !draft.upload_video || video_available);
+            if source_matches && format_matches {
                 Ok(())
             } else {
                 Err("The upload source changed; close and reopen the review".to_owned())
@@ -310,7 +354,8 @@ impl AppController {
         };
         let job = ArchiveUploadJob {
             config: self.config.clone(),
-            media,
+            media: item.media,
+            playback_location: item.playback_location,
             draft,
             credentials,
         };
@@ -512,5 +557,27 @@ impl AppController {
         }
         self.view.archive_credentials_popup = None;
         self.archive_upload.credentials = None;
+    }
+}
+
+/// Returns finite source capabilities without resolving or disclosing local paths.
+fn archive_upload_video_available(item: &QueueItem) -> Option<bool> {
+    match item.media.id.source {
+        SourceKind::YouTube if matches!(item.media.kind, MediaKind::Audio | MediaKind::Video) => {
+            Some(true)
+        }
+        SourceKind::Local
+            if matches!(item.media.kind, MediaKind::Audio | MediaKind::Video)
+                && item.media.webpage_url.scheme() == "file"
+                && item.playback_location == item.media.webpage_url.as_str()
+                && item
+                    .media
+                    .webpage_url
+                    .to_file_path()
+                    .is_ok_and(|path| path.is_file()) =>
+        {
+            Some(item.media.kind == MediaKind::Video)
+        }
+        _ => None,
     }
 }

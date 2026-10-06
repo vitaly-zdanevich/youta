@@ -595,6 +595,35 @@
 		snapshot({ ...previous, local_file_popup: null, local_file_progress: null });
 		await until(() => !dialog(), 'closed transfer fixture');
 	}
+	/** Local publication uses controller capabilities and never exposes a private file path in review. */
+	async function checkArchiveLocalUpload() {
+		const previous = clone(view);
+		for (const [supported, available, folder] of [[true, true, false], [true, false, false], [true, false, true], [false, false, false]]) {
+			const title = `Local upload: supported=${supported}, available=${available}, folder=${folder}`;
+			snapshot({ screen: 'Local', archive_upload_supported: supported, archive_upload_available: available,
+				details: { ...clone(defaults.DetailView), title, source: 'Local',
+					media_id: folder ? null : { source: 'local', external_id: 'file:///private/library/track.flac' } } });
+			await until(() => document.querySelector('[aria-label=Details] h2')?.textContent === title, title);
+			const upload = button('Upload to archive.org');
+			assert(Boolean(upload) === (supported && available), `Archive Local button follows shared capability: ${title}`);
+			if (upload) await action('OpenArchiveUpload', () => upload.click(), 'Local file opens explicit Archive upload review');
+		}
+		for (const video_available of [false, true]) {
+			const popup = { ...clone(defaults.ArchiveUploadPopupView), generation: 72, video_available,
+				draft: { ...clone(defaults.ArchiveUploadPopupView.draft), source: 'Local', source_url: '',
+					identifier: 'local-fixture', title: 'Local fixture', description: 'Public description', upload_video: true } };
+			snapshot({ archive_upload_popup: popup });
+			await until(() => dialog()?.textContent.includes('Local fixture'), 'Local Archive review');
+			const checkbox = dialog().querySelector('[role=checkbox]');
+			await until(() => checkbox.disabled === !video_available, 'Local Archive video capability');
+			assert(checkbox.getAttribute('aria-checked') === String(video_available), 'Local audio never displays a stale video choice');
+			assert(!dialog().textContent.includes('/private/library') && !dialog().textContent.includes('file://'), 'Local Archive review omits private path/source URL');
+			if (video_available) await action('ToggleArchiveUploadVideo', () => checkbox.click(), 'Local video keeps the shared export toggle');
+			await action({ SubmitArchiveUpload: 72 }, () => button('Upload', dialog()).click(), 'Local publication requires explicit generation-bound submission');
+		}
+		snapshot({ ...previous, archive_upload_popup: null });
+		await until(() => !dialog(), 'closed Local Archive review');
+	}
 	/** The browser forwards arrow modifiers; Rust alone decides navigation and seek distances. */
 	async function checkArrowShortcuts() {
 		for (const [name, shared] of [['ArrowLeft', 'Left'], ['ArrowRight', 'Right']]) {
@@ -719,6 +748,7 @@
 		await checkLocalTrackMetadata();
 		await checkLocalActionOrder();
 		await checkLocalCopy();
+		await checkArchiveLocalUpload();
 		await checkArrowShortcuts();
 		await checkPreferencesFocus();
 		await checkUnsubscribeConfirmation();
@@ -1055,8 +1085,8 @@
 			archive_upload_supported: true, archive_upload_available: true, s3_upload_supported: true, s3_upload_available: true });
 		await until(() => button('Upload to archive.org'), 'Archive upload action');
 		await action('OpenArchiveUpload', () => button('Upload to archive.org').click(), 'Archive Details action opens publication review');
-		const archive = { ...clone(defaults.ArchiveUploadPopupView), generation: 7, selected_field: 'Description', phase: 'Review',
-			draft: { identifier: 'fixture-review', title: 'Fixture title', description: 'Full description\nAnother line', creator: 'Fixture creator',
+		const archive = { ...clone(defaults.ArchiveUploadPopupView), generation: 7, selected_field: 'Description', phase: 'Review', video_available: true,
+			draft: { source: 'YouTube', identifier: 'fixture-review', title: 'Fixture title', description: 'Full description\nAnother line', creator: 'Fixture creator',
 				source_url: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ', upload_video: false } };
 		snapshot({ archive_upload_popup: archive });
 		await until(() => dialog()?.textContent.includes('Fixture title'), 'Archive review');

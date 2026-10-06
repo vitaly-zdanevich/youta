@@ -986,6 +986,40 @@ mod wire_tests {
         }
     }
 
+    /// Local publication opens only an available review and cannot toggle absent video.
+    #[cfg(feature = "archive-upload")]
+    #[test]
+    fn archive_upload_local_shortcuts_respect_availability_and_video_capability() {
+        for supported in [false, true] {
+            for available in [false, true] {
+                let view = ViewModel {
+                    screen: crate::view::Screen::Local,
+                    archive_upload_supported: supported,
+                    archive_upload_available: available,
+                    ..ViewModel::default()
+                };
+                assert_eq!(
+                    key_action(KeyPress::new(Key::Char('I')), &view, None, None),
+                    (supported && available).then_some(UiAction::OpenArchiveUpload)
+                );
+            }
+        }
+        for video_available in [false, true] {
+            let view = ViewModel {
+                screen: crate::view::Screen::Local,
+                archive_upload_popup: Some(crate::view::ArchiveUploadPopupView {
+                    video_available,
+                    ..Default::default()
+                }),
+                ..ViewModel::default()
+            };
+            assert_eq!(
+                key_action(KeyPress::new(Key::F(2)), &view, None, None),
+                video_available.then_some(UiAction::ToggleArchiveUploadVideo)
+            );
+        }
+    }
+
     #[cfg(not(feature = "archive-upload"))]
     #[test]
     fn archive_upload_shortcut_is_absent_without_the_feature() {
@@ -1008,6 +1042,7 @@ mod wire_tests {
             ArchiveUploadPopupView,
         };
         let mut view = ViewModel {
+            archive_upload_supported: true,
             archive_upload_available: true,
             external_opener_available: true,
             ..ViewModel::default()
@@ -1018,6 +1053,7 @@ mod wire_tests {
         );
         view.archive_upload_popup = Some(ArchiveUploadPopupView {
             generation: 42,
+            video_available: true,
             draft: crate::archive_upload::ArchiveUploadDraft {
                 identifier: "fixture-item".to_owned(),
                 title: "Fixture upload".to_owned(),
@@ -2068,7 +2104,7 @@ fn unfiltered_key_action(
             Key::Char('s' | 'S') if key.ctrl => {
                 Some(UiAction::SubmitArchiveUpload(popup.generation))
             }
-            Key::F(2) => Some(UiAction::ToggleArchiveUploadVideo),
+            Key::F(2) if popup.video_available => Some(UiAction::ToggleArchiveUploadVideo),
 
             Key::F(1) if view.external_opener_available => {
                 Some(UiAction::OpenArchiveCredentialsGuide)
@@ -2755,7 +2791,9 @@ fn unfiltered_key_action(
             Some(UiAction::OpenS3Upload)
         }
         #[cfg(feature = "archive-upload")]
-        Key::Char('I') if !key.chorded() && view.archive_upload_available => {
+        Key::Char('I')
+            if !key.chorded() && view.archive_upload_supported && view.archive_upload_available =>
+        {
             Some(UiAction::OpenArchiveUpload)
         }
         Key::Char('l') if view.playlist_item.is_some() && !key.modified() => {
