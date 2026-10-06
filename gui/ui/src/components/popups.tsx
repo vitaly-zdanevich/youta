@@ -141,7 +141,7 @@ export function HelpPopup({
         [
           playbackHistoryEnabled ? "F2 · F3 · F4 · F5" : "F2 · F4 · F5",
           playbackHistoryEnabled
-			? 'offline · history · lists · stats'
+			? 'offline · log · lists · stats'
 			: 'offline · lists · stats',
         ],
 		['S · p · F9', 'subs · preferences · recent commits'],

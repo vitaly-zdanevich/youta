@@ -125,7 +125,7 @@ pub enum Screen {
     Web,
     /// Media available without a network connection.
     Downloaded,
-    /// Played and partially played media.
+    /// Played and partially played media, displayed in the Log tab.
     History,
     /// Nested user playlists and folders.
     Playlists,
@@ -253,7 +253,7 @@ impl Screen {
             Self::Subscriptions => "Subs",
             Self::Playlists => "Lists",
             Self::Downloaded => "Offline",
-            Self::History => "History",
+            Self::History => "Log",
             Self::Statistics => "Stats",
         }
     }
@@ -277,7 +277,7 @@ impl Screen {
             Self::Subscriptions => "Subs",
             Self::Playlists => "Lists",
             Self::Downloaded => "Offline",
-            Self::History => "History",
+            Self::History => "Log",
             Self::Statistics => "Stats",
         }
     }
@@ -4671,6 +4671,30 @@ mod tests {
                 screen
             );
         }
+    }
+
+    /// The Log label must not migrate the frontend ID or previously saved sessions.
+    #[test]
+    fn log_tab_preserves_history_wire_and_saved_screen_identifiers() {
+        assert_eq!(Screen::History.label(), "Log");
+        assert_eq!(Screen::History.compact_label(), "Log");
+        assert_eq!(
+            serde_json::to_value(Screen::History).unwrap(),
+            serde_json::json!("History")
+        );
+        assert_eq!(
+            serde_json::from_value::<Screen>(serde_json::json!("History")).unwrap(),
+            Screen::History
+        );
+        let saved = serde_json::json!({ "screen": "history" });
+        assert_eq!(
+            serde_json::to_value(crate::domain::Screen::History).unwrap(),
+            saved
+        );
+        assert_eq!(
+            serde_json::from_value::<crate::domain::Screen>(saved).unwrap(),
+            crate::domain::Screen::History
+        );
     }
 
     /// Search videos may subscribe their channel, but never unsubscribe it.

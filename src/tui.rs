@@ -8137,7 +8137,7 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
     #[cfg(not(feature = "qr"))]
     let private_note_help = "  n private note     t Details-only text selection";
     let history_navigation_help = if view.playback_history_enabled {
-        "  F2 offline     F3 history     Backspace back"
+        "  F2 offline     F3 log     Backspace back"
     } else {
         "  F2 offline     Backspace back"
     };
@@ -41177,6 +41177,58 @@ prose 07:25 remains clickable but is not a chapter";
     }
 
     #[test]
+    fn log_tab_uses_short_label_and_keeps_history_click_and_f3_routes() {
+        let view = ViewModel {
+            screen: Screen::History,
+            ..ViewModel::default()
+        };
+        for width in [40, 180] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+            let mut hit_map = HitMap::default();
+            terminal
+                .draw(|frame| {
+                    render_tabs(frame, frame.area(), &view, &Theme::new(false), &mut hit_map)
+                })
+                .unwrap();
+            let rendered = rendered_text(&terminal);
+            assert!(rendered.contains("Log"));
+            assert!(!rendered.contains("History"));
+            let (_, target) = hit_map
+                .tabs
+                .iter()
+                .find(|(screen, _)| *screen == Screen::History)
+                .unwrap();
+            assert_eq!(target.width, 3);
+            for column in target.x..target.right() {
+                assert_eq!(
+                    mouse_action(
+                        MouseEvent {
+                            kind: MouseEventKind::Down(MouseButton::Left),
+                            column,
+                            row: target.y,
+                            modifiers: KeyModifiers::NONE,
+                        },
+                        &hit_map,
+                        &view
+                    ),
+                    Some(UiAction::ShowScreen(Screen::History))
+                );
+            }
+        }
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE), &view),
+            Some(UiAction::ShowScreen(Screen::History))
+        );
+        let mut terminal = Terminal::new(TestBackend::new(180, 40)).unwrap();
+        terminal
+            .draw(|frame| render_help(frame, &view, &Theme::new(false)))
+            .unwrap();
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("F3 log"));
+        assert!(!rendered.contains("F3 history"));
+    }
+
+    #[test]
     fn disabled_playback_history_is_absent_from_top_tabs_and_help() {
         let backend = TestBackend::new(180, 40);
         let mut terminal = Terminal::new(backend).expect("terminal");
@@ -41228,7 +41280,7 @@ prose 07:25 remains clickable but is not a chapter";
             .draw(|frame| render_help(frame, &view, &Theme::new(false)))
             .expect("draw Help without History");
         let rendered = rendered_text(&terminal);
-        assert!(!rendered.contains("F3 history"));
+        assert!(!rendered.contains("F3 log"));
         assert!(rendered.contains("F2 offline"));
         assert!(rendered.contains("F4 lists"));
     }

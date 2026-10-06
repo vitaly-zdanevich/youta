@@ -460,7 +460,7 @@ resolver:
 - **SoundCloud** has its own tab after YT Music. Public track search and HLS
   playback use [Soundcloak](https://github.com/maid-zone/soundcloak), without
   an API key or SoundCloud login. Each track links to both its original
-  SoundCloud page and its page on the configured Soundcloak instance. History
+  SoundCloud page and its page on the configured Soundcloak instance. Log
   and playlists retain the original URL, not an instance-specific stream.
   Artist links open their tracks and albums inside Youta; clickable tags run
   SoundCloud tag searches. **Esc / Back** restores the preceding catalogue.
@@ -480,7 +480,7 @@ resolver:
   stream proxying, and image proxying enabled. Public instances can go offline
   or disable their API. Public previews are playable and explicitly labeled
   with their actual duration; they never overwrite full-track resume or
-  completion progress. Every playback, including History and playlist replay,
+  completion progress. Every playback, including Log and playlist replay,
   checks current public availability first. SoundCloud also has an [official API](https://developers.soundcloud.com/docs/api/),
   but [registering an application](https://developers.soundcloud.com/docs/api/register-app)
   currently requires Artist Pro; Youta's Soundcloak tab does not use it.
@@ -636,7 +636,7 @@ already retained by `mpv`. A station without a reported cache range stays
 non-seekable, and synthetic multi-day stream timestamps are never displayed.
 Repeat remains disabled. Live streams remain marker-free as
 `Radio · live` entries in
-History, `todo`, and other playlists. Listening time still contributes to the
+Log, `todo`, and other playlists. Listening time still contributes to the
 Radio total on the Stats screen.
 
 `[f]` toggles a station as a favorite. Favorites survive restarts and appear
@@ -720,7 +720,7 @@ or `[O] open homepage` on macOS, and choosing `Copy link` all use the same
 canonical homepage rather than the audio endpoint. This metadata is compiled
 into the catalogue, so showing it performs no request and preserves
 zero-network startup. The same stable station identity is used for playlists,
-History replay, private station notes, and the now-playing click target;
+Log replay, private station notes, and the now-playing click target;
 transient redirects are never persisted. `[B]` cycles name, high-to-low
 bitrate, and low-to-high bitrate order while the selected station remains
 stable across ordering changes and restarts. Routine two-channel streams omit
@@ -1278,11 +1278,11 @@ activity. Writes use canonical ordering and same-directory atomic replacement
 so diffs remain readable and an interrupted write does not replace the last
 complete document. Each kind of state has its own document, so saving playback
 progress does not rewrite history, notes, bookmarks, statistics, or playlists.
-`persistence.save_playback_history = false` prevents only new playback History
-entries and hides the History tab. Existing History remains in the selected
+`persistence.save_playback_history = false` prevents only new playback history
+entries and hides the Log tab. Existing history remains in the selected
 backend, and playback progress, listening statistics, sessions, caches, and
 graceful-shutdown Git synchronization continue normally. Setting it back to
-`true` exposes the retained History again.
+`true` exposes the retained history in Log again.
 At startup, a corrupt `runtime/` or `cache/` document is preserved beside its
 canonical path under a private hidden `.corrupt` name and replaced with an
 empty valid document. Existing quarantine files are never overwritten.
@@ -1338,7 +1338,7 @@ Youta keeps one private note per exact target:
 - media targets include a YouTube video, YouTube Music or Bandcamp track,
   Apple Podcasts episode, MOD/tracker item, resolved direct-source item, or
   local file; the same media target is reused when selected through
-  **Offline**, **History**, or a playlist;
+  **Offline**, **Log**, or a playlist;
 - source targets include a YouTube channel, Bandcamp album/release, an
   RSS/podcast subscription, an Apple Podcasts show, or a Local folder.
 
@@ -1714,7 +1714,7 @@ The optimization is skipped when an HTTP(S)/ALL proxy environment variable is
 nonempty, so normal playback keeps its configured network route.
 
 The temporary route listens only on `127.0.0.1`, not the LAN, and never replaces
-the canonical URL in History or playlists. Its files are retired when playback
+the canonical URL in Log or playlists. Its files are retired when playback
 is replaced or Youta exits; outstanding saves cannot publish a retired cache.
 A forced process kill can leave temporary files for the operating system to clean up.
 This cache is separate from mpv's packet cache and does not reuse recordings
@@ -2104,7 +2104,7 @@ focus a setting and Space to change it, or use its displayed shortcut; press
 - exact `Реклама` chapter skipping and independent SponsorBlock skipping;
 - Nyan Cat seek bar and selected YouTube audio preparation;
 - Local folder-size measurement and YouTube video-thumbnail size;
-- playback History recording and hourly channel-download checks;
+- playback history recording and hourly channel-download checks;
 - manual video/audio download mode and archive.org original/MP3 selection;
 - archive.org playback: ask, prefer the original, or use an existing audio-only file;
 - the explicit video-summary backend.
@@ -2156,10 +2156,10 @@ work, hides cached folder sizes, and removes the Local size-sort control.
 `YOUTA_UI__NATURAL_LOCAL_SORT=true` enables numeric filename ordering in Local.
 `YOUTA_UI__YOUTUBE_THUMBNAIL_SIZE=high` selects the strict 480×360 YouTube
 video-thumbnail entry. `YOUTA_PERSISTENCE__SAVE_PLAYBACK_HISTORY=false` stops
-new playback History entries and hides the History tab. It does not delete
-existing History or disable playback progress, listening statistics, session
+new playback history entries and hides the Log tab. It does not delete
+existing history or disable playback progress, listening statistics, session
 and cache persistence, or graceful-shutdown Git synchronization. Re-enabling
-it exposes the retained History again. `YOUTA_VIDEO_SUMMARY__BACKEND=codex`
+it exposes the retained history in Log again. `YOUTA_VIDEO_SUMMARY__BACKEND=codex`
 enables the same explicit summary action without editing the TOML file;
 `YOUTA_VIDEO_SUMMARY__CODEX_EXECUTABLE=/path/to/codex` selects another CLI
 executable. The executable is not edited in Preferences, so that path override

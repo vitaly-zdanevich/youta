@@ -70,6 +70,7 @@
 		{ id: 'ArchiveOrg', label: 'archive.org', details_kind: 'Generic', search_verb: 'Search' },
 		{ id: 'LibriVox', label: 'LibriVox', details_kind: 'Podcast', search_verb: 'Search' },
 		{ id: 'Local', label: 'Local', details_kind: 'Local', search_verb: null },
+		{ id: 'History', label: 'Log', details_kind: 'Generic', search_verb: null },
 	];
 	window.addEventListener('error', (event) => failures.push(event.message));
 	window.addEventListener('unhandledrejection', (event) => failures.push(String(event.reason)));
@@ -645,6 +646,26 @@
 		}
 		snapshot(previous);
 	}
+	/** A shorter display label never changes the persisted screen identity or history policy. */
+	async function checkLogTab() {
+		const previous = clone(view);
+		const tabs = document.querySelector('[aria-label=Sources]');
+		const log = await until(() => button('Log', tabs), 'Log tab from the native catalogue fixture');
+		assert(!button('History', tabs), 'The playback tab shows Log rather than History');
+		await action({ ShowScreen: 'History' }, () => log.click(), 'Log tab still dispatches the stable History screen identity');
+		snapshot({ screen: 'History' });
+		await until(() => button('Log', tabs)?.getAttribute('aria-selected') === 'true', 'Log is selected for a History snapshot');
+		await key('F3', { F: 3 });
+		snapshot({ help_open: true });
+		await until(() => dialog()?.textContent.includes('The same map serves the terminal front-end'), 'Log navigation help');
+		const shortcut = [...dialog().querySelectorAll('dt')].find((node) => node.textContent === 'F2 · F3 · F4 · F5');
+		assert(shortcut?.nextElementSibling.textContent === 'offline · log · lists · stats', 'F3 help names the Log tab');
+		snapshot({ screen: previous.screen, playback_history_enabled: false });
+		await until(() => !button('Log', tabs) && !dialog()?.textContent.includes('F3'), 'disabled playback history hides Log and its F3 help');
+		snapshot({ help_open: false, playback_history_enabled: true });
+		await until(() => !dialog() && button('Log', tabs), 'reenabling playback history restores Log');
+		snapshot(previous);
+	}
 	/** The browser forwards arrow modifiers; Rust alone decides navigation and seek distances. */
 	async function checkArrowShortcuts() {
 		for (const [name, shared] of [['ArrowLeft', 'Left'], ['ArrowRight', 'Right']]) {
@@ -771,6 +792,7 @@
 		await checkLocalCopy();
 		await checkArchiveLocalUpload();
 		await checkEvernoteButton();
+		await checkLogTab();
 		await checkArrowShortcuts();
 		await checkPreferencesFocus();
 		await checkUnsubscribeConfirmation();

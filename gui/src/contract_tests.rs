@@ -757,6 +757,7 @@ fn the_window_screen_catalog_uses_compact_labels_without_changing_ids() {
         ("Playlists", "Lists"),
         ("Downloaded", "Offline"),
         ("Subscriptions", "Subs"),
+        ("History", "Log"),
     ] {
         let matches = screens
             .iter()
@@ -1527,7 +1528,7 @@ fn subscription_continuation_has_a_static_indicator_without_animating_refresh() 
 fn the_window_help_uses_current_navigation_labels() {
     let source = window_source("components/popups.tsx");
     for label in [
-        "offline · history · lists · stats",
+        "offline · log · lists · stats",
         "offline · lists · stats",
         "subs · preferences · recent commits",
     ] {
