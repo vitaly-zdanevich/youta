@@ -1158,7 +1158,7 @@ impl Config {
         Ok(())
     }
 
-    /// Persists whether `YouTube` Shorts are visible in subscription videos.
+    /// Persists whether `YouTube` Shorts are visible in search and subscription videos.
     ///
     /// Existing unrelated settings and comments are preserved.
     /// [`SHOW_YOUTUBE_SHORTS_ENV`] retains precedence and therefore prevents
@@ -1571,7 +1571,7 @@ pub struct UiConfig {
     pub show_full_local_paths: bool,
     /// Compare ASCII digit runs numerically when ordering Local names.
     pub natural_local_sort: bool,
-    /// Show `YouTube` Shorts in subscription video lists.
+    /// Show `YouTube` Shorts in search results and subscription video lists.
     pub show_youtube_shorts: bool,
     /// Seek-bar foreground color name or terminal palette index.
     pub seekbar_color: String,

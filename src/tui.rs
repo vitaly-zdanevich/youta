@@ -3358,7 +3358,11 @@ fn main_body_panes(area: Rect) -> [Rect; 2] {
 fn main_list_pane_areas(mut pane: Rect, screen: Screen) -> (Rect, Rect) {
     let controls_height = pane.height.min(match screen {
         Screen::Web => 2,
-        Screen::ArchiveOrg | Screen::SoundCloud | Screen::ApplePodcasts | Screen::TrackerMusic => 1,
+        Screen::Search
+        | Screen::ArchiveOrg
+        | Screen::SoundCloud
+        | Screen::ApplePodcasts
+        | Screen::TrackerMusic => 1,
         _ => 0,
     });
     pane.height = pane.height.saturating_sub(controls_height);
@@ -3417,7 +3421,11 @@ fn render_body(
         render_web_controls(frame, controls, show_hotkeys, view.autoplay, theme, hit_map);
     } else if matches!(
         view.screen,
-        Screen::ArchiveOrg | Screen::SoundCloud | Screen::ApplePodcasts | Screen::TrackerMusic
+        Screen::Search
+            | Screen::ArchiveOrg
+            | Screen::SoundCloud
+            | Screen::ApplePodcasts
+            | Screen::TrackerMusic
     ) {
         render_catalog_playback_controls(frame, controls, view, show_hotkeys, theme, hit_map);
     }
@@ -3471,7 +3479,7 @@ fn render_body(
     }
 }
 
-/// Shares playback toggles and available parent navigation below catalogue lists.
+/// Shares playback toggles, YT Shorts visibility, and parent navigation below catalogue lists.
 fn render_catalog_playback_controls(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -3490,6 +3498,15 @@ fn render_catalog_playback_controls(
         || (view.screen == Screen::SoundCloud && view.soundcloud_back_available))
         .then_some(("Esc", "Back", UiAction::GoBack))
         .into_iter()
+        .chain((view.screen == Screen::Search).then_some((
+            "h",
+            if view.subscriptions.show_youtube_shorts {
+                "Shorts: on"
+            } else {
+                "Shorts: off"
+            },
+            UiAction::ToggleSubscriptionShorts,
+        )))
         .chain([
             (
                 "A",
@@ -8221,6 +8238,8 @@ fn search_kind_help(view: &ViewModel) -> &'static str {
         "  archive.org: / search   Enter open/play   d download   F6 comments   Esc back"
     } else if view.screen == Screen::Web {
         "  Web: / open URL     R refresh     Esc back     Enter open/play audio"
+    } else if view.screen == Screen::Search {
+        "  YT: v video/channel  N relevance/newest  C CC-only  h Shorts on/off"
     } else {
         "  v video/channel search     N relevance/newest     C CC-only videos"
     }
@@ -17746,7 +17765,7 @@ for encoded, expected in json.load(sys.stdin):
         view.screen = Screen::Search;
         assert_eq!(
             search_kind_help(&view),
-            "  v video/channel search     N relevance/newest     C CC-only videos"
+            "  YT: v video/channel  N relevance/newest  C CC-only  h Shorts on/off"
         );
     }
 
@@ -19074,7 +19093,7 @@ for encoded, expected in json.load(sys.stdin):
             "text selection must not consume right-panel space"
         );
         assert_eq!(hit_map.rows.y, 1);
-        assert_eq!(hit_map.rows.bottom(), buffer.area.bottom());
+        assert_eq!(hit_map.rows.bottom(), buffer.area.bottom() - 1);
         assert_eq!(hit_map.rows.right(), hit_map.details_panel.x);
         assert_eq!(
             mouse_action(
@@ -22064,7 +22083,7 @@ for encoded, expected in json.load(sys.stdin):
     }
 
     #[test]
-    fn shorts_shortcut_is_scoped_to_youtube_subscription_items() {
+    fn shorts_shortcut_is_scoped_to_youtube_search_and_subscription_items() {
         let shorts = KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE);
         let mut view = ViewModel {
             screen: Screen::Subscriptions,
@@ -22114,8 +22133,13 @@ for encoded, expected in json.load(sys.stdin):
         view.screen = Screen::Search;
         assert_eq!(
             key_action(shorts, &view),
+            Some(UiAction::ToggleSubscriptionShorts)
+        );
+        view.screen = Screen::YouTubeMusic;
+        assert_eq!(
+            key_action(shorts, &view),
             None,
-            "the shortcut must not leak globally"
+            "the shortcut must not leak into YouTube Music"
         );
     }
 
@@ -22556,7 +22580,6 @@ for encoded, expected in json.load(sys.stdin):
         assert!(!rendered.contains("[w]"));
         for removed in [
             "[/] Search",
-            "[A] Autoplay",
             "[k] Move up",
             "[j] Move down",
             "[↑] Volume up",
@@ -29672,6 +29695,7 @@ for encoded, expected in json.load(sys.stdin):
     #[test]
     fn catalog_playback_footers_show_autoplay_repeat_and_working_controls() {
         for (screen, width) in [
+            Screen::Search,
             Screen::ArchiveOrg,
             Screen::SoundCloud,
             Screen::ApplePodcasts,
@@ -29788,10 +29812,123 @@ for encoded, expected in json.load(sys.stdin):
         }
     }
 
+    /// The YT list owns one stateful control row, with matching keyboard and mouse actions.
+    #[test]
+    fn youtube_search_controls_show_shorts_autoplay_repeat_in_order() {
+        for show_hotkeys in [false, true] {
+            for enabled in [false, true] {
+                let mut view = ViewModel {
+                    screen: Screen::Search,
+                    autoplay: enabled,
+                    repeating: enabled,
+                    ..ViewModel::default()
+                };
+                view.subscriptions.show_youtube_shorts = enabled;
+                let mut terminal = Terminal::new(TestBackend::new(160, 24)).unwrap();
+                let mut hits = HitMap::default();
+                terminal
+                    .draw(|frame| {
+                        render_body(
+                            frame,
+                            frame.area(),
+                            &view,
+                            show_hotkeys,
+                            DEFAULT_THUMBNAIL_HEIGHT,
+                            &Theme::new(false),
+                            &mut hits,
+                            None,
+                        )
+                    })
+                    .unwrap();
+                let state = if enabled { "on" } else { "off" };
+                let labels = [
+                    (
+                        'h',
+                        format!("Shorts: {state}"),
+                        UiAction::ToggleSubscriptionShorts,
+                    ),
+                    ('A', format!("Autoplay: {state}"), UiAction::ToggleAutoplay),
+                    ('r', format!("Repeat: {state}"), UiAction::ToggleRepeat),
+                ];
+                let expected = labels
+                    .iter()
+                    .map(|(key, label, _)| button(&key.to_string(), label, show_hotkeys))
+                    .collect::<Vec<_>>()
+                    .join("  ");
+                assert!(rendered_text(&terminal).contains(&expected), "{expected}");
+                for (key, label, action) in labels {
+                    let target = hits
+                        .detail_buttons
+                        .iter()
+                        .find_map(|(candidate, target)| (candidate == &action).then_some(*target))
+                        .expect("YT control");
+                    assert_eq!(target.y, 23);
+                    assert_eq!(
+                        target.width,
+                        terminal_text_width(&button(&key.to_string(), &label, show_hotkeys))
+                    );
+                    assert!(hits.rows.intersection(target).is_empty());
+                    assert_eq!(
+                        key_action(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE), &view),
+                        Some(action.clone())
+                    );
+                    for column in [target.x, target.right() - 1] {
+                        assert_eq!(
+                            mouse_action(
+                                MouseEvent {
+                                    kind: MouseEventKind::Down(MouseButton::Left),
+                                    column,
+                                    row: target.y,
+                                    modifiers: KeyModifiers::NONE
+                                },
+                                &hits,
+                                &view
+                            ),
+                            Some(action.clone())
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Search editing owns text input; Shorts is not a global shortcut for other tabs.
+    #[test]
+    fn youtube_search_controls_do_not_steal_search_text_or_other_tabs() {
+        let mut view = ViewModel {
+            screen: Screen::Search,
+            ..ViewModel::default()
+        };
+        let key = KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE);
+        assert_eq!(
+            key_action(key, &view),
+            Some(UiAction::ToggleSubscriptionShorts)
+        );
+        view.search_editing = true;
+        assert_ne!(
+            key_action(key, &view),
+            Some(UiAction::ToggleSubscriptionShorts)
+        );
+        view.search_editing = false;
+        for screen in [
+            Screen::YouTubeMusic,
+            Screen::SoundCloud,
+            Screen::ArchiveOrg,
+            Screen::Local,
+        ] {
+            view.screen = screen;
+            assert_ne!(
+                key_action(key, &view),
+                Some(UiAction::ToggleSubscriptionShorts)
+            );
+        }
+    }
+
     /// Clipped catalogue controls never claim cells outside their one-row footer.
     #[test]
     fn catalog_playback_footers_stay_bounded_in_small_terminals() {
         for (screen, (width, height)) in [
+            Screen::Search,
             Screen::ArchiveOrg,
             Screen::SoundCloud,
             Screen::ApplePodcasts,
@@ -29824,7 +29961,12 @@ for encoded, expected in json.load(sys.stdin):
                 .detail_buttons
                 .iter()
                 .filter(|(action, _)| {
-                    matches!(action, UiAction::ToggleAutoplay | UiAction::ToggleRepeat)
+                    matches!(
+                        action,
+                        UiAction::ToggleSubscriptionShorts
+                            | UiAction::ToggleAutoplay
+                            | UiAction::ToggleRepeat
+                    )
                 })
                 .collect::<Vec<_>>();
             if width >= 80 || height > 1 {
@@ -30986,7 +31128,14 @@ for encoded, expected in json.load(sys.stdin):
         assert!(rendered.contains("open video"));
         assert!(!rendered.contains("[o] open video"));
         assert!(!rendered.contains("[O] open channel"));
-        assert_eq!(hit_map.detail_buttons.len(), 2);
+        assert_eq!(
+            hit_map
+                .detail_buttons
+                .iter()
+                .filter(|(_, area)| area.x >= hit_map.details_panel.x)
+                .count(),
+            2
+        );
         assert!(
             hit_map
                 .detail_buttons

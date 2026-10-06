@@ -4485,7 +4485,7 @@ pub enum UiAction {
     ToggleSubscriptionDescription,
     /// Refresh page one for the active subscribed channel.
     RefreshSubscriptionVideos,
-    /// Include or exclude YouTube Shorts in the active subscription list.
+    /// Toggle shared Shorts visibility from YT search or an active YouTube subscription.
     ToggleSubscriptionShorts,
     /// Show paths a system drag-and-drop delivered, in the Local browser.
     ///

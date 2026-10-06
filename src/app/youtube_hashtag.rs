@@ -19,6 +19,7 @@ pub(super) struct HashtagLocation {
     search_kind: SearchKind,
     sort: YouTubeSearchSort,
     creative_commons_only: bool,
+    show_youtube_shorts: bool,
     youtube_query: String,
     youtube_selected: usize,
     items: Vec<SearchItem>,
@@ -121,6 +122,7 @@ impl AppController {
             search_kind: self.view.search_kind,
             sort: self.view.youtube_search_sort,
             creative_commons_only: self.view.youtube_creative_commons_only,
+            show_youtube_shorts: self.config.ui.show_youtube_shorts,
             youtube_query,
             youtube_selected,
             items: std::mem::take(&mut self.youtube_results),
@@ -195,10 +197,164 @@ impl AppController {
         self.detail_navigation_back = location.detail_back;
         self.detail_navigation_forward = location.detail_forward;
         self.view.detail_link_reveal = None;
+        if location.show_youtube_shorts != self.config.ui.show_youtube_shorts {
+            self.reproject_hashtag_origin_shorts(location.show_youtube_shorts);
+        }
         self.refresh_selected_playlist_state();
         self.view.status_line = "Returned from YouTube hashtag search".into();
         self.persist_restored_hashtag_search();
         true
+    }
+
+    /// Reapplies the shared Shorts preference without replaying searches or video requests.
+    fn reproject_hashtag_origin_shorts(&mut self, previously_showed_shorts: bool) {
+        if self.youtube_search_request.is_some()
+            && self.direct_item.is_none()
+            && self.resolved_direct.is_none()
+            && self.local_results.is_empty()
+        {
+            let mut visible_count: usize = 0;
+            let selection_map = self
+                .youtube_results
+                .iter()
+                .filter_map(|item| {
+                    let current = self.youtube_search_item_visible(item).then(|| {
+                        let index = visible_count;
+                        visible_count += 1;
+                        index
+                    });
+                    let previously_visible = previously_showed_shorts
+                        || !matches!(
+                            item, SearchItem::Video(video) if youtube_video_uses_shorts_style(video)
+                        );
+                    previously_visible.then_some(current)
+                })
+                .collect::<Vec<_>>();
+            self.youtube_selected = selection_map
+                .get(self.youtube_selected)
+                .copied()
+                .flatten()
+                .unwrap_or_else(|| self.youtube_selected.min(visible_count.saturating_sub(1)));
+            if self.view.screen == Screen::Search {
+                let previous_selected = self.view.selected;
+                let selected = selection_map.get(previous_selected).copied().flatten();
+                let had_selection = self.view.rows.get(previous_selected).is_some();
+                self.refresh_youtube_rows();
+                self.view.selected = selected.unwrap_or_else(|| {
+                    previous_selected.min(self.view.rows.len().saturating_sub(1))
+                });
+                self.youtube_selected = self.view.selected;
+                self.rebase_hashtag_detail_history(Screen::Search, &selection_map);
+                if had_selection && selected.is_none() {
+                    self.replace_hidden_hashtag_origin_details();
+                }
+            }
+        }
+        if self.view.screen == Screen::Subscriptions {
+            self.reproject_hashtag_subscription_shorts(previously_showed_shorts);
+        }
+    }
+
+    /// Restores subscription rows from their retained source under the current preference.
+    fn reproject_hashtag_subscription_shorts(&mut self, previously_showed_shorts: bool) {
+        let source = self.active_subscription_channel_id.as_deref().or_else(|| {
+            #[cfg(feature = "rss")]
+            {
+                self.active_subscription_rss_url.as_deref()
+            }
+            #[cfg(not(feature = "rss"))]
+            {
+                None
+            }
+        });
+        let Some(cached) = source.and_then(|source| self.subscription_video_cache.get(source))
+        else {
+            return;
+        };
+        let mut visible_count: usize = 0;
+        let selection_map = cached
+            .items
+            .iter()
+            .filter_map(|item| {
+                let short = matches!(item,
+				SearchItem::Video(video) if youtube_video_uses_shorts_style(video));
+                let current = (self.config.ui.show_youtube_shorts || !short).then(|| {
+                    let index = visible_count;
+                    visible_count += 1;
+                    index
+                });
+                (previously_showed_shorts || !short).then_some(current)
+            })
+            .collect::<Vec<_>>();
+        let previous_selected = self.view.subscriptions.selected_item;
+        let selected = selection_map.get(previous_selected).copied().flatten();
+        let details = self.view.details.take();
+        let selected_link = self.view.selected_detail_link;
+        self.refresh_subscription_video_rows();
+        self.view.subscriptions.selected_item = selected.unwrap_or_else(|| {
+            previous_selected.min(self.view.subscriptions.items.len().saturating_sub(1))
+        });
+        self.view.details = details;
+        self.view.selected_detail_link = selected_link;
+        self.rebase_hashtag_detail_history(Screen::Subscriptions, &selection_map);
+        let item_details_visible = self.view.subscriptions.route == SubscriptionRoute::Items
+            || (self.view.subscriptions.layout == SubscriptionsLayout::Split
+                && self.view.subscriptions.focus == SubscriptionPane::Items);
+        if item_details_visible
+            && selection_map.get(previous_selected).is_some()
+            && selected.is_none()
+        {
+            self.replace_hidden_hashtag_origin_details();
+        }
+    }
+
+    /// Rebases description Back/Forward locations and drops entries whose source is hidden.
+    fn rebase_hashtag_detail_history(&mut self, screen: Screen, selection_map: &[Option<usize>]) {
+        for history in [
+            &mut self.detail_navigation_back,
+            &mut self.detail_navigation_forward,
+        ] {
+            history.retain_mut(|snapshot| {
+                if snapshot.screen != screen
+                    || (screen == Screen::Subscriptions
+                        && snapshot.subscription_route == SubscriptionRoute::Sources
+                        && snapshot.subscription_focus == SubscriptionPane::Sources)
+                {
+                    return true;
+                }
+                let selected = if screen == Screen::Subscriptions {
+                    &mut snapshot.subscription_selected_item
+                } else {
+                    &mut snapshot.selected
+                };
+                let Some(rebased) = selection_map.get(*selected).copied().flatten() else {
+                    return false;
+                };
+                *selected = rebased;
+                true
+            });
+        }
+    }
+
+    /// Replaces a hidden selection from owned summaries without issuing provider work.
+    fn replace_hidden_hashtag_origin_details(&mut self) {
+        self.clear_detail_navigation_history();
+        self.previous_detail = None;
+        #[cfg(feature = "wikidata")]
+        self.invalidate_wikidata_lookup();
+        self.view.details = self.selected_youtube_item().map(|item| {
+            preliminary_detail_with_thumbnail_size(
+                item,
+                &self.subscription_tree,
+                self.effective_youtube_thumbnail_size(),
+                self.youtube_thumbnail_terminal_bounds(),
+            )
+        });
+        self.view.right_panel_mode = RightPanelMode::Details;
+        self.view.details_scroll = 0;
+        self.view.selected_detail_link = None;
+        self.view.details_text_selection = None;
+        self.view.text_selection_mode = false;
     }
 
     /// Keeps restart state aligned with the restored adapter without retaining copies.
@@ -714,5 +870,304 @@ mod tests {
         controller.dispatch(UiAction::SearchYouTubeHashtag("One".into()));
         assert!(controller.youtube_hashtag_history.is_empty());
         assert_eq!(controller.view.search_query, "original search");
+    }
+
+    /// Back reapplies the current Shorts preference while retaining a surviving selection.
+    #[test]
+    fn youtube_hashtag_back_reprojects_shorts_without_losing_selected_identity() {
+        let (_temporary, mut controller, requests) = hashtag_controller();
+        controller.config.ui.show_youtube_shorts = true;
+        let SearchItem::Video(short) = &mut controller.youtube_results[0] else {
+            panic!("fixture must contain a video");
+        };
+        short.orientation = VideoOrientation::Vertical;
+        controller.refresh_youtube_rows();
+        controller.dispatch(UiAction::SearchYouTubeHashtag("One".into()));
+        let _ = requests.try_iter().count();
+        controller.config.ui.show_youtube_shorts = false;
+
+        controller.dispatch(UiAction::GoBack);
+
+        assert_eq!(controller.view.rows.len(), 1);
+        assert_eq!(controller.view.rows[0].title, "Original selection");
+        assert_eq!(controller.view.selected, 0);
+        assert_eq!(controller.youtube_selected, 0);
+        assert_eq!(controller.view.details_scroll, 17);
+        assert_eq!(controller.view.selected_detail_link, Some(1));
+        assert_eq!(
+            controller.view.details.as_ref().unwrap().title,
+            "Original selection"
+        );
+        assert_eq!(
+            controller.selected_queue_item().unwrap().media.id,
+            MediaId::new(SourceKind::YouTube, "9bZkp7q19f0")
+        );
+        assert_eq!(controller.youtube_results.len(), 2);
+        assert!(!requests.try_iter().any(|request| matches!(
+            request,
+            ProviderRequest::Search { .. } | ProviderRequest::Details { .. }
+        )));
+    }
+
+    /// A restored Short loses Details ownership when the shared preference hides its row.
+    #[test]
+    fn youtube_hashtag_back_replaces_hidden_short_details_without_requesting_metadata() {
+        let (_temporary, mut controller, requests) = hashtag_controller();
+        controller.config.ui.show_youtube_shorts = true;
+        let SearchItem::Video(short) = &mut controller.youtube_results[1] else {
+            panic!("fixture must contain a video");
+        };
+        short.orientation = VideoOrientation::Vertical;
+        controller.refresh_youtube_rows();
+        controller.dispatch(UiAction::SearchYouTubeHashtag("One".into()));
+        let _ = requests.try_iter().count();
+        controller.config.ui.show_youtube_shorts = false;
+
+        controller.dispatch(UiAction::GoBack);
+
+        assert_eq!(controller.view.rows.len(), 1);
+        assert_eq!(controller.view.rows[0].title, "First result");
+        assert_eq!(controller.view.selected, 0);
+        assert_eq!(controller.youtube_selected, 0);
+        assert_eq!(controller.view.details_scroll, 0);
+        assert_eq!(controller.view.selected_detail_link, None);
+        assert_eq!(
+            controller.view.details.as_ref().unwrap().title,
+            "First result"
+        );
+        assert_eq!(
+            controller.selected_queue_item().unwrap().media.id,
+            MediaId::new(SourceKind::YouTube, "dQw4w9WgXcQ")
+        );
+        assert!(!requests.try_iter().any(|request| matches!(
+            request,
+            ProviderRequest::Search { .. } | ProviderRequest::Details { .. }
+        )));
+    }
+
+    /// Description history keeps its row identity when filtering moves the visible offset.
+    #[test]
+    fn youtube_hashtag_back_rebases_description_history_after_shorts_change() {
+        let (_temporary, mut controller, requests) = hashtag_controller();
+        controller.config.ui.show_youtube_shorts = true;
+        let SearchItem::Video(short) = &mut controller.youtube_results[0] else {
+            panic!("fixture must contain a video");
+        };
+        short.orientation = VideoOrientation::Vertical;
+        controller.refresh_youtube_rows();
+        controller.dispatch(UiAction::ActivateDescriptionVideo {
+            video_id: "M7lc1UVf-VE".into(),
+            start_seconds: None,
+        });
+        controller.handle_provider_response(ProviderResponse::Details {
+            generation: controller.details_generation,
+            result: Ok(linked_video_details("M7lc1UVf-VE", "Linked origin", "#One")),
+        });
+        controller.view.details_scroll = 9;
+        controller.dispatch(UiAction::SearchYouTubeHashtag("One".into()));
+        let _ = requests.try_iter().count();
+        controller.config.ui.show_youtube_shorts = false;
+
+        controller.dispatch(UiAction::GoBack);
+        assert_eq!(controller.view.rows.len(), 1);
+        assert_eq!(controller.view.selected, 0);
+        assert_eq!(
+            controller.view.details.as_ref().unwrap().title,
+            "Linked origin"
+        );
+        assert_eq!(controller.view.details_scroll, 9);
+        controller.dispatch(UiAction::GoBack);
+        assert_eq!(controller.view.selected, 0);
+        assert_eq!(
+            controller.view.details.as_ref().unwrap().title,
+            "Original selection"
+        );
+        assert_eq!(controller.view.details_scroll, 17);
+        assert_eq!(
+            controller.selected_queue_item().unwrap().media.id,
+            MediaId::new(SourceKind::YouTube, "9bZkp7q19f0")
+        );
+    }
+
+    /// Other tabs keep their rows while the parked search adapter selection is rebased.
+    #[test]
+    fn youtube_hashtag_back_reprojects_hidden_search_adapter_selection() {
+        let (_temporary, mut controller, requests) = hashtag_controller();
+        controller.config.ui.show_youtube_shorts = true;
+        let SearchItem::Video(short) = &mut controller.youtube_results[0] else {
+            panic!("fixture must contain a video");
+        };
+        short.orientation = VideoOrientation::Vertical;
+        controller.view.screen = Screen::YouTubeMusic;
+        controller.youtube_music_results = controller.youtube_results.clone();
+        controller.view.search_query = "music origin".into();
+        controller.refresh_youtube_music_rows();
+        controller.dispatch(UiAction::SearchYouTubeHashtag("One".into()));
+        let _ = requests.try_iter().count();
+        controller.config.ui.show_youtube_shorts = false;
+
+        controller.dispatch(UiAction::GoBack);
+
+        assert_eq!(controller.view.screen, Screen::YouTubeMusic);
+        assert_eq!(controller.view.rows.len(), 2);
+        assert_eq!(controller.view.selected, 1);
+        assert_eq!(controller.view.search_query, "music origin");
+        assert_eq!(controller.youtube_selected, 0);
+        assert_eq!(controller.view.details_scroll, 17);
+        assert_eq!(
+            controller.selected_queue_item().unwrap().media.id,
+            MediaId::new(SourceKind::YouTube, "9bZkp7q19f0")
+        );
+    }
+
+    /// Reenabling Shorts restores rows without moving the selection to the newly shown video.
+    #[test]
+    fn youtube_hashtag_back_reprojects_when_shorts_are_reenabled() {
+        let (_temporary, mut controller, requests) = hashtag_controller();
+        let SearchItem::Video(short) = &mut controller.youtube_results[0] else {
+            panic!("fixture must contain a video");
+        };
+        short.orientation = VideoOrientation::Vertical;
+        controller.config.ui.show_youtube_shorts = false;
+        controller.refresh_youtube_rows();
+        controller.dispatch(UiAction::SearchYouTubeHashtag("One".into()));
+        let _ = requests.try_iter().count();
+        controller.config.ui.show_youtube_shorts = true;
+
+        controller.dispatch(UiAction::GoBack);
+
+        assert_eq!(controller.view.rows.len(), 2);
+        assert_eq!(controller.view.selected, 1);
+        assert_eq!(controller.youtube_selected, 1);
+        assert_eq!(controller.view.details_scroll, 17);
+        assert_eq!(
+            controller.view.details.as_ref().unwrap().title,
+            "Original selection"
+        );
+        assert_eq!(
+            controller.selected_queue_item().unwrap().media.id,
+            MediaId::new(SourceKind::YouTube, "9bZkp7q19f0")
+        );
+    }
+
+    /// Returning to a subscription uses the same new preference as the visible hashtag page.
+    #[test]
+    fn youtube_hashtag_back_reprojects_subscription_origin_shorts() {
+        for short_index in [0, 1] {
+            let (_temporary, mut controller, requests) = hashtag_controller();
+            controller.config.ui.show_youtube_shorts = true;
+            let SearchItem::Video(short) = &mut controller.youtube_results[short_index] else {
+                panic!("fixture must contain a video");
+            };
+            short.orientation = VideoOrientation::Vertical;
+            controller.view.screen = Screen::Subscriptions;
+            controller.view.subscriptions.route = SubscriptionRoute::Items;
+            controller.view.subscriptions.focus = SubscriptionPane::Items;
+            controller.view.subscriptions.selected_item = 1;
+            controller.active_subscription_channel_id = Some("UCfixture".into());
+            controller.subscription_video_cache.insert(
+                "UCfixture".into(),
+                CachedSubscriptionVideos {
+                    items: controller.youtube_results.clone(),
+                    next_page: Some(4),
+                    ..CachedSubscriptionVideos::default()
+                },
+            );
+            controller.refresh_subscription_video_rows();
+            controller.dispatch(UiAction::SearchYouTubeHashtag("One".into()));
+            let _ = requests.try_iter().count();
+            controller.config.ui.show_youtube_shorts = false;
+
+            controller.dispatch(UiAction::GoBack);
+
+            assert_eq!(controller.view.screen, Screen::Subscriptions);
+            assert_eq!(controller.view.subscriptions.items.len(), 1);
+            assert_eq!(controller.view.subscriptions.selected_item, 0);
+            let (title, id, scroll) = if short_index == 0 {
+                ("Original selection", "9bZkp7q19f0", 17)
+            } else {
+                ("First result", "dQw4w9WgXcQ", 0)
+            };
+            assert_eq!(controller.view.subscriptions.items[0].title, title);
+            assert_eq!(controller.view.details.as_ref().unwrap().title, title);
+            assert_eq!(controller.view.details_scroll, scroll);
+            assert_eq!(
+                controller.selected_queue_item().unwrap().media.id,
+                MediaId::new(SourceKind::YouTube, id)
+            );
+            assert!(!requests.try_iter().any(|request| matches!(
+                request,
+                ProviderRequest::Search { .. } | ProviderRequest::Details { .. }
+            )));
+        }
+    }
+
+    /// A hidden cached item must not replace the channel description owned by Sources focus.
+    #[test]
+    fn youtube_hashtag_back_shorts_change_preserves_subscription_source_details() {
+        let (_temporary, mut controller, requests) = hashtag_controller();
+        controller.config.ui.show_youtube_shorts = true;
+        let SearchItem::Video(short) = &mut controller.youtube_results[1] else {
+            panic!("fixture must contain a video");
+        };
+        short.orientation = VideoOrientation::Vertical;
+        controller.view.screen = Screen::Subscriptions;
+        controller.view.subscriptions.route = SubscriptionRoute::Sources;
+        controller.view.subscriptions.focus = SubscriptionPane::Sources;
+        controller.view.subscriptions.selected_item = 1;
+        controller.active_subscription_channel_id = Some("UCfixture".into());
+        controller.subscription_video_cache.insert(
+            "UCfixture".into(),
+            CachedSubscriptionVideos {
+                items: controller.youtube_results.clone(),
+                ..CachedSubscriptionVideos::default()
+            },
+        );
+        controller.refresh_subscription_video_rows();
+        controller.view.details.as_mut().unwrap().title = "Channel description".into();
+        controller.dispatch(UiAction::SearchYouTubeHashtag("One".into()));
+        let _ = requests.try_iter().count();
+        controller.config.ui.show_youtube_shorts = false;
+
+        controller.dispatch(UiAction::GoBack);
+
+        assert_eq!(controller.view.subscriptions.items.len(), 1);
+        assert_eq!(
+            controller.view.details.as_ref().unwrap().title,
+            "Channel description"
+        );
+        assert_eq!(controller.view.details_scroll, 17);
+    }
+
+    /// Exact video URLs remain reachable when Back restores a vertical direct result.
+    #[test]
+    fn youtube_hashtag_back_keeps_direct_short_visible() {
+        let (_temporary, mut controller, requests) = hashtag_controller();
+        controller.youtube_search_request = None;
+        controller.youtube_results.remove(0);
+        let SearchItem::Video(short) = &mut controller.youtube_results[0] else {
+            panic!("fixture must contain a video");
+        };
+        short.orientation = VideoOrientation::Vertical;
+        controller.config.ui.show_youtube_shorts = true;
+        controller.refresh_youtube_rows();
+        controller.dispatch(UiAction::SearchYouTubeHashtag("One".into()));
+        let _ = requests.try_iter().count();
+        controller.config.ui.show_youtube_shorts = false;
+
+        controller.dispatch(UiAction::GoBack);
+
+        assert_eq!(controller.view.rows.len(), 1);
+        assert_eq!(controller.view.rows[0].title, "Original selection");
+        assert_eq!(controller.view.details_scroll, 17);
+        assert!(controller.youtube_search_request.is_none());
+        assert_eq!(
+            controller.selected_queue_item().unwrap().media.id,
+            MediaId::new(SourceKind::YouTube, "9bZkp7q19f0")
+        );
+        assert!(!requests.try_iter().any(|request| matches!(
+            request,
+            ProviderRequest::Search { .. } | ProviderRequest::Details { .. }
+        )));
     }
 }

@@ -67,6 +67,8 @@ struct SearchLocation {
     local: Vec<LocalMediaItem>,
     next_page: Option<u32>,
     request: Option<SearchRequest>,
+    /// Canonical provider index retained across changes to the visible Shorts projection.
+    selected_result: Option<usize>,
     start_override: Option<u64>,
     apple_route: ApplePodcastsRoute,
 }
@@ -686,7 +688,7 @@ impl AppController {
         use std::mem::swap;
         let screen = location.screen;
         let query = location.query.clone();
-        let selected = location.selected;
+        let mut selected = location.selected;
         location.query = self.source_location_query(screen).to_owned();
         location.selected = if self.view.screen == screen {
             self.view.selected
@@ -712,6 +714,11 @@ impl AppController {
         self.supersede_search_generation();
         match &mut location.content {
             Content::Search(search) => {
+                let selected_result = search.selected_result;
+                search.selected_result = (screen == Screen::Search
+                    && self.youtube_search_request.is_some())
+                .then(|| self.youtube_search_result_index(location.selected))
+                .flatten();
                 swap(&mut search.items, &mut self.youtube_results);
                 swap(&mut search.direct, &mut self.direct_item);
                 swap(&mut search.resolved, &mut self.resolved_direct);
@@ -724,6 +731,19 @@ impl AppController {
                 );
                 if screen == Screen::ApplePodcasts {
                     swap(&mut search.apple_route, &mut self.apple_podcasts_route);
+                }
+                if screen == Screen::Search && self.youtube_search_request.is_some() {
+                    selected = selected_result
+                        .and_then(|index| self.youtube_search_visible_index(index))
+                        .unwrap_or_else(|| {
+                            selected.min(
+                                self.youtube_results
+                                    .iter()
+                                    .filter(|item| self.youtube_search_item_visible(item))
+                                    .count()
+                                    .saturating_sub(1),
+                            )
+                        });
                 }
             }
             Content::Music {
@@ -1118,4 +1138,77 @@ fn accepted_yandex_track(item: &QueueItem) -> Option<YandexMusicTrack> {
     let matches = matches!(segments.as_slice(), ["track", track] if *track == id)
         || matches!(segments.as_slice(), ["album", album, "track", track] if !album.is_empty() && *track == id);
     matches.then(|| yandex_music_track_from_queue_item(item))
+}
+
+#[cfg(test)]
+mod shorts_navigation_tests {
+    use super::*;
+    use crate::app::tests::{controller_with_youtube_video_comments, linked_video_details};
+
+    /// A parked search retains its selected provider item when the shared projection changes.
+    #[test]
+    fn now_playing_back_rebases_search_selection_after_shorts_toggle() {
+        for initially_shown in [true, false] {
+            let (_temporary, mut controller, requests) = controller_with_youtube_video_comments();
+            controller.youtube_provider_available = true;
+            controller.config.ui.show_youtube_shorts = initially_shown;
+            let mut short =
+                summary_from_details(&linked_video_details("dQw4w9WgXcQ", "Short", "#Short"));
+            short.orientation = VideoOrientation::Vertical;
+            let selected = summary_from_details(&linked_video_details(
+                "9bZkp7q19f0",
+                "Selected standard video",
+                "#Music",
+            ));
+            let third = summary_from_details(&linked_video_details(
+                "aaaaaaaaaaa",
+                "Other standard video",
+                "#Music",
+            ));
+            controller.youtube_results = vec![
+                SearchItem::Video(short),
+                SearchItem::Video(selected),
+                SearchItem::Video(third),
+            ];
+            controller.youtube_search_request =
+                Some(SearchRequest::new("original search", SearchTarget::Videos));
+            controller.youtube_search_query = "original search".into();
+            controller.view.search_query = "original search".into();
+            controller.view.rows.clear();
+            controller.view.selected = usize::from(initially_shown);
+            controller.refresh_youtube_rows();
+            controller.youtube_selected = controller.view.selected;
+            let playing = queue_item_from_video(
+                &summary_from_details(&linked_video_details(
+                    "M7lc1UVf-VE",
+                    "Playing retained video",
+                    "#Music",
+                )),
+                None,
+            );
+            controller.current_media = Some(playing.media.id.clone());
+            controller.remember_now_playing_context(&playing);
+            assert!(controller.reveal_retained_now_playing(&playing));
+            assert!(controller.youtube_search_request.is_none());
+            controller.dispatch(UiAction::ToggleSubscriptionShorts);
+            let _ = requests.try_iter().count();
+
+            controller.dispatch(UiAction::GoBack);
+
+            assert_eq!(controller.view.search_query, "original search");
+            assert_eq!(controller.view.selected, usize::from(!initially_shown));
+            assert_eq!(controller.youtube_selected, controller.view.selected);
+            assert_eq!(
+                controller.selected_queue_item().unwrap().media.id,
+                MediaId::new(SourceKind::YouTube, "9bZkp7q19f0")
+            );
+            assert_eq!(controller.current_media, Some(playing.media.id));
+            assert_eq!(controller.youtube_results.len(), 3);
+            assert!(
+                !requests
+                    .try_iter()
+                    .any(|request| matches!(request, ProviderRequest::Search { .. }))
+            );
+        }
+    }
 }

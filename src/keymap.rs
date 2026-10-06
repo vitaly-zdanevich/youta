@@ -2965,8 +2965,9 @@ fn unfiltered_key_action(
         Key::Char('W') => wikidata_link_index.map(UiAction::ToggleWikidataStatements),
         Key::Char('h')
             if !key.modified()
-                && subscription_items_active(view)
-                && view.subscriptions.source_kind == SubscriptionKind::YouTube =>
+                && (view.screen == Screen::Search
+                    || (subscription_items_active(view)
+                        && view.subscriptions.source_kind == SubscriptionKind::YouTube)) =>
         {
             Some(UiAction::ToggleSubscriptionShorts)
         }

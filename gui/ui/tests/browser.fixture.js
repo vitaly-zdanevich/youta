@@ -144,6 +144,44 @@
 		description: 'Complete fixture description.\nSecond paragraph remains visible.',
 		webpage_url: 'https://archive.org/details/fixture',
 	});
+	/** YouTube exposes the saved Shorts filter alongside the existing global playback controls. */
+	async function checkYouTubeSearchControls() {
+		const previous = clone(view);
+		for (const enabled of [false, true]) {
+			snapshot({ screen: 'Search', details: null, rows: [], search_query: '', search_editing: false,
+				autoplay: enabled, repeating: enabled,
+				subscriptions: { ...view.subscriptions, show_youtube_shorts: enabled } });
+			const shorts = await until(() => {
+				const search = document.querySelector('[role=search]');
+				return search && button(`[h] Shorts: ${enabled ? 'on' : 'off'}`, search);
+			}, 'YouTube search Shorts state');
+			assert(shorts.getAttribute('aria-pressed') === String(enabled) && !shorts.disabled,
+				'YouTube Shorts reflects the shared saved preference');
+			const player = document.querySelector('footer');
+			assert(button('Autoplay', player)?.getAttribute('aria-pressed') === String(enabled)
+				&& button('Repeat', player)?.getAttribute('aria-pressed') === String(enabled),
+				'YouTube retains the global Autoplay and Repeat controls with their shared states');
+			await action('ToggleSubscriptionShorts', () => shorts.click(), 'YouTube Shorts dispatches its existing shared action');
+		}
+		await action('ToggleAutoplay', () => button('Autoplay', document.querySelector('footer')).click(), 'YouTube Autoplay dispatches its global action');
+		await action('ToggleRepeat', () => button('Repeat', document.querySelector('footer')).click(), 'YouTube Repeat dispatches its global action');
+		snapshot({ search_editing: true, search_query: 'h', search_cursor_byte: 1 });
+		const disabled = await until(() => button('[h] Shorts: on')?.disabled && button('[h] Shorts: on'), 'Shorts disabled while editing search');
+		const beforeTyping = calls.length;
+		disabled.click();
+		await key('h', { Char: 'h' });
+		assert(!calls.slice(beforeTyping).some((call) => call.command === 'dispatch'),
+			'While editing, h reaches the shared keymap and the disabled button cannot toggle Shorts');
+		snapshot({ search_query: 'hh', search_cursor_byte: 2 });
+		await until(() => document.querySelector('[role=search]')?.textContent.includes('hh'), 'typed h remains in the search query');
+		for (const screen of ['YouTubeMusic', 'ArchiveOrg', 'SoundCloud', 'Local']) {
+			snapshot({ screen, search_editing: false });
+			await until(() => !button('[h] Shorts: on'), `No YouTube Shorts search control on ${screen}`);
+			assert(!button('[h] Shorts: off'), `Shorts filtering stays scoped to YouTube: ${screen}`);
+		}
+		snapshot(previous);
+	}
+
 	/** The live duration is red in results, subscriptions, Details and the transport. */
 	async function checkLiveDuration() {
 		const previous = clone(view);
@@ -880,6 +918,7 @@
 		}
 		snapshot(beforeTabMarkers);
 		await checkRadioPresentation();
+		await checkYouTubeSearchControls();
 		await checkLiveDuration();
 		await checkLocalFullPath();
 		await checkLocalTrackMetadata();

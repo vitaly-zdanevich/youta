@@ -13839,6 +13839,17 @@ impl AppController {
                 }
                 match result {
                     Ok(details) => {
+                        let previous_search_selection = if self.view.screen == Screen::Search
+                            && self.local_results.is_empty()
+                            && self.direct_item.is_none()
+                            && self.resolved_direct.is_none()
+                        {
+                            self.view.selected
+                        } else {
+                            self.youtube_selected
+                        };
+                        let selected_search_result_before =
+                            self.youtube_search_result_index(previous_search_selection);
                         let selected_subscription_video_id_before = (self.view.screen
                             == Screen::Subscriptions)
                             .then(|| self.selected_subscription_item())
@@ -13966,8 +13977,43 @@ impl AppController {
                             self.touch_subscription_cache(&channel_id);
                             self.enforce_subscription_cache_byte_budget(&channel_id);
                         }
+                        let search_projection_changed = orientation_changed
+                            && self.youtube_search_request.is_some()
+                            && !self.config.ui.show_youtube_shorts;
+                        if search_projection_changed {
+                            // Search may be parked while another route enriches a shared
+                            // video. Preserve its canonical cursor before restoring rows.
+                            self.youtube_selected = selected_search_result_before
+                                .and_then(|index| self.youtube_search_visible_index(index))
+                                .unwrap_or_else(|| {
+                                    previous_search_selection.min(
+                                        self.youtube_results
+                                            .iter()
+                                            .filter(|item| self.youtube_search_item_visible(item))
+                                            .count()
+                                            .saturating_sub(1),
+                                    )
+                                });
+                            self.detail_navigation_back
+                                .retain(|snapshot| snapshot.screen != Screen::Search);
+                            self.detail_navigation_forward
+                                .retain(|snapshot| snapshot.screen != Screen::Search);
+                        }
                         if self.view.screen == Screen::Search {
                             self.refresh_youtube_rows();
+                            if search_projection_changed {
+                                // Orientation proof can change visible offsets without
+                                // changing the canonical provider-page ordering.
+                                self.view.selected = self.youtube_selected;
+                                if selected_search_result_before
+                                    .and_then(|index| self.youtube_search_visible_index(index))
+                                    .is_none()
+                                    && self.view.right_panel_mode == RightPanelMode::Details
+                                    && self.active_description_video.is_none()
+                                {
+                                    self.request_selected_details();
+                                }
+                            }
                         } else if self.view.screen == Screen::YouTubeMusic {
                             self.refresh_youtube_music_rows();
                         } else if self.view.screen == Screen::Subscriptions {
@@ -14760,12 +14806,16 @@ impl AppController {
         }
     }
 
+    /// Projects visible search rows without interpreting stale rows from another route.
+    /// Callers that change the projection own canonical selection rebasing before or after this.
     fn refresh_youtube_rows(&mut self) {
         let today = Local::now().date_naive();
         let youtube_thumbnail_size = self.effective_youtube_thumbnail_size();
+        self.view.subscriptions.show_youtube_shorts = self.config.ui.show_youtube_shorts;
         self.view.rows = self
             .youtube_results
             .iter()
+            .filter(|item| self.youtube_search_item_visible(item))
             .map(|item| {
                 row_from_search_item_with_thumbnail_size(
                     item,
@@ -14782,6 +14832,32 @@ impl AppController {
             .view
             .selected
             .min(self.view.rows.len().saturating_sub(1));
+    }
+
+    /// Filters real search pages, while explicit video links remain individually addressable.
+    fn youtube_search_item_visible(&self, item: &SearchItem) -> bool {
+        self.youtube_search_request.is_none()
+            || self.config.ui.show_youtube_shorts
+            || !matches!(item, SearchItem::Video(video) if youtube_video_uses_shorts_style(video))
+    }
+
+    /// Maps a visible search row to its unchanged canonical provider-page index.
+    fn youtube_search_result_index(&self, visible_index: usize) -> Option<usize> {
+        self.youtube_results
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| self.youtube_search_item_visible(item))
+            .nth(visible_index)
+            .map(|(index, _)| index)
+    }
+
+    /// Finds the visible position of one canonical result after a projection change.
+    fn youtube_search_visible_index(&self, result_index: usize) -> Option<usize> {
+        self.youtube_results
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| self.youtube_search_item_visible(item))
+            .position(|(index, _)| index == result_index)
     }
 
     fn refresh_youtube_music_rows(&mut self) {
@@ -17210,6 +17286,17 @@ impl AppController {
             return;
         }
         if self.view.rows.is_empty() {
+            if delta.is_positive()
+                && self.view.screen == Screen::Search
+                && self.local_results.is_empty()
+                && self.direct_item.is_none()
+                && self.resolved_direct.is_none()
+                && let Some(page) = self.next_youtube_page
+            {
+                // A provider page can contain only hidden Shorts. Keep explicit
+                // forward navigation available without an automatic page crawl.
+                self.submit_youtube_search(page);
+            }
             return;
         }
         let last = self.view.rows.len().saturating_sub(1);
@@ -17531,7 +17618,7 @@ impl AppController {
             }
             return Ok(queue_item_from_direct(direct));
         }
-        match self.youtube_results.get(self.view.selected) {
+        match self.selected_youtube_item() {
             Some(SearchItem::Video(video)) => {
                 Ok(self.selected_video_queue_item(video, self.selected_start_override))
             }
@@ -21979,13 +22066,17 @@ impl AppController {
         }
 
         if item.media.id.source == SourceKind::YouTube
-            && let Some(index) = self.youtube_results.iter().position(|candidate| {
-                matches!(
-                    candidate,
-                    SearchItem::Video(video)
-                        if video.video_id == item.media.id.external_id
-                )
-            })
+            && let Some(index) = self
+                .youtube_results
+                .iter()
+                .filter(|candidate| self.youtube_search_item_visible(candidate))
+                .position(|candidate| {
+                    matches!(
+                        candidate,
+                        SearchItem::Video(video)
+                            if video.video_id == item.media.id.external_id
+                    )
+                })
         {
             self.view.screen = Screen::Search;
             self.refresh_youtube_rows();
@@ -25485,11 +25576,15 @@ impl AppController {
         };
 
         match self.view.screen {
-            Screen::Search if video_at(&self.youtube_results, self.view.selected) => {
-                return Some(AutoplayOrigin::YouTube {
-                    generation: self.search_generation,
-                    index: self.view.selected,
-                });
+            Screen::Search => {
+                if let Some(index) = self.youtube_search_result_index(self.view.selected)
+                    && video_at(&self.youtube_results, index)
+                {
+                    return Some(AutoplayOrigin::YouTube {
+                        generation: self.search_generation,
+                        index,
+                    });
+                }
             }
             Screen::YouTubeMusic if video_at(&self.youtube_music_results, self.view.selected) => {
                 return Some(AutoplayOrigin::YouTubeMusic {
@@ -25791,7 +25886,10 @@ impl AppController {
                 }
                 neighbour_list_step(&self.youtube_results, *index, direction, |index, item| {
                     match item {
-                        SearchItem::Video(video) if video_is_autoplay_playable(video) => {
+                        SearchItem::Video(video)
+                            if video_is_autoplay_playable(video)
+                                && self.youtube_search_item_visible(item) =>
+                        {
                             Some(AutoplayStep::Play {
                                 item: Box::new(queue_item_from_video_with_thumbnail_size(
                                     video,
@@ -30472,7 +30570,8 @@ impl AppController {
                     && self.direct_item.is_none()
                     && self.resolved_direct.is_none() =>
             {
-                self.youtube_results.get(self.view.selected)
+                self.youtube_results
+                    .get(self.youtube_search_result_index(self.view.selected)?)
             }
             Screen::YouTubeMusic => self.youtube_music_results.get(self.view.selected),
             Screen::Subscriptions
@@ -30836,7 +30935,7 @@ impl AppController {
         if let Some(direct) = &self.direct_item {
             return Some(direct.url.to_string());
         }
-        search_item_url(self.youtube_results.get(self.view.selected)?)
+        search_item_url(self.selected_youtube_item()?)
     }
 
     /// Returns the provider page owned by the active Apple show or episode row.
@@ -33358,25 +33457,77 @@ impl AppController {
             format!("Autoplay {}", if autoplay { "enabled" } else { "disabled" });
     }
 
-    /// Persists and applies the YouTube-subscription Shorts projection.
+    /// Persists the shared `YouTube` search and subscription Shorts projection.
     ///
     /// Canonical provider pages remain intact in RAM and on disk. Toggling the
-    /// preference therefore rebuilds only the visible rows and never spends a
-    /// provider request to restore hidden videos.
+    /// preference therefore rebuilds only the visible rows and never refetches
+    /// provider pages to restore hidden videos.
     fn toggle_subscription_shorts(&mut self) {
         let items_visible = self.view.screen == Screen::Subscriptions
             && self.view.subscriptions.source_kind == SubscriptionKind::YouTube
             && (self.view.subscriptions.route == SubscriptionRoute::Items
                 || self.view.subscriptions.layout == SubscriptionsLayout::Split);
-        if !items_visible {
+        if !items_visible && self.view.screen != Screen::Search {
             self.view.status_line =
                 "Open a YouTube subscription's videos before toggling Shorts".to_owned();
             return;
         }
 
+        let youtube_rows_visible = self.view.screen == Screen::Search
+            && self.local_results.is_empty()
+            && self.direct_item.is_none()
+            && self.resolved_direct.is_none();
+        let previous_search_selection = if youtube_rows_visible {
+            self.view.selected
+        } else {
+            self.youtube_selected
+        };
+        let previous_search_result = self.youtube_search_result_index(previous_search_selection);
+        let previous_search_media_id = youtube_rows_visible
+            .then(|| {
+                self.selected_youtube_item()
+                    .and_then(subscription_item_media_id)
+            })
+            .flatten();
         let show_youtube_shorts = !self.config.ui.show_youtube_shorts;
         if let Err(error) = self.config.save_show_youtube_shorts(show_youtube_shorts) {
             self.show_error("Could not save Shorts visibility", &error);
+            return;
+        }
+        self.view.subscriptions.show_youtube_shorts = show_youtube_shorts;
+        self.youtube_selected = previous_search_result
+            .and_then(|index| self.youtube_search_visible_index(index))
+            .unwrap_or_else(|| {
+                previous_search_selection.min(
+                    self.youtube_results
+                        .iter()
+                        .filter(|item| self.youtube_search_item_visible(item))
+                        .count()
+                        .saturating_sub(1),
+                )
+            });
+        if self.view.screen == Screen::Search {
+            self.detail_navigation_back.clear();
+            self.detail_navigation_forward.clear();
+            if youtube_rows_visible {
+                self.refresh_youtube_rows();
+                self.view.selected = self.youtube_selected;
+                let selected_media_id = self
+                    .selected_youtube_item()
+                    .and_then(subscription_item_media_id);
+                if selected_media_id != previous_search_media_id
+                    && self.view.right_panel_mode == RightPanelMode::Details
+                {
+                    self.request_selected_details();
+                }
+            }
+            self.refresh_selected_playlist_state();
+            self.view.status_line = if show_youtube_shorts {
+                "YouTube Shorts shown in search and subscriptions"
+            } else {
+                "YouTube Shorts hidden from search and subscriptions"
+            }
+            .to_owned();
             return;
         }
         let previous_media_id = self
@@ -42442,7 +42593,7 @@ fn row_from_search_item_with_progress_mode(
 /// Returns whether one provider-confirmed video uses Youta's Shorts styling.
 ///
 /// This single predicate owns both the distinct title color and the optional
-/// Subscriptions filter, preventing those two presentations from disagreeing.
+/// search and Subscriptions filters, preventing those presentations from disagreeing.
 /// Unknown, horizontal, and square rows remain standard videos.
 fn youtube_video_uses_shorts_style(video: &VideoSummary) -> bool {
     matches!(video.orientation, VideoOrientation::Vertical)
@@ -46987,6 +47138,8 @@ mod tests {
     #[cfg(feature = "web-browser")]
     #[path = "web_worker.rs"]
     mod web_worker_tests;
+    #[path = "youtube_shorts.rs"]
+    mod youtube_shorts_tests;
 
     use std::collections::VecDeque;
     #[cfg(feature = "lan-sharing")]

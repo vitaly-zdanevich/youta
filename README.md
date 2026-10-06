@@ -1518,6 +1518,14 @@ These are distinct integration modes:
   input opens directly in this first-class tab without issuing a text search.
   Public-page search has its own capacity-one latest-only worker and cannot
   hold the general YouTube provider lane.
+- The **YT** list footer offers `[h] Shorts: on/off`, `[A] Autoplay: on/off`,
+  and `[r] Repeat: on/off`. Shorts visibility uses the same saved preference
+  as YouTube subscriptions; toggling restores cached results without another
+  network request. It hides only provider-confirmed vertical videos, keeps
+  channels and explicitly opened video URLs available, and does not affect
+  the YT Music tab. If a whole page is hidden, `PageDown` can fetch the next
+  page. The GUI provides Shorts beside the search controls and keeps Autoplay
+  and Repeat in its player.
 - `[N] Sort: relevance/newest` changes the order and reloads the current
   YouTube search. The official adapter sends `order=date` for newest-first
   searches. Invidious currently

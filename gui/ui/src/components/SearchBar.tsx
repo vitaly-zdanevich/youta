@@ -97,6 +97,18 @@ export function SearchBar({
           view.search_query
         )}
       </div>
+		{/* Search and Subscriptions share the same saved Shorts preference. */}
+		{view.screen === 'Search' ? (
+			<button
+				type='button'
+				aria-pressed={view.subscriptions.show_youtube_shorts}
+				disabled={view.search_editing}
+				onClick={() => void dispatch('ToggleSubscriptionShorts')}
+				className='shrink-0 rounded-[5px] px-[8px] py-[3px] text-[11px] whitespace-nowrap text-accent disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent'
+			>
+				[h] Shorts: {view.subscriptions.show_youtube_shorts ? 'on' : 'off'}
+			</button>
+		) : null}
       {web ? (
 		<>
 			<span className='shrink-0 text-[11px] text-ink-faint'>Audio only</span>
