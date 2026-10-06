@@ -556,6 +556,7 @@ fn soundcloud_artist_links_tags_and_comment_authors_are_internal_and_owned() {
             like_count: 0,
             published: None,
             text: "Comment".into(),
+            email_links: Vec::new(),
         }],
         scroll_offset: 0,
     });

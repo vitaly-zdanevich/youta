@@ -6,6 +6,7 @@
 
 use std::borrow::Cow;
 
+use linkify::{LinkFinder, LinkKind};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -58,10 +59,15 @@ pub enum LinkTarget {
         /// Tag text without the leading hash mark.
         tag: String,
     },
+    /// A single email recipient opened by the user's configured mail application.
+    Email {
+        /// Validated recipient address without a scheme or mail headers.
+        address: String,
+    },
 }
 
 impl LinkTarget {
-    /// Builds a canonical web URL when the target is independently addressable.
+    /// Builds a canonical URL when the target is independently addressable.
     ///
     /// Standalone timecodes return `None` because they require the current media
     /// identifier and should be handled by the player navigation stack.
@@ -115,9 +121,125 @@ impl LinkTarget {
                 segments.push(tag);
             }
             Self::Timecode { .. } => return None,
+            Self::Email { address } => return email_url(address),
         }
         Some(url)
     }
+}
+
+/// Validates a single-recipient `mailto` link without accepting headers or recipient lists.
+#[must_use]
+pub fn validated_mailto_url(raw: &str) -> Option<Url> {
+    let address = mailto_recipient(raw)?;
+    email_url(&address)
+}
+
+/// Decodes only one opaque mail recipient after rejecting headers and malformed escapes.
+fn mailto_recipient(raw: &str) -> Option<String> {
+    if raw.len() > 1_024
+        || raw
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+    {
+        return None;
+    }
+    let url = Url::parse(raw).ok()?;
+    if url.scheme() != "mailto"
+        || !url.cannot_be_a_base()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    let path = url.path();
+    for (index, byte) in path.bytes().enumerate() {
+        if byte == b'%'
+            && path
+                .as_bytes()
+                .get(index + 1..index + 3)
+                .is_none_or(|pair| !pair.iter().all(u8::is_ascii_hexdigit))
+        {
+            return None;
+        }
+    }
+    // Form decoding replaces invalid UTF-8, which recipient validation rejects.
+    // Protect literal plus and ampersand to retain their email local-part meaning.
+    let encoded = format!("address={}", path.replace('+', "%2B").replace('&', "%26"));
+    let (_, address) = url::form_urlencoded::parse(encoded.as_bytes()).next()?;
+    email_domain(&address)?;
+    Some(address.into_owned())
+}
+
+/// Builds an opaque URL with all reserved local-part characters encoded as recipient data.
+fn email_url(address: &str) -> Option<Url> {
+    let domain = email_domain(address)?;
+    let (local, _) = address.split_once('@')?;
+    let local: String = url::form_urlencoded::byte_serialize(local.as_bytes()).collect();
+    Url::parse(&format!("mailto:{local}@{domain}")).ok()
+}
+
+/// Checks a practical unquoted mailbox and normalizes its DNS domain using URL's IDNA rules.
+fn email_domain(address: &str) -> Option<String> {
+    if address.len() > 254 {
+        return None;
+    }
+    let (local, domain) = address.split_once('@')?;
+    if local.is_empty()
+        || local.len() > 64
+        || local.starts_with('.')
+        || local.ends_with('.')
+        || local.contains("..")
+        || !local.chars().all(|character| {
+            character.is_alphanumeric()
+                || matches!(
+                    character,
+                    '.' | '!'
+                        | '#'
+                        | '$'
+                        | '%'
+                        | '&'
+                        | '\''
+                        | '*'
+                        | '+'
+                        | '-'
+                        | '/'
+                        | '='
+                        | '?'
+                        | '^'
+                        | '_'
+                        | '`'
+                        | '{'
+                        | '|'
+                        | '}'
+                        | '~'
+                )
+        })
+    {
+        return None;
+    }
+    // Mailto recipients have already been decoded. Host parsing must not decode
+    // another escape layer into a different mailbox domain.
+    if domain.contains('%') {
+        return None;
+    }
+    let url::Host::Domain(domain) = url::Host::parse(domain).ok()? else {
+        return None;
+    };
+    if domain.len() > 253
+        || !domain.contains('.')
+        || domain.split('.').any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || label.starts_with('-')
+                || label.ends_with('-')
+                || !label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+    {
+        return None;
+    }
+    Some(domain)
 }
 
 /// A selectable description span.
@@ -178,17 +300,131 @@ impl DescriptionChapter {
     }
 }
 
-/// Extracts supported URLs, standalone timecodes, and hashtags.
+/// Extracts supported URLs, email addresses, standalone timecodes, and hashtags.
 ///
 /// Results are returned in display order and never overlap. Unsupported and
 /// malformed URLs remain ordinary description text.
+/// Email extraction is limited to 256 addresses in descriptions up to 256 KiB;
+/// these limits do not truncate the existing URL, timecode or hashtag actions.
 #[must_use]
 pub fn parse_description_links(description: &str) -> Vec<DescriptionLink> {
     let mut links = parse_url_links(description);
+    parse_email_links(description, &mut links);
     parse_timecodes(description, &mut links);
     parse_hashtags(description, &mut links);
     links.sort_unstable_by_key(|link| (link.start_byte, link.end_byte));
     links
+}
+
+/// Bounds only email extraction; existing URL, chapter and hashtag parsing stays unchanged.
+const MAX_EMAIL_DESCRIPTION_BYTES: usize = 256 * 1024;
+/// Limits owned recipient strings and clickable email actions per description.
+const MAX_DESCRIPTION_EMAIL_LINKS: usize = 256;
+
+/// Adds exact email spans while existing web URLs and complete mailto tokens own their text.
+fn parse_email_links(description: &str, links: &mut Vec<DescriptionLink>) {
+    if description.len() > MAX_EMAIL_DESCRIPTION_BYTES {
+        return;
+    }
+    let mut blocked = description_url_ranges(description).collect::<Vec<_>>();
+    let mailto = description_mailto_ranges(description).collect::<Vec<_>>();
+    let mut web_ranges = blocked.iter().copied().peekable();
+    let mut added = 0;
+    for &(start_byte, end_byte) in &mailto {
+        if added == MAX_DESCRIPTION_EMAIL_LINKS {
+            break;
+        }
+        while web_ranges.peek().is_some_and(|&(_, end)| end <= start_byte) {
+            web_ranges.next();
+        }
+        if web_ranges
+            .peek()
+            .is_some_and(|&(start, end)| start_byte < end && end_byte > start)
+        {
+            continue;
+        }
+        if let Some(address) = mailto_recipient(&description[start_byte..end_byte]) {
+            links.push(DescriptionLink {
+                start_byte,
+                end_byte,
+                target: LinkTarget::Email { address },
+            });
+            added += 1;
+        }
+    }
+    blocked.extend(mailto);
+    blocked.sort_unstable();
+    let mut blocked = blocked.into_iter().peekable();
+    let mut finder = LinkFinder::new();
+    finder.kinds(&[LinkKind::Email]);
+    for email in finder.links(description) {
+        if added == MAX_DESCRIPTION_EMAIL_LINKS {
+            break;
+        }
+        while blocked.peek().is_some_and(|&(_, end)| end <= email.start()) {
+            blocked.next();
+        }
+        if blocked
+            .peek()
+            .is_some_and(|&(start, end)| email.start() < end && email.end() > start)
+            || description[..email.start()]
+                .chars()
+                .next_back()
+                .is_some_and(|previous| matches!(previous, '.' | '@'))
+            || email_domain(email.as_str()).is_none()
+        {
+            continue;
+        }
+        links.push(DescriptionLink {
+            start_byte: email.start(),
+            end_byte: email.end(),
+            target: LinkTarget::Email {
+                address: email.as_str().to_owned(),
+            },
+        });
+        added += 1;
+    }
+}
+
+/// Reserves the whole literal mailto token, including invalid headers, against nested emails.
+fn description_mailto_ranges(description: &str) -> impl Iterator<Item = (usize, usize)> + '_ {
+    let mut cursor = 0;
+    std::iter::from_fn(move || {
+        while cursor < description.len() {
+            let character = description[cursor..].chars().next()?;
+            if !description[cursor..]
+                .get(..7)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("mailto:"))
+                || !is_url_start_boundary(description, cursor)
+            {
+                cursor += character.len_utf8();
+                continue;
+            }
+            let start = cursor;
+            let end = description[start..]
+                .char_indices()
+                .find_map(|(offset, character)| {
+                    (character.is_whitespace()
+                        || character.is_control()
+                        || matches!(character, '<' | '>' | '"'))
+                    .then_some(start + offset)
+                })
+                .unwrap_or(description.len());
+            cursor = end;
+            let mut trimmed = end;
+            while description[start..trimmed]
+                .chars()
+                .next_back()
+                .is_some_and(|character| {
+                    matches!(character, '.' | ',' | ';' | ':' | '!' | ')' | ']' | '}')
+                })
+            {
+                trimmed -= 1;
+            }
+            return Some((start, trimmed));
+        }
+        None
+    })
 }
 
 /// Extracts only `YouTube` video URLs eligible for internal Details navigation.
@@ -930,6 +1166,174 @@ fn hashtag_target(tag: &str) -> Option<LinkTarget> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Email spans retain source byte offsets and exclude surrounding prose punctuation.
+    #[test]
+    fn description_email_links_preserve_unicode_offsets_and_plus_addresses() {
+        let source = "🎵 Контакт: (alice+music@example.test), затем bob.smith@example.org!";
+        let links = parse_description_links(source);
+        let addresses = links
+            .iter()
+            .filter_map(|link| match &link.target {
+                LinkTarget::Email { address } => {
+                    Some((link.selected_text(source).unwrap(), address.as_str()))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            addresses,
+            [
+                ("alice+music@example.test", "alice+music@example.test"),
+                ("bob.smith@example.org", "bob.smith@example.org")
+            ]
+        );
+        assert!(
+            links
+                .iter()
+                .all(|link| source.is_char_boundary(link.start_byte)
+                    && source.is_char_boundary(link.end_byte))
+        );
+    }
+
+    /// Literal mail links remain selectable alongside existing video, timecode and tag actions.
+    #[test]
+    fn description_email_links_include_mailto_and_preserve_existing_actions() {
+        let source = "mailto:alice%2Bmusic@example.test 1:23 #Music https://youtu.be/dQw4w9WgXcQ";
+        let links = parse_description_links(source);
+        assert_eq!(links.len(), 4);
+        assert_eq!(
+            links[0].selected_text(source),
+            Some("mailto:alice%2Bmusic@example.test")
+        );
+        assert_eq!(
+            links[0].target,
+            LinkTarget::Email {
+                address: "alice+music@example.test".into()
+            }
+        );
+        assert!(matches!(
+            links[1].target,
+            LinkTarget::Timecode { seconds: 83 }
+        ));
+        assert!(matches!(links[2].target, LinkTarget::Hashtag { .. }));
+        assert!(matches!(links[3].target, LinkTarget::YouTubeVideo { .. }));
+        assert!(
+            links
+                .windows(2)
+                .all(|pair| pair[0].end_byte <= pair[1].start_byte)
+        );
+    }
+
+    /// Existing HTTP URL spans own email-looking paths, query values and user information.
+    #[test]
+    fn description_email_links_do_not_split_existing_http_urls() {
+        let source = concat!(
+            "https://example.test/alice@example.org ",
+            "http://example.test/?email=bob@example.org ",
+            "https://alice@example.org/path HTTPS://example.test/carol@example.org ",
+            "mailto:bob@example.test?cc=eve@example.org actual@example.net"
+        );
+        let emails = parse_description_links(source)
+            .into_iter()
+            .filter_map(|link| match link.target {
+                LinkTarget::Email { address } => Some(address),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(emails, ["actual@example.net"]);
+    }
+
+    /// Reserved local-part characters must remain recipient data instead of mail headers.
+    #[test]
+    fn email_canonical_urls_encode_recipient_delimiters_and_round_trip() {
+        for address in [
+            "alice+music@example.test",
+            "sales?tag#inbox@example.test",
+            "o'brien@example.test",
+        ] {
+            let url = LinkTarget::Email {
+                address: address.into(),
+            }
+            .canonical_url()
+            .unwrap();
+            assert_eq!(url.scheme(), "mailto");
+            assert!(url.query().is_none());
+            assert!(url.fragment().is_none());
+            assert_eq!(validated_mailto_url(url.as_str()), Some(url));
+        }
+    }
+
+    /// Openers accept only a checked recipient, never headers, control bytes or recipient lists.
+    #[test]
+    fn mailto_validation_rejects_headers_controls_and_multiple_recipients() {
+        assert!(validated_mailto_url("mailto:alice+music@example.test").is_some());
+        for raw in [
+            "https://example.test",
+            "mailto:",
+            "mailto:not-an-email",
+            "mailto:alice@example.test?subject=Hello",
+            "mailto:alice@example.test#fragment",
+            "mailto:alice@example.test,bob@example.test",
+            "mailto:alice@example.test;bob@example.test",
+            "mailto:alice%0D%0ABcc%3Aeve@example.test",
+            "mailto:alice\nbcc@example.test",
+            "mailto:alice%00@example.test",
+            "mailto:%2Ealice@example.test",
+            "mailto:alice..bob@example.test",
+            "mailto:alice@example..test",
+            "mailto:alice@-example.test",
+            " mailto:alice@example.test",
+            "mailto://alice@example.test",
+            "mailto:alice%zz@example.test",
+            "mailto:alice@example.test%20",
+        ] {
+            assert!(
+                validated_mailto_url(raw).is_none(),
+                "unexpectedly accepted {raw:?}"
+            );
+        }
+    }
+
+    /// Domain normalization must not reinterpret a second layer of percent-encoded text.
+    #[test]
+    fn email_mailto_domain_is_decoded_only_once() {
+        assert_eq!(
+            validated_mailto_url("mailto:alice@%65xample.test").map(|url| url.to_string()),
+            Some("mailto:alice@example.test".into())
+        );
+        assert!(validated_mailto_url("mailto:alice@%2565xample.test").is_none());
+    }
+
+    /// Email bounds leave unrelated description actions untouched even beyond the scan budget.
+    #[test]
+    fn description_email_links_are_bounded_without_truncating_other_actions() {
+        let repeated = "alice@example.test ".repeat(300);
+        assert_eq!(
+            parse_description_links(&repeated)
+                .iter()
+                .filter(|link| matches!(link.target, LinkTarget::Email { .. }))
+                .count(),
+            256
+        );
+        let source = format!("{} alice@example.test #Music 1:23", "x ".repeat(128 * 1024));
+        let links = parse_description_links(&source);
+        assert!(
+            !links
+                .iter()
+                .any(|link| matches!(link.target, LinkTarget::Email { .. }))
+        );
+        assert!(
+            links
+                .iter()
+                .any(|link| matches!(link.target, LinkTarget::Hashtag { .. }))
+        );
+        assert!(
+            links
+                .iter()
+                .any(|link| matches!(link.target, LinkTarget::Timecode { seconds: 83 }))
+        );
+    }
 
     /// Applies display replacements without mutating the original source fixture.
     #[cfg(feature = "controller")]

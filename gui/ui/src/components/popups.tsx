@@ -58,6 +58,7 @@ import type {
 } from "../contract";
 import { dispatch } from "../ipc";
 import { humanBytes } from '../format';
+import { annotate } from '../spans';
 import { Popup, PopupButton, PopupError } from "./Popup";
 import { ScrollingText } from "./ScrollingText";
 
@@ -1447,7 +1448,10 @@ export function ErrorPopup({
 }
 
 /** Bounded public YouTube/SoundCloud comments or Archive.org item reviews. */
-export function VideoCommentsPopup({ popup }: { popup: VideoCommentsPopupView }) {
+export function VideoCommentsPopup({ popup, externalOpenerAvailable }: {
+	popup: VideoCommentsPopupView;
+	externalOpenerAvailable: boolean;
+}) {
   const state = popup.state;
 	const archiveOrg = popup.source === 'archive-org';
 	const soundcloud = popup.source === 'sound-cloud';
@@ -1495,7 +1499,28 @@ export function VideoCommentsPopup({ popup }: { popup: VideoCommentsPopupView })
 									: ` · ${comment.like_count} likes${comment.published ? ` · ${comment.published}` : ''}`}
               </span>
               {"\n"}
-              <span className="text-ink-dim">{comment.text.trimEnd()}</span>
+							<span className='text-ink-dim'>{annotate(comment.text.trimEnd(),
+								comment.email_links.map((email, emailIndex) => ({ ...email, emailIndex })),
+								(email, covered, key) => {
+									// Capture the rendered owner; Rust rejects clicks from a replaced popup.
+									const activate = () => void dispatch({ ActivateCommentEmail: {
+										source: popup.source, video_id: popup.video_id,
+										comment_index: index, email_index: email.emailIndex,
+									} });
+									return <button key={key} type='button'
+										title={externalOpenerAvailable ? 'Compose email in your default mail app' : 'No external opener available'}
+										disabled={!externalOpenerAvailable}
+										onClick={activate}
+										onKeyDown={(event) => {
+											if (event.key !== 'Enter') return;
+											// The document key bridge must not also activate the popup.
+											event.preventDefault();
+											event.stopPropagation();
+											if (externalOpenerAvailable) activate();
+										}}
+										className='rounded-[3px] text-left text-ink underline decoration-dotted underline-offset-2 disabled:cursor-default disabled:no-underline not-disabled:hover:text-accent focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-accent'
+									>{covered}</button>;
+								})}</span>
             </div>
           ))}
         </ScrollingText>

@@ -256,7 +256,7 @@ export function App() {
       {view.queue_popup ? <QueuePopup popup={view.queue_popup} /> : null}
       {view.private_note_open ? <CredentialEditorNotice editor="private_note" /> : null}
       {view.video_comments_popup ? (
-        <VideoCommentsPopup popup={view.video_comments_popup} />
+				<VideoCommentsPopup popup={view.video_comments_popup} externalOpenerAvailable={view.external_opener_available} />
       ) : null}
       {view.video_qr_popup ? <VideoQrPopup popup={view.video_qr_popup} /> : null}
 		{view.podcast_feed_options_popup ? (

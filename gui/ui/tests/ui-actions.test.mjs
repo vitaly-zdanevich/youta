@@ -137,6 +137,8 @@ test('UiAction rejects unknown names, incorrect payloads, null identities and mu
 		'{ ActivateWaveformTimecode: { media_id: { source: \'local\', external_id: \'id\' }, seconds: 1 } }',
 		'{ ActivateDescriptionVideo: { video_id: \'id\', start_seconds: \'1\' } }',
 		'{ SearchYouTubeHashtag: 123 }',
+		'{ ActivateCommentEmail: { source: \'you-tube\', comment_index: 0, email_index: 0 } }',
+		'{ ActivateCommentEmail: { source: \'you-tube\', video_id: \'id\', comment_index: 0, email_index: 0, url: \'mailto:raw@example.org\' } }',
 		'{ SelectDownloadChoice: { generation: 1, index: 0, invented: true } }',
 	];
 	const { diagnostics } = compile(`import { dispatch as send } from '../src/ipc';

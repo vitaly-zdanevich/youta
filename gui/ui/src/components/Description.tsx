@@ -44,6 +44,7 @@ export function Description({
 	selectedLink = null,
 	revealLink = null,
 	urlEscapes = [],
+	externalOpenerAvailable = true,
 }: {
   text: string;
   timecodes: DetailTimecodeView[];
@@ -54,6 +55,7 @@ export function Description({
 	selectedLink?: number | null;
 	revealLink?: number | null;
 	urlEscapes?: readonly DetailUrlEscapeView[];
+	externalOpenerAvailable?: boolean;
 }) {
 	const container = useRef<HTMLDivElement>(null);
 	// Reveal only an explicit controller request, not every selected-link redraw.
@@ -96,14 +98,24 @@ export function Description({
     <div ref={container} data-description className="mt-3 border-t border-line pt-[10px] text-xs leading-relaxed whitespace-pre-wrap text-ink-dim">
       {annotate(text, spans, (span, covered, key) => {
 				if (span.kind === 'detail') {
+					// Email targets are canonical parser output, never inferred from displayed text.
+					const email = links[span.index]?.url.startsWith('mailto:') === true;
 					return <button
 						key={key}
 						type='button'
 						data-detail-link={span.index}
-						title='Browse related items in Youta'
+						title={email ? externalOpenerAvailable ? 'Compose email in your default mail app' : 'No external opener available' : 'Browse related items in Youta'}
+						disabled={email && !externalOpenerAvailable}
 						onFocus={() => void dispatch({ SelectDetailLink: span.index })}
 						onClick={() => void dispatch({ ActivateDetailLink: span.index })}
-						className={`rounded-[3px] text-left underline decoration-dotted underline-offset-2 hover:text-accent focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-accent ${
+						onKeyDown={(event) => {
+							if (!email || event.key !== 'Enter') return;
+							// Tab focus does not change reducer focus; bypass global track activation.
+							event.preventDefault();
+							event.stopPropagation();
+							if (externalOpenerAvailable) void dispatch({ ActivateDetailLink: span.index });
+						}}
+						className={`rounded-[3px] text-left underline decoration-dotted underline-offset-2 disabled:cursor-default disabled:no-underline not-disabled:hover:text-accent focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-accent ${
 							selectedLink === span.index ? 'text-accent' : 'text-ink'
 						}`}
 					><DescriptionText text={covered} highlights={highlights} escapes={urlEscapes} offset={span.start_byte} /></button>;

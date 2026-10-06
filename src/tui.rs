@@ -2808,7 +2808,13 @@ fn render_frame(
     hit_map.video_comments_scroll_maximum = 0;
     hit_map.video_comments_page_lines = 0;
     if let Some(popup) = view.video_comments_popup.as_ref() {
-        render_video_comments_popup(frame, popup, &theme, hit_map);
+        render_video_comments_popup(
+            frame,
+            popup,
+            view.external_opener_available,
+            &theme,
+            hit_map,
+        );
     }
     #[cfg(feature = "youtube-captions")]
     {
@@ -6323,6 +6329,15 @@ fn render_information_panel(
         } else {
             (description_area, Rect::default())
         };
+        // Appended email spans may precede provider metadata in the text. Sort
+        // references, retaining the original action/highlight indices in the DTO.
+        let mut inline_links = details
+            .links
+            .iter()
+            .enumerate()
+            .filter(|(_, link)| link.description_range.is_some())
+            .collect::<Vec<_>>();
+        inline_links.sort_unstable_by_key(|(_, link)| link.description_range.unwrap().start_byte);
         // Metadata navigation owns its source bytes, even when a value looks
         // like a video URL. Do not inject a competing action into that label.
         let video_links: std::borrow::Cow<'_, [DetailVideoLinkView]> = if details
@@ -6481,6 +6496,7 @@ fn render_information_panel(
                         } else {
                             append_description_source_spans(
                                 details,
+                                &inline_links,
                                 body_source,
                                 start_byte,
                                 end_byte,
@@ -6874,6 +6890,7 @@ fn append_description_url_escape<'a>(
 )]
 fn append_description_source_spans<'a>(
     details: &'a DetailView,
+    inline_links: &[(usize, &'a DetailLinkView)],
     source: &'a str,
     start_byte: usize,
     end_byte: usize,
@@ -6887,7 +6904,7 @@ fn append_description_source_spans<'a>(
     cell_cursor: &mut u16,
 ) {
     let mut cursor = start_byte;
-    for (index, link) in details.links.iter().enumerate() {
+    for &(index, link) in inline_links {
         let Some(range) = link.description_range.filter(|range| {
             range.start_byte < end_byte
                 && range.end_byte > start_byte
@@ -9433,10 +9450,70 @@ fn render_youtube_captions_popup(
     );
 }
 
+/// One email fragment's cell coordinates in a wrapped comment, before viewport scrolling.
+struct CommentEmailFragment {
+    line: usize,
+    email_index: usize,
+    column: u16,
+    width: u16,
+}
+
+/// Styles core-owned email bytes without changing comment text or wrapping offsets.
+fn comment_email_lines<'a>(
+    comment: &'a VideoCommentView,
+    width: u16,
+    style: Style,
+) -> (Vec<Line<'a>>, Vec<CommentEmailFragment>) {
+    let mut lines = Vec::new();
+    let mut fragments = Vec::new();
+    for source_line in wrap_description_source(&comment.text, usize::from(width), &[], &[]) {
+        let mut cursor = source_line.start_byte;
+        let mut spans = Vec::new();
+        let mut column = 0_u16;
+        for (email_index, email) in comment.email_links.iter().enumerate() {
+            if email.start_byte >= email.end_byte
+                || email.end_byte > comment.text.len()
+                || !comment.text.is_char_boundary(email.start_byte)
+                || !comment.text.is_char_boundary(email.end_byte)
+                || email.start_byte >= source_line.end_byte
+                || email.end_byte <= source_line.start_byte
+            {
+                continue;
+            }
+            let start = email.start_byte.max(source_line.start_byte);
+            let end = email.end_byte.min(source_line.end_byte);
+            if start < cursor {
+                continue;
+            }
+            let plain = &comment.text[cursor..start];
+            column = column.saturating_add(terminal_text_width(plain));
+            spans.push(Span::raw(plain));
+            let linked = &comment.text[start..end];
+            let link_width = terminal_text_width(linked);
+            let clipped_width = link_width.min(width.saturating_sub(column));
+            if clipped_width > 0 {
+                fragments.push(CommentEmailFragment {
+                    line: lines.len(),
+                    email_index,
+                    column,
+                    width: clipped_width,
+                });
+            }
+            spans.push(Span::styled(linked, style));
+            column = column.saturating_add(link_width);
+            cursor = end;
+        }
+        spans.push(Span::raw(&comment.text[cursor..source_line.end_byte]));
+        lines.push(Line::from(spans));
+    }
+    (lines, fragments)
+}
+
 /// Renders one bounded, resize-aware public-comments popup.
 fn render_video_comments_popup(
     frame: &mut Frame<'_>,
     popup: &VideoCommentsPopupView,
+    external_opener_available: bool,
     theme: &Theme,
     hit_map: &mut HitMap,
 ) {
@@ -9483,6 +9560,7 @@ fn render_video_comments_popup(
     };
     let mut content = Vec::new();
     let mut author_lines = Vec::new();
+    let mut email_lines = Vec::new();
     match &popup.state {
         VideoCommentsPopupState::Loading => {
             let message = if popup.source == SourceKind::SoundCloud {
@@ -9541,11 +9619,30 @@ fn render_video_comments_popup(
                     header.push(Span::raw(published.to_owned()));
                 }
                 content.push(Line::from(header));
-                content.extend(
-                    wrap_text_lines(&comment.text, text_area.width)
-                        .into_iter()
-                        .map(Line::raw),
-                );
+                if comment.email_links.is_empty() {
+                    content.extend(
+                        wrap_text_lines(&comment.text, text_area.width)
+                            .into_iter()
+                            .map(Line::raw),
+                    );
+                } else {
+                    let (lines, fragments) = comment_email_lines(
+                        comment,
+                        text_area.width,
+                        if external_opener_available {
+                            theme.accent.add_modifier(Modifier::UNDERLINED)
+                        } else {
+                            theme.base
+                        },
+                    );
+                    if external_opener_available {
+                        email_lines.extend(fragments.into_iter().map(|mut fragment| {
+                            fragment.line += content.len();
+                            (index, fragment)
+                        }));
+                    }
+                    content.extend(lines);
+                }
             }
         }
     }
@@ -9570,6 +9667,24 @@ fn render_video_comments_popup(
                     text_area.x,
                     text_area.y + (line - offset) as u16,
                     width.min(text_area.width),
+                    1,
+                ),
+            ));
+        }
+    }
+    for (comment_index, fragment) in email_lines {
+        if fragment.line >= offset && fragment.line < offset.saturating_add(visible_lines) {
+            hit_map.video_comments_buttons.push((
+                UiAction::ActivateCommentEmail {
+                    source: popup.source.clone(),
+                    video_id: popup.video_id.clone(),
+                    comment_index,
+                    email_index: fragment.email_index,
+                },
+                Rect::new(
+                    text_area.x.saturating_add(fragment.column),
+                    text_area.y + (fragment.line - offset) as u16,
+                    fragment.width,
                     1,
                 ),
             ));
@@ -30675,6 +30790,159 @@ for encoded, expected in json.load(sys.stdin):
         assert!(hit_map.video_comments_buttons.is_empty());
     }
 
+    /// Appended email links retain their original indices while interleaving metadata spans.
+    #[test]
+    fn email_description_links_keep_click_targets_when_wrapped_and_out_of_order() {
+        let source = "Почта: hello+music@example.org #music and second@example.net.";
+        let mut view = ViewModel {
+            details: Some(DetailView {
+                description: source.into(),
+                links: ["#music", "hello+music@example.org", "second@example.net"]
+                    .into_iter()
+                    .map(|label| {
+                        let start = source.find(label).unwrap();
+                        DetailLinkView {
+                            label: label.into(),
+                            url: format!("mailto:{label}"),
+                            description_range: Some(DetailHighlightRange {
+                                start_byte: start,
+                                end_byte: start + label.len(),
+                            }),
+                            internal_target: (label == "#music")
+                                .then(|| DetailLinkInternalTarget::YouTubeHashtag("music".into())),
+                            presentation: DetailLinkPresentation::LabelOnly,
+                            ..DetailLinkView::default()
+                        }
+                    })
+                    .collect(),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        for width in [120, 32] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            let mut hits = HitMap::default();
+            terminal
+                .draw(|frame| {
+                    render_details(
+                        frame,
+                        frame.area(),
+                        &view,
+                        true,
+                        0,
+                        &Theme::new(false),
+                        &mut hits,
+                        None,
+                    )
+                })
+                .unwrap();
+            for index in [0, 1, 2] {
+                assert!(
+                    hits.detail_links.iter().any(|(actual, _)| *actual == index),
+                    "link {index} missing at width {width}"
+                );
+            }
+            for (index, area) in &hits.detail_links {
+                let click = MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: area.x,
+                    row: area.y,
+                    modifiers: KeyModifiers::NONE,
+                };
+                assert_eq!(
+                    mouse_action(click, &hits, &view),
+                    Some(UiAction::ActivateDetailLink(*index))
+                );
+                view.external_opener_available = false;
+                assert_eq!(
+                    mouse_action(click, &hits, &view),
+                    (*index == 0).then_some(UiAction::ActivateDetailLink(*index))
+                );
+                view.external_opener_available = true;
+            }
+            assert!(
+                !rendered_text(&terminal).contains("mailto:"),
+                "only original address text is displayed"
+            );
+        }
+    }
+
+    /// Comment email hitboxes follow exact source bytes across wrapping and scrolling.
+    #[test]
+    fn email_comment_links_remain_clickable_after_wrapping_and_scrolling() {
+        let address = "long.address+music@subdomain.example.org";
+        let source = format!("Intro\nПочта: {address}.\nUnlinked tail");
+        let start = source.find(address).unwrap();
+        let mut view = ViewModel {
+            video_comments_popup: Some(VideoCommentsPopupView {
+                source: SourceKind::YouTube,
+                video_id: "dQw4w9WgXcQ".into(),
+                state: VideoCommentsPopupState::Ready,
+                comments: vec![VideoCommentView {
+                    author_name: "Author".into(),
+                    text: source.clone(),
+                    email_links: vec![crate::view::EmailLinkView {
+                        start_byte: start,
+                        end_byte: start + address.len(),
+                        url: format!("mailto:{address}"),
+                    }],
+                    ..VideoCommentView::default()
+                }],
+                scroll_offset: 2,
+                ..VideoCommentsPopupView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let expected = UiAction::ActivateCommentEmail {
+            source: SourceKind::YouTube,
+            video_id: "dQw4w9WgXcQ".into(),
+            comment_index: 0,
+            email_index: 0,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        let mut hits = HitMap::default();
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hits))
+            .unwrap();
+        let targets: Vec<_> = hits
+            .video_comments_buttons
+            .iter()
+            .filter(|(action, _)| *action == expected)
+            .map(|(_, area)| *area)
+            .collect();
+        assert!(
+            targets.len() >= 2,
+            "the wrapped email must keep all visible fragments clickable"
+        );
+        for area in targets {
+            assert_eq!(area.intersection(hits.video_comments_text_area), area);
+            assert!(
+                terminal.backend().buffer()[(area.x, area.y)]
+                    .modifier
+                    .contains(Modifier::UNDERLINED)
+            );
+            let click = MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: area.x,
+                row: area.y,
+                modifiers: KeyModifiers::NONE,
+            };
+            assert_eq!(mouse_action(click, &hits, &view), Some(expected.clone()));
+            view.external_opener_available = false;
+            assert_eq!(mouse_action(click, &hits, &view), None);
+            view.external_opener_available = true;
+        }
+        assert_eq!(
+            view.video_comments_popup.as_ref().unwrap().comments[0].text,
+            source
+        );
+        view.video_comments_popup = None;
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hits))
+            .unwrap();
+        assert!(hits.video_comments_buttons.is_empty());
+    }
+
     /// Catalogue Back precedes unfocusing Details but not editing or expansion.
     #[test]
     fn soundcloud_back_control_and_escape_respect_route_and_modal_state() {
@@ -40612,6 +40880,7 @@ prose 07:25 remains clickable but is not a chapter";
                 text: format!(
                     "Comment {index} contains enough plain text to wrap across several terminal rows."
                 ),
+                email_links: Vec::new(),
             })
             .collect();
         let view = ViewModel {

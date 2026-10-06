@@ -386,6 +386,14 @@ Use `Alt+Left` or `Backspace` to return to the previous view, including its
 search results, selected item, and Details scroll position. Going back does
 not repeat the search or interrupt playback.
 
+Email addresses in Details descriptions and public comments are clickable in
+both interfaces. Clicking opens the system's default mail application with
+that recipient; Youta never sends mail. Details emails also use the link keys
+above. Detection uses [Linkify](https://docs.rs/linkify/latest/linkify/), while
+Youta limits generated `mailto:` links to one recipient without message headers.
+External email actions are unavailable on a Linux virtual console without a
+desktop opener.
+
 Vertical YouTube videos use a distinct title color once the configured
 provider reports a portrait aspect ratio. The official adapter uses player
 dimensions already returned by its batched video request, while Invidious

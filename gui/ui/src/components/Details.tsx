@@ -206,6 +206,7 @@ function Links({
         const showUrl = link.presentation.startsWith("LabelAndUrl") && link.label !== "";
 				// Keep existing provider markers independent of external URL capabilities.
 				const target = link.internal_target;
+				const email = link.url.startsWith('mailto:');
 				const uploader = target !== null && 'ArchiveUploader' in target;
 				const internal = target === null ? null
 					: 'YandexMusicArtist' in target ? { OpenYandexMusicArtistById: target.YandexMusicArtist }
@@ -217,10 +218,18 @@ function Links({
               {link.prefix ? <span className="text-ink-faint"><SearchHighlight text={link.prefix} ranges={highlightRanges(details.search_highlights, { LinkPrefix: index })} /></span> : null}
               <button
                 type="button"
-                title={link.url}
+								title={email ? externalOpenerAvailable ? 'Compose email in your default mail app' : 'No external opener available' : link.url}
+								disabled={email && !externalOpenerAvailable}
                 onClick={() => void dispatch({ ActivateDetailLink: index })}
                 onFocus={() => void dispatch({ SelectDetailLink: index })}
-                className={`rounded-[3px] text-left underline decoration-dotted underline-offset-2 hover:text-accent focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-accent ${
+								onKeyDown={(event) => {
+									if (!email || event.key !== 'Enter') return;
+									// A focused email must not fall through to the global playback keymap.
+									event.preventDefault();
+									event.stopPropagation();
+									if (externalOpenerAvailable) void dispatch({ ActivateDetailLink: index });
+								}}
+                className={`rounded-[3px] text-left underline decoration-dotted underline-offset-2 disabled:cursor-default disabled:no-underline not-disabled:hover:text-accent focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-accent ${
                   index === selectedLink ? "text-accent" : "text-ink"
                 }`}
               >
@@ -575,6 +584,7 @@ export function Details({ view, kind }: { view: ViewModel; kind: InformationPane
 				links={details.links}
 				selectedLink={view.selected_detail_link}
 				revealLink={view.detail_link_reveal}
+				externalOpenerAvailable={view.external_opener_available}
       />
 
       {kind === "Local" && audioQuality !== null ? (

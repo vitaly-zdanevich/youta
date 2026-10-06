@@ -1765,6 +1765,10 @@ pub struct DetailLinkView {
     pub internal_target: Option<DetailLinkInternalTarget>,
     /// Original description bytes occupied by an inline link; no fixed rail row.
     pub description_range: Option<DetailHighlightRange>,
+    /// Controller provenance retained by navigation snapshots, not renderer IPC.
+    /// Only generated email spans may be removed by the central email projection.
+    #[serde(skip)]
+    pub generated_email: bool,
 }
 
 /// Exact provider destination exposed by a Details link or inline metadata value.
@@ -2163,6 +2167,19 @@ pub struct VideoCommentView {
     pub published: Option<String>,
     /// Provider-supplied plain-text body.
     pub text: String,
+    /// Bounded, validated mail links located in the unchanged comment body.
+    pub email_links: Vec<EmailLinkView>,
+}
+
+/// One validated single-recipient email action over original UTF-8 source bytes.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct EmailLinkView {
+    /// Inclusive byte offset into the unchanged source text.
+    pub start_byte: usize,
+    /// Exclusive byte offset into the unchanged source text.
+    pub end_byte: usize,
+    /// Core-generated, header-free `mailto:` target; activation resolves it by index.
+    pub url: String,
 }
 
 /// Explicit loading state for the bounded public-comments popup.
@@ -4186,6 +4203,17 @@ pub enum UiAction {
     OpenVideoComments,
     /// Browse the validated public artist owning this current SoundCloud comment.
     OpenVideoCommentAuthor(usize),
+    /// Open a core-owned email link only while its exact comments popup remains selected.
+    ActivateCommentEmail {
+        /// Provider owning the displayed popup.
+        source: SourceKind,
+        /// Stable item identifier copied from that popup.
+        video_id: String,
+        /// Comment position within the current bounded popup.
+        comment_index: usize,
+        /// Email position within that comment's core-projected links.
+        email_index: usize,
+    },
     /// Browse public tracks from a canonical SoundCloud artist profile.
     OpenSoundCloudArtist(String),
     /// Browse public albums from a canonical SoundCloud artist profile.
@@ -4505,6 +4533,7 @@ impl UiAction {
         let standard = matches!(
             self,
             Self::ActivateDetailLink(_)
+                | Self::ActivateCommentEmail { .. }
                 | Self::OpenWikidataValue(_)
                 | Self::OpenInBrowser
                 | Self::OpenChannelInBrowser

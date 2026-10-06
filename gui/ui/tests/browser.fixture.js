@@ -144,6 +144,89 @@
 		description: 'Complete fixture description.\nSecond paragraph remains visible.',
 		webpage_url: 'https://archive.org/details/fixture',
 	});
+	/** Core-projected email spans stay literal, selectable and explicitly activated through native actions. */
+	async function checkEmailLinks() {
+		const previous = clone(view);
+		const address = 'sales+music@example.org';
+		const description = `📮 Напишите (${address}), #Music; raw@test.example <b>literal</b>`;
+		const range = (body, value, from = 0) => {
+			const offset = body.indexOf(value, from);
+			const start_byte = new TextEncoder().encode(body.slice(0, offset)).length;
+			return { start_byte, end_byte: start_byte + new TextEncoder().encode(value).length };
+		};
+		const link = (label, url, description_range = null, internal_target = null) => ({
+			prefix: '', label, url, description_range, internal_target, presentation: 'LabelOnly', wikidata_item_id: null,
+		});
+		const fixture = { ...details('Email links', { source: 'you-tube', external_id: 'fixture-mail' }), source: 'YouTube', description,
+			links: [link('Contact', `mailto:${address}`), link(address, `mailto:${address}`, range(description, address)),
+				link('#Music', 'https://www.youtube.com/hashtag/music', range(description, '#Music'), { YouTubeHashtag: 'Music' })],
+			search_highlights: [{ field: 'Description', ranges: [range(description, 'sales+music')] }] };
+		const beforeRender = calls.length;
+		snapshot({ screen: 'Search', details: fixture, details_focused: false, external_opener_available: false });
+		const panel = await until(() => document.querySelector('[data-description]')?.textContent === description
+			&& document.querySelector('[aria-label=Details]'), 'email description snapshot');
+		const inline = button(address, panel);
+		const rail = button('Contact', panel);
+		assert(inline.disabled && rail.disabled, 'inline and rail emails honor unavailable external opener');
+		assert(inline.title === 'No external opener available' && rail.title === inline.title, 'email tooltip explains unavailable opener');
+		assert(!button('#Music', panel).disabled, 'internal metadata remains usable without external opener');
+		assert(inline.querySelector('mark')?.textContent === 'sales+music', 'email span retains search highlighting after Unicode prefix');
+		assert(!panel.querySelector('b') && !button('raw@test.example', panel), 'markup and unannotated email-looking text remain inert');
+		inline.click();
+		rail.click();
+		assert(!calls.slice(beforeRender).some((call) => call.command === 'dispatch'), 'rendering and disabled email clicks never open an app');
+		await action({ ActivateDetailLink: 2 }, () => button('#Music', panel).click(), 'email gating preserves internal metadata action');
+		snapshot({ external_opener_available: true });
+		await until(() => !inline.disabled && !rail.disabled, 'available email opener');
+		assert(inline.title === 'Compose email in your default mail app' && rail.title === inline.title, 'email tooltip names default mail application');
+		const selection = window.getSelection();
+		const selected = document.createRange();
+		selected.selectNodeContents(inline);
+		selection.removeAllRanges();
+		selection.addRange(selected);
+		assert(selection.toString() === address, 'email address remains selectable independently of punctuation');
+		selection.removeAllRanges();
+		for (const [email, index] of [[inline, 1], [rail, 0]]) {
+			await action({ SelectDetailLink: index }, () => email.focus(), 'tab focus selects email without changing reducer Details focus');
+			const start = calls.length;
+			const enter = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true });
+			await action({ ActivateDetailLink: index }, () => email.dispatchEvent(enter), 'focused email Enter composes using its exact detail index');
+			assert(enter.defaultPrevented && calls.slice(start).filter((call) => call.command === 'dispatch').length === 1
+				&& !calls.slice(start).some((call) => call.command === 'key'), 'email Enter cannot activate the selected track or dispatch twice');
+		}
+		await action({ SelectDetailLink: 1 }, () => inline.focus(), 'focusing email selects its existing global detail index');
+		await action({ ActivateDetailLink: 1 }, () => inline.click(), 'inline email dispatches its core link index');
+		await action({ ActivateDetailLink: 0 }, () => rail.click(), 'rail email dispatches its core link index');
+		const commentText = `📮 (${address}), again ${address}. <script>literal</script>\n`;
+		const email_links = [range(commentText, address), range(commentText, address, commentText.indexOf(address) + address.length)]
+			.map((span) => ({ ...span, url: `mailto:${address}` }));
+		for (const source of ['you-tube', 'sound-cloud', 'archive-org']) {
+			const popup = { source, video_id: `mail-${source}`, video_title: 'Email comments', state: 'Ready', scroll_offset: 0,
+				comments: [{ author_name: 'Reader', author_url: null, like_count: 2, published: null, text: commentText, email_links }] };
+			snapshot({ video_comments_popup: popup, external_opener_available: false });
+			await until(() => dialog()?.querySelectorAll('button[title="No external opener available"]').length === 2, 'disabled comment emails');
+			assert(dialog().textContent.includes(commentText.trimEnd()) && !dialog().querySelector('script'), `${source} comments keep literal body text`);
+			assert([...dialog().querySelectorAll('button[title="No external opener available"]')].every((node) => node.disabled), `${source} comment emails honor opener availability`);
+			snapshot({ external_opener_available: true });
+			const emails = await until(() => {
+				const buttons = dialog()?.querySelectorAll('button[title="Compose email in your default mail app"]');
+				return buttons?.length === 2 && buttons;
+			}, 'clickable comment emails');
+			const payload = (email_index) => ({ ActivateCommentEmail: { source, video_id: popup.video_id, comment_index: 0, email_index } });
+			await action(payload(1), () => emails[1].click(), `${source} email click captures popup owner and occurrence`);
+			const beforeEnter = calls.length;
+			emails[0].focus();
+			assert(calls.length === beforeEnter, 'focusing comment email does not open an app');
+			const enter = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true });
+			await action(payload(0), () => emails[0].dispatchEvent(enter), `${source} comment email Enter activates once`);
+			assert(enter.defaultPrevented && calls.slice(beforeEnter).filter((call) => call.command === 'dispatch').length === 1
+				&& !calls.slice(beforeEnter).some((call) => call.command === 'key'), 'comment email Enter consumes the document key path without duplicate dispatch');
+			await action('DismissVideoComments', () => dialog().querySelector('button[aria-label=Close]').click(), 'email comments remain closeable');
+			snapshot({ video_comments_popup: null });
+			await until(() => !dialog(), 'closed email comments');
+		}
+		snapshot(previous);
+	}
 	/** YouTube exposes the saved Shorts filter alongside the existing global playback controls. */
 	async function checkYouTubeSearchControls() {
 		const previous = clone(view);
@@ -496,8 +579,8 @@
 	async function checkSoundCloudNavigation(base) {
 		const profile = 'https://soundcloud.com/canonical-artist';
 		snapshot({ video_comments_popup: { source: 'sound-cloud', video_id: 'track', video_title: 'Commented track', state: 'Ready', scroll_offset: 0,
-			comments: [{ author_name: 'Display artist', author_url: profile, like_count: 0, published: '2026 September 23', text: 'Comment text' },
-				{ author_name: 'Unknown author', author_url: null, like_count: 0, published: null, text: 'Another comment' }] } });
+			comments: [{ author_name: 'Display artist', author_url: profile, like_count: 0, published: '2026 September 23', text: 'Comment text', email_links: [] },
+				{ author_name: 'Unknown author', author_url: null, like_count: 0, published: null, text: 'Another comment', email_links: [] }] } });
 		const author = await until(() => button('Display artist', dialog()), 'clickable SoundCloud comment author');
 		assert(author.title === profile && author.className.includes('underline'), 'comment author is visibly linked to its canonical profile');
 		assert(!button('Unknown author', dialog()), 'comment without canonical author URL stays plain');
@@ -919,6 +1002,7 @@
 		snapshot(beforeTabMarkers);
 		await checkRadioPresentation();
 		await checkYouTubeSearchControls();
+		await checkEmailLinks();
 		await checkLiveDuration();
 		await checkLocalFullPath();
 		await checkLocalTrackMetadata();

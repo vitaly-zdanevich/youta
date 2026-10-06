@@ -21,6 +21,7 @@ mod bandcamp_resolver;
 mod cached_download;
 #[cfg(feature = "yt-dlp")]
 mod download_choice;
+mod email_links;
 mod end_pause;
 mod invidious_instances;
 #[cfg(feature = "local-copy")]
@@ -5527,6 +5528,8 @@ pub struct AppController {
     url_open_result_sender: Sender<UrlOpenCompletion>,
     /// Number of system-opener tasks that have not reported completion.
     url_open_pending: usize,
+    /// Bounded email projections shared by all description and comment providers.
+    email_projection: email_links::EmailProjectionCache,
     playback_queue: PlaybackQueue,
     playback_phase: PlaybackPhase,
     /// The backend still owns the finite `YouTube` timeline after natural EOF.
@@ -6789,6 +6792,7 @@ impl AppController {
             url_open_results,
             url_open_result_sender,
             url_open_pending: 0,
+            email_projection: email_links::EmailProjectionCache::default(),
             playback_queue: PlaybackQueue::default(),
             playback_phase: PlaybackPhase::Idle,
             playback_held_at_end: false,
@@ -6993,6 +6997,7 @@ impl AppController {
         }
         #[cfg(feature = "yandex-music")]
         controller.retry_pending_yandex_music_reactions();
+        controller.refresh_email_links();
         controller
     }
 
@@ -34874,13 +34879,22 @@ impl AppController {
             self.view.status_line = "External link is malformed".to_owned();
             return;
         };
+        if url.scheme() == "mailto" {
+            let Some(url) = crate::links::validated_mailto_url(raw_url) else {
+                self.view.status_line =
+                    "Email links must contain one recipient without headers".to_owned();
+                return;
+            };
+            self.spawn_url_opener(url.as_str());
+            return;
+        }
         if !matches!(url.scheme(), "http" | "https")
             || url.host_str().is_none()
             || !url.username().is_empty()
             || url.password().is_some()
         {
             self.view.status_line =
-                "External links must be credential-free HTTP or HTTPS URLs".to_owned();
+                "External links must be credential-free HTTP(S) URLs or single-recipient mailto links".to_owned();
             return;
         }
         self.spawn_url_opener(url.as_str());
@@ -34889,7 +34903,7 @@ impl AppController {
     fn spawn_url_opener(&mut self, url: &str) {
         if url.starts_with('-') {
             self.show_error_message(
-                "Cannot open webpage",
+                "Cannot open link",
                 "the selected target begins with a command-option marker",
             );
             return;
@@ -34907,9 +34921,9 @@ impl AppController {
         ) {
             Ok(()) => {
                 self.url_open_pending = self.url_open_pending.saturating_add(1);
-                self.view.status_line = format!("Opening selected webpage with {opener_name}...");
+                self.view.status_line = format!("Opening selected link with {opener_name}...");
             }
-            Err(error) => self.show_error("Cannot start webpage opener", &error),
+            Err(error) => self.show_error("Cannot start link opener", &error),
         }
     }
 
@@ -34920,11 +34934,11 @@ impl AppController {
                 Ok(UrlOpenCompletion::Succeeded) => {
                     self.url_open_pending = self.url_open_pending.saturating_sub(1);
                     self.view.status_line =
-                        format!("Opened selected webpage with {}", system_url_opener_name());
+                        format!("Opened selected link with {}", system_url_opener_name());
                 }
                 Ok(UrlOpenCompletion::Failed(error)) => {
                     self.url_open_pending = self.url_open_pending.saturating_sub(1);
-                    self.show_error_message("Could not open webpage", error);
+                    self.show_error_message("Could not open link", error);
                 }
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
             }
@@ -36393,6 +36407,14 @@ impl UiController for AppController {
             }
             UiAction::OpenVideoComments => self.open_youtube_video_comments(),
             UiAction::OpenVideoCommentAuthor(index) => self.open_soundcloud_comment_author(index),
+            UiAction::ActivateCommentEmail {
+                source,
+                video_id,
+                comment_index,
+                email_index,
+            } => {
+                self.activate_comment_email(source, &video_id, comment_index, email_index);
+            }
             UiAction::OpenSoundCloudArtist(url) => self.open_soundcloud_artist(url, false),
             UiAction::OpenSoundCloudArtistAlbums(url) => self.open_soundcloud_artist(url, true),
             UiAction::SearchSoundCloudTag(tag) => self.search_soundcloud_tag(tag),
@@ -36927,6 +36949,7 @@ impl UiController for AppController {
                     .to_owned();
         }
         self.refresh_playback_preparation_activity();
+        self.refresh_email_links();
     }
 
     fn take_clipboard_request(&mut self) -> Option<ClipboardRequest> {
@@ -37173,6 +37196,7 @@ impl UiController for AppController {
             self.save_session();
         }
         self.refresh_playback_preparation_activity();
+        self.refresh_email_links();
     }
 }
 
@@ -46355,6 +46379,7 @@ fn video_comments_popup(
                 .map(format_unix_utc_date)
                 .filter(|published| published != "unknown"),
             text: comment.text,
+            email_links: Vec::new(),
         })
         .collect::<Vec<_>>();
     VideoCommentsPopupView {
@@ -53810,6 +53835,140 @@ mod tests {
         assert_eq!(format_count(887_263), "887,263");
         assert_eq!(format_count(1_000_000), "1,000,000");
         assert_eq!(format_count(u64::MAX), "18,446,744,073,709,551,615");
+    }
+
+    #[test]
+    fn email_description_projection_preserves_owned_links_and_original_bytes() {
+        let (mut controller, _) = controller_with_mock_statuses([]);
+        let description = "Почта first+tag@example.org #music owner@example.org";
+        let owned_start = description.find("owner@").unwrap();
+        let owned = DetailLinkView {
+            label: "owned provider link".to_owned(),
+            url: "https://example.org/creator".to_owned(),
+            description_range: Some(DetailHighlightRange {
+                start_byte: owned_start,
+                end_byte: description.len(),
+            }),
+            ..DetailLinkView::default()
+        };
+        controller.view.details = Some(DetailView {
+            description: description.to_owned(),
+            links: vec![owned.clone()],
+            ..DetailView::default()
+        });
+        controller.dispatch(UiAction::SetExternalOpenerAvailable(true));
+        let details = controller.view.details.as_ref().unwrap();
+        assert_eq!(details.description, description);
+        assert_eq!(details.links.len(), 2);
+        assert_eq!(details.links[0], owned);
+        let email = &details.links[1];
+        let range = email.description_range.unwrap();
+        assert_eq!(
+            &description[range.start_byte..range.end_byte],
+            "first+tag@example.org"
+        );
+        assert_eq!(email.url, "mailto:first%2Btag@example.org");
+        let projected = details.links.clone();
+        controller.dispatch(UiAction::SetExternalOpenerAvailable(true));
+        assert_eq!(controller.view.details.as_ref().unwrap().links, projected);
+        controller.view.details.as_mut().unwrap().description = "No address remains".to_owned();
+        controller.dispatch(UiAction::SetExternalOpenerAvailable(true));
+        assert_eq!(controller.view.details.as_ref().unwrap().links, vec![owned]);
+    }
+
+    #[test]
+    fn email_comment_projection_and_activation_are_popup_owner_indexed() {
+        let (mut controller, _) = controller_with_mock_statuses([]);
+        controller.url_open_pending = MAX_URL_OPEN_TASKS;
+        controller.view.video_comments_popup = Some(VideoCommentsPopupView {
+            source: SourceKind::YouTube,
+            video_id: "email-owner".to_owned(),
+            state: VideoCommentsPopupState::Ready,
+            comments: vec![crate::view::VideoCommentView {
+                text: "Привет: inbox@example.org".to_owned(),
+                ..crate::view::VideoCommentView::default()
+            }],
+            ..VideoCommentsPopupView::default()
+        });
+        controller.dispatch(UiAction::SetExternalOpenerAvailable(true));
+        let comment = &controller
+            .view
+            .video_comments_popup
+            .as_ref()
+            .unwrap()
+            .comments[0];
+        assert_eq!(comment.email_links.len(), 1);
+        let email = &comment.email_links[0];
+        assert_eq!(
+            &comment.text[email.start_byte..email.end_byte],
+            "inbox@example.org"
+        );
+        let action =
+            |source, video_id: &str, comment_index, email_index| UiAction::ActivateCommentEmail {
+                source,
+                video_id: video_id.to_owned(),
+                comment_index,
+                email_index,
+            };
+        for stale in [
+            action(SourceKind::SoundCloud, "email-owner", 0, 0),
+            action(SourceKind::YouTube, "old-owner", 0, 0),
+            action(SourceKind::YouTube, "email-owner", 1, 0),
+            action(SourceKind::YouTube, "email-owner", 0, 1),
+        ] {
+            controller.view.status_line = "unchanged".to_owned();
+            controller.dispatch(stale);
+            assert_eq!(controller.view.status_line, "unchanged");
+        }
+        controller.dispatch(action(SourceKind::YouTube, "email-owner", 0, 0));
+        assert_eq!(
+            controller.view.status_line,
+            "Wait for an earlier system-opener request to finish"
+        );
+        controller.dispatch(UiAction::SetExternalOpenerAvailable(false));
+        controller.dispatch(action(SourceKind::YouTube, "email-owner", 0, 0));
+        assert!(
+            controller
+                .view
+                .status_line
+                .contains("Linux virtual console")
+        );
+        assert_eq!(controller.url_open_pending, MAX_URL_OPEN_TASKS);
+    }
+
+    #[test]
+    fn email_external_opener_accepts_single_recipient_without_headers() {
+        let (mut controller, _) = controller_with_mock_statuses([]);
+        controller.url_open_pending = MAX_URL_OPEN_TASKS;
+        let pending = "Wait for an earlier system-opener request to finish";
+        for target in [
+            "mailto:inbox@example.org",
+            "mailto:inbox%2Btag@example.org",
+            "mailto:-flag@example.org",
+            "https://example.org/contact",
+        ] {
+            controller.open_external_url(target);
+            assert_eq!(controller.view.status_line, pending, "{target}");
+        }
+        for target in [
+            "mailto:inbox@example.org?bcc=other@example.org",
+            "mailto:inbox@example.org#fragment",
+            "mailto:a@example.org,b@example.org",
+            "mailto:a%0D%0ABcc%3Ab@example.org",
+            "file:///tmp/inbox@example.org",
+            "https://user@example.org/",
+        ] {
+            controller.view.status_line.clear();
+            controller.open_external_url(target);
+            assert_ne!(controller.view.status_line, pending, "{target}");
+        }
+        let target = "mailto:inbox%2Btag@example.org";
+        let command = url_opener_command(Path::new(system_url_opener_name()), target);
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [std::ffi::OsStr::new(target)]
+        );
+        assert_eq!(controller.url_open_pending, MAX_URL_OPEN_TASKS);
     }
 
     #[test]

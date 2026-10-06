@@ -186,6 +186,7 @@ impl AppController {
                                 || comment.body.clone(),
                                 |seconds| format!("[{}] {}", format_seconds(seconds), comment.body),
                             ),
+                            email_links: Vec::new(),
                         }
                     })
                     .collect();

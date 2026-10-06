@@ -353,6 +353,13 @@ export interface AudioQualityPopupView {
   scroll_offset: number;
 }
 
+/** One core-parsed email address, with UTF-8 byte bounds into its owning text. */
+export interface EmailLinkView {
+	start_byte: number;
+	end_byte: number;
+	url: string;
+}
+
 /** One public top-level comment. */
 export interface VideoCommentView {
   author_name: string;
@@ -361,6 +368,7 @@ export interface VideoCommentView {
   like_count: number;
   published: string | null;
   text: string;
+	email_links: EmailLinkView[];
 }
 
 /** Explicit request state of the bounded comments popup. */
@@ -368,7 +376,7 @@ export type VideoCommentsPopupState = "Loading" | "Ready" | "Empty" | { Error: s
 
 /** Scrollable public comments for one selected video. */
 export interface VideoCommentsPopupView {
-	source: string;
+	source: SourceKind;
   video_id: string;
   video_title: string;
   state: VideoCommentsPopupState;

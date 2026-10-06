@@ -69,7 +69,7 @@ test('Archive.org comments popup retains source identity and omits fictional lik
 	assert.match(popups, /title=\{archiveOrg \? 'archive.org comments' : soundcloud \? 'SoundCloud comments' : 'Comments'\}/);
 	assert.match(popups, /This item has no public reviews\./);
 	assert.match(popups, /archiveOrg \|\| soundcloud\s*\? comment\.published/);
-	assert.match(contract, /export interface VideoCommentsPopupView \{\s*source: string;/);
+	assert.match(contract, /export interface VideoCommentsPopupView \{\s*source: SourceKind;/);
 });
 
 /** Search, item loading, and parent navigation reuse the shared reducer actions. */

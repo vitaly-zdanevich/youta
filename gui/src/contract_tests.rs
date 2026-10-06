@@ -50,12 +50,12 @@ use youta::view::{
     ArchivePlaybackChoicePopupView, AudioQualityPopupView, DetailHighlightField,
     DetailHighlightRange, DetailHighlightView, DetailLinkView, DetailTimecodeView,
     DetailUrlEscapeView, DetailVideoLinkView, DetailView, DetailWikidataEntityView,
-    DownloadChoicePopupView, DownloadView, ErrorPopupView, GitHubIssueSubmissionView,
-    LocalFileProgressView, LocalMoveDestinationView, NowPlayingView, PlaylistChoiceView,
-    PlaylistPopupView, PreferencesPopupView, ProjectCommitView, ProjectHistoryPopupView,
-    QueuePopupView, QueueRowView, RowView, SoundCloudDetailsView, SubscriptionsView,
-    VideoCommentView, VideoCommentsPopupView, VideoSummaryPopupView, ViewModel, WaveformView,
-    YtDlpForbiddenView, YtDlpGentooVersionView, YtDlpVersionLookupView,
+    DownloadChoicePopupView, DownloadView, EmailLinkView, ErrorPopupView,
+    GitHubIssueSubmissionView, LocalFileProgressView, LocalMoveDestinationView, NowPlayingView,
+    PlaylistChoiceView, PlaylistPopupView, PreferencesPopupView, ProjectCommitView,
+    ProjectHistoryPopupView, QueuePopupView, QueueRowView, RowView, SoundCloudDetailsView,
+    SubscriptionsView, VideoCommentView, VideoCommentsPopupView, VideoSummaryPopupView, ViewModel,
+    WaveformView, YtDlpForbiddenView, YtDlpGentooVersionView, YtDlpVersionLookupView,
 };
 use youta::view::{ChannelDownloadOption, ChannelDownloadPopupView};
 #[cfg(feature = "lan-sharing")]
@@ -549,6 +549,14 @@ fn the_typescript_contract_names_only_fields_the_reducer_emits() {
         emitted_keys(&VideoCommentView::default()),
     );
     emitted.insert(
+        "EmailLinkView",
+        emitted_keys(&EmailLinkView {
+            start_byte: 0,
+            end_byte: 19,
+            url: "mailto:fixture@example.org".to_owned(),
+        }),
+    );
+    emitted.insert(
         "ArchiveOrgFileCountsView",
         emitted_keys(&youta::view::ArchiveOrgFileCountsView::default()),
     );
@@ -909,6 +917,7 @@ fn every_checked_interface_is_actually_declared() {
         "LanSharePopupView",
         "PodcastFeedOptionsPopupView",
         "VideoCommentView",
+        "EmailLinkView",
         "ProjectHistoryPopupView",
         "ProjectCommitView",
         "PreferencesPopupView",

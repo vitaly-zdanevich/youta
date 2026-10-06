@@ -252,6 +252,8 @@ export interface UiActionPayloads {
 	MoveInvidiousInstance: number;
 	OpenCommonsCategorySuggestionAt: number;
 	OpenVideoCommentAuthor: number;
+	/** Indexed core email with captured comment-popup ownership; never a raw URL. */
+	ActivateCommentEmail: { source: SourceKind; video_id: string; comment_index: number; email_index: number; };
 	OpenSoundCloudArtist: string;
 	OpenSoundCloudArtistAlbums: string;
 	SearchSoundCloudTag: string;

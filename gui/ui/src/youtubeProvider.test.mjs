@@ -23,6 +23,7 @@ const mockRequire = (name) => {
 		PopupError: () => null,
 	};
 	if (name === './ScrollingText') return { ScrollingText: () => null };
+	if (name === '../spans') return { annotate: (text) => text };
 	if (name === '../format') return { humanBytes: String };
 	return require(name);
 };
