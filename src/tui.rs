@@ -3647,6 +3647,10 @@ fn render_row_list(
                 title_style = title_style.add_modifier(Modifier::ITALIC);
             }
             let show_watched_marker = has_playback_progress && !youtube_video_title;
+            // YT search rows use only visible markers; mixed-source layouts keep their slots.
+            let tight_youtube_prefix = !row.compact
+                && matches!(source_labels, RowSourceLabels::YouTubeSearch)
+                && matches!(row.source.as_str(), "YouTube" | "YouTube channel");
             let marker = if row.subscribed { "◆" } else { " " };
             let progress = if !has_playback_progress || row.watched_percent == 0 {
                 String::new()
@@ -3708,13 +3712,16 @@ fn render_row_list(
                 }
                 spans
             } else if show_source {
-                let mut spans = vec![
-                    Span::styled(
+                let mut spans = Vec::with_capacity(4);
+                if playing || !tight_youtube_prefix {
+                    spans.push(Span::styled(
                         format!("{} ", if playing { playing_symbol } else { " " }),
                         row_style,
-                    ),
-                    Span::styled(format!("{marker} "), source_style),
-                ];
+                    ));
+                }
+                if row.subscribed || !tight_youtube_prefix {
+                    spans.push(Span::styled(format!("{marker} "), source_style));
+                }
                 if row.local_marked {
                     spans.push(Span::styled("✓ ", marked_style));
                 }
@@ -3756,6 +3763,14 @@ fn render_row_list(
             if row.downloaded {
                 title_spans.push(Span::styled("↓ ", marked_style));
             }
+            // Align YT metadata with its title, including the two-cell ASCII pause marker.
+            let subtitle_indent = if tight_youtube_prefix {
+                title_spans.iter().map(Span::width).sum::<usize>()
+            } else if !row.compact && (show_source || playing) {
+                4
+            } else {
+                0
+            };
             title_spans.push(Span::styled(&row.title, title_style));
             if row_height == 1 && !row.subtitle.is_empty() {
                 title_spans.push(Span::styled(" · ", secondary_style));
@@ -3769,8 +3784,8 @@ fn render_row_list(
                 return ListItem::new(line).style(row_style);
             }
             let mut subtitle_spans = Vec::new();
-            if !row.compact && (show_source || playing) {
-                subtitle_spans.push(Span::styled("    ", row_style));
+            if subtitle_indent > 0 {
+                subtitle_spans.push(Span::styled(" ".repeat(subtitle_indent), row_style));
             }
             let source_label = source_labels.label(row);
             if !row.compact && !source_label.is_empty() {
@@ -18128,7 +18143,7 @@ for encoded, expected in json.load(sys.stdin):
         assert_eq!(buffer[(0, 1)].symbol(), "|");
         assert_eq!(buffer[(1, 1)].symbol(), "|");
         assert_eq!(buffer[(0, 1)].fg, Color::Cyan);
-        assert_eq!(buffer[(0, 3)].symbol(), " ");
+        assert_eq!(buffer[(0, 3)].symbol(), "S");
         assert_eq!(buffer[(0, 3)].bg, Color::Cyan);
         assert_eq!(
             buffer
@@ -18276,19 +18291,19 @@ for encoded, expected in json.load(sys.stdin):
             })
             .expect("draw vertical-video colors");
         let buffer = terminal.backend().buffer();
-        let playing_title = &buffer[(4, 1)];
+        let playing_title = &buffer[(2, 1)];
         assert_eq!(playing_title.symbol(), "P");
         assert_eq!(playing_title.fg, Color::Rgb(255, 105, 180));
         assert!(!playing_title.modifier.contains(Modifier::BOLD));
         assert!(playing_title.modifier.contains(Modifier::DIM));
         assert!(!playing_title.modifier.contains(Modifier::ITALIC));
-        let idle_title = &buffer[(4, 3)];
+        let idle_title = &buffer[(0, 3)];
         assert_eq!(idle_title.symbol(), "V");
         assert_eq!(idle_title.fg, Color::Rgb(255, 105, 180));
         assert!(idle_title.modifier.contains(Modifier::BOLD));
         assert!(!idle_title.modifier.contains(Modifier::DIM));
         assert!(!idle_title.modifier.contains(Modifier::ITALIC));
-        let selected_title = &buffer[(4, 5)];
+        let selected_title = &buffer[(0, 5)];
         assert_eq!(selected_title.symbol(), "S");
         assert_eq!(selected_title.fg, Color::Black);
         assert_eq!(selected_title.bg, Color::Cyan);
@@ -18373,10 +18388,10 @@ for encoded, expected in json.load(sys.stdin):
             })
             .expect("draw YouTube title playback states");
         let buffer = terminal.backend().buffer();
-        let regular_unplayed = &buffer[(4, 3)];
-        let regular_started = &buffer[(4, 5)];
-        let short_unplayed = &buffer[(4, 7)];
-        let short_started = &buffer[(4, 9)];
+        let regular_unplayed = &buffer[(0, 3)];
+        let regular_started = &buffer[(0, 5)];
+        let short_unplayed = &buffer[(0, 7)];
+        let short_started = &buffer[(0, 9)];
 
         assert_eq!(regular_unplayed.symbol(), "R");
         assert!(regular_unplayed.modifier.contains(Modifier::BOLD));
@@ -18470,7 +18485,7 @@ for encoded, expected in json.load(sys.stdin):
             .expect("draw selected idle row");
         let buffer = terminal.backend().buffer();
 
-        assert_eq!(buffer[(0, 1)].symbol(), " ");
+        assert_eq!(buffer[(0, 1)].symbol(), "S");
         assert_eq!(buffer[(0, 1)].bg, Color::Cyan);
         assert!(buffer.content().iter().all(|cell| cell.symbol() != "▶"));
     }
@@ -18550,36 +18565,36 @@ for encoded, expected in json.load(sys.stdin):
         );
         assert_eq!(
             buffer[(2, 1)].symbol(),
-            " ",
-            "the unsubscribed row keeps alignment without a visible marker"
+            "s",
+            "the unsubscribed title uses the former subscription-marker cell"
         );
         assert_eq!(
-            buffer[(4, 1)].symbol(),
+            buffer[(0, 1)].symbol(),
             "U",
-            "an unplayed video title reclaims the watched-marker column"
+            "an unplayed video title reclaims all unused marker columns"
         );
-        assert!(buffer[(4, 1)].modifier.contains(Modifier::BOLD));
+        assert!(buffer[(0, 1)].modifier.contains(Modifier::BOLD));
         assert_eq!(
-            buffer[(4, 3)].symbol(),
+            buffer[(0, 3)].symbol(),
             "U",
             "a partially watched video title starts in the reclaimed column"
         );
-        assert_eq!(buffer[(4, 3)].fg, Color::DarkGray);
-        assert!(!buffer[(4, 3)].modifier.contains(Modifier::BOLD));
+        assert_eq!(buffer[(0, 3)].fg, Color::DarkGray);
+        assert!(!buffer[(0, 3)].modifier.contains(Modifier::BOLD));
         assert_eq!(
-            buffer[(2, 5)].symbol(),
+            buffer[(0, 5)].symbol(),
             "◆",
             "a locally subscribed row keeps the solid subscription marker"
         );
         assert_eq!(
-            buffer[(4, 5)].symbol(),
+            buffer[(2, 5)].symbol(),
             "S",
             "a completed video title follows its subscription marker directly"
         );
-        assert_eq!(buffer[(4, 5)].fg, Color::DarkGray);
-        assert!(!buffer[(4, 5)].modifier.contains(Modifier::BOLD));
+        assert_eq!(buffer[(2, 5)].fg, Color::DarkGray);
+        assert!(!buffer[(2, 5)].modifier.contains(Modifier::BOLD));
         assert_eq!(
-            buffer[(4, 7)].symbol(),
+            buffer[(2, 7)].symbol(),
             "S",
             "a non-playable channel title follows the subscription column directly"
         );
@@ -18589,15 +18604,15 @@ for encoded, expected in json.load(sys.stdin):
             "a live item suppresses watched-state spacing as well as its marker"
         );
         assert!(
-            !buffer[(4, 1)].modifier.contains(Modifier::ITALIC),
+            !buffer[(0, 1)].modifier.contains(Modifier::ITALIC),
             "unplayed titles remain roman"
         );
         assert!(
-            !buffer[(4, 3)].modifier.contains(Modifier::ITALIC),
+            !buffer[(0, 3)].modifier.contains(Modifier::ITALIC),
             "partially watched video titles use brightness rather than italics"
         );
         assert!(
-            !buffer[(4, 5)].modifier.contains(Modifier::ITALIC),
+            !buffer[(2, 5)].modifier.contains(Modifier::ITALIC),
             "completed video titles use brightness rather than italics"
         );
         assert!(
@@ -18801,10 +18816,10 @@ for encoded, expected in json.load(sys.stdin):
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
 
-        assert_eq!(buffer[(4, 3)].symbol(), "A");
-        assert_eq!(buffer[(4, 3)].fg, Color::DarkGray);
-        assert!(!buffer[(4, 3)].modifier.contains(Modifier::BOLD));
-        assert!(!buffer[(4, 3)].modifier.contains(Modifier::ITALIC));
+        assert_eq!(buffer[(0, 3)].symbol(), "A");
+        assert_eq!(buffer[(0, 3)].fg, Color::DarkGray);
+        assert!(!buffer[(0, 3)].modifier.contains(Modifier::BOLD));
+        assert!(!buffer[(0, 3)].modifier.contains(Modifier::ITALIC));
         assert!(!rendered.contains(['●', '◐', '○']));
         assert!(
             !rendered.contains("   0%"),
@@ -18867,7 +18882,7 @@ for encoded, expected in json.load(sys.stdin):
             .expect("draw physical-console playback state");
         let buffer = terminal.backend().buffer();
 
-        let regular_started = &buffer[(4, 3)];
+        let regular_started = &buffer[(0, 3)];
         assert_eq!(regular_started.symbol(), "S");
         assert_eq!(regular_started.fg, Color::DarkGray);
         assert!(!regular_started.modifier.contains(Modifier::BOLD));
@@ -18875,11 +18890,11 @@ for encoded, expected in json.load(sys.stdin):
             !regular_started.modifier.contains(Modifier::ITALIC),
             "the Linux console must use title brightness instead of unsupported italics"
         );
-        let short_unplayed = &buffer[(4, 5)];
+        let short_unplayed = &buffer[(0, 5)];
         assert_eq!(short_unplayed.symbol(), "U");
         assert_eq!(short_unplayed.fg, Color::LightMagenta);
         assert!(short_unplayed.modifier.contains(Modifier::BOLD));
-        let short_started = &buffer[(4, 7)];
+        let short_started = &buffer[(0, 7)];
         assert_eq!(short_started.symbol(), "S");
         assert_eq!(short_started.fg, Color::Magenta);
         assert!(!short_started.modifier.contains(Modifier::BOLD));
@@ -22483,6 +22498,78 @@ for encoded, expected in json.load(sys.stdin):
         }
     }
 
+    /// YT search titles use every cell not occupied by a visible status marker.
+    #[test]
+    fn youtube_search_rows_reserve_space_only_for_visible_markers() {
+        let media_id = MediaId::new(SourceKind::YouTube, "dQw4w9WgXcQ");
+        let title = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        for (playing, paused, subscribed, download_marked, downloaded, prefix) in [
+            (false, false, false, false, false, ""),
+            (true, false, false, false, false, "▶ "),
+            (true, true, false, false, false, "|| "),
+            (false, false, true, false, false, "◆ "),
+            (true, true, true, false, false, "|| ◆ "),
+            (false, false, false, true, false, "[x] "),
+            (false, false, false, false, true, "↓ "),
+            (true, true, true, true, true, "|| ◆ [x] ↓ "),
+        ] {
+            for selected in 0..=1 {
+                let mut terminal = Terminal::new(TestBackend::new(26, 4)).expect("terminal");
+                let rows = [
+                    RowView {
+                        media_id: Some(media_id.clone()),
+                        title: title.to_owned(),
+                        subtitle: "Artist".to_owned(),
+                        source: "YouTube".to_owned(),
+                        playback_started: true,
+                        subscribed,
+                        download_marked,
+                        downloaded,
+                        ..RowView::default()
+                    },
+                    RowView::default(),
+                ];
+                terminal
+                    .draw(|frame| {
+                        let theme = Theme::new(false);
+                        render_row_list(
+                            frame,
+                            frame.area(),
+                            "",
+                            &rows,
+                            RowSourceLabels::YouTubeSearch,
+                            selected,
+                            playing.then_some(&media_id),
+                            paused,
+                            None,
+                            true,
+                            theme.base,
+                            &theme,
+                        );
+                    })
+                    .expect("draw YT marker spacing");
+                let buffer = terminal.backend().buffer();
+                let line = |y| (0..26).map(|x| buffer[(x, y)].symbol()).collect::<String>();
+                assert_eq!(
+                    line(0),
+                    format!("{prefix}{title}")
+                        .chars()
+                        .take(26)
+                        .collect::<String>(),
+                    "only visible markers may take title space: {prefix:?}, selected={selected}"
+                );
+                assert_eq!(
+                    line(1).trim_end(),
+                    format!(
+                        "{}Artist",
+                        " ".repeat(usize::from(terminal_text_width(prefix)))
+                    ),
+                    "metadata must align with its title, including the two-cell pause marker"
+                );
+            }
+        }
+    }
+
     /// The YT tab supplies source context without changing row identity or markers.
     #[test]
     fn youtube_search_rows_omit_redundant_source_labels_only_in_yt_tab() {
@@ -22562,22 +22649,22 @@ for encoded, expected in json.load(sys.stdin):
             assert_eq!(
                 line(1),
                 format!(
-                    "    {}DoTravel · 81,100 subscribers · 2025 April 30 · 8:43 28%",
+                    "{}DoTravel · 81,100 subscribers · 2025 April 30 · 8:43 28%",
                     if screen == Screen::Search {
-                        ""
+                        "     "
                     } else {
-                        "YouTube · "
+                        "    YouTube · "
                     }
                 )
             );
             assert_eq!(
                 line(3),
                 format!(
-                    "    {}81,100 subscribers",
+                    "{}81,100 subscribers",
                     if screen == Screen::Search {
                         "channel · "
                     } else {
-                        "YouTube channel · "
+                        "    YouTube channel · "
                     }
                 )
             );
@@ -22589,7 +22676,7 @@ for encoded, expected in json.load(sys.stdin):
             assert_eq!(
                 line(7),
                 if screen == Screen::Search {
-                    "    channel"
+                    "channel"
                 } else {
                     "    YouTube channel · channel"
                 },
