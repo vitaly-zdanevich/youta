@@ -372,6 +372,9 @@ YouTube description hashtags are clickable in both interfaces: choosing
 `#Minsk` searches YouTube for that hashtag inside Youta. In the terminal,
 `Alt+j` / `Alt+k` selects a Details link and `Alt+Enter` opens it; clicking the
 hashtag works too. Unicode hashtags keep their original spelling.
+Use `Alt+Left` or `Backspace` to return to the previous view, including its
+search results, selected item, and Details scroll position. Going back does
+not repeat the search or interrupt playback.
 
 Vertical YouTube videos use a distinct title color once the configured
 provider reports a portrait aspect ratio. The official adapter uses player

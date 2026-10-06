@@ -315,6 +315,35 @@ mod wire_tests {
         }
     }
 
+    /// Hashtag results retain Back shortcuts while loading and with Details focused.
+    #[test]
+    fn hashtag_search_back_shortcuts_remain_navigation_not_seeking() {
+        for details_focused in [false, true] {
+            for search_activity in [None, Some(crate::view::SearchActivity::YouTube)] {
+                let view = ViewModel {
+                    screen: crate::view::Screen::Search,
+                    search_query: "#Music".to_owned(),
+                    search_activity,
+                    details_focused,
+                    playback: PlaybackStatus {
+                        idle: false,
+                        ..PlaybackStatus::default()
+                    },
+                    ..ViewModel::default()
+                };
+                for press in [
+                    KeyPress {
+                        alt: true,
+                        ..KeyPress::new(Key::Left)
+                    },
+                    KeyPress::new(Key::Backspace),
+                ] {
+                    assert_eq!(key_action(press, &view, None, None), Some(UiAction::GoBack));
+                }
+            }
+        }
+    }
+
     /// Faster seeking respects the same idle and live-buffer constraints as plain arrows.
     #[test]
     fn ctrl_arrow_seek_requires_a_seekable_timeline() {

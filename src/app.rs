@@ -45,6 +45,7 @@ mod web;
 mod web_metadata;
 #[cfg(all(feature = "web-browser", feature = "local-metadata"))]
 mod web_probe;
+mod youtube_hashtag;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 #[cfg(any(feature = "commons-upload", feature = "evernote", feature = "yt-dlp"))]
@@ -5556,6 +5557,8 @@ pub struct AppController {
     detail_navigation_back: VecDeque<DetailNavigationSnapshot>,
     /// Internal Details pages available after going back.
     detail_navigation_forward: VecDeque<DetailNavigationSnapshot>,
+    /// Cached origins displaced by internal `YouTube` hashtag searches.
+    youtube_hashtag_history: VecDeque<youtube_hashtag::HashtagLocation>,
     /// Linked video whose provider response owns the current Details panel.
     active_description_video: Option<ActiveDescriptionVideo>,
     last_position_save: Instant,
@@ -6806,6 +6809,7 @@ impl AppController {
             previous_detail: None,
             detail_navigation_back: VecDeque::new(),
             detail_navigation_forward: VecDeque::new(),
+            youtube_hashtag_history: VecDeque::new(),
             active_description_video: None,
             last_position_save: Instant::now(),
             last_session_save: Instant::now(),
@@ -9794,46 +9798,6 @@ impl AppController {
             "This build omits the `librivox` feature; rebuild with it enabled".to_owned();
     }
 
-    /// Searches a clicked hashtag through the configured `YouTube` metadata provider.
-    ///
-    /// Uses the normal video-search route and its filters, without requesting the
-    /// previous selection's metadata or interrupting current playback.
-    fn search_youtube_hashtag(&mut self, tag: &str) {
-        if tag.len() > 400 {
-            "Invalid YouTube hashtag".clone_into(&mut self.view.status_line);
-            return;
-        }
-        let query = format!("#{tag}");
-        if !matches!(parse_description_links(&query).as_slice(), [link]
-            if link.start_byte == 0 && link.end_byte == query.len()
-                && matches!(&link.target, LinkTarget::Hashtag { tag: parsed } if parsed == tag))
-        {
-            "Invalid YouTube hashtag".clone_into(&mut self.view.status_line);
-            return;
-        }
-        if !self.youtube_provider_available {
-            self.open_youtube_setup();
-            return;
-        }
-        self.prepare_screen_transition(Screen::Search);
-        self.view.screen = Screen::Search;
-        self.view.right_panel_mode = RightPanelMode::Details;
-        self.view.search_kind = SearchKind::Videos;
-        self.view.search_query = query;
-        self.view.search_cursor_byte = self.view.search_query.len();
-        self.view.details_focused = false;
-        self.view.details_scroll = 0;
-        self.view.selected_detail_link = None;
-        self.view.detail_link_reveal = None;
-        self.active_subscription_channel_id = None;
-        if self.pending_subscription_refresh.take().is_some() {
-            self.subscription_generation = self.subscription_generation.wrapping_add(1);
-        }
-        self.clear_subscription_loading_state();
-        self.clear_search_activity();
-        self.submit_youtube_search(1);
-    }
-
     fn submit_youtube_search(&mut self, page: u32) {
         if !self.youtube_provider_available {
             self.open_youtube_setup();
@@ -9906,6 +9870,7 @@ impl AppController {
 
     /// Drops a search snapshot when another input route replaces its rows.
     fn clear_youtube_search_snapshot(&mut self) {
+        self.youtube_hashtag_history.clear();
         self.youtube_search_request = None;
         self.next_youtube_page = None;
         if let Err(error) = self.store.clear_youtube_search() {
@@ -13661,7 +13626,13 @@ impl AppController {
                     }
                 }
                 self.apply_cached_channel_webpage_to_current_detail();
-                self.refresh_youtube_rows();
+                if self.view.screen == Screen::Search
+                    && self.local_results.is_empty()
+                    && self.direct_item.is_none()
+                    && self.resolved_direct.is_none()
+                {
+                    self.refresh_youtube_rows();
+                }
                 let visible_subscription_channel = if self.view.screen == Screen::Subscriptions {
                     self.selected_subscription_channel_id()
                 } else {
@@ -22688,6 +22659,9 @@ impl AppController {
         if self.move_detail_navigation(false) {
             return;
         }
+        if self.restore_youtube_hashtag_location() {
+            return;
+        }
         if self.view.screen == Screen::ApplePodcasts
             && self.apple_podcasts_route == ApplePodcastsRoute::Episodes
         {
@@ -27259,6 +27233,7 @@ impl AppController {
             };
             return;
         }
+        self.youtube_hashtag_history.clear();
         self.prepare_screen_transition(screen);
         self.view.screen = screen;
         if self.view.right_panel_mode == RightPanelMode::Channel {
@@ -50158,7 +50133,7 @@ mod tests {
     }
 
     /// Builds a selected YouTube video with a captured provider request lane.
-    fn controller_with_youtube_video_comments()
+    pub(super) fn controller_with_youtube_video_comments()
     -> (tempfile::TempDir, AppController, Receiver<ProviderRequest>) {
         let temporary = crate::test_support::canonical_tempdir("temporary directory");
         let config = Config::for_dir(temporary.path().join("youta"));
@@ -53085,7 +53060,12 @@ mod tests {
         );
     }
 
-    fn linked_video_details(video_id: &str, title: &str, description: &str) -> VideoDetails {
+    /// Creates deterministic video metadata for inline-link navigation tests.
+    pub(super) fn linked_video_details(
+        video_id: &str,
+        title: &str,
+        description: &str,
+    ) -> VideoDetails {
         VideoDetails {
             video_id: video_id.to_owned(),
             title: title.to_owned(),
