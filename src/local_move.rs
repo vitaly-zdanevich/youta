@@ -1627,7 +1627,7 @@ mod tests {
             fs::write(&track, &bytes).unwrap();
             let plan = validate_local_move(
                 &source,
-                &[track.clone()],
+                std::slice::from_ref(&track),
                 &destination,
                 LocalMoveLimits::default(),
             )

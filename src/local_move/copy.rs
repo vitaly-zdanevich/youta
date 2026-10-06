@@ -583,6 +583,7 @@ fn check_source_ancestors(entry: &CopyEntry, relative: &Path) -> io::Result<()> 
     Ok(())
 }
 
+/// Creates a unique staging directory, applying owner-only permissions on Unix.
 fn create_copy_stage(parent: &Path) -> io::Result<PathBuf> {
     for _ in 0..HIDDEN_NAME_ATTEMPTS {
         let sequence = HIDDEN_NAME_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -590,7 +591,9 @@ fn create_copy_stage(parent: &Path) -> io::Result<PathBuf> {
             ".youta-copy-stage-{}-{sequence}.part",
             std::process::id()
         ));
-        let mut builder = fs::DirBuilder::new();
+        let builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        let mut builder = builder;
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt;
@@ -895,7 +898,7 @@ mod tests {
         assert!(
             copy_local_entries(
                 &source,
-                &[track.clone()],
+                std::slice::from_ref(&track),
                 &target,
                 LocalMoveLimits::default()
             )
@@ -916,7 +919,7 @@ mod tests {
         fs::set_permissions(&track, fs::Permissions::from_mode(0o640)).unwrap();
         copy_local_entries(
             &source,
-            &[track.clone()],
+            std::slice::from_ref(&track),
             &target,
             LocalMoveLimits::default(),
         )
