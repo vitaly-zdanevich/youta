@@ -1,0 +1,681 @@
+.\" Keep CLI syntax aligned with src/main.rs and configuration with src/config.rs.
+.\" Check hotkeys against src/keymap.rs, terminal-only handlers in src/tui.rs,
+.\" and the controller's action availability before changing this reference.
+.\" Keep this source ASCII and omit a release version to avoid stale metadata.
+.TH YOUTA 1 "2026-10-06" "Youta" "User Commands"
+.SH NAME
+youta \- terminal audio player and subscription manager
+.SH SYNOPSIS
+.B youta
+.RI [ options ]
+.RI [ URL ]
+.br
+.B youta
+.RI [ options ]
+.B tui
+.br
+.B youta
+.RI [ options ]
+.B search
+.RB [ \-\-channels ]
+.I QUERY
+.br
+.B youta
+.RI [ options ]
+.RB { doctor | config | extractors }
+.br
+.B youta help
+.RI [ COMMAND ]
+.SH DESCRIPTION
+.B Youta
+plays audio, browses media sources, and keeps local subscriptions, playlists,
+notes, listening history, and playback positions.
+Running it without a command opens the terminal interface.
+The default playback backend controls an invisible
+.BR mpv (1)
+process and uses
+.BR yt-dlp (1)
+for supported media resolution and downloads.
+.PP
+Available sources and actions depend on the features included in the build,
+configured providers, installed helpers, and the selected item.
+The contextual help opened with
+.B ?
+and the displayed action labels show the controls available in the current view.
+YouTube subscriptions are managed locally; they do not synchronize with a
+YouTube account.
+.SH COMMANDS
+.TP
+.B tui
+Open the terminal player. Requires the
+.B tui
+build feature.
+.TP
+.BR search " [\-\-channels] " QUERY
+Search YouTube videos, or channel names with
+.BR \-\-channels .
+Configure an official YouTube API key or an Invidious instance first;
+the corresponding provider must be included in the build.
+Results contain tab-separated identifiers, titles or names, and webpage URLs.
+Quote queries containing spaces.
+.TP
+.B doctor
+Check external helpers, configuration, storage, and tracker decoder support.
+.TP
+.B config
+Print non-secret effective configuration and state paths.
+.TP
+.B extractors
+List site extractors reported by the installed
+.BR yt-dlp .
+Requires the
+.B yt-dlp
+build feature.
+.TP
+.BR help " [COMMAND]"
+Print general help or help for the named command.
+.SH OPTIONS
+.TP
+.BI \-\-config-dir " PATH"
+Use this application directory for configuration and state.
+Overrides
+.BR YOUTA_CONFIG_DIR .
+This option is accepted before or after a subcommand.
+.TP
+.B \-\-license
+Print the complete MIT license notice and exit.
+This option is accepted before or after a subcommand.
+.TP
+.BR \-h , " \-\-help"
+Print help. Use a subcommand followed by
+.B \-\-help
+for its options.
+.TP
+.BR \-V , " \-\-version"
+Print the version.
+.TP
+.I URL
+Open a complete HTTP or HTTPS page in the Web tab without starting playback.
+The URL must not contain a username or password.
+Quote URLs containing shell metacharacters.
+A startup URL cannot be combined with a subcommand and requires both the
+.B tui
+and
+.B web-browser
+build features.
+.SH TERMINAL HOTKEYS
+Letter keys are case-sensitive:
+.B s
+and
+.B S
+are different commands.
+.B Ctrl+
+and
+.B Alt+
+mean holding that modifier while pressing the named key.
+These bindings describe normal browsing unless a context is stated.
+Popups, text editors, text-selection mode, and the keyboard pointer can consume
+keys before normal browsing does.
+For example, typing
+.B q
+in a search field inserts a letter, and arrow keys in an editor move its cursor.
+.SS General navigation
+.TP
+.B ?
+Open contextual help. Press
+.B ?
+or
+.B Esc
+to close it.
+.TP
+.BR q ", " Ctrl+C
+Quit from normal browsing. Popups can override or ignore these keys; close
+the popup first if necessary.
+.TP
+.BR Tab ", " Shift+Tab
+Switch to the next or previous enabled top-level screen, wrapping at the ends.
+.B Ctrl+Tab
+and
+.B Ctrl+Shift+Tab
+also work when the terminal reports these combinations.
+.TP
+.BR j ", " k
+Select the next or previous row.
+.TP
+.BR PageUp ", " PageDown
+Move by the visible page in Local, Web, Subs, Radio, Apple Podcasts,
+SoundCloud, archive.org, and LibriVox lists.
+When Details has focus, scroll Details instead.
+.TP
+.B Enter
+Open the selected source, folder, playlist, or item, or start its playback.
+In focused Details, an actionable selected link or media control can take
+priority.
+.TP
+.BR Backspace ", " Alt+Left ", " Alt+Right
+Go back, back, or forward in navigation, respectively.
+.TP
+.B Esc
+Close the current popup or editor, leave focused Details, or return from a
+supported nested view. In Local, open the parent directory when no higher
+priority view consumes the key.
+.TP
+.B S
+Open the Subs source root.
+.TP
+.B F2
+Open downloaded media (Offline).
+.TP
+.B F3
+Open History when playback-history recording is enabled.
+.TP
+.B F4
+Open playlists (Lists).
+.TP
+.B F5
+Open listening statistics.
+.TP
+.BR p ", " F7
+Open Preferences. Use
+.B Up
+and
+.B Down
+to focus a setting,
+.B Space
+to change it, and
+.B Enter
+to save. Press
+.B Esc
+or
+.B p
+to dismiss the dialog.
+.TP
+.B F9
+Open project history. Press
+.B F9
+or
+.B Esc
+to close it.
+.SS Playback and queue
+.TP
+.B Space
+Toggle pause.
+.TP
+.BR Left ", " Right
+Seek backward or forward five seconds when seeking is available.
+.TP
+.BR Up ", " Down
+Increase or decrease volume by five percentage points.
+Use
+.B j
+and
+.B k
+to navigate ordinary lists.
+.TP
+.BR 0 " through " 9
+Seek to 0 through 90 percent of the playing item when seeking is available.
+.TP
+.BR , " or " < "; " . " or " >
+Decrease or increase playback speed by 0.1.
+.TP
+.BR [ ", " ]
+Go to the previous or next chapter of seekable, non-live media.
+.TP
+.BR { ", " }
+Play the previous or next queue item, using the source continuation where
+available.
+.TP
+.B A
+Toggle autoplay of the source list. Explicit queued items play first.
+This preference is saved.
+.TP
+.B r
+Toggle repeat of the playing item for this session.
+In Local this key opens Rename when that feature is included; in Radio it
+toggles recording. Live radio cannot repeat.
+.TP
+.B a
+Add the selected playable item to the queue.
+At the Subs source root this key opens Add RSS feed instead.
+.TP
+.B Ctrl+n
+Put the selected playable item next in the queue.
+.TP
+.B u
+Open the playback queue. Within it,
+.B j/k
+or
+.B Up/Down
+select an entry,
+.B Enter
+plays it,
+.B x
+or
+.B Delete
+removes it, and
+.B C
+clears the queue.
+.B Esc
+or
+.B u
+closes the queue.
+.TP
+.B w
+Toggle a waveform for supported local audio or video using
+.BR ffmpeg .
+.TP
+.B F10
+Open the ASCII audio visualizer while playback is loaded, when the feature
+and its helper are available.
+.B Esc
+or
+.B F10
+closes it.
+.SS Search, subscriptions, and Web
+.TP
+.B /
+Begin a search in the current source or edit the address in Web.
+While editing,
+.B Enter
+submits,
+.B Esc
+cancels,
+.B Left/Right
+move the cursor,
+.B Backspace
+deletes the preceding character, and
+.B Ctrl+w
+deletes the preceding word.
+.TP
+.B v
+Switch between videos and channels in YouTube search.
+In Yandex Music, cycle the search category.
+.TP
+.B N
+Toggle relevance or newest-first ordering in YouTube search.
+.TP
+.B C
+Toggle the Creative Commons filter in YouTube video search.
+An active download takes priority: this key cancels that download instead.
+.TP
+.B c
+Open the selected item's channel or source when supported.
+.TP
+.B s
+Subscribe locally to the selected YouTube channel, including an unsubscribed
+channel identified by a video result.
+On an already subscribed channel, open an unsubscribe confirmation;
+.B Enter
+confirms and
+.B Esc
+cancels. Downloaded files are kept.
+.TP
+.B a
+At the Subs source root, open Add RSS feed.
+Enter an HTTP or HTTPS RSS/Atom feed URL and press
+.B Enter
+to save, or
+.B Esc
+to cancel.
+.TP
+.B R
+Refresh Web or the active subscription's videos or episodes.
+In Yandex Music recommendations, this key downloads twenty recommendations
+when that action is available.
+.TP
+.B h
+Toggle YouTube Shorts in an active YouTube subscription's item list.
+.TP
+.B i
+Toggle item Details in the split Subs layout.
+.TP
+.B X
+Toggle automatic downloads for an eligible YouTube channel.
+In Yandex Music, dislike or undo dislike of the selected track.
+.TP
+.B D
+Review a full-channel YouTube download when available.
+In an open Yandex Music album, download the album.
+.SS Downloads, playlists, and notes
+.TP
+.B Insert
+Toggle the download mark on a supported playable row.
+.TP
+.B d
+Download the marked items or selected supported media.
+When a download-choice dialog opens, use
+.B j/k
+or
+.B Up/Down
+to choose,
+.B Enter
+to confirm, and
+.B Esc
+to cancel.
+.TP
+.B Ctrl+d
+Open the persistent download queue. Use
+.B j/k
+or
+.B Up/Down
+to select,
+.B r
+to retry,
+.B x
+or
+.B Delete
+to cancel or remove an entry, and
+.B Esc
+to close.
+.TP
+.B l
+Toggle the selected supported item's membership in the built-in todo playlist.
+.TP
+.B P
+Open the playlist picker for the selected supported item.
+Use
+.B j/k
+or
+.B Up/Down
+to select,
+.B Enter
+to toggle membership,
+.B n
+to create a playlist, and
+.B Esc
+to close.
+In the name-and-description editor,
+.B Tab
+switches fields and
+.B Enter
+saves.
+.TP
+.B e
+Edit the selected playlist's name and description in the Lists index.
+.TP
+.B n
+Edit a private note for the selected supported target.
+Inside the editor,
+.B Enter
+inserts a newline,
+.B Ctrl+s
+saves,
+.B Delete
+requests deletion, and
+.B Esc
+closes. Confirm deletion with
+.B Enter
+or a second
+.BR Delete .
+.SS Local files and Radio
+.TP
+.B r
+Rename the selected Local entry when supported.
+.TP
+.B m
+Open Move for selected Local entries when supported.
+In the destination picker,
+.B j/k
+or
+.B Up/Down
+select a directory,
+.B Enter
+opens it, and
+.B m
+confirms moving into the current directory.
+.TP
+.BR Shift+j ", " Shift+k
+Extend Local file/folder selection down or up for move or quality analysis,
+when supported and reported distinctly by the terminal.
+.TP
+.B Delete
+Request Move to Trash for selected Local entries when supported.
+Confirm with
+.B Enter
+or cancel with
+.BR Esc .
+.TP
+.B x
+Request Move to Trash for selected downloaded media in Offline.
+.TP
+.B H
+Toggle showing all Local files.
+.TP
+.B Z
+Cycle Local folder-size sorting off, ascending, and descending when folder
+size measurement is enabled.
+.TP
+.B f
+Fingerprint selected supported Local audio through Chromaprint and AcoustID.
+In Radio, toggle the selected station's favorite status.
+.TP
+.B V
+Analyze supported Local audio quality for the selected item or marked files
+and folders.
+.TP
+.B B
+Cycle Radio sorting.
+.TP
+.B r
+Start or stop recording in Radio.
+.PP
+Rename, Move, and Trash are unavailable inside read-only archives.
+.SS Details, links, and optional actions
+.TP
+.BR Alt+Up ", " Alt+Down ", " Alt+u ", " Alt+d
+Scroll visible Details one line up or down.
+.B Alt+u/d
+also work on Linux virtual consoles whose keymaps intercept Alt-arrow keys.
+.TP
+.BR Alt+j ", " Alt+k
+Select the next or previous Details link, or an expanded Wikidata media
+control when those controls have focus.
+.TP
+.BR Alt+Home ", " Alt+End
+Select the first or last Details link.
+.TP
+.B Alt+Enter
+Activate the selected Details link.
+.TP
+.BR Home ", " End
+Scroll to the beginning or end when Details has focus.
+.TP
+.B t
+Enter or leave Details text-selection mode for copying through the terminal.
+.B Esc
+also leaves this mode.
+.TP
+.B T
+Toggle chapter timestamps.
+.TP
+.B W
+Expand or collapse statements for an available Wikidata link.
+.TP
+.BR o ", " O
+Open the selected item's webpage or its channel's webpage in the external
+browser. In Radio both keys open the station page.
+External browser actions require an available graphical opener.
+.TP
+.B y
+Copy the selected item's link.
+.TP
+.B F6
+Open available public comments or reviews.
+.B F6
+or
+.B Esc
+closes the popup.
+.TP
+.B G
+Generate a video summary when the configured summary backend and selected
+item support it.
+.TP
+.B Y
+Open available YouTube captions.
+.TP
+.B Q
+Show a QR code for the selected YouTube video when supported.
+.B Q
+or
+.B Esc
+closes it.
+.TP
+.BR I ", " M ", " U ", " E
+Open the selected item's Internet Archive upload, Amazon S3 upload,
+Wikimedia Commons upload, or Evernote note review, respectively, when the
+corresponding integration and item are available.
+Review the destination and fields before submitting.
+.TP
+.BR L ", " g ", " b
+In Yandex Music, like or undo like of a track, open its artist, or open its
+album, respectively, when available.
+.TP
+.B F11
+Start sharing the selected Local file or folder over the LAN when supported.
+.TP
+.B F12
+Share a podcast feed for selected Local audio or an eligible YouTube channel
+when supported. Selecting a playable Local file or a YouTube channel opens
+feed options first; selecting a Local folder starts sharing directly.
+In the active LAN-share popup,
+.B x
+stops sharing;
+.B Esc
+only closes the popup.
+.SS Keyboard pointer
+.B F8
+toggles the terminal keyboard pointer.
+While active, arrow keys move it one cell,
+.B Enter
+clicks, and
+.B Esc
+or
+.B F8
+exits pointer mode.
+.SH CONFIGURATION
+On Linux the default application directory is
+.IR $XDG_CONFIG_HOME/youta ,
+or
+.I ~/.config/youta
+when
+.B XDG_CONFIG_HOME
+is unset.
+Other platforms use their platform configuration directory.
+Select another directory with
+.B YOUTA_CONFIG_DIR
+or, at higher priority,
+.BR \-\-config-dir .
+.PP
+Settings load in increasing priority: built-in defaults,
+.IR config.toml ,
+.IR secrets/credentials.toml ,
+and environment variables beginning with
+.BR YOUTA_ .
+Two underscores express nested keys: for example,
+.B YOUTA_PLAYBACK__VOLUME_PERCENT=40
+sets
+.BR playback.volume_percent .
+The repository's
+.I config.example.toml
+documents available settings.
+.PP
+The first unconfigured YouTube search in the terminal offers provider setup.
+It saves API keys in
+.I secrets/credentials.toml
+and the Invidious instance URL in
+.IR config.toml .
+Stored credentials are plaintext; Youta creates private directories and files
+with user-only permissions on Unix.
+Preferences also exposes provider setup when the build supports it.
+.SH FILES
+The following paths are relative to the selected application directory.
+.TP
+.I config.toml
+User settings.
+.TP
+.I secrets/credentials.toml
+Provider credentials.
+.TP
+.I subscriptions.opml
+Portable local subscriptions to RSS, podcast, and compatible channel feeds.
+.TP
+.I state/*.toml
+Canonical progress, history, notes, bookmarks, statistics, playlists, and
+move-journal documents for the default files backend.
+Close Youta before editing these documents.
+.TP
+.I state/.lock
+The files backend's exclusive instance lock. Only one process can open that
+backend in an application directory at a time.
+.TP
+.I runtime/
+Restart session state and playback checkpoints.
+.TP
+.I cache/
+Regenerable search, metadata, and local archive caches.
+.TP
+.I thumbnail-cache/
+Persistent artwork cache.
+.TP
+.I downloads/
+Downloaded media and related data.
+.TP
+.I state.sqlite3
+State database when the optional SQLite backend is selected and compiled in.
+.SH ENVIRONMENT
+.TP
+.B YOUTA_CONFIG_DIR
+Select the application directory unless
+.B \-\-config-dir
+is supplied.
+.TP
+.B XDG_CONFIG_HOME
+Select the Linux configuration base directory.
+.TP
+.B YOUTA_<SECTION>__<KEY>
+Override a nested setting, for example
+.B YOUTA_UI__THEME=dark
+or
+.BR YOUTA_PLAYBACK__AUTOPLAY=true .
+Environment overrides take precedence over saved preferences.
+.SH EXAMPLES
+Open the terminal player:
+.PP
+.nf
+.B youta
+.fi
+.PP
+Open a Web directory without starting playback:
+.PP
+.nf
+.B youta \(aqhttps://example.com/music/\(aq
+.fi
+.PP
+Search configured YouTube metadata:
+.PP
+.nf
+.B youta search \(aqambient music\(aq
+.B youta search \-\-channels \(aqradio\(aq
+.fi
+.PP
+Inspect a separate application directory:
+.PP
+.nf
+.B youta \-\-config-dir /path/to/youta config
+.B youta \-\-config-dir /path/to/youta doctor
+.fi
+.PP
+Start with a volume override:
+.PP
+.nf
+.B YOUTA_PLAYBACK__VOLUME_PERCENT=40 youta
+.fi
+.SH SEE ALSO
+.BR mpv (1),
+.BR yt-dlp (1),
+.BR ffmpeg (1)
+.PP
+Project documentation and configuration examples:
+.UR https://github.com/vitaly-zdanevich/youta
+Youta documentation
+.UE

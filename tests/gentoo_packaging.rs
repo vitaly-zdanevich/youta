@@ -86,6 +86,45 @@ fn trace_fields<'a>(trace: &'a str, phase: &str) -> Vec<&'a str> {
         .collect()
 }
 
+/// Installs the terminal manual for both terminal-only and desktop packages.
+#[test]
+fn man_page_is_installed_with_and_without_the_desktop() {
+    let template = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("packaging/gentoo/youta.ebuild");
+    let script = r#"
+inherit() { :; }
+use() { [[ " ${USE_FIXTURE} " == *" $1 "* ]]; }
+cargo_src_install() { :; }
+cargo_target_dir() { printf '%s' /unused/target; }
+dobin() { :; }
+dodoc() { :; }
+doman() { printf 'MAN'; printf '|%s' "$@"; printf '\n'; }
+source "$1"
+src_install
+"#;
+
+    for gui in [false, true] {
+        let output = Command::new("bash")
+            .args(["-ec", script, "gentoo-man-install-test"])
+            .arg(&template)
+            .env("USE_FIXTURE", if gui { "gui" } else { "" })
+            .env("PV", "99.0.0")
+            .env("P", "youta-99.0.0")
+            .env("S", "/unused/youta-99.0.0")
+            .output()
+            .expect("run the mocked ebuild install phase");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).expect("UTF-8 install trace"),
+            "MAN|man/youta.1\n",
+            "the section-one terminal manual must be installed with gui={gui}"
+        );
+    }
+}
+
 #[test]
 fn archive_org_is_default_on_in_the_future_source_ebuild() {
     let trace = evaluate_template(true, false, false);

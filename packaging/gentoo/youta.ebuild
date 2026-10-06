@@ -377,6 +377,7 @@ src_install() {
 		dobin "$(cargo_target_dir)/youta-gui"
 	fi
 
+	doman man/youta.1
 	dodoc README.md config.example.toml
 	dodoc docs/ARCHITECTURE.md docs/AUDIOPHILE.md docs/FEASIBILITY.md
 }

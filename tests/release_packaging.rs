@@ -151,6 +151,62 @@ fn read_repository_file(relative: impl AsRef<Path>) -> String {
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
 }
 
+/// Keeps the shipped terminal manual usable without requiring a roff renderer.
+#[test]
+fn man_page_documents_the_cli_and_core_keyboard_controls() {
+    let manual = read_repository_file("man/youta.1");
+    let header: Vec<_> = manual
+        .lines()
+        .find(|line| line.starts_with(".TH "))
+        .expect("the manual must declare its title and section")
+        .split_whitespace()
+        .map(|field| field.trim_matches('"'))
+        .collect();
+    assert_eq!(&header[..3], [".TH", "YOUTA", "1"]);
+    let sections: BTreeSet<_> = manual
+        .lines()
+        .filter_map(|line| line.strip_prefix(".SH "))
+        .map(|section| section.trim_matches('"'))
+        .collect();
+    for required in [
+        "NAME",
+        "SYNOPSIS",
+        "DESCRIPTION",
+        "COMMANDS",
+        "OPTIONS",
+        "TERMINAL HOTKEYS",
+        "CONFIGURATION",
+        "FILES",
+        "ENVIRONMENT",
+        "EXAMPLES",
+        "SEE ALSO",
+    ] {
+        assert!(
+            sections.contains(required),
+            "missing manual section: {required}"
+        );
+    }
+    let text = manual.replace("\\-", "-");
+    for option in [
+        "--config-dir",
+        "--license",
+        "--help",
+        "--version",
+        "--channels",
+    ] {
+        assert!(
+            text.contains(option),
+            "missing command-line option: {option}"
+        );
+    }
+    for command in ["tui", "search", "doctor", "config", "extractors", "help"] {
+        assert!(text.contains(command), "missing command: {command}");
+    }
+    for key in ["F7", "Space", "Up", "Down", "?"] {
+        assert!(text.contains(key), "missing core keyboard control: {key}");
+    }
+}
+
 /// Reads a feature or USE-flag table row without fixing its surrounding prose.
 fn documented_table_description<'a>(readme: &'a str, key: &str) -> &'a str {
     let prefix = format!("| `{key}` |");

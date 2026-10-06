@@ -45,6 +45,12 @@ For installation alternatives, optional helpers, credentials, and smaller
 builds, see [Build and run](#build-and-run). For the desktop front-end, see
 [The desktop window](#the-desktop-window).
 
+For an offline command and hotkey reference, see the [manual page](man/youta.1).
+Read it from a checkout with `man -l man/youta.1`; after installation into a
+manual directory, use `man youta`. The repository's Gentoo source ebuild installs
+it automatically. Cargo installs and standalone executable downloads do not
+install manual pages.
+
 ## Contents
 
 - [Design](#why-this-design), [playback and queue](#the-mpv-backend-and-the-tui),
