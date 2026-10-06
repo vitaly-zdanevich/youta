@@ -97,6 +97,8 @@ tiers](docs/FEASIBILITY.md), and [audiophile guidance](docs/AUDIOPHILE.md).
 
 The Local tab browses supported media and images in place. `Enter` opens a
 folder; `Esc` returns to its parent and reselects the folder just left.
+On a media file, `Enter` starts playback, or toggles pause like `Space` if
+that same file is already active. Selecting another file still starts it.
 `PageUp` / `PageDown` move by the visible Local page. Recursive folder sizes
 are enabled by default and calculated asynchronously, one folder at a time,
 without following symbolic links. `[Z]` cycles size sorting off, ascending,

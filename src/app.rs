@@ -21484,6 +21484,7 @@ impl AppController {
         self.view.status_line = "This build omits local text-file opening".to_owned();
     }
 
+    /// Opens the selected Local entry, or toggles pause for its active playback.
     fn activate_local_browser_selection(&mut self) {
         use crate::local_browser::LocalEntryKind;
 
@@ -21514,6 +21515,19 @@ impl AppController {
                     "No default action is available for this file type".to_owned();
             }
             LocalEntryKind::Audio | LocalEntryKind::Video | LocalEntryKind::TrackerModule => {
+                // Match the accepted playback identity before probing the file:
+                // Enter must behave like Space without replacing the queue or
+                // position, including while that same file is still loading.
+                if self.playback_phase != PlaybackPhase::Idle
+                    && self.player.is_some()
+                    && self
+                        .current_media
+                        .as_ref()
+                        .is_some_and(|media_id| local_path_matches_media_id(&entry.path, media_id))
+                {
+                    self.player_command(PlayerCommand::TogglePause);
+                    return;
+                }
                 let item = local_media_item(entry.path, &self.config.providers.ffprobe_executable);
                 match queue_item_from_local(&item) {
                     Ok(item) => self.play_queue_item(item, false),
@@ -46478,6 +46492,8 @@ mod tests {
     mod download_choice_tests;
     #[path = "end_pause.rs"]
     mod end_pause_tests;
+    #[path = "local_activation.rs"]
+    mod local_activation_tests;
     #[path = "local_folder_notes.rs"]
     mod local_folder_note_tests;
     #[path = "local_sort.rs"]
