@@ -259,7 +259,10 @@ mod controller_tests {
             let details = controller.view.details.as_ref().unwrap();
             assert_eq!(
                 details.description,
-                format!("Full path:\n{}", controller.local_display_path(&track))
+                format!(
+                    "Full path:\n{}\nCreated: unavailable\nModified: unavailable",
+                    controller.local_display_path(&track)
+                )
             );
             assert_eq!(details.media_id.as_ref(), Some(&media_id));
         }

@@ -6,7 +6,7 @@ use super::*;
 fn assert_track_description(item: &LocalMediaItem, expected: Option<&str>) {
     for description in [
         local_media_description(item),
-        local_media_description_with_path(item, "~/Music/mock.flac"),
+        local_media_description_with_location(item, "Full path:\n~/Music/mock.flac".to_owned()),
     ] {
         assert_eq!(
             description.lines().find(|line| line.starts_with("Track:")),

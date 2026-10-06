@@ -25,6 +25,7 @@ mod end_pause;
 mod invidious_instances;
 #[cfg(feature = "local-copy")]
 mod local_copy;
+mod local_file_dates;
 mod local_path_display;
 mod manual_downloads;
 mod now_playing;
@@ -16126,7 +16127,28 @@ impl AppController {
 
     /// Projects playable-file metadata with the current display-only path preference.
     fn local_details_description(&self, item: &LocalMediaItem) -> String {
-        local_media_description_with_path(item, &self.local_display_path(&item.path))
+        local_media_description_with_location(item, self.local_file_path_description(&item.path))
+    }
+
+    /// Shows real file dates, not the creation time of an extracted archive cache copy.
+    fn local_file_path_description(&self, path: &Path) -> String {
+        let label = self.local_display_path(path);
+        let cache = self.config.cache_dir().join("local-archives");
+        let in_cache = path.starts_with(&cache)
+            || cache
+                .canonicalize()
+                .is_ok_and(|cache| path.starts_with(cache));
+        #[cfg(feature = "local-archives")]
+        let in_cache = in_cache
+            || self
+                .local_archive_stack
+                .iter()
+                .any(|archive| archive.contains(path));
+        if in_cache {
+            format!("Full path:\n{label}")
+        } else {
+            local_file_dates::path_description(path, &label)
+        }
     }
 
     /// Returns whether the current Local route is backed by archive cache data.
@@ -16806,8 +16828,12 @@ impl AppController {
                 }
                 .to_owned(),
                 description: format!(
-                    "Full path:\n{}{}{}",
-                    self.local_display_path(&entry.path),
+                    "{}{}{}",
+                    if is_directory {
+                        format!("Full path:\n{}", self.local_display_path(&entry.path))
+                    } else {
+                        self.local_file_path_description(&entry.path)
+                    },
                     known_size
                         .map_or_else(String::new, |size| format!("\nSize: {}", human_bytes(size))),
                     entry
@@ -17580,16 +17606,25 @@ impl AppController {
                     "Only available local audio, video, or tracker files can be added to a media playlist"
                         .to_owned()
                 })?;
-            return playlist_snapshot_from_local_media_item(&local_media_item(
+            let item = local_media_item(
                 entry.path.clone(),
                 &self.config.providers.ffprobe_executable,
-            ));
+            );
+            return playlist_snapshot_from_local_media_presentation(
+                &item,
+                &item.title,
+                &self.local_details_description(&item),
+            );
         }
 
         if self.view.screen == Screen::Search
             && let Some(item) = self.local_results.get(self.view.selected)
         {
-            return playlist_snapshot_from_local_media_item(item);
+            return playlist_snapshot_from_local_media_presentation(
+                item,
+                &item.title,
+                &self.local_details_description(item),
+            );
         }
 
         if self.view.screen == Screen::Downloaded {
@@ -17604,8 +17639,8 @@ impl AppController {
                 .as_ref()
                 .filter(|details| details.media_id.as_ref() == Some(&media_id))
                 .map(|details| (details.title.clone(), details.description.clone()));
-            let (title, description) =
-                visible.unwrap_or_else(|| (item.title.clone(), local_media_description(&item)));
+            let (title, description) = visible
+                .unwrap_or_else(|| (item.title.clone(), self.local_details_description(&item)));
             return playlist_snapshot_from_local_media_presentation(&item, &title, &description);
         }
 
@@ -17696,7 +17731,7 @@ impl AppController {
                     playlist_snapshot_from_local_media_presentation(
                         &item,
                         &entry.title,
-                        &local_media_description(&item),
+                        &self.local_details_description(&item),
                     )
                 }
                 HistoryReplayTarget::Remote(url) => playlist_snapshot_from_queue_item(
@@ -28655,16 +28690,7 @@ impl AppController {
                     return;
                 };
                 let saved_description = entry.media.description.clone().unwrap_or_default();
-                let timecodes = if entry.media.kind == MediaKind::LiveStream {
-                    Vec::new()
-                } else {
-                    detail_timecodes(&saved_description)
-                        .into_iter()
-                        .filter(|timecode| {
-                            playlist_segment_contains_timecode(&entry, timecode.seconds)
-                        })
-                        .collect()
-                };
+                let timecodes = playlist_detail_timecodes(&entry, &saved_description);
                 let video_links = detail_video_links(&saved_description);
                 let hashtag_links = if entry.media.id.source == SourceKind::YouTube {
                     youtube_hashtag_links(&saved_description)
@@ -30576,7 +30602,7 @@ impl AppController {
             )
         } else {
             (
-                format!("Full path:\n{}", self.local_display_path(&path)),
+                self.local_file_path_description(&path),
                 String::new(),
                 None,
                 false,
@@ -42080,14 +42106,18 @@ fn local_video_thumbnail_view(
 }
 
 /// Formats human and technical metadata for one playable Local Details panel.
+#[cfg(test)]
 fn local_media_description(item: &LocalMediaItem) -> String {
-    local_media_description_with_path(item, &item.path.display().to_string())
+    local_media_description_with_location(
+        item,
+        local_file_dates::path_description(&item.path, &item.path.display().to_string()),
+    )
 }
 
-/// Formats metadata with a caller-provided display label, keeping the stored item untouched.
-/// The path starts on its own line so the heading does not consume its display width.
-fn local_media_description_with_path(item: &LocalMediaItem, path_label: &str) -> String {
-    let mut lines = vec![format!("Full path:\n{path_label}")];
+/// Adds media metadata after the caller's display path and optional filesystem dates.
+/// The path retains its own full-width line; the stored media item remains untouched.
+fn local_media_description_with_location(item: &LocalMediaItem, location: String) -> String {
+    let mut lines = vec![location];
     if let Some(artist) = &item.artist {
         lines.push(format!("Artists: {artist}"));
     }
@@ -42569,6 +42599,43 @@ fn detail_timecodes(description: &str) -> Vec<DetailTimecodeView> {
             _ => None,
         })
         .take(MAX_DESCRIPTION_TIMECODES)
+        .collect()
+}
+
+/// Projects saved seek links without treating generated Local file dates as playback times.
+///
+/// Only the two date lines immediately following the generated path heading are excluded.
+/// Parsing the original text preserves every remaining byte range and chapter marker;
+/// remote descriptions and Local comments retain their existing timecode behavior.
+fn playlist_detail_timecodes(entry: &PlaylistEntry, description: &str) -> Vec<DetailTimecodeView> {
+    if entry.media.kind == MediaKind::LiveStream {
+        return Vec::new();
+    }
+    let date_range = (entry.media.id.source == SourceKind::Local)
+        .then(|| {
+            let mut lines = description.split_inclusive('\n');
+            let heading = lines.next()?;
+            if heading != "Full path:\n" {
+                return None;
+            }
+            let path = lines.next()?;
+            let created = lines.next()?;
+            let modified = lines.next()?;
+            if !created.starts_with("Created: ") || !modified.starts_with("Modified: ") {
+                return None;
+            }
+            let start = heading.len() + path.len();
+            Some(start..start + created.len() + modified.len())
+        })
+        .flatten();
+    detail_timecodes(description)
+        .into_iter()
+        .filter(|timecode| {
+            date_range
+                .as_ref()
+                .is_none_or(|range| !range.contains(&timecode.start_byte))
+                && playlist_segment_contains_timecode(entry, timecode.seconds)
+        })
         .collect()
 }
 
@@ -44712,6 +44779,7 @@ fn playlist_snapshot_from_queue_item(item: &QueueItem) -> Result<PlaylistMediaSn
 /// Optional enrichments such as quality reports and Wikidata remain separate
 /// view fields, while the file-derived description passes through the shared
 /// playlist normalization and size boundary.
+#[cfg(test)]
 fn playlist_snapshot_from_local_media_item(
     item: &LocalMediaItem,
 ) -> Result<PlaylistMediaSnapshot, String> {
@@ -51430,6 +51498,115 @@ mod tests {
         let playback = playback.lock().expect("mock playback");
         assert_eq!(playback.played.len(), 1);
         assert_eq!(playback.played[0].start_at, Duration::from_secs(1));
+    }
+
+    /// Saved filesystem clock times remain plain text without changing genuine seek spans.
+    #[test]
+    fn playlist_local_file_dates_are_not_playback_timecodes() {
+        let description = concat!(
+            "Full path:\n/music/Музыка.flac\n",
+            "Created: 2026 August 25 14:20\n",
+            "Modified: 2026 August 26 09:05\n",
+            "00:05 Chapter\nComment: Created: 03:04"
+        );
+        for (source, expected) in [
+            (SourceKind::Local, vec![5, 184]),
+            (SourceKind::YouTube, vec![860, 545, 5, 184]),
+        ] {
+            let mut entry = fixture_youtube_playlist_entry("dQw4w9WgXcQ", "Saved dates");
+            entry.media.id.source = source;
+            entry.media.kind = MediaKind::Audio;
+            entry.media.description = Some(description.to_owned());
+            let (mut controller, _) = controller_with_mock_statuses([]);
+            controller_with_active_playlist(&mut controller, vec![entry]);
+
+            controller.update_playlist_detail();
+
+            let details = controller.view.details.as_ref().expect("playlist Details");
+            assert!(details.description.starts_with(description));
+            assert_eq!(
+                details
+                    .timecodes
+                    .iter()
+                    .map(|timecode| timecode.seconds)
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            for timecode in &details.timecodes {
+                let token = &details.description[timecode.start_byte..timecode.end_byte];
+                assert_eq!(
+                    parse_description_links(token)[0].target,
+                    LinkTarget::Timecode {
+                        seconds: timecode.seconds,
+                    }
+                );
+            }
+            assert!(
+                details
+                    .timecodes
+                    .iter()
+                    .any(|timecode| { timecode.seconds == 5 && timecode.is_chapter })
+            );
+        }
+
+        let mut entry = fixture_youtube_playlist_entry("dQw4w9WgXcQ", "Local comment");
+        entry.media.id.source = SourceKind::Local;
+        entry.media.description = Some("Created: 14:20\nModified: 09:05".to_owned());
+        let (mut controller, _) = controller_with_mock_statuses([]);
+        controller_with_active_playlist(&mut controller, vec![entry]);
+        controller.update_playlist_detail();
+        assert_eq!(controller.view.details.as_ref().unwrap().timecodes.len(), 2);
+    }
+
+    /// Reopened extracted members do not persist cache dates through another Local route.
+    #[test]
+    fn snapshot_local_file_dates_omit_reopened_archive_cache_timestamps() {
+        for screen in [Screen::Search, Screen::History, Screen::Downloaded] {
+            let temporary = crate::test_support::canonical_tempdir("archive snapshot dates");
+            let mut config = Config::for_dir(temporary.path().join("config"));
+            config.providers.ffprobe_executable = temporary.path().join("missing-ffprobe");
+            let directory = config.cache_dir().join("local-archives/fixture/contents");
+            std::fs::create_dir_all(&directory).expect("archive cache directory");
+            let path = directory.join("track.flac");
+            std::fs::write(&path, b"fixture media").expect("extracted file");
+            let mut controller = AppController::new(
+                config,
+                StateStore::open_in_memory().expect("state"),
+                None,
+                None,
+            );
+            controller.view.screen = screen;
+            controller.local_results = vec![local_media_item_stub(path.clone(), None)];
+            controller.view.rows = vec![RowView {
+                media_id: Some(local_media_id(&path)),
+                ..RowView::default()
+            }];
+            controller.history_entries = vec![HistoryListEntry {
+                entry: HistoryEntry {
+                    id: 1,
+                    media_id: local_media_id(&path),
+                    title: "Archived track".to_owned(),
+                    replay_locator: Some(path.to_string_lossy().into_owned()),
+                    started_at: 1,
+                    last_played_at: 2,
+                    position_seconds: 0,
+                    duration_seconds: None,
+                    finished: false,
+                },
+                local_removed: false,
+            }];
+
+            let snapshot = controller
+                .selected_playlist_snapshot()
+                .expect("saved Local media");
+            let description = snapshot.description.as_deref().expect("saved description");
+
+            assert!(description.starts_with("Full path:\n"));
+            assert!(
+                !description.contains("Created:") && !description.contains("Modified:"),
+                "{screen:?} must not save archive extraction dates"
+            );
+        }
     }
 
     #[test]

@@ -109,6 +109,12 @@ Local paths inside your home folder display as `~/…` by default. Enable
 to show `/home/username/…` instead. Playback and saved folder locations always
 retain their full paths.
 
+File Details show **Created** and **Modified** immediately below the path, in
+your local time (for example, `2026 August 25 14:20`). Unsupported or unreadable
+filesystem timestamps show `unavailable`; creation time is never inferred from
+modification time. Extracted archive members omit these fields because their
+cache timestamps do not describe the original files.
+
 Enable **Natural Local filename sorting (1, 2, 10)** in Preferences
 (`ui.natural_local_sort = true`) to sort numbered files and folders numerically.
 The default remains filename order (`1, 10, 100, 2`). Folders stay first unless

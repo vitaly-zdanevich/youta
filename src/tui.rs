@@ -40719,7 +40719,10 @@ prose 07:25 remains clickable but is not a chapter";
                 "~/Music/01 - Long track.flac",
             ] {
                 let mut terminal = Terminal::new(TestBackend::new(width, 18)).expect("terminal");
-                let description = format!("Full path:\n{path}");
+                let path_description = format!("Full path:\n{path}");
+                let description = format!(
+                    "{path_description}\nCreated: 2026 August 25 14:20\nModified: 2026 August 26 09:05"
+                );
                 let view = ViewModel {
                     screen: Screen::Local,
                     details: Some(DetailView {
@@ -40786,7 +40789,21 @@ prose 07:25 remains clickable but is not a chapter";
                         },
                         ..selection
                     }),
-                    description
+                    path_description
+                );
+                let selectable = hit_map
+                    .detail_text_rows
+                    .iter()
+                    .map(|row| row.cells.concat())
+                    .collect::<Vec<_>>()
+                    .join("");
+                assert!(selectable.contains("Created: 2026 August 25 14:20"));
+                assert!(selectable.contains("Modified: 2026 August 26 09:05"));
+                assert!(
+                    !hit_map
+                        .detail_buttons
+                        .iter()
+                        .any(|(action, _)| matches!(action, UiAction::ActivateTimecode { .. }))
                 );
             }
         }

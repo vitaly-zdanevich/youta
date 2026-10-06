@@ -527,14 +527,24 @@
 		snapshot({ details: null });
 		await until(() => !document.querySelector('[aria-label=Details]'), 'cleared selected artwork owner');
 	}
-	/** Local path values begin on the next complete line without losing width to their heading. */
+	/** Local timestamps follow the selectable standalone path without becoming seek controls. */
 	async function checkLocalFullPath() {
 		const previous = clone(view);
-		for (const path of ['/fixture/library/audio.flac', '~/library/audio.flac', '/fixture/library/archive.zip!/audio.flac']) {
-			const description = `Full path:\n${path}`;
+		for (const [path, kind, created, modified] of [
+			['/fixture/library/audio.flac', 'file', '2026 August 25 14:20', '2026 September 3 09:05'],
+			['~/library/audio.flac', 'file', '2026 August 25 14:20', '2026 September 3 09:05'],
+			['/fixture/library/no-birth-time.flac', 'file', 'unavailable', '2026 September 3 09:05'],
+			['/fixture/library/no-modified-time.flac', 'file', '2026 August 25 14:20', 'unavailable'],
+			['/fixture/library/unavailable.flac', 'file', 'unavailable', 'unavailable'],
+			['/fixture/library/archive.zip!/audio.flac', 'archive member', null, null],
+			['/fixture/library', 'folder', null, null],
+		]) {
+			const lines = ['Full path:', path];
+			if (created !== null) lines.push(`Created: ${created}`, `Modified: ${modified}`);
+			const description = lines.join('\n');
 			snapshot({ screen: 'Local', details: { ...clone(defaults.DetailView),
 				title: 'Local path fixture', source: 'Local', description,
-				media_id: { source: 'local', external_id: path },
+				media_id: kind === 'folder' ? null : { source: 'local', external_id: path },
 			} });
 			const rendered = await until(() => {
 				const node = document.querySelector('[data-description]');
@@ -555,6 +565,30 @@
 			const styles = getComputedStyle(panel);
 			const availableWidth = panel.clientWidth - Number.parseFloat(styles.paddingLeft) - Number.parseFloat(styles.paddingRight);
 			assert(Math.abs(rendered.getBoundingClientRect().width - availableWidth) < 1, `Local path keeps the full description width: ${path}`);
+			range.setEnd(text, 'Full path:\n'.length + path.length);
+			const selection = window.getSelection();
+			selection.removeAllRanges();
+			selection.addRange(range);
+			assert(styles.userSelect === 'text' && selection.toString() === path,
+				`The complete Local path remains selectable without timestamp text: ${path}`);
+			selection.removeAllRanges();
+			assert(rendered.querySelector('button, a') === null,
+				`Local path and HH:MM metadata remain plain text without seek controls: ${path}`);
+			if (created !== null) {
+				for (const [offset, label] of ['Created:', 'Modified:'].entries()) {
+					const start = description.indexOf(label);
+					range.setStart(text, start);
+					range.setEnd(text, start + label.length);
+					const timestamp = range.getBoundingClientRect();
+					assert(Math.abs(timestamp.top - value.top - lineHeight * (offset + 1)) < 1,
+						`${label} follows the path in order on its own line: ${path}`);
+				}
+				assert(rendered.textContent === `Full path:\n${path}\nCreated: ${created}\nModified: ${modified}`,
+					`Local dates retain the exact English-month minute format or unavailable value: ${path}`);
+			} else {
+				assert(!rendered.textContent.includes('Created:') && !rendered.textContent.includes('Modified:'),
+					`The ${kind} description does not invent filesystem timestamps`);
+			}
 		}
 		snapshot(previous);
 	}
