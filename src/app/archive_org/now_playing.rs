@@ -115,6 +115,26 @@ impl AppController {
         self.archive_org.pending = None;
         self.archive_org.request = None;
         self.finish_search_activity(SearchActivity::ArchiveOrg);
+        // Fresh replay identities may name a ZIP member absent from item metadata.
+        // Resolve only a ZIP admitted by that metadata, with a new explicit owner.
+        if let Ok(ArchiveResponse::Details(parent)) = result
+            && parent.archive_filename.is_none()
+            && let Ok(source) = url::Url::parse(&owner.id.external_id)
+            && matching_track(parent, &source).is_none()
+            && let Some(archive) = zip::archive_for_source(parent, &source)
+        {
+            self.queue_archive_zip_request(Arc::clone(parent), archive, true);
+            if let Some(next) = self.archive_org.pending.as_ref() {
+                self.archive_org.now_playing = Some(PendingArchiveNowPlaying {
+                    generation: next.generation,
+                    id: owner.id,
+                    selected: self.view.selected,
+                });
+                self.begin_search_activity(SearchActivity::ArchiveOrg);
+                self.view.status_line = "Locating playing archive.org ZIP member…".into();
+            }
+            return true;
+        }
         match result {
             Ok(ArchiveResponse::Details(_)) if self.reveal_playing_archive_org(&owner.id) => {
                 if let Some(item) = self
@@ -162,6 +182,10 @@ impl AppController {
                         .and_then(|details| matching_track(details, &source))
                 })
             })
+            .or_else(|| {
+                self.cached_archive_zip_snapshots()
+                    .find_map(|details| matching_track(details, &source))
+            })
             .or_else(|| match self.current_autoplay_origin.as_ref() {
                 Some(AutoplayOrigin::ArchiveOrg { details, .. }) => {
                     matching_track(details, &source)
@@ -192,15 +216,18 @@ impl AppController {
             self.archive_org.page_turn = None;
             // Retained playback metadata may have outlived cache eviction. Keep
             // the real enclosing item available when Esc leaves its track list.
-            self.archive_org
-                .cache
-                .retain(|(identifier, _)| *identifier != details.item.identifier);
-            self.archive_org
-                .cache
-                .push_back((details.item.identifier.clone(), Ok(Arc::clone(&details))));
-            while self.archive_org.cache.len() > 8 {
-                self.archive_org.cache.pop_front();
+            if details.archive_filename.is_some() {
+                self.archive_org.zip_parent = self
+                    .cached_archive_details(&details.item.identifier)
+                    .and_then(Result::ok);
+            } else {
+                self.archive_org.zip_parent = None;
             }
+            self.cache_archive_response(
+                &details.item.identifier,
+                details.archive_filename.as_deref(),
+                Ok(Arc::clone(&details)),
+            );
             self.archive_org.active = Some(details);
         }
         // Navigation can revoke a stale search/open, but a pinned manual download
@@ -548,6 +575,7 @@ mod tests {
                     source: url::Url::parse("https://archive.org/download/other/track.mp3")
                         .unwrap(),
                     identifier: "other".into(),
+                    archive_filename: None,
                     generation: 7,
                 });
             }

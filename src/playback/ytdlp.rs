@@ -1675,9 +1675,108 @@ fn build_base_command(config: &YtDlpConfig) -> Command {
     command
 }
 
+/// Recovers a canonical Archive ZIP member's whitelisted audio filename suffix.
+///
+/// Archive serves extracted members as octet-stream, which yt-dlp can label
+/// `unknown_video`. Exact-file downloads keep those bytes unchanged, so their
+/// accepted member suffix is authoritative. Decode and rebuild bounded path
+/// components before trusting that suffix; arbitrary URLs, escaped separators,
+/// controls, and output-template text can never become a filename extension.
+fn archive_zip_audio_extension(source: &Url) -> Option<String> {
+    if source.as_str().len() > 6400 || !crate::domain::is_canonical_archive_org_audio_url(source) {
+        return None;
+    }
+    let mut segments = source.path_segments()?;
+    if segments.next()? != "download" {
+        return None;
+    }
+    let identifier = segments.next()?;
+    if identifier.is_empty()
+        || identifier.len() > 100
+        || !(identifier.as_bytes()[0].is_ascii_alphanumeric() || identifier.starts_with('@'))
+        || !identifier
+            .bytes()
+            .skip(1)
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+    {
+        return None;
+    }
+    let mut filenames = Vec::new();
+    let mut length = 0_usize;
+    for segment in segments {
+        let mut decoded = Vec::with_capacity(segment.len());
+        let mut bytes = segment.bytes();
+        while let Some(byte) = bytes.next() {
+            decoded.push(if byte == b'%' {
+                let high = char::from(bytes.next()?).to_digit(16)?;
+                let low = char::from(bytes.next()?).to_digit(16)?;
+                u8::try_from(high * 16 + low).ok()?
+            } else {
+                byte
+            });
+        }
+        let filename = String::from_utf8(decoded).ok()?;
+        if matches!(filename.as_str(), "" | "." | "..")
+            || filename
+                .chars()
+                .any(|character| character.is_control() || matches!(character, '/' | '\\'))
+        {
+            return None;
+        }
+        length += filename.len() + usize::from(!filenames.is_empty());
+        filenames.push(filename);
+        if length > 2048 || filenames.len() > 32 {
+            return None;
+        }
+    }
+    let (member, parents) = filenames.split_last()?;
+    if !parents.iter().any(|filename| {
+        filename
+            .rsplit_once('.')
+            .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("zip"))
+    }) {
+        return None;
+    }
+    let extension = member.rsplit_once('.')?.1.to_ascii_lowercase();
+    if !matches!(
+        extension.as_str(),
+        "mp3"
+            | "opus"
+            | "ogg"
+            | "oga"
+            | "m4a"
+            | "m4b"
+            | "aac"
+            | "flac"
+            | "wav"
+            | "wave"
+            | "aif"
+            | "aiff"
+            | "mp2"
+            | "wma"
+            | "ape"
+            | "shn"
+    ) {
+        return None;
+    }
+    let mut canonical = Url::parse("https://archive.org/").ok()?;
+    canonical
+        .path_segments_mut()
+        .ok()?
+        .clear()
+        .extend(["download", identifier])
+        .extend(&filenames);
+    (canonical == *source).then_some(extension)
+}
+
 /// Builds the shared fixed download policy without spawning it or appending the source URL.
 /// Private exporters can add their own supervised lifecycle and helper location.
 pub(crate) fn build_download_command(config: &YtDlpConfig, request: &DownloadRequest) -> Command {
+    let exact_archive_output = (request.scope == DownloadScope::SingleItem
+        && request.format == DownloadFormat::ExactFile)
+        .then(|| archive_zip_audio_extension(&request.source_url))
+        .flatten()
+        .map(|extension| format!("%(title).180B [%(id)s].{extension}"));
     let mut command = build_base_command(config);
     command
 		.arg("--no-overwrites")
@@ -1698,7 +1797,7 @@ pub(crate) fn build_download_command(config: &YtDlpConfig, request: &DownloadReq
         .arg(&request.destination)
         .arg("--output")
 		.arg(match request.scope {
-			DownloadScope::SingleItem => "%(title).180B [%(id)s].%(ext)s",
+			DownloadScope::SingleItem => exact_archive_output.as_deref().unwrap_or("%(title).180B [%(id)s].%(ext)s"),
 			DownloadScope::Collection | DownloadScope::CollectionArchiveOnly => {
 				"%(channel).100B [%(channel_id)s]/%(title).180B [%(id)s].%(ext)s"
 			}
@@ -2933,6 +3032,134 @@ mod tests {
         ] {
             let url = Url::parse(value).expect("valid test URL");
             assert!(validate_remote_source(&url).is_err());
+        }
+    }
+
+    /// ZIP-member downloads keep their known audio suffix despite octet-stream responses.
+    #[test]
+    fn exact_archive_zip_download_preserves_safe_member_audio_extensions() {
+        for (source, extension) in [
+            (
+                "https://archive.org/download/merry-bitsmix-3/Merry%20Bitsmix%203.0.zip/3D%20Santa%20Quest%20-%20Level%201.mp3",
+                "mp3",
+            ),
+            (
+                "https://archive.org/download/fixture/folder/Album.ZIP/Disc%201/Track.FLAC",
+                "flac",
+            ),
+            (
+                "https://archive.org/download/fixture/Album.zip/100%25%20mix/%D0%A2%D1%80%D0%B5%D0%BA.opus",
+                "opus",
+            ),
+        ] {
+            let request = archive_zip_download_request(source, DownloadFormat::ExactFile);
+            let command = build_download_command(&YtDlpConfig::default(), &request);
+            let arguments: Vec<_> = command
+                .get_args()
+                .map(|value| value.to_string_lossy().into_owned())
+                .collect();
+            let template = arguments
+                .windows(2)
+                .find(|pair| pair[0] == "--output")
+                .unwrap();
+            assert_eq!(template[1], format!("%(title).180B [%(id)s].{extension}"));
+            assert!(!arguments.iter().any(|argument| matches!(
+                argument.as_str(),
+                "--recode-video" | "--remux-video" | "--extract-audio"
+            )));
+        }
+    }
+
+    /// Only canonical Archive ZIP members can override ExactFile's output filename suffix.
+    #[test]
+    fn exact_archive_zip_download_rejects_untrusted_or_ambiguous_suffixes() {
+        for source in [
+            "https://archive.org/download/fixture/track.mp3",
+            "https://archive.org/download/fixture.zip/track.mp3",
+            "https://archive.org/download/fixture/Album.zip.mp3",
+            "https://archive.org/download/fixture/Album.zip/track.mp4",
+            "https://archive.org/download/fixture/Album.zip/track.exe",
+            "https://archive.org/download/fixture/Album.zip/track.mp3%25%28title%29s",
+            "https://archive.org/download/fixture/Album.zip/disc%2Ftrack.mp3",
+            "https://archive.org/download/fixture/Album.zip/disc%5Ctrack.mp3",
+            "https://archive.org/download/fixture/Album.zip/track%00.mp3",
+            "https://archive.org/download/fixture/Album.zip/%FF.mp3",
+            "https://archive.org/download/fixture/Album.zip/track%2Emp3",
+            "https://archive.org/download/fixture/Album.zip//track.mp3",
+            "https://archive.org/download/fixture/Album.zip/track.mp3?token=secret",
+            "https://archive.org/download/fixture/Album.zip/track.mp3#part",
+            "https://user@archive.org/download/fixture/Album.zip/track.mp3",
+            "https://archive.org:8443/download/fixture/Album.zip/track.mp3",
+            "http://archive.org/download/fixture/Album.zip/track.mp3",
+            "https://elsewhere.example/download/fixture/Album.zip/track.mp3",
+        ] {
+            let request = archive_zip_download_request(source, DownloadFormat::ExactFile);
+            let command = build_download_command(&YtDlpConfig::default(), &request);
+            let arguments: Vec<_> = command
+                .get_args()
+                .map(|value| value.to_string_lossy().into_owned())
+                .collect();
+            let template = arguments
+                .windows(2)
+                .find(|pair| pair[0] == "--output")
+                .unwrap();
+            assert_eq!(template[1], "%(title).180B [%(id)s].%(ext)s", "{source}");
+        }
+    }
+
+    /// Conversion and collection naming remain controlled by yt-dlp's resulting format.
+    #[test]
+    fn archive_zip_extension_does_not_override_other_download_modes_or_collections() {
+        let source = "https://archive.org/download/fixture/Album.zip/track.mp3";
+        for format in [
+            DownloadFormat::BestVideo,
+            DownloadFormat::AudioOnlyWithoutReencoding,
+            DownloadFormat::OpusWithoutTranscoding,
+            DownloadFormat::OriginalBestAudio,
+            DownloadFormat::TranscodeToOpus,
+        ] {
+            let request = archive_zip_download_request(source, format);
+            let command = build_download_command(&YtDlpConfig::default(), &request);
+            let arguments: Vec<_> = command
+                .get_args()
+                .map(|value| value.to_string_lossy().into_owned())
+                .collect();
+            assert!(
+                arguments
+                    .windows(2)
+                    .any(|pair| pair == ["--output", "%(title).180B [%(id)s].%(ext)s"])
+            );
+        }
+        for scope in [
+            DownloadScope::Collection,
+            DownloadScope::CollectionArchiveOnly,
+        ] {
+            let mut request = archive_zip_download_request(source, DownloadFormat::ExactFile);
+            request.scope = scope;
+            let command = build_download_command(&YtDlpConfig::default(), &request);
+            let arguments: Vec<_> = command
+                .get_args()
+                .map(|value| value.to_string_lossy().into_owned())
+                .collect();
+            assert!(arguments.windows(2).any(|pair| pair
+                == [
+                    "--output",
+                    "%(channel).100B [%(channel_id)s]/%(title).180B [%(id)s].%(ext)s"
+                ]));
+        }
+    }
+
+    /// Provides an inert download fixture whose command is inspected without spawning helpers.
+    fn archive_zip_download_request(source: &str, format: DownloadFormat) -> DownloadRequest {
+        DownloadRequest {
+            source_url: Url::parse(source).expect("fixture URL"),
+            destination: PathBuf::from("/tmp/youta-fixture-downloads"),
+            format,
+            scope: DownloadScope::SingleItem,
+            playlist_start: None,
+            skip_shorts: false,
+            write_thumbnail: false,
+            archive_path: None,
         }
     }
 

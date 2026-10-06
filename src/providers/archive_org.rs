@@ -24,6 +24,8 @@ use super::{
     VideoComment,
 };
 
+mod zip;
+
 const MAX_SEARCH_JSON_BYTES: usize = 4 * 1024 * 1024;
 /// Audio collections include per-track waveform and spectrogram metadata.
 const MAX_ITEM_JSON_BYTES: usize = 8 * 1024 * 1024;
@@ -219,6 +221,15 @@ pub struct ArchiveOrgFileCounts {
     pub playable: u64,
 }
 
+/// One public ZIP available for lazy browsing through Archive.org's member service.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ArchiveOrgZip {
+    /// Exact item-relative ZIP path; members are fetched only after it is opened.
+    pub filename: String,
+    /// Compressed ZIP size, separate from each member's extracted size.
+    pub size_bytes: Option<u64>,
+}
+
 /// Complete bounded item metadata and selected tracks.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ArchiveOrgItemDetails {
@@ -229,6 +240,12 @@ pub struct ArchiveOrgItemDetails {
     /// Known inventory counts; older snapshots do not invent zero-valued counts.
     #[serde(default)]
     pub file_counts: Option<ArchiveOrgFileCounts>,
+    /// Public ZIPs available to open without downloading or extracting locally.
+    #[serde(default)]
+    pub archives: Vec<ArchiveOrgZip>,
+    /// Exact parent ZIP path for a member listing; absent on the item's root.
+    #[serde(default)]
+    pub archive_filename: Option<String>,
     /// At most twenty public reviews represented as comments; stars stay text.
     pub comments: Vec<VideoComment>,
 }
@@ -241,6 +258,18 @@ pub trait ArchiveOrgTransport: Send + Sync {
     ///
     /// Reports network failures, unsuccessful status codes, and oversized bodies.
     fn fetch(&self, url: &Url, max_bytes: usize) -> Result<Vec<u8>, ProviderError>;
+
+    /// Reads a canonical ZIP directory with the same hard response bound.
+    ///
+    /// Production may follow only validated Archive storage redirects for this
+    /// exact ZIP. The default keeps existing injected transports compatible.
+    ///
+    /// # Errors
+    ///
+    /// Reports inaccessible listings, unsafe redirects, and oversized bodies.
+    fn fetch_zip_listing(&self, url: &Url, max_bytes: usize) -> Result<Vec<u8>, ProviderError> {
+        self.fetch(url, max_bytes)
+    }
 }
 
 /// Cloneable blocking client; the application runs provider work off its UI loop.
@@ -479,6 +508,8 @@ impl ArchiveOrgClient {
                     .sum(),
             }),
             tracks,
+            archives: zip::normalize_archives(files)?,
+            archive_filename: None,
             comments,
         })
     }
@@ -563,7 +594,7 @@ impl ArchiveOrgTransport for UreqArchiveOrgTransport {
                 "Archive.org transport accepts canonical HTTPS URLs only".into(),
             ));
         }
-        let mut response = self
+        let response = self
             .agent
             .get(url.as_str())
             .header("Accept", "application/json, text/html;q=0.9")
@@ -572,32 +603,44 @@ impl ArchiveOrgTransport for UreqArchiveOrgTransport {
                 ureq::Error::StatusCode(code) => ProviderError::HttpStatus(code),
                 other => ProviderError::Transport(other.to_string()),
             })?;
-        if !(200..300).contains(&response.status().as_u16()) {
-            return Err(ProviderError::HttpStatus(response.status().as_u16()));
-        }
-        if response
-            .body()
-            .content_length()
-            .is_some_and(|length| length > max_bytes as u64)
-        {
-            return Err(ProviderError::ResponseTooLarge { limit: max_bytes });
-        }
-        let bytes = response
-            .body_mut()
-            .with_config()
-            .limit(max_bytes.saturating_add(1) as u64)
-            .read_to_vec()
-            .map_err(|error| match error {
-                ureq::Error::BodyExceedsLimit(_) => {
-                    ProviderError::ResponseTooLarge { limit: max_bytes }
-                }
-                other => ProviderError::Transport(other.to_string()),
-            })?;
-        if bytes.len() > max_bytes {
-            return Err(ProviderError::ResponseTooLarge { limit: max_bytes });
-        }
-        Ok(bytes)
+        read_bounded_response(response, max_bytes)
     }
+
+    fn fetch_zip_listing(&self, url: &Url, max_bytes: usize) -> Result<Vec<u8>, ProviderError> {
+        zip::fetch_listing(&self.agent, url, max_bytes)
+    }
+}
+
+/// Applies the same response ceiling to direct metadata and validated ZIP listings.
+fn read_bounded_response(
+    mut response: ureq::http::Response<ureq::Body>,
+    max_bytes: usize,
+) -> Result<Vec<u8>, ProviderError> {
+    if !(200..300).contains(&response.status().as_u16()) {
+        return Err(ProviderError::HttpStatus(response.status().as_u16()));
+    }
+    if response
+        .body()
+        .content_length()
+        .is_some_and(|length| length > max_bytes as u64)
+    {
+        return Err(ProviderError::ResponseTooLarge { limit: max_bytes });
+    }
+    let bytes = response
+        .body_mut()
+        .with_config()
+        .limit(max_bytes.saturating_add(1) as u64)
+        .read_to_vec()
+        .map_err(|error| match error {
+            ureq::Error::BodyExceedsLimit(_) => {
+                ProviderError::ResponseTooLarge { limit: max_bytes }
+            }
+            other => ProviderError::Transport(other.to_string()),
+        })?;
+    if bytes.len() > max_bytes {
+        return Err(ProviderError::ResponseTooLarge { limit: max_bytes });
+    }
+    Ok(bytes)
 }
 
 /// Creates fixed-origin URLs by percent-encoding each individual path segment.

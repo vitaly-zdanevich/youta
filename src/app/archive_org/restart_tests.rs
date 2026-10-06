@@ -6,6 +6,196 @@ use super::*;
 use crate::providers::ProviderError;
 use crate::providers::archive_org::ArchiveOrgTransport;
 
+/// Serves root metadata and a ZIP directory independently without transferring ZIP bytes.
+struct ZipRestartTransport {
+    requests: Mutex<Vec<url::Url>>,
+    missing_zip: bool,
+    missing_member: bool,
+}
+
+impl ArchiveOrgTransport for ZipRestartTransport {
+    fn fetch(&self, url: &url::Url, _: usize) -> Result<Vec<u8>, ProviderError> {
+        self.requests.lock().unwrap().push(url.clone());
+        match url.path() {
+            "/advancedsearch.php" => Ok(serde_json::to_vec(&serde_json::json!({
+                "response": {"numFound": 1, "start": 0, "docs": [
+                    {"identifier":"second", "title":"ZIP item", "mediatype":"audio"}
+                ]}
+            }))
+            .unwrap()),
+            "/metadata/second" => {
+                let mut files =
+                    vec![serde_json::json!({"name":"direct.opus", "source":"original"})];
+                if !self.missing_zip {
+                    files.push(serde_json::json!({"name":"Album.zip", "format":"ZIP", "source":"original", "size":"9000"}));
+                }
+                Ok(serde_json::to_vec(&serde_json::json!({
+                    "metadata": {"identifier":"second", "title":"ZIP item", "mediatype":"audio"},
+                    "files": files
+                }))
+                .unwrap())
+            }
+            "/details/second" => Ok(Vec::new()),
+            "/download/second/Album.zip/" => Ok(if self.missing_member {
+                br#"<table class="archext"><caption>listing of Album.zip</caption><tr><td><a href="/download/second/Album.zip/01-new.mp3">01-new.mp3</a><td><td><td id="size">10</tr></table>"#.to_vec()
+            } else {
+                br#"<table class="archext"><caption>listing of Album.zip</caption>
+                <tr><th>file<th>as jpg<th>timestamp<th>size</tr>
+                <tr><td><a href="/download/second/Album.zip/01-new.mp3">01-new.mp3</a><td><td>2026-10-06<td id="size">10</tr>
+                <tr><td><a href="/download/second/Album.zip/disc%2F03-selected.mp3">disc/03-selected.mp3</a><td><td>2026-10-06<td id="size">20</tr>
+                </table>"#.to_vec()
+            }),
+            _ => panic!("unexpected ZIP restart fetch: {url}"),
+        }
+    }
+}
+
+/// Restart resolves the enclosing ZIP lazily and keeps Back at its original item row.
+#[test]
+fn archive_zip_restart_reopens_exact_member_without_playback_or_archive_download() {
+    let (_temporary, config) = saved_item();
+    let store = StateStore::open(&config).unwrap();
+    let mut saved = store.session().unwrap().unwrap();
+    let location = saved.archive_org_location.as_mut().unwrap();
+    location.archive_filename = Some("Album.zip".into());
+    location.filename = Some("Album.zip/disc/03-selected.mp3".into());
+    store.save_session(&saved, 2).unwrap();
+    drop(store);
+    let (mut app, _) = reopened(config, false);
+    let transport = Arc::new(ZipRestartTransport {
+        requests: Mutex::new(Vec::new()),
+        missing_zip: false,
+        missing_member: false,
+    });
+    app.archive_org.client = ArchiveOrgClient::with_transport(transport.clone());
+    finish_restore(&mut app);
+    assert_eq!(
+        app.archive_org
+            .active
+            .as_ref()
+            .unwrap()
+            .archive_filename
+            .as_deref(),
+        Some("Album.zip")
+    );
+    assert_eq!(app.view.selected, 1);
+    assert_eq!(
+        app.selected_archive_org_queue_item()
+            .unwrap()
+            .playback_location,
+        "https://archive.org/download/second/Album.zip/disc/03-selected.mp3"
+    );
+    assert_eq!(
+        app.archive_org_session_location()
+            .unwrap()
+            .archive_filename
+            .as_deref(),
+        Some("Album.zip")
+    );
+    assert!(app.player.is_none());
+    assert!(app.playback_queue.items.is_empty());
+    assert!(app.go_back_archive_org());
+    assert!(
+        app.archive_org
+            .active
+            .as_ref()
+            .unwrap()
+            .archive_filename
+            .is_none()
+    );
+    assert_eq!(app.selected_archive_zip().unwrap().filename, "Album.zip");
+    assert!(app.selected_archive_org_queue_item().is_err());
+    assert!(app.go_back_archive_org());
+    assert!(app.archive_org.active.is_none());
+    assert_eq!(
+        transport
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|url| url.path().ends_with(".zip/"))
+            .count(),
+        1
+    );
+}
+
+/// Removed ZIPs or members fall back without starting playback or retrying each frame.
+#[test]
+fn archive_zip_restart_missing_container_or_member_stops_at_safe_parent() {
+    for missing_zip in [true, false] {
+        let (_temporary, config) = saved_item();
+        let store = StateStore::open(&config).unwrap();
+        let mut saved = store.session().unwrap().unwrap();
+        let location = saved.archive_org_location.as_mut().unwrap();
+        location.archive_filename = Some("Album.zip".into());
+        location.filename = Some("Album.zip/disc/03-selected.mp3".into());
+        store.save_session(&saved, 2).unwrap();
+        drop(store);
+        let (mut app, _) = reopened(config, false);
+        let transport = Arc::new(ZipRestartTransport {
+            requests: Mutex::new(Vec::new()),
+            missing_zip,
+            missing_member: !missing_zip,
+        });
+        app.archive_org.client = ArchiveOrgClient::with_transport(transport.clone());
+        finish_restore(&mut app);
+        assert!(
+            app.view
+                .status_line
+                .contains("saved file is no longer available")
+        );
+        assert_eq!(app.view.selected, 0);
+        assert_eq!(
+            app.archive_org
+                .active
+                .as_ref()
+                .unwrap()
+                .archive_filename
+                .is_none(),
+            missing_zip
+        );
+        assert!(app.player.is_none());
+        assert!(app.playback_queue.items.is_empty());
+        let requests = transport.requests.lock().unwrap().len();
+        for _ in 0..3 {
+            app.poll_archive_org_worker();
+        }
+        assert_eq!(
+            transport.requests.lock().unwrap().len(),
+            requests,
+            "missing route must not retry each frame"
+        );
+    }
+}
+
+/// Revealing a fresh ZIP playback identity loads root and members without replaying.
+#[test]
+fn archive_zip_now_playing_reveal_resolves_member_without_changing_queue() {
+    let (_temporary, mut app) = super::tests::lookup_controller();
+    disable_external_enrichment(&mut app);
+    app.view.screen = Screen::SoundCloud;
+    app.archive_org.initialized = true;
+    let transport = Arc::new(ZipRestartTransport {
+        requests: Mutex::new(Vec::new()),
+        missing_zip: false,
+        missing_member: false,
+    });
+    app.archive_org.client = ArchiveOrgClient::with_transport(transport.clone());
+    let source = "https://archive.org/download/second/Album.zip/disc/03-selected.mp3";
+    let id = MediaId::new(SourceKind::ArchiveOrg, source);
+    app.current_media = Some(id.clone());
+    assert!(app.request_playing_archive_org(&id));
+    finish_restore(&mut app);
+    assert_eq!(app.view.screen, Screen::ArchiveOrg);
+    assert_eq!(app.view.selected, 1);
+    assert_eq!(app.selected_archive_org_queue_item().unwrap().media.id, id);
+    assert!(app.playback_queue.items.is_empty());
+    assert!(app.player.is_none());
+    assert_eq!(transport.requests.lock().unwrap().len(), 3);
+    assert!(app.go_back_archive_org());
+    assert_eq!(app.selected_archive_zip().unwrap().filename, "Album.zip");
+}
+
 /// Returns reordered catalogue/files, recording the exact requests made after restart.
 struct RestartTransport {
     requests: Mutex<Vec<url::Url>>,

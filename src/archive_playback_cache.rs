@@ -166,7 +166,7 @@ impl ArchivePlaybackCache {
         if !canonical_source(&source) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "expected a canonical Archive file URL",
+                "expected a cacheable canonical Archive file URL",
             ));
         }
         budget
@@ -706,6 +706,8 @@ fn content_range(value: &str) -> Option<(u64, u64, u64)> {
     (start <= end && end < length).then_some((start, end, length))
 }
 
+/// Accepts canonical files whose route is eligible for original-byte range caching.
+///
 /// Only provider-canonical segment spelling is accepted; decoded separators never escape it.
 fn canonical_source(url: &Url) -> bool {
     if url.as_str().len() > 6400 || !crate::domain::is_canonical_archive_org_audio_url(url) {
@@ -750,6 +752,16 @@ fn canonical_source(url: &Url) -> bool {
         }
     }
     if filenames.is_empty() {
+        return false;
+    }
+    // Archive's ZIP-member endpoint ignores Range and streams without a length.
+    // Keep mpv on the direct URL instead of first probing/decompressing the same
+    // member through this cache and then redirecting playback to fetch it again.
+    if filenames.iter().take(filenames.len() - 1).any(|filename| {
+        filename
+            .rsplit_once('.')
+            .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("zip"))
+    }) {
         return false;
     }
     let Ok(mut canonical) = Url::parse("https://archive.org/") else {
@@ -1321,6 +1333,49 @@ mod tests {
             "https://user@archive.org/download/fixture/a.flac",
         ] {
             assert!(ArchivePlaybackCache::start(Url::parse(address).unwrap()).is_err());
+        }
+    }
+
+    /// ZIP members stream without ranges, so playback must keep the direct URL.
+    #[test]
+    fn playback_cache_declines_zip_members_before_binding_or_fetching() {
+        let origin = Origin::new(2048, ResponseKind::IgnoreRange);
+        for address in [
+            "https://archive.org/download/fixture/album.zip/track.mp3",
+            "https://archive.org/download/fixture/album.ZIP/disc/track.mp3",
+            "https://archive.org/download/fixture/album%20name.zip/track.mp3",
+            "https://archive.org/download/fixture/folder/album.zip/track.mp3",
+            "https://archive.org/download/fixture/album%2Ezip/track.mp3",
+        ] {
+            let budget = Arc::new(Budget::new(MAX_TOTAL_BYTES));
+            let result = ArchivePlaybackCache::start_inner(
+                Url::parse(address).unwrap(),
+                origin.url.clone(),
+                Arc::clone(&budget),
+            );
+            assert!(result.is_err(), "ZIP member must play directly: {address}");
+            assert_eq!(budget.entries.load(Ordering::Acquire), 0);
+            assert_eq!(budget.bytes.load(Ordering::Acquire), 0);
+        }
+        assert_eq!(origin.calls.load(Ordering::Acquire), 0);
+    }
+
+    /// Only a ZIP path ancestor disables caching; ordinary nested files still work.
+    #[test]
+    fn playback_cache_keeps_regular_nested_and_zip_named_audio_eligible() {
+        let origin = Origin::new(2048, ResponseKind::Valid);
+        for address in [
+            "https://archive.org/download/fixture/album/disc/track.mp3",
+            "https://archive.org/download/fixture/album.zip.mp3",
+            "https://archive.org/download/fixture/album.zip.backup/track.mp3",
+            "https://archive.org/download/fixture.zip/track.mp3",
+        ] {
+            let source = Url::parse(address).unwrap();
+            let cache = ArchivePlaybackCache::start_with_origin(source.clone(), origin.url.clone())
+                .unwrap();
+            assert_eq!(cache.source_url(), &source);
+            assert_eq!(get(cache.playback_url(), None).1, *origin.bytes);
+            assert!(cache.completed().is_some());
         }
     }
 

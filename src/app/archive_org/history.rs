@@ -12,6 +12,7 @@ pub(super) struct ArchiveLocation {
     selected: usize,
     selected_id: Option<String>,
     active_id: Option<String>,
+    archive_filename: Option<String>,
     track: usize,
     filename: Option<String>,
     scroll: usize,
@@ -39,6 +40,7 @@ impl ArchiveLocation {
             selected: location.catalogue_selected,
             selected_id: location.catalogue_identifier,
             active_id: Some(location.identifier),
+            archive_filename: location.archive_filename,
             track: 0,
             filename: location.filename,
             scroll: 0,
@@ -55,6 +57,7 @@ impl ArchiveLocation {
             catalogue_selected: self.selected,
             catalogue_identifier: self.selected_id.clone(),
             identifier: self.active_id.clone()?,
+            archive_filename: self.archive_filename.clone(),
             filename: self.filename.clone(),
         };
         location.is_valid().then_some(location)
@@ -74,31 +77,34 @@ impl AppController {
             } else {
                 self.view.selected
             };
-            let mut location = ArchiveLocation {
-                query: self.archive_org.submitted_query.clone(),
-                scope: self.archive_org.submitted_scope,
-                selected,
-                selected_id: self
-                    .archive_org
-                    .items
-                    .get(selected)
-                    .map(|item| item.identifier.clone()),
-                active_id: self
-                    .archive_org
-                    .active
-                    .as_ref()
-                    .map(|details| details.item.identifier.clone()),
-                track: self.view.selected,
-                filename: self
-                    .archive_org
-                    .active
-                    .as_ref()
-                    .and_then(|details| details.tracks.get(self.view.selected))
-                    .map(|track| track.filename.clone()),
-                scroll: self.view.details_scroll,
-                focused: self.view.details_focused,
-                cached: None,
-            };
+            let mut location =
+                ArchiveLocation {
+                    query: self.archive_org.submitted_query.clone(),
+                    scope: self.archive_org.submitted_scope,
+                    selected,
+                    selected_id: self
+                        .archive_org
+                        .items
+                        .get(selected)
+                        .map(|item| item.identifier.clone()),
+                    active_id: self
+                        .archive_org
+                        .active
+                        .as_ref()
+                        .map(|details| details.item.identifier.clone()),
+                    archive_filename: self
+                        .archive_org
+                        .active
+                        .as_ref()
+                        .and_then(|details| details.archive_filename.clone()),
+                    track: self.view.selected,
+                    filename: self.archive_org.active.as_ref().and_then(|details| {
+                        session::selected_filename(details, self.view.selected)
+                    }),
+                    scroll: self.view.details_scroll,
+                    focused: self.view.details_focused,
+                    cached: None,
+                };
             let items = std::mem::take(&mut self.archive_org.items);
             let active = self.archive_org.active.take();
             // A pending search is not a completed empty/partial catalogue.
@@ -212,27 +218,12 @@ impl AppController {
             .unwrap_or(location.selected)
             .min(self.archive_org.items.len().saturating_sub(1));
         self.archive_org_selected = self.archive_org.search_selected;
-        if let Some(identifier) = location.active_id.clone()
-            && self
-                .archive_org
-                .active
-                .as_ref()
-                .is_none_or(|details| details.item.identifier != identifier)
+        let identifier = location.active_id.clone();
+        let archive_filename = location.archive_filename.clone();
+        if let Some(identifier) = identifier
+            && !self.restore_archive_target(&identifier, archive_filename.as_deref())
         {
-            match self.cached_archive_details(&identifier) {
-                Some(Ok(details)) => self.archive_org.active = Some(details),
-                Some(Err(_)) => {} // Failed metadata does not create an automatic retry loop.
-                None => {
-                    self.queue_archive_request(
-                        ArchiveRequest::Details {
-                            identifier,
-                            open: true,
-                        },
-                        false,
-                    );
-                    return false;
-                }
-            }
+            return false;
         }
         let location = self
             .archive_org
@@ -241,22 +232,18 @@ impl AppController {
             .expect("owned Archive restoration");
         let mut missing_file = false;
         if let Some(details) = &self.archive_org.active {
-            let exact_file = location.filename.as_ref().and_then(|filename| {
-                details
-                    .tracks
-                    .iter()
-                    .position(|track| track.filename == *filename)
-            });
-            missing_file = location.filename.is_some() && exact_file.is_none();
+            let exact_file = location
+                .filename
+                .as_ref()
+                .and_then(|filename| session::filename_index(details, filename));
+            missing_file = (location.filename.is_some() && exact_file.is_none())
+                || location.archive_filename != details.archive_filename;
             self.archive_org_selected = exact_file
                 .unwrap_or(if missing_file { 0 } else { location.track })
-                .min(details.tracks.len().saturating_sub(1));
+                .min((details.tracks.len() + details.archives.len()).saturating_sub(1));
         }
         self.archive_org.message = if let Some(details) = &self.archive_org.active {
-            format!(
-                "{} audio tracks · Enter: play · d: download · Esc: back",
-                details.tracks.len()
-            )
+            zip::items_message(details)
         } else {
             format!(
                 "{} of {} archive.org items · Enter: open · /: search",
@@ -275,13 +262,75 @@ impl AppController {
         true
     }
 
+    /// Restores a ZIP only after revalidating its membership in public parent metadata.
+    /// Errors remain terminal for this attempt; an explicit later open can retry.
+    fn restore_archive_target(&mut self, identifier: &str, archive: Option<&str>) -> bool {
+        if self.archive_org.active.as_ref().is_some_and(|details| {
+            details.item.identifier == identifier && details.archive_filename.as_deref() == archive
+        }) {
+            return true;
+        }
+        let cached = self.cached_archive_details_for(identifier, archive);
+        if let Some(Ok(details)) = &cached {
+            self.archive_org.zip_parent =
+                archive.and_then(|_| self.cached_archive_details(identifier).and_then(Result::ok));
+            self.archive_org.active = Some(Arc::clone(details));
+            return true;
+        }
+        if let Some(archive) = archive {
+            let parent = self
+                .archive_org
+                .active
+                .as_ref()
+                .filter(|details| {
+                    details.item.identifier == identifier && details.archive_filename.is_none()
+                })
+                .cloned()
+                .or_else(|| self.cached_archive_details(identifier).and_then(Result::ok));
+            if let Some(parent) = parent {
+                self.archive_org.active = Some(Arc::clone(&parent));
+                if cached.is_none()
+                    && let Some(descriptor) = parent
+                        .archives
+                        .iter()
+                        .find(|entry| entry.filename == archive)
+                        .cloned()
+                {
+                    self.queue_archive_zip_request(parent, descriptor, true);
+                    return false;
+                }
+                return true;
+            }
+        } else if cached.is_some() {
+            return true;
+        }
+        if self
+            .cached_archive_details(identifier)
+            .is_some_and(|result| result.is_err())
+        {
+            return true;
+        }
+        self.queue_archive_request(
+            ArchiveRequest::Details {
+                identifier: identifier.to_owned(),
+                open: true,
+            },
+            false,
+        );
+        false
+    }
+
     /// Publishes only currently actionable Back controls to both renderers.
     pub(super) fn update_archive_back_available(&mut self) {
         self.view.archive_org_back_available = !self.archive_download_lookup_pending()
             && (self.archive_org.active.is_some()
                 || !self.archive_org.history.is_empty()
                 || self.archive_org.pending.as_ref().is_some_and(|job| {
-                    matches!(job.kind, ArchiveRequest::Details { open: true, .. })
+                    matches!(
+                        job.kind,
+                        ArchiveRequest::Details { open: true, .. }
+                            | ArchiveRequest::Zip { open: true, .. }
+                    )
                 }));
     }
 
@@ -314,6 +363,13 @@ fn retained_weight(
     if let Some(details) = active {
         budget.add(std::mem::size_of::<ArchiveOrgItemDetails>())?;
         budget.item(&details.item)?;
+        if let Some(filename) = &details.archive_filename {
+            budget.add(filename.capacity())?;
+        }
+        budget.vector(&details.archives)?;
+        for archive in &details.archives {
+            budget.add(archive.filename.capacity())?;
+        }
         budget.vector(&details.tracks)?;
         for track in &details.tracks {
             budget.add(track.filename.capacity())?;

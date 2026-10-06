@@ -8,6 +8,10 @@ mod history;
 mod now_playing;
 mod playback_choice;
 mod session;
+mod zip;
+
+#[cfg(test)]
+mod zip_tests;
 
 #[cfg(test)]
 mod search_pagination_tests;
@@ -32,7 +36,7 @@ use crate::domain::ArchiveOrgSearchScope;
 use crate::providers::archive_org::ArchiveOrgDownloadVariant;
 use crate::providers::archive_org::{
     ArchiveOrgClient, ArchiveOrgItem, ArchiveOrgItemDetails, ArchiveOrgSearchPage,
-    ArchiveOrgSearchRequest, ArchiveOrgTrack,
+    ArchiveOrgSearchRequest, ArchiveOrgTrack, ArchiveOrgZip,
 };
 
 /// Search pages and metadata are bounded independently; navigation never waits on HTTP.
@@ -42,6 +46,12 @@ pub(super) struct ArchiveOrgState {
     items: Vec<ArchiveOrgItem>,
     active: Option<Arc<ArchiveOrgItemDetails>>,
     cache: VecDeque<(String, Result<Arc<ArchiveOrgItemDetails>, String>)>,
+    /// ZIP snapshots have separate cache identities from their enclosing item.
+    zip_cache: VecDeque<zip::ArchiveZipCacheEntry>,
+    /// Retains the current ZIP's enclosing item even if its ordinary cache ages out.
+    zip_parent: Option<Arc<ArchiveOrgItemDetails>>,
+    /// Exact parent row to restore if a retained ZIP outlived its parent snapshot.
+    zip_return_filename: Option<String>,
     search_highlighter: super::archive_org_highlight::ArchiveSearchHighlighter,
     description_urls: ArchiveDescriptionUrlCache,
     /// Owns the displayed result set; persisted editor drafts may change separately.
@@ -109,6 +119,8 @@ struct ArchiveDownloadLookup {
     #[cfg(any(feature = "yt-dlp", test))]
     source: url::Url,
     identifier: String,
+    /// A member lookup first loads its enclosing item, then its verified ZIP.
+    archive_filename: Option<String>,
     generation: u64,
 }
 
@@ -124,7 +136,16 @@ struct ArchiveJob {
 #[derive(Clone)]
 enum ArchiveRequest {
     Search(ArchiveOrgSearchRequest),
-    Details { identifier: String, open: bool },
+    Details {
+        identifier: String,
+        open: bool,
+    },
+    /// Listing metadata is fetched only for a ZIP admitted by its parent item.
+    Zip {
+        parent: Arc<ArchiveOrgItemDetails>,
+        archive: ArchiveOrgZip,
+        open: bool,
+    },
 }
 
 /// The only live provider thread owns no UI or persistence references.
@@ -168,7 +189,28 @@ impl AppController {
         {
             self.cancel_archive_download_lookup();
         }
-        let cached = self.cached_archive_details(&identifier);
+        let root = self
+            .cached_archive_details(&identifier)
+            .and_then(Result::ok)
+            .or_else(|| {
+                self.archive_org
+                    .active
+                    .as_ref()
+                    .filter(|details| {
+                        details.item.identifier == identifier && details.archive_filename.is_none()
+                    })
+                    .cloned()
+            });
+        let archive = root
+            .as_ref()
+            .and_then(|parent| zip::archive_for_source(parent, source));
+        let archive_filename = self
+            .archive_org
+            .download_lookup
+            .as_ref()
+            .and_then(|lookup| lookup.archive_filename.as_deref())
+            .or_else(|| archive.as_ref().map(|archive| archive.filename.as_str()));
+        let cached = self.cached_archive_details_for(&identifier, archive_filename);
         let active = self
             .archive_org
             .active
@@ -179,6 +221,10 @@ impl AppController {
             .and_then(|result| result.as_ref().ok())
             .into_iter()
             .chain(active)
+            .chain(
+                self.cached_archive_zip_snapshots()
+                    .filter(|details| details.item.identifier == identifier),
+            )
         {
             if let Some(track) = details.tracks.iter().find(|track| {
                 track.download_url == *source
@@ -192,6 +238,37 @@ impl AppController {
             }
         }
         if self.archive_org.download_lookup.is_some() {
+            if self.archive_download_lookup_pending() {
+                return Ok(None);
+            }
+            if self
+                .archive_org
+                .download_lookup
+                .as_ref()
+                .is_some_and(|lookup| lookup.archive_filename.is_none())
+                && let Some(Err(error)) = self.cached_archive_details(&identifier)
+            {
+                return Err(error);
+            }
+            if self
+                .archive_org
+                .download_lookup
+                .as_ref()
+                .is_some_and(|lookup| lookup.archive_filename.is_none())
+                && let Some(parent) = root
+                && let Some(archive) = archive
+            {
+                self.queue_archive_download_lookup(
+                    source,
+                    identifier,
+                    ArchiveRequest::Zip {
+                        parent,
+                        archive,
+                        open: false,
+                    },
+                );
+                return Ok(None);
+            }
             if let Some(result) = cached {
                 return match result {
                     Err(error) => Err(error),
@@ -201,46 +278,23 @@ impl AppController {
                     ),
                 };
             }
-            return if self.archive_download_lookup_pending() {
-                Ok(None)
-            } else {
-                Err("Archive.org download metadata lookup was canceled".to_owned())
-            };
+            return Err("Archive.org download metadata lookup was canceled".to_owned());
         }
         // A new user action may refresh a failed/legacy cache once. The pinned
         // generation keeps subsequent polls from clearing this attempt's result.
-        self.archive_org.cache.retain(|(id, _)| id != &identifier);
-        let existing = self.archive_org.pending.as_mut().filter(|job| {
-            matches!(&job.kind, ArchiveRequest::Details { identifier: pending, .. } if *pending == identifier)
-        });
-        let generation = if let Some(job) = existing {
-            if let ArchiveRequest::Details { open, .. } = &mut job.kind {
-                *open = false;
-            }
-            if let Some(request) = &mut self.archive_org.request
-                && request.generation == job.generation
-                && let ArchiveRequest::Details { open, .. } = &mut request.kind
-            {
-                *open = false;
-            }
-            job.generation
-        } else {
-            self.archive_org.generation.wrapping_add(1)
-        };
-        self.finish_search_activity(SearchActivity::ArchiveOrg);
-        self.archive_org.download_lookup = Some(ArchiveDownloadLookup {
-            source: source.clone(),
-            identifier: identifier.clone(),
-            generation,
-        });
-        self.queue_archive_request(
-            ArchiveRequest::Details {
-                identifier,
+        let request = if let (Some(parent), Some(archive)) = (root, archive) {
+            ArchiveRequest::Zip {
+                parent,
+                archive,
                 open: false,
-            },
-            false,
-        );
-        self.update_archive_back_available();
+            }
+        } else {
+            ArchiveRequest::Details {
+                identifier: identifier.clone(),
+                open: false,
+            }
+        };
+        self.queue_archive_download_lookup(source, identifier, request);
         Ok(None)
     }
 
@@ -322,6 +376,8 @@ impl AppController {
             .clone_from(&self.archive_org_search_query);
         self.archive_org.items.clear();
         self.archive_org.active = None;
+        self.archive_org.zip_parent = None;
+        self.archive_org.zip_return_filename = None;
         self.archive_org.next_page = None;
         self.archive_org.search_selected = 0;
         self.archive_org_selected = 0;
@@ -344,6 +400,23 @@ impl AppController {
 
     /// Coalesces rapid selections to one latest request behind one bounded worker.
     fn queue_archive_request(&mut self, kind: ArchiveRequest, debounce: bool) {
+        if let ArchiveRequest::Zip {
+            parent,
+            archive,
+            open,
+        } = &kind
+            && let Some(pending) = &mut self.archive_org.pending
+            && let ArchiveRequest::Zip {
+                parent: previous_parent,
+                archive: previous_archive,
+                open: previous_open,
+            } = &mut pending.kind
+            && previous_parent.item.identifier == parent.item.identifier
+            && previous_archive.filename == archive.filename
+        {
+            *previous_open |= open;
+            return;
+        }
         if let ArchiveRequest::Details { identifier, open } = &kind
             && let Some(pending) = &mut self.archive_org.pending
             && let ArchiveRequest::Details {
@@ -403,6 +476,11 @@ impl AppController {
                     ArchiveRequest::Details { identifier, .. } => client
                         .item_details(identifier)
                         .map(|details| ArchiveResponse::Details(Arc::new(details))),
+                    ArchiveRequest::Zip {
+                        parent, archive, ..
+                    } => client
+                        .zip_details(parent, archive)
+                        .map(|details| ArchiveResponse::Details(Arc::new(details))),
                 }
                 .map_err(|error| error.to_string());
                 let _ = sender.send(result);
@@ -456,20 +534,14 @@ impl AppController {
         job: ArchiveJob,
         result: Result<ArchiveResponse, String>,
     ) {
-        if let ArchiveRequest::Details { identifier, .. } = &job.kind {
+        if let Some((identifier, archive_filename)) = zip::request_location(&job.kind) {
             let cached = match &result {
                 Ok(ArchiveResponse::Details(details)) => Some(Ok(Arc::clone(details))),
                 Err(error) => Some(Err(error.clone())),
                 Ok(ArchiveResponse::Search(_)) => None,
             };
             if let Some(cached) = cached {
-                self.archive_org.cache.retain(|(id, _)| id != identifier);
-                self.archive_org
-                    .cache
-                    .push_back((identifier.clone(), cached));
-                while self.archive_org.cache.len() > 8 {
-                    self.archive_org.cache.pop_front();
-                }
+                self.cache_archive_response(identifier, archive_filename, cached);
             }
         }
         if self.complete_archive_now_playing_lookup(&job, &result) {
@@ -488,10 +560,19 @@ impl AppController {
             .pending
             .take()
             .expect("current Archive.org owner");
-        if self.archive_org.download_lookup.as_ref().is_some_and(|lookup| {
-            lookup.generation == owner.generation
-                && matches!(&owner.kind, ArchiveRequest::Details { identifier, .. } if *identifier == lookup.identifier)
-        }) {
+        if self
+            .archive_org
+            .download_lookup
+            .as_ref()
+            .is_some_and(|lookup| {
+                lookup.generation == owner.generation
+                    && zip::request_location(&owner.kind)
+                        == Some((
+                            lookup.identifier.as_str(),
+                            lookup.archive_filename.as_deref(),
+                        ))
+            })
+        {
             // The download popup polls the cache using its pinned file URL.
             // Do not open an item or rewrite another tab's rows/status/details.
             self.update_archive_back_available();
@@ -543,28 +624,58 @@ impl AppController {
                 );
             }
             Ok(ArchiveResponse::Details(details)) => {
-                if matches!(owner.kind, ArchiveRequest::Details { open: true, .. }) {
-                    self.archive_org.search_selected = self.archive_org_selected;
-                    self.archive_org.active = Some(Arc::clone(&details));
-                    self.archive_org_selected = 0;
-                    if self.view.screen == Screen::ArchiveOrg {
-                        self.view.selected = 0;
+                if matches!(
+                    owner.kind,
+                    ArchiveRequest::Details { open: true, .. }
+                        | ArchiveRequest::Zip { open: true, .. }
+                ) {
+                    if let ArchiveRequest::Zip { parent, .. } = &owner.kind {
+                        self.archive_org.zip_parent = Some(Arc::clone(parent));
+                    } else {
+                        if self.archive_org.zip_return_filename.is_none() {
+                            self.archive_org.search_selected = self.archive_org_selected;
+                        }
+                        self.archive_org.zip_parent = None;
                     }
-                    self.archive_org.message = format!(
-                        "{} audio tracks · Enter: play · d: download · Esc: back",
-                        details.tracks.len()
-                    );
+                    self.archive_org.active = Some(Arc::clone(&details));
+                    self.archive_org_selected = self
+                        .archive_org
+                        .zip_return_filename
+                        .take()
+                        .and_then(|filename| {
+                            details
+                                .archives
+                                .iter()
+                                .position(|archive| archive.filename == filename)
+                        })
+                        .map_or(0, |index| details.tracks.len() + index);
+                    if self.view.screen == Screen::ArchiveOrg {
+                        self.view.selected = self.archive_org_selected;
+                    }
+                    self.archive_org.message = zip::items_message(&details);
                 }
                 self.complete_archive_comments(&details);
             }
             Err(error) => {
                 self.archive_org.page_turn = None;
+                self.archive_org.zip_return_filename = None;
                 let was_restoring = self.archive_org.restoring.is_some();
                 self.archive_org.restoring = None;
                 self.archive_org.message = if was_restoring {
-                    format!(
-                        "Saved archive.org location is unavailable; showing the catalogue: {error}"
-                    )
+                    if self
+                        .archive_org
+                        .active
+                        .as_ref()
+                        .is_some_and(|details| details.archive_filename.is_none())
+                    {
+                        format!(
+                            "Saved archive.org location is unavailable; showing the enclosing item: {error}"
+                        )
+                    } else {
+                        format!(
+                            "Saved archive.org location is unavailable; showing the catalogue: {error}"
+                        )
+                    }
                 } else {
                     format!("Archive.org: {error}")
                 };
@@ -572,9 +683,20 @@ impl AppController {
                 // background selection prefetches must not interrupt the user.
                 if self.view.screen == Screen::ArchiveOrg
                     && !was_restoring
-                    && matches!(owner.kind, ArchiveRequest::Details { open: true, .. })
+                    && matches!(
+                        owner.kind,
+                        ArchiveRequest::Details { open: true, .. }
+                            | ArchiveRequest::Zip { open: true, .. }
+                    )
                 {
-                    self.show_actionable_message("Could not open archive.org item", &error);
+                    self.show_actionable_message(
+                        if matches!(owner.kind, ArchiveRequest::Zip { .. }) {
+                            "Could not open archive.org ZIP"
+                        } else {
+                            "Could not open archive.org item"
+                        },
+                        &error,
+                    );
                 }
                 if let Some(popup) = &mut self.view.video_comments_popup
                     && popup.source == SourceKind::ArchiveOrg
@@ -635,6 +757,16 @@ impl AppController {
                     compact: true,
                     ..RowView::default()
                 })
+                .chain(details.archives.iter().map(|archive| RowView {
+                    title: archive.filename.clone(),
+                    subtitle: archive.size_bytes.map_or_else(
+                        || "ZIP folder".to_owned(),
+                        |size| format!("ZIP folder · {}", human_bytes(size)),
+                    ),
+                    source: "archive.org".to_owned(),
+                    compact: true,
+                    ..RowView::default()
+                }))
                 .collect()
         } else {
             let mut rows: Vec<_> = self
@@ -671,7 +803,9 @@ impl AppController {
         if self.archive_org.pending.as_ref().is_some_and(|job| {
             matches!(
                 job.kind,
-                ArchiveRequest::Search(_) | ArchiveRequest::Details { open: true, .. }
+                ArchiveRequest::Search(_)
+                    | ArchiveRequest::Details { open: true, .. }
+                    | ArchiveRequest::Zip { open: true, .. }
             )
         }) {
             self.begin_search_activity(SearchActivity::ArchiveOrg);
@@ -733,18 +867,14 @@ impl AppController {
         &self,
         identifier: &str,
     ) -> Option<Result<Arc<ArchiveOrgItemDetails>, String>> {
-        self.archive_org
-            .cache
-            .iter()
-            .rev()
-            .find(|(id, _)| id == identifier)
-            .map(|(_, result)| result.clone())
+        self.cached_archive_details_for(identifier, None)
     }
 
     /// Displays known metadata immediately and debounces only missing metadata.
     pub(super) fn update_archive_org_detail(&mut self) {
         self.cancel_stale_archive_now_playing_navigation();
         self.archive_org_selected = self.view.selected;
+        self.cancel_archive_zip_open_for_selection();
         let selected = self.selected_archive_item();
         if self.archive_org.now_playing.is_none()
             && !self.archive_download_lookup_pending()
@@ -770,6 +900,18 @@ impl AppController {
             .as_ref()
             .and_then(|details| details.tracks.get(self.view.selected));
         let mut detail = detail_view(&item, track);
+        if let Some(archive) = self.selected_archive_zip() {
+            detail.title.clone_from(&archive.filename);
+            detail.description.push_str(&format!(
+                "\n\nZIP archive: {}\n{}",
+                archive.filename,
+                archive.size_bytes.map_or_else(
+                    || "Size: unknown".into(),
+                    |size| format!("Size: {}", human_bytes(size))
+                ),
+            ));
+            // Keep the enclosing non-playable item identity for public reviews.
+        }
         detail.archive_file_counts = self
             .archive_org
             .active
@@ -796,7 +938,13 @@ impl AppController {
             .details
             .as_ref()
             .and_then(|previous| previous.media_id.as_ref())
-            == detail.media_id.as_ref();
+            == detail.media_id.as_ref()
+            && (track.is_some()
+                || self
+                    .view
+                    .details
+                    .as_ref()
+                    .is_some_and(|previous| previous.title == detail.title));
         if same_identity && let Some(previous) = self.view.details.as_ref() {
             // Rebuilding file facts must not erase the same item's completed lookup.
             detail.wikidata.clone_from(&previous.wikidata);
@@ -869,6 +1017,10 @@ impl AppController {
     /// Opens a container or starts the selected exact file with its track-order snapshot.
     pub(super) fn activate_archive_org_selection(&mut self) {
         self.cancel_archive_restore_for_selection();
+        if let Some(archive) = self.selected_archive_zip().cloned() {
+            self.open_archive_zip(archive);
+            return;
+        }
         if let Some(details) = &self.archive_org.active {
             let index = self.view.selected;
             self.begin_archive_playback(
@@ -883,10 +1035,8 @@ impl AppController {
             match self.cached_archive_details(&item.identifier) {
                 Some(Ok(details)) => {
                     self.archive_org.search_selected = self.view.selected;
-                    self.archive_org.message = format!(
-                        "{} audio tracks · Enter: play · d: download · Esc: back",
-                        details.tracks.len()
-                    );
+                    self.archive_org.message = zip::items_message(&details);
+                    self.archive_org.zip_parent = None;
                     self.archive_org.active = Some(details);
                     self.archive_org_selected = 0;
                     self.populate_archive_org();
@@ -944,6 +1094,9 @@ impl AppController {
         }
         if self.archive_download_lookup_pending() {
             return false;
+        }
+        if self.leave_archive_zip() {
+            return true;
         }
         if self.archive_org.restoring.is_some() && !self.archive_org.history.is_empty() {
             return self.restore_archive_location();
@@ -1979,6 +2132,8 @@ mod tests {
         Arc::new(ArchiveOrgItemDetails {
             item: value,
             tracks: vec![audio],
+            archives: Vec::new(),
+            archive_filename: None,
             file_counts: None,
             comments: Vec::new(),
         })

@@ -1466,6 +1466,9 @@ pub struct ArchiveOrgSessionLocation {
     pub catalogue_identifier: Option<String>,
     /// Public Archive item identifier; never an arbitrary URL or local path.
     pub identifier: String,
+    /// Optional public ZIP filename whose member list was open at shutdown.
+    #[serde(default)]
+    pub archive_filename: Option<String>,
     /// Exact relative file name in the item's public metadata, absent for an empty item.
     pub filename: Option<String>,
 }
@@ -1485,6 +1488,16 @@ impl ArchiveOrgSessionLocation {
                     .skip(1)
                     .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
         };
+        let filename_is_valid = |filename: &str| {
+            !filename.is_empty()
+                && filename.len() <= 2_048
+                && !filename.contains('\\')
+                && !filename.chars().any(char::is_control)
+                && filename.split('/').count() <= 32
+                && filename
+                    .split('/')
+                    .all(|part| !matches!(part, "" | "." | ".."))
+        };
         self.query.len() <= 512
             && !self.query.chars().any(char::is_control)
             && (self.scope == ArchiveOrgSearchScope::Text || !self.query.trim().is_empty())
@@ -1500,15 +1513,15 @@ impl ArchiveOrgSessionLocation {
                 .as_deref()
                 .is_none_or(identifier_is_valid)
             && identifier_is_valid(&self.identifier)
-            && self.filename.as_deref().is_none_or(|filename| {
-                !filename.is_empty()
-                    && filename.len() <= 2_048
-                    && !filename.contains('\\')
-                    && !filename.chars().any(char::is_control)
-                    && filename.split('/').count() <= 32
-                    && filename
-                        .split('/')
-                        .all(|part| !matches!(part, "" | "." | ".."))
+            && self.filename.as_deref().is_none_or(filename_is_valid)
+            && self.archive_filename.as_deref().is_none_or(|archive| {
+                filename_is_valid(archive)
+                    && archive.to_ascii_lowercase().ends_with(".zip")
+                    && self.filename.as_deref().is_none_or(|filename| {
+                        filename
+                            .strip_prefix(archive)
+                            .is_some_and(|member| member.starts_with('/') && member.len() > 1)
+                    })
             })
     }
 }
@@ -2086,6 +2099,31 @@ mod tests {
         assert_eq!(restored.archive_org_location, None);
     }
 
+    /// ZIP restart routes retain their container and reject a mismatched member path.
+    #[test]
+    fn archive_zip_session_location_preserves_and_validates_container() {
+        let mut value = serde_json::json!({
+            "query": "music", "scope": "text", "catalogue_selected": 0,
+            "identifier": "sample", "catalogue_identifier": "sample",
+            "archive_filename": "Album.zip", "filename": "Album.zip/disc/03.mp3"
+        });
+        let location: ArchiveOrgSessionLocation = serde_json::from_value(value.clone()).unwrap();
+        assert!(location.is_valid());
+        assert_eq!(
+            serde_json::to_value(&location).unwrap()["archive_filename"],
+            "Album.zip"
+        );
+        for archive in ["../Album.zip", "Album.mp3", "Album.zip/inside.zip", ""] {
+            value["archive_filename"] = archive.into();
+            let invalid: ArchiveOrgSessionLocation = serde_json::from_value(value.clone()).unwrap();
+            assert!(!invalid.is_valid(), "{archive:?}");
+        }
+        value["archive_filename"] = "Album.zip".into();
+        value["filename"] = "Other.zip/03.mp3".into();
+        let invalid: ArchiveOrgSessionLocation = serde_json::from_value(value).unwrap();
+        assert!(!invalid.is_valid());
+    }
+
     /// Exact public file names round-trip without storing an endpoint, token, or cache.
     #[test]
     fn archive_session_location_round_trips_and_rejects_unbounded_or_unsafe_values() {
@@ -2095,6 +2133,7 @@ mod tests {
             catalogue_selected: 12,
             catalogue_identifier: Some("public-item".to_owned()),
             identifier: "public-item".to_owned(),
+            archive_filename: None,
             filename: Some("folder/日本語 recording.opus".to_owned()),
         };
         assert!(location.is_valid());

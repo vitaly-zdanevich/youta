@@ -489,6 +489,15 @@ resolver:
   each search retains at most 1,000 items. Restarting restores the open item and
   exact selected file without starting playback.
 
+  ZIP files appear as folders after the item's direct tracks. Press Enter to
+  fetch a ZIP's supported audio members, then Enter on a member to play it.
+  Relative member paths stay visible, and Esc returns to the same ZIP row in
+  the parent item. The contents load only when opened; Archive.org streams each
+  member separately, so Youta does not download or extract the whole ZIP.
+  Queue, playlists, downloads, and restart use the exact member URL. Nested
+  archives are not opened. Seeking depends on Archive.org's member endpoint;
+  unlike ordinary files, it may not support byte-range requests.
+
   Playback prefers supported uploaded originals. When an audio track comes
   from an original video and separate audio files exist, the default chooser
   shows the available formats and sizes before playback. Preferences can instead
@@ -527,7 +536,8 @@ resolver:
   as literal phrases using Archive's [advanced-search fields](https://archive.org/advancedsearch.php).
   `[Esc] Back` returns through Creator/Topics/uploader searches, restoring the previous
   query, selected item or track, and description position. Inside a track list,
-  Back first returns to its catalogue. A new submitted text search clears this
+  Back first returns to its catalogue (or from a ZIP to its enclosing item).
+  A new submitted text search clears this
   history; history itself is session-only, limited to 16 locations and a 16 MiB
   cache. Evicted locations reload bounded search pages when revisited.
   Strong legacy Cyrillic encoding errors in track titles are repaired for display
