@@ -84057,6 +84057,68 @@ mod tests {
         );
     }
 
+    /// Successful NPR absence replaces stale programme text while preserving audio and ICY.
+    #[cfg(feature = "radio")]
+    #[test]
+    fn npr_empty_programme_clears_stale_metadata_without_changing_playback() {
+        let (mut controller, _) = controller_with_mock_statuses([]);
+        let station_id = "npr-4fcf71471a22460b8c99eb9f58fac6ca";
+        controller.current_media = Some(MediaId::new(SourceKind::Radio, station_id));
+        controller.view.playback.title = Some("WAMU 88.5".to_owned());
+        controller.view.playback.stream_title = Some("Live ICY title".to_owned());
+        controller.view.radio_now_playing = Some("On air: Previous programme".to_owned());
+        let absent = RadioNowPlaying {
+            kind: RadioNowPlayingKind::OnAir,
+            title: None,
+            artist: None,
+            programme: None,
+            station_start_time: None,
+            duration: None,
+            refresh_after: Duration::from_secs(60),
+        };
+        controller.radio_now_playing_cache.insert(
+            station_id.to_owned(),
+            CachedRadioNowPlaying {
+                value: RadioNowPlaying {
+                    programme: Some("Previous programme".to_owned()),
+                    ..absent.clone()
+                },
+                refresh_at: Instant::now(),
+            },
+        );
+        controller.radio_now_playing_retry_at.insert(
+            station_id.to_owned(),
+            RadioNowPlayingRetry {
+                retry_at: Instant::now() + Duration::from_secs(600),
+                consecutive_failures: 4,
+            },
+        );
+        controller.pending_radio_now_playing = Some(PendingRadioNowPlaying {
+            generation: 1,
+            station_id: station_id.to_owned(),
+        });
+        let playback = controller.view.playback.clone();
+        let before = Instant::now();
+
+        controller.handle_radio_now_playing(1, station_id.to_owned(), Ok(absent));
+
+        assert_eq!(controller.view.playback, playback);
+        assert_eq!(
+            controller.view.radio_now_playing.as_deref(),
+            Some("Track: Live ICY title")
+        );
+        assert!(controller.view.error_popup.is_none());
+        assert!(controller.pending_radio_now_playing.is_none());
+        assert!(
+            !controller
+                .radio_now_playing_retry_at
+                .contains_key(station_id)
+        );
+        let cached = &controller.radio_now_playing_cache[station_id];
+        assert!(cached.value.programme.is_none());
+        assert!(cached.refresh_at >= before + Duration::from_secs(60));
+    }
+
     #[cfg(feature = "radio")]
     #[test]
     fn icy_radio_metadata_updates_deduplicates_and_clears_without_losing_station_title() {

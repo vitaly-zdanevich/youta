@@ -117,6 +117,10 @@ impl RadioNowPlayingEndpoint {
 }
 
 /// Bounded now-playing metadata returned by a radio station.
+///
+/// A valid NPR schedule can have no current programme. Its successful record
+/// has empty optional fields and retains the normal refresh interval, allowing
+/// callers to clear stale programme text without treating working audio as failed.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RadioNowPlaying {
     /// Whether the record describes a track or an on-air programme.
@@ -194,6 +198,8 @@ impl RadioNowPlayingClient {
     /// Remote text remains untrusted: fields are trimmed, control characters
     /// and oversized values are rejected, and refresh advice is clamped to a
     /// battery-friendly interval.
+    /// A valid empty NPR schedule succeeds with `programme: None`; transport,
+    /// service-error and malformed-response failures remain errors.
     ///
     /// # Errors
     ///
@@ -260,16 +266,60 @@ struct RadioCoCurrentTrack {
     title: Option<String>,
 }
 
+/// NPR envelopes are JSON objects; positional arrays must not become empty schedules.
 #[derive(Debug, Deserialize)]
-struct NprStationProgramResponse {
+#[serde(try_from = "serde_json::Map<String, serde_json::Value>")]
+struct NprStationProgramResponse(NprStationProgramFields);
+
+impl TryFrom<serde_json::Map<String, serde_json::Value>> for NprStationProgramResponse {
+    type Error = serde_json::Error;
+
+    /// Decodes the existing typed fields only after the outer object has been verified.
+    fn try_from(value: serde_json::Map<String, serde_json::Value>) -> Result<Self, Self::Error> {
+        serde_json::from_value(serde_json::Value::Object(value)).map(Self)
+    }
+}
+
+/// Typed fields shared by the direct and collection-shaped NPR object responses.
+#[derive(Debug, Deserialize)]
+struct NprStationProgramFields {
+    #[serde(default, deserialize_with = "deserialize_npr_program_attributes")]
     attributes: Option<NprStationProgramAttributes>,
+    #[serde(default, deserialize_with = "deserialize_npr_program_items")]
+    items: Option<Vec<NprStationProgramItem>>,
     #[serde(default)]
-    items: Vec<NprStationProgramItem>,
+    errors: Vec<serde::de::IgnoredAny>,
+}
+
+/// Distinguishes an omitted collection from an empty array without accepting `null`.
+fn deserialize_npr_program_items<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<NprStationProgramItem>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Vec::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Deserialize)]
 struct NprStationProgramItem {
+    #[serde(default, deserialize_with = "deserialize_npr_program_attributes")]
     attributes: Option<NprStationProgramAttributes>,
+}
+
+/// Accepts only object-or-null attributes, not Serde's positional struct arrays.
+fn deserialize_npr_program_attributes<'de, D>(
+    deserializer: D,
+) -> Result<Option<NprStationProgramAttributes>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<serde_json::Map<String, serde_json::Value>>::deserialize(deserializer)?
+        .map(|attributes| {
+            serde_json::from_value(serde_json::Value::Object(attributes))
+                .map_err(serde::de::Error::custom)
+        })
+        .transpose()
 }
 
 #[derive(Debug, Deserialize)]
@@ -277,9 +327,25 @@ struct NprStationProgramAttributes {
     name: Option<String>,
 }
 
+/// Separates a valid empty schedule from malformed or explicitly failed responses.
 fn normalize_npr_station_program_response(
     response: NprStationProgramResponse,
 ) -> Result<RadioNowPlaying, ProviderError> {
+    let response = response.0;
+    if !response.errors.is_empty() {
+        return Err(ProviderError::InvalidResponse(
+            "NPR station service returned errors".to_owned(),
+        ));
+    }
+    if response.attributes.is_none() && response.items.is_none() {
+        return Err(ProviderError::InvalidResponse(
+            "NPR station service response has no programme envelope".to_owned(),
+        ));
+    }
+    let has_programme_items = response
+        .items
+        .as_ref()
+        .is_some_and(|items| !items.is_empty());
     let programme = response
         .attributes
         .and_then(|attributes| attributes.name)
@@ -287,6 +353,7 @@ fn normalize_npr_station_program_response(
             response
                 .items
                 .into_iter()
+                .flatten()
                 .filter_map(|item| item.attributes)
                 .find_map(|attributes| attributes.name)
         });
@@ -295,9 +362,9 @@ fn normalize_npr_station_program_response(
         "NPR current programme",
         MAX_NOW_PLAYING_TEXT_BYTES,
     )?;
-    if programme.is_none() {
+    if programme.is_none() && has_programme_items {
         return Err(ProviderError::InvalidResponse(
-            "NPR station service has no current programme".to_owned(),
+            "NPR programme items have no current programme name".to_owned(),
         ));
     }
     Ok(RadioNowPlaying {
@@ -2541,12 +2608,80 @@ mod tests {
         }
     }
 
+    /// A valid empty schedule is successful absence, not a station or audio failure.
     #[test]
-    fn npr_current_program_rejects_empty_schedule_payload() {
-        let response: NprStationProgramResponse =
-            serde_json::from_slice(br#"{"attributes":null,"items":[]}"#).unwrap();
+    fn npr_current_program_accepts_explicit_empty_schedule() {
+        for payload in [
+            r#"{"version":"1.0","attributes":{},"items":[],"links":{},"errors":[]}"#,
+            r#"{"attributes":null,"items":[]}"#,
+            r#"{"items":[]}"#,
+            r#"{"attributes":{"name":"   "},"items":[]}"#,
+        ] {
+            let response: NprStationProgramResponse = serde_json::from_str(payload).unwrap();
+            let metadata = normalize_npr_station_program_response(response)
+                .expect("an explicitly empty NPR schedule is valid metadata");
+            assert_eq!(
+                metadata,
+                RadioNowPlaying {
+                    kind: RadioNowPlayingKind::OnAir,
+                    title: None,
+                    artist: None,
+                    programme: None,
+                    station_start_time: None,
+                    duration: None,
+                    refresh_after: DEFAULT_NOW_PLAYING_REFRESH,
+                },
+                "{payload}"
+            );
+        }
+    }
 
-        assert!(normalize_npr_station_program_response(response).is_err());
+    /// Explicit service errors must not be hidden by otherwise plausible programme fields.
+    #[test]
+    fn npr_current_program_rejects_service_errors() {
+        for payload in [
+            r#"{"attributes":{"name":"Stale programme"},"items":[],"errors":[{"code":"unavailable"}]}"#,
+            r#"{"attributes":{"name":"Stale programme"},"errors":"unavailable"}"#,
+        ] {
+            let result = serde_json::from_str::<NprStationProgramResponse>(payload)
+                .map_err(|error| ProviderError::InvalidResponse(error.to_string()))
+                .and_then(normalize_npr_station_program_response);
+            assert!(
+                matches!(result, Err(ProviderError::InvalidResponse(_))),
+                "{payload}"
+            );
+        }
+    }
+
+    /// Missing envelopes, malformed fields and unsafe text remain failures rather than absence.
+    #[test]
+    fn npr_current_program_rejects_malformed_metadata() {
+        let oversized = format!(
+            r#"{{"attributes":{{"name":"{}"}},"items":[]}}"#,
+            "x".repeat(MAX_NOW_PLAYING_TEXT_BYTES + 1)
+        );
+        for payload in [
+            "not JSON",
+            "{}",
+            "[]",
+            "[{}, [], []]",
+            r#"{"unrelated":true}"#,
+            r#"{"attributes":[],"items":[]}"#,
+            r#"{"attributes":{"name":42},"items":[]}"#,
+            r#"{"attributes":{"name":"Programme"},"items":{}}"#,
+            r#"{"attributes":{"name":"Programme"},"items":null}"#,
+            r#"{"attributes":{},"items":[{}]}"#,
+            r#"{"attributes":{"name":"Bad\u0000programme"},"items":[]}"#,
+            oversized.as_str(),
+        ] {
+            let result = serde_json::from_str::<NprStationProgramResponse>(payload)
+                .map_err(|error| ProviderError::InvalidResponse(error.to_string()))
+                .and_then(normalize_npr_station_program_response);
+            assert!(
+                matches!(result, Err(ProviderError::InvalidResponse(_))),
+                "{payload}"
+            );
+        }
     }
 
     #[test]

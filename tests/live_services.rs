@@ -937,7 +937,7 @@ fn radio_stream_and_passive_metadata_are_usable() {
     );
 }
 
-/// Decodes one generated NPR preset and parses its current-program endpoint.
+/// Decodes one generated NPR preset and validates its optional current-program response.
 #[cfg(all(feature = "backend-mpv", feature = "radio"))]
 #[test]
 #[ignore = "requires a public NPR member stream, NPR metadata, and mpv"]
@@ -949,7 +949,7 @@ fn generated_npr_station_stream_and_program_are_usable() {
         AudioOutputDriver, AudiophilePlaybackOptions, PlaybackBackend, PlaybackInput,
         PlaybackProfile, ProcessPlaybackConfig,
     };
-    use youta::providers::radio::{RadioNowPlayingClient, station_by_id};
+    use youta::providers::radio::{RadioNowPlayingClient, RadioNowPlayingKind, station_by_id};
 
     assert_eq!(
         std::env::var(RADIO_TEST_OPT_IN).as_deref(),
@@ -1032,13 +1032,17 @@ fn generated_npr_station_stream_and_program_are_usable() {
         .expect("bounded NPR metadata client")
         .fetch(endpoint)
         .expect("fetch and parse NPR's current-program JSON");
-    assert!(
-        metadata
-            .programme
-            .as_deref()
-            .is_some_and(|programme| !programme.trim().is_empty()),
-        "NPR returned no current programme"
-    );
+    assert_eq!(metadata.kind, RadioNowPlayingKind::OnAir);
+    if let Some(programme) = metadata.programme.as_deref() {
+        assert!(
+            !programme.trim().is_empty(),
+            "NPR returned a blank programme name"
+        );
+    } else {
+        // An empty schedule is valid: audio above must still decode, and fetch
+        // still rejects transport, service-error and malformed-response failures.
+        eprintln!("NPR returned a valid empty schedule; no current programme is listed");
+    }
 }
 
 /// Resolves a fresh regional BBC manifest and decodes it through Youta's backend.
