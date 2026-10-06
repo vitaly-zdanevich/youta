@@ -1685,12 +1685,12 @@ fn the_window_exposes_commons_review_with_its_uppercase_hotkey() {
 
 #[cfg(feature = "evernote")]
 #[test]
-fn the_window_exposes_evernote_review_without_putting_the_hotkey_on_the_button() {
+fn the_window_exposes_evernote_review_with_its_uppercase_hotkey() {
     let details = source_named("components/Details.tsx");
     for required in [
         "view.evernote_available",
         "dispatch('OpenEvernoteNote')",
-        ">Save audio to Evernote</Action>",
+        ">[E] To Evernote</Action>",
     ] {
         assert!(
             details.contains(required),
@@ -1698,10 +1698,8 @@ fn the_window_exposes_evernote_review_without_putting_the_hotkey_on_the_button()
         );
     }
     assert!(
-        !details.contains("Save audio to Evernote (E)")
-            && !details.contains("[E] Save audio to Evernote")
-            && !details.contains("<u>E</u>Save audio to Evernote"),
-        "the Evernote button must not render its hotkey"
+        !details.contains("Save audio to Evernote"),
+        "the Evernote button must use the compact label"
     );
 
     let popups = source_named("components/popups.tsx");
@@ -1737,7 +1735,7 @@ fn the_window_places_evernote_after_commons() {
         .find(">[U] To Commons</Action>")
         .expect("Commons action");
     let evernote = details
-        .find(">Save audio to Evernote</Action>")
+        .find(">[E] To Evernote</Action>")
         .expect("Evernote action");
 
     assert!(

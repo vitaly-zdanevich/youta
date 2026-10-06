@@ -4858,7 +4858,7 @@ fn render_information_panel(
             &mut lines,
             &mut right_buttons,
             inner.width,
-            "Save audio to Evernote".to_owned(),
+            button("E", "To Evernote", show_hotkeys),
             theme.accent,
             UiAction::OpenEvernoteNote,
         );
@@ -30509,9 +30509,7 @@ for encoded, expected in json.load(sys.stdin):
 
     #[cfg(feature = "evernote")]
     #[test]
-    fn details_evernote_button_never_renders_its_help_only_hotkey() {
-        let backend = TestBackend::new(140, 32);
-        let mut terminal = Terminal::new(backend).expect("terminal");
+    fn details_evernote_button_shows_short_label_and_respects_hotkey_visibility() {
         let view = ViewModel {
             details: Some(DetailView {
                 title: "Evernote fixture".to_owned(),
@@ -30522,19 +30520,42 @@ for encoded, expected in json.load(sys.stdin):
         };
         let mut hit_map = HitMap::default();
 
-        terminal
-            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
-            .expect("draw Evernote action");
-        let rendered = rendered_text(&terminal);
-        assert!(rendered.contains("Save audio to Evernote"));
-        assert!(!rendered.contains("[E] Save audio to Evernote"));
-        assert!(
-            hit_map
-                .detail_buttons
-                .iter()
-                .any(|(action, _)| action == &UiAction::OpenEvernoteNote)
-        );
+        for width in [90, 140] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 32)).expect("terminal");
+            for show_hotkeys in [true, false] {
+                let settings = UiSettings {
+                    show_hotkeys,
+                    ..UiSettings::default()
+                };
+                terminal
+                    .draw(|frame| render(frame, &view, &settings, &mut hit_map))
+                    .expect("draw Evernote action");
+                let rendered = rendered_text(&terminal);
+                assert!(rendered.contains("To Evernote"));
+                assert!(!rendered.contains("Save audio to Evernote"));
+                assert_eq!(rendered.contains("[E] To Evernote"), show_hotkeys);
+                let (_, area) = hit_map
+                    .detail_buttons
+                    .iter()
+                    .find(|(action, _)| action == &UiAction::OpenEvernoteNote)
+                    .expect("Evernote button remains clickable");
+                assert_eq!(
+                    mouse_action(
+                        MouseEvent {
+                            kind: MouseEventKind::Down(MouseButton::Left),
+                            column: area.x,
+                            row: area.y,
+                            modifiers: KeyModifiers::NONE,
+                        },
+                        &hit_map,
+                        &view,
+                    ),
+                    Some(UiAction::OpenEvernoteNote)
+                );
+            }
+        }
 
+        let mut terminal = Terminal::new(TestBackend::new(140, 32)).expect("terminal");
         let help_view = ViewModel {
             help_open: true,
             ..ViewModel::default()
@@ -34520,7 +34541,7 @@ for encoded, expected in json.load(sys.stdin):
         terminal
             .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
             .unwrap();
-        assert!(!rendered_text(&terminal).contains("Save audio to Evernote"));
+        assert!(!rendered_text(&terminal).contains("To Evernote"));
         assert!(
             !hit_map
                 .detail_buttons

@@ -328,7 +328,7 @@
 		const footer = document.querySelector('footer');
 		assert(footer.textContent.includes('radio') && !footer.textContent.includes('24:00:00'), 'radio footer omits live-buffer duration');
 		assert(!document.querySelector('[aria-label="Playback position"]').disabled, 'radio label keeps buffered seeking available');
-		assert(!button('Save audio to Evernote'), 'live radio has no direct Evernote upload action');
+		assert(!button('[E] To Evernote'), 'live radio has no direct Evernote upload action');
 		await action('ShowNowPlaying', () => button('Fixture station', footer).click(), 'radio title retains source navigation');
 		const beforeOffer = calls.length;
 		snapshot({ evernote_popup: {
@@ -624,6 +624,27 @@
 		snapshot({ ...previous, archive_upload_popup: null });
 		await until(() => !dialog(), 'closed Local Archive review');
 	}
+	/** Compact Evernote entrypoints preserve selected-item capability and defer key mapping to Rust. */
+	async function checkEvernoteButton() {
+		const previous = clone(view);
+		for (const [screen, source] of [['Local', 'local'], ['Search', 'you-tube'], ['Radio', 'radio']]) {
+			for (const available of [false, true]) {
+				const title = `Evernote ${source}, available=${available}`;
+				snapshot({ screen, evernote_available: available,
+					details: { ...clone(defaults.DetailView), title, source,
+						media_id: { source, external_id: 'fixture-item' } } });
+				await until(() => document.querySelector('[aria-label=Details] h2')?.textContent === title, title);
+				const note = button('[E] To Evernote');
+				assert(Boolean(note) === (available && source !== 'radio'), `Evernote entrypoint preserves its source/capability gate: ${title}`);
+				assert(!button('Save audio to Evernote'), 'Evernote no longer uses its old Details label');
+				if (note) {
+					await action('OpenEvernoteNote', () => note.click(), `Compact Evernote button opens the existing ${source} review`);
+					await key('E', { Char: 'E' }, { shiftKey: true });
+				}
+			}
+		}
+		snapshot(previous);
+	}
 	/** The browser forwards arrow modifiers; Rust alone decides navigation and seek distances. */
 	async function checkArrowShortcuts() {
 		for (const [name, shared] of [['ArrowLeft', 'Left'], ['ArrowRight', 'Right']]) {
@@ -749,6 +770,7 @@
 		await checkLocalActionOrder();
 		await checkLocalCopy();
 		await checkArchiveLocalUpload();
+		await checkEvernoteButton();
 		await checkArrowShortcuts();
 		await checkPreferencesFocus();
 		await checkUnsubscribeConfirmation();

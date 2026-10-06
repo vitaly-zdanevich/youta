@@ -2626,9 +2626,9 @@ files on Commons](https://commons.wikimedia.org/wiki/Commons:YouTube_files),
 
 ## Evernote audio notes
 
-The default-on `evernote` feature adds `Save audio to Evernote` for selected
-remote or local video and audio items. Its uppercase `E` shortcut is documented
-only in Help. A review popup pre-fills the optional title and provider
+The default-on `evernote` feature adds `[E] To Evernote` for selected remote or
+local video and audio items, showing its uppercase `E` shortcut (also listed in
+Help). A review popup pre-fills the optional title and provider
 description, accepts optional comma-separated tags, and retains the immutable
 canonical video or audio page as the note source for remote items. Local notes
 omit the web-only source URL. For YouTube, `Add YouTube
