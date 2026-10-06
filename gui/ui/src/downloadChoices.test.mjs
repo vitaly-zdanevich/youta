@@ -175,6 +175,24 @@ test('persistent download queue selects, retries and cancels exact stable entrie
 	assert.equal(empty.some((node) => node.type === 'button' && text(node) === 'Retry'), false);
 });
 
+/** Queue length is formatted by the reducer; titles and creator names are never live markers. */
+test('playback queue colors only the YouTube canonical LIVE length', () => {
+	for (const [source, length, expected] of [
+		['you-tube', 'LIVE', ['LIVE']], ['you-tube', '0:00', []], ['you-tube', '3:21', []],
+		['local', 'LIVE', []], ['radio', 'LIVE', []],
+	]) {
+		const tree = module.exports.QueuePopup({ popup: {
+			items: [{ media_id: { source, external_id: 'fixture' }, title: 'LIVE', subtitle: 'LIVE', length }],
+			current: 0, selected: 0, repeat_one: false,
+		} });
+		const red = nodes(tree).filter((node) => node.props.className?.split(/\s+/).includes('text-red-400'));
+		assert.deepEqual(red.map(text), expected, `${source}: ${length}`);
+		const row = nodes(tree).find((node) => node.type === 'button' && node.props.onDoubleClick);
+		assert.ok(text(row).includes('LIVELIVE'));
+		assert.ok(!nodes(row).some((node) => red.includes(node)), 'the title and creator stay uncolored');
+	}
+});
+
 /** Exercise rendered row semantics with deterministic virtual rows and inert effects. */
 test('normal and subscription rows distinguish marks from downloaded files and dispatch Ctrl-click', async () => {
 	const load = async (file) => {
@@ -189,12 +207,14 @@ test('normal and subscription rows distinguish marks from downloaded files and d
 				getVirtualItems: () => Array.from({ length: count }, (_, index) => ({ index, key: index, size: 46, start: index * 46 })),
 			}) };
 			if (name === './Artwork') return { Artwork: () => null };
+			if (name === './RowSubtitle') return subtitleModule;
 			if (name === '../subscriptionPageRows') return { SUBSCRIPTION_ROW_HEIGHT: 46 };
 			return mockRequire(name);
 		};
 		new Function('require', 'module', 'exports', code)(rowRequire, loaded, loaded.exports);
 		return loaded.exports;
 	};
+	const subtitleModule = await load('./components/RowSubtitle.tsx');
 	const { RowList } = await load('./components/RowList.tsx');
 	const { Subscriptions } = await load('./components/Subscriptions.tsx');
 	for (const marked of [false, true]) {

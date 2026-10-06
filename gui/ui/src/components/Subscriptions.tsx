@@ -5,6 +5,7 @@ import type { MediaId, RowView, SubscriptionPane, SubscriptionsView } from "../c
 import { dispatch } from "../ipc";
 import { SUBSCRIPTION_ROW_HEIGHT } from "../subscriptionPageRows";
 import { Artwork } from "./Artwork";
+import { RowSubtitle } from './RowSubtitle';
 
 /** Abbreviates a count the way the terminal heading does. */
 function formatCount(value: number): string {
@@ -271,7 +272,7 @@ function Pane({
                     </span>
                     {row.subtitle ? (
                       <span className="block truncate text-[11px] text-ink-faint">
-                        {row.subtitle}
+						<RowSubtitle row={row} />
                       </span>
                     ) : null}
                   </span>

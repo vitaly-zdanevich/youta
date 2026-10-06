@@ -144,6 +144,66 @@
 		description: 'Complete fixture description.\nSecond paragraph remains visible.',
 		webpage_url: 'https://archive.org/details/fixture',
 	});
+	/** The live duration is red in results, subscriptions, Details and the transport. */
+	async function checkLiveDuration() {
+		const previous = clone(view);
+		const id = { source: 'you-tube', external_id: 'fixture-live' };
+		const liveRow = { ...row('LIVE', id), source: 'YouTube', subtitle: 'LIVE · LIVE', live: true };
+		const ordinary = { ...row('Ordinary video', id), subtitle: 'LIVE · 0:00', live: false };
+		snapshot({ screen: 'Search', rows: [liveRow, ordinary],
+			details: { ...details('LIVE', id), source: 'YouTube', channel_name: 'LIVE', length: 'LIVE', live: true },
+			now_playing: { media_id: id, title: 'LIVE', subtitle: '' },
+			playback: { ...view.playback, idle: false, live: true, duration: null,
+				position: { secs: 0, nanos: 0 }, live_seekable_range: null } });
+		const resultMarker = await until(() => document.querySelector('[aria-label=Results] .text-red-400'), 'red LIVE in search results');
+		const lengthMarker = await until(() => document.querySelector('[aria-label=Details] dd.text-red-400'), 'red LIVE Length in Details');
+		const playerMarker = await until(() => document.querySelector('footer .text-red-400'), 'red LIVE in the player');
+		const probe = document.createElement('span');
+		probe.style.color = 'var(--color-red-400)';
+		document.body.append(probe);
+		for (const marker of [resultMarker, lengthMarker, playerMarker]) {
+			assert(marker.textContent === 'LIVE' && getComputedStyle(marker).color === getComputedStyle(probe).color,
+				'The canonical LIVE indicator uses the built red color');
+			assert(getComputedStyle(marker).color !== getComputedStyle(marker.parentElement).color,
+				'LIVE styling remains distinct from its surrounding title and channel text');
+		}
+		probe.remove();
+		assert(document.querySelectorAll('[aria-label=Results] .text-red-400').length === 1,
+			'A channel named LIVE and unknown ordinary duration stay uncolored');
+		assert(resultMarker.parentElement.textContent === 'LIVE · LIVE', 'The complete channel and live duration remain visible');
+		assert(!document.querySelector('footer').textContent.includes('--:--'), 'Live playback omits an unknown finite duration');
+		assert(document.querySelector('[aria-label="Playback position"]').disabled, 'An unseekable live stream keeps seeking disabled');
+		snapshot({ playback: { ...view.playback, position: { secs: 240, nanos: 0 }, duration: { secs: 300, nanos: 0 },
+			live_seekable_range: { start: { secs: 0, nanos: 0 }, end: { secs: 300, nanos: 0 } } } });
+		await until(() => document.querySelector('footer').textContent.includes('LIVE −1:00'), 'live edge offset in DVR playback');
+		assert(document.querySelector('footer').textContent.includes('5:00 buffer'), 'Seekable live playback retains the available buffer duration');
+		assert(!document.querySelector('[aria-label="Playback position"]').disabled, 'The live DVR buffer remains seekable');
+		const dvrMarker = document.querySelector('footer .text-red-400');
+		assert(dvrMarker.textContent === 'LIVE'
+			&& getComputedStyle(dvrMarker).color !== getComputedStyle(dvrMarker.parentElement).color,
+			'Only LIVE is red; its DVR offset retains the muted status color');
+		snapshot({ queue_popup: { current: 0, selected: 0, repeat_one: false, items: [
+			{ media_id: id, title: 'LIVE', subtitle: 'LIVE', length: 'LIVE' },
+			{ media_id: { ...id, external_id: 'ordinary' }, title: 'LIVE', subtitle: 'LIVE', length: '0:00' },
+			{ media_id: { source: 'local', external_id: '/music/live.flac' }, title: 'LIVE', subtitle: 'LIVE', length: '3:21' },
+		] } });
+		const queueMarker = await until(() => dialog()?.querySelector('.text-red-400'), 'red LIVE in the playback queue');
+		assert(queueMarker.textContent === 'LIVE' && dialog().querySelectorAll('.text-red-400').length === 1
+			&& queueMarker.closest('button') === null, 'Queue styling applies only to the canonical YouTube LIVE length');
+		snapshot({ queue_popup: null });
+		await until(() => !dialog(), 'close the live queue fixture');
+		snapshot({ screen: 'Subscriptions', details: null, subscriptions: {
+			...clone(defaults.ViewModel.subscriptions), layout: 'drill-down', route: 'Items', focus: 'Items',
+			source_kind: 'you-tube', source_title: 'LIVE', items: [liveRow, ordinary],
+		} });
+		const subscriptionMarker = await until(() => document.querySelector('[data-subscription-pane] .text-red-400'), 'red LIVE in subscription items');
+		assert(subscriptionMarker.textContent === 'LIVE'
+			&& document.querySelectorAll('[data-subscription-pane] .text-red-400').length === 1,
+			'Subscriptions shares the confirmed live duration styling without coloring the channel');
+		snapshot(previous);
+		await until(() => !document.querySelector('[data-subscriptions-screen]'), 'restore the prior screen after live fixtures');
+	}
+
 	/** Exercise provider settings without providing a credential to the web-view fixture. */
 	async function checkProviderSettings() {
 		const aboutUrl = 'https://en.wikipedia.org/wiki/Invidious';
@@ -786,6 +846,7 @@
 		}
 		snapshot(beforeTabMarkers);
 		await checkRadioPresentation();
+		await checkLiveDuration();
 		await checkLocalFullPath();
 		await checkLocalTrackMetadata();
 		await checkLocalActionOrder();

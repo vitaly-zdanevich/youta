@@ -69,6 +69,8 @@ export interface RowView {
   media_id: MediaId | null;
   title: string;
   subtitle: string;
+	/** Confirmed YouTube broadcast; the canonical subtitle duration is LIVE. */
+	live: boolean;
   source: string;
   watched_percent: number;
   playback_started: boolean;
@@ -245,6 +247,8 @@ export interface DetailView {
   channel_country: string;
   channel_links_truncated: boolean;
   length: string;
+	/** Confirmed YouTube broadcast; Length is LIVE instead of a finite duration. */
+	live: boolean;
   description: string;
   dearrow_title: string | null;
   timecodes: DetailTimecodeView[];
@@ -589,6 +593,7 @@ export interface QueueRowView {
   media_id: MediaId;
   title: string;
   subtitle: string;
+	/** Reducer-formatted duration, or LIVE for a confirmed YouTube broadcast. */
   length: string;
 }
 

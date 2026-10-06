@@ -3267,6 +3267,30 @@ fn uses_youtube_video_title_style(row: &RowView) -> bool {
         .is_some_and(|media_id| media_id.source == SourceKind::YouTube && row.source == "YouTube")
 }
 
+/// Makes a confirmed live marker readable with ordinary ANSI terminal colors.
+fn live_marker_style(style: Style) -> Style {
+    style
+        .fg(Color::Red)
+        .add_modifier(Modifier::BOLD)
+        .remove_modifier(Modifier::DIM)
+}
+
+/// Highlights only the reducer's trailing live-duration field, never creator text.
+fn row_subtitle_spans(row: &RowView, style: Style) -> Vec<Span<'_>> {
+    let live_prefix = row
+        .subtitle
+        .strip_suffix("LIVE")
+        .filter(|prefix| row.live && (prefix.is_empty() || prefix.ends_with(" · ")));
+    if let Some(prefix) = live_prefix {
+        vec![
+            Span::styled(prefix, style),
+            Span::styled("LIVE", live_marker_style(style)),
+        ]
+    } else {
+        vec![Span::styled(&row.subtitle, style)]
+    }
+}
+
 /// Returns the end of the first standalone duration field in row metadata.
 ///
 /// Subtitles retain their source-specific text and ordering. This recognizes
@@ -3782,7 +3806,7 @@ fn render_row_list(
             title_spans.push(Span::styled(&row.title, title_style));
             if row_height == 1 && !row.subtitle.is_empty() {
                 title_spans.push(Span::styled(" · ", secondary_style));
-                title_spans.push(Span::styled(&row.subtitle, secondary_style));
+                title_spans.extend(row_subtitle_spans(row, secondary_style));
             }
             if row_height == 1 && !progress.is_empty() {
                 title_spans.push(Span::styled(progress.clone(), secondary_style));
@@ -3803,7 +3827,8 @@ fn render_row_list(
                 }
             }
             if !row.subtitle.is_empty() {
-                if let Some(duration_end) = subtitle_duration_field_end(&row.subtitle)
+                if !row.live
+                    && let Some(duration_end) = subtitle_duration_field_end(&row.subtitle)
                     && !progress.is_empty()
                 {
                     subtitle_spans
@@ -3812,7 +3837,7 @@ fn render_row_list(
                     subtitle_spans
                         .push(Span::styled(&row.subtitle[duration_end..], secondary_style));
                 } else {
-                    subtitle_spans.push(Span::styled(&row.subtitle, secondary_style));
+                    subtitle_spans.extend(row_subtitle_spans(row, secondary_style));
                     if !progress.is_empty() {
                         subtitle_spans.push(Span::styled(progress, secondary_style));
                     }
@@ -5456,7 +5481,11 @@ fn render_information_panel(
                     spans.push(Span::raw("  "));
                 }
                 spans.push(Span::styled(format!("{name}: "), theme.muted));
-                spans.push(Span::raw(value.to_owned()));
+                spans.push(if name == "Length" && details.live && value == "LIVE" {
+                    Span::styled(value.to_owned(), live_marker_style(Style::default()))
+                } else {
+                    Span::raw(value.to_owned())
+                });
             }
             if !spans.is_empty() {
                 lines.push(Line::from(spans));
@@ -7796,6 +7825,11 @@ fn render_seek_status(
             ),
             Span::raw(visible_label["● REC".len()..].to_owned()),
         ])
+    } else if visible_label.starts_with("LIVE ") {
+        Line::from(vec![
+            Span::styled("LIVE", live_marker_style(Style::default())),
+            Span::raw(visible_label[4..].to_owned()),
+        ])
     } else {
         Line::raw(visible_label.clone())
     };
@@ -8103,10 +8137,12 @@ fn rounded_duration_column(value: Duration, duration: Duration, width: u16) -> u
     u16::try_from(column).unwrap_or(width).min(width)
 }
 
+/// Restores the seek label over cache colors, highlighting a player-owned live prefix.
 fn restore_seek_label(frame: &mut Frame<'_>, area: Rect, label: &str) {
     if area.is_empty() {
         return;
     }
+    let live = label.starts_with("LIVE ");
     let label = Span::raw(label);
     let width = u16::try_from(label.width())
         .unwrap_or(u16::MAX)
@@ -8116,6 +8152,15 @@ fn restore_seek_label(frame: &mut Frame<'_>, area: Rect, label: &str) {
     // A raw span has no foreground or background fields, so `set_span`
     // replaces the glyphs while preserving the played/cached cell styles.
     frame.buffer_mut().set_span(x, y, &label, width);
+    // The player owns this prefix; a title containing LIVE must not be recolored.
+    if live {
+        frame.buffer_mut().set_span(
+            x,
+            y,
+            &Span::styled("LIVE", live_marker_style(Style::default())),
+            width.min(4),
+        );
+    }
 }
 
 /// Reserves the spinner and a gap only for text on the terminal's last line.
@@ -12555,13 +12600,27 @@ fn render_queue_popup(
                 label.push_str(" · ");
                 label.push_str(&item.length);
             }
-            ListItem::new(truncate_terminal_text(&label, width)).style(if is_selected {
+            let style = if is_selected {
                 theme.selected
             } else if is_current {
                 theme.accent
             } else {
                 theme.base
-            })
+            };
+            let label = truncate_terminal_text(&label, width);
+            // Only the visible, controller-formatted duration is a live marker.
+            let line = if item.media_id.source == SourceKind::YouTube
+                && item.length == "LIVE"
+                && label.ends_with(" · LIVE")
+            {
+                Line::from(vec![
+                    Span::raw(label[..label.len() - 4].to_owned()),
+                    Span::styled("LIVE", live_marker_style(style)),
+                ])
+            } else {
+                Line::raw(label)
+            };
+            ListItem::new(line).style(style)
         })
         .collect::<Vec<_>>();
     frame.render_widget(List::new(items), sections[1]);
@@ -35133,6 +35192,62 @@ for encoded, expected in json.load(sys.stdin):
     }
 
     #[test]
+    fn youtube_live_player_colors_the_status_marker_but_not_the_title() {
+        for height in [1, 2] {
+            for seekable in [false, true] {
+                let mut terminal = Terminal::new(TestBackend::new(100, height)).expect("terminal");
+                let mut view = ViewModel {
+                    playing_media_id: Some(MediaId::new(SourceKind::YouTube, "live-fixture")),
+                    playback: PlaybackStatus {
+                        idle: false,
+                        paused: false,
+                        live: true,
+                        title: Some("Show called LIVE".to_owned()),
+                        ..PlaybackStatus::default()
+                    },
+                    ..ViewModel::default()
+                };
+                if seekable {
+                    view.playback.duration = Some(Duration::from_secs(300));
+                    view.playback.live_seekable_range = Some(crate::playback::BufferedRange {
+                        start: Duration::ZERO,
+                        end: Duration::from_secs(300),
+                    });
+                }
+                terminal
+                    .draw(|frame| {
+                        render_seek_bar(
+                            frame,
+                            frame.area(),
+                            &view,
+                            &UiSettings::default(),
+                            &Theme::new(false),
+                            &mut HitMap::default(),
+                        );
+                    })
+                    .expect("draw live player");
+
+                let buffer = terminal.backend().buffer();
+                let y = height - 1;
+                let line = (0..100)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>();
+                let marker = terminal_text_width(&line[..line.find("LIVE").expect("live marker")]);
+                for x in marker..marker + 4 {
+                    assert_eq!(buffer[(x, y)].fg, Color::Red, "{line}");
+                }
+                let title = terminal_text_width(&line[..line.rfind("LIVE").expect("title text")]);
+                assert_ne!(
+                    buffer[(title, y)].fg,
+                    Color::Red,
+                    "title is not a status marker"
+                );
+                assert!(!line.contains("0:00 /"));
+            }
+        }
+    }
+
+    #[test]
     fn live_seek_status_hides_backend_timeline_and_has_no_seek_target() {
         let backend = TestBackend::new(100, 2);
         let mut terminal = Terminal::new(backend).expect("terminal");
@@ -39615,6 +39730,168 @@ prose 07:25 remains clickable but is not a chapter";
             .expect("draw channel without public subscribers");
 
         assert!(!rendered_text(&terminal).contains("Subscribers:"));
+    }
+
+    #[test]
+    fn youtube_live_queue_colors_only_the_visible_duration_field() {
+        for (source, length, title, red) in [
+            (SourceKind::YouTube, "LIVE", "LIVE title", true),
+            (SourceKind::YouTube, "0:00", "LIVE title", false),
+            (SourceKind::Radio, "LIVE", "LIVE title", false),
+            (
+                SourceKind::YouTube,
+                "LIVE",
+                "A title that is deliberately longer than the entire popup row and ends with LIVE",
+                false,
+            ),
+        ] {
+            let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("terminal");
+            let popup = QueuePopupView {
+                items: vec![crate::view::QueueRowView {
+                    media_id: MediaId::new(source, "live-fixture"),
+                    title: title.to_owned(),
+                    subtitle: "LIVE channel".to_owned(),
+                    length: length.to_owned(),
+                }],
+                current: Some(0),
+                selected: 0,
+                repeat_one: false,
+            };
+            let mut hits = HitMap::default();
+            terminal
+                .draw(|frame| {
+                    render_queue_popup(frame, &popup, true, &Theme::new(false), &mut hits);
+                })
+                .expect("draw live queue");
+            let buffer = terminal.backend().buffer();
+            let red_text = (hits.queue_popup_rows.x..hits.queue_popup_rows.right())
+                .filter_map(|x| {
+                    let cell = &buffer[(x, hits.queue_popup_rows.y)];
+                    (cell.fg == Color::Red).then_some(cell.symbol())
+                })
+                .collect::<String>();
+            assert_eq!(red_text, if red { "LIVE" } else { "" });
+        }
+    }
+
+    #[test]
+    fn youtube_live_rows_color_only_the_confirmed_duration_marker() {
+        for source_labels in [
+            RowSourceLabels::YouTubeSearch,
+            RowSourceLabels::All,
+            RowSourceLabels::Hidden,
+        ] {
+            for (selected, playing, compact, live) in [
+                (0, false, false, true),
+                (1, false, false, true),
+                (1, true, false, true),
+                (0, false, true, true),
+                (0, false, false, false),
+            ] {
+                let mut terminal = Terminal::new(TestBackend::new(100, 6)).expect("terminal");
+                let id = MediaId::new(SourceKind::YouTube, "live-fixture");
+                let rows = [
+                    RowView {
+                        media_id: Some(id.clone()),
+                        title: "LIVE title".to_owned(),
+                        subtitle: "LIVE channel · LIVE".to_owned(),
+                        source: "YouTube".to_owned(),
+                        live,
+                        compact,
+                        ..RowView::default()
+                    },
+                    RowView {
+                        compact,
+                        ..RowView::default()
+                    },
+                ];
+                let theme = Theme::new(false);
+                terminal
+                    .draw(|frame| {
+                        render_row_list(
+                            frame,
+                            frame.area(),
+                            "",
+                            &rows,
+                            source_labels,
+                            selected,
+                            playing.then_some(&id),
+                            false,
+                            None,
+                            true,
+                            theme.heading,
+                            &theme,
+                        );
+                    })
+                    .expect("draw live row");
+
+                let buffer = terminal.backend().buffer();
+                let y = if compact { 0 } else { 1 };
+                let line = (0..100)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>();
+                let metadata = line.find("LIVE channel · LIVE").expect("complete subtitle");
+                let channel_x = terminal_text_width(&line[..metadata]);
+                let marker_x = channel_x + terminal_text_width("LIVE channel · ");
+                assert_ne!(
+                    buffer[(channel_x, y)].fg,
+                    Color::Red,
+                    "channel name is not a live marker"
+                );
+                for x in marker_x..marker_x + 4 {
+                    assert_eq!(buffer[(x, y)].fg == Color::Red, live, "{line}");
+                    if live {
+                        assert!(buffer[(x, y)].modifier.contains(Modifier::BOLD));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn youtube_live_details_color_the_length_without_changing_public_counts() {
+        for live in [true, false] {
+            let mut terminal = Terminal::new(TestBackend::new(160, 18)).expect("terminal");
+            let view = ViewModel {
+                details: Some(DetailView {
+                    media_id: Some(MediaId::new(SourceKind::YouTube, "live-fixture")),
+                    source: "YouTube".to_owned(),
+                    title: "LIVE title".to_owned(),
+                    live,
+                    length: "LIVE".to_owned(),
+                    views: "12".to_owned(),
+                    likes: "3".to_owned(),
+                    comments: "4".to_owned(),
+                    ..DetailView::default()
+                }),
+                ..ViewModel::default()
+            };
+            terminal
+                .draw(|frame| {
+                    render(frame, &view, &UiSettings::default(), &mut HitMap::default());
+                })
+                .expect("draw live details");
+
+            let buffer = terminal.backend().buffer();
+            let (y, line, start) = (0..18)
+                .find_map(|y| {
+                    let line = (0..160)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>();
+                    let start = line.find("Length: LIVE  Views: 12  Likes: 3  Comments: 4")?;
+                    Some((y, line, start))
+                })
+                .expect("live length and original public counts");
+            let x = terminal_text_width(&line[..start]) + 8;
+            for x in x..x + 4 {
+                assert_eq!(buffer[(x, y)].fg == Color::Red, live);
+            }
+            assert_ne!(
+                buffer[(x + 14, y)].fg,
+                Color::Red,
+                "view count stays unchanged"
+            );
+        }
     }
 
     #[test]

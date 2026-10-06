@@ -117,6 +117,8 @@ export function Player({
   const progress = duration > 0 ? Math.min(100, (position / duration) * 100) : 0;
 	// A live station's rewind buffer is not a finite track duration.
 	const radio = playback.live && track?.media_id.source === 'radio';
+	// Seekable broadcasts retain their distance from the live edge and buffer length.
+	const liveSeekable = playback.live && !radio && seekable;
 
   // A snapshot arriving mid-drag must not yank the scrubber out from under the
   // pointer, so the control is uncontrolled while the pointer is down.
@@ -186,7 +188,12 @@ export function Player({
           </div>
 
           <div className="mt-[5px] flex justify-between gap-3 text-[11px] text-ink-faint">
-            <span className="font-mono tabular-nums">{radio ? 'radio' : formatSeconds(position)}</span>
+			<span className='font-mono tabular-nums'>
+				{radio ? 'radio' : playback.live ? <>
+					<span className='font-semibold text-red-400'>LIVE</span>
+					{liveSeekable ? ` −${formatSeconds(duration - position)}` : null}
+				</> : formatSeconds(position)}
+			</span>
             {/* Clicking the title jumps the list to whatever is playing, which
                 is the only way back to it after browsing elsewhere.
 
@@ -212,7 +219,8 @@ export function Player({
                     : `${track.title} — ${track.subtitle}`)}
             </button>
             <span className="font-mono tabular-nums">
-              {radio ? null : duration > 0 ? formatSeconds(duration) : '--:--'}
+				{radio ? null : liveSeekable ? `${formatSeconds(duration)} buffer`
+					: playback.live ? null : duration > 0 ? formatSeconds(duration) : '--:--'}
             </span>
           </div>
 

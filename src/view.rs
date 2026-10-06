@@ -603,6 +603,8 @@ pub struct RowView {
     pub thumbnail_url: Option<url::Url>,
     /// Whether provider metadata identifies this as a vertical video.
     pub vertical: bool,
+    /// Whether provider metadata confirms that this media is currently live.
+    pub live: bool,
     /// Hide played-state markers while retaining identity for playing-row emphasis.
     pub hide_watched_marker: bool,
     /// Omit generic source and marker padding on a source-specific screen.
@@ -874,6 +876,8 @@ pub struct DetailView {
     pub channel_links_truncated: bool,
     /// Human-readable length.
     pub length: String,
+    /// Whether provider metadata confirms that the selected media is currently live.
+    pub live: bool,
     /// Description text.
     pub description: String,
     /// Display-only URL graphemes; offsets and copied text retain the raw description.
@@ -1445,7 +1449,8 @@ pub struct QueueRowView {
     pub title: String,
     /// Channel, artist, author, or station name.
     pub subtitle: String,
-    /// Preformatted running time, or an empty string when the provider has none.
+    /// Preformatted running time, `LIVE` for a confirmed `YouTube` broadcast,
+    /// or an empty string when the provider has no duration.
     ///
     /// The provider is named by [`Self::media_id`] rather than repeated here,
     /// so no front-end has to keep its own copy of the source-label mapping.

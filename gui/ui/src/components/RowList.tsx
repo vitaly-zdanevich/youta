@@ -4,6 +4,7 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import type { MediaId, RowView } from "../contract";
 import { dispatch } from "../ipc";
 import { Artwork } from "./Artwork";
+import { RowSubtitle } from './RowSubtitle';
 
 /** Row height in pixels, kept in one place so paging and layout agree. */
 export const ROW_HEIGHT = 46;
@@ -95,7 +96,7 @@ export function RowList({
                 </span>
                 {row.subtitle ? (
                   <span className="block truncate text-[11px] text-ink-faint">
-                    {row.subtitle}
+					<RowSubtitle row={row} />
                   </span>
                 ) : null}
               </span>

@@ -2009,7 +2009,8 @@ export function QueuePopup({ popup }: { popup: QueuePopupView }) {
                   </span>
                 )}
               </button>
-              <span className="shrink-0 text-[11px] tabular-nums text-ink-faint">
+							<span className={`shrink-0 text-[11px] tabular-nums ${item.media_id.source === 'you-tube' && item.length === 'LIVE'
+								? 'font-semibold text-red-400' : 'text-ink-faint'}`}>
                 {item.length}
               </span>
             </div>

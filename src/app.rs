@@ -18987,11 +18987,12 @@ impl AppController {
                     media_id: item.media.id.clone(),
                     title: item.media.title.clone(),
                     subtitle: item.media.creator.clone().unwrap_or_default(),
-                    length: item
-                        .media
-                        .duration_seconds
-                        .map(format_seconds)
-                        .unwrap_or_default(),
+                    length: youtube_media_length(
+                        item.media.duration_seconds,
+                        item.media.id.source == SourceKind::YouTube
+                            && item.media.kind == MediaKind::LiveStream,
+                        "",
+                    ),
                 })
                 .collect(),
             current: self.playback_queue.current_index,
@@ -28549,6 +28550,7 @@ impl AppController {
             .iter()
             .map(|entry| {
                 let live_stream = entry.media.kind == MediaKind::LiveStream;
+                let youtube_live = live_stream && entry.media.id.source == SourceKind::YouTube;
                 let playback = if live_stream {
                     PlaybackRowState::default()
                 } else {
@@ -28557,7 +28559,7 @@ impl AppController {
                 };
                 let mut metadata = Vec::with_capacity(3);
                 if live_stream {
-                    metadata.push("live".to_owned());
+                    metadata.push(if youtube_live { "LIVE" } else { "live" }.to_owned());
                 } else {
                     if let Some(creator) = entry
                         .media
@@ -28594,6 +28596,7 @@ impl AppController {
                         youtube_thumbnail_size,
                     ),
                     hide_watched_marker: live_stream,
+                    live: youtube_live,
                     compact: true,
                     ..RowView::default()
                 }
@@ -28715,6 +28718,8 @@ impl AppController {
                     && thumbnail_url.is_some())
                 .then(|| youtube_thumbnail_size.dimensions())
                 .flatten();
+                let youtube_live = entry.media.id.source == SourceKind::YouTube
+                    && entry.media.kind == MediaKind::LiveStream;
                 self.view.details = Some(DetailView {
                     media_id: Some(entry.media.id.clone()),
                     title: entry.media.title.clone(),
@@ -28723,10 +28728,8 @@ impl AppController {
                     } else {
                         entry.media.id.source.to_string()
                     },
-                    length: entry
-                        .media
-                        .duration_seconds
-                        .map_or_else(String::new, format_seconds),
+                    length: youtube_media_length(entry.media.duration_seconds, youtube_live, ""),
+                    live: youtube_live,
                     description,
                     timecodes,
                     video_links,
@@ -42339,6 +42342,7 @@ fn row_from_search_item_with_progress_mode(
                     preferred_youtube_thumbnail_url(&video.thumbnails, youtube_thumbnail_size)
                 },
                 vertical: youtube_video_uses_shorts_style(video),
+                live: video.live,
                 hide_watched_marker: false,
                 compact: false,
                 radio_favorite: false,
@@ -42502,10 +42506,22 @@ fn youtube_video_row_subtitle(
             fields.push(date);
         }
     }
-    if let Some(duration) = video.duration_seconds {
-        fields.push(format_seconds(duration));
+    if video.live || video.duration_seconds.is_some() {
+        fields.push(youtube_media_length(video.duration_seconds, video.live, ""));
     }
     fields.join(" · ")
+}
+
+/// Formats a `YouTube` duration, replacing it only for a confirmed live broadcast.
+///
+/// Missing and zero durations retain their existing representation unless the
+/// provider's live flag or a saved live media kind confirms the broadcast state.
+fn youtube_media_length(duration_seconds: Option<u64>, live: bool, unknown: &str) -> String {
+    if live {
+        "LIVE".to_owned()
+    } else {
+        duration_seconds.map_or_else(|| unknown.to_owned(), format_seconds)
+    }
 }
 
 #[cfg(feature = "youtube-music")]
@@ -42647,9 +42663,8 @@ fn preliminary_detail_with_thumbnail_size(
                 channel_subscribed: subscriptions.contains_youtube_channel(&video.channel_id),
                 channel_auto_download: subscriptions
                     .youtube_channel_auto_download(&video.channel_id),
-                length: video
-                    .duration_seconds
-                    .map_or_else(|| "unknown".to_owned(), format_seconds),
+                length: youtube_media_length(video.duration_seconds, video.live, "unknown"),
+                live: video.live,
                 timecodes: detail_timecodes(&description),
                 video_links: detail_video_links(&description),
                 links: youtube_hashtag_links(&description),
@@ -43387,9 +43402,8 @@ fn detail_from_video_with_thumbnail_size(
         channel_subscribed: subscriptions.contains_youtube_channel(&video.channel_id),
         channel_auto_download: subscriptions.youtube_channel_auto_download(&video.channel_id),
         channel_subscriber_count: None,
-        length: video
-            .duration_seconds
-            .map_or_else(|| "unknown".to_owned(), format_seconds),
+        length: youtube_media_length(video.duration_seconds, video.live, "unknown"),
+        live: video.live,
         timecodes: detail_timecodes(&description),
         video_links: detail_video_links(&description),
         links: youtube_hashtag_links(&description),
@@ -43444,6 +43458,8 @@ fn detail_from_media_item(
     let thumbnail_dimensions = (media.id.source == SourceKind::YouTube && thumbnail_url.is_some())
         .then(|| youtube_thumbnail_size.dimensions())
         .flatten();
+    let youtube_live =
+        media.id.source == SourceKind::YouTube && media.kind == MediaKind::LiveStream;
     DetailView {
         media_id: Some(media.id.clone()),
         title: media.title.clone(),
@@ -43451,9 +43467,8 @@ fn detail_from_media_item(
         webpage_url: matches!(media.webpage_url.scheme(), "http" | "https")
             .then(|| media.webpage_url.clone()),
         channel_name: media.creator.clone().unwrap_or_default(),
-        length: media
-            .duration_seconds
-            .map_or_else(String::new, format_seconds),
+        length: youtube_media_length(media.duration_seconds, youtube_live, ""),
+        live: youtube_live,
         description: description.clone(),
         timecodes: detail_timecodes(&description),
         video_links: detail_video_links(&description),
@@ -52887,6 +52902,75 @@ mod tests {
     }
 
     #[test]
+    fn youtube_live_playlist_rows_and_details_preserve_confirmed_stream_kind() {
+        for (source, kind, duration_seconds, expected_subtitle, expected_length, live) in [
+            (
+                SourceKind::YouTube,
+                MediaKind::LiveStream,
+                Some(0),
+                "LIVE",
+                "LIVE",
+                true,
+            ),
+            (
+                SourceKind::YouTube,
+                MediaKind::LiveStream,
+                None,
+                "LIVE",
+                "LIVE",
+                true,
+            ),
+            (
+                SourceKind::YouTube,
+                MediaKind::LiveStream,
+                Some(42),
+                "LIVE",
+                "LIVE",
+                true,
+            ),
+            (
+                SourceKind::YouTube,
+                MediaKind::Video,
+                Some(0),
+                "0:00",
+                "0:00",
+                false,
+            ),
+            (SourceKind::YouTube, MediaKind::Video, None, "", "", false),
+            (
+                SourceKind::YouTube,
+                MediaKind::Video,
+                Some(42),
+                "0:42",
+                "0:42",
+                false,
+            ),
+            (
+                SourceKind::Radio,
+                MediaKind::LiveStream,
+                None,
+                "live",
+                "",
+                false,
+            ),
+        ] {
+            let mut entry = fixture_youtube_playlist_entry("dQw4w9WgXcQ", "Fixture video");
+            entry.media.id.source = source;
+            entry.media.kind = kind;
+            entry.media.duration_seconds = duration_seconds;
+            entry.media.creator = None;
+            let (mut controller, _) = controller_with_mock_statuses([]);
+            controller_with_active_playlist(&mut controller, vec![entry]);
+            controller.populate_playlist_entries();
+            assert_eq!(controller.view.rows[0].live, live);
+            assert_eq!(controller.view.rows[0].subtitle, expected_subtitle);
+            let details = controller.view.details.as_ref().expect("playlist details");
+            assert_eq!(details.live, live);
+            assert_eq!(details.length, expected_length);
+        }
+    }
+
+    #[test]
     fn live_playlist_description_does_not_expose_unusable_timecodes() {
         let webpage_url =
             url::Url::parse("https://radio.example.test/station").expect("fixture station page");
@@ -53597,6 +53681,152 @@ mod tests {
             "",
             "missing or invalid fields must not leave separators or `unknown`"
         );
+    }
+
+    #[test]
+    fn youtube_live_rows_replace_any_duration_with_confirmed_live_status() {
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let subscriptions = SubscriptionTree::default();
+        let today = NaiveDate::from_ymd_opt(2026, 7, 26).expect("valid fixture date");
+        for duration_seconds in [Some(0), None, Some(42)] {
+            for context in [
+                SearchRowContext::GlobalSearch,
+                SearchRowContext::YouTubeMusic,
+                SearchRowContext::SubscriptionFeed,
+            ] {
+                let mut video = subscription_video_summary();
+                video.live = true;
+                video.duration_seconds = duration_seconds;
+                video.published_at = None;
+                let row = row_from_search_item(
+                    &SearchItem::Video(video),
+                    &store,
+                    &subscriptions,
+                    &HashMap::new(),
+                    context,
+                    today,
+                );
+                assert!(row.live, "confirmed live status must reach the renderer");
+                assert_eq!(
+                    row.subtitle,
+                    if matches!(context, SearchRowContext::SubscriptionFeed) {
+                        "LIVE"
+                    } else {
+                        "Fixture channel · LIVE"
+                    },
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn youtube_live_rows_do_not_guess_from_zero_or_unknown_duration() {
+        let store = StateStore::open_in_memory().expect("in-memory state");
+        let subscriptions = SubscriptionTree::default();
+        let today = NaiveDate::from_ymd_opt(2026, 7, 26).expect("valid fixture date");
+        for (duration_seconds, expected) in [(Some(0), "0:00"), (None, ""), (Some(42), "0:42")] {
+            let mut video = subscription_video_summary();
+            video.duration_seconds = duration_seconds;
+            video.published_at = None;
+            let row = row_from_search_item(
+                &SearchItem::Video(video),
+                &store,
+                &subscriptions,
+                &HashMap::new(),
+                SearchRowContext::SubscriptionFeed,
+                today,
+            );
+            assert!(!row.live);
+            assert_eq!(row.subtitle, expected);
+        }
+    }
+
+    #[test]
+    fn youtube_live_details_preserve_status_before_and_after_enrichment() {
+        let subscriptions = SubscriptionTree::default();
+        for live in [false, true] {
+            for (duration_seconds, finite_length) in
+                [(Some(0), "0:00"), (None, "unknown"), (Some(42), "0:42")]
+            {
+                let mut video = subscription_video_details("Fixture video");
+                video.live = live;
+                video.duration_seconds = duration_seconds;
+                let preliminary = preliminary_detail(
+                    &SearchItem::Video(summary_from_details(&video)),
+                    &subscriptions,
+                );
+                let complete = detail_from_video(&video, &subscriptions);
+                for details in [preliminary, complete] {
+                    assert_eq!(details.live, live);
+                    assert_eq!(details.length, if live { "LIVE" } else { finite_length });
+                }
+                let item = queue_item_from_video(&summary_from_details(&video), None);
+                let details = detail_from_media_item(&item.media, YouTubeThumbnailSize::Standard);
+                assert_eq!(details.live, live);
+                assert_eq!(
+                    details.length,
+                    if live {
+                        "LIVE"
+                    } else if duration_seconds.is_none() {
+                        ""
+                    } else {
+                        finite_length
+                    },
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn youtube_live_lazy_details_refresh_visible_rows_when_broadcast_status_changes() {
+        for screen in [Screen::Search, Screen::YouTubeMusic, Screen::Subscriptions] {
+            let temporary = crate::test_support::canonical_tempdir("live details fixture");
+            let config = Config::for_dir(temporary.path().join("youta"));
+            let store = StateStore::open_in_memory().expect("in-memory state");
+            let mut controller = AppController::new(config, store, None, None);
+            let mut summary = subscription_video_summary();
+            summary.duration_seconds = None;
+            controller.view.screen = screen;
+            controller.view.right_panel_mode = RightPanelMode::Details;
+            controller.youtube_results = vec![SearchItem::Video(summary.clone())];
+            controller.youtube_music_results = vec![SearchItem::Video(summary.clone())];
+            controller.view.subscriptions.route = SubscriptionRoute::Items;
+            controller.view.subscriptions.focus = SubscriptionPane::Items;
+            controller.active_subscription_channel_id = Some("UCfixture".to_owned());
+            controller.cache_subscription_video_page(
+                "UCfixture",
+                SearchPage {
+                    page: 1,
+                    items: vec![SearchItem::Video(summary)],
+                    next_page: None,
+                },
+            );
+            for (live, duration_seconds, expected_length) in
+                [(true, Some(0), "LIVE"), (false, Some(42), "0:42")]
+            {
+                let mut details = subscription_video_details("Fixture video");
+                details.live = live;
+                details.duration_seconds = duration_seconds;
+                controller.handle_provider_response(ProviderResponse::Details {
+                    generation: controller.details_generation,
+                    result: Ok(details),
+                });
+                let row = if screen == Screen::Subscriptions {
+                    &controller.view.subscriptions.items[0]
+                } else {
+                    &controller.view.rows[0]
+                };
+                assert_eq!(row.live, live, "{screen:?}");
+                assert!(
+                    row.subtitle.ends_with(expected_length),
+                    "{screen:?}: {}",
+                    row.subtitle
+                );
+                let details = controller.view.details.as_ref().expect("visible details");
+                assert_eq!(details.live, live, "{screen:?}");
+                assert_eq!(details.length, expected_length, "{screen:?}");
+            }
+        }
     }
 
     #[test]
@@ -75074,6 +75304,36 @@ mod tests {
             !published.contains(&location),
             "the playable location must not reach a front-end"
         );
+    }
+
+    /// Queue durations follow confirmed broadcasts without interpreting titles or creators.
+    #[test]
+    fn youtube_live_queue_rows_replace_only_confirmed_stream_durations() {
+        let (mut controller, _) = controller_with_mock_statuses([]);
+        for (source, kind, duration, expected) in [
+            (SourceKind::YouTube, MediaKind::LiveStream, Some(0), "LIVE"),
+            (SourceKind::YouTube, MediaKind::LiveStream, None, "LIVE"),
+            (SourceKind::YouTube, MediaKind::LiveStream, Some(42), "LIVE"),
+            (SourceKind::YouTube, MediaKind::Video, Some(0), "0:00"),
+            (SourceKind::YouTube, MediaKind::Video, None, ""),
+            (SourceKind::YouTube, MediaKind::Video, Some(42), "0:42"),
+            (SourceKind::Radio, MediaKind::LiveStream, Some(0), "0:00"),
+            (SourceKind::Radio, MediaKind::LiveStream, None, ""),
+            (SourceKind::Radio, MediaKind::LiveStream, Some(42), "0:42"),
+        ] {
+            let mut item = fixture_youtube_item("LIVE title");
+            item.media.id.source = source;
+            item.media.kind = kind;
+            item.media.duration_seconds = duration;
+            item.media.creator = Some("LIVE creator".to_owned());
+            controller.playback_queue.items = vec![item];
+
+            let popup = controller.queue_popup_view(0);
+
+            assert_eq!(popup.items[0].length, expected);
+            assert_eq!(popup.items[0].title, "LIVE title");
+            assert_eq!(popup.items[0].subtitle, "LIVE creator");
+        }
     }
 
     /// A media key means "the next entry", not "the next entry unless repeat".

@@ -360,7 +360,10 @@ export function Details({ view, kind }: { view: ViewModel; kind: InformationPane
           {facts.map(([label, value]) => (
             <div key={label} className="contents">
               <dt className="text-ink-faint">{label}</dt>
-							<dd className='m-0'><FactValue details={details} label={label} value={value} /></dd>
+							<dd className={details.live && label === 'Length' && value === 'LIVE'
+								? 'm-0 font-semibold text-red-400' : 'm-0'}>
+								<FactValue details={details} label={label} value={value} />
+							</dd>
             </div>
           ))}
         </dl>
