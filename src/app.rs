@@ -16551,7 +16551,7 @@ impl AppController {
             self.view.details = Some(DetailView {
                 title: "..".to_owned(),
                 source: "Local folder".to_owned(),
-                description: format!("Full path: {}", self.local_display_path(&parent)),
+                description: format!("Full path:\n{}", self.local_display_path(&parent)),
                 ..DetailView::default()
             });
             #[cfg(feature = "audio-quality")]
@@ -16622,7 +16622,7 @@ impl AppController {
                 }
                 .to_owned(),
                 description: format!(
-                    "Full path: {}{}{}",
+                    "Full path:\n{}{}{}",
                     self.local_display_path(&entry.path),
                     known_size
                         .map_or_else(String::new, |size| format!("\nSize: {}", human_bytes(size))),
@@ -30307,7 +30307,7 @@ impl AppController {
             )
         } else {
             (
-                format!("Full path: {}", self.local_display_path(&path)),
+                format!("Full path:\n{}", self.local_display_path(&path)),
                 String::new(),
                 None,
                 false,
@@ -41613,8 +41613,9 @@ fn local_media_description(item: &LocalMediaItem) -> String {
 }
 
 /// Formats metadata with a caller-provided display label, keeping the stored item untouched.
+/// The path starts on its own line so the heading does not consume its display width.
 fn local_media_description_with_path(item: &LocalMediaItem, path_label: &str) -> String {
-    let mut lines = vec![format!("Full path: {path_label}")];
+    let mut lines = vec![format!("Full path:\n{path_label}")];
     if let Some(artist) = &item.artist {
         lines.push(format!("Artists: {artist}"));
     }

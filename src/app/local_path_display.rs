@@ -81,7 +81,7 @@ mod controller_tests {
                 .as_ref()
                 .unwrap()
                 .description
-                .starts_with(&format!("Full path: {}\n", short.display()))
+                .starts_with(&format!("Full path:\n{}\n", short.display()))
         );
         assert_eq!(
             controller.view.rows[1].media_id,
@@ -155,7 +155,7 @@ mod controller_tests {
                 .as_ref()
                 .unwrap()
                 .description
-                .starts_with(&format!("Full path: {}\n", track.display()))
+                .starts_with(&format!("Full path:\n{}\n", track.display()))
         );
         assert!(
             Config::load_from_dir(controller.config.config_dir())
@@ -194,7 +194,7 @@ mod controller_tests {
         controller.update_local_browser_detail();
         assert_eq!(
             controller.view.details.as_ref().unwrap().description,
-            "Full path: ~"
+            "Full path:\n~"
         );
         controller.local_listing.as_mut().unwrap().entries[0].kind =
             crate::local_browser::LocalEntryKind::Directory;
@@ -205,14 +205,64 @@ mod controller_tests {
             .join("track.opus");
         assert_eq!(
             controller.view.details.as_ref().unwrap().description,
-            format!("Full path: {}", short.display())
+            format!("Full path:\n{}", short.display())
         );
         controller.config.ui.show_full_local_paths = true;
         controller.update_local_browser_detail();
         assert_eq!(
             controller.view.details.as_ref().unwrap().description,
-            format!("Full path: {}", track.display())
+            format!("Full path:\n{}", track.display())
         );
+    }
+
+    /// Folder and non-playable file paths each get the full next line in both display modes.
+    #[test]
+    fn non_playable_local_paths_start_below_the_heading() {
+        use crate::local_browser::LocalEntryKind;
+
+        let (_temporary, mut controller, track) = fixture();
+        for kind in [
+            LocalEntryKind::Directory,
+            LocalEntryKind::Image,
+            LocalEntryKind::Text,
+            LocalEntryKind::Other,
+        ] {
+            controller.local_listing.as_mut().unwrap().entries[0].kind = kind;
+            for show_full in [false, true] {
+                controller.config.ui.show_full_local_paths = show_full;
+                controller.update_local_browser_detail();
+                let description = &controller.view.details.as_ref().unwrap().description;
+                let expected_path = controller.local_display_path(&track);
+                let mut lines = description.lines();
+                assert_eq!(lines.next(), Some("Full path:"));
+                assert_eq!(lines.next(), Some(expected_path.as_str()));
+                assert_eq!(controller.selected_local_path(), Some(track.clone()));
+            }
+        }
+    }
+
+    /// Offline files use the same two-line presentation without changing their replay identity.
+    #[test]
+    fn downloaded_local_paths_start_below_the_heading() {
+        let (_temporary, mut controller, track) = fixture();
+        let media_id = local_media_id(&track);
+        controller.view.screen = Screen::Downloaded;
+        controller.view.rows = vec![RowView {
+            media_id: Some(media_id.clone()),
+            title: "Downloaded track".to_owned(),
+            ..RowView::default()
+        }];
+        controller.view.selected = 0;
+        for show_full in [false, true] {
+            controller.config.ui.show_full_local_paths = show_full;
+            controller.update_downloaded_detail();
+            let details = controller.view.details.as_ref().unwrap();
+            assert_eq!(
+                details.description,
+                format!("Full path:\n{}", controller.local_display_path(&track))
+            );
+            assert_eq!(details.media_id.as_ref(), Some(&media_id));
+        }
     }
 
     /// Archive members show their logical source, not a private extraction-cache path.
@@ -245,7 +295,7 @@ mod controller_tests {
                 .unwrap()
                 .description
                 .starts_with(&format!(
-                    "Full path: {}!/track.opus\n",
+                    "Full path:\n{}!/track.opus\n",
                     short_source.display()
                 ))
         );

@@ -69,6 +69,7 @@
 		{ id: 'SoundCloud', label: 'SoundCloud', details_kind: 'Generic', search_verb: 'Search' },
 		{ id: 'ArchiveOrg', label: 'archive.org', details_kind: 'Generic', search_verb: 'Search' },
 		{ id: 'LibriVox', label: 'LibriVox', details_kind: 'Podcast', search_verb: 'Search' },
+		{ id: 'Local', label: 'Local', details_kind: 'Local', search_verb: null },
 	];
 	window.addEventListener('error', (event) => failures.push(event.message));
 	window.addEventListener('unhandledrejection', (event) => failures.push(String(event.reason)));
@@ -465,6 +466,37 @@
 		snapshot({ details: null });
 		await until(() => !document.querySelector('[aria-label=Details]'), 'cleared selected artwork owner');
 	}
+	/** Local path values begin on the next complete line without losing width to their heading. */
+	async function checkLocalFullPath() {
+		const previous = clone(view);
+		for (const path of ['/fixture/library/audio.flac', '~/library/audio.flac', '/fixture/library/archive.zip!/audio.flac']) {
+			const description = `Full path:\n${path}`;
+			snapshot({ screen: 'Local', details: { ...clone(defaults.DetailView),
+				title: 'Local path fixture', source: 'Local', description,
+				media_id: { source: 'local', external_id: path },
+			} });
+			const rendered = await until(() => {
+				const node = document.querySelector('[data-description]');
+				return node?.textContent === description && node;
+			}, `Local path description: ${path}`);
+			const text = document.createTreeWalker(rendered, NodeFilter.SHOW_TEXT).nextNode();
+			const range = document.createRange();
+			range.setStart(text, 0);
+			range.setEnd(text, 'Full path:'.length);
+			const heading = range.getBoundingClientRect();
+			range.setStart(text, 'Full path:\n'.length);
+			range.setEnd(text, 'Full path:\n'.length + 1);
+			const value = range.getBoundingClientRect();
+			const lineHeight = Number.parseFloat(getComputedStyle(rendered).lineHeight);
+			assert(Math.abs(value.top - heading.top - lineHeight) < 1, `Local path follows its heading on the next line: ${path}`);
+			assert(Math.abs(value.left - heading.left) < 1, `Local path starts at the heading's left edge: ${path}`);
+			const panel = document.querySelector('[aria-label=Details]');
+			const styles = getComputedStyle(panel);
+			const availableWidth = panel.clientWidth - Number.parseFloat(styles.paddingLeft) - Number.parseFloat(styles.paddingRight);
+			assert(Math.abs(rendered.getBoundingClientRect().width - availableWidth) < 1, `Local path keeps the full description width: ${path}`);
+		}
+		snapshot(previous);
+	}
 	/** Focus snapshots and native checkbox/button keys must agree with the shared keymap. */
 	async function checkPreferencesFocus() {
 		const preferences = { ...clone(defaults.PreferencesPopupView), selected_field: 'SubscriptionsLayout',
@@ -537,6 +569,7 @@
 		}
 		snapshot(beforeTabMarkers);
 		await checkRadioPresentation();
+		await checkLocalFullPath();
 		await checkPreferencesFocus();
 		await checkUnsubscribeConfirmation();
 		await checkProviderSettings();

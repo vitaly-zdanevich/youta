@@ -30466,7 +30466,7 @@ for encoded, expected in json.load(sys.stdin):
             details: Some(DetailView {
                 title: "Local MOV fixture".to_owned(),
                 source: "Local video (audio playback)".to_owned(),
-                description: "Full path: /tmp/youta-video-thumbnail-fixture.MOV".to_owned(),
+                description: "Full path:\n/tmp/youta-video-thumbnail-fixture.MOV".to_owned(),
                 thumbnail_url: Some(
                     url::Url::parse("https://images.example/stale-artwork.jpg")
                         .expect("stale artwork URL"),
@@ -30536,7 +30536,7 @@ for encoded, expected in json.load(sys.stdin):
         view.details = Some(DetailView {
             title: "Local audio fixture".to_owned(),
             source: "Local audio".to_owned(),
-            description: "Full path: /tmp/youta-audio-fixture.flac".to_owned(),
+            description: "Full path:\n/tmp/youta-audio-fixture.flac".to_owned(),
             ..DetailView::default()
         });
         terminal
@@ -38927,6 +38927,88 @@ prose 07:25 remains clickable but is not a chapter";
         );
     }
 
+    /// Local paths own the full row below their heading and retain their copyable text.
+    #[test]
+    fn local_details_full_path_uses_a_separate_full_width_selectable_row() {
+        for width in [29, 80] {
+            for path in [
+                "/music/01 - Long track.flac",
+                "~/Music/01 - Long track.flac",
+            ] {
+                let mut terminal = Terminal::new(TestBackend::new(width, 18)).expect("terminal");
+                let description = format!("Full path:\n{path}");
+                let view = ViewModel {
+                    screen: Screen::Local,
+                    details: Some(DetailView {
+                        title: "01 - Long track.flac".to_owned(),
+                        source: "Local audio".to_owned(),
+                        description: description.clone(),
+                        ..DetailView::default()
+                    }),
+                    ..ViewModel::default()
+                };
+                let mut hit_map = HitMap::default();
+
+                terminal
+                    .draw(|frame| {
+                        render_details(
+                            frame,
+                            frame.area(),
+                            &view,
+                            true,
+                            0,
+                            &Theme::new(false),
+                            &mut hit_map,
+                            None,
+                        );
+                    })
+                    .expect("draw Local path below its heading");
+
+                let (heading_index, heading_row) = hit_map
+                    .detail_text_rows
+                    .iter()
+                    .enumerate()
+                    .find(|(_, row)| row.cells.concat() == "Full path:")
+                    .expect("standalone Full path heading");
+                let (path_index, path_row) = hit_map
+                    .detail_text_rows
+                    .iter()
+                    .enumerate()
+                    .find(|(_, row)| row.cells.concat() == path)
+                    .expect("complete selectable path on one row");
+                assert_eq!(path_row.x, heading_row.x);
+                assert_eq!(path_row.y, heading_row.y + 1);
+                if width == 29 {
+                    let text_width = width - 1;
+                    assert!(terminal_text_width(path) <= text_width);
+                    assert!(terminal_text_width(&format!("Full path: {path}")) > text_width);
+                }
+                let selection = DetailsTextSelection {
+                    anchor: DetailsTextPosition {
+                        row: path_index,
+                        column: 0,
+                    },
+                    focus: DetailsTextPosition {
+                        row: path_index,
+                        column: path_row.cells.len() - 1,
+                    },
+                    dragging: false,
+                };
+                assert_eq!(hit_map.selected_details_text(selection), path);
+                assert_eq!(
+                    hit_map.selected_details_text(DetailsTextSelection {
+                        anchor: DetailsTextPosition {
+                            row: heading_index,
+                            column: 0,
+                        },
+                        ..selection
+                    }),
+                    description
+                );
+            }
+        }
+    }
+
     #[test]
     fn local_details_expose_the_current_file_visibility_toggle() {
         for (show_all_local_files, expected, unexpected, highlighted) in [
@@ -38941,7 +39023,7 @@ prose 07:25 remains clickable but is not a chapter";
                 details: Some(DetailView {
                     title: "notes.txt".to_owned(),
                     source: "Local text".to_owned(),
-                    description: "Full path: /music/notes.txt".to_owned(),
+                    description: "Full path:\n/music/notes.txt".to_owned(),
                     ..DetailView::default()
                 }),
                 ..ViewModel::default()
@@ -38992,7 +39074,7 @@ prose 07:25 remains clickable but is not a chapter";
                 details: Some(DetailView {
                     title: title.to_owned(),
                     source: "Local folder".to_owned(),
-                    description: format!("Full path: /music/{title}"),
+                    description: format!("Full path:\n/music/{title}"),
                     local_renamable: requested_rename,
                     local_movable: requested_move,
                     local_trashable: requested_trash,
@@ -39087,7 +39169,7 @@ prose 07:25 remains clickable but is not a chapter";
             details: Some(DetailView {
                 title: "01 - Track.flac".to_owned(),
                 source: "Local audio".to_owned(),
-                description: "Full path: /music/01 - Track.flac".to_owned(),
+                description: "Full path:\n/music/01 - Track.flac".to_owned(),
                 local_fingerprint_available: true,
                 local_fingerprint_pending: true,
                 ..DetailView::default()
@@ -39212,7 +39294,7 @@ prose 07:25 remains clickable but is not a chapter";
             details: Some(DetailView {
                 title: "01 - Track.flac".to_owned(),
                 source: "Local audio".to_owned(),
-                description: "Full path: /music/01 - Track.flac".to_owned(),
+                description: "Full path:\n/music/01 - Track.flac".to_owned(),
                 local_fingerprint_available: true,
                 local_audio_quality_available: true,
                 local_audio_quality_description: concat!(
@@ -39726,7 +39808,7 @@ prose 07:25 remains clickable but is not a chapter";
             details: Some(DetailView {
                 title: "Track.flac".to_owned(),
                 source: "Local audio".to_owned(),
-                description: "Full path: /music/Track.flac".to_owned(),
+                description: "Full path:\n/music/Track.flac".to_owned(),
                 lastfm_artist_description: concat!(
                     "самая конфликтная, самая нищебродская и самая сексистская группа.\n",
                     "новейший дип-хоп - местами абстракт хип-хоп\n",
@@ -39744,7 +39826,8 @@ prose 07:25 remains clickable but is not a chapter";
             .expect("draw Last.fm artist description");
 
         let rendered = rendered_text(&terminal);
-        assert!(rendered.contains("Full path: /music/Track.flac"));
+        assert!(rendered.contains("Full path:"));
+        assert!(rendered.contains("/music/Track.flac"));
         assert!(rendered.contains("Last.fm artist description:"));
         assert!(rendered.contains("самая конфликтная"));
         assert!(hit_map.details_scroll_maximum > 0);
@@ -39764,7 +39847,7 @@ prose 07:25 remains clickable but is not a chapter";
             details: Some(DetailView {
                 title: "offline.opus".to_owned(),
                 source: "Local download".to_owned(),
-                description: "Full path: /downloads/offline.opus".to_owned(),
+                description: "Full path:\n/downloads/offline.opus".to_owned(),
                 ..DetailView::default()
             }),
             ..ViewModel::default()
