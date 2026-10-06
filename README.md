@@ -1324,11 +1324,15 @@ Youta keeps one private note per exact target:
   local file; the same media target is reused when selected through
   **Offline**, **History**, or a playlist;
 - source targets include a YouTube channel, Bandcamp album/release, an
-  RSS/podcast subscription, or an Apple Podcasts show.
+  RSS/podcast subscription, an Apple Podcasts show, or a Local folder.
 
 Provider-qualified IDs keep equal-looking titles from sharing a note, and a
 channel/show note remains independent from notes on its videos or episodes.
 The note is limited to 16 KiB of UTF-8 text.
+
+A Local folder is identified by its exact full path, and its note is separate
+from notes on its child files. With `..` selected, `n` targets the parent
+folder. Folder notes use the same editor and storage as other notes.
 
 | Editor key | Action |
 | --- | --- |

@@ -4809,6 +4809,29 @@ mod tests {
         ));
     }
 
+    /// File state keeps same-basename folders and their child notes as separate exact targets.
+    #[test]
+    fn local_folder_private_notes_are_exact_and_survive_restart() {
+        let directory = tempdir().expect("temporary note fixture");
+        let config = Config::for_dir(directory.path().join("youta"));
+        assert_local_folder_note_isolation(
+            || FileStateStore::open(&config).expect("file state"),
+            directory.path(),
+        );
+    }
+
+    /// File state remaps folder and child notes together while preserving unrelated siblings.
+    #[cfg(any(feature = "local-rename", feature = "local-move"))]
+    #[test]
+    fn local_folder_private_notes_follow_prefix_moves_and_survive_restart() {
+        let directory = tempdir().expect("temporary note fixture");
+        let config = Config::for_dir(directory.path().join("youta"));
+        assert_local_folder_note_move(
+            || FileStateStore::open(&config).expect("file state"),
+            directory.path(),
+        );
+    }
+
     #[test]
     fn private_note_upsert_is_exact_atomic_and_preserves_creation_time() {
         let store = FileStateStore::open_in_memory().expect("open file state");

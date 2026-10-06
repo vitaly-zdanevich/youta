@@ -7596,6 +7596,157 @@ pub(crate) fn assert_yandex_music_reaction_backend_contract(store: &dyn StateBac
     }
 }
 
+/// Verifies exact folder identities, independent child notes, and durable edits for both backends.
+#[cfg(all(test, any(unix, feature = "sqlite-state")))]
+fn assert_local_folder_note_isolation<B: StateBackend>(
+    open: impl Fn() -> B,
+    directory: &std::path::Path,
+) {
+    let directory = directory.join("Local notes 音楽");
+    let local_id = |path: &str| {
+        MediaId::new(
+            SourceKind::Local,
+            Url::from_file_path(directory.join(path))
+                .expect("absolute fixture path")
+                .to_string(),
+        )
+    };
+    let targets = [
+        CommentTarget::Source {
+            source_id: local_id("one/album"),
+        },
+        CommentTarget::Source {
+            source_id: local_id("two/album"),
+        },
+        CommentTarget::Media {
+            media_id: local_id("one/album/track.mp3"),
+        },
+    ];
+    let bodies = [
+        "First folder",
+        "Same basename, another folder",
+        "Child file",
+    ];
+    let mut notes = Vec::new();
+    {
+        let store = open();
+        for (target, body) in targets.iter().zip(bodies) {
+            notes.push(
+                store
+                    .upsert_private_note(target, body, 10)
+                    .expect("seed note"),
+            );
+        }
+        let edited = store
+            .upsert_private_note(&targets[0], "Edited folder", 20)
+            .expect("edit folder note");
+        assert_eq!(edited.id, notes[0].id);
+        assert_eq!(edited.created_at, 10);
+        assert_eq!(edited.updated_at, 20);
+        notes[0] = edited;
+    }
+    {
+        let reopened = open();
+        for (target, note) in targets.iter().zip(&notes) {
+            assert_eq!(
+                reopened.private_note(target).expect("reopened note"),
+                Some(note.clone())
+            );
+        }
+        assert!(
+            reopened
+                .delete_private_note(&targets[0])
+                .expect("delete folder note")
+        );
+    }
+    let reopened = open();
+    assert!(
+        reopened
+            .private_note(&targets[0])
+            .expect("deleted folder note")
+            .is_none()
+    );
+    for (target, note) in targets[1..].iter().zip(&notes[1..]) {
+        assert_eq!(
+            reopened.private_note(target).expect("unrelated note"),
+            Some(note.clone())
+        );
+    }
+}
+
+/// Verifies that directory-prefix moves retain note IDs, timestamps, and exact target kinds.
+#[cfg(all(
+    test,
+    any(unix, feature = "sqlite-state"),
+    any(feature = "local-rename", feature = "local-move")
+))]
+fn assert_local_folder_note_move<B: StateBackend>(
+    open: impl Fn() -> B,
+    directory: &std::path::Path,
+) {
+    let directory = directory.join("Local notes 音楽");
+    let local_id = |path: &str| {
+        MediaId::new(
+            SourceKind::Local,
+            Url::from_file_path(directory.join(path))
+                .expect("absolute fixture path")
+                .to_string(),
+        )
+    };
+    let folder = |path: &str| CommentTarget::Source {
+        source_id: local_id(path),
+    };
+    let source_targets = [
+        folder("music/album"),
+        folder("music/album/disc"),
+        CommentTarget::Media {
+            media_id: local_id("music/album/disc/track.mp3"),
+        },
+        folder("backup/album"),
+        folder("music/album-other"),
+    ];
+    let target_targets = [
+        folder("archive/album"),
+        folder("archive/album/disc"),
+        CommentTarget::Media {
+            media_id: local_id("archive/album/disc/track.mp3"),
+        },
+        source_targets[3].clone(),
+        source_targets[4].clone(),
+    ];
+    let mut notes = Vec::new();
+    {
+        let store = open();
+        for (index, target) in source_targets.iter().enumerate() {
+            notes.push(
+                store
+                    .upsert_private_note(target, &format!("Note {index}"), 10)
+                    .expect("seed move note"),
+            );
+        }
+        let report = store
+            .remap_local_move_state(&[LocalMoveMapping {
+                source: directory.join("music/album"),
+                target: directory.join("archive/album"),
+            }])
+            .expect("move folder notes");
+        assert_eq!(report.private_comments, 3);
+    }
+    let reopened = open();
+    for target in &source_targets[..3] {
+        assert!(reopened.private_note(target).expect("old target").is_none());
+    }
+    for (target, mut note) in target_targets.into_iter().zip(notes) {
+        note.target = target.clone();
+        assert_eq!(
+            reopened
+                .private_note(&target)
+                .expect("moved or retained note"),
+            Some(note)
+        );
+    }
+}
+
 #[cfg(all(test, feature = "sqlite-state"))]
 mod tests {
     #[cfg(any(feature = "local-rename", feature = "local-move"))]
@@ -9379,6 +9530,29 @@ mod tests {
                 .private_comments(&target)
                 .expect("comments")
                 .is_empty()
+        );
+    }
+
+    /// SQLite stores same-basename folders and their child notes as separate exact targets.
+    #[test]
+    fn local_folder_private_notes_are_exact_and_survive_restart() {
+        let directory = tempdir().expect("temporary note fixture");
+        let config = Config::for_dir(directory.path().join("youta"));
+        assert_local_folder_note_isolation(
+            || StateStore::open(&config).expect("SQLite state"),
+            directory.path(),
+        );
+    }
+
+    /// SQLite remaps folder and child notes together while preserving unrelated siblings.
+    #[cfg(any(feature = "local-rename", feature = "local-move"))]
+    #[test]
+    fn local_folder_private_notes_follow_prefix_moves_and_survive_restart() {
+        let directory = tempdir().expect("temporary note fixture");
+        let config = Config::for_dir(directory.path().join("youta"));
+        assert_local_folder_note_move(
+            || StateStore::open(&config).expect("SQLite state"),
+            directory.path(),
         );
     }
 

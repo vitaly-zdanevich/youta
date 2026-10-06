@@ -1334,7 +1334,7 @@ pub enum CommentTarget {
         /// Commented media.
         media_id: MediaId,
     },
-    /// A channel, podcast show, artist, station, or other non-playable source.
+    /// A channel, podcast show, artist, station, local folder, or other source.
     Source {
         /// Provider-qualified stable identity for the annotated source.
         source_id: MediaId,

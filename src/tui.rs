@@ -21344,6 +21344,83 @@ for encoded, expected in json.load(sys.stdin):
         assert!(rendered_text(&terminal).contains("[n] Edit private note"));
     }
 
+    /// Folder notes remain actionable without manufacturing a playable media identity.
+    #[test]
+    fn local_folder_private_notes_support_mouse_and_keyboard_without_playback_actions() {
+        for title in ["Album", ".."] {
+            for has_private_note in [false, true] {
+                let mut terminal = Terminal::new(TestBackend::new(110, 24)).unwrap();
+                let view = ViewModel {
+                    screen: Screen::Local,
+                    rows: vec![RowView {
+                        title: title.to_owned(),
+                        source: "Local folder".to_owned(),
+                        ..RowView::default()
+                    }],
+                    details: Some(DetailView {
+                        title: title.to_owned(),
+                        source: "Local folder".to_owned(),
+                        description: "Full path:\n/music/Album".to_owned(),
+                        has_private_note,
+                        ..DetailView::default()
+                    }),
+                    private_note_available: true,
+                    ..ViewModel::default()
+                };
+                let mut hit_map = HitMap::default();
+                terminal
+                    .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+                    .unwrap();
+                let label = if has_private_note {
+                    "[n] Edit private note"
+                } else {
+                    "[n] Add private note"
+                };
+                assert!(rendered_text(&terminal).contains(label));
+                assert!(view.details.as_ref().unwrap().media_id.is_none());
+                assert!(view.rows[0].media_id.is_none());
+                let target = hit_map
+                    .detail_buttons
+                    .iter()
+                    .find_map(|(action, target)| {
+                        (*action == UiAction::EditPrivateNote).then_some(*target)
+                    })
+                    .expect("folder note click target");
+                assert_eq!(
+                    mouse_action(
+                        MouseEvent {
+                            kind: MouseEventKind::Down(MouseButton::Left),
+                            column: target.x,
+                            row: target.y,
+                            modifiers: KeyModifiers::NONE,
+                        },
+                        &hit_map,
+                        &view,
+                    ),
+                    Some(UiAction::EditPrivateNote)
+                );
+                assert_eq!(
+                    key_action(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE), &view),
+                    Some(UiAction::EditPrivateNote)
+                );
+                assert!(
+                    hit_map.detail_buttons.iter().chain(&hit_map.buttons).all(
+                        |(action, _)| !matches!(
+                            action,
+                            UiAction::AddToQueue
+                                | UiAction::PlayNext
+                                | UiAction::Download
+                                | UiAction::ToggleTodoPlaylist
+                                | UiAction::OpenPlaylistPopup
+                                | UiAction::FingerprintLocalAudio
+                        )
+                    ),
+                    "folder note availability must not expose playable-file controls"
+                );
+            }
+        }
+    }
+
     #[test]
     fn keyboard_moves_selects_and_activates_detail_links_without_replacing_list_controls() {
         let view = ViewModel {

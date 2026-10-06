@@ -15744,6 +15744,7 @@ impl AppController {
         self.pending_local_reselection = None;
         self.local_listing = None;
         self.view.details = None;
+        self.view.private_note_available = false;
         self.view.local_browse_pending = false;
         let name = source.file_name().map_or_else(
             || source.display().to_string(),
@@ -15867,6 +15868,9 @@ impl AppController {
             }
             Err(error) => {
                 self.pending_local_reselection = None;
+                self.local_listing = None;
+                self.view.details = None;
+                self.view.private_note_available = false;
                 self.view.rows.clear();
                 self.view.selected = 0;
                 self.show_error_message("Local folder could not be opened", error);
@@ -15917,6 +15921,7 @@ impl AppController {
             self.view.selected = 0;
         }
         self.view.details = None;
+        self.view.private_note_available = false;
         self.view.local_path = self.local_location_path(&directory);
         let status_line = format!("Reading {}…", self.local_display_path(&directory));
         self.view.local_browse_pending = false;
@@ -16551,6 +16556,7 @@ impl AppController {
         self.cancel_stale_local_audio_quality();
         let Some(listing) = self.local_listing.as_ref() else {
             self.view.details = None;
+            self.refresh_selected_private_note_state();
             #[cfg(feature = "audio-quality")]
             self.apply_local_audio_quality_details();
             return;
@@ -16564,6 +16570,7 @@ impl AppController {
                 description: format!("Full path:\n{}", self.local_display_path(&parent)),
                 ..DetailView::default()
             });
+            self.refresh_selected_private_note_state();
             #[cfg(feature = "audio-quality")]
             self.apply_local_audio_quality_details();
             #[cfg(all(feature = "acoustid", feature = "wikidata"))]
@@ -16572,6 +16579,7 @@ impl AppController {
         }
         let Some(index) = self.local_entry_index() else {
             self.view.details = None;
+            self.refresh_selected_private_note_state();
             #[cfg(feature = "audio-quality")]
             self.apply_local_audio_quality_details();
             return;
@@ -16662,6 +16670,7 @@ impl AppController {
         }
         #[cfg(feature = "local-artwork")]
         self.request_selected_local_artwork();
+        self.refresh_selected_private_note_state();
     }
 
     fn refresh_tracker_rows(&mut self) {
@@ -17834,12 +17843,61 @@ impl AppController {
         }
     }
 
+    /// Resolves Local notes from the accepted row, never stale Details or a label.
+    ///
+    /// Folders are non-playable source targets; `..` uses the logical parent,
+    /// including when navigating out of a materialized archive. File targets
+    /// retain their media identity, shared with History and playlists.
+    fn selected_local_private_note_target(&self) -> Option<PrivateNoteSelection> {
+        if self.view.local_browse_pending {
+            return None;
+        }
+        let listing = self.local_listing.as_ref()?;
+        if self.view.selected == 0
+            && let Some(parent) = self.local_parent_path(listing)
+        {
+            return Some(PrivateNoteSelection {
+                target: CommentTarget::Source {
+                    source_id: local_media_id(&parent),
+                },
+                label: self.local_display_path(&parent),
+            });
+        }
+        let entry = listing.entries.get(self.local_entry_index()?)?;
+        let media_id = local_media_id(&entry.path);
+        let (target, label) = if entry.kind == crate::local_browser::LocalEntryKind::Directory {
+            (
+                CommentTarget::Source {
+                    source_id: media_id,
+                },
+                self.local_display_path(&entry.path),
+            )
+        } else if entry.kind.is_playable() {
+            let label = self
+                .view
+                .details
+                .as_ref()
+                .filter(|details| details.media_id.as_ref() == Some(&media_id))
+                .map_or_else(
+                    || entry.display_name().into_owned(),
+                    |details| details.title.clone(),
+                );
+            (CommentTarget::Media { media_id }, label)
+        } else {
+            return None;
+        };
+        Some(PrivateNoteSelection { target, label })
+    }
+
     /// Resolves the active route to one exact media or source note target.
     ///
     /// Provider-qualified identities keep equal-looking titles from colliding,
     /// while source targets let channels and podcast shows retain notes
     /// independently from their individual uploads or episodes.
     fn selected_private_note_target(&self) -> Option<PrivateNoteSelection> {
+        if self.view.screen == Screen::Local {
+            return self.selected_local_private_note_target();
+        }
         if self.view.right_panel_mode == RightPanelMode::Channel {
             let details = self.view.details.as_ref()?;
             if !details.channel_id.is_empty() {
@@ -18032,7 +18090,8 @@ impl AppController {
                     label: entry.media.title.clone(),
                 })
             }
-            Screen::Local | Screen::Downloaded | Screen::History => {
+            Screen::Local => self.selected_local_private_note_target(),
+            Screen::Downloaded | Screen::History => {
                 let details = self.view.details.as_ref()?;
                 let media_id = details.media_id.clone()?;
                 Some(PrivateNoteSelection {
@@ -18108,7 +18167,8 @@ impl AppController {
     fn open_private_note_popup(&mut self) {
         let Some(selection) = self.selected_private_note_target() else {
             self.view.status_line =
-                "Select a media item, channel, or podcast show before adding a note".to_owned();
+                "Select a media item, folder, channel, or podcast show before adding a note"
+                    .to_owned();
             return;
         };
         let existing = match self.store.private_note(&selection.target) {
@@ -46418,6 +46478,8 @@ mod tests {
     mod download_choice_tests;
     #[path = "end_pause.rs"]
     mod end_pause_tests;
+    #[path = "local_folder_notes.rs"]
+    mod local_folder_note_tests;
     #[path = "local_sort.rs"]
     mod local_sort_tests;
     #[path = "local_track_metadata.rs"]
@@ -50570,8 +50632,19 @@ mod tests {
             "Fixture module",
         );
 
-        let local_id = local_media_id(Path::new("/tmp/fixture.opus"));
+        let temporary = crate::test_support::canonical_tempdir("local note target");
+        let local_path = temporary.path().join("fixture.opus");
+        std::fs::write(&local_path, b"fixture").expect("local file");
+        let local_id = local_media_id(&local_path);
         controller.view.screen = Screen::Local;
+        controller.local_listing = Some(
+            crate::local_browser::list_local_directory(
+                temporary.path(),
+                crate::local_browser::LocalBrowseLimits::default(),
+            )
+            .expect("local listing"),
+        );
+        controller.select_local_path(Some(&local_path));
         controller.view.details = Some(DetailView {
             media_id: Some(local_id.clone()),
             title: "fixture.opus".to_owned(),
