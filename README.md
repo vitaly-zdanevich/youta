@@ -159,7 +159,8 @@ entry rather than retaining stale copies.
 
 `[w]` generates a waveform for a local audio or video file with `ffmpeg` and
 replaces the seek bar without hiding Details. Clicking any waveform row starts
-or seeks the exact selected file at that position. Extraction is cancellable,
+or seeks the exact selected file at that position. Silent terminal-waveform
+columns use ordinary spaces and remain clickable. Extraction is cancellable,
 runs outside the UI thread, aligns delayed or shorter audio with the whole
 media timeline, and retains only a bounded min/max envelope in RAM. Long files
 skip mathematically inevitable intermediate compactions.

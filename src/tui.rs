@@ -7530,9 +7530,8 @@ fn render_waveform(
 
 /// Maps one peak magnitude to bottom-up terminal block cells.
 ///
-/// Every row contributes eight amplitude levels. Silence retains a one-eighth
-/// baseline in the bottom row so the seek target remains visible across quiet
-/// passages.
+/// Every row contributes eight amplitude levels. Silence uses ordinary ASCII
+/// spaces, avoiding a special-font baseline; its rectangle remains seekable.
 fn waveform_column_symbols(peak: Peak, row_count: usize) -> [char; WAVEFORM_ROWS as usize] {
     const BLOCKS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
     let row_count = row_count.clamp(1, WAVEFORM_ROWS as usize);
@@ -7541,7 +7540,7 @@ fn waveform_column_symbols(peak: Peak, row_count: usize) -> [char; WAVEFORM_ROWS
         .abs()
         .max(i32::from(peak.minimum).abs()) as usize;
     let level = if amplitude == 0 {
-        1
+        0
     } else {
         1 + amplitude
             .saturating_sub(1)
@@ -21024,7 +21023,7 @@ for encoded, expected in json.load(sys.stdin):
             .collect::<Vec<_>>();
         assert_eq!(
             row_symbols,
-            ["       ▄", "     ▄██", "   ▄████", "▁▄██████"]
+            ["       ▄", "     ▄██", "   ▄████", " ▄██████"]
         );
         for row in 0..waveform_area.height {
             for offset in 0..waveform_area.width {
@@ -21043,6 +21042,72 @@ for encoded, expected in json.load(sys.stdin):
                     offset < 4,
                     "played waveform cells must retain their emphasis"
                 );
+            }
+        }
+    }
+
+    /// Silence clears old bars using ordinary spaces without losing its seek target.
+    #[test]
+    fn silent_waveform_uses_ascii_spaces_and_remains_seekable_at_every_height() {
+        let media_id = MediaId::new(SourceKind::Local, "/music/silence.flac");
+        for physical_linux_console in [false, true] {
+            for height in 1..=WAVEFORM_ROWS {
+                let mut terminal = Terminal::new(TestBackend::new(4, height)).expect("terminal");
+                let mut view = ViewModel {
+                    physical_linux_console,
+                    ..ViewModel::default()
+                };
+                let mut hit_map = HitMap::default();
+                for amplitude in [i16::MAX, 0] {
+                    view.waveform =
+                        ready_waveform(media_id.clone(), Duration::from_secs(40), &[amplitude; 4]);
+                    terminal
+                        .draw(|frame| {
+                            render_waveform(
+                                frame,
+                                frame.area(),
+                                &view,
+                                &Theme::new(false),
+                                &mut hit_map,
+                            );
+                            normalize_physical_linux_console_frame(frame, &view);
+                        })
+                        .expect("replace full-height bars with silence");
+                }
+                assert!(
+                    terminal
+                        .backend()
+                        .buffer()
+                        .content()
+                        .iter()
+                        .all(|cell| cell.symbol() == " "),
+                    "silent columns must contain U+0020 spaces, not a special-font baseline"
+                );
+                let target = hit_map
+                    .waveform_seek
+                    .as_ref()
+                    .expect("silent waveform seek target");
+                assert_eq!(target.area, Rect::new(0, 0, 4, height));
+                for row in target.area.y..target.area.bottom() {
+                    assert_eq!(
+                        mouse_action(
+                            MouseEvent {
+                                kind: MouseEventKind::Down(MouseButton::Left),
+                                column: 2,
+                                row,
+                                modifiers: KeyModifiers::NONE,
+                            },
+                            &hit_map,
+                            &view
+                        ),
+                        Some(UiAction::ActivateWaveformTimecode {
+                            media_id: media_id.clone(),
+                            generation: TEST_WAVEFORM_GENERATION,
+                            seconds: 26,
+                        }),
+                        "silent cells must still seek the waveform owner"
+                    );
+                }
             }
         }
     }

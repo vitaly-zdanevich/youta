@@ -76,9 +76,8 @@ function paint(
     const top = middle - maximum * middle;
     const bottom = middle - minimum * middle;
     context.fillStyle = column < playedColumns ? colors.played : colors.remaining;
-    // Silence still gets a hairline, so the seek target stays visible and
-    // clickable across a quiet passage — the same reason the terminal keeps a
-    // one-eighth baseline block.
+    // Silence still gets a font-independent canvas hairline. The terminal uses
+    // ordinary spaces for silence; both surfaces retain their seek targets.
     context.fillRect(column, top, 1, Math.max(bottom - top, 1));
   }
 }
