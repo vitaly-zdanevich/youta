@@ -1426,7 +1426,9 @@ These are distinct integration modes:
   `providers.invidious_base_url`. It provides the same selected-video comment
   count and top-comments popup through the documented
   [`videos/:id` and `comments/:id` endpoints](https://docs.invidious.io/api/)
-  without requiring an API key.
+  without requiring an API key. Missing video author IDs or invalid ID strings do not
+  discard playable search results or video details; channel-specific actions
+  and subscriber lookups require a usable channel ID.
 - The separate **YouTube Music** tab searches the public
   `music.youtube.com` catalog through
   [yt-dlp](https://github.com/yt-dlp/yt-dlp), so discovery and playback do not

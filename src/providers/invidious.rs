@@ -338,7 +338,7 @@ impl InvidiousProvider {
                     "channel video result {index} is malformed: {error}"
                 ))
             })?;
-            if raw.author_id != request.channel_id {
+            if raw.author_id.as_deref() != Some(request.channel_id.as_str()) {
                 return Err(ProviderError::InvalidResponse(format!(
                     "channel video result {index} does not belong to the requested channel"
                 )));
@@ -364,7 +364,6 @@ impl InvidiousProvider {
         validate_youtube_video_id(&raw.video_id).map_err(|_| {
             ProviderError::InvalidResponse("video result contains an invalid videoId".to_owned())
         })?;
-        validate_resource_id(&raw.author_id, "authorId")?;
         require_nonempty(&raw.title, "video title")?;
         require_nonempty(&raw.author, "video author")?;
         let webpage_url = youtube_video_url(&raw.video_id);
@@ -373,7 +372,7 @@ impl InvidiousProvider {
             video_id: raw.video_id,
             title: raw.title,
             channel_name: raw.author,
-            channel_id: raw.author_id,
+            channel_id: optional_video_channel_id(raw.author_id),
             description: raw.description,
             duration_seconds: raw.length_seconds,
             view_count: raw.view_count,
@@ -474,7 +473,6 @@ impl InvidiousProvider {
         validate_youtube_video_id(&raw.video_id).map_err(|_| {
             ProviderError::InvalidResponse("video details contain an invalid videoId".to_owned())
         })?;
-        validate_resource_id(&raw.author_id, "authorId")?;
         require_nonempty(&raw.title, "video title")?;
         require_nonempty(&raw.author, "video author")?;
         let webpage_url = youtube_video_url(&raw.video_id);
@@ -484,7 +482,7 @@ impl InvidiousProvider {
             video_id: raw.video_id,
             title: raw.title,
             channel_name: raw.author,
-            channel_id: raw.author_id,
+            channel_id: optional_video_channel_id(raw.author_id),
             description: raw.description,
             duration_seconds: raw.length_seconds,
             view_count: raw.view_count,
@@ -891,6 +889,18 @@ fn validate_continuation_token(value: Option<Value>) -> Result<Option<String>, P
     Ok(Some(token))
 }
 
+/// Keeps a video's optional channel identity only when it is safe for channel routes.
+///
+/// Missing or malformed author metadata must not discard an otherwise playable
+/// video or its details. The empty-ID convention disables channel-specific
+/// lookups/actions in the controller. Handles and URLs are not channel IDs.
+/// Channel resources and channel-upload ownership remain independently strict.
+fn optional_video_channel_id(author_id: Option<String>) -> String {
+    author_id
+        .filter(|id| valid_youtube_channel_route_id(id))
+        .unwrap_or_default()
+}
+
 fn validate_resource_id(value: &str, field: &str) -> Result<(), ProviderError> {
     if value.is_empty()
         || value.len() > 128
@@ -957,7 +967,8 @@ struct RawVideoSearch {
     video_id: String,
     title: String,
     author: String,
-    author_id: String,
+    #[serde(default)]
+    author_id: Option<String>,
     #[serde(default)]
     description: String,
     #[serde(default)]
@@ -1044,7 +1055,8 @@ struct RawVideoDetails {
     video_id: String,
     title: String,
     author: String,
-    author_id: String,
+    #[serde(default)]
+    author_id: Option<String>,
     #[serde(default)]
     description: String,
     #[serde(default)]
@@ -1451,6 +1463,186 @@ mod tests {
         );
     }
 
+    /// Models incomplete channel metadata without damaging the video itself.
+    fn videos_without_usable_author_ids(fixture: &Value) -> Vec<Value> {
+        let mut values = Vec::new();
+        for author_id in [
+            "invalid channel id".to_owned(),
+            String::new(),
+            "../channels".to_owned(),
+            "https://www.youtube.com/channel/UC_example".to_owned(),
+            "UC_bad\nheader".to_owned(),
+            "UC_bad\\path".to_owned(),
+            "UC_bad?query".to_owned(),
+            "UC_bad%2Fpath".to_owned(),
+            "UC_канал".to_owned(),
+            "@example".to_owned(),
+            ".".to_owned(),
+            "x".repeat(129),
+        ] {
+            let mut value = fixture.clone();
+            value["authorId"] = Value::String(author_id);
+            values.push(value);
+        }
+        let mut null = fixture.clone();
+        null["authorId"] = Value::Null;
+        values.push(null);
+        let mut missing = fixture.clone();
+        missing
+            .as_object_mut()
+            .expect("video object")
+            .remove("authorId");
+        values.push(missing);
+        values
+    }
+
+    #[test]
+    fn video_search_keeps_results_without_usable_author_ids() {
+        let provider = provider();
+        let fixture: Vec<Value> = serde_json::from_str(SEARCH_FIXTURE).expect("search fixture");
+        let mut values = vec![fixture[0].clone()];
+        values.extend(videos_without_usable_author_ids(&fixture[0]));
+        values.push(fixture[0].clone());
+        let expected_count = values.len();
+        let page = provider
+            .parse_search_values(values, &SearchRequest::new("video", SearchTarget::Videos))
+            .expect("incomplete channel metadata must not break a playable search page");
+
+        assert_eq!(
+            page.items.len(),
+            expected_count,
+            "no playable result is lost"
+        );
+        assert_eq!(page.next_page, Some(2));
+        for (index, item) in page.items.iter().enumerate() {
+            let SearchItem::Video(video) = item else {
+                panic!("expected a video");
+            };
+            let expected_channel_id = if index == 0 || index == expected_count - 1 {
+                "UC_x5XG1OV2P6uZZ5FSM9Ttw"
+            } else {
+                ""
+            };
+            assert_eq!(video.channel_id, expected_channel_id);
+            assert_eq!(video.channel_name, "Example channel");
+            assert_eq!(video.title, "A video");
+            assert_eq!(video.duration_seconds, Some(212));
+            assert_eq!(video.view_count, Some(1234));
+            assert_eq!(video.thumbnails.len(), 1);
+            assert_eq!(
+                video.webpage_url.as_ref().map(Url::as_str),
+                Some("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+            );
+        }
+    }
+
+    #[test]
+    fn video_details_accept_missing_and_unusable_author_ids() {
+        let provider = provider();
+        let fixture: Value = serde_json::from_str(DETAILS_FIXTURE).expect("details fixture");
+        for value in videos_without_usable_author_ids(&fixture) {
+            let raw = serde_json::from_value(value).expect("optional video author ID");
+            let details = provider
+                .convert_video_details(raw)
+                .expect("video details remain usable without a channel ID");
+            assert!(details.channel_id.is_empty());
+            assert_eq!(details.channel_name, "Example channel");
+            assert_eq!(details.description, "Full description");
+            assert_eq!(details.like_count, Some(50));
+            assert_eq!(details.comment_count, Some(20));
+            assert_eq!(details.thumbnails.len(), 1);
+            assert_eq!(
+                details.webpage_url.as_ref().map(Url::as_str),
+                Some("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+            );
+        }
+    }
+
+    #[test]
+    fn video_search_and_details_work_over_http_without_author_ids() {
+        let search = SEARCH_FIXTURE.replace("UC_x5XG1OV2P6uZZ5FSM9Ttw", "invalid channel id");
+        let details = DETAILS_FIXTURE.replace("\"UC_x5XG1OV2P6uZZ5FSM9Ttw\"", "null");
+        let server = MockServer::spawn(vec![
+            json_response("200 OK", &search),
+            json_response("200 OK", &details),
+        ]);
+        let provider = InvidiousProvider::with_options(
+            server.base_url.clone(),
+            Duration::from_secs(2),
+            DEFAULT_MAX_JSON_BYTES,
+        )
+        .expect("mock provider");
+        let page = provider
+            .search(&SearchRequest::new("video", SearchTarget::Videos))
+            .expect("search should keep the playable video");
+        let [SearchItem::Video(video)] = page.items.as_slice() else {
+            panic!("expected one video");
+        };
+        let details = provider
+            .video_details(&video.video_id)
+            .expect("selected video details");
+        assert!(video.channel_id.is_empty());
+        assert!(details.channel_id.is_empty());
+        assert_eq!(details.video_id, video.video_id);
+        assert_eq!(details.description, "Full description");
+        let requests = server.finish();
+        assert_eq!(requests.len(), 2, "no extra channel resolution requests");
+        assert!(requests[0].starts_with("/api/v1/search?"));
+    }
+
+    #[test]
+    fn missing_video_author_id_does_not_relax_required_video_fields() {
+        let provider = provider();
+        let fixture: Value = serde_json::from_str(DETAILS_FIXTURE).expect("video fixture");
+        for (field, invalid) in [("videoId", "../api/stats"), ("title", ""), ("author", "")] {
+            let mut value = fixture.clone();
+            value["type"] = Value::String("video".to_owned());
+            value[field] = Value::String(invalid.to_owned());
+            value
+                .as_object_mut()
+                .expect("video object")
+                .remove("authorId");
+            let raw = serde_json::from_value(value.clone()).expect("details fixture");
+            assert!(matches!(
+                provider.convert_video_details(raw),
+                Err(ProviderError::InvalidResponse(_))
+            ));
+            assert!(matches!(
+                provider.parse_search_values(
+                    vec![value],
+                    &SearchRequest::new("video", SearchTarget::Videos),
+                ),
+                Err(ProviderError::InvalidResponse(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn optional_video_author_id_does_not_relax_channel_identity_checks() {
+        let provider = provider();
+        let fixture: Value = serde_json::from_str(CHANNEL_VIDEO_FIXTURE).expect("video fixture");
+        for value in videos_without_usable_author_ids(&fixture) {
+            let raw = serde_json::from_value(serde_json::json!({"videos": [value]}))
+                .expect("channel uploads fixture");
+            assert!(matches!(
+                provider.convert_channel_videos_page(
+                    raw,
+                    &ChannelVideosRequest::new("UC_x5XG1OV2P6uZZ5FSM9Ttw"),
+                ),
+                Err(ProviderError::InvalidResponse(message)) if message.contains("does not belong")
+            ));
+        }
+        let mut channel: Value = serde_json::from_str(CHANNEL_FIXTURE).expect("channel fixture");
+        channel[0]["authorId"] = Value::String("invalid channel id".to_owned());
+        assert!(matches!(
+            provider.parse_search_values(
+                channel.as_array().expect("search array").clone(),
+                &SearchRequest::new("channel", SearchTarget::Channels),
+            ),
+            Err(ProviderError::InvalidResponse(message)) if message.contains("authorId")
+        ));
+    }
+
     #[test]
     fn creative_commons_filter_is_preserved_with_newest_page_requests() {
         let provider = provider();
@@ -1800,6 +1992,7 @@ mod tests {
             .convert_video_details(raw)
             .expect("fixture should convert");
 
+        assert_eq!(details.channel_id, "UC_x5XG1OV2P6uZZ5FSM9Ttw");
         assert_eq!(details.like_count, Some(50));
         assert_eq!(details.comment_count, Some(20));
         assert_eq!(details.published_at, Some(1_700_000_000));
