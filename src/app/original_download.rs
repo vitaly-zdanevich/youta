@@ -324,7 +324,12 @@ mod tests {
                 match outcome {
                     0 => Ok(Box::new(UnpublishedArtifact)),
                     1 => Err(()),
-                    _ => panic!("simulated original download worker failure"),
+                    // Exercise unwinding and disconnect notification, not the global
+                    // panic hook: Windows CI backtrace symbolization can exceed the
+                    // bounded wake deadline before any destructor gets to run.
+                    _ => std::panic::resume_unwind(Box::new(
+                        "simulated original download worker failure",
+                    )),
                 }
             })
             .unwrap()
