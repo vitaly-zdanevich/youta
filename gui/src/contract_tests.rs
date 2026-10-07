@@ -47,10 +47,10 @@ use youta::view::EvernoteNotePopupView;
 #[cfg(feature = "archive-upload")]
 use youta::view::{ArchiveCredentialsPopupView, ArchiveUploadPopupView};
 use youta::view::{
-    ArchivePlaybackChoicePopupView, AudioQualityPopupView, DetailHighlightField,
-    DetailHighlightRange, DetailHighlightView, DetailLinkView, DetailTimecodeView,
-    DetailUrlEscapeView, DetailVideoLinkView, DetailView, DetailWikidataEntityView,
-    DownloadChoicePopupView, DownloadView, EmailLinkView, ErrorPopupView,
+    ArchivePlaybackChoicePopupView, AudioQualityPopupView, BugReportPopupView,
+    DetailHighlightField, DetailHighlightRange, DetailHighlightView, DetailLinkView,
+    DetailTimecodeView, DetailUrlEscapeView, DetailVideoLinkView, DetailView,
+    DetailWikidataEntityView, DownloadChoicePopupView, DownloadView, EmailLinkView, ErrorPopupView,
     GitHubIssueSubmissionView, LocalFileProgressView, LocalMoveDestinationView, NowPlayingView,
     PlaylistChoiceView, PlaylistPopupView, PreferencesPopupView, ProjectCommitView,
     ProjectHistoryPopupView, QueuePopupView, QueueRowView, RowView, SoundCloudDetailsView,
@@ -499,6 +499,10 @@ fn the_typescript_contract_names_only_fields_the_reducer_emits() {
     );
     emitted.insert("ErrorPopupView", emitted_keys(&ErrorPopupView::default()));
     emitted.insert(
+        "BugReportPopupView",
+        emitted_keys(&BugReportPopupView::default()),
+    );
+    emitted.insert(
         "AudioQualityPopupView",
         emitted_keys(&AudioQualityPopupView::default()),
     );
@@ -909,6 +913,7 @@ fn every_checked_interface_is_actually_declared() {
         "DetailVideoLinkView",
         "DetailWikidataEntityView",
         "ErrorPopupView",
+        "BugReportPopupView",
         "AudioQualityPopupView",
         "YtDlpForbiddenView",
         "YtDlpGentooVersionView",

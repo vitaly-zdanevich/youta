@@ -172,6 +172,7 @@ export function HelpPopup({
     [
       "Actions",
       [
+		['Ctrl+Alt+B', 'report a bug (title, body, optional text screenshot)'],
         ["Ctrl+n · a · u", "play next · add to queue · show the queue"],
         ["d · o · y", "download · open page · copy link"],
 		['Insert · Ctrl+click', 'mark an item for downloading'],

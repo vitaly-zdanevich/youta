@@ -27,6 +27,7 @@ pub(crate) mod original_cache_download;
 pub mod archive_upload;
 #[cfg(any(feature = "archive-upload", feature = "s3-upload"))]
 pub mod archive_upload_media;
+pub mod bug_report;
 pub mod build_info;
 pub mod child_process;
 #[cfg(feature = "commons-upload")]

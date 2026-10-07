@@ -2012,6 +2012,92 @@ pub enum GitHubIssueSubmissionView {
     },
 }
 
+/// Focused field in the RAM-only manual bug-report composer.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub enum BugReportField {
+    /// Short issue title, sent without an automatic error prefix.
+    #[default]
+    Title,
+    /// Multiline, user-authored issue body.
+    Body,
+    /// Whether to include the captured, redacted terminal text.
+    Screenshot,
+}
+
+/// Editable manual report and its explicit submission result.
+///
+/// The captured screenshot remains private to the controller. Draft text is
+/// available to the rendering frontend, but is never included in Debug output.
+#[derive(Clone, Eq, PartialEq, Serialize)]
+pub struct BugReportPopupView {
+    /// Exact authored issue title.
+    pub title: String,
+    /// Authored Markdown description.
+    pub body: String,
+    /// Keyboard-focused input or checkbox.
+    pub selected_field: BugReportField,
+    /// Insertion point in the title, at a UTF-8 grapheme boundary.
+    pub title_cursor_byte: usize,
+    /// Insertion point in the body, at a UTF-8 grapheme boundary.
+    pub body_cursor_byte: usize,
+    /// First requested wrapped body row.
+    pub body_scroll_offset: usize,
+    /// Whether the body viewport should follow its insertion cursor.
+    pub follow_cursor: bool,
+    /// Explicit screenshot opt-out; checked when the composer first opens.
+    pub with_screenshot: bool,
+    /// Whether a safe pre-composer screenshot was captured.
+    pub screenshot_available: bool,
+    /// Explains missing or deliberately omitted screenshot text.
+    pub screenshot_notice: Option<String>,
+    /// Final version and operating-system lines included in the payload.
+    pub footer: String,
+    /// Whether direct, browser-free GitHub submission is installed.
+    pub gh_available: bool,
+    /// Validation, copy, or helper guidance shown inside this composer.
+    pub validation_error: Option<String>,
+    /// Direct submission lifecycle; manual reports never enter Confirming.
+    pub submission: GitHubIssueSubmissionView,
+    /// Spinner cadence advanced only while a submission is pending.
+    pub animation_frame: usize,
+}
+
+impl Default for BugReportPopupView {
+    fn default() -> Self {
+        Self {
+            title: String::new(),
+            body: String::new(),
+            selected_field: BugReportField::Title,
+            title_cursor_byte: 0,
+            body_cursor_byte: 0,
+            body_scroll_offset: 0,
+            follow_cursor: true,
+            with_screenshot: true,
+            screenshot_available: false,
+            screenshot_notice: None,
+            footer: String::new(),
+            gh_available: false,
+            validation_error: None,
+            submission: GitHubIssueSubmissionView::Idle,
+            animation_frame: 0,
+        }
+    }
+}
+
+impl std::fmt::Debug for BugReportPopupView {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BugReportPopupView")
+            .field("title", &"[REDACTED]")
+            .field("body", &"[REDACTED]")
+            .field("selected_field", &self.selected_field)
+            .field("with_screenshot", &self.with_screenshot)
+            .field("screenshot_available", &self.screenshot_available)
+            .field("submission", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
+
 /// Diagnostic, setup, or service information shown above the normal interface.
 ///
 /// For reportable failures, `report` contains the complete, copyable diagnostic
@@ -3162,6 +3248,8 @@ pub struct ViewModel {
     pub physical_linux_console: bool,
     /// Scrollable diagnostic popup, when a recoverable error is being reported.
     pub error_popup: Option<ErrorPopupView>,
+    /// Explicit, RAM-only bug report layered over the current screen or editor.
+    pub bug_report_popup: Option<BugReportPopupView>,
     /// Whether this build can analyze effective local audio quality.
     pub audio_quality_supported: bool,
     /// Immediate progress and copyable results for local quality analysis.
@@ -3330,6 +3418,38 @@ pub struct ViewModel {
 }
 
 impl ViewModel {
+    /// Whether rendered cells can be captured without exposing a private editor.
+    #[must_use]
+    pub fn bug_report_screenshot_allowed(&self) -> bool {
+        if self.bug_report_popup.is_some()
+            || self.private_note_popup.is_some()
+            || self.youtube_setup_popup.is_some()
+            || self.yandex_music_setup_popup.is_some()
+            || self.rss_subscription_popup.is_some()
+            || self.preferences_popup.is_some()
+            || self.playlist_popup.is_some()
+            || self.local_file_popup.is_some()
+        {
+            return false;
+        }
+        #[cfg(feature = "commons-upload")]
+        if self.commons_credentials_popup.is_some() || self.commons_upload_popup.is_some() {
+            return false;
+        }
+        #[cfg(feature = "evernote")]
+        if self.evernote_credentials_popup.is_some() || self.evernote_popup.is_some() {
+            return false;
+        }
+        #[cfg(feature = "s3-upload")]
+        if self.s3_credentials_popup.is_some() || self.s3_upload_popup.is_some() {
+            return false;
+        }
+        #[cfg(feature = "archive-upload")]
+        if self.archive_credentials_popup.is_some() || self.archive_upload_popup.is_some() {
+            return false;
+        }
+        true
+    }
     /// Whether playback resolution or an accepted backend load is still pending.
     #[must_use]
     pub fn playback_activity_pending(&self) -> bool {
@@ -3547,6 +3667,7 @@ impl Default for ViewModel {
             external_opener_available: true,
             physical_linux_console: false,
             error_popup: None,
+            bug_report_popup: None,
             #[cfg(feature = "ascii-visualizer")]
             ascii_visualizer_supported: true,
             #[cfg(feature = "ascii-visualizer")]
@@ -3686,6 +3807,32 @@ pub enum UiAction {
     DismissAsciiVisualizer,
     /// Open the offline-first recent project-history popup.
     OpenProjectHistory,
+    /// Opens a fresh manual report without posting or disturbing another editor.
+    OpenBugReport,
+    /// Focuses one manual-report input or screenshot checkbox.
+    SelectBugReportField(BugReportField),
+    /// Moves cyclically among manual-report fields.
+    MoveBugReportField(i32),
+    /// Inserts one printable character or body newline at the selected cursor.
+    AppendBugReportCharacter(char),
+    /// Removes the grapheme immediately before the selected cursor.
+    DeleteBugReportCharacter,
+    /// Removes the grapheme immediately after the selected cursor.
+    DeleteBugReportForward,
+    /// Removes the preceding word in the selected report input.
+    DeleteBugReportWord,
+    /// Moves the report input cursor without splitting graphemes.
+    MoveBugReportCursor(PrivateNoteCursorMotion),
+    /// Toggles inclusion of the frozen ASCII screenshot.
+    ToggleBugReportScreenshot,
+    /// Explicitly submits the authored report directly through GitHub CLI.
+    SubmitBugReport,
+    /// Copies the composed report without requiring a browser.
+    CopyBugReport,
+    /// Closes a non-pending report and releases its private capture.
+    DismissBugReport,
+    /// Opens the validated submitted issue or uncertain-result issue list.
+    OpenBugReportResult,
     /// Set the exact renderer-clamped project-history line offset.
     SetProjectHistoryScroll(usize),
     /// Close the project-history popup without changing the active screen.
@@ -4539,6 +4686,7 @@ impl UiAction {
                 | Self::OpenChannelInBrowser
                 | Self::CopyAndOpenGitHubIssue
                 | Self::OpenGitHubIssueSubmissionTarget
+                | Self::OpenBugReportResult
                 | Self::OpenYtDlpProject
                 | Self::OpenGentooYtDlpPackage
                 | Self::OpenYouTubeApiKeyGuide
@@ -4624,6 +4772,12 @@ pub trait UiController {
 
     /// Applies one semantic user action.
     fn dispatch(&mut self, action: UiAction);
+
+    /// Opens a report with optional pre-composer terminal text from the frontend.
+    /// The concrete reducer independently bounds and redacts this untrusted text.
+    fn open_bug_report(&mut self, _screenshot: Option<String>) {
+        self.dispatch(UiAction::OpenBugReport);
+    }
 
     /// Polls background workers and playback state.
     fn tick(&mut self);

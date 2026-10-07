@@ -3,6 +3,7 @@
 //! This module renders Youta's own controls. An external player backend never
 //! writes to the terminal and does not create a second user interface.
 
+mod bug_report;
 #[cfg(test)]
 mod performance;
 
@@ -1028,7 +1029,7 @@ pub fn run(controller: &mut impl UiController, settings: &UiSettings) -> io::Res
     loop {
         let mut renderer = thumbnail_renderer.take();
         let mut fullscreen_artwork_area = Rect::default();
-        if let Some(renderer) = renderer.as_mut() {
+        let completed = if let Some(renderer) = renderer.as_mut() {
             synchronize_tty_image_preference(controller.view(), renderer.as_mut());
             renderer.poll();
             session.terminal.draw(|frame| {
@@ -1043,7 +1044,7 @@ pub fn run(controller: &mut impl UiController, settings: &UiSettings) -> io::Res
                 render_local_rename_cursor(frame, controller.view(), !virtual_cursor.active);
                 render_virtual_cursor_overlay(frame, controller.view(), &mut virtual_cursor);
                 normalize_physical_linux_console_frame(frame, controller.view());
-            })?;
+            })?
         } else {
             session.terminal.draw(|frame| {
                 fullscreen_artwork_area = frame.area();
@@ -1051,8 +1052,8 @@ pub fn run(controller: &mut impl UiController, settings: &UiSettings) -> io::Res
                 render_local_rename_cursor(frame, controller.view(), !virtual_cursor.active);
                 render_virtual_cursor_overlay(frame, controller.view(), &mut virtual_cursor);
                 normalize_physical_linux_console_frame(frame, controller.view());
-            })?;
-        }
+            })?
+        };
         synchronize_search_page_capacities(controller, fullscreen_artwork_area);
         if let Some(renderer) = renderer.as_deref_mut() {
             synchronize_thumbnail_prefetch(controller.view(), settings, renderer);
@@ -1084,12 +1085,22 @@ pub fn run(controller: &mut impl UiController, settings: &UiSettings) -> io::Res
                                 visible_main_list_page_rows(&hit_map, controller.view()),
                                 Some(&hit_map),
                             ) {
-                                controller.dispatch(action);
+                                bug_report::dispatch_terminal_action(
+                                    controller,
+                                    action,
+                                    completed.buffer,
+                                    &hit_map,
+                                );
                             }
                         }
                         VirtualCursorKey::Click(mouse) => {
                             if let Some(action) = mouse_action(mouse, &hit_map, controller.view()) {
-                                controller.dispatch(action);
+                                bug_report::dispatch_terminal_action(
+                                    controller,
+                                    action,
+                                    completed.buffer,
+                                    &hit_map,
+                                );
                             }
                         }
                         VirtualCursorKey::Consumed => {}
@@ -1113,7 +1124,12 @@ pub fn run(controller: &mut impl UiController, settings: &UiSettings) -> io::Res
                 Event::Mouse(mouse) => {
                     virtual_cursor.follow_mouse(&mouse);
                     if let Some(action) = mouse_action(mouse, &hit_map, controller.view()) {
-                        controller.dispatch(action);
+                        bug_report::dispatch_terminal_action(
+                            controller,
+                            action,
+                            completed.buffer,
+                            &hit_map,
+                        );
                     }
                 }
                 Event::Resize(columns, rows) => {
@@ -1486,12 +1502,18 @@ fn render_virtual_cursor_overlay(
     virtual_cursor: &mut VirtualCursor,
 ) {
     #[cfg(feature = "qr")]
-    if view.video_qr_popup.is_some() && view.error_popup.is_none() {
+    if view.video_qr_popup.is_some()
+        && view.error_popup.is_none()
+        && view.bug_report_popup.is_none()
+    {
         virtual_cursor.synchronize_bounds(frame.area());
         return;
     }
     #[cfg(feature = "lan-sharing")]
-    if view.lan_share_popup.is_some() && view.error_popup.is_none() {
+    if view.lan_share_popup.is_some()
+        && view.error_popup.is_none()
+        && view.bug_report_popup.is_none()
+    {
         virtual_cursor.synchronize_bounds(frame.area());
         return;
     }
@@ -1760,6 +1782,10 @@ fn event_wait(view: &ViewModel, settings: &UiSettings) -> Duration {
     {
         playback_wait.min(LOCAL_BROWSE_RESPONSE_POLL_INTERVAL)
     } else if view.search_activity.is_some()
+        || view
+            .bug_report_popup
+            .as_ref()
+            .is_some_and(|popup| matches!(popup.submission, GitHubIssueSubmissionView::Submitting))
         || view.subscriptions.loading
         || view.subscriptions.metadata_pending
         || view.playback_activity_pending()
@@ -1999,6 +2025,10 @@ struct HitMap {
     buttons: Vec<(UiAction, Rect)>,
     now_playing: Option<Rect>,
     error_buttons: Vec<(UiAction, Rect)>,
+    /// Editable fields visible in the topmost manual bug-report composer.
+    bug_report_fields: Vec<(BugReportField, Rect)>,
+    /// Only enabled, visible controls from the manual bug-report composer.
+    bug_report_buttons: Vec<(UiAction, Rect)>,
     /// Copy/cancel/close controls rendered inside the audio-quality popup.
     audio_quality_buttons: Vec<(UiAction, Rect)>,
     /// Wrapped report viewport inside the audio-quality popup.
@@ -2484,10 +2514,13 @@ fn render_frame(
     mut thumbnail_renderer: Option<&mut dyn ThumbnailRenderer>,
 ) {
     let theme = Theme::for_terminal(settings.funny_mode, view.physical_linux_console);
+    hit_map.bug_report_fields.clear();
+    hit_map.bug_report_buttons.clear();
     hit_map.thumbnail_overlay_area = None;
     frame.render_widget(Block::default().style(theme.base), frame.area());
     #[cfg(feature = "ascii-visualizer")]
     if view.error_popup.is_none()
+        && view.bug_report_popup.is_none()
         && view.unsubscribe_popup.is_none()
         && let Some(visualizer) = view.ascii_visualizer.as_ref()
     {
@@ -2520,6 +2553,7 @@ fn render_frame(
         || view.preferences_popup.is_some()
         || view.playlist_popup.is_some()
         || view.private_note_popup.is_some()
+        || view.bug_report_popup.is_some()
         || view.local_file_popup.is_some()
         || view.download_choice_popup.is_some()
         || view.archive_playback_choice_popup.is_some()
@@ -2855,6 +2889,16 @@ fn render_frame(
         render_error_popup(
             frame,
             error,
+            view.external_opener_available,
+            &theme,
+            hit_map,
+        );
+    }
+    if let Some(popup) = view.bug_report_popup.as_ref() {
+        bug_report::render_popup(
+            frame,
+            popup,
+            settings.show_hotkeys,
             view.external_opener_available,
             &theme,
             hit_map,
@@ -8420,6 +8464,7 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
         "  O channel page     i subscription description     p preferences",
         channel_actions_help,
         private_note_help,
+        "  Ctrl+Alt+B report a bug (optional plain-text screen capture)",
         "  Alt+j/k select external link     Alt+Enter open selected link",
         "",
         "Mouse",
@@ -12880,6 +12925,16 @@ struct WrappedPrivateNote {
 /// included in the measured output so cursor following matches what the user
 /// sees at the right edge of a line.
 fn wrap_private_note(body: &str, requested_cursor: usize, width: u16) -> WrappedPrivateNote {
+    wrap_editor_text(body, requested_cursor, width, true)
+}
+
+/// Shares grapheme wrapping with unfocused fields that should hide their cursor.
+fn wrap_editor_text(
+    body: &str,
+    requested_cursor: usize,
+    width: u16,
+    show_cursor: bool,
+) -> WrappedPrivateNote {
     const CURSOR_MARKER: &str = "▏";
 
     let width = usize::from(width.max(1));
@@ -12916,7 +12971,9 @@ fn wrap_private_note(body: &str, requested_cursor: usize, width: u16) -> Wrapped
                          line: &mut String,
                          line_width: &mut usize,
                          cursor_row: &mut usize| {
-        push_grapheme(CURSOR_MARKER, lines, line, line_width);
+        if show_cursor {
+            push_grapheme(CURSOR_MARKER, lines, line, line_width);
+        }
         *cursor_row = lines.len();
     };
 
@@ -14790,7 +14847,11 @@ fn render_local_rename_field(
 /// suppresses this layer. Omitting it from the next frame makes Ratatui hide
 /// the terminal cursor automatically.
 fn render_local_rename_cursor(frame: &mut Frame<'_>, view: &ViewModel, enabled: bool) {
-    if !enabled || view.error_popup.is_some() || view.audio_quality_popup.is_some() {
+    if !enabled
+        || view.error_popup.is_some()
+        || view.audio_quality_popup.is_some()
+        || view.bug_report_popup.is_some()
+    {
         return;
     }
     let Some(LocalFilePopupView::Rename {
@@ -15288,6 +15349,23 @@ fn mouse_action_unfiltered(
         // selection even while mouse reporting is enabled. Never turn the
         // corresponding events into Youta actions if a terminal forwards them.
         return None;
+    }
+    if view.bug_report_popup.is_some() {
+        return match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => hit_map
+                .bug_report_buttons
+                .iter()
+                .find(|(_, area)| contains(*area, mouse.column, mouse.row))
+                .map(|(action, _)| action.clone())
+                .or_else(|| {
+                    hit_map
+                        .bug_report_fields
+                        .iter()
+                        .find(|(_, area)| contains(*area, mouse.column, mouse.row))
+                        .map(|(field, _)| UiAction::SelectBugReportField(*field))
+                }),
+            _ => None,
+        };
     }
     if view.error_popup.is_some() {
         return match mouse.kind {

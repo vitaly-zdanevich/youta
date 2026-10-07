@@ -140,6 +140,125 @@ pub struct PopupGeometry {
 mod wire_tests {
     use super::{Key, KeyPress, PopupGeometry, key_action};
     use crate::playback::PlaybackStatus;
+
+    /// The three-key chord is global, while the composer owns all later typing.
+    #[test]
+    fn bug_report_chord_and_editor_are_modal_and_never_require_a_browser() {
+        use crate::view::{
+            BugReportField, BugReportPopupView, GitHubIssueSubmissionView, PrivateNoteCursorMotion,
+            PrivateNotePopupView,
+        };
+        let mut view = ViewModel {
+            external_opener_available: false,
+            private_note_popup: Some(PrivateNotePopupView::default()),
+            ..ViewModel::default()
+        };
+        for character in ['b', 'B'] {
+            assert_eq!(
+                key_action(
+                    KeyPress {
+                        key: Key::Char(character),
+                        ctrl: true,
+                        alt: true,
+                        shift: false
+                    },
+                    &view,
+                    None,
+                    None
+                ),
+                Some(UiAction::OpenBugReport)
+            );
+        }
+        view.bug_report_popup = Some(BugReportPopupView::default());
+        for (key, expected) in [
+            (Key::Char('q'), UiAction::AppendBugReportCharacter('q')),
+            (Key::Enter, UiAction::MoveBugReportField(1)),
+            (Key::Tab, UiAction::MoveBugReportField(1)),
+            (Key::BackTab, UiAction::MoveBugReportField(-1)),
+            (Key::Delete, UiAction::DeleteBugReportForward),
+            (
+                Key::Left,
+                UiAction::MoveBugReportCursor(PrivateNoteCursorMotion::Left),
+            ),
+        ] {
+            assert_eq!(
+                key_action(KeyPress::new(key), &view, None, None),
+                Some(expected)
+            );
+        }
+        view.bug_report_popup.as_mut().unwrap().selected_field = BugReportField::Body;
+        assert_eq!(
+            key_action(KeyPress::new(Key::Enter), &view, None, None),
+            Some(UiAction::AppendBugReportCharacter('\n'))
+        );
+        assert_eq!(
+            key_action(
+                KeyPress {
+                    key: Key::Enter,
+                    ctrl: true,
+                    alt: false,
+                    shift: false
+                },
+                &view,
+                None,
+                None
+            ),
+            Some(UiAction::SubmitBugReport)
+        );
+        view.bug_report_popup.as_mut().unwrap().submission = GitHubIssueSubmissionView::Submitting;
+        for key in [Key::Esc, Key::Char('q'), Key::Enter] {
+            assert_eq!(key_action(KeyPress::new(key), &view, None, None), None);
+        }
+    }
+
+    /// Ctrl+S remains distinguishable from a body newline on legacy physical TTYs.
+    #[test]
+    fn bug_report_submit_control_s_works_without_enhanced_keyboard_protocol() {
+        use crate::view::BugReportPopupView;
+        let view = ViewModel {
+            bug_report_popup: Some(BugReportPopupView::default()),
+            ..ViewModel::default()
+        };
+        for character in ['s', 'S'] {
+            assert_eq!(
+                key_action(
+                    KeyPress {
+                        key: Key::Char(character),
+                        ctrl: true,
+                        alt: false,
+                        shift: false
+                    },
+                    &view,
+                    None,
+                    None
+                ),
+                Some(UiAction::SubmitBugReport)
+            );
+        }
+    }
+
+    /// A disabled screenshot checkbox is inert for keyboard input as well as clicks.
+    #[test]
+    fn bug_report_unavailable_screenshot_checkbox_does_not_toggle_from_keyboard() {
+        use crate::view::{BugReportField, BugReportPopupView};
+        let mut view = ViewModel {
+            bug_report_popup: Some(BugReportPopupView {
+                selected_field: BugReportField::Screenshot,
+                ..BugReportPopupView::default()
+            }),
+            ..ViewModel::default()
+        };
+        for key in [Key::Char(' '), Key::Enter] {
+            assert_eq!(key_action(KeyPress::new(key), &view, None, None), None);
+        }
+        view.bug_report_popup.as_mut().unwrap().screenshot_available = true;
+        for key in [Key::Char(' '), Key::Enter] {
+            assert_eq!(
+                key_action(KeyPress::new(key), &view, None, None),
+                Some(UiAction::ToggleBugReportScreenshot)
+            );
+        }
+    }
     #[cfg(feature = "commons-upload")]
     use crate::view::{CommonsUploadField, CommonsUploadPhase, CommonsUploadPopupView};
     use crate::view::{
@@ -1658,6 +1777,19 @@ pub fn key_action(
     if view.local_file_progress.is_some() {
         return None;
     }
+    let manual_pending = view
+        .bug_report_popup
+        .as_ref()
+        .is_some_and(|popup| popup.submission == GitHubIssueSubmissionView::Submitting);
+    let diagnostic_pending = view.error_popup.as_ref().is_some_and(|popup| {
+        popup.github_issue_submission == GitHubIssueSubmissionView::Submitting
+    });
+    if key.ctrl && key.alt && matches!(key.key, Key::Char('b' | 'B')) {
+        return (!manual_pending && !diagnostic_pending).then_some(UiAction::OpenBugReport);
+    }
+    if let Some(popup) = view.bug_report_popup.as_ref() {
+        return bug_report_key_action(key, popup, view.external_opener_available);
+    }
     if view.error_popup.is_none()
         && let Some(popup) = view.unsubscribe_popup.as_ref()
     {
@@ -1737,6 +1869,68 @@ pub fn key_action(
     unfiltered_key_action(key, view, page_rows).filter(|action| {
         view.external_opener_available || !view.action_requires_external_opener(action)
     })
+}
+
+/// Keeps the manual composer above covered editors and never submits on plain Enter.
+fn bug_report_key_action(
+    key: KeyPress,
+    popup: &BugReportPopupView,
+    opener_available: bool,
+) -> Option<UiAction> {
+    if popup.submission == GitHubIssueSubmissionView::Submitting {
+        return None;
+    }
+    if key.key == Key::Esc {
+        return Some(UiAction::DismissBugReport);
+    }
+    if key.ctrl && !key.alt && matches!(key.key, Key::Char('c' | 'C')) {
+        return Some(UiAction::CopyBugReport);
+    }
+    if !matches!(
+        popup.submission,
+        GitHubIssueSubmissionView::Idle | GitHubIssueSubmissionView::Failed { .. }
+    ) {
+        return (opener_available && !key.chorded() && key.key == Key::Char('o'))
+            .then_some(UiAction::OpenBugReportResult);
+    }
+    if key.ctrl && !key.alt {
+        return match key.key {
+            Key::Enter | Key::Char('s' | 'S') => Some(UiAction::SubmitBugReport),
+            Key::Char('w' | 'W') | Key::Backspace => Some(UiAction::DeleteBugReportWord),
+            _ => None,
+        };
+    }
+    if key.chorded() {
+        return None;
+    }
+    match key.key {
+        Key::Tab => Some(UiAction::MoveBugReportField(if key.shift { -1 } else { 1 })),
+        Key::BackTab => Some(UiAction::MoveBugReportField(-1)),
+        Key::Enter => match popup.selected_field {
+            BugReportField::Title => Some(UiAction::MoveBugReportField(1)),
+            BugReportField::Body => Some(UiAction::AppendBugReportCharacter('\n')),
+            BugReportField::Screenshot => popup
+                .screenshot_available
+                .then_some(UiAction::ToggleBugReportScreenshot),
+        },
+        Key::Char(' ') if popup.selected_field == BugReportField::Screenshot => popup
+            .screenshot_available
+            .then_some(UiAction::ToggleBugReportScreenshot),
+        Key::Char(character) if popup.selected_field != BugReportField::Screenshot => {
+            Some(UiAction::AppendBugReportCharacter(character))
+        }
+        Key::Backspace => Some(UiAction::DeleteBugReportCharacter),
+        Key::Delete => Some(UiAction::DeleteBugReportForward),
+        Key::Left => Some(UiAction::MoveBugReportCursor(PrivateNoteCursorMotion::Left)),
+        Key::Right => Some(UiAction::MoveBugReportCursor(
+            PrivateNoteCursorMotion::Right,
+        )),
+        Key::Up => Some(UiAction::MoveBugReportCursor(PrivateNoteCursorMotion::Up)),
+        Key::Down => Some(UiAction::MoveBugReportCursor(PrivateNoteCursorMotion::Down)),
+        Key::Home => Some(UiAction::MoveBugReportCursor(PrivateNoteCursorMotion::Home)),
+        Key::End => Some(UiAction::MoveBugReportCursor(PrivateNoteCursorMotion::End)),
+        _ => None,
+    }
 }
 
 /// Maps the searchable caption browser before ordinary application shortcuts.

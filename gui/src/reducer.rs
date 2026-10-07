@@ -267,10 +267,19 @@ const STATS_INTERVAL: Duration = Duration::from_secs(5);
 /// keep a windowless process alive forever.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
+/// Renderer-owned input, kept separate from semantic actions and never Debug-logged.
+#[derive(serde::Deserialize)]
+pub enum FrontendAction {
+    /// A pre-composer text snapshot; the shared controller enforces privacy again.
+    OpenBugReport { screenshot: Option<String> },
+}
+
 /// One item on the reducer's inbox.
 enum Message {
     /// A semantic action from the window.
     Action(UiAction),
+    /// Renderer capture with no provider or application policy in the frontend.
+    Frontend(FrontendAction),
     /// A key press, still to be resolved against the live view.
     ///
     /// The window deliberately does not resolve this itself. Which action a key
@@ -340,6 +349,23 @@ impl ReducerHandle {
     pub fn dispatch(&self, action: UiAction) -> Result<(), String> {
         self.actions
             .send(Message::Action(action))
+            .map_err(|_| "the Youta reducer stopped".to_owned())
+    }
+
+    /// Queues a bounded renderer capture without printing its private contents.
+    ///
+    /// # Errors
+    /// Returns a fixed message for an oversized capture or stopped reducer.
+    pub fn frontend(&self, action: FrontendAction) -> Result<(), String> {
+        let FrontendAction::OpenBugReport { screenshot } = &action;
+        if screenshot
+            .as_ref()
+            .is_some_and(|text| text.len() > 32 * 1024)
+        {
+            return Err("the GUI text snapshot exceeds 32 KiB".to_owned());
+        }
+        self.actions
+            .send(Message::Frontend(action))
             .map_err(|_| "the Youta reducer stopped".to_owned())
     }
 
@@ -534,6 +560,9 @@ pub fn start<R: Runtime>(
 fn apply<R: Runtime>(app: &AppHandle<R>, controller: &mut AppController, message: Message) -> bool {
     match message {
         Message::Action(action) => controller.dispatch(action),
+        Message::Frontend(FrontendAction::OpenBugReport { screenshot }) => {
+            controller.open_bug_report(screenshot);
+        }
         Message::Key {
             press,
             page_rows,
@@ -683,7 +712,12 @@ fn run<R: Runtime>(
     }
     loop {
         match actions.recv_timeout(TICK) {
-            Ok(message @ (Message::Action(_) | Message::Key { .. } | Message::Media(_))) => {
+            Ok(
+                message @ (Message::Action(_)
+                | Message::Frontend(_)
+                | Message::Key { .. }
+                | Message::Media(_)),
+            ) => {
                 if !apply(app, controller, message) {
                     return;
                 }
@@ -889,6 +923,39 @@ mod tests {
         assert!(
             inbox.try_recv().is_err(),
             "an authorized exit must not queue another Quit"
+        );
+    }
+
+    /// Renderer captures use a separate bounded inbox message, not generic action payloads.
+    #[test]
+    fn bug_report_capture_is_bounded_before_queueing() {
+        let (actions, inbox) = channel();
+        let (_finished_sender, finished) = channel();
+        let handle = ReducerHandle {
+            actions,
+            latest: Arc::new(Mutex::new(ViewModel::default())),
+            artwork: Arc::new(PublishedArtwork::default()),
+            finished: Mutex::new(finished),
+            exit_authorization: ExitAuthorization::default(),
+        };
+        let parsed = serde_json::from_str::<super::FrontendAction>(
+            r#"{"OpenBugReport":{"screenshot":"GUI text snapshot\nfixture"}}"#,
+        )
+        .expect("frontend capture wire format");
+        handle.frontend(parsed).expect("queue bounded capture");
+        assert!(matches!(inbox.try_recv(), Ok(Message::Frontend(
+			super::FrontendAction::OpenBugReport { screenshot: Some(text) }
+		)) if text == "GUI text snapshot\nfixture"));
+        let result = handle.frontend(super::FrontendAction::OpenBugReport {
+            screenshot: Some("private-screenshot".repeat(32 * 1024)),
+        });
+        assert_eq!(
+            result,
+            Err("the GUI text snapshot exceeds 32 KiB".to_owned())
+        );
+        assert!(
+            inbox.try_recv().is_err(),
+            "oversized text never enters the reducer queue"
         );
     }
 

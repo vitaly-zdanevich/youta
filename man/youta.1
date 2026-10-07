@@ -2,7 +2,7 @@
 .\" Check hotkeys against src/keymap.rs, terminal-only handlers in src/tui.rs,
 .\" and the controller's action availability before changing this reference.
 .\" Keep this source ASCII and omit a release version to avoid stale metadata.
-.TH YOUTA 1 "2026-10-06" "Youta" "User Commands"
+.TH YOUTA 1 "2026-10-07" "Youta" "User Commands"
 .SH NAME
 youta \- terminal audio player and subscription manager
 .SH SYNOPSIS
@@ -120,6 +120,10 @@ For example, typing
 .B q
 in a search field inserts a letter, and arrow keys in an editor move its cursor.
 .SS General navigation
+.TP
+.B Ctrl+Alt+B
+Open the bug-report composer with title/body inputs and an enabled-by-default
+With ASCII screenshot checkbox. See BUG REPORTS below.
 .TP
 .B ?
 Open contextual help. Press
@@ -623,6 +627,52 @@ clicks, and
 or
 .B F8
 exits pointer mode.
+.SH BUG REPORTS
+Press
+.B Ctrl+Alt+B
+to compose a public GitHub issue without leaving Youta.
+The optional text screenshot captures the visible screen before the form opens,
+preserves Unicode titles, and omits artwork and terminal-image commands.
+In the GUI it is a labeled text snapshot, not a raster image.
+Private-note and credential editors suppress capture. Common credentials and
+home paths are redacted; large screenshots are truncated. Other visible
+personal text may remain: uncheck With ASCII screenshot to exclude it.
+.PP
+.B Tab
+and
+.B Shift+Tab
+move between fields;
+.B Space
+toggles the screenshot checkbox when selected.
+.B Enter
+in the body inserts a newline.
+.B Ctrl+S
+or Submit sends directly, with no additional review or confirmation screen.
+.B Ctrl+Enter
+also submits on terminals that can distinguish it from plain Enter.
+While sending, Submit is gray and disabled, a simple spinner animates,
+and editing, dismissal, and repeated submission are blocked.
+An explicit failure allows retrying; an uncertain outcome asks you to check the
+issue list to avoid duplicates.
+.B Esc
+closes the form when it is not sending.
+.PP
+The report ends automatically with a separator, Youta version, and OS.
+Drafts and screenshots are kept only in memory.
+Submission uses an installed, authenticated
+.BR gh (1)
+and works from a physical TTY without opening a browser.
+The body is sent through standard input, not a browser URL.
+Missing-helper and authentication errors include guidance; Copy is also
+available. Never include authentication tokens in a report.
+.PP
+.UR https://cli.github.com/manual/gh_auth_login
+GitHub CLI authentication, including headless token input
+.UE
+.br
+.UR https://cli.github.com/manual/gh_issue_create
+GitHub CLI issue creation
+.UE
 .SH CONFIGURATION
 On Linux the default application directory is
 .IR $XDG_CONFIG_HOME/youta ,

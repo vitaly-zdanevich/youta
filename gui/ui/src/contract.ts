@@ -341,6 +341,31 @@ export interface ErrorPopupView {
   github_issue_submission: GitHubIssueSubmissionView;
 }
 
+/** Shared editor focus; the optional captured screen remains private to Rust. */
+export type BugReportField = 'Title' | 'Body' | 'Screenshot';
+
+/** Cursor movements use the reducer's existing grapheme-aware editor. */
+export type PrivateNoteCursorMotion = 'Left' | 'Right' | 'Up' | 'Down' | 'Home' | 'End';
+
+/** User-authored report with direct submission state and final version/OS footer. */
+export interface BugReportPopupView {
+	title: string;
+	body: string;
+	selected_field: BugReportField;
+	title_cursor_byte: number;
+	body_cursor_byte: number;
+	body_scroll_offset: number;
+	follow_cursor: boolean;
+	with_screenshot: boolean;
+	screenshot_available: boolean;
+	screenshot_notice: string | null;
+	footer: string;
+	gh_available: boolean;
+	validation_error: string | null;
+	submission: GitHubIssueSubmissionView;
+	animation_frame: number;
+}
+
 /** Copyable progress and results for one local audio-quality batch. */
 export interface AudioQualityPopupView {
   title: string;
@@ -1028,6 +1053,7 @@ export interface ViewModel {
   help_open: boolean;
   project_history_popup: ProjectHistoryPopupView | null;
   error_popup: ErrorPopupView | null;
+	bug_report_popup: BugReportPopupView | null;
   audio_quality_supported: boolean;
   audio_quality_popup: AudioQualityPopupView | null;
   video_summary_supported: boolean;

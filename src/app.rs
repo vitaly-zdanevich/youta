@@ -17,6 +17,7 @@ mod archive_org_highlight;
 mod archive_upload;
 #[cfg(feature = "bandcamp")]
 mod bandcamp_resolver;
+mod bug_report;
 #[cfg(all(feature = "yt-dlp", feature = "backend-mpv"))]
 mod cached_download;
 #[cfg(feature = "yt-dlp")]
@@ -304,6 +305,21 @@ use crate::view::RadioSort;
 use crate::view::VideoQrPopupView;
 #[cfg(any(feature = "summary", test))]
 use crate::view::VideoSummaryPopupView;
+use crate::view::{
+    BugReportField, BugReportPopupView, ClipboardRequest, ClipboardSubject, DetailTimecodeView,
+    DetailVideoLinkView, DetailView, DetailWikidataMediaView, DetailsScroll, DetailsTextSelection,
+    ErrorPopupScroll, ErrorPopupView, GOOGLE_CLOUD_CREDENTIALS_URL, GitHubIssueSubmissionView,
+    INVIDIOUS_ABOUT_URL, INVIDIOUS_INSTANCES_URL, LocalFilePopupView, LocalSizeSort,
+    LocalVideoThumbnailView, MAX_DETAILS_SELECTION_BYTES, NowPlayingView, PlaylistChoiceView,
+    PlaylistEditorField, PlaylistItemView, PlaylistPopupMode, PlaylistPopupView,
+    PreferencesPopupView, PrivateNoteCursorMotion, PrivateNotePopupView, ProjectCommitView,
+    ProjectHistoryPopupView, ProjectHistoryRemoteState, QueuePopupView, QueueRowView,
+    RightPanelMode, RowView, RssSubscriptionPopupView, Screen, SearchActivity, SearchKind,
+    SubscriptionPane, SubscriptionRoute, UiAction, UiController, VideoCommentView,
+    VideoCommentsPopupState, VideoCommentsPopupView, VideoSummaryPopupState, ViewModel,
+    WaveformView, YANDEX_OAUTH_GUIDE_URL, YOUTUBE_API_KEY_GUIDE_URL, YouTubeSearchSort,
+    YouTubeSetupField, YouTubeSetupPopupView,
+};
 #[cfg(feature = "commons-upload")]
 use crate::view::{
     COMMONS_ACCOUNT_REGISTRATION_GUIDE_URL, COMMONS_BOT_PASSWORD_GUIDE_URL,
@@ -311,21 +327,6 @@ use crate::view::{
 };
 #[cfg(feature = "yt-dlp")]
 use crate::view::{ChannelDownloadOption, ChannelDownloadPopupView};
-use crate::view::{
-    ClipboardRequest, ClipboardSubject, DetailTimecodeView, DetailVideoLinkView, DetailView,
-    DetailWikidataMediaView, DetailsScroll, DetailsTextSelection, ErrorPopupScroll, ErrorPopupView,
-    GOOGLE_CLOUD_CREDENTIALS_URL, GitHubIssueSubmissionView, INVIDIOUS_ABOUT_URL,
-    INVIDIOUS_INSTANCES_URL, LocalFilePopupView, LocalSizeSort, LocalVideoThumbnailView,
-    MAX_DETAILS_SELECTION_BYTES, NowPlayingView, PlaylistChoiceView, PlaylistEditorField,
-    PlaylistItemView, PlaylistPopupMode, PlaylistPopupView, PreferencesPopupView,
-    PrivateNoteCursorMotion, PrivateNotePopupView, ProjectCommitView, ProjectHistoryPopupView,
-    ProjectHistoryRemoteState, QueuePopupView, QueueRowView, RightPanelMode, RowView,
-    RssSubscriptionPopupView, Screen, SearchActivity, SearchKind, SubscriptionPane,
-    SubscriptionRoute, UiAction, UiController, VideoCommentView, VideoCommentsPopupState,
-    VideoCommentsPopupView, VideoSummaryPopupState, ViewModel, WaveformView,
-    YANDEX_OAUTH_GUIDE_URL, YOUTUBE_API_KEY_GUIDE_URL, YouTubeSearchSort, YouTubeSetupField,
-    YouTubeSetupPopupView,
-};
 use crate::view::{DetailHighlightRange, DetailLinkInternalTarget};
 #[cfg(feature = "wikidata")]
 use crate::view::{
@@ -5492,6 +5493,8 @@ pub struct AppController {
     #[cfg(feature = "evernote")]
     evernote_thread: Option<JoinHandle<()>>,
     report_actions: Box<dyn DiagnosticActionHandler>,
+    /// Private capture and independent lifecycle of the manually composed report.
+    bug_report: bug_report::ManualBugReportState,
     /// Completions from the sole explicitly confirmed GitHub submission.
     github_issue_submission_results: Receiver<GitHubIssueSubmissionCompletion>,
     /// Sender cloned into the detached submission task.
@@ -6771,6 +6774,7 @@ impl AppController {
             #[cfg(feature = "evernote")]
             evernote_thread: None,
             report_actions: Box::new(SystemReportActions::new()),
+            bug_report: bug_report::ManualBugReportState::default(),
             github_issue_submission_results,
             github_issue_submission_result_sender,
             diagnostic_report_generation: 0,
@@ -31861,6 +31865,9 @@ impl AppController {
 
     /// Enters an explicit confirmation state before publishing diagnostics.
     fn request_github_issue_submission(&mut self) {
+        if self.bug_report.pending.is_some() {
+            return;
+        }
         let Some(error) = self.view.error_popup.as_mut() else {
             return;
         };
@@ -31903,6 +31910,9 @@ impl AppController {
 
     /// Starts one background `gh` submission after explicit confirmation.
     fn confirm_github_issue_submission(&mut self) {
+        if self.bug_report.pending.is_some() {
+            return;
+        }
         if !self.view.error_popup.as_ref().is_some_and(|error| {
             error.reportable
                 && error.yt_dlp_forbidden.is_none()
@@ -35482,6 +35492,9 @@ impl AppController {
 }
 
 impl UiController for AppController {
+    fn open_bug_report(&mut self, screenshot: Option<String>) {
+        self.open_bug_report_composer(screenshot);
+    }
     fn view(&self) -> &ViewModel {
         &self.view
     }
@@ -35508,6 +35521,17 @@ impl UiController for AppController {
             self.view.status_line = "Wait for the Local transfer to finish".to_owned();
             return;
         }
+        // The topmost composer also rejects stale frontend events targeting a
+        // covered editor, while terminal geometry/capability updates still apply.
+        if self.view.bug_report_popup.is_some()
+            && !bug_report::composer_action(&action)
+            && !matches!(
+                action,
+                UiAction::SetTerminalWindowPixels { .. } | UiAction::SetExternalOpenerAvailable(_)
+            )
+        {
+            return;
+        }
         self.synchronize_preferences_action_focus(&action);
         if !self.view.external_opener_available
             && self.view.action_requires_external_opener(&action)
@@ -35518,7 +35542,9 @@ impl UiController for AppController {
         }
         match action {
             UiAction::Quit => {
-                if self.pending_github_issue_submission.is_some() {
+                if self.pending_github_issue_submission.is_some()
+                    || self.bug_report.pending.is_some()
+                {
                     self.view.status_line =
                         "Wait for the GitHub issue submission result before quitting".to_owned();
                 } else if self.local_move_is_executing() {
@@ -35553,6 +35579,21 @@ impl UiController for AppController {
             #[cfg(feature = "ascii-visualizer")]
             UiAction::DismissAsciiVisualizer => self.dismiss_ascii_visualizer(),
             UiAction::OpenProjectHistory => self.open_project_history(),
+            UiAction::OpenBugReport => self.open_bug_report_composer(None),
+            UiAction::SelectBugReportField(field) => self.select_bug_report_field(field),
+            UiAction::MoveBugReportField(direction) => self.move_bug_report_field(direction),
+            UiAction::AppendBugReportCharacter(character) => {
+                self.append_bug_report_character(character)
+            }
+            UiAction::DeleteBugReportCharacter => self.delete_bug_report_character(false),
+            UiAction::DeleteBugReportForward => self.delete_bug_report_character(true),
+            UiAction::DeleteBugReportWord => self.delete_bug_report_word(),
+            UiAction::MoveBugReportCursor(motion) => self.move_bug_report_cursor(motion),
+            UiAction::ToggleBugReportScreenshot => self.toggle_bug_report_screenshot(),
+            UiAction::SubmitBugReport => self.submit_bug_report(),
+            UiAction::CopyBugReport => self.copy_bug_report(),
+            UiAction::DismissBugReport => self.dismiss_bug_report(),
+            UiAction::OpenBugReportResult => self.open_bug_report_result(),
             UiAction::SetProjectHistoryScroll(offset) => {
                 if let Some(popup) = self.view.project_history_popup.as_mut() {
                     popup.scroll_offset = offset;
@@ -37055,6 +37096,7 @@ impl UiController for AppController {
             Instant::now(),
         );
         self.drain_github_issue_submission_results();
+        self.poll_bug_report_submission();
         if self.diagnostic_only {
             return;
         }
@@ -47115,6 +47157,8 @@ mod tests {
     #[cfg(feature = "archive-upload")]
     #[path = "archive_upload.rs"]
     mod archive_upload_tests;
+    #[path = "bug_report.rs"]
+    mod bug_report_tests;
     #[cfg(all(feature = "yt-dlp", feature = "backend-mpv"))]
     #[path = "cached_download.rs"]
     mod cached_download_tests;

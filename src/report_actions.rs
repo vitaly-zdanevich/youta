@@ -1319,7 +1319,8 @@ fn issue_page_plan(executable: &Path, title: &str) -> CommandPlan {
     }
 }
 
-fn bounded_issue_title(title: &str) -> String {
+/// Normalizes a safe bounded title identically for the composer and native helpers.
+pub(crate) fn bounded_issue_title(title: &str) -> String {
     let redacted = redact_diagnostic_text(title);
     let flattened = redacted.split_whitespace().collect::<Vec<_>>().join(" ");
     let title = if flattened.is_empty() {

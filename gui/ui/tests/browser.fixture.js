@@ -81,7 +81,7 @@
 				if (command === 'screens') return clone(sources);
 				if (command === 'snapshot') return clone(view);
 				if (command === 'audio_output') return { engine: 'fixture', driver: 'none', device: null };
-				if (command === 'dispatch' || command === 'key') return null;
+				if (command === 'dispatch' || command === 'key' || command === 'frontend') return null;
 				if (command === 'report_window_failure') { failures.push(JSON.stringify(args)); return null; }
 				throw new Error(`Unexpected native command: ${command}`);
 			},
@@ -989,8 +989,98 @@
 		await until(() => !dialog(), 'closed unsubscribe confirmation');
 	}
 
+	/** Report editing and publication use mocked native commands only. */
+	async function checkBugReportComposer() {
+		const previous = clone(view);
+		const nativeInput = document.createElement('input');
+		nativeInput.value = 'Underlying private fixture value';
+		document.body.append(nativeInput);
+		nativeInput.focus();
+		let underlyingKeys = 0;
+		nativeInput.addEventListener('keydown', () => { underlyingKeys++; });
+		const opened = calls.length;
+		nativeInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'b', ctrlKey: true, altKey: true, bubbles: true, cancelable: true }));
+		const request = await until(() => calls.slice(opened).find((call) => call.command === 'frontend'), 'bug report capture command');
+		assert(typeof request.args.action.OpenBugReport.screenshot === 'string'
+			&& request.args.action.OpenBugReport.screenshot.includes('GUI text snapshot'), 'Ctrl+Alt+B captures a labeled text-only GUI snapshot');
+		assert(!calls.slice(opened).some((call) => call.command === 'key'), 'The capture shortcut opens only once');
+		assert(!request.args.action.OpenBugReport.screenshot.includes(nativeInput.value), 'Native input values are excluded from the text capture');
+		const popup = { title: 'Wrong title <b>literal</b>', body: 'First line\nSecond 📮 line', selected_field: 'Title',
+			title_cursor_byte: 5, body_cursor_byte: 0, body_scroll_offset: 0, follow_cursor: true,
+			with_screenshot: true, screenshot_available: true, screenshot_notice: null,
+			footer: 'Youta 0.fixture\nOS: Fixture OS', gh_available: true, validation_error: null,
+			submission: 'Idle', animation_frame: 0 };
+		snapshot({ bug_report_popup: popup });
+		await until(() => dialog()?.textContent.includes('Report a bug'), 'bug report composer');
+		nativeInput.focus();
+		const typingStart = calls.length;
+		nativeInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'x', bubbles: true, cancelable: true }));
+		await until(() => calls.slice(typingStart).some((call) => call.command === 'key' && call.args.press.key.Char === 'x'), 'composer typing while a native input has focus');
+		assert(underlyingKeys === 0, 'Composer capture-phase keys never edit the underlying input');
+		assert(dialog().textContent.includes(popup.title) && dialog().textContent.includes(popup.body), 'Title/body remain literal multiline text');
+		assert(!dialog().querySelector('input, textarea, b'), 'Composer uses controller-owned fields without interpreting markup');
+		assert(dialog().querySelector('[role=checkbox]').getAttribute('aria-checked') === 'true', 'ASCII screenshot defaults checked');
+		assert(dialog().textContent.includes('published publicly') && dialog().textContent.includes(popup.footer), 'The composer shows privacy notice and final metadata before Submit');
+		await action({ SelectBugReportField: 'Body' }, () => button('Body', dialog()).click(), 'Body selects the shared editor field');
+		nativeInput.focus();
+		const bodyTypingStart = calls.length;
+		nativeInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+		await until(() => calls.slice(bodyTypingStart).some((call) => call.command === 'key' && call.args.press.key === 'Enter'), 'body newline while native input has focus');
+		assert(underlyingKeys === 0, 'Body editing also bypasses the underlying input');
+		nativeInput.blur();
+		await key('Enter', 'Enter');
+		await key('ArrowLeft', 'Left');
+		await action('ToggleBugReportScreenshot', () => dialog().querySelector('[role=checkbox]').click(), 'Screenshot checkbox toggles through the reducer');
+		const enabledBorder = getComputedStyle(button('Submit', dialog())).borderColor;
+		await action('SubmitBugReport', () => button('Submit', dialog()).click(), 'Submit sends directly without a review or confirmation step');
+		snapshot({ bug_report_popup: { ...popup, submission: 'Submitting' } });
+		const submit = await until(() => button('Submit', dialog())?.disabled && button('Submit', dialog()), 'disabled pending Submit');
+		assert(getComputedStyle(submit).borderColor !== enabledBorder && Number(getComputedStyle(submit).opacity) < 1,
+			'Pending Submit is visually muted rather than highlighted');
+		assert(dialog().querySelector('[role=status]').textContent.includes('|'), 'Pending submission shows a simple ASCII spinner');
+		const pendingCalls = calls.length;
+		submit.click();
+		assert(calls.length === pendingCalls, 'Disabled Submit cannot publish a duplicate');
+		await key('Enter', 'Enter', { ctrlKey: true });
+		assert(!calls.slice(pendingCalls).some((call) => call.command === 'dispatch'), 'Pending keyboard submission is delegated only to the guarded shared keymap');
+		const repeatedStart = calls.length;
+		document.dispatchEvent(new KeyboardEvent('keydown', { key: 'b', ctrlKey: true, altKey: true, repeat: true, bubbles: true, cancelable: true }));
+		assert(calls.length === repeatedStart, 'Repeated composer shortcut cannot recapture or reopen a pending draft');
+		assert(dialog().querySelector('button[aria-label=Close]').disabled, 'Pending publication cannot be dismissed');
+		snapshot({ bug_report_popup: { ...popup, submission: 'Submitting', animation_frame: 1 } });
+		await until(() => dialog()?.querySelector('[role=status]')?.textContent.includes('/'), 'animated ASCII spinner');
+		snapshot({ bug_report_popup: { ...popup, submission: { Failed: { message: 'Fixture submission failed' } } } });
+		await until(() => button('Submit', dialog())?.disabled === false, 'retryable failure');
+		assert(dialog().textContent.includes('Fixture submission failed'), 'Submission failure remains inline with the authored draft');
+		await action('CopyBugReport', () => button('Copy report', dialog()).click(), 'Copy retains an explicit fallback');
+		const issueUrl = 'https://github.com/vitaly-zdanevich/youta/issues/123';
+		snapshot({ bug_report_popup: { ...popup, submission: { Submitted: { url: issueUrl } } }, external_opener_available: true });
+		await until(() => dialog()?.textContent.includes(issueUrl), 'visible submitted issue URL');
+		assert(button('Submit', dialog()).disabled, 'A completed issue cannot be submitted again');
+		await action('OpenBugReportResult', () => button('Open issue', dialog()).click(), 'A completed issue opens the controller-validated result');
+		const issuesUrl = 'https://github.com/vitaly-zdanevich/youta/issues';
+		snapshot({ bug_report_popup: { ...popup, submission: { OutcomeUnknown: { issues_url: issuesUrl } } } });
+		await until(() => dialog()?.textContent.includes('outcome is unknown'), 'uncertain submission outcome');
+		assert(dialog().textContent.includes(issuesUrl) && button('Submit', dialog()).disabled, 'Unknown publication shows its check URL and prevents retry duplicates');
+		snapshot({ bug_report_popup: { ...popup, gh_available: false, screenshot_available: false, screenshot_notice: 'Capture omitted for privacy.' } });
+		await until(() => dialog()?.textContent.includes('gh auth login'), 'GitHub CLI fallback guidance');
+		assert(button('Submit', dialog()).disabled && dialog().querySelector('[role=checkbox]').disabled,
+			'Missing helpers or capture disable unavailable controls while Copy remains available');
+		await action('DismissBugReport', () => button('Close', dialog()).click(), 'Close dismisses the composer');
+		snapshot({ bug_report_popup: null, private_note_open: true });
+		await until(() => dialog()?.textContent.includes('Private note'), 'private editor before report');
+		const privateStart = calls.length;
+		document.dispatchEvent(new KeyboardEvent('keydown', { key: 'B', ctrlKey: true, altKey: true, bubbles: true, cancelable: true }));
+		const privateRequest = await until(() => calls.slice(privateStart).find((call) => call.command === 'frontend'), 'private-context bug report');
+		assert(privateRequest.args.action.OpenBugReport.screenshot === null, 'Private editor DOM is not captured');
+		snapshot(previous);
+		nativeInput.remove();
+		await until(() => !dialog(), 'composer fixture cleanup');
+	}
+
 	async function run() {
 		await until(() => document.querySelector('[title="Search archive.org"]'), 'Archive search');
+		await checkBugReportComposer();
 		await checkSoundCloudTab();
 		const beforeTabMarkers = clone(view);
 		for (const [idle, paused, label] of [[false, false, '▶ SoundCloud'], [false, true, '|| SoundCloud'], [true, false, 'SoundCloud']]) {

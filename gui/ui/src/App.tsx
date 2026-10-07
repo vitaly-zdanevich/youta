@@ -11,6 +11,8 @@ import { Subscriptions } from "./components/Subscriptions";
 import { Tabs } from "./components/Tabs";
 import { Waveform } from "./components/Waveform";
 import { AsciiVisualizer } from './components/AsciiVisualizer';
+import { BugReportPopup } from './components/BugReportPopup';
+import { captureBugReportScreenshot, visibleWindowText } from './bugReport';
 import {
   AudioQualityPopup,
 	S3UploadPopup,
@@ -43,7 +45,7 @@ import {
 	YouTubeProviderPopup,
 } from "./components/popups";
 import { namedKey } from "./keys";
-import { sendKey } from "./ipc";
+import { openBugReport, sendKey } from './ipc';
 import { popupGeometry } from "./popupGeometry";
 import { subscriptionPageRows } from "./subscriptionPageRows";
 import { useYouta } from "./useYouta";
@@ -56,6 +58,9 @@ function hasSelection(): boolean {
 export function App() {
   const { view, sources, output, failure } = useYouta();
   const body = useRef<HTMLDivElement>(null);
+	// A committed render can receive a key before passive effects replace a listener.
+	const latestView = useRef(view);
+	latestView.current = view;
 
   /** Reports how many list rows are on screen, for page-sized movement. */
   const pageRows = useCallback((): number | null => {
@@ -71,8 +76,28 @@ export function App() {
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
+		const view = latestView.current;
 		if (view?.local_file_progress) {
 			event.preventDefault();
+			return;
+		}
+		// Capture belongs to the renderer and must precede mounting the composer.
+		// The native hook still enforces live modal and submission ownership.
+		if (view && !event.metaKey && event.ctrlKey && event.altKey && event.key.toLowerCase() === 'b') {
+			event.preventDefault();
+			if (!event.repeat && !view.bug_report_popup) {
+				if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+				void openBugReport(captureBugReportScreenshot(view, () => visibleWindowText(document)));
+			}
+			return;
+		}
+		// A parked native input cannot consume typing intended for the composer.
+		if (view?.bug_report_popup && !event.metaKey) {
+			const key = namedKey(event);
+			if (key !== null) {
+				event.preventDefault();
+				void sendKey({ key, ctrl: event.ctrlKey, alt: event.altKey, shift: event.shiftKey }, pageRows(), popupGeometry());
+			}
 			return;
 		}
       // A text field or slider owns its own keys.
@@ -111,9 +136,21 @@ export function App() {
       );
     };
 
+		// Intercept only the composer and its opening chord before native editors
+		// or React field handlers. Existing links retain their own Enter behavior.
+		const onComposerKey = (event: KeyboardEvent) => {
+			if (event.metaKey || (!latestView.current?.bug_report_popup
+				&& !(event.ctrlKey && event.altKey && event.key.toLowerCase() === 'b'))) return;
+			event.stopPropagation();
+			onKeyDown(event);
+		};
+		document.addEventListener('keydown', onComposerKey, true);
     document.addEventListener("keydown", onKeyDown);
-    return () => document.removeEventListener("keydown", onKeyDown);
-  }, [pageRows, view?.local_file_progress]);
+		return () => {
+			document.removeEventListener('keydown', onComposerKey, true);
+			document.removeEventListener('keydown', onKeyDown);
+		};
+  }, [pageRows]);
 
   if (failure !== null) {
     return (
@@ -278,6 +315,7 @@ export function App() {
           externalOpener={view.external_opener_available}
         />
       ) : null}
+		{view.bug_report_popup ? <BugReportPopup popup={view.bug_report_popup} externalOpener={view.external_opener_available} /> : null}
     </>
   );
 }

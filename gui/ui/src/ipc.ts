@@ -109,6 +109,17 @@ export function dispatch(action: UiAction): Promise<void> {
   return invoke<void>("dispatch", { action }).catch(() => undefined);
 }
 
+/** A private screenshot travels only to the native composer hook, never error logs. */
+export function openBugReport(screenshot: string | null): Promise<void> {
+	try {
+		return bridge().core.invoke<void>('frontend', { action: { OpenBugReport: { screenshot } } })
+			.catch(() => { reportFailure('frontend', 'Could not open the bug report composer'); });
+	} catch {
+		reportFailure('frontend', 'Could not open the bug report composer');
+		return Promise.resolve();
+	}
+}
+
 /**
  * Sends one key press to the shared keyboard map.
  *

@@ -899,6 +899,21 @@ fn redact_helper_executable(path: &Path) -> String {
     redact_diagnostic_text(&raw)
 }
 
+/// Returns a compact, bounded OS label for manual reports without collecting
+/// dependencies, backtraces, environment variables, or running helper commands.
+pub(crate) fn operating_system_summary() -> String {
+    let (info, _) = operating_system_info();
+    let mut summary = info.name;
+    if let Some(version) = info.version
+        && !summary.contains(&version)
+    {
+        summary.push(' ');
+        summary.push_str(&version);
+    }
+    let single_line = summary.split_whitespace().collect::<Vec<_>>().join(" ");
+    truncate_utf8(&single_line, 512).0
+}
+
 fn operating_system_info() -> (OperatingSystemInfo, bool) {
     #[cfg(target_os = "linux")]
     {

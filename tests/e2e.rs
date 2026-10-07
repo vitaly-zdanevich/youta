@@ -789,6 +789,201 @@ fn tui_error_popup_runs_copy_browser_review_and_confirmed_submission_actions() {
     }
 }
 
+/// Exercises raw terminal chords and a single controlled, browser-free submission.
+#[cfg(all(target_os = "linux", feature = "tui"))]
+#[test]
+fn tui_manual_bug_report_ctrl_s_submits_once_with_a_pre_popup_screenshot() {
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    let temporary = tempdir().expect("isolated report fixture");
+    let helpers = temporary.path().join("helpers");
+    fs::create_dir(&helpers).expect("helper directory");
+    let transcript = temporary.path().join("typescript.txt");
+    let args_log = temporary.path().join("gh-args.txt");
+    let body_log = temporary.path().join("gh-body.txt");
+    let calls_log = temporary.path().join("gh-calls.txt");
+    let release = temporary.path().join("release-gh");
+    let tty_log = temporary.path().join("initial-termios.txt");
+    let launcher = temporary.path().join("launch-youta");
+    write_executable(
+        &helpers.join("gh"),
+        r#"#!/bin/sh
+printf 'invoked\n' >> "$YOUTA_TEST_GH_CALLS_LOG"
+printf '%s\n' "$@" > "$YOUTA_TEST_GH_ARGS_LOG"
+/bin/cat > "$YOUTA_TEST_GH_BODY_LOG"
+attempt=0
+while [ ! -f "$YOUTA_TEST_GH_RELEASE" ]; do
+  attempt=$((attempt + 1))
+  [ "$attempt" -lt 1000 ] || exit 75
+  /bin/sleep 0.02
+done
+printf '%s\n' 'https://github.com/vitaly-zdanevich/youta/issues/456'
+"#,
+    );
+    // Enable software flow control only on the test PTY. Youta's raw-mode
+    // setup must disable IXON so Ctrl+S reaches the form instead of freezing it.
+    write_executable(
+        &launcher,
+        r#"#!/bin/sh
+/bin/stty cols 120 rows 40 ixon start '^Q' stop '^S'
+/bin/stty -a > "$YOUTA_TEST_TTY_LOG"
+exec "$YOUTA_TEST_BINARY" --config-dir "$YOUTA_TEST_CONFIG_DIR" tui
+"#,
+    );
+    fs::write(
+        temporary.path().join("config.toml"),
+        "[playback]\nyoutube_prewarm = false\n",
+    )
+    .expect("network-free report configuration");
+    let mut child = Command::new("/usr/bin/timeout")
+        .args([
+            "--signal=TERM",
+            "--kill-after=2",
+            "30",
+            "/usr/bin/script",
+            "--quiet",
+            "--return",
+            "--flush",
+            "--echo",
+            "never",
+            "--output-limit",
+            "4MiB",
+            "--log-out",
+        ])
+        .arg(&transcript)
+        .arg("--command")
+        .arg(&launcher)
+        .env_clear()
+        .env("TERM", "xterm-256color")
+        .env("PATH", &helpers)
+        .env("YOUTA_TEST_BINARY", assert_cmd::cargo_bin!("youta"))
+        .env("YOUTA_TEST_CONFIG_DIR", temporary.path())
+        .env("YOUTA_TEST_GH_ARGS_LOG", &args_log)
+        .env("YOUTA_TEST_GH_BODY_LOG", &body_log)
+        .env("YOUTA_TEST_GH_CALLS_LOG", &calls_log)
+        .env("YOUTA_TEST_GH_RELEASE", &release)
+        .env("YOUTA_TEST_TTY_LOG", &tty_log)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("launch isolated report PTY");
+    wait_for_text_file(&transcript, "Video search", "terminal transcript");
+    let initial_tty = fs::read_to_string(&tty_log).expect("initial PTY termios");
+    assert!(
+        initial_tty
+            .split_whitespace()
+            .any(|flag| flag.trim_end_matches(';') == "ixon"),
+        "fixture must start with software flow control enabled: {initial_tty}"
+    );
+    let input = child.stdin.as_mut().expect("pseudo-terminal input");
+    input
+        .write_all(b"\x1b\x02")
+        .expect("open composer with Alt+Ctrl+B");
+    input.flush().expect("flush composer hotkey");
+    wait_for_text_file(&transcript, "Bug report", "terminal transcript");
+    input
+        .write_all(b"TTY manual report fixture\tFirst body line\rSecond body line\x13")
+        .expect("type title and multiline body, then Ctrl+S");
+    input.flush().expect("flush direct submission");
+    wait_for_helper_output(&body_log, "OS:");
+    wait_for_text_file(&transcript, "Submitting", "terminal transcript");
+    let pending_size = fs::metadata(&transcript).expect("pending transcript").len();
+    input
+        .write_all(b"\x13\x13\x13")
+        .expect("repeat submit while helper is pending");
+    input.flush().expect("flush duplicate submission hotkeys");
+    // Only the spinner can change the idle form while the controlled helper
+    // is blocked. This also proves Ctrl+S did not suspend terminal output.
+    let deadline = Instant::now() + TUI_READINESS_TIMEOUT;
+    while fs::metadata(&transcript).expect("spinner transcript").len() <= pending_size {
+        assert!(
+            Instant::now() < deadline,
+            "pending report stopped redrawing after Ctrl+S"
+        );
+        std::thread::sleep(TUI_READINESS_POLL);
+    }
+    assert_eq!(
+        fs::read_to_string(&calls_log)
+            .expect("pending helper calls")
+            .lines()
+            .count(),
+        1
+    );
+    fs::write(&release, "complete").expect("release controlled gh result");
+    wait_for_text_file(
+        &transcript,
+        "https://github.com/vitaly-zdanevich/youta/issues/456",
+        "terminal transcript",
+    );
+    input.write_all(b"\x1b").expect("close completed composer");
+    input.flush().expect("flush composer close");
+    // A standalone Escape must not combine with the subsequent quit as Alt+Q.
+    std::thread::sleep(Duration::from_millis(100));
+    input.write_all(b"q").expect("quit isolated Youta");
+    input.flush().expect("flush quit");
+    child.stdin.take();
+    let output = child.wait_with_output().expect("wait for report PTY");
+    assert!(
+        output.status.success(),
+        "report PTY failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&calls_log)
+            .expect("completed helper calls")
+            .lines()
+            .count(),
+        1,
+        "repeated Ctrl+S must not create duplicate issues"
+    );
+    let args = fs::read_to_string(&args_log).expect("captured helper arguments");
+    let arguments = args.lines().collect::<Vec<_>>();
+    assert!(
+        arguments
+            .windows(2)
+            .any(|pair| pair == ["--title", "TTY manual report fixture"])
+    );
+    assert!(
+        arguments
+            .windows(2)
+            .any(|pair| pair == ["--body-file", "-"])
+    );
+    assert!(
+        arguments
+            .windows(2)
+            .any(|pair| pair == ["--repo", "vitaly-zdanevich/youta"])
+    );
+    assert!(!arguments.contains(&"--web"));
+    assert!(
+        !args.contains("First body line"),
+        "authored body belongs on stdin, never argv"
+    );
+    let body = fs::read_to_string(&body_log).expect("captured helper stdin");
+    assert!(body.starts_with("First body line\nSecond body line"));
+    assert!(body.contains(&format!("\nYouta {}\nOS:", env!("CARGO_PKG_VERSION"))));
+    assert!(!body.contains('\u{1b}') && !body.contains('\u{10eeee}'));
+    let screenshot = body
+        .split_once("### ASCII screenshot\n\n")
+        .expect("default-checked screenshot")
+        .1;
+    assert!(
+        screenshot.contains("Video search"),
+        "the screenshot must describe the pre-composer screen"
+    );
+    assert!(!screenshot.contains("TTY manual report fixture"));
+    assert!(!screenshot.contains("With ASCII screenshot"));
+
+    /// Makes helpers executable inside this fixture's private PATH only.
+    fn write_executable(path: &std::path::Path, contents: &str) {
+        fs::write(path, contents).expect("helper fixture");
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).expect("helper permissions");
+    }
+}
+
 #[cfg(all(target_os = "linux", feature = "tui"))]
 #[test]
 fn tui_history_enter_reports_a_removed_local_file_without_deleting_history() {

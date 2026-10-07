@@ -2691,6 +2691,43 @@ remove the generated EDAM bindings, hashing, network client, and UI by leaving
 
 ## Diagnostics and issue review
 
+### Write a bug report
+
+Press **Ctrl+Alt+B** to open a bug-report form with a title, a multiline body,
+and a checked-by-default **With ASCII screenshot** checkbox. The screenshot
+captures the visible terminal screen before the form opens; in the GUI it is a
+labeled text snapshot of the visible interface, not an image. Unicode track
+names remain readable. Artwork and terminal-image commands are omitted, and
+screens containing private notes or credential editors are not captured.
+Common credentials and home-directory paths are redacted, and large snapshots
+are truncated. Visible titles, searches, descriptions, and other personal text
+can still be included: uncheck the screenshot option when you do not want to
+publish them.
+
+Use **Tab/Shift+Tab** to move between fields, **Space** to toggle the checkbox,
+and **Enter** for a newline in the body. Click **Submit** or press
+**Ctrl+S** (or **Ctrl+Enter** where supported) to publish directly to Youta's
+public GitHub issue tracker; there is no additional review or confirmation
+screen. During submission,
+Submit is gray and disabled, the usual simple spinner animates, and repeated
+submission, editing, and dismissal are blocked. An explicit failure permits a
+retry; an uncertain outcome instead asks you to check the issue list first to
+avoid duplicate reports. **Esc** closes the form when it is not sending.
+Ctrl+S also works on terminals that cannot distinguish Ctrl+Enter from Enter.
+
+Reports finish automatically with a separator, the Youta version, and the OS.
+The draft and screenshot stay in memory and are not saved in configuration.
+Submission uses an already authenticated [GitHub CLI (`gh`)](https://cli.github.com/)
+and works on a physical TTY without opening a browser. See
+[`gh auth login`](https://cli.github.com/manual/gh_auth_login) for setup,
+including token input through standard input in a headless environment, and
+[`gh issue create`](https://cli.github.com/manual/gh_issue_create) for the
+submission command. Never put an authentication token in the report itself.
+The form explains missing-`gh` or authentication errors and offers **Copy**;
+the complete report is passed to `gh` through standard input, not a browser URL.
+
+### Unexpected errors
+
 Unexpected operational errors open a scrollable report containing the Youta
 version, operating-system identity, enabled build features, exact Rust
 dependency versions, configured helper paths, the error chain, and a forced

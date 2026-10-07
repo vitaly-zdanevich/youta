@@ -37,7 +37,7 @@ use youta::playback::{AudioOutputDriver, ProcessPlaybackConfig};
 use youta::view::{InformationPanelKind, Screen, UiAction, ViewModel};
 
 use desktop::WindowFocus;
-use reducer::ReducerHandle;
+use reducer::{FrontendAction, ReducerHandle};
 
 /// One selectable source, as the window should label it.
 #[derive(serde::Serialize)]
@@ -150,6 +150,15 @@ fn snapshot(reducer: tauri::State<'_, ReducerHandle>) -> ViewModel {
 #[tauri::command]
 fn dispatch(action: UiAction, reducer: tauri::State<'_, ReducerHandle>) -> Result<(), String> {
     reducer.dispatch(action)
+}
+
+/// Passes renderer-only captured text to the shared composer without logging it.
+#[tauri::command]
+fn frontend(
+    action: FrontendAction,
+    reducer: tauri::State<'_, ReducerHandle>,
+) -> Result<(), String> {
+    reducer.frontend(action)
 }
 
 /// Serves the local waveform envelope for one exact generation.
@@ -363,6 +372,7 @@ fn main() {
             screens,
             snapshot,
             dispatch,
+            frontend,
             key,
             audio_output,
             waveform_peaks,

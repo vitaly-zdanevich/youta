@@ -4,6 +4,8 @@
  * Views remain the separate, intentionally redacted subset in contract.ts.
  */
 import type {
+	BugReportField,
+	PrivateNoteCursorMotion,
 	ArchiveUploadField,
 	CommonsUploadField,
 	EvernoteNoteField,
@@ -70,6 +72,15 @@ export type SourceKind =
 
 /** Unit variants reachable through controls or their typed action tables. */
 export type UnitUiAction =
+	| 'OpenBugReport'
+	| 'DeleteBugReportCharacter'
+	| 'DeleteBugReportForward'
+	| 'DeleteBugReportWord'
+	| 'ToggleBugReportScreenshot'
+	| 'SubmitBugReport'
+	| 'CopyBugReport'
+	| 'DismissBugReport'
+	| 'OpenBugReportResult'
 	| 'ActivateLocalMoveDestination'
 	| 'ActivateSelection'
 	| 'AnalyzeLocalAudioQuality'
@@ -230,6 +241,10 @@ export type UnitUiAction =
  * generations, and explicit null values are part of the wire contract.
  */
 export interface UiActionPayloads {
+	SelectBugReportField: BugReportField;
+	MoveBugReportField: number;
+	AppendBugReportCharacter: string;
+	MoveBugReportCursor: PrivateNoteCursorMotion;
 	MovePreferencesFocus: number;
 	SelectPreferencesField: PreferencesField;
 	ActivateDescriptionVideo: { video_id: string; start_seconds: number | null; };
