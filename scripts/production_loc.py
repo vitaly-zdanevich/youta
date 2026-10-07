@@ -190,7 +190,8 @@ def production_counts(root, tracked):
 	for name in sorted(tracked):
 		path = PurePosixPath(name)
 		frontend = name.startswith('gui/ui/src/') or name in {'gui/ui/index.html', 'gui/ui/vite.config.ts'}
-		if not frontend or path.suffix not in {'.ts', '.tsx', '.js', '.mjs', '.css', '.html'}:
+		embedded_lua = name.startswith('src/') and path.suffix == '.lua'
+		if not embedded_lua and (not frontend or path.suffix not in {'.ts', '.tsx', '.js', '.mjs', '.css', '.html'}):
 			continue
 		if set(path.parts) & {'tests', '__tests__', 'fixtures', 'generated', 'vendor', 'node_modules'} or re.search(r'\.(test|spec)\.', path.name) or path.stem.endswith('_generated'):
 			continue

@@ -340,6 +340,29 @@ Disable this with
 `playback.youtube_prewarm = false`, `[y] Prepare selected YouTube audio` in
 Preferences, or `YOUTA_PLAYBACK__YOUTUBE_PREWARM=false`.
 
+On Linux, the default `cache` build feature retains fetched remote audio bytes
+in RAM across track switches. Returning to a cached YouTube track can skip
+extraction and reuse its audio at the saved resume position, including after
+playing several other items. Only requested bytes are fetched; this is not an
+automatic whole-track download. An uncached seek or evicted range still needs
+the network, and mpv still opens the decoder when returning to a track.
+
+The cache grows only while total memory usage stays below a best-effort 90%
+ceiling, taking Linux `MemAvailable` and tighter container/cgroup limits into
+account. Older bytes are evicted under pressure. This is not a reservation of
+90% of your RAM, and other applications can temporarily exceed the ceiling.
+Missing memory measurements disable retention. Audio, signed URLs, and headers
+remain session-only; quitting clears this RAM cache.
+
+Caching supports validated, seekable HTTP audio. Live streams, HLS/DASH
+manifests, unsupported servers, and externally configured HTTP proxies retain
+normal playback. Archive.org's exact-original download cache remains available.
+Other platforms currently use normal playback until equivalent memory-pressure
+measurement is implemented. Omit `cache` from a `--no-default-features` build,
+or use Gentoo `USE="-cache"`, to remove this capability from both frontends.
+See [mpv's loading hooks](https://mpv.io/manual/stable/#hooks) and
+[Linux memory reporting](https://docs.kernel.org/filesystems/proc.html#meminfo).
+
 `[A] Autoplay` is off by default and persists its state in
 `playback.autoplay`. When enabled, EOF advances through the same YouTube,
 YouTube Music, Podcasts, archive.org, subscription-channel, Local, Offline,
@@ -945,7 +968,7 @@ dependencies, or the optional Linux virtual-console mouse client with:
 
 ```sh
 cargo build --release --locked --no-default-features \
-	--features app,archive-org,archive-upload,ascii-visualizer,audio-quality,commons-upload,evernote,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,web-browser,youtube-captions
+	--features app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,commons-upload,evernote,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,web-browser,youtube-captions
 ```
 
 The `app` profile includes the experimental YandexMusic adapter but does not
@@ -956,7 +979,7 @@ with:
 
 ```sh
 cargo build --release --locked --no-default-features \
-	--features app-core,archive-org,archive-upload,ascii-visualizer,audio-quality,commons-upload,evernote,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,web-browser,youtube-captions
+	--features app-core,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,commons-upload,evernote,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,web-browser,youtube-captions
 ```
 
 Omit `images` from that command for the Yandex-free text-only variant. Omit
@@ -974,6 +997,7 @@ leave it out of an explicit `--no-default-features` feature list:
 | `archive-upload` | Reviewed YouTube and Local audio/video uploads to Internet Archive. |
 | `ascii-visualizer` | CAVA capture and fullscreen terminal/desktop spectrum renderers. |
 | `audio-quality` | Local spectral analysis and RustFFT. |
+| `cache` | Session RAM audio cache with a 90% system/container memory-pressure ceiling on Linux. |
 | `cmd` | Terminal Local-tab Bash commands, Tab completion, and persistent command history. |
 | `commons-upload` | Commons authentication, upload client, and review UI. |
 | `evernote` | Evernote client and audio-note UI. |
@@ -3153,7 +3177,7 @@ The positive `images` and `qr` USE flags are enabled by default. Gentoo users
 can independently disable them with
 conventional `USE="-images"` and `USE="-qr"` overrides.
 
-The source package maps the default-enabled `ascii-visualizer`, `audio-quality`,
+The source package maps the default-enabled `ascii-visualizer`, `audio-quality`, `cache`,
 `commons-upload`, `evernote`, `lan-sharing`, `local-archives`, `nyan-cat`,
 `sponsorblock`, `summary`, and `youtube-captions` flags to their Cargo features.
 
@@ -3162,6 +3186,7 @@ The source package maps the default-enabled `ascii-visualizer`, `audio-quality`,
 | `USE="-archive-org"` (next release template) | Internet Archive catalogue, metadata, reviews, and track browsing in both frontends. |
 | `USE="-ascii-visualizer"` | CAVA integration, fullscreen rendering, and its Help entry. |
 | `USE="-audio-quality"` | Local analyzer and RustFFT dependency. |
+| `USE="-cache"` | Session RAM audio caching in both frontends. |
 | `USE="-commons-upload"` | Commons client and review UI. |
 | `USE="-evernote"` | Evernote EDAM client and note UI. |
 | `USE="-lan-sharing"` | Session HTTP server, LAN-share/feed actions, and their QR workflow. |

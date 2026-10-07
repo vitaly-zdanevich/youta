@@ -259,6 +259,7 @@ jobs:
           cargo check --locked --no-default-features --features cli --bin youta
           cargo check --locked --no-default-features --features subscriptions --lib
           cargo check --locked --no-default-features --features tui
+          cargo check --locked --no-default-features --features cache --lib
           cargo check --locked --no-default-features --features cmd --lib
           cargo check --locked --no-default-features --features tui,cmd
           cargo check --locked --no-default-features --features qr
@@ -343,14 +344,14 @@ jobs:
       # tagged release cannot be the first attempt to link the 32-bit target.
       - name: Compile all release variants
         run: |
-          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,archive-org,archive-upload,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary
-          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,archive-org,archive-upload,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary
-          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,archive-org,archive-upload,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,images,local-archives,nyan-cat,sponsorblock,summary
-          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,archive-org,archive-upload,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,local-archives,nyan-cat,sponsorblock,summary
-          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,archive-org,archive-upload,ascii-visualizer,audio-quality,commons-upload,evernote,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary
-          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,archive-org,archive-upload,ascii-visualizer,audio-quality,commons-upload,evernote,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary
-          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,archive-org,archive-upload,ascii-visualizer,audio-quality,commons-upload,evernote,images,local-archives,nyan-cat,sponsorblock,summary
-          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,archive-org,archive-upload,ascii-visualizer,audio-quality,commons-upload,evernote,local-archives,nyan-cat,sponsorblock,summary
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,commons-upload,evernote,gpm,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,commons-upload,evernote,gpm,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,commons-upload,evernote,gpm,images,local-archives,nyan-cat,sponsorblock,summary
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,commons-upload,evernote,gpm,local-archives,nyan-cat,sponsorblock,summary
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,commons-upload,evernote,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,commons-upload,evernote,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,commons-upload,evernote,images,local-archives,nyan-cat,sponsorblock,summary
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,commons-upload,evernote,local-archives,nyan-cat,sponsorblock,summary
 
       - name: Validate and start the i686 executable
         run: |
@@ -664,6 +665,37 @@ jobs:
           cargo check --locked --target x86_64-unknown-freebsd
           --no-default-features
           --features tui,local-browser,backend-mpv
+
+  ram-audio-cache:
+    name: Native RAM audio cache regression
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@v6
+
+      - name: Install the minimum Rust toolchain
+        run: |
+          rustup toolchain install "${RUST_VERSION}" --profile minimal
+          rustup default "${RUST_VERSION}"
+
+      - name: Restore Cargo registry cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Install native audio helpers
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ffmpeg mpv
+
+      - name: Replay synthetic audio without its origin or a second extraction
+        run: >-
+          cargo test --locked --no-default-features --features cache,yt-dlp
+          --lib native_ram_cache -- --ignored --nocapture
 
   e2e:
     name: End-to-end terminal test

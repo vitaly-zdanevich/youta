@@ -105,6 +105,9 @@ impl Wake for BackendWake {
 
 /// A playback backend supervised on its own thread.
 pub struct ThreadedBackend {
+    /// Shared RAM routing requires neither the player worker nor its IPC channel.
+    #[cfg(feature = "cache")]
+    ram_cache: Option<super::ram_cache::RamPlaybackCache>,
     /// Invalidates cached tickets even while a load/stop waits behind polling.
     cache_epoch: Arc<AtomicU64>,
     /// Process identity captured before the backend moves to its worker.
@@ -123,6 +126,8 @@ impl ThreadedBackend {
         B: PlaybackBackend + Send + 'static,
     {
         let process_id = backend.process_id();
+        #[cfg(feature = "cache")]
+        let ram_cache = backend.ram_cache_handle();
         let (job_sender, job_receiver) = channel();
         let backend_wake = Arc::new(BackendWake {
             pending: AtomicBool::new(false),
@@ -149,6 +154,8 @@ impl ThreadedBackend {
             })
             .ok();
         Self {
+            #[cfg(feature = "cache")]
+            ram_cache,
             cache_epoch,
             process_id,
             jobs: job_sender,
@@ -333,6 +340,11 @@ fn run<B>(
 }
 
 impl PlaybackBackend for ThreadedBackend {
+    #[cfg(feature = "cache")]
+    fn ram_cache_handle(&self) -> Option<super::ram_cache::RamPlaybackCache> {
+        self.ram_cache.clone()
+    }
+
     fn set_worker_waker(&mut self, waker: Option<Waker>) -> bool {
         let previous = {
             let mut shared = self.shared.lock().unwrap_or_else(PoisonError::into_inner);
@@ -855,6 +867,8 @@ mod tests {
                 http_headers: super::super::PlaybackHttpHeaders::default(),
                 bypass_ytdl: true,
                 keep_open: false,
+                cache_identity: None,
+                cache_fallback_url: None,
             };
             backend.play(&input).expect("queued load");
             backend

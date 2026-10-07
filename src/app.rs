@@ -26487,6 +26487,23 @@ impl AppController {
             media_id.source,
             SourceKind::YouTube | SourceKind::ArchiveOrg
         ) && !live_stream;
+        // The stable locator distinguishes selected source files, while the
+        // access variant prevents preview bytes from becoming full-track audio.
+        // Resolved URLs and their credentials never enter this session identity.
+        canonical_input.cache_identity = (!live_stream
+            && media_id.source != SourceKind::Local
+            && url::Url::parse(&item.playback_location)
+                .is_ok_and(|url| matches!(url.scheme(), "http" | "https")))
+        .then(|| {
+            serde_json::to_string(&(
+                &media_id,
+                &item.playback_location,
+                preview,
+                (media_id.source == SourceKind::Bandcamp)
+                    .then_some(self.config.providers.bandcamp_audio_format),
+            ))
+            .expect("media identity and strings serialize")
+        });
         #[cfg(feature = "waveform")]
         let local_playback_candidate = (media_id.source == SourceKind::Local)
             .then(|| local_playback_path(&canonical_input.location))
@@ -26498,6 +26515,7 @@ impl AppController {
         input.start_at = Duration::from_secs(start_at);
         input.title = Some(item.media.title.clone());
         input.keep_open = canonical_input.keep_open;
+        input.cache_identity = canonical_input.cache_identity.clone();
         let mut load_kind = if media_id.source == SourceKind::YouTube {
             PlaybackLoadKind::YouTubeCanonical
         } else {
@@ -26513,6 +26531,9 @@ impl AppController {
             input.http_headers = headers;
             input.bypass_ytdl = true;
             load_kind = PlaybackLoadKind::YouTubeDirect;
+        }
+        if media_id.source == SourceKind::YouTube && input.location != canonical_input.location {
+            input.cache_fallback_url = Some(canonical_input.location.clone());
         }
         #[cfg(all(feature = "archive-org", feature = "yt-dlp", feature = "backend-mpv"))]
         self.cache_original_playback_input(&item, &mut input);
@@ -82005,6 +82026,57 @@ mod tests {
         assert!(controller.youtube_prewarm_failure.is_none());
     }
 
+    #[test]
+    fn playback_cache_identity_distinguishes_bandcamp_format_preferences() {
+        let (mut controller, state, _, _) = controller_with_mock_lifecycle([], []);
+        let mut item = fixture_youtube_item("format fixture");
+        item.media.id.source = SourceKind::Bandcamp;
+        item.playback_location = "https://artist.bandcamp.com/track/fixture".to_owned();
+        controller.play_queue_item(item.clone(), false);
+        controller.config.providers.bandcamp_audio_format =
+            crate::config::BandcampAudioFormat::Flac;
+        controller.play_queue_item(item, false);
+        let state = state.lock().expect("mock state");
+        assert_eq!(state.played.len(), 2);
+        assert_ne!(
+            state.played[0].cache_identity,
+            state.played[1].cache_identity
+        );
+    }
+
+    #[test]
+    fn playback_cache_identity_survives_source_switches_but_excludes_live_and_local() {
+        let (mut controller, state, _, _) = controller_with_mock_lifecycle([], []);
+        let first = fixture_youtube_item("first remote track");
+        controller.play_queue_item(first.clone(), false);
+        let mut local = first.clone();
+        local.media.id.source = SourceKind::Local;
+        local.playback_location = "/tmp/cache-fixture.opus".to_owned();
+        controller.play_queue_item(local, false);
+        let mut other = first.clone();
+        other.media.id.external_id = "another-video".to_owned();
+        other.playback_location = "https://www.youtube.com/watch?v=another-video".to_owned();
+        controller.play_queue_item(other, false);
+        controller.play_queue_item(first.clone(), false);
+        let mut live = first;
+        live.media.kind = MediaKind::LiveStream;
+        controller.play_queue_item(live, false);
+
+        let state = state.lock().expect("mock state");
+        assert_eq!(state.played.len(), 5);
+        assert!(state.played[0].cache_identity.is_some());
+        assert!(state.played[1].cache_identity.is_none());
+        assert_ne!(
+            state.played[0].cache_identity,
+            state.played[2].cache_identity
+        );
+        assert_eq!(
+            state.played[0].cache_identity,
+            state.played[3].cache_identity
+        );
+        assert!(state.played[4].cache_identity.is_none());
+    }
+
     #[cfg(feature = "yt-dlp")]
     #[test]
     fn prewarmed_youtube_load_uses_bounded_fallbacks_without_losing_queue_state() {
@@ -82052,6 +82124,16 @@ mod tests {
             );
             assert!(!format!("{:?}", state.played[0]).contains("signed.example"));
             assert!(!format!("{:?}", state.played[0]).contains("secret"));
+            assert!(
+                state.played[0]
+                    .cache_identity
+                    .as_ref()
+                    .is_some_and(|key| { key.contains("dQw4w9WgXcQ") && !key.contains("secret") })
+            );
+            assert_eq!(
+                state.played[0].cache_fallback_url.as_deref(),
+                Some("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+            );
         }
 
         {

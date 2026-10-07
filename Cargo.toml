@@ -4,7 +4,7 @@ resolver = "3"
 
 [package]
 name = "youta"
-version = "0.94.0"
+version = "0.95.0"
 edition = "2024"
 rust-version = "1.95"
 description = "A low-resource YouTube TUI audio player and local subscription manager that uses yt-dlp and saves and shows listening progress"
@@ -37,6 +37,7 @@ default = [
     "archive-upload",
     "ascii-visualizer",
     "audio-quality",
+    "cache",
     "cmd",
     "commons-upload",
     "evernote",
@@ -161,6 +162,8 @@ lan-sharing = [
 # keyboard pointer when physical input is unavailable.
 gpm = ["tui", "dep:mio"]
 backend-mpv = ["dep:mio"]
+# Retain original remote audio bytes in RAM between finite-media playback loads.
+cache = ["backend-mpv", "network", "dep:chrono", "dep:getrandom", "dep:tempfile"]
 backend-native = []
 alsa = []
 jack = []

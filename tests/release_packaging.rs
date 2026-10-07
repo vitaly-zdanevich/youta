@@ -132,6 +132,27 @@ fn s3_upload_sdk_and_ui_are_exclusively_opt_in() {
     assert!(ci.contains("feature_arguments: --no-default-features --features tui,s3-upload"));
 }
 
+/// RAM retention stays independently removable from either frontend and Gentoo.
+#[test]
+fn ram_audio_cache_is_default_but_independently_removable() {
+    let manifest = manifest();
+    assert!(feature_entries(&manifest, "default").contains(&"cache"));
+    assert!(!feature_closure(&manifest, "app").contains("cache"));
+    assert!(feature_closure(&manifest, "cache").contains("backend-mpv"));
+    assert!(feature_closure(&manifest, "cache").contains("network"));
+    let gui: toml::Value = toml::from_str(&read_repository_file("gui/Cargo.toml")).unwrap();
+    assert!(feature_entries(&gui, "default").contains(&"cache"));
+    assert_eq!(feature_entries(&gui, "cache"), ["youta/cache"]);
+    let ebuild = read_repository_file("packaging/gentoo/youta.ebuild");
+    assert!(ebuild.contains("+cache"));
+    assert!(ebuild.contains("cache? ( mpv )"));
+    assert!(ebuild.contains("$(usev cache)"));
+    assert!(ebuild.contains("gui_features+=,cache"));
+    let manual = read_repository_file("man/youta.1");
+    assert!(manual.contains(".SH AUDIO CACHE"));
+    assert!(manual.contains("90% total memory usage"));
+}
+
 /// Removing Web also removes its HTML parser without changing other sources.
 #[test]
 fn web_browser_is_default_but_independently_removable() {
@@ -803,11 +824,11 @@ fn yandex_music_feature_and_credentials_remain_optional_and_documented() {
     let readme = read_repository_file("README.md");
     assert!(readme.contains("private client API"));
     assert!(readme.contains(
-        "--features app,archive-org,archive-upload,ascii-visualizer,audio-quality,commons-upload"
+        "--features app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,commons-upload"
     ));
     assert!(
         readme.contains(
-            "--features app-core,archive-org,archive-upload,ascii-visualizer,audio-quality,commons-upload"
+            "--features app-core,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,commons-upload"
         )
     );
     assert!(readme.contains("Audiobook search is best-effort"));
@@ -912,14 +933,14 @@ fn release_script_builds_gpm_and_linux_no_gpm_non_sqlite_executables() {
 
     assert!(!script.contains("--features bundled-sqlite"));
     for feature_set in [
-        "cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,web-browser,youtube-captions",
-        "cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,web-browser,youtube-captions",
-        "cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,images,local-archives,nyan-cat,sponsorblock,summary,web-browser,youtube-captions",
-        "cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,local-archives,nyan-cat,sponsorblock,summary,web-browser,youtube-captions",
-        "cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,commons-upload,evernote,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,web-browser,youtube-captions",
-        "cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,commons-upload,evernote,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,web-browser,youtube-captions",
-        "cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,commons-upload,evernote,images,local-archives,nyan-cat,sponsorblock,summary,web-browser,youtube-captions",
-        "cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,commons-upload,evernote,local-archives,nyan-cat,sponsorblock,summary,web-browser,youtube-captions",
+        "cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,commons-upload,evernote,gpm,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,web-browser,youtube-captions",
+        "cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,commons-upload,evernote,gpm,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,web-browser,youtube-captions",
+        "cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,commons-upload,evernote,gpm,images,local-archives,nyan-cat,sponsorblock,summary,web-browser,youtube-captions",
+        "cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,commons-upload,evernote,gpm,local-archives,nyan-cat,sponsorblock,summary,web-browser,youtube-captions",
+        "cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,commons-upload,evernote,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,web-browser,youtube-captions",
+        "cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,commons-upload,evernote,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,web-browser,youtube-captions",
+        "cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,commons-upload,evernote,images,local-archives,nyan-cat,sponsorblock,summary,web-browser,youtube-captions",
+        "cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,commons-upload,evernote,local-archives,nyan-cat,sponsorblock,summary,web-browser,youtube-captions",
     ] {
         assert!(
             script
@@ -1118,14 +1139,14 @@ fn workflows_validate_and_publish_the_documented_platform_contract() {
     assert!(ci.contains("sudo apt-get install --yes gcc-multilib libc6-dev-i386"));
     assert!(ci.contains("cargo build --locked --release --target i686-unknown-linux-gnu"));
     for feature_set in [
-        "app,archive-org,archive-upload,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary",
-        "app,archive-org,archive-upload,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary",
-        "app,archive-org,archive-upload,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,images,local-archives,nyan-cat,sponsorblock,summary",
-        "app,archive-org,archive-upload,ascii-visualizer,audio-quality,commons-upload,evernote,gpm,local-archives,nyan-cat,sponsorblock,summary",
-        "app,archive-org,archive-upload,ascii-visualizer,audio-quality,commons-upload,evernote,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary",
-        "app,archive-org,archive-upload,ascii-visualizer,audio-quality,commons-upload,evernote,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary",
-        "app,archive-org,archive-upload,ascii-visualizer,audio-quality,commons-upload,evernote,images,local-archives,nyan-cat,sponsorblock,summary",
-        "app,archive-org,archive-upload,ascii-visualizer,audio-quality,commons-upload,evernote,local-archives,nyan-cat,sponsorblock,summary",
+        "app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,commons-upload,evernote,gpm,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary",
+        "app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,commons-upload,evernote,gpm,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary",
+        "app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,commons-upload,evernote,gpm,images,local-archives,nyan-cat,sponsorblock,summary",
+        "app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,commons-upload,evernote,gpm,local-archives,nyan-cat,sponsorblock,summary",
+        "app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,commons-upload,evernote,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary",
+        "app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,commons-upload,evernote,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary",
+        "app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,commons-upload,evernote,images,local-archives,nyan-cat,sponsorblock,summary",
+        "app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,commons-upload,evernote,local-archives,nyan-cat,sponsorblock,summary",
     ] {
         assert!(
             ci.contains(&format!(

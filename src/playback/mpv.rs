@@ -23,6 +23,11 @@ mod backend {
         PlaybackError, PlaybackEvent, PlaybackInput, PlaybackProfile, PlaybackStatus,
         PlayerCommand, ProcessPlaybackConfig, Result,
     };
+    #[cfg(feature = "cache")]
+    use super::super::{
+        PlaybackHttpHeaders,
+        ram_cache::{RamCacheTicket, RamPlaybackCache},
+    };
 
     const IPC_TIMEOUT: Duration = Duration::from_secs(2);
     const MAX_MPV_SAMPLE_RATE_HZ: u32 = 768_000;
@@ -80,6 +85,66 @@ mod backend {
         eof_held: bool,
         /// Detects an EOF edge interleaved with a command's IPC response.
         held_eof_generation: u64,
+        #[cfg(feature = "cache")]
+        ram: RamIpcState,
+    }
+
+    /// Bounded messages from the owned Lua bridge, drained outside IPC parsing.
+    #[cfg(feature = "cache")]
+    #[derive(Default)]
+    struct RamIpcState {
+        requests: VecDeque<RamCacheRequest>,
+        pending_generation: Option<u64>,
+        generation: u64,
+        position: Option<Duration>,
+        endings: VecDeque<(u64, Option<Duration>)>,
+        /// Replacing a failed held-EOF file is internal, not a user stop.
+        suppress_stop_generation: Option<u64>,
+    }
+
+    /// Original transport is retained for one uncached retry at the same position.
+    #[cfg(feature = "cache")]
+    struct RamCachePlayback {
+        generation: u64,
+        key: String,
+        original: PlaybackInput,
+        routed: bool,
+        ticket: Option<RamCacheTicket>,
+        /// A trusted source-specific wrapper already resolved its public URL.
+        direct_fallback: bool,
+    }
+
+    /// Owns one RAM store and a private, fixed-name mpv script for its lifetime.
+    #[cfg(feature = "cache")]
+    struct RamPlaybackState {
+        cache: RamPlaybackCache,
+        bridge_directory: tempfile::TempDir,
+        generation: u64,
+        playback: Option<RamCachePlayback>,
+    }
+
+    #[cfg(feature = "cache")]
+    impl RamPlaybackState {
+        /// Failure to install the optional bridge leaves ordinary playback intact.
+        fn new(cache: RamPlaybackCache, runtime: &Path) -> std::io::Result<Self> {
+            use std::io::Write as _;
+
+            let bridge_directory = tempfile::Builder::new()
+                .prefix("mpv-ram-")
+                .tempdir_in(runtime)?;
+            crate::private_files::set_private_directory_permissions(bridge_directory.path())?;
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            let mut file = crate::private_files::open_privately(&mut options)
+                .open(bridge_directory.path().join("youta_ram_cache.lua"))?;
+            file.write_all(include_bytes!("youta_ram_cache.lua"))?;
+            Ok(Self {
+                cache,
+                bridge_directory,
+                generation: 0,
+                playback: None,
+            })
+        }
     }
 
     /// Headless mpv playback backend.
@@ -92,6 +157,8 @@ mod backend {
         socket_path: PathBuf,
         profile: PlaybackProfile,
         process_exit_reported: bool,
+        #[cfg(feature = "cache")]
+        ram: Option<RamPlaybackState>,
     }
 
     impl MpvBackend {
@@ -102,11 +169,48 @@ mod backend {
         /// Returns an error when the runtime directory is unsafe, tuning is
         /// invalid, mpv cannot start, or its private IPC socket is unavailable.
         pub fn spawn(config: &ProcessPlaybackConfig) -> Result<Self> {
+            Self::spawn_inner(
+                config,
+                #[cfg(feature = "cache")]
+                RamPlaybackCache::new(),
+            )
+        }
+
+        /// Injects a bounded, loopback-enabled store into the real native backend.
+        #[cfg(all(test, feature = "cache"))]
+        pub(crate) fn spawn_with_ram_cache(
+            config: &ProcessPlaybackConfig,
+            cache: RamPlaybackCache,
+        ) -> Result<Self> {
+            Self::spawn_inner(config, Some(cache))
+        }
+
+        fn spawn_inner(
+            config: &ProcessPlaybackConfig,
+            #[cfg(feature = "cache")] cache: Option<RamPlaybackCache>,
+        ) -> Result<Self> {
             ensure_private_directory(&config.runtime_dir)?;
             let socket_path = endpoint_path(&config.runtime_dir);
             remove_stale_socket(&socket_path)?;
 
             let mut command = mpv_command(config, &socket_path)?;
+            #[cfg(feature = "cache")]
+            let ram =
+                cache.and_then(|cache| RamPlaybackState::new(cache, &config.runtime_dir).ok());
+            #[cfg(feature = "cache")]
+            if let Some(ram) = &ram {
+                command.arg(format!(
+                    "--script={}",
+                    ram.bridge_directory
+                        .path()
+                        .join("youta_ram_cache.lua")
+                        .display()
+                ));
+                // Retain the chosen audio stream as one progressive URL where
+                // possible instead of an EDL containing unselected alternatives.
+                #[cfg(feature = "yt-dlp")]
+                command.arg("--script-opts-append=ytdl_hook-all_formats=no");
+            }
             let mut child = command.spawn().map_err(|error| {
                 if error.kind() == std::io::ErrorKind::NotFound {
                     PlaybackError::ExecutableUnavailable(
@@ -125,6 +229,8 @@ mod backend {
                 socket_path,
                 profile: config.profile,
                 process_exit_reported: false,
+                #[cfg(feature = "cache")]
+                ram,
             };
             backend.ipc.cache_export = Some(CacheExportControl::new(
                 backend.child.id(),
@@ -137,6 +243,141 @@ mod backend {
 
         fn send(&mut self, command: &[Value]) -> Result<Value> {
             self.ipc.send(command)
+        }
+
+        /// Installs load state before IPC can deliver the ordered start event.
+        fn load_prepared(
+            &mut self,
+            input: &PlaybackInput,
+            command: &[Value],
+            #[cfg(feature = "cache")] generation: u64,
+        ) -> Result<()> {
+            self.ipc.stream_title = None;
+            if let Some(cache) = &self.ipc.cache_export {
+                cache.begin_load(&input.location);
+            }
+            self.ipc.pending_keep_open = Some(input.keep_open);
+            #[cfg(feature = "cache")]
+            {
+                self.ipc.ram.pending_generation = Some(generation);
+            }
+            if let Err(error) = self.send(command) {
+                self.ipc.pending_keep_open = None;
+                #[cfg(feature = "cache")]
+                {
+                    self.ipc.ram.pending_generation = None;
+                }
+                return Err(error);
+            }
+            Ok(())
+        }
+
+        /// Registration only changes in-memory routing; HTTP stays on the proxy
+        /// worker. Never send IPC recursively from the response parser itself.
+        #[cfg(feature = "cache")]
+        fn service_ram_requests(&mut self) -> Result<()> {
+            for _ in 0..2 {
+                let Some(request) = self.ipc.ram.requests.pop_front() else {
+                    break;
+                };
+                let route = self.ram.as_mut().and_then(|ram| {
+                    let playback = ram.playback.as_mut()?;
+                    if playback.generation != request.generation {
+                        return None;
+                    }
+                    let (route, ticket) = ram.cache.register_with_ticket(
+                        &playback.key,
+                        &request.source,
+                        &request.headers,
+                    )?;
+                    playback.routed = true;
+                    playback.ticket = Some(ticket);
+                    Some(route)
+                });
+                self.send(&[
+                    json!("script-message-to"),
+                    json!("youta_ram_cache"),
+                    json!("youta-ram-cache-route"),
+                    json!(request.generation.to_string()),
+                    json!(request.nonce.to_string()),
+                    json!(route.unwrap_or_default()),
+                ])?;
+            }
+            Ok(())
+        }
+
+        /// A stale or expired byte route gets one normal transport attempt,
+        /// retaining the last known timeline position instead of restarting.
+        #[cfg(feature = "cache")]
+        fn retry_ram_failure(&mut self, event: &PlaybackEvent) -> Result<bool> {
+            let (generation, position, error, held) = match event {
+                PlaybackEvent::Ended(end)
+                    if matches!(
+                        end.reason,
+                        PlaybackEndReason::Error | PlaybackEndReason::Eof
+                    ) =>
+                {
+                    let Some((generation, position)) = self.ipc.ram.endings.pop_front() else {
+                        return Ok(false);
+                    };
+                    (
+                        generation,
+                        position,
+                        end.reason == PlaybackEndReason::Error,
+                        false,
+                    )
+                }
+                PlaybackEvent::EndOfFileHeld => {
+                    (self.ipc.ram.generation, self.ipc.ram.position, false, true)
+                }
+                _ => return Ok(false),
+            };
+            let Some(ram) = self.ram.as_mut() else {
+                return Ok(false);
+            };
+            if !ram.playback.as_ref().is_some_and(|playback| {
+                playback.routed
+                    && playback.generation == generation
+                    && (error
+                        || playback
+                            .ticket
+                            .as_ref()
+                            .is_some_and(RamCacheTicket::is_failed))
+            }) {
+                return Ok(false);
+            }
+            let Some(playback) = ram.playback.take() else {
+                return Ok(false);
+            };
+            ram.cache.invalidate(&playback.key);
+            let mut original = playback.original;
+            original.start_at = position.unwrap_or(original.start_at);
+            original.cache_identity = None;
+            if let Some(canonical) = original.cache_fallback_url.take() {
+                // A prewarmed signed CDN URL may expire while another item is
+                // playing. Resolve its canonical page through normal mpv
+                // extraction instead of retrying the same expired address.
+                original.location = canonical;
+                original.http_headers = PlaybackHttpHeaders::default();
+                original.bypass_ytdl = playback.direct_fallback;
+                original.verify_remote_format = false;
+            }
+            let command = loadfile_command_with_ram_hook(&original, 0)?;
+            self.ipc.ram.suppress_stop_generation = held.then_some(generation);
+            self.load_prepared(&original, &command, 0)?;
+            Ok(true)
+        }
+
+        /// Return queued lifecycle events after servicing the optional RAM retry.
+        fn next_queued_event(&mut self) -> Result<Option<PlaybackEvent>> {
+            while let Some(event) = self.ipc.events.pop_front() {
+                #[cfg(feature = "cache")]
+                if self.retry_ram_failure(&event)? {
+                    continue;
+                }
+                return Ok(Some(event));
+            }
+            Ok(None)
         }
 
         fn process_exit_event(&mut self) -> Result<Option<PlaybackEvent>> {
@@ -229,6 +470,8 @@ mod backend {
                 media_loaded: false,
                 eof_held: false,
                 held_eof_generation: 0,
+                #[cfg(feature = "cache")]
+                ram: RamIpcState::default(),
             }
         }
 
@@ -270,6 +513,12 @@ mod backend {
         fn handle_event(&mut self, message: &Value) {
             match message.get("event").and_then(Value::as_str) {
                 Some("start-file") => {
+                    #[cfg(feature = "cache")]
+                    {
+                        self.ram.generation = self.ram.pending_generation.take().unwrap_or(0);
+                        self.ram.position = None;
+                        self.ram.suppress_stop_generation = None;
+                    }
                     if let Some(cache) = &self.cache_export {
                         cache.invalidate();
                     }
@@ -295,6 +544,18 @@ mod backend {
                 }
                 Some("playback-restart") => self.push_event(PlaybackEvent::PlaybackStarted),
                 Some("end-file") => {
+                    #[cfg(feature = "cache")]
+                    if matches!(
+                        message.get("reason").and_then(Value::as_str),
+                        Some("error" | "eof")
+                    ) {
+                        if self.ram.endings.len() == MAX_PENDING_EVENTS {
+                            self.ram.endings.pop_front();
+                        }
+                        self.ram
+                            .endings
+                            .push_back((self.ram.generation, self.ram.position));
+                    }
                     if let Some(cache) = &self.cache_export {
                         cache.invalidate();
                     }
@@ -327,6 +588,13 @@ mod backend {
                     let diagnostic = self.diagnostic();
                     self.warnings.clear();
                     self.stream_title = None;
+                    #[cfg(feature = "cache")]
+                    if reason == PlaybackEndReason::Stop
+                        && self.ram.suppress_stop_generation == Some(self.ram.generation)
+                    {
+                        self.ram.suppress_stop_generation = None;
+                        return;
+                    }
                     self.push_event(PlaybackEvent::Ended(PlaybackEnd {
                         reason,
                         error,
@@ -367,6 +635,18 @@ mod backend {
                         .and_then(normalize_stream_title);
                 }
                 Some("log-message") => self.capture_warning(message),
+                #[cfg(feature = "cache")]
+                Some("client-message") => {
+                    if let Some(request) = parse_ram_cache_request(message) {
+                        // The bridge waits for only one request; a small queue
+                        // also bounds hostile messages from other mpv scripts.
+                        if self.ram.requests.len() == 2 {
+                            self.ram.requests.pop_front();
+                        }
+                        self.ram.requests.push_back(request);
+                        self.link.wake();
+                    }
+                }
                 Some("property-change") => {
                     if let Some(index) = message
                         .get("id")
@@ -406,7 +686,15 @@ mod backend {
             };
             match name {
                 "idle-active" => self.status.idle = value.as_bool().unwrap_or(false),
-                "time-pos" => self.status.position = seconds().unwrap_or(Duration::ZERO),
+                "time-pos" => {
+                    self.status.position = seconds().unwrap_or(Duration::ZERO);
+                    #[cfg(feature = "cache")]
+                    if self.media_loaded
+                        && let Some(position) = seconds()
+                    {
+                        self.ram.position = Some(position);
+                    }
+                }
                 "duration" => self.status.duration = seconds(),
                 "pause" => self.status.paused = value.as_bool().unwrap_or(true),
                 "volume" => {
@@ -733,6 +1021,106 @@ mod backend {
         (start < end).then_some(BufferedRange { start, end })
     }
 
+    /// A hook message contains private transport details and is never logged.
+    #[cfg(feature = "cache")]
+    struct RamCacheRequest {
+        generation: u64,
+        nonce: u64,
+        source: String,
+        headers: PlaybackHttpHeaders,
+    }
+
+    /// Reject malformed, duplicate or oversized effective headers before routing.
+    #[cfg(feature = "cache")]
+    fn parse_ram_cache_request(message: &Value) -> Option<RamCacheRequest> {
+        let args = message.get("args")?.as_array()?;
+        if args.len() != 5 || args[0].as_str()? != "youta-ram-cache-register" {
+            return None;
+        }
+        let number = |value: &Value| {
+            value.as_str()?.parse::<u64>().ok().filter(|number| {
+                // Lua numbers represent these integers exactly.
+                (1..=9_007_199_254_740_991).contains(number)
+            })
+        };
+        let generation = number(&args[1])?;
+        let nonce = number(&args[2])?;
+        let source = args[3].as_str()?;
+        let encoded_headers = args[4].as_str()?;
+        if source.len() > 8192
+            || source.chars().any(char::is_control)
+            || encoded_headers.len() > MAX_RESOLVED_HTTP_HEADER_BYTES * 2
+        {
+            return None;
+        }
+        let fields: Vec<String> = serde_json::from_str(encoded_headers).ok()?;
+        if fields.len() > MAX_RESOLVED_HTTP_HEADERS {
+            return None;
+        }
+        let mut total = 0_usize;
+        let mut headers = std::collections::BTreeMap::new();
+        for field in fields {
+            total = total.saturating_add(field.len());
+            if total > MAX_RESOLVED_HTTP_HEADER_BYTES {
+                return None;
+            }
+            let (name, value) = field.split_once(':')?;
+            if name.is_empty()
+                || !name.bytes().all(is_http_token_byte)
+                || value
+                    .bytes()
+                    .any(|byte| matches!(byte, b'\r' | b'\n' | b'\0'))
+                || headers
+                    .insert(name.to_ascii_lowercase(), value.trim().to_owned())
+                    .is_some()
+            {
+                return None;
+            }
+        }
+        Some(RamCacheRequest {
+            generation,
+            nonce,
+            source: source.to_owned(),
+            headers: PlaybackHttpHeaders::new(headers),
+        })
+    }
+
+    /// Reuse encoded bytes without changing timeline, title or redirect headers.
+    #[cfg(feature = "cache")]
+    fn ram_routed_input(input: &PlaybackInput, route: String) -> PlaybackInput {
+        let mut routed = input.clone();
+        routed.location = route;
+        routed.bypass_ytdl = true;
+        routed.verify_remote_format = false;
+        routed
+    }
+
+    /// Only an owned loopback wrapper can opt into tracking without interception.
+    /// Its declared upstream must also match an existing cache ticket exactly.
+    #[cfg(feature = "cache")]
+    fn is_loopback_transport(source: &str) -> bool {
+        url::Url::parse(source).is_ok_and(|url| {
+            url.scheme() == "http"
+                && match url.host() {
+                    Some(url::Host::Ipv4(address)) => address.is_loopback(),
+                    Some(url::Host::Ipv6(address)) => address.is_loopback(),
+                    _ => false,
+                }
+        })
+    }
+
+    /// Per-file generations prevent delayed hooks from registering another item.
+    #[cfg(feature = "cache")]
+    fn loadfile_command_with_ram_hook(
+        input: &PlaybackInput,
+        generation: u64,
+    ) -> Result<Vec<Value>> {
+        let mut command = loadfile_command(input)?;
+        command[4]["script-opts-append"] =
+            json!(format!("youta_ram_cache-generation={generation}"));
+        Ok(command)
+    }
+
     fn loadfile_command(input: &PlaybackInput) -> Result<Vec<Value>> {
         if input.verify_remote_format && input.bypass_ytdl {
             return Err(PlaybackError::InvalidValue(
@@ -974,31 +1362,105 @@ mod backend {
             self.ipc.cache_export.as_ref()?.handle()
         }
 
+        #[cfg(feature = "cache")]
+        fn ram_cache_handle(&self) -> Option<RamPlaybackCache> {
+            self.ram.as_ref().map(|ram| ram.cache.clone())
+        }
+
         fn process_id(&self) -> Option<u32> {
             Some(self.child.id())
         }
 
         fn play(&mut self, input: &PlaybackInput) -> Result<()> {
+            #[cfg(feature = "cache")]
+            {
+                self.ipc.ram.suppress_stop_generation = None;
+            }
             if input.location.trim().is_empty() {
                 return Err(PlaybackError::InvalidValue(
                     "media location cannot be empty".to_owned(),
                 ));
             }
-            // Do not show metadata retained from the previous stream while
-            // mpv is loading a replacement.
-            self.ipc.stream_title = None;
+            // Validate the original input before a cached route changes its
+            // extractor policy. A bad input remains an error on a warm cache.
             let command = loadfile_command(input)?;
-            if let Some(cache) = &self.ipc.cache_export {
-                cache.begin_load(&input.location);
+            #[cfg(feature = "cache")]
+            if let Some(ram) = self.ram.as_mut() {
+                ram.playback = None;
+                // In particular, preserve Archive's private original-file proxy:
+                // its upstream can share RAM, but its download accounting must
+                // still see every byte on both cold and warm playback.
+                if let Some(key) = &input.cache_identity
+                    && is_loopback_transport(&input.location)
+                    && let Some(source) = &input.cache_fallback_url
+                    && let Some(ticket) = ram.cache.ticket(key)
+                    && ticket.matches_source(source)
+                {
+                    // The controller registered this exact public source before
+                    // wrapping it in its private original-byte download proxy.
+                    // Observe failures without bypassing or wrapping that proxy.
+                    ram.generation = ram.generation % 9_007_199_254_740_991 + 1;
+                    let generation = ram.generation;
+                    ram.playback = Some(RamCachePlayback {
+                        generation,
+                        key: key.clone(),
+                        original: input.clone(),
+                        routed: true,
+                        ticket: Some(ticket),
+                        direct_fallback: true,
+                    });
+                    let command = loadfile_command_with_ram_hook(input, 0)?;
+                    return self.load_prepared(input, &command, generation);
+                }
+                if let Some(key) = &input.cache_identity
+                    && ram.cache.accepts_source(&input.location)
+                {
+                    ram.generation = ram.generation % 9_007_199_254_740_991 + 1;
+                    let generation = ram.generation;
+                    let route = ram
+                        .cache
+                        .cached_route_with_ticket(
+                            key,
+                            input.bypass_ytdl.then_some(&input.http_headers),
+                        )
+                        .or_else(|| {
+                            input
+                                .bypass_ytdl
+                                .then(|| {
+                                    ram.cache.register_with_ticket(
+                                        key,
+                                        &input.location,
+                                        &input.http_headers,
+                                    )
+                                })
+                                .flatten()
+                        });
+                    let routed = route.is_some();
+                    let (actual, ticket) = route.map_or_else(
+                        || (input.clone(), None),
+                        |(route, ticket)| (ram_routed_input(input, route), Some(ticket)),
+                    );
+                    ram.playback = Some(RamCachePlayback {
+                        generation,
+                        key: key.clone(),
+                        original: input.clone(),
+                        routed,
+                        ticket,
+                        direct_fallback: false,
+                    });
+                    let hook_generation = if routed { 0 } else { generation };
+                    let command = loadfile_command_with_ram_hook(&actual, hook_generation)?;
+                    return self.load_prepared(&actual, &command, generation);
+                }
+                let command = loadfile_command_with_ram_hook(input, 0)?;
+                return self.load_prepared(input, &command, 0);
             }
-            // Replacement emits the previous file's terminal event first.
-            // Install its new policy only once `start-file` identifies it.
-            self.ipc.pending_keep_open = Some(input.keep_open);
-            if let Err(error) = self.send(&command) {
-                self.ipc.pending_keep_open = None;
-                return Err(error);
-            }
-            Ok(())
+            self.load_prepared(
+                input,
+                &command,
+                #[cfg(feature = "cache")]
+                0,
+            )
         }
 
         fn command(&mut self, command: PlayerCommand) -> Result<()> {
@@ -1108,6 +1570,10 @@ mod backend {
                     self.set_property("stream-record", stream_recording_property_value(path)?)?;
                 }
                 PlayerCommand::Stop => {
+                    #[cfg(feature = "cache")]
+                    if let Some(ram) = &mut self.ram {
+                        ram.playback = None;
+                    }
                     if let Some(cache) = &self.ipc.cache_export {
                         cache.invalidate();
                     }
@@ -1122,6 +1588,8 @@ mod backend {
                 configure_ipc(&mut self.ipc)?;
             }
             self.ipc.drain_ready()?;
+            #[cfg(feature = "cache")]
+            self.service_ram_requests()?;
             if !self.ipc.status_initialized {
                 // Set this before reading: file-loaded can arrive inside any GET
                 // and invalidate a snapshot that spans two different media files.
@@ -1143,7 +1611,9 @@ mod backend {
         }
 
         fn poll_event(&mut self) -> Result<Option<PlaybackEvent>> {
-            if let Some(event) = self.ipc.events.pop_front() {
+            #[cfg(feature = "cache")]
+            self.service_ram_requests()?;
+            if let Some(event) = self.next_queued_event()? {
                 return Ok(Some(event));
             }
             if self.process_exit_reported {
@@ -1154,7 +1624,9 @@ mod backend {
             }
 
             let result = self.ipc.drain_ready();
-            if let Some(event) = self.ipc.events.pop_front() {
+            #[cfg(feature = "cache")]
+            self.service_ram_requests()?;
+            if let Some(event) = self.next_queued_event()? {
                 return Ok(Some(event));
             }
             match result {
@@ -1319,6 +1791,341 @@ mod backend {
                 .map(OsStr::to_string_lossy)
                 .map(std::borrow::Cow::into_owned)
                 .collect()
+        }
+
+        /// Replaying bytes from RAM must retain the requested timeline while
+        /// skipping a second extractor invocation and format verification.
+        #[cfg(feature = "cache")]
+        #[test]
+        fn ram_route_preserves_resume_position_without_reextracting() {
+            let mut input = PlaybackInput::new("https://www.youtube.com/watch?v=fixture");
+            input.start_at = Duration::from_secs(93);
+            input.title = Some("Fixture".into());
+            input.keep_open = true;
+            input.verify_remote_format = true;
+            input.cache_identity = Some("youtube:fixture:audio".into());
+            let routed = ram_routed_input(&input, "http://127.0.0.1:1234/private/audio".into());
+            assert_eq!(routed.start_at, input.start_at);
+            assert_eq!(routed.title, input.title);
+            assert!(routed.keep_open && routed.bypass_ytdl);
+            assert!(!routed.verify_remote_format);
+            assert_eq!(routed.cache_identity, input.cache_identity);
+            assert_eq!(input.location, "https://www.youtube.com/watch?v=fixture");
+        }
+
+        /// Hooks carry an exact load generation; malformed headers must fail
+        /// open to ordinary mpv transport, never enter the proxy registry.
+        #[cfg(feature = "cache")]
+        #[test]
+        fn ram_hook_request_is_bounded_and_preserves_sensitive_headers() {
+            let request = json!({"args": ["youta-ram-cache-register", "7", "2",
+                "https://cdn.example/audio.webm?token=private",
+                "[\"User-Agent: fixture\",\"Authorization: Bearer private\"]"]});
+            let parsed = parse_ram_cache_request(&request).expect("valid bridge request");
+            assert_eq!(parsed.generation, 7);
+            assert_eq!(parsed.nonce, 2);
+            assert_eq!(parsed.headers.iter().count(), 2);
+            assert!(!format!("{:?}", parsed.headers).contains("private"));
+            for invalid in [
+                json!({"args": ["youta-ram-cache-register", "0", "2", "https://cdn.example/a", "[]"]}),
+                json!({"args": ["youta-ram-cache-register", "7", "2", "https://cdn.example/a", "[\"X-Test: a\\r\\nCookie: x\"]"]}),
+                json!({"args": ["youta-ram-cache-register", "7", "2", "https://cdn.example/a", "[\"Cookie: a\",\"cookie: b\"]"]}),
+            ] {
+                assert!(parse_ram_cache_request(&invalid).is_none());
+            }
+        }
+
+        #[cfg(feature = "cache")]
+        #[test]
+        fn ram_hook_generation_is_a_per_file_option_and_zero_disables_retry() {
+            let input = PlaybackInput::new("https://cdn.example/audio.webm");
+            let active = loadfile_command_with_ram_hook(&input, 12).expect("active hook");
+            assert_eq!(
+                active[4]["script-opts-append"],
+                "youta_ram_cache-generation=12"
+            );
+            let retry = loadfile_command_with_ram_hook(&input, 0).expect("uncached retry");
+            assert_eq!(
+                retry[4]["script-opts-append"],
+                "youta_ram_cache-generation=0"
+            );
+        }
+
+        /// A delayed hook may not route the newly selected track under an old key.
+        #[cfg(feature = "cache")]
+        #[test]
+        fn ram_hook_registration_is_deferred_and_rejects_stale_generations() {
+            let runtime = tempfile::tempdir().expect("private runtime");
+            let (mut backend, commands, server) = backend_with_command_recorder();
+            backend.ram = Some(
+                RamPlaybackState::new(
+                    RamPlaybackCache::for_test(8 * 1024 * 1024).expect("RAM cache"),
+                    runtime.path(),
+                )
+                .expect("private bridge"),
+            );
+            let mut input = PlaybackInput::new("https://www.youtube.com/watch?v=fixture");
+            input.cache_identity = Some("youtube:fixture".into());
+            backend.play(&input).expect("canonical load");
+            let first_load = commands.recv().expect("load command");
+            assert_eq!(first_load[1], input.location);
+            for generation in [0, 1, 2] {
+                backend
+                    .ipc
+                    .handle_event(&json!({"event":"client-message", "args": [
+                        "youta-ram-cache-register", generation.to_string(), "1",
+                        "https://cdn.example/audio.webm", "[\"Cookie: private\"]",
+                    ]}));
+            }
+            assert_eq!(backend.ipc.ram.requests.len(), 2);
+            assert!(
+                commands.try_recv().is_err(),
+                "IPC parser must not recursively send"
+            );
+            backend
+                .service_ram_requests()
+                .expect("nonblocking registration");
+            let accepted = commands.recv().expect("accepted reply");
+            assert_eq!(accepted[0], "script-message-to");
+            assert!(
+                accepted[5]
+                    .as_str()
+                    .expect("RAM URL")
+                    .starts_with("http://127.0.0.1:")
+            );
+            let stale = commands.recv().expect("stale reply");
+            assert_eq!(stale[5], "");
+            assert!(
+                backend
+                    .ram
+                    .as_ref()
+                    .unwrap()
+                    .playback
+                    .as_ref()
+                    .unwrap()
+                    .routed
+            );
+            backend.shutdown().expect("shutdown mock");
+            server.join().expect("server");
+        }
+
+        /// An interrupted cached stream retries once, including a backward seek
+        /// below its original start offset; the second failure reaches the UI.
+        #[cfg(feature = "cache")]
+        #[test]
+        fn ram_failure_retries_once_at_the_last_observed_position() {
+            for position in [None, Some(10.25)] {
+                let runtime = tempfile::tempdir().expect("private runtime");
+                let (mut backend, commands, server) = backend_with_command_recorder();
+                backend.ram = Some(
+                    RamPlaybackState::new(
+                        RamPlaybackCache::for_test(8 * 1024 * 1024).expect("RAM cache"),
+                        runtime.path(),
+                    )
+                    .expect("private bridge"),
+                );
+                let mut input = PlaybackInput::new("https://cdn.example/audio.ogg?token=private");
+                input.bypass_ytdl = true;
+                input.start_at = Duration::from_secs(60);
+                input.cache_identity = Some("fixture".into());
+                backend.play(&input).expect("cached load");
+                let cached = commands.recv().expect("cached command");
+                assert!(cached[1].as_str().unwrap().starts_with("http://127.0.0.1:"));
+                backend.ipc.handle_event(&json!({"event":"start-file"}));
+                backend.ipc.apply_status_property("time-pos", &json!(3.0));
+                assert!(backend.ipc.ram.position.is_none());
+                if let Some(position) = position {
+                    backend.ipc.media_loaded = true;
+                    backend
+                        .ipc
+                        .apply_status_property("time-pos", &json!(position));
+                }
+                backend
+                    .ipc
+                    .handle_event(&json!({"event":"end-file", "reason":"error"}));
+                assert!(
+                    backend
+                        .poll_event()
+                        .expect("normal transport retry")
+                        .is_none()
+                );
+                let retry = commands.recv().expect("uncached command");
+                assert_eq!(retry[1], input.location);
+                assert_eq!(retry[4]["start"], position.unwrap_or(60.0).to_string());
+                assert_eq!(
+                    retry[4]["script-opts-append"],
+                    "youta_ram_cache-generation=0"
+                );
+                backend.ipc.handle_event(&json!({"event":"start-file"}));
+                backend
+                    .ipc
+                    .handle_event(&json!({"event":"end-file", "reason":"error"}));
+                assert!(matches!(backend.poll_event().expect("terminal failure"),
+                Some(PlaybackEvent::Ended(end)) if end.reason == PlaybackEndReason::Error));
+                assert!(commands.try_recv().is_err(), "no unbounded retry loop");
+                backend.shutdown().expect("shutdown mock");
+                server.join().expect("server");
+            }
+        }
+
+        /// Demuxers can report a broken response as EOF (including held EOF).
+        /// Only explicit cache failure triggers a fresh canonical extraction;
+        /// healthy EOF and ordinary memory-pressure eviction must remain EOF.
+        #[cfg(feature = "cache")]
+        #[test]
+        fn ram_failed_eof_reextracts_prewarmed_youtube_without_stale_headers() {
+            for held in [false, true] {
+                for failed in [false, true] {
+                    let runtime = tempfile::tempdir().expect("private runtime");
+                    let (mut backend, commands, server) = backend_with_command_recorder();
+                    backend.ram = Some(
+                        RamPlaybackState::new(
+                            RamPlaybackCache::for_test(8 * 1024 * 1024).expect("RAM cache"),
+                            runtime.path(),
+                        )
+                        .expect("private bridge"),
+                    );
+                    let mut input = PlaybackInput::new("https://cdn.example/audio.ogg?expired=yes");
+                    input.bypass_ytdl = true;
+                    input.start_at = Duration::from_secs(60);
+                    input.keep_open = held;
+                    input.cache_identity = Some("youtube:fixture".into());
+                    input.cache_fallback_url =
+                        Some("https://www.youtube.com/watch?v=fixture".into());
+                    input.http_headers =
+                        PlaybackHttpHeaders::new(std::collections::BTreeMap::from([(
+                            "Authorization".into(),
+                            "Bearer old".into(),
+                        )]));
+                    backend.play(&input).expect("cached load");
+                    let _ = commands.recv().expect("cached command");
+                    backend.ipc.handle_event(&json!({"event":"start-file"}));
+                    backend.ipc.media_loaded = true;
+                    backend.ipc.apply_status_property("time-pos", &json!(10.25));
+                    if failed {
+                        backend
+                            .ram
+                            .as_ref()
+                            .unwrap()
+                            .cache
+                            .mark_stream_failed("youtube:fixture");
+                    }
+                    if held {
+                        backend
+                            .ipc
+                            .handle_event(&json!({"event":"property-change", "id":EOF_OBSERVER_ID,
+                            "name":EOF_PROPERTY, "data":true}));
+                    } else {
+                        backend
+                            .ipc
+                            .handle_event(&json!({"event":"end-file", "reason":"eof"}));
+                    }
+                    let event = backend.poll_event().expect("EOF processing");
+                    if failed {
+                        assert!(event.is_none(), "failed bytes are not natural EOF");
+                        let retry = commands.recv().expect("fresh canonical load");
+                        assert_eq!(retry[1], input.cache_fallback_url.as_deref().unwrap());
+                        assert_eq!(retry[4]["start"], "10.25");
+                        assert_eq!(
+                            retry[4]["script-opts-append"],
+                            "youta_ram_cache-generation=0"
+                        );
+                        assert!(retry[4].get("http-header-fields").is_none());
+                        assert!(retry[4].get("ytdl").is_none());
+                        if held {
+                            // An internal replacement of a held file produces
+                            // Stop. Do not expose it as a user-requested stop.
+                            backend
+                                .ipc
+                                .handle_event(&json!({"event":"end-file", "reason":"stop"}));
+                            backend.ipc.handle_event(&json!({"event":"start-file"}));
+                            assert!(backend.poll_event().expect("internal stop").is_none());
+                        }
+                    } else {
+                        assert!(event.is_some(), "healthy EOF must reach the controller");
+                        assert!(commands.try_recv().is_err(), "healthy EOF needs no reload");
+                    }
+                    backend.shutdown().expect("shutdown mock");
+                    server.join().expect("server");
+                }
+            }
+        }
+
+        /// Archive's original-byte proxy remains in the path; RAM failure only
+        /// changes the bounded fallback, not the initial or warm load location.
+        #[cfg(feature = "cache")]
+        #[test]
+        fn ram_tracks_owned_original_proxy_without_bypassing_its_download_accounting() {
+            let runtime = tempfile::tempdir().expect("private runtime");
+            let (mut backend, commands, server) = backend_with_command_recorder();
+            let cache = RamPlaybackCache::for_test(8 * 1024 * 1024).expect("RAM cache");
+            let canonical = "https://archive.org/download/fixture/audio.ogg";
+            cache
+                .register(
+                    "archive:fixture",
+                    canonical,
+                    &PlaybackHttpHeaders::default(),
+                )
+                .expect("registered upstream");
+            backend.ram =
+                Some(RamPlaybackState::new(cache.clone(), runtime.path()).expect("private bridge"));
+            let mut input = PlaybackInput::new("http://127.0.0.1:1234/original-bytes");
+            input.bypass_ytdl = true;
+            input.cache_identity = Some("archive:fixture".into());
+            input.cache_fallback_url = Some(canonical.into());
+            backend.play(&input).expect("wrapped load");
+            let wrapped = commands.recv().expect("wrapped command");
+            assert_eq!(wrapped[1], input.location);
+            assert_eq!(
+                wrapped[4]["script-opts-append"],
+                "youta_ram_cache-generation=0"
+            );
+            backend.ipc.handle_event(&json!({"event":"start-file"}));
+            backend.ipc.media_loaded = true;
+            backend.ipc.apply_status_property("time-pos", &json!(8.5));
+            cache.mark_stream_failed("archive:fixture");
+            backend
+                .ipc
+                .handle_event(&json!({"event":"end-file", "reason":"eof"}));
+            assert!(backend.poll_event().expect("canonical fallback").is_none());
+            let retry = commands.recv().expect("direct original fallback");
+            assert_eq!(retry[1], canonical);
+            assert_eq!(retry[4]["ytdl"], "no");
+            assert_eq!(retry[4]["start"], "8.5");
+            assert_eq!(
+                retry[4]["script-opts-append"],
+                "youta_ram_cache-generation=0"
+            );
+            backend.shutdown().expect("shutdown mock");
+            server.join().expect("server");
+        }
+
+        #[cfg(feature = "cache")]
+        #[test]
+        fn ram_bridge_is_private_and_removed_with_its_owner() {
+            use std::os::unix::fs::PermissionsExt as _;
+            let runtime = tempfile::tempdir().expect("private runtime");
+            let state = RamPlaybackState::new(
+                RamPlaybackCache::for_test(8 * 1024 * 1024).expect("RAM cache"),
+                runtime.path(),
+            )
+            .expect("private bridge");
+            let directory = state.bridge_directory.path().to_owned();
+            let script = directory.join("youta_ram_cache.lua");
+            assert_eq!(
+                fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                fs::metadata(&script).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                fs::read(&script).unwrap(),
+                include_bytes!("youta_ram_cache.lua")
+            );
+            drop(state);
+            assert!(!directory.exists());
         }
 
         /// Exercises production IPC plus independent packet/decode validation on
@@ -1528,6 +2335,8 @@ mod backend {
                     extension,
                 );
                 let input = PlaybackInput {
+                    cache_identity: None,
+                    cache_fallback_url: None,
                     location: server.url.clone(),
                     start_at: Duration::ZERO,
                     title: Some("Generated cache fixture".to_owned()),
@@ -1794,6 +2603,8 @@ mod backend {
                     socket_path: PathBuf::from("/tmp/youta-unused-buffer-status.sock"),
                     profile: PlaybackProfile::Balanced,
                     process_exit_reported: false,
+                    #[cfg(feature = "cache")]
+                    ram: None,
                 },
                 server_thread,
             )
@@ -1883,6 +2694,8 @@ mod backend {
                     socket_path: PathBuf::from("/tmp/youta-unused-command-recorder.sock"),
                     profile: PlaybackProfile::Balanced,
                     process_exit_reported: false,
+                    #[cfg(feature = "cache")]
+                    ram: None,
                 },
                 command_receiver,
                 server_thread,
@@ -2538,6 +3351,8 @@ mod backend {
                 socket_path: temporary.path().join("unused.sock"),
                 profile: PlaybackProfile::Balanced,
                 process_exit_reported: false,
+                #[cfg(feature = "cache")]
+                ram: None,
             };
             let mut input = PlaybackInput::new("/tmp/fixture.opus");
             input.start_at = Duration::from_secs(30);
@@ -3376,6 +4191,8 @@ mod backend {
                 socket_path: temporary.path().join("unused.sock"),
                 profile: PlaybackProfile::Balanced,
                 process_exit_reported: false,
+                #[cfg(feature = "cache")]
+                ram: None,
             };
 
             let deadline = Instant::now() + Duration::from_secs(2);

@@ -67,6 +67,15 @@ class ProductionLocTests(unittest.TestCase):
 		})
 		self.assertEqual(counts['src/lib.rs'], 1)
 
+	def test_embedded_lua_bridge_counts_without_comments_or_fixtures(self):
+		'''Owned runtime bridges are code, even when embedded into the Rust binary.'''
+		counts = self.count_fixture({
+			'src/playback/bridge.lua': '-- Loading hook\nlocal enabled = true\nreturn enabled\n',
+			'src/playback/fixtures/example.lua': 'return false\n',
+			'src/playback/bridge.test.lua': 'return false\n',
+		})
+		self.assertEqual(counts, {'src/playback/bridge.lua': 2})
+
 	def test_test_only_modules_with_neutral_names_and_path_attributes_are_excluded(self):
 		'''Ownership, not a filename heuristic, identifies out-of-line tests.'''
 		counts = self.count_fixture({

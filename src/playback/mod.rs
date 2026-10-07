@@ -21,6 +21,12 @@ pub mod mpv;
 #[cfg(feature = "backend-mpv")]
 mod mpv_ipc;
 
+#[cfg(feature = "cache")]
+mod memory_budget;
+
+#[cfg(feature = "cache")]
+pub mod ram_cache;
+
 pub mod threaded;
 
 pub mod cache_export;
@@ -132,6 +138,17 @@ pub struct PlaybackInput {
     /// without reloading the item. [`PlayerCommand::ReleaseEndOfFile`]
     /// alternatively restores normal completion so the controller can continue its queue.
     pub keep_open: bool,
+    /// Stable, session-only identity for retaining finite remote audio between loads.
+    ///
+    /// This must distinguish source files and full-track/preview variants. It
+    /// must not contain an expiring resolved URL. `None` disables retention for
+    /// live streams, local files, or a deliberate uncached retry.
+    pub cache_identity: Option<String>,
+    /// Canonical extractor URL for one uncached retry of a resolved RAM route.
+    ///
+    /// This lets an expired prewarmed YouTube stream be resolved again after
+    /// playback has begun. It is session-only and must be credential-free.
+    pub cache_fallback_url: Option<String>,
 }
 
 impl fmt::Debug for PlaybackInput {
@@ -152,6 +169,8 @@ impl fmt::Debug for PlaybackInput {
             .field("http_headers", &self.http_headers)
             .field("bypass_ytdl", &self.bypass_ytdl)
             .field("keep_open", &self.keep_open)
+            .field("cache_identity", &self.cache_identity.is_some())
+            .field("cache_fallback_url", &self.cache_fallback_url.is_some())
             .finish()
     }
 }
@@ -168,6 +187,8 @@ impl PlaybackInput {
             http_headers: PlaybackHttpHeaders::default(),
             bypass_ytdl: false,
             keep_open: false,
+            cache_identity: None,
+            cache_fallback_url: None,
         }
     }
 }
@@ -439,6 +460,15 @@ pub trait PlaybackBackend {
     /// Returns a nonblocking ticket for the current complete-load cache source.
     /// Unsupported backends retain `None`; no IPC is performed by this method.
     fn cache_export_handle(&self) -> Option<cache_export::PlaybackCacheHandle> {
+        None
+    }
+
+    /// Shares the session RAM cache without IPC or an upstream network request.
+    ///
+    /// Source-specific adapters may retain exact original-file download support
+    /// by routing their trusted upstream requests through this same byte cache.
+    #[cfg(feature = "cache")]
+    fn ram_cache_handle(&self) -> Option<ram_cache::RamPlaybackCache> {
         None
     }
 

@@ -32,7 +32,7 @@ KEYWORDS="~amd64 ~arm64 ~x86"
 
 IUSE="
 	+acoustid +alsa +ascii-visualizer +audio-quality archive-rar +archive-zip +archive-org +archive-upload apple-podcasts +bbc-radio
-	bandcamp bilibili bundled-sqlite +cmd cpu_flags_x86_sse2 dearrow discord +evernote
+	bandcamp bilibili bundled-sqlite +cache +cmd cpu_flags_x86_sse2 dearrow discord +evernote
 	+commons-upload +funkwhale +generic-ytdlp google-drive gpm gpodder gui +invidious jack +jamendo
 	keyring +lan-sharing +lastfm +librivox +litres +local +local-archives +mpv native +nyan-cat odysee +peertube pipewire
 	podcast-index pulseaudio +qr +radio +rss rumble +rutube s3-upload +soundcloud +soundstream
@@ -62,6 +62,7 @@ REQUIRED_USE="
 	lan-sharing? ( local qr yt-dlp )
 	lastfm? ( acoustid wikidata )
 	local-archives? ( archive-zip local )
+	cache? ( mpv )
 	podcast-index? ( rss )
 	qr? ( tui )
 	rutube? ( yt-dlp )
@@ -199,6 +200,7 @@ src_configure() {
 		$(usev odysee)
 		$(usev peertube)
 		$(usev pipewire)
+		$(usev cache)
 		$(usev podcast-index)
 		$(usev pulseaudio)
 		$(usev qr)
@@ -276,6 +278,9 @@ src_compile() {
 		if use nyan-cat; then
 			gui_features+=,nyan-cat
 		fi
+		if use cache; then
+			gui_features+=,cache
+		fi
 		if use sponsorblock; then
 			gui_features+=,sponsorblock
 		fi
@@ -343,6 +348,10 @@ src_test() {
 		if use nyan-cat; then
 			[[ -n ${gui_test_features} ]] && gui_test_features+=,
 			gui_test_features+=nyan-cat
+		fi
+		if use cache; then
+			[[ -n ${gui_test_features} ]] && gui_test_features+=,
+			gui_test_features+=cache
 		fi
 		if use sponsorblock; then
 			[[ -n ${gui_test_features} ]] && gui_test_features+=,

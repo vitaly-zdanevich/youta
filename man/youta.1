@@ -729,6 +729,30 @@ GitHub CLI authentication, including headless token input
 .UR https://cli.github.com/manual/gh_issue_create
 GitHub CLI issue creation
 .UE
+.SH AUDIO CACHE
+On Linux, the default
+.B cache
+build feature retains fetched, validated HTTP audio bytes in RAM across track
+switches. Returning to cached YouTube audio can skip extraction and reuse the
+saved playback position, including after playing several other tracks.
+Uncached or evicted ranges still need the network; the decoder still opens
+when returning to a track. Audio is fetched on demand, not downloaded in full
+automatically.
+.PP
+The cache observes a best-effort ceiling of 90% total memory usage, respecting
+both available physical memory and tighter container limits. Older bytes are
+evicted under pressure. This does not allocate 90% of RAM to Youta or prevent
+other applications from exceeding the threshold. Missing memory measurements
+disable retention. Audio bytes and resolved URLs are session-only.
+.PP
+Live streams, HLS/DASH manifests, unsupported HTTP servers, configured HTTP
+proxies, and platforms without memory measurements use ordinary playback.
+Archive.org's existing exact-original download cache remains available.
+Omit the
+.B cache
+Cargo feature, or use Gentoo
+.BR USE="-cache" ,
+to remove RAM audio caching from both frontends.
 .SH CONFIGURATION
 On Linux the default application directory is
 .IR $XDG_CONFIG_HOME/youta ,

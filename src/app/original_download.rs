@@ -38,11 +38,31 @@ impl AppController {
             .is_none_or(|cache| cache.source_url() != &source)
         {
             self.archive_playback_cache = None;
-            self.archive_playback_cache = ArchivePlaybackCache::start(source).ok();
+            #[cfg(feature = "cache")]
+            let ram_backed = input.cache_identity.as_deref().and_then(|identity| {
+                let ram = self.player.as_ref()?.ram_cache_handle()?;
+                let route = ram.register_trusted(identity, source.as_str(), &input.http_headers)?;
+                ArchivePlaybackCache::start_with_ram_cache(source.clone(), route).ok()
+            });
+            #[cfg(not(feature = "cache"))]
+            let ram_backed = None;
+            self.archive_playback_cache =
+                ram_backed.or_else(|| ArchivePlaybackCache::start(source).ok());
         }
         if let Some(cache) = &self.archive_playback_cache {
             input.location = cache.playback_url().to_owned();
             input.bypass_ytdl = true;
+            // The backend tracks RAM failures without bypassing this original
+            // proxy. Otherwise a later short read can look like ordinary EOF
+            // and silently finish the track instead of retrying its source.
+            input.cache_fallback_url = None;
+            #[cfg(feature = "cache")]
+            if cache.has_ram_upstream() {
+                input.cache_fallback_url = Some(cache.source_url().to_string());
+            }
+            if input.cache_fallback_url.is_none() {
+                input.cache_identity = None;
+            }
         }
     }
 

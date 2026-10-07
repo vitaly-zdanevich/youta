@@ -491,6 +491,7 @@ pub fn enabled_compile_features() -> Vec<&'static str> {
         "bbc-radio",
         "bilibili",
         "bundled-sqlite",
+        "cache",
         "cli",
         "cmd",
         "dearrow",

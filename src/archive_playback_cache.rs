@@ -15,6 +15,9 @@ use ureq::unversioned::resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver
 use ureq::unversioned::transport::{DefaultConnector, NextTimeout};
 use url::Url;
 
+#[cfg(feature = "cache")]
+use crate::playback::ram_cache::TrustedRamRoute;
+
 const BLOCK_BYTES: u64 = 1024 * 1024;
 const MAX_FILE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
@@ -120,6 +123,10 @@ struct CacheState {
 struct Shared {
     source: Url,
     origin: Url,
+    /// A typed capability keeps the shared RAM cache alive without trusting
+    /// arbitrary loopback URLs or weakening the public Archive resolver.
+    #[cfg(feature = "cache")]
+    ram_route: Option<TrustedRamRoute>,
     route: String,
     host: String,
     path: PathBuf,
@@ -151,6 +158,44 @@ pub(crate) struct CompletedOriginal {
     length: u64,
 }
 
+/// Separates a public origin from an application-owned RAM capability.
+struct CacheUpstream {
+    origin: Url,
+    #[cfg(feature = "cache")]
+    ram_route: Option<TrustedRamRoute>,
+}
+
+impl CacheUpstream {
+    /// Public origins retain the existing Archive-only redirect policy.
+    fn direct(origin: Url) -> Self {
+        Self {
+            origin,
+            #[cfg(feature = "cache")]
+            ram_route: None,
+        }
+    }
+
+    /// Only a capability constructed by the RAM cache can select loopback.
+    #[cfg(feature = "cache")]
+    fn ram(route: TrustedRamRoute) -> io::Result<Self> {
+        let origin = Url::parse(route.url()).map_err(|_| unavailable("invalid RAM cache route"))?;
+        if origin.scheme() != "http"
+            || origin.host_str() != Some("127.0.0.1")
+            || origin.port().is_none()
+            || !origin.username().is_empty()
+            || origin.password().is_some()
+            || origin.query().is_some()
+            || origin.fragment().is_some()
+        {
+            return Err(unavailable("invalid RAM cache endpoint"));
+        }
+        Ok(Self {
+            origin,
+            ram_route: Some(route),
+        })
+    }
+}
+
 impl ArchivePlaybackCache {
     /// Starts only the private local route; upstream reads remain demand-driven.
     pub(crate) fn start(source: Url) -> io::Result<Self> {
@@ -162,7 +207,28 @@ impl ArchivePlaybackCache {
         Self::start_inner(source.clone(), source, Arc::clone(&BUDGET))
     }
 
+    /// Keeps exact original-file downloading while fetching playback bytes
+    /// through the shared RAM cache that survives changes of current media.
+    #[cfg(feature = "cache")]
+    pub(crate) fn start_with_ram_cache(source: Url, route: TrustedRamRoute) -> io::Result<Self> {
+        if route.source_url() != &source {
+            return Err(unavailable(
+                "RAM cache source does not match the original file",
+            ));
+        }
+        Self::start_with_upstream(source, CacheUpstream::ram(route)?, Arc::clone(&BUDGET))
+    }
+
     fn start_inner(source: Url, origin: Url, budget: Arc<Budget>) -> io::Result<Self> {
+        Self::start_with_upstream(source, CacheUpstream::direct(origin), budget)
+    }
+
+    /// Establishes only private routes; no source or RAM bytes are fetched yet.
+    fn start_with_upstream(
+        source: Url,
+        upstream: CacheUpstream,
+        budget: Arc<Budget>,
+    ) -> io::Result<Self> {
         if !canonical_source(&source) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -197,10 +263,12 @@ impl ArchivePlaybackCache {
         poll.registry()
             .register(&mut listener, mio::Token(0), mio::Interest::READABLE)?;
         let waker = mio::Waker::new(poll.registry(), mio::Token(1))?;
-        let agents = (0..MAX_FETCHES).map(|_| http_agent(&origin)).collect();
+        let agents = (0..MAX_FETCHES).map(|_| http_agent(&upstream)).collect();
         let shared = Arc::new(Shared {
             source,
-            origin,
+            origin: upstream.origin,
+            #[cfg(feature = "cache")]
+            ram_route: upstream.ram_route,
             route,
             host,
             path,
@@ -230,6 +298,12 @@ impl ArchivePlaybackCache {
     /// Returns the exact original canonical Archive file URL.
     pub(crate) fn source_url(&self) -> &Url {
         &self.shared.source
+    }
+
+    /// Lets the backend retain a failure ticket without bypassing this proxy.
+    #[cfg(feature = "cache")]
+    pub(crate) fn has_ram_upstream(&self) -> bool {
+        self.shared.ram_route.is_some()
     }
 
     /// Returns a private lease only after every byte of the original is committed.
@@ -262,6 +336,17 @@ impl ArchivePlaybackCache {
             ));
         }
         Self::start_inner(source, origin, Arc::new(Budget::new(MAX_TOTAL_BYTES)))
+    }
+
+    /// Tests may map a canonical Archive identity to a fixture-owned source
+    /// behind a genuine RAM capability, without relaxing production identity.
+    #[cfg(all(test, feature = "cache"))]
+    fn start_with_ram_cache_fixture(source: Url, route: TrustedRamRoute) -> io::Result<Self> {
+        Self::start_with_upstream(
+            source,
+            CacheUpstream::ram(route)?,
+            Arc::new(Budget::new(MAX_TOTAL_BYTES)),
+        )
     }
 }
 
@@ -446,7 +531,7 @@ impl Shared {
 }
 
 /// Each exclusive agent retains its own bounded connection pool and no ambient cookies.
-fn http_agent(origin: &Url) -> ureq::Agent {
+fn http_agent(upstream: &CacheUpstream) -> ureq::Agent {
     let config = ureq::Agent::config_builder()
         .timeout_global(Some(FETCH_TIMEOUT))
         .max_redirects(0)
@@ -458,14 +543,16 @@ fn http_agent(origin: &Url) -> ureq::Agent {
         .proxy(None)
         .user_agent(concat!("youta/", env!("CARGO_PKG_VERSION")))
         .build();
-    let _ = origin;
+    let _ = upstream;
     ureq::Agent::with_parts(
         config,
         DefaultConnector::default(),
         PublicResolver {
             resolver: DefaultResolver::default(),
+            #[cfg(feature = "cache")]
+            trusted_origin: upstream.ram_route.as_ref().map(|_| upstream.origin.clone()),
             #[cfg(test)]
-            loopback: origin.scheme() == "http",
+            loopback: upstream.origin.scheme() == "http",
         },
     )
 }
@@ -492,6 +579,8 @@ impl Drop for AgentLease<'_> {
 #[derive(Debug, Default)]
 struct PublicResolver {
     resolver: DefaultResolver,
+    #[cfg(feature = "cache")]
+    trusted_origin: Option<Url>,
     #[cfg(test)]
     loopback: bool,
 }
@@ -503,6 +592,23 @@ impl Resolver for PublicResolver {
         config: &ureq::config::Config,
         timeout: NextTimeout,
     ) -> Result<ResolvedSocketAddrs, ureq::Error> {
+        #[cfg(feature = "cache")]
+        if let Some(origin) = &self.trusted_origin {
+            // The typed capability pins an exact address. Do not run DNS or
+            // allow its requests to follow a redirect to another local service.
+            if uri.scheme_str() != Some("http")
+                || uri.host() != Some("127.0.0.1")
+                || uri.port_u16() != origin.port()
+            {
+                return Err(ureq::Error::HostNotFound);
+            }
+            let mut resolved = self.empty();
+            resolved.push(std::net::SocketAddr::from((
+                std::net::Ipv4Addr::LOCALHOST,
+                origin.port().expect("validated RAM capability port"),
+            )));
+            return Ok(resolved);
+        }
         let resolved = self.resolver.resolve(uri, config, timeout)?;
         let mut public = self.empty();
         for address in &resolved {
@@ -682,6 +788,10 @@ fn endpoint_allowed(shared: &Shared, url: &Url) -> bool {
         || url.fragment().is_some()
     {
         return false;
+    }
+    #[cfg(feature = "cache")]
+    if shared.ram_route.is_some() {
+        return url == &shared.origin;
     }
     #[cfg(test)]
     if shared.origin.scheme() == "http" {
@@ -926,7 +1036,23 @@ fn serve(mut stream: TcpStream, shared: &Shared) -> io::Result<()> {
             let block_end = ((position / BLOCK_BYTES + 1) * BLOCK_BYTES - 1).min(end);
             // Once headers were emitted a later cache failure closes this response.
             // The next request redirects; never splice 307 headers into audio bytes.
-            let bytes = shared.read_block(position, block_end)?;
+            let bytes = match shared.read_block(position, block_end) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    // This outer response has already advertised success. A
+                    // nested RAM redirect cannot finish it, so preserve the
+                    // failure on the exact load ticket even after eviction.
+                    // Retiring an owner during an ordinary selection change
+                    // is not a failed stream for a later visit.
+                    #[cfg(feature = "cache")]
+                    if !shared.stop.load(Ordering::Acquire)
+                        && let Some(route) = &shared.ram_route
+                    {
+                        route.mark_stream_failed();
+                    }
+                    return Err(error);
+                }
+            };
             write_bytes(&mut stream, &bytes, &shared.stop, lifetime)?;
             position = block_end + 1;
         }
@@ -1069,6 +1195,8 @@ mod tests {
         Oversized,
         IgnoreRange,
         ChangedTag,
+        #[cfg(feature = "cache")]
+        ChangedTagAfterFirstBlock,
         StallAfterFirst,
     }
 
@@ -1142,7 +1270,12 @@ mod tests {
                             };
                             let reported_start =
                                 start + usize::from(matches!(kind, ResponseKind::WrongRange));
-                            let etag = if matches!(kind, ResponseKind::ChangedTag) && start > 0 {
+                            let changed = matches!(kind, ResponseKind::ChangedTag) && start > 0;
+                            #[cfg(feature = "cache")]
+                            let changed = changed
+                                || (matches!(kind, ResponseKind::ChangedTagAfterFirstBlock)
+                                    && start >= BLOCK);
+                            let etag = if changed {
                                 "\"changed\""
                             } else if matches!(kind, ResponseKind::WeakTag) {
                                 "W/\"fixture\""
@@ -1278,6 +1411,136 @@ mod tests {
         assert_eq!(
             get(cache.playback_url(), Some("bytes=-137")).1,
             expected[BLOCK * 2..]
+        );
+    }
+
+    /// Returning after the current original-file owner retires reuses its RAM
+    /// bytes, while each exact-download lease still belongs to its own owner.
+    #[cfg(feature = "cache")]
+    #[test]
+    fn ram_backing_survives_original_owner_changes_without_changing_download_leases() {
+        use crate::playback::PlaybackHttpHeaders;
+        use crate::playback::ram_cache::RamPlaybackCache;
+
+        let origin = Origin::new(BLOCK * 2 + 137, ResponseKind::Valid);
+        let expected = Arc::clone(&origin.bytes);
+        let ram = RamPlaybackCache::for_test(8 * BLOCK_BYTES).unwrap();
+        let upstream = origin.url.clone();
+        let route = ram
+            .register_trusted(
+                "archive:fixture",
+                upstream.as_str(),
+                &PlaybackHttpHeaders::default(),
+            )
+            .unwrap();
+        let first = ArchivePlaybackCache::start_with_ram_cache_fixture(source(), route).unwrap();
+        assert_eq!(get(first.playback_url(), None).1, *expected);
+        let old_lease = first.completed().expect("first exact original is complete");
+        let old_path = old_lease.path().to_owned();
+        assert_eq!(std::fs::read(&old_path).unwrap(), *expected);
+        drop(first);
+        assert!(
+            !old_lease.is_current(),
+            "switching away must retire publication permission"
+        );
+        assert!(
+            !old_path.exists(),
+            "the current-only disk cache is still removed"
+        );
+        drop(origin);
+
+        let route = ram
+            .register_trusted(
+                "archive:fixture",
+                upstream.as_str(),
+                &PlaybackHttpHeaders::default(),
+            )
+            .unwrap();
+        let returned = ArchivePlaybackCache::start_with_ram_cache_fixture(source(), route).unwrap();
+        assert_eq!(
+            get(returned.playback_url(), None).1,
+            *expected,
+            "return must not require the disconnected origin"
+        );
+        let current = returned
+            .completed()
+            .expect("returned original is downloadable without network");
+        assert!(current.is_current());
+        assert_eq!(current.source_url(), &source());
+        assert_eq!(current.len(), expected.len() as u64);
+        assert_eq!(std::fs::read(current.path()).unwrap(), *expected);
+    }
+
+    /// A typed RAM route never permits another canonical file or arbitrary
+    /// loopback redirect to inherit the Archive proxy's trusted capability.
+    #[cfg(feature = "cache")]
+    #[test]
+    fn ram_upstream_requires_matching_source_and_exact_capability_endpoint() {
+        use crate::playback::PlaybackHttpHeaders;
+        use crate::playback::ram_cache::RamPlaybackCache;
+
+        let ram = RamPlaybackCache::for_test(4 * BLOCK_BYTES).unwrap();
+        let route = ram
+            .register_trusted(
+                "archive:fixture",
+                source().as_str(),
+                &PlaybackHttpHeaders::default(),
+            )
+            .unwrap();
+        let different = Url::parse("https://archive.org/download/fixture/other.flac").unwrap();
+        assert!(ArchivePlaybackCache::start_with_ram_cache(different, route.clone()).is_err());
+        let cache = ArchivePlaybackCache::start_with_upstream(
+            source(),
+            CacheUpstream::ram(route.clone()).unwrap(),
+            Arc::new(Budget::new(MAX_TOTAL_BYTES)),
+        )
+        .unwrap();
+        let endpoint = Url::parse(route.url()).unwrap();
+        assert!(endpoint_allowed(&cache.shared, &endpoint));
+        assert!(
+            !endpoint_allowed(&cache.shared, &source()),
+            "a RAM redirect cannot expand this private route"
+        );
+        let mut wrong_path = endpoint.clone();
+        wrong_path.set_path("/different-capability");
+        assert!(!endpoint_allowed(&cache.shared, &wrong_path));
+        let mut wrong_port = endpoint.clone();
+        wrong_port
+            .set_port(Some(if endpoint.port() == Some(1) { 2 } else { 1 }))
+            .unwrap();
+        assert!(!endpoint_allowed(&cache.shared, &wrong_port));
+    }
+
+    /// A failure before a nested RAM response can still truncate the outer
+    /// original-file response after its first block has already been delivered.
+    #[cfg(feature = "cache")]
+    #[test]
+    fn ram_failure_after_original_headers_is_not_natural_eof() {
+        use crate::playback::PlaybackHttpHeaders;
+        use crate::playback::ram_cache::RamPlaybackCache;
+
+        let origin = Origin::new(BLOCK * 2 + 137, ResponseKind::ChangedTagAfterFirstBlock);
+        let ram = RamPlaybackCache::for_test(8 * BLOCK_BYTES).unwrap();
+        let key = "archive:partial-fixture";
+        let route = ram
+            .register_trusted(key, origin.url.as_str(), &PlaybackHttpHeaders::default())
+            .unwrap();
+        let cache = ArchivePlaybackCache::start_with_ram_cache_fixture(source(), route).unwrap();
+        assert!(!ram.is_failed(key));
+        let (headers, bytes) = get(cache.playback_url(), None);
+        assert!(headers.starts_with("HTTP/1.1 200"));
+        assert_eq!(
+            bytes,
+            origin.bytes[..BLOCK],
+            "only the complete first original block may be sent"
+        );
+        assert!(
+            cache.completed().is_none(),
+            "partial bytes are never an exact original download"
+        );
+        assert!(
+            ram.is_failed(key),
+            "the outer response failure must reach the mpv load ticket"
         );
     }
 
