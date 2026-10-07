@@ -112,7 +112,7 @@ def main():
 				drain(0.02)
 			raise AssertionError(f'Foreground exec sleep did not start: {transcript[-12000:]!r}')
 
-		for index, name in enumerate(('normal', 'nonzero', 'validation', 'missing_directory', 'interrupt', 'read')):
+		for index, name in enumerate(('normal', 'exec', 'nonzero', 'validation', 'missing_directory', 'interrupt', 'read')):
 			wait_for(f'COMMAND_BEGIN_{name}'.encode())
 			if name == 'interrupt':
 				wait_for(b'COMMAND_INTERRUPT_READY')
@@ -125,6 +125,8 @@ def main():
 			if name == 'normal':
 				for marker in (b'PATH_ONE_ARG_OK', b'COMMAND_STDOUT', b'COMMAND_STDERR'):
 					assert marker in output, (marker, output)
+			elif name == 'exec':
+				assert b'COMMAND_EXEC_OK' in output, output
 			elif name == 'read':
 				assert b'COMMAND_INPUT_OK' in output, output
 			elif name == 'validation':

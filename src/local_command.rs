@@ -102,6 +102,10 @@ impl LocalCommandPlan {
 impl ShellCommandPlan {
     /// Builds the foreground TTY wrapper used by both prompts and configured buttons.
     ///
+    /// The explicit final `exit` prevents Bash 5.2 from replacing the outer
+    /// shell with its final command, so job control restores the original
+    /// foreground process group while preserving the command's exit status.
+    ///
     /// # Errors
     /// Returns a validation error for unsupported percent-macro shell grammar.
     pub fn command(&self) -> Result<Command, String> {
@@ -113,7 +117,7 @@ impl ShellCommandPlan {
                 "--norc",
                 "-i",
                 "-c",
-                "\"$BASH\" --noprofile --norc -c \"$1\" youta \"$2\" \"$3\"",
+                "\"$BASH\" --noprofile --norc -c \"$1\" youta \"$2\" \"$3\"; exit \"$?\"",
                 "youta",
             ])
             .arg(expanded)

@@ -62,7 +62,7 @@ fn expect_ui_key(input: &mut TerminalInput) {
     }
 }
 
-/// Exercises output, validation/spawn errors, interrupted exec, and interactive stdin.
+/// Exercises output, validation/spawn errors, successful/interrupted exec, and stdin.
 fn run_child(directory: PathBuf) {
     let path = directory.join("track' $(touch COMMAND_INJECTION) ;\n song.flac");
     std::fs::write(&path, b"command fixture").unwrap();
@@ -79,6 +79,7 @@ fn run_child(directory: PathBuf) {
              printf '%s\\n' COMMAND_STDOUT; printf '%s\\n' COMMAND_STDERR >&2",
             true,
         ),
+        ("exec", "exec printf 'COMMAND_EXEC_OK\\n'", true),
         ("nonzero", "printf 'COMMAND_NONZERO\\n'; exit 17", false),
         ("validation", "echo $(echo %)", false),
         ("missing_directory", "printf 'UNEXPECTED_SPAWN\\n'", false),
