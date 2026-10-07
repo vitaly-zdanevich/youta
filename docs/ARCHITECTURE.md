@@ -1,8 +1,7 @@
 # Architecture
 
-This document describes the intended boundaries of Youta and the foundation
-present in `0.19.0`. Items marked **roadmap** are design decisions, not support
-claims.
+This document describes Youta's component boundaries and shared application
+state. Items marked **roadmap** are design decisions, not support claims.
 
 ## Goals
 
@@ -43,10 +42,34 @@ The library is divided by responsibility:
 - `links`: safe extraction and classification of links and timecodes;
 - `local_archive`: bounded ZIP/RAR materialization for read-only Local folders;
 - `playback`: backend interface, process supervision, and player events;
-- `tui`: input mapping, reducer, layout, widgets, and terminal lifecycle.
+- `app`: shared application controller, action handling, and worker coordination;
+- `view`: frontend-independent snapshots and actions;
+- `tui`: input mapping, layout, widgets, and terminal lifecycle.
 
 Provider-specific response structures do not cross into TUI code. They are
 normalized into domain objects with the original source ID retained.
+
+## Source map
+
+Use this map to find a change's owning layer before opening the large controller
+or renderer. Filenames below are relative to the repository root.
+
+| Concern | Implementation | Tests |
+| --- | --- | --- |
+| Shared actions and state transitions | `src/app.rs`, focused modules in `src/app/` | Inline `app::tests`, `src/app/tests/`, adjacent provider-specific test modules |
+| Terminal layout and input | `src/tui.rs`, `src/tui/`, `src/keymap.rs` | Inline renderer/keymap tests, `src/tui/*tests.rs`, `tests/e2e.rs` |
+| Desktop | `gui/src/reducer.rs`, `gui/src/desktop.rs`, `gui/ui/src/` | `gui/src/contract_tests.rs`, frontend `*.test.mjs`, `gui/ui/tests/` |
+| Playback and byte caching | `src/playback/`, Archive original-file bridge in `src/archive_playback_cache.rs` | Adjacent unit/native tests, `tests/mpv_end_pause.rs` |
+| Provider requests and parsing | `src/providers/` | Inline mocked responses; opt-in live probes in `tests/live_*.rs` |
+| Durable state and filesystem operations | `src/persistence*.rs`, `src/local_*.rs`, `src/private_files.rs` | Adjacent temporary-filesystem tests |
+| Build features, releases and source metrics | `Cargo.toml`, `packaging/`, `scripts/`, `.github/workflows/` | `tests/*packaging.rs`, `tests/ci_validation.rs`, `scripts/tests/` |
+
+For example, `rg -n '^mod tests|^impl|^pub struct' src/app.rs` locates major
+boundaries without reading tens of thousands of test lines. Check the relevant
+Cargo feature before following a provider or platform branch. Keep production
+behavior changes and test-only file moves in separate commits; moving tests
+does not make the production implementation smaller. The
+[source-count report](PRODUCTION_CODE.md) provides reproducible per-file totals.
 
 ## State and persistence
 

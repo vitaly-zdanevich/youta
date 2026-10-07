@@ -20,7 +20,7 @@ SPEC.loader.exec_module(production_loc)
 class ProductionLocTests(unittest.TestCase):
 	'''Use miniature repositories to separate runtime code from test scaffolding.'''
 
-	def count_fixture(self, files, untracked=None):
+	def count_fixture(self, files, untracked=None, *, tests=False):
 		'''Count tracked fixture files without reading the real working tree.'''
 		with tempfile.TemporaryDirectory() as temporary:
 			root = Path(temporary)
@@ -28,7 +28,109 @@ class ProductionLocTests(unittest.TestCase):
 				path = root / name
 				path.parent.mkdir(parents=True, exist_ok=True)
 				path.write_text(content, encoding='utf-8')
-			return production_loc.production_counts(root, set(files))
+			counter = production_loc.test_counts if tests else production_loc.production_counts
+			return counter(root, set(files))
+
+	def test_test_count_includes_inline_helpers_and_separate_modules_once(self):
+		'''Test-only syntax is counted even in otherwise production Rust files.'''
+		counts = self.count_fixture({
+			'src/lib.rs': (
+				'pub fn runtime() {}\n'
+				'#[cfg(test)]\nmod checks;\n'
+				'#[cfg(test)]\nmod tests {\n'
+				'\tfn helper() {}\n\t#[test]\n\tfn works() { helper(); }\n}\n'
+			),
+			'src/main.rs': '#[cfg(test)]\nmod checks;\nfn main() {}\n',
+			'src/checks.rs': '// comment\n#[test]\nfn shared_check() {}\n',
+			'src/orphan.rs': '#[test]\nfn unreachable() {}\n',
+		}, tests=True)
+		self.assertEqual(counts, {'src/checks.rs': 2, 'src/lib.rs': 8, 'src/main.rs': 2})
+
+	def test_test_count_preserves_platform_branches_and_excludes_shared_lines(self):
+		'''Unknown features are included; shared code belongs to production only.'''
+		counts = self.count_fixture({
+			'src/lib.rs': (
+				'#[cfg(any(windows, test))]\nfn shared() {}\n'
+				'#[cfg(not(test))]\nfn release() {}\n'
+				'#[cfg(all(test, unix))]\nfn helper() {}\n'
+				'fn runtime() {} #[cfg(test)] mod checks { fn fixture() {} }\n'
+				'#[test]\nfn direct_test() {}\n'
+			),
+		}, tests=True)
+		self.assertEqual(counts, {'src/lib.rs': 4})
+
+	def test_test_count_follows_integration_and_gui_shared_module_paths(self):
+		'''Integration roots and cross-crate test helpers count without duplicates.'''
+		counts = self.count_fixture({
+			'src/lib.rs': 'pub fn runtime() {}\n',
+			'gui/src/main.rs': '#[cfg(test)]\nmod checks;\nfn main() {}\n',
+			'gui/src/checks.rs': '#[path = "../../tests/support/shared.rs"]\nmod shared;\n',
+			'tests/works.rs': '#[path = "support/shared.rs"]\nmod shared;\n#[test]\nfn works() {}\n',
+			'tests/support/shared.rs': 'pub fn helper() {}\n',
+		}, tests=True)
+		self.assertEqual(counts, {
+			'gui/src/main.rs': 2, 'gui/src/checks.rs': 2,
+			'tests/works.rs': 4, 'tests/support/shared.rs': 1,
+		})
+
+	def test_integration_crate_roots_resolve_sibling_and_directory_modules(self):
+		'''Cargo integration roots resolve mod support relative to the crate file.'''
+		counts = self.count_fixture({
+			'tests/integration.rs': 'mod support;\n#[test]\nfn works() {}\n',
+			'tests/support/mod.rs': 'pub fn helper() {}\n',
+			'tests/suite/main.rs': 'mod helper;\n#[test]\nfn works() {}\n',
+			'tests/suite/helper.rs': 'pub fn helper() {}\n',
+		}, tests=True)
+		self.assertEqual(counts, {
+			'tests/integration.rs': 3, 'tests/support/mod.rs': 1,
+			'tests/suite/main.rs': 3, 'tests/suite/helper.rs': 1,
+		})
+
+	def test_test_count_includes_frontend_scripts_and_executable_fixtures(self):
+		'''Tests and test harness code count, but snapshots/dependencies do not.'''
+		counts = self.count_fixture({
+			'gui/ui/src/actions.test.mjs': '// comment\ntest("action", () => {});\n',
+			'gui/ui/src/__tests__/helper.ts': 'export const helper = 1;\n',
+			'gui/ui/tests/browser.fixture.js': 'export const fixture = 1;\n',
+			'scripts/tests/test_counter.py': 'def test_count():\n\tassert True\n',
+			'tests/fixtures/terminal.py': 'print("terminal fixture")\n',
+			'gui/ui/src/actions.ts': 'export const action = 1;\n',
+			'gui/ui/tests/data.json': '{"fixture": true}\n',
+			'gui/ui/tests/snapshot_generated.ts': 'export const generated = 1;\n',
+			'vendor/tests/test_dep.py': 'assert True\n',
+		}, untracked={'scripts/tests/test_scratch.py': 'assert True\n'}, tests=True)
+		self.assertEqual(counts, {
+			'gui/ui/src/actions.test.mjs': 1, 'gui/ui/src/__tests__/helper.ts': 1,
+			'gui/ui/tests/browser.fixture.js': 1, 'scripts/tests/test_counter.py': 2,
+			'tests/fixtures/terminal.py': 1,
+		})
+
+	def test_test_count_handles_inner_cfg_raw_strings_and_test_fields(self):
+		'''Masking test syntax preserves physical line numbers and literal text.'''
+		counts = self.count_fixture({
+			'src/lib.rs': (
+				'const TEXT: &str = "#[test] // literal";\n'
+				'mod support;\n'
+				'struct Settings {\n#[cfg(test)]\nprobe: bool,\nvalue: u32,\n}\n'
+				'#[cfg(test)]\nconst SEPARATOR: &str = "\u2028";\n'
+				'pub fn runtime() {}\n'
+			),
+			'src/support.rs': '#![cfg(test)]\nfn fixture() {}\n',
+		}, tests=True)
+		self.assertEqual(counts, {'src/lib.rs': 4, 'src/support.rs': 2})
+
+	def test_test_count_rejects_unresolved_test_modules_and_paths_outside_roots(self):
+		'''An incomplete test graph must not silently publish an undercount.'''
+		for files in [
+			{'src/lib.rs': '#[cfg(test)]\nmod missing;\n'},
+			{
+				'src/lib.rs': '#[cfg(test)]\n#[path = "../vendor/checks.rs"]\nmod checks;\n',
+				'vendor/checks.rs': '#[test]\nfn check() {}\n',
+			},
+		]:
+			with self.subTest(files=files):
+				with self.assertRaises(ValueError):
+					self.count_fixture(files, tests=True)
 
 	def test_rust_modules_are_reachable_once_from_runtime_and_build_roots(self):
 		'''Shared modules count once; orphan helpers and integration tests do not.'''
@@ -243,23 +345,30 @@ class ProductionLocTests(unittest.TestCase):
 		for filename, source, expected in [
 			('fixture.rs', '\n// comment\n/* outer /* nested */ comment */\nfn run() {} // mixed\n', 1),
 			('fixture.rs', 'const TEXT: &str = "// literal";\n', 1),
+			('fixture.rs', '//! Module documentation\n/// Function documentation\nfn run() {}\n', 1),
+			('fixture.rs', '/** Block documentation */\nfn run() {}\n', 1),
 			('fixture.ts', '// comment\nconst text = "/* literal */";\n/* comment */ const value = 1;\n', 2),
 			('fixture.css', '/* comment */\nbody {\n\tcolor: black; /* mixed */\n}\n', 3),
 			('fixture.html', '<!-- comment -->\n<main>literal</main>\n', 1),
+			('fixture.py', "'''Module documentation.'''\ndef check():\n\t'''Test documentation.'''\n\tassert True\n", 2),
+			('fixture.py', 'TEXT = """Literal fixture, not documentation."""\n', 1),
 		]:
 			with self.subTest(filename=filename, source=source):
 				self.assertEqual(production_loc.code_lines(source, filename), expected)
 
 	def test_badge_is_deterministic_self_contained_and_displays_the_count(self):
 		'''Rendering a count must produce a valid SVG without external assets.'''
-		badge = production_loc.badge_svg(12345)
-		self.assertEqual(badge, production_loc.badge_svg(12345))
-		root = ET.fromstring(badge)
-		self.assertEqual(root.tag, '{http://www.w3.org/2000/svg}svg')
-		self.assertIn('12345', ''.join(root.itertext()).replace(',', '').replace(' ', ''))
-		self.assertNotIn('<script', badge)
-		self.assertNotIn('<image', badge)
-		self.assertNotIn('href=', badge)
+		for tests in (False, True):
+			with self.subTest(tests=tests):
+				badge = production_loc.badge_svg(12345, tests=tests)
+				self.assertEqual(badge, production_loc.badge_svg(12345, tests=tests))
+				root = ET.fromstring(badge)
+				self.assertEqual(root.tag, '{http://www.w3.org/2000/svg}svg')
+				self.assertIn('12345', ''.join(root.itertext()).replace(',', '').replace(' ', ''))
+				self.assertIn('test code' if tests else 'production code', root.attrib['aria-label'])
+				self.assertNotIn('<script', badge)
+				self.assertNotIn('<image', badge)
+				self.assertNotIn('href=', badge)
 
 	def test_malformed_rust_or_unresolved_runtime_module_fails_instead_of_undercounting(self):
 		'''An incomplete analysis must never silently publish a smaller number.'''
@@ -276,6 +385,7 @@ class ProductionLocTests(unittest.TestCase):
 			source = root / 'src/lib.rs'
 			source.write_text('pub fn production() {}\n', encoding='utf-8')
 			badge = root / production_loc.BADGE
+			test_badge = root / production_loc.TEST_BADGE
 
 			def invoke(mode):
 				'''Run the actual command entry point against an isolated repository.'''
@@ -290,6 +400,7 @@ class ProductionLocTests(unittest.TestCase):
 			self.assertEqual(missing.exception.code, 1)
 			invoke('--write')
 			self.assertEqual(badge.read_text(encoding='utf-8'), production_loc.badge_svg(1))
+			self.assertEqual(test_badge.read_text(encoding='utf-8'), production_loc.badge_svg(0, tests=True))
 			invoke('--check')
 			source.write_text('pub fn production() {}\npub fn additional() {}\n', encoding='utf-8')
 			with self.assertRaises(SystemExit) as stale:
@@ -298,15 +409,31 @@ class ProductionLocTests(unittest.TestCase):
 			invoke('--write')
 			self.assertEqual(badge.read_text(encoding='utf-8'), production_loc.badge_svg(2))
 			invoke('--check')
+			# A tests-only change must invalidate the new badge, not the production one.
+			source.write_text('pub fn production() {}\npub fn additional() {}\n#[test]\nfn check() {}\n', encoding='utf-8')
+			with self.assertRaises(SystemExit) as stale_tests:
+				invoke('--check')
+			self.assertEqual(stale_tests.exception.code, 1)
+			invoke('--write')
+			self.assertEqual(badge.read_text(encoding='utf-8'), production_loc.badge_svg(2))
+			self.assertEqual(test_badge.read_text(encoding='utf-8'), production_loc.badge_svg(2, tests=True))
+			invoke('--check')
+			test_badge.unlink()
+			with self.assertRaises(SystemExit) as missing_tests:
+				invoke('--check')
+			self.assertEqual(missing_tests.exception.code, 1)
 
-	def test_readme_places_production_badge_immediately_before_existing_loc_badge(self):
-		'''The new badge stays to the left of the existing Sonar LOC badge.'''
+	def test_readme_places_three_code_badges_on_a_dedicated_row(self):
+		'''Production, tests, and Sonar counts share their own Markdown paragraph.'''
 		root = Path(__file__).parents[2]
 		lines = (root / 'README.md').read_text(encoding='utf-8').splitlines()
 		position = next(index for index, line in enumerate(lines) if 'metric=ncloc' in line)
-		self.assertGreater(position, 0)
-		self.assertIn('docs/badges/production-code.svg', lines[position - 1])
-		self.assertIn('docs/PRODUCTION_CODE.md', lines[position - 1])
+		self.assertGreater(position, 2)
+		self.assertIn('docs/badges/production-code.svg', lines[position - 2])
+		self.assertIn('docs/badges/test-code.svg', lines[position - 1])
+		self.assertEqual(lines[position - 3], '')
+		self.assertEqual(lines[position + 1], '')
+		self.assertIn('docs/PRODUCTION_CODE.md', lines[position - 2])
 		self.assertTrue((root / 'docs/badges/production-code.svg').is_file())
 		self.assertTrue((root / 'docs/PRODUCTION_CODE.md').is_file())
 
