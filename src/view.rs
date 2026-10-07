@@ -3456,6 +3456,87 @@ impl ViewModel {
         self.playback_starting || self.playback_preparing
     }
 
+    /// Whether a visible activity indicator needs timed redraws between events.
+    ///
+    /// Waiting for artwork or a folder listing alone does not animate the view:
+    /// their workers wake the frontend when a result is available.
+    #[must_use]
+    pub fn needs_animation_tick(&self) -> bool {
+        if self.search_activity.is_some()
+            || self.playback_activity_pending()
+            || self.playback_end_releasing
+            || self.subscriptions.loading
+            || self.subscriptions.metadata_pending
+            || self
+                .details
+                .as_ref()
+                .is_some_and(|details| details.local_fingerprint_pending)
+            || self.bug_report_popup.as_ref().is_some_and(|popup| {
+                matches!(popup.submission, GitHubIssueSubmissionView::Submitting)
+            })
+            || self
+                .youtube_setup_popup
+                .as_ref()
+                .and_then(|setup| setup.invidious_instances.as_ref())
+                .is_some_and(|picker| picker.loading)
+        {
+            return true;
+        }
+        #[cfg(feature = "ascii-visualizer")]
+        if self.ascii_visualizer.is_some() {
+            return true;
+        }
+        #[cfg(feature = "commons-upload")]
+        if self.commons_upload_popup.as_ref().is_some_and(|popup| {
+            matches!(
+                popup.phase,
+                CommonsUploadPhase::PreparingAudio | CommonsUploadPhase::Uploading
+            )
+        }) {
+            return true;
+        }
+        #[cfg(feature = "evernote")]
+        if self.evernote_popup.as_ref().is_some_and(|popup| {
+            matches!(
+                popup.phase,
+                EvernoteNotePhase::LoadingCaptions
+                    | EvernoteNotePhase::PreparingAudio
+                    | EvernoteNotePhase::Saving
+            )
+        }) {
+            return true;
+        }
+        #[cfg(feature = "archive-upload")]
+        if self.archive_upload_popup.as_ref().is_some_and(|popup| {
+            matches!(
+                popup.phase,
+                ArchiveUploadPhase::Preparing
+                    | ArchiveUploadPhase::Uploading
+                    | ArchiveUploadPhase::Cancelling
+            )
+        }) {
+            return true;
+        }
+        #[cfg(feature = "s3-upload")]
+        if self.s3_upload_popup.as_ref().is_some_and(|popup| {
+            matches!(
+                popup.phase,
+                S3UploadPhase::Preparing | S3UploadPhase::Uploading | S3UploadPhase::Cancelling
+            )
+        }) {
+            return true;
+        }
+        #[cfg(feature = "lan-sharing")]
+        if self
+            .podcast_feed_options_popup
+            .as_ref()
+            .is_some_and(|popup| popup.phase == PodcastFeedOptionsPhase::Preparing)
+        {
+            return true;
+        }
+        false
+    }
+
     /// Resolves indexed metadata destinations before applying terminal URL policy.
     pub(crate) fn action_requires_external_opener(&self, action: &UiAction) -> bool {
         if let UiAction::ActivateDetailLink(index) = action
@@ -4809,6 +4890,29 @@ pub trait UiController {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Idle workers notify completion; only visible indicators require timed frames.
+    #[test]
+    fn worker_waits_do_not_animate_an_idle_view() {
+        let mut view = ViewModel::default();
+        assert!(!view.needs_animation_tick());
+        view.local_artwork_pending = true;
+        view.local_browse_pending = true;
+        assert!(!view.needs_animation_tick());
+        view.search_activity = Some(SearchActivity::YouTube);
+        assert!(view.needs_animation_tick());
+        view.search_activity = None;
+        view.playback_starting = true;
+        assert!(view.needs_animation_tick());
+        view.playback_starting = false;
+        view.bug_report_popup = Some(BugReportPopupView {
+            submission: GitHubIssueSubmissionView::Submitting,
+            ..BugReportPopupView::default()
+        });
+        assert!(view.needs_animation_tick());
+        view.bug_report_popup.as_mut().unwrap().submission = GitHubIssueSubmissionView::Idle;
+        assert!(!view.needs_animation_tick());
+    }
 
     /// Both frontends use one stable action and focus identifier for numeric ordering.
     #[test]

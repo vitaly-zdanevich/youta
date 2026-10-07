@@ -45,6 +45,7 @@ use url::Url;
 
 use crate::config::ThumbnailMode;
 use crate::terminal_environment::{TerminalAttachment, is_linux_virtual_console};
+use crate::worker_wake::WorkerNotifier;
 
 const MAX_DOWNLOAD_BYTES: usize = 4 * 1024 * 1024;
 use crate::artwork::{
@@ -313,6 +314,41 @@ struct WorkerRequest {
 struct WorkerResult {
     generation: u64,
     result: Result<EncodedThumbnail, ThumbnailFailure>,
+}
+
+/// Publishes results before waking, and disconnects before its final notification.
+struct WorkerResultSender {
+    sender: Option<Sender<WorkerResult>>,
+    notifier: WorkerNotifier,
+}
+
+impl WorkerResultSender {
+    /// Keeps the sole sender attached until the worker returns or unwinds.
+    fn new(sender: Sender<WorkerResult>, notifier: WorkerNotifier) -> Self {
+        Self {
+            sender: Some(sender),
+            notifier,
+        }
+    }
+
+    /// Wakes only once the frontend can receive the completed result.
+    fn send(&self, result: WorkerResult) -> Result<(), ()> {
+        self.sender
+            .as_ref()
+            .expect("worker result sender remains attached until drop")
+            .send(result)
+            .map_err(|_| ())?;
+        self.notifier.wake();
+        Ok(())
+    }
+}
+
+impl Drop for WorkerResultSender {
+    fn drop(&mut self) {
+        // The frontend must see disconnection even when no result could be produced.
+        drop(self.sender.take());
+        self.notifier.wake();
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -873,6 +909,7 @@ pub struct ThumbnailManager {
     prefetch_discarder: Option<Receiver<Vec<Url>>>,
     prefetch_sources: Vec<Url>,
     result_receiver: Option<Receiver<WorkerResult>>,
+    worker_notifier: WorkerNotifier,
 }
 
 /// One independently prepared fullscreen target; results enter the shared RAM LRU.
@@ -892,7 +929,22 @@ struct ExpansionPrefetch {
     result_receiver: Option<Receiver<WorkerResult>>,
 }
 
+impl Drop for ThumbnailManager {
+    fn drop(&mut self) {
+        // A detached worker can finish after the renderer and terminal are gone.
+        self.worker_notifier.set_waker(None);
+    }
+}
+
 impl ThumbnailManager {
+    /// Registers a frontend wake target for completed visible and expansion work.
+    ///
+    /// Registration wakes once to collect already queued replies. Passing `None`
+    /// detaches the frontend without cancelling work; cache-only prefetch stays silent.
+    pub fn set_worker_waker(&mut self, waker: Option<std::task::Waker>) {
+        self.worker_notifier.set_waker(waker);
+    }
+
     /// Points local video-frame extraction at a specific `FFmpeg`.
     ///
     /// Applied after construction rather than through every constructor: the
@@ -1028,6 +1080,7 @@ impl ThumbnailManager {
             prefetch_discarder: None,
             prefetch_sources: Vec::new(),
             result_receiver: None,
+            worker_notifier: WorkerNotifier::default(),
         }
     }
 
@@ -1059,6 +1112,7 @@ impl ThumbnailManager {
             prefetch_discarder: None,
             prefetch_sources: Vec::new(),
             result_receiver: None,
+            worker_notifier: WorkerNotifier::default(),
         }
     }
 
@@ -1219,7 +1273,7 @@ impl ThumbnailManager {
         if !spawn_expansion_worker_with_transport(
             picker,
             receiver,
-            results,
+            WorkerResultSender::new(results, self.worker_notifier.clone()),
             HttpThumbnailTransport::new(),
             Arc::clone(&self.expansion.current_generation),
         ) {
@@ -1503,7 +1557,7 @@ impl ThumbnailManager {
         let spawned = spawn_visible_worker(
             picker,
             request_receiver,
-            result_sender,
+            WorkerResultSender::new(result_sender, self.worker_notifier.clone()),
             self.cache_directory.clone(),
             self.video_frame_program.clone(),
             Arc::clone(&self.current_generation),
@@ -1789,7 +1843,7 @@ impl ThumbnailManager {
 fn spawn_expansion_worker_with_transport<T: ThumbnailTransport>(
     picker: Picker,
     requests: Receiver<WorkerRequest>,
-    results: Sender<WorkerResult>,
+    results: WorkerResultSender,
     mut transport: T,
     current_generation: Arc<AtomicU64>,
 ) -> bool {
@@ -1851,7 +1905,7 @@ fn spawn_expansion_worker_with_transport<T: ThumbnailTransport>(
 fn spawn_visible_worker(
     picker: Picker,
     requests: Receiver<WorkerRequest>,
-    results: Sender<WorkerResult>,
+    results: WorkerResultSender,
     cache_directory: Option<PathBuf>,
     video_frame_program: PathBuf,
     current_generation: Arc<AtomicU64>,
@@ -1872,7 +1926,7 @@ fn spawn_visible_worker(
 fn spawn_visible_worker_with_transport<T: ThumbnailTransport>(
     picker: Picker,
     requests: Receiver<WorkerRequest>,
-    results: Sender<WorkerResult>,
+    results: WorkerResultSender,
     transport: T,
     cache: Option<ThumbnailCache>,
     debounce: Duration,
@@ -1895,7 +1949,7 @@ fn spawn_visible_worker_with_transport_and_extractor<
 >(
     picker: Picker,
     requests: Receiver<WorkerRequest>,
-    results: Sender<WorkerResult>,
+    results: WorkerResultSender,
     mut transport: T,
     mut extractor: E,
     mut cache: Option<ThumbnailCache>,
@@ -1981,7 +2035,7 @@ fn spawn_worker_with_transport<T: ThumbnailTransport>(
     picker: Picker,
     requests: Receiver<WorkerRequest>,
     prefetch_updates: Receiver<Vec<Url>>,
-    results: Sender<WorkerResult>,
+    results: WorkerResultSender,
     mut transport: T,
     mut cache: Option<ThumbnailCache>,
     debounce: Duration,
@@ -2131,7 +2185,7 @@ fn latest_prefetch_update(prefetch: &Receiver<Vec<Url>>) -> WorkerInput<Vec<Url>
 fn render_worker_request<T: ThumbnailTransport>(
     mut request: WorkerRequest,
     requests: &Receiver<WorkerRequest>,
-    results: &Sender<WorkerResult>,
+    results: &WorkerResultSender,
     transport: &mut T,
     extractor: &mut impl LocalVideoFrameExtractor,
     cache: Option<&mut ThumbnailCache>,
@@ -3041,6 +3095,280 @@ pub(crate) mod tests {
     use std::time::Instant;
 
     use super::*;
+
+    /// Records callbacks without consuming the worker result they announce.
+    struct ThumbnailWake(Sender<()>);
+
+    impl std::task::Wake for ThumbnailWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            let _ = self.0.send(());
+        }
+    }
+
+    /// Uses an unbounded callback channel so a worker never blocks on notification.
+    fn thumbnail_wake_recorder() -> (std::task::Waker, Receiver<()>) {
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        (
+            std::task::Waker::from(Arc::new(ThumbnailWake(sender))),
+            receiver,
+        )
+    }
+
+    /// A callback is sufficient to collect a result; no periodic manager probe is needed.
+    fn await_thumbnail_wake(wakes: &Receiver<()>) {
+        wakes
+            .recv_timeout(Duration::from_secs(5))
+            .expect("thumbnail completion wake");
+    }
+
+    #[test]
+    fn thumbnail_worker_wake_announces_visible_success_and_failures_after_publication() {
+        let (mut manager, replies, observed) = manager_with_mock_transport();
+        let (waker, wakes) = thumbnail_wake_recorder();
+        manager.set_worker_waker(Some(waker));
+        let _ = wakes.try_recv();
+        let cases = [
+            (Ok(fixture_png()), ThumbnailState::Ready),
+            (
+                Err(ThumbnailFailure::DownloadFailed),
+                ThumbnailState::Failed(ThumbnailFailure::DownloadFailed),
+            ),
+            (
+                Ok(vec![0, 1, 2]),
+                ThumbnailState::Failed(ThumbnailFailure::UnsupportedFormat),
+            ),
+        ];
+        for (index, (reply, expected)) in cases.into_iter().enumerate() {
+            let source = Url::parse(&format!("https://images.example/wake-{index}.png")).unwrap();
+            assert!(manager.synchronize(Some(&source), Rect::new(0, 0, 20, 8)));
+            assert_eq!(
+                observed.recv_timeout(Duration::from_secs(2)).unwrap(),
+                source
+            );
+            replies.send(reply).unwrap();
+            await_thumbnail_wake(&wakes);
+            assert!(
+                manager.poll(),
+                "the announced result must already be observable"
+            );
+            assert_eq!(manager.state(), &expected);
+            assert!(wakes.is_empty(), "one result needs one callback");
+        }
+    }
+
+    #[test]
+    fn thumbnail_worker_wake_replays_results_completed_before_registration() {
+        let (mut manager, replies, observed) = manager_with_mock_transport();
+        let source = Url::parse("https://images.example/before-registration.png").unwrap();
+        manager.synchronize(Some(&source), Rect::new(0, 0, 20, 8));
+        observed.recv_timeout(Duration::from_secs(2)).unwrap();
+        replies.send(Err(ThumbnailFailure::DownloadFailed)).unwrap();
+        wait_for_queued_result(&manager);
+        let (waker, wakes) = thumbnail_wake_recorder();
+        manager.set_worker_waker(Some(waker));
+        await_thumbnail_wake(&wakes);
+        assert!(manager.poll());
+        assert_eq!(
+            manager.state(),
+            &ThumbnailState::Failed(ThumbnailFailure::DownloadFailed)
+        );
+    }
+
+    #[test]
+    fn thumbnail_worker_wake_is_idle_after_registration_and_safe_to_detach() {
+        let (mut manager, replies, observed) = manager_with_mock_transport();
+        let (waker, wakes) = thumbnail_wake_recorder();
+        manager.set_worker_waker(Some(waker.clone()));
+        await_thumbnail_wake(&wakes);
+        assert!(!manager.poll());
+        assert!(!manager.poll());
+        assert!(wakes.is_empty());
+        manager.set_worker_waker(None);
+        let source = Url::parse("https://images.example/detached.png").unwrap();
+        manager.synchronize(Some(&source), Rect::new(0, 0, 20, 8));
+        observed.recv_timeout(Duration::from_secs(2)).unwrap();
+        replies.send(Err(ThumbnailFailure::DownloadFailed)).unwrap();
+        wait_for_queued_result(&manager);
+        assert!(
+            wakes.is_empty(),
+            "detached frontends receive no completion callback"
+        );
+        manager.set_worker_waker(Some(waker));
+        await_thumbnail_wake(&wakes);
+        assert!(manager.poll());
+    }
+
+    #[test]
+    fn thumbnail_worker_wake_announces_disconnect_after_the_sender_is_dropped() {
+        let (mut manager, _replies, _observed) = manager_with_mock_transport();
+        let (waker, wakes) = thumbnail_wake_recorder();
+        manager.set_worker_waker(Some(waker));
+        let _ = wakes.try_recv();
+        manager.state = ThumbnailState::Loading;
+        manager.request_sender = None;
+        await_thumbnail_wake(&wakes);
+        assert!(manager.poll(), "the disconnect must precede its callback");
+        assert_eq!(
+            manager.state(),
+            &ThumbnailState::Failed(ThumbnailFailure::WorkerStopped)
+        );
+        assert!(manager.result_receiver.is_none());
+    }
+
+    #[test]
+    fn thumbnail_worker_wake_announces_disconnection_during_unwinding() {
+        let notifier = WorkerNotifier::default();
+        let (waker, wakes) = thumbnail_wake_recorder();
+        notifier.set_waker(Some(waker));
+        await_thumbnail_wake(&wakes);
+        let (sender, receiver) = bounded(1);
+        let sender = WorkerResultSender::new(sender, notifier);
+        let worker = thread::spawn(move || {
+            let _sender = sender;
+            panic!("simulated thumbnail worker failure");
+        });
+        await_thumbnail_wake(&wakes);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(TryRecvError::Disconnected)
+        ));
+        assert!(worker.join().is_err());
+    }
+
+    #[test]
+    fn thumbnail_worker_wake_detaches_when_the_manager_is_dropped() {
+        let (mut manager, _replies, _observed) = manager_with_mock_transport();
+        let notifier = manager.worker_notifier.clone();
+        let (waker, wakes) = thumbnail_wake_recorder();
+        manager.set_worker_waker(Some(waker));
+        await_thumbnail_wake(&wakes);
+        drop(manager);
+        notifier.wake();
+        assert!(
+            matches!(wakes.try_recv(), Err(TryRecvError::Disconnected)),
+            "dropping the manager must release its frontend callback before workers exit"
+        );
+    }
+
+    #[test]
+    fn thumbnail_worker_wake_keeps_cache_only_prefetch_silent() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut manager, replies, observed) =
+            manager_with_mock_transport_in_cache(Some(directory.path().to_path_buf()));
+        let (waker, wakes) = thumbnail_wake_recorder();
+        manager.set_worker_waker(Some(waker));
+        let _ = wakes.try_recv();
+        let failed = Url::parse("https://images.example/prefetch-failed.png").unwrap();
+        let success = Url::parse("https://images.example/prefetch-success.png").unwrap();
+        manager.synchronize_prefetch(&[failed.clone(), success.clone()]);
+        assert_eq!(
+            observed.recv_timeout(Duration::from_secs(2)).unwrap(),
+            failed
+        );
+        replies.send(Err(ThumbnailFailure::DownloadFailed)).unwrap();
+        assert_eq!(
+            observed.recv_timeout(Duration::from_secs(2)).unwrap(),
+            success
+        );
+        replies.send(Ok(fixture_png())).unwrap();
+        wait_for_cached_source(directory.path(), &success);
+        assert!(
+            wakes.is_empty(),
+            "prefetch does not publish visible results"
+        );
+        assert!(!manager.poll());
+        assert_eq!(manager.state(), &ThumbnailState::Idle);
+    }
+
+    #[test]
+    fn thumbnail_worker_wake_covers_cache_hits_and_retained_native_waveforms() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = Url::parse("https://images.example/cached.png").unwrap();
+        let cache = ThumbnailCache::new(directory.path().to_path_buf());
+        cache.prepare().unwrap();
+        cache.store(&source, &fixture_png()).unwrap();
+        let (mut manager, _replies, observed) =
+            manager_with_mock_transport_in_cache(Some(directory.path().to_path_buf()));
+        let (waker, wakes) = thumbnail_wake_recorder();
+        manager.set_worker_waker(Some(waker));
+        let _ = wakes.try_recv();
+        manager.synchronize(Some(&source), Rect::new(0, 0, 20, 8));
+        await_thumbnail_wake(&wakes);
+        assert!(manager.poll());
+        assert_eq!(manager.state(), &ThumbnailState::Ready);
+        assert!(
+            observed.is_empty(),
+            "persistent cache hits need no transfer"
+        );
+
+        let waveform = Url::parse(
+            "https://iiif.archive.org/image/iiif/3/fixture%2Ftrack.png/full/max/0/default.jpg",
+        )
+        .unwrap();
+        manager.expansion.native_waveform =
+            Some((waveform.clone(), Arc::new(DynamicImage::new_rgb8(8, 4))));
+        manager.synchronize(Some(&waveform), Rect::new(0, 0, 20, 8));
+        await_thumbnail_wake(&wakes);
+        assert!(manager.poll());
+        assert_eq!(manager.state(), &ThumbnailState::Ready);
+        assert!(
+            observed.is_empty(),
+            "retained waveform pixels need no transfer"
+        );
+    }
+
+    #[test]
+    fn thumbnail_worker_wake_covers_expansion_success_failure_native_and_disconnect() {
+        let (mut manager, _replies, _observed) = manager_with_mock_transport();
+        let (replies, observed) = install_mock_expansion_transport(&mut manager);
+        let (waker, wakes) = thumbnail_wake_recorder();
+        manager.set_worker_waker(Some(waker));
+        let _ = wakes.try_recv();
+        manager.state = ThumbnailState::Ready;
+        for (index, reply) in [Ok(fixture_png()), Err(ThumbnailFailure::DownloadFailed)]
+            .into_iter()
+            .enumerate()
+        {
+            let source =
+                Url::parse(&format!("https://images.example/expansion-{index}.png")).unwrap();
+            assert!(manager.synchronize_expansion(Some(&source), Rect::new(0, 0, 20, 8)));
+            assert_eq!(
+                observed.recv_timeout(Duration::from_secs(2)).unwrap(),
+                source
+            );
+            replies.send(reply).unwrap();
+            await_thumbnail_wake(&wakes);
+            assert!(
+                !manager.poll(),
+                "speculative completion stays visually silent"
+            );
+            assert!(!manager.expansion.pending);
+            assert_eq!(
+                manager.expansion.failure,
+                (index == 1).then_some(ThumbnailFailure::DownloadFailed)
+            );
+        }
+        let waveform = Url::parse(
+            "https://iiif.archive.org/image/iiif/3/fixture%2Ftrack.png/full/max/0/default.jpg",
+        )
+        .unwrap();
+        manager.expansion.native_waveform =
+            Some((waveform.clone(), Arc::new(DynamicImage::new_rgb8(8, 4))));
+        assert!(manager.synchronize_expansion(Some(&waveform), Rect::new(0, 0, 20, 8)));
+        await_thumbnail_wake(&wakes);
+        assert!(!manager.poll());
+        assert!(!manager.expansion.pending);
+        assert_eq!(manager.expansion.failure, None);
+        assert!(observed.is_empty());
+        manager.expansion.request_sender = None;
+        await_thumbnail_wake(&wakes);
+        assert!(!manager.poll());
+        assert!(manager.expansion.result_receiver.is_none());
+    }
 
     /// Cold decoding, fullscreen scaling, and protocol encoding are not latency assertions.
     ///
@@ -4562,7 +4890,7 @@ pub(crate) mod tests {
         assert!(spawn_expansion_worker_with_transport(
             picker_for_protocol(ThumbnailProtocol::Kitty, FALLBACK_FONT_SIZE),
             request_receiver,
-            results,
+            WorkerResultSender::new(results, manager.worker_notifier.clone()),
             MockTransport {
                 observed: warm_observed_sender,
                 replies: warm_reply_receiver
@@ -4863,6 +5191,7 @@ pub(crate) mod tests {
             prefetch_discarder: None,
             prefetch_sources: Vec::new(),
             result_receiver: Some(result_receiver),
+            worker_notifier: WorkerNotifier::default(),
         };
         let first = Url::parse("https://images.example/first.jpg").expect("first URL");
         let second = Url::parse("https://images.example/second.jpg").expect("second URL");
@@ -5260,7 +5589,7 @@ pub(crate) mod tests {
         assert!(spawn_visible_worker_with_transport(
             picker_for_protocol(ThumbnailProtocol::Halfblocks, FALLBACK_FONT_SIZE),
             request_receiver,
-            results,
+            WorkerResultSender::new(results, manager.worker_notifier.clone()),
             transport,
             Some(ThumbnailCache::new(cache_directory.clone())),
             Duration::ZERO,
@@ -5370,7 +5699,7 @@ pub(crate) mod tests {
             assert!(spawn_expansion_worker_with_transport(
                 picker_for_protocol(ThumbnailProtocol::Halfblocks, FALLBACK_FONT_SIZE),
                 request_receiver,
-                results,
+                WorkerResultSender::new(results, manager.worker_notifier.clone()),
                 transport,
                 Arc::clone(&manager.expansion.current_generation),
             ));
@@ -5720,10 +6049,11 @@ pub(crate) mod tests {
         let (result_sender, result_receiver) = bounded(1);
         let (visible_observed_sender, visible_observed) = bounded(1);
         let (visible_reply_sender, visible_reply_receiver) = bounded(1);
+        let worker_notifier = WorkerNotifier::default();
         assert!(spawn_visible_worker_with_transport(
             picker_for_protocol(ThumbnailProtocol::Kitty, FALLBACK_FONT_SIZE),
             visible_request_receiver,
-            result_sender,
+            WorkerResultSender::new(result_sender, worker_notifier.clone()),
             MockTransport {
                 observed: visible_observed_sender,
                 replies: visible_reply_receiver,
@@ -5767,6 +6097,7 @@ pub(crate) mod tests {
             prefetch_discarder: Some(prefetch_discarder),
             prefetch_sources: Vec::new(),
             result_receiver: Some(result_receiver),
+            worker_notifier,
         };
         let background =
             Url::parse("https://images.example/blocked-prefetch.png").expect("prefetch URL");
@@ -6079,6 +6410,7 @@ pub(crate) mod tests {
             prefetch_discarder: None,
             prefetch_sources: Vec::new(),
             result_receiver: Some(result_receiver),
+            worker_notifier: WorkerNotifier::default(),
         };
 
         assert!(manager.poll());
@@ -6155,7 +6487,7 @@ pub(crate) mod tests {
         assert!(spawn_expansion_worker_with_transport(
             picker_for_protocol(ThumbnailProtocol::Kitty, FALLBACK_FONT_SIZE),
             request_receiver,
-            results,
+            WorkerResultSender::new(results, manager.worker_notifier.clone()),
             MockTransport {
                 observed: observed_sender,
                 replies: reply_receiver
@@ -6211,11 +6543,12 @@ pub(crate) mod tests {
         let (observed_sender, observed_receiver) = bounded(4);
         let (reply_sender, reply_receiver) = bounded(4);
         let picker = picker_for_protocol(ThumbnailProtocol::Kitty, FALLBACK_FONT_SIZE);
+        let worker_notifier = WorkerNotifier::default();
         assert!(spawn_worker_with_transport(
             picker,
             request_receiver,
             prefetch_receiver,
-            result_sender,
+            WorkerResultSender::new(result_sender, worker_notifier.clone()),
             MockTransport {
                 observed: observed_sender,
                 replies: reply_receiver,
@@ -6246,6 +6579,7 @@ pub(crate) mod tests {
                 prefetch_discarder: Some(prefetch_discarder),
                 prefetch_sources: Vec::new(),
                 result_receiver: Some(result_receiver),
+                worker_notifier,
             },
             reply_sender,
             observed_receiver,
@@ -6269,10 +6603,11 @@ pub(crate) mod tests {
         let (reply_sender, reply_receiver) = bounded(4);
         let (cancelled_sender, cancelled_receiver) = bounded(4);
         let current_generation = Arc::new(AtomicU64::new(0));
+        let worker_notifier = WorkerNotifier::default();
         assert!(spawn_visible_worker_with_transport_and_extractor(
             picker_for_protocol(ThumbnailProtocol::Kitty, FALLBACK_FONT_SIZE),
             request_receiver,
-            result_sender,
+            WorkerResultSender::new(result_sender, worker_notifier.clone()),
             RejectingTransport,
             MockVideoExtractor {
                 observed: observed_sender,
@@ -6306,6 +6641,7 @@ pub(crate) mod tests {
                 prefetch_discarder: None,
                 prefetch_sources: Vec::new(),
                 result_receiver: Some(result_receiver),
+                worker_notifier,
             },
             reply_sender,
             observed_receiver,
@@ -6536,7 +6872,8 @@ pub(crate) mod tests {
         manager.state().clone()
     }
 
-    fn wait_for_queued_result(manager: &ThumbnailManager) {
+    /// Waits for a mock completion without consuming it or requiring a live wake target.
+    pub(crate) fn wait_for_queued_result(manager: &ThumbnailManager) {
         let deadline = Instant::now() + Duration::from_secs(2);
         while manager
             .result_receiver

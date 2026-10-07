@@ -887,10 +887,12 @@ context-sensitive help layer.
 Terminal input uses Crossterm's `EventStream` with a shared `mio` wake handle,
 without an async runtime. Workers queue their results before waking the
 frontend; folder listings, Copy/Move destination listings, transfer progress,
-provider replies and selected-file metadata share this mechanism.
+provider replies, artwork and waveform completions share this mechanism.
+Thumbnail cache hits and errors wake through the same path; cache-only
+prefetch remains silent, and disabling TTY artwork detaches its notifications.
 Notifications are coalesced and never consume the controller's response queue.
-Normal playback and animation deadlines remain, as do the separate artwork
-and waveform response checks. Before a foreground editor starts, Youta drops
+Normal playback and animation deadlines remain; artwork and
+waveforms no longer introduce separate response checks. Before a foreground editor starts, Youta drops
 the input stream and waits for its outstanding task-waker leases to end, so
 no background terminal reader can consume the editor's keys. Input resumes
 after the editor exits. This handoff has an isolated real-PTY regression test.

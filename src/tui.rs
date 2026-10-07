@@ -122,9 +122,6 @@ pub struct UiSettings {
     pub idle_tick: Duration,
 }
 
-/// Response budget for artwork/waveform workers without completion notifications.
-const LOCAL_ARTWORK_RESPONSE_POLL_INTERVAL: Duration = Duration::from_millis(25);
-
 impl Default for UiSettings {
     fn default() -> Self {
         Self {
@@ -142,6 +139,9 @@ impl Default for UiSettings {
 }
 
 trait ThumbnailRenderer {
+    /// Registers completion notifications without transferring ownership of replies.
+    fn set_worker_waker(&mut self, _waker: Option<std::task::Waker>) {}
+
     /// Applies the current physical-TTY artwork preference.
     ///
     /// Renderers for graphical terminals and no-image builds ignore this
@@ -151,6 +151,7 @@ trait ThumbnailRenderer {
     }
     fn poll(&mut self) -> bool;
     fn is_enabled(&self) -> bool;
+    #[cfg(test)]
     fn is_pending(&self) -> bool {
         false
     }
@@ -229,6 +230,8 @@ struct TerminalThumbnailRenderer {
     tty_images_enabled: bool,
     tty_image_policy_applies: bool,
     suspended_tty_manager: Option<ThumbnailManager>,
+    /// Retained across live TTY artwork toggles, including newly created managers.
+    worker_waker: Option<std::task::Waker>,
     clear_before_ready: bool,
     followup_frame_pending: bool,
     visible_source: Option<url::Url>,
@@ -276,6 +279,7 @@ impl TerminalThumbnailRenderer {
             tty_images_enabled,
             tty_image_policy_applies,
             suspended_tty_manager: None,
+            worker_waker: None,
             clear_before_ready: false,
             followup_frame_pending: false,
             visible_source: None,
@@ -317,6 +321,15 @@ impl TerminalThumbnailRenderer {
 
 #[cfg(feature = "images")]
 impl ThumbnailRenderer for TerminalThumbnailRenderer {
+    fn set_worker_waker(&mut self, waker: Option<std::task::Waker>) {
+        self.manager.set_worker_waker(waker.clone());
+        // Disabled artwork must not wake the terminal for hidden completions.
+        if let Some(manager) = self.suspended_tty_manager.as_mut() {
+            manager.set_worker_waker(None);
+        }
+        self.worker_waker = waker;
+    }
+
     fn set_tty_images_enabled(&mut self, enabled: bool) -> bool {
         if !self.tty_image_policy_applies || self.tty_images_enabled == enabled {
             return false;
@@ -342,6 +355,7 @@ impl ThumbnailRenderer for TerminalThumbnailRenderer {
             let disabled = ThumbnailManager::from_current_terminal(ThumbnailMode::Off);
             self.suspended_tty_manager = Some(std::mem::replace(&mut self.manager, disabled));
         }
+        self.set_worker_waker(self.worker_waker.clone());
         self.clear_before_ready = false;
         self.followup_frame_pending = false;
         self.visible_source = None;
@@ -364,6 +378,7 @@ impl ThumbnailRenderer for TerminalThumbnailRenderer {
         self.manager.is_enabled()
     }
 
+    #[cfg(test)]
     fn is_pending(&self) -> bool {
         self.manager.state() == &ThumbnailState::Loading
     }
@@ -1042,6 +1057,9 @@ fn run_with_input(
 ) -> io::Result<()> {
     let mut thumbnail_renderer =
         create_thumbnail_renderer(settings, controller.view().show_images_in_tty);
+    if let Some(renderer) = thumbnail_renderer.as_mut() {
+        renderer.set_worker_waker(Some(input.worker_waker()));
+    }
     let mut hit_map = HitMap::default();
     let mut virtual_cursor = VirtualCursor::default();
     // Discovery reads filesystem metadata once and runs nothing, so the
@@ -1636,12 +1654,11 @@ enum WaitOutcome {
     Timeout,
 }
 
-/// Waits for input or Local replies while probing an in-flight thumbnail worker.
+/// Waits once for input or worker completion, bounded by the redraw deadline.
 ///
-/// Cached thumbnails receive two quick probes, followed by progressively
-/// slower checks. Idle operation without thumbnail work still uses one full
-/// blocking terminal wait, and long network loads settle at four probes per
-/// second.
+/// Thumbnail workers signal after publishing a reply, including cache hits and
+/// failures. Only the clear-before-image followup needs an immediate frame;
+/// loading artwork does not introduce periodic probes or shorten this wait.
 fn wait_for_event_or_thumbnail(
     wait: Duration,
     mut thumbnail_renderer: Option<&mut (dyn ThumbnailRenderer + '_)>,
@@ -1653,41 +1670,7 @@ fn wait_for_event_or_thumbnail(
     if renderer.needs_immediate_redraw() {
         return Ok(WaitOutcome::ThumbnailRedraw);
     }
-    if !renderer.is_pending() {
-        return terminal_event_ready(wait);
-    }
-    if renderer.poll() || !renderer.is_pending() {
-        return Ok(WaitOutcome::ThumbnailRedraw);
-    }
-
-    let mut remaining = wait;
-    let mut waited = Duration::ZERO;
-    while !remaining.is_zero() {
-        let probe = thumbnail_probe_interval(waited).min(remaining);
-        let outcome = terminal_event_ready(probe)?;
-        if outcome != WaitOutcome::Timeout {
-            return Ok(outcome);
-        }
-        remaining = remaining.saturating_sub(probe);
-        waited = waited.saturating_add(probe);
-        if renderer.poll() || !renderer.is_pending() {
-            return Ok(WaitOutcome::ThumbnailRedraw);
-        }
-    }
-    Ok(WaitOutcome::Timeout)
-}
-
-/// Chooses an early cache-friendly probe followed by low-power network checks.
-fn thumbnail_probe_interval(waited: Duration) -> Duration {
-    if waited < Duration::from_millis(50) {
-        Duration::from_millis(25)
-    } else if waited < Duration::from_millis(100) {
-        Duration::from_millis(50)
-    } else if waited < Duration::from_millis(200) {
-        Duration::from_millis(100)
-    } else {
-        Duration::from_millis(250)
-    }
+    terminal_event_ready(wait)
 }
 
 /// Stable-width ASCII frames shared by background activity indicators.
@@ -1706,28 +1689,11 @@ fn event_wait(view: &ViewModel, settings: &UiSettings) -> Duration {
     } else {
         playback_wait
     };
-    let wait =
-        if view.local_artwork_pending || matches!(view.waveform, WaveformView::Loading { .. }) {
-            playback_wait.min(LOCAL_ARTWORK_RESPONSE_POLL_INTERVAL)
-        } else if view.search_activity.is_some()
-            || view.bug_report_popup.as_ref().is_some_and(|popup| {
-                matches!(popup.submission, GitHubIssueSubmissionView::Submitting)
-            })
-            || view.subscriptions.loading
-            || view.subscriptions.metadata_pending
-            || view.playback_activity_pending()
-            || view.playback_end_releasing
-            || (cfg!(feature = "invidious")
-                && view
-                    .youtube_setup_popup
-                    .as_ref()
-                    .and_then(|setup| setup.invidious_instances.as_ref())
-                    .is_some_and(|picker| picker.loading))
-        {
-            playback_wait.min(settings.playing_tick)
-        } else {
-            playback_wait
-        };
+    let wait = if view.needs_animation_tick() {
+        playback_wait.min(settings.playing_tick)
+    } else {
+        playback_wait
+    };
     wait.max(Duration::from_millis(1))
 }
 
@@ -16663,6 +16629,73 @@ mod tests {
         assert!(!renderer.set_tty_images_enabled(true));
     }
 
+    /// Hidden transfers stay quiet; restoring the manager replays their queued completion.
+    #[cfg(feature = "images")]
+    #[test]
+    fn live_tty_image_toggle_detaches_hidden_work_and_restores_completion_wakes() {
+        use crate::thumbnails::{ThumbnailFailure, ThumbnailState, tests as thumbnail_tests};
+        use std::sync::Arc;
+        use std::task::{Wake, Waker};
+        use std::time::Duration;
+
+        struct RecordedWake(crossbeam_channel::Sender<()>);
+        impl Wake for RecordedWake {
+            fn wake(self: Arc<Self>) {
+                let _ = self.0.send(());
+            }
+        }
+
+        let (manager, replies, observed) = thumbnail_tests::manager_with_mock_transport();
+        // Force the physical-console policy while retaining the controlled transport.
+        let mut renderer = TerminalThumbnailRenderer::new_with_runtime_policy(
+            manager,
+            ThumbnailMode::Auto,
+            None,
+            PathBuf::from("ffmpeg"),
+            true,
+            true,
+        );
+        let (wake_sender, wakes) = crossbeam_channel::unbounded();
+        renderer.set_worker_waker(Some(Waker::from(Arc::new(RecordedWake(wake_sender)))));
+        wakes.recv_timeout(Duration::from_secs(5)).unwrap();
+        let source = url::Url::parse("https://images.example/hidden-completion.png").unwrap();
+        assert!(renderer.synchronize(Some(&source), Rect::new(0, 0, 20, 8)));
+        assert_eq!(
+            observed.recv_timeout(Duration::from_secs(2)).unwrap(),
+            source
+        );
+        assert!(renderer.set_tty_images_enabled(false));
+        let _ = wakes.try_recv();
+        replies.send(Ok(thumbnail_tests::fixture_png())).unwrap();
+        thumbnail_tests::wait_for_queued_result(renderer.suspended_tty_manager.as_ref().unwrap());
+        assert!(
+            wakes.is_empty(),
+            "hidden image completion must not wake the frontend"
+        );
+        assert!(renderer.set_tty_images_enabled(true));
+        wakes.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(renderer.poll());
+        assert_eq!(renderer.manager.state(), &ThumbnailState::Ready);
+
+        let next = url::Url::parse("https://images.example/restored-completion.png").unwrap();
+        assert!(renderer.synchronize(Some(&next), Rect::new(0, 0, 20, 8)));
+        assert_eq!(observed.recv_timeout(Duration::from_secs(2)).unwrap(), next);
+        // A completion racing reattachment may coalesce with its replay callback.
+        for () in wakes.try_iter() {}
+        replies.send(Err(ThumbnailFailure::DownloadFailed)).unwrap();
+        wakes.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(renderer.poll());
+        assert_eq!(
+            renderer.manager.state(),
+            &ThumbnailState::Failed(ThumbnailFailure::DownloadFailed)
+        );
+        renderer.set_worker_waker(None);
+        assert!(matches!(
+            wakes.recv_timeout(Duration::from_secs(2)),
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected)
+        ));
+    }
+
     #[test]
     fn f8_virtual_cursor_moves_clamps_and_clicks_existing_hitboxes() {
         let mut cursor = VirtualCursor {
@@ -17524,7 +17557,7 @@ for encoded, expected in json.load(sys.stdin):
     }
 
     #[test]
-    fn pending_local_artwork_uses_the_interactive_response_budget() {
+    fn pending_local_artwork_does_not_shorten_the_redraw_deadline() {
         let settings = UiSettings {
             idle_tick: Duration::from_secs(2),
             playing_tick: Duration::from_millis(250),
@@ -17535,14 +17568,11 @@ for encoded, expected in json.load(sys.stdin):
             ..ViewModel::default()
         };
 
-        assert_eq!(
-            event_wait(&view, &settings),
-            LOCAL_ARTWORK_RESPONSE_POLL_INTERVAL
-        );
+        assert_eq!(event_wait(&view, &settings), settings.idle_tick);
     }
 
     #[test]
-    fn pending_local_waveform_uses_the_interactive_response_budget() {
+    fn pending_local_waveform_does_not_shorten_the_redraw_deadline() {
         let settings = UiSettings {
             idle_tick: Duration::from_secs(2),
             playing_tick: Duration::from_millis(250),
@@ -17555,14 +17585,11 @@ for encoded, expected in json.load(sys.stdin):
             ..ViewModel::default()
         };
 
-        assert_eq!(
-            event_wait(&view, &settings),
-            LOCAL_ARTWORK_RESPONSE_POLL_INTERVAL
-        );
+        assert_eq!(event_wait(&view, &settings), settings.idle_tick);
     }
 
     #[test]
-    fn thumbnail_wait_probes_cache_hits_early_and_redraws_on_completion() {
+    fn thumbnail_completion_interrupts_the_full_redraw_wait() {
         let mut thumbnails = MockThumbnailRenderer {
             pending: true,
             poll_results: VecDeque::from([false, true]),
@@ -17573,17 +17600,17 @@ for encoded, expected in json.load(sys.stdin):
         let outcome =
             wait_for_event_or_thumbnail(Duration::from_secs(2), Some(&mut thumbnails), |wait| {
                 waits.push(wait);
-                Ok(WaitOutcome::Timeout)
+                Ok(WaitOutcome::WorkerReady)
             })
             .expect("wait for cached thumbnail");
 
-        assert_eq!(outcome, WaitOutcome::ThumbnailRedraw);
-        assert_eq!(waits, [Duration::from_millis(25)]);
-        assert_eq!(thumbnails.poll_count, 2);
+        assert_eq!(outcome, WaitOutcome::WorkerReady);
+        assert_eq!(waits, [Duration::from_secs(2)]);
+        assert_eq!(thumbnails.poll_count, 0);
     }
 
     #[test]
-    fn thumbnail_wait_keeps_idle_and_long_network_work_low_frequency() {
+    fn thumbnail_wait_does_not_probe_idle_or_pending_workers() {
         let mut idle = MockThumbnailRenderer::default();
         let mut idle_waits = Vec::new();
         assert_eq!(
@@ -17610,19 +17637,8 @@ for encoded, expected in json.load(sys.stdin):
             .expect("network thumbnail wait"),
             WaitOutcome::Timeout
         );
-        assert_eq!(
-            loading_waits,
-            [
-                Duration::from_millis(25),
-                Duration::from_millis(25),
-                Duration::from_millis(50),
-                Duration::from_millis(100),
-                Duration::from_millis(250),
-                Duration::from_millis(250),
-                Duration::from_millis(250),
-                Duration::from_millis(50),
-            ]
-        );
+        assert_eq!(loading_waits, [Duration::from_secs(1)]);
+        assert_eq!(loading.poll_count, 0);
     }
 
     #[test]
@@ -17640,7 +17656,7 @@ for encoded, expected in json.load(sys.stdin):
             .expect("terminal event wait"),
             WaitOutcome::TerminalEvent
         );
-        assert_eq!(event_waits, [Duration::from_millis(25)]);
+        assert_eq!(event_waits, [Duration::from_secs(1)]);
 
         let mut followup = MockThumbnailRenderer {
             immediate_redraw: true,
@@ -34987,7 +35003,7 @@ for encoded, expected in json.load(sys.stdin):
         assert_eq!(renderer.visible_source.as_ref(), Some(&preview));
         assert!(
             renderer.is_pending(),
-            "the event loop must keep polling the fallback"
+            "the fallback must remain in flight until its completion notification"
         );
         assert!(!rendered_text(&terminal).contains("Thumbnail unavailable"));
         assert_eq!(

@@ -1841,8 +1841,9 @@ another decode or protocol-encoding pass. Local entries include a filesystem
 fingerprint in that RAM key, so replacing an image at the same path invalidates
 the prepared result.
 
-Background source results notify the interface when they finish, without waiting
-for the next periodic response check.
+Artwork and local waveform workers notify the interface when they finish,
+including cache hits and failures; loading an image does not add a short
+polling timer. Background source results use the same completion signal.
 
 A directly attached Linux virtual console (`TERM=linux`, with output resolved
 to `/dev/ttyN`) uses Unicode half-block cells as a conservative artwork
