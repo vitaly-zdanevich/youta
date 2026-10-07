@@ -429,6 +429,14 @@ its key and Cargo feature are present, then falls back to Invidious. Explicit
 shared by the TUI and CLI search paths. It does not select playback:
 `yt-dlp` resolution and `mpv` playback remain separate workers.
 
+The mpv adapter subscribes to status properties over JSON IPC and caches the
+observations. It takes one initial snapshot and resynchronizes after a file
+loads; repeated status reads do not send another batch of property requests.
+A bounded IPC reader wakes the playback supervisor, which forwards state
+changes to the frontend. Position/cache notifications are rate-limited while
+pause, EOF and metadata changes remain immediate. Backends without readiness
+support keep their timed refresh fallback.
+
 YouTube Music discovery is a separate provider route and persistent result
 snapshot. It invokes the configured `yt-dlp` executable on the public
 `music.youtube.com` search page from a capacity-one latest-only worker,

@@ -26398,6 +26398,7 @@ impl AppController {
             };
             match factory() {
                 Ok(mut player) => {
+                    player.set_worker_waker(Some(self.worker_notifier.as_waker()));
                     if !self.config.playback.audiophile.enabled {
                         let initial_speed = f64::from(self.config.playback.speed_percent) / 100.0;
                         let initialized = player
@@ -35645,6 +35646,9 @@ impl UiController for AppController {
 
     fn set_worker_waker(&mut self, waker: Option<std::task::Waker>) {
         self.worker_notifier.set_waker(waker);
+        if let Some(player) = self.player.as_mut() {
+            player.set_worker_waker(Some(self.worker_notifier.as_waker()));
+        }
     }
 
     #[cfg(feature = "archive-org")]

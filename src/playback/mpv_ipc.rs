@@ -7,17 +7,11 @@
 //! `mpv.rs` — is written once and shared, so a protocol fix cannot land on one
 //! platform and miss the other.
 //!
-//! # Why the two halves are not symmetric
-//!
-//! A Unix socket answers `set_read_timeout`, so the two-second guard against an
-//! mpv that stops replying is one syscall. A Windows named pipe opened as a
-//! file has no such control: the documented ways to bound a blocking read are
-//! overlapped I/O and `PeekNamedPipe`, both of which mean raw Win32 calls, and
-//! this crate forbids `unsafe` outright. So the Windows half buys the same
-//! guarantee with a thread: one reader owns the pipe, hands finished lines to a
-//! bounded channel, and the caller's timeout becomes `recv_timeout`. The thread
-//! ends when the pipe closes, which is what mpv exiting does, and `shutdown`
-//! kills mpv, so no reader outlives the backend that started it.
+//! One blocking reader hands completed lines to a bounded queue on both
+//! platforms. Unsolicited property events wake their consumer without polling
+//! mpv, and synchronous command replies retain their bounded timeout. Unix
+//! closes the socket and joins its reader on drop; Windows pipe reads end when
+//! the owned mpv process exits, as before.
 //!
 //! The channel is bounded on purpose. A reader that is not being drained blocks
 //! on send rather than growing, so a stalled consumer costs a fixed amount of
@@ -31,6 +25,144 @@
 use std::io;
 use std::path::Path;
 use std::time::Duration;
+
+/// Bounded, independently readable IPC lines with coalescible readiness notices.
+struct ReadQueue {
+    lines: Option<std::sync::mpsc::Receiver<io::Result<String>>>,
+    waker: std::sync::Arc<std::sync::Mutex<Option<std::task::Waker>>>,
+    #[cfg_attr(
+        windows,
+        allow(
+            dead_code,
+            reason = "Windows pipe reads end when the owned mpv process exits"
+        )
+    )]
+    reader: Option<std::thread::JoinHandle<()>>,
+    timeout: Duration,
+    closed: bool,
+}
+
+impl ReadQueue {
+    /// Keeps one blocking reader off the owner so unsolicited events need no request.
+    fn start(reader: impl io::Read + Send + 'static, timeout: Duration) -> io::Result<Self> {
+        let (sender, lines) = std::sync::mpsc::sync_channel(512);
+        let waker = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let worker_waker = std::sync::Arc::clone(&waker);
+        let reader = std::thread::Builder::new()
+            .name("youta-mpv-ipc".to_owned())
+            .spawn(move || {
+                use std::io::BufRead as _;
+                let mut reader = io::BufReader::new(reader);
+                loop {
+                    let mut line = String::new();
+                    let result = reader.read_line(&mut line);
+                    let failed = result.is_err();
+                    if matches!(result, Ok(0)) {
+                        break;
+                    }
+                    if sender.send(result.map(|_| line)).is_err() {
+                        break;
+                    }
+                    notify(&worker_waker);
+                    if failed {
+                        break;
+                    }
+                }
+                drop(sender);
+                notify(&worker_waker);
+            })?;
+        Ok(Self {
+            lines: Some(lines),
+            waker,
+            reader: Some(reader),
+            timeout,
+            closed: false,
+        })
+    }
+
+    /// Installs readiness after enqueueing and also covers already-buffered lines.
+    fn set_waker(&self, waker: Option<std::task::Waker>) {
+        let previous = std::mem::replace(
+            &mut *self
+                .waker
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            waker,
+        );
+        drop(previous);
+        notify(&self.waker);
+    }
+
+    /// Reads a complete queued line; `Some("")` denotes a disconnected stream.
+    fn try_read_line(&mut self) -> io::Result<Option<String>> {
+        if self.closed {
+            return Ok(Some(String::new()));
+        }
+        match self.lines.as_ref().expect("attached IPC reader").try_recv() {
+            Ok(Ok(line)) => Ok(Some(line)),
+            Ok(Err(error)) => {
+                self.closed = true;
+                Err(error)
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => Ok(None),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.closed = true;
+                Ok(Some(String::new()))
+            }
+        }
+    }
+
+    /// Bounds synchronous command acknowledgement without timing out idle readers.
+    fn read_line(&mut self, line: &mut String) -> io::Result<usize> {
+        if self.closed {
+            return Ok(0);
+        }
+        match self
+            .lines
+            .as_ref()
+            .expect("attached IPC reader")
+            .recv_timeout(self.timeout)
+        {
+            Ok(Ok(next)) => {
+                let count = next.len();
+                line.push_str(&next);
+                Ok(count)
+            }
+            Ok(Err(error)) => {
+                self.closed = true;
+                Err(error)
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                self.closed = true;
+                Ok(0)
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "mpv did not answer its control channel in time",
+            )),
+        }
+    }
+
+    /// Releases backpressure before joining a reader whose transport was shut down.
+    #[cfg(unix)]
+    fn join(&mut self) {
+        drop(self.lines.take());
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+    }
+}
+
+/// Calls user readiness handlers outside the registration lock.
+fn notify(waker: &std::sync::Mutex<Option<std::task::Waker>>) {
+    let waker = waker
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if let Some(waker) = waker {
+        waker.wake();
+    }
+}
 
 #[cfg(unix)]
 pub(super) use unix_socket::IpcLink;
@@ -83,41 +215,72 @@ pub(super) fn connection_is_pending(error: &io::Error) -> bool {
 
 #[cfg(unix)]
 mod unix_socket {
-    use std::io::{self, BufRead, BufReader, Write};
+    use std::io::{self, Write};
     use std::os::unix::net::UnixStream;
     use std::path::Path;
     use std::time::Duration;
 
     /// One open mpv control channel, carrying whole lines in both directions.
     pub(in crate::playback) struct IpcLink {
-        reader: BufReader<UnixStream>,
+        writer: UnixStream,
+        lines: super::ReadQueue,
     }
 
     pub(super) fn connect(endpoint: &Path, timeout: Duration) -> io::Result<IpcLink> {
         let stream = UnixStream::connect(endpoint)?;
-        stream.set_read_timeout(Some(timeout))?;
         stream.set_write_timeout(Some(timeout))?;
-        Ok(IpcLink::over(stream))
+        IpcLink::try_over(stream, timeout)
     }
 
     impl IpcLink {
         /// Wraps an already connected socket, for tests that supply both ends.
+        #[cfg(test)]
         pub(in crate::playback) fn over(stream: UnixStream) -> Self {
-            Self {
-                reader: BufReader::new(stream),
-            }
+            Self::try_over(stream, Duration::from_secs(2)).expect("start mock IPC reader")
+        }
+
+        /// Separates blocking reads from commands while preserving socket timeouts.
+        fn try_over(stream: UnixStream, timeout: Duration) -> io::Result<Self> {
+            stream.set_read_timeout(None)?;
+            let lines = super::ReadQueue::start(stream.try_clone()?, timeout)?;
+            Ok(Self {
+                writer: stream,
+                lines,
+            })
+        }
+
+        /// Registers notifications for complete lines and channel disconnection.
+        pub(in crate::playback) fn set_waker(&self, waker: Option<std::task::Waker>) {
+            self.lines.set_waker(waker);
+        }
+
+        /// Rearms bounded consumers when parsed or unread events still need service.
+        pub(in crate::playback) fn wake(&self) {
+            super::notify(&self.lines.waker);
+        }
+
+        /// Takes one complete line without issuing an IPC command or blocking.
+        pub(in crate::playback) fn try_read_line(&mut self) -> io::Result<Option<String>> {
+            self.lines.try_read_line()
         }
 
         /// Writes one request, newline included, as a single write.
         pub(in crate::playback) fn write_line(&mut self, payload: &[u8]) -> io::Result<()> {
-            let stream = self.reader.get_mut();
+            let stream = &mut self.writer;
             stream.write_all(&super::framed(payload))?;
             stream.flush()
         }
 
         /// Reads the next line, appending it to `line`; zero means closed.
         pub(in crate::playback) fn read_line(&mut self, line: &mut String) -> io::Result<usize> {
-            self.reader.read_line(line)
+            self.lines.read_line(line)
+        }
+    }
+
+    impl Drop for IpcLink {
+        fn drop(&mut self) {
+            let _ = self.writer.shutdown(std::net::Shutdown::Both);
+            self.lines.join();
         }
     }
 }
@@ -125,25 +288,14 @@ mod unix_socket {
 #[cfg(windows)]
 mod windows_pipe {
     use std::fs::{File, OpenOptions};
-    use std::io::{self, BufRead, BufReader, Write};
+    use std::io::{self, Write};
     use std::path::Path;
-    use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
-    use std::thread;
     use std::time::Duration;
-
-    /// Lines the reader may hold before it blocks instead of allocating.
-    ///
-    /// mpv emits one line per reply and per event; a consumer that is keeping
-    /// up never approaches this, and one that is not stops the reader rather
-    /// than growing the queue without limit.
-    const PENDING_LINES: usize = 512;
 
     /// One open mpv control channel, carrying whole lines in both directions.
     pub(in crate::playback) struct IpcLink {
         writer: File,
-        lines: Receiver<io::Result<String>>,
-        timeout: Duration,
-        closed: bool,
+        lines: super::ReadQueue,
     }
 
     pub(super) fn connect(endpoint: &Path, timeout: Duration) -> io::Result<IpcLink> {
@@ -151,40 +303,25 @@ mod windows_pipe {
         // what lets the reader thread block while this one writes.
         let writer = OpenOptions::new().read(true).write(true).open(endpoint)?;
         let reader = writer.try_clone()?;
-        let (sender, lines) = sync_channel(PENDING_LINES);
-        thread::Builder::new()
-            .name("youta-mpv-ipc".to_owned())
-            .spawn(move || pump(reader, &sender))?;
-        Ok(IpcLink {
-            writer,
-            lines,
-            timeout,
-            closed: false,
-        })
-    }
-
-    /// Turns blocking reads into lines on a channel until the pipe closes.
-    fn pump(reader: File, sender: &SyncSender<io::Result<String>>) {
-        let mut reader = BufReader::new(reader);
-        loop {
-            let mut line = String::new();
-            match reader.read_line(&mut line) {
-                // mpv closed the pipe. Dropping the sender is the message.
-                Ok(0) => return,
-                Ok(_) => {
-                    if sender.send(Ok(line)).is_err() {
-                        return;
-                    }
-                }
-                Err(error) => {
-                    let _ = sender.send(Err(error));
-                    return;
-                }
-            }
-        }
+        let lines = super::ReadQueue::start(reader, timeout)?;
+        Ok(IpcLink { writer, lines })
     }
 
     impl IpcLink {
+        /// Registers notifications for complete lines and channel disconnection.
+        pub(in crate::playback) fn set_waker(&self, waker: Option<std::task::Waker>) {
+            self.lines.set_waker(waker);
+        }
+
+        /// Rearms bounded consumers when parsed or unread events still need service.
+        pub(in crate::playback) fn wake(&self) {
+            super::notify(&self.lines.waker);
+        }
+
+        /// Takes one complete line without issuing an IPC command or blocking.
+        pub(in crate::playback) fn try_read_line(&mut self) -> io::Result<Option<String>> {
+            self.lines.try_read_line()
+        }
         /// Writes one request, newline included, as a single write.
         pub(in crate::playback) fn write_line(&mut self, payload: &[u8]) -> io::Result<()> {
             self.writer.write_all(&super::framed(payload))?;
@@ -193,29 +330,7 @@ mod windows_pipe {
 
         /// Reads the next line, appending it to `line`; zero means closed.
         pub(in crate::playback) fn read_line(&mut self, line: &mut String) -> io::Result<usize> {
-            if self.closed {
-                return Ok(0);
-            }
-            match self.lines.recv_timeout(self.timeout) {
-                Ok(Ok(next)) => {
-                    let read = next.len();
-                    line.push_str(&next);
-                    Ok(read)
-                }
-                Ok(Err(error)) => {
-                    self.closed = true;
-                    Err(error)
-                }
-                Err(RecvTimeoutError::Timeout) => Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "mpv did not answer its control pipe in time",
-                )),
-                // The reader stopped, which only happens once the pipe is gone.
-                Err(RecvTimeoutError::Disconnected) => {
-                    self.closed = true;
-                    Ok(0)
-                }
-            }
+            self.lines.read_line(line)
         }
     }
 }
@@ -245,5 +360,54 @@ mod tests {
 
         assert!(connection_is_pending(&absent));
         assert!(!connection_is_pending(&refused));
+    }
+
+    /// Notifications follow complete lines, never partial JSON fragments.
+    #[cfg(unix)]
+    #[test]
+    fn unsolicited_lines_and_disconnect_wake_without_any_request() {
+        use std::io::Write as _;
+        use std::sync::{Arc, mpsc};
+        use std::task::{Wake, Waker};
+        struct Notice(mpsc::Sender<()>);
+        impl Wake for Notice {
+            fn wake(self: Arc<Self>) {
+                let _ = self.0.send(());
+            }
+        }
+        let (client, mut server) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut link = IpcLink::over(client);
+        let (notice, received) = mpsc::channel();
+        link.set_waker(Some(Waker::from(Arc::new(Notice(notice)))));
+        received.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(link.try_read_line().unwrap().is_none());
+        server.write_all(b"{\"event\":").unwrap();
+        assert!(received.recv_timeout(Duration::from_millis(25)).is_err());
+        server.write_all(b"\"file-loaded\"}\n").unwrap();
+        received.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(
+            link.try_read_line().unwrap().as_deref(),
+            Some("{\"event\":\"file-loaded\"}\n")
+        );
+        drop(server);
+        received.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(link.try_read_line().unwrap().as_deref(), Some(""));
+    }
+
+    /// Closing a local link releases a reader blocked on an otherwise idle peer.
+    #[cfg(unix)]
+    #[test]
+    fn dropping_a_link_cancels_its_idle_reader() {
+        let (client, _server) = std::os::unix::net::UnixStream::pair().unwrap();
+        let link = IpcLink::over(client);
+        let (done, completion) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            drop(link);
+            done.send(()).unwrap();
+        });
+        completion
+            .recv_timeout(Duration::from_secs(2))
+            .expect("idle read cancelled");
+        thread.join().unwrap();
     }
 }

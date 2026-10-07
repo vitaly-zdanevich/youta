@@ -426,6 +426,16 @@ pub enum PlaybackEndReason {
 
 /// Common interface implemented by playback engines.
 pub trait PlaybackBackend {
+    /// Registers a readiness notification after backend state or events become available.
+    ///
+    /// Returns whether this backend supports notifications. Other backends keep
+    /// the default polling fallback; the callback never consumes their events.
+    /// A supporting backend signals its current state on registration and signals
+    /// later state changes, including events queued while servicing a command.
+    fn set_worker_waker(&mut self, _waker: Option<std::task::Waker>) -> bool {
+        false
+    }
+
     /// Returns a nonblocking ticket for the current complete-load cache source.
     /// Unsupported backends retain `None`; no IPC is performed by this method.
     fn cache_export_handle(&self) -> Option<cache_export::PlaybackCacheHandle> {

@@ -36,6 +36,21 @@ mod backend {
     const ICY_TITLE_PROPERTY: &str = "metadata/by-key/icy-title";
     const EOF_OBSERVER_ID: u64 = 2;
     const EOF_PROPERTY: &str = "eof-reached";
+    /// Ordered initial reads and observation IDs share one allowlisted vocabulary.
+    const STATUS_PROPERTIES: [&str; 10] = [
+        "idle-active",
+        "time-pos",
+        "duration",
+        "pause",
+        "volume",
+        "speed",
+        "chapter",
+        "paused-for-cache",
+        "demuxer-cache-state",
+        "media-title",
+    ];
+    /// Keeps snapshot observations separate from ICY and held-EOF observations.
+    const STATUS_OBSERVER_BASE: u64 = 10;
     /// Audio-only selector used by every ordinary extractor-backed load.
     #[cfg(feature = "yt-dlp")]
     const YTDL_AUDIO_FORMAT: &str = "bestaudio[acodec^=opus]/bestaudio";
@@ -50,6 +65,11 @@ mod backend {
         events: VecDeque<PlaybackEvent>,
         warnings: VecDeque<String>,
         stream_title: Option<String>,
+        /// Latest values from the initial snapshot and ordered property observations.
+        status: PlaybackStatus,
+        /// Missing properties are initialized too; absence is not a reason to poll.
+        status_initialized: bool,
+        observations_configured: bool,
         /// EOF holding requested for the current mpv playlist entry.
         keep_open: bool,
         /// Replacement policy is installed by its ordered `start-file` event.
@@ -201,6 +221,9 @@ mod backend {
                 events: VecDeque::new(),
                 warnings: VecDeque::new(),
                 stream_title: None,
+                status: PlaybackStatus::default(),
+                status_initialized: false,
+                observations_configured: false,
                 keep_open: false,
                 pending_keep_open: None,
                 media_loaded: false,
@@ -253,6 +276,7 @@ mod backend {
                     // mpv may retain the previous file's metadata until the
                     // replacement stream publishes its first property event.
                     self.stream_title = None;
+                    self.clear_media_status();
                     if let Some(keep_open) = self.pending_keep_open.take() {
                         self.keep_open = keep_open;
                     }
@@ -264,6 +288,9 @@ mod backend {
                         cache.loaded();
                     }
                     self.media_loaded = true;
+                    // Equal values need not emit a new observation across files.
+                    // One ordered resync per completed load restores those fields.
+                    self.status_initialized = false;
                     self.push_event(PlaybackEvent::MediaLoaded);
                 }
                 Some("playback-restart") => self.push_event(PlaybackEvent::PlaybackStarted),
@@ -272,6 +299,7 @@ mod backend {
                         cache.invalidate();
                     }
                     self.media_loaded = false;
+                    self.clear_media_status();
                     self.eof_held = false;
                     let reason_text = message
                         .get("reason")
@@ -339,8 +367,95 @@ mod backend {
                         .and_then(normalize_stream_title);
                 }
                 Some("log-message") => self.capture_warning(message),
+                Some("property-change") => {
+                    if let Some(index) = message
+                        .get("id")
+                        .and_then(Value::as_u64)
+                        .and_then(|id| id.checked_sub(STATUS_OBSERVER_BASE))
+                        .and_then(|index| usize::try_from(index).ok())
+                        && let Some(name) = STATUS_PROPERTIES.get(index)
+                        && message.get("name").and_then(Value::as_str) == Some(*name)
+                    {
+                        self.apply_status_property(
+                            name,
+                            message.get("data").unwrap_or(&Value::Null),
+                        );
+                    }
+                }
                 _ => {}
             }
+        }
+
+        /// Clears file-owned metadata without resetting persistent player controls.
+        fn clear_media_status(&mut self) {
+            self.status.idle = true;
+            self.status.position = Duration::ZERO;
+            self.status.duration = None;
+            self.status.chapter = None;
+            self.status.buffering = false;
+            self.status.buffered_ranges.clear();
+            self.status.title = None;
+        }
+
+        /// Applies only allowlisted properties using the same missing-value defaults as GET.
+        fn apply_status_property(&mut self, name: &str, value: &Value) {
+            let seconds = || {
+                value
+                    .as_f64()
+                    .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
+            };
+            match name {
+                "idle-active" => self.status.idle = value.as_bool().unwrap_or(false),
+                "time-pos" => self.status.position = seconds().unwrap_or(Duration::ZERO),
+                "duration" => self.status.duration = seconds(),
+                "pause" => self.status.paused = value.as_bool().unwrap_or(true),
+                "volume" => {
+                    let volume = value
+                        .as_f64()
+                        .filter(|value| value.is_finite())
+                        .unwrap_or(100.0)
+                        .clamp(0.0, 100.0)
+                        .round();
+                    #[allow(
+                        clippy::cast_possible_truncation,
+                        clippy::cast_sign_loss,
+                        reason = "finite value rounded and clamped to 0..=100"
+                    )]
+                    {
+                        self.status.volume = volume as u8;
+                    }
+                }
+                "speed" => self.status.speed = value.as_f64().unwrap_or(1.0),
+                "chapter" => self.status.chapter = value.as_i64(),
+                "paused-for-cache" => self.status.buffering = value.as_bool().unwrap_or(false),
+                "demuxer-cache-state" => self.status.buffered_ranges = parse_buffered_ranges(value),
+                "media-title" => self.status.title = value.as_str().map(ToOwned::to_owned),
+                _ => {}
+            }
+        }
+
+        /// Drains a bounded burst of unsolicited messages without forcing an IPC round trip.
+        fn drain_ready(&mut self) -> Result<()> {
+            for _ in 0..512 {
+                let Some(line) = self.link.try_read_line()? else {
+                    return Ok(());
+                };
+                if line.is_empty() {
+                    return Err(PlaybackError::ProcessExited(String::new()));
+                }
+                match serde_json::from_str(&line) {
+                    Ok(message) => self.handle_event(&message),
+                    Err(error) => {
+                        // Other complete lines may already have spent their coalesced
+                        // transport wake. Recover them in a fresh bounded pass.
+                        self.link.wake();
+                        return Err(error.into());
+                    }
+                }
+            }
+            // Hitting the budget is not proof the reader queue is empty.
+            self.link.wake();
+            Ok(())
         }
 
         fn capture_warning(&mut self, message: &Value) {
@@ -374,6 +489,9 @@ mod backend {
                 self.events.pop_front();
             }
             self.events.push_back(event);
+            // A status snapshot or command can consume the transport line after
+            // the supervisor's event pass. Keep that newly parsed event runnable.
+            self.link.wake();
         }
 
         fn diagnostic(&self) -> Option<String> {
@@ -397,18 +515,19 @@ mod backend {
         for command in ipc_configuration_commands() {
             ipc.send(&command)?;
         }
+        ipc.observations_configured = true;
         Ok(())
     }
 
     /// Returns the deterministic subscriptions installed on every mpv process.
-    fn ipc_configuration_commands() -> [Vec<Value>; 3] {
+    fn ipc_configuration_commands() -> Vec<Vec<Value>> {
         // mpv's JSON IPC log stream contains the authoritative extractor,
         // decoder, and audio-output failure text that otherwise occurs after
         // `loadfile` has already been acknowledged.
         // ICY title changes arrive on the existing audio connection.
         // Observing the property avoids another stream or HTTP poll and keeps
         // status reads cheap on low-power systems.
-        [
+        let mut commands = vec![
             vec![json!("request_log_messages"), json!("warn")],
             vec![
                 json!("observe_property"),
@@ -422,7 +541,15 @@ mod backend {
                 json!(EOF_OBSERVER_ID),
                 json!(EOF_PROPERTY),
             ],
-        ]
+        ];
+        commands.extend(STATUS_PROPERTIES.iter().enumerate().map(|(index, name)| {
+            vec![
+                json!("observe_property"),
+                json!(STATUS_OBSERVER_BASE + index as u64),
+                json!(name),
+            ]
+        }));
+        commands
     }
 
     fn event_text(message: &Value, field: &str) -> Option<String> {
@@ -839,6 +966,10 @@ mod backend {
     }
 
     impl PlaybackBackend for MpvBackend {
+        fn set_worker_waker(&mut self, waker: Option<std::task::Waker>) -> bool {
+            self.ipc.link.set_waker(waker);
+            true
+        }
         fn cache_export_handle(&self) -> Option<PlaybackCacheHandle> {
             self.ipc.cache_export.as_ref()?.handle()
         }
@@ -987,69 +1118,28 @@ mod backend {
         }
 
         fn status(&mut self) -> Result<PlaybackStatus> {
-            let idle = self
-                .property("idle-active")?
-                .and_then(|value| value.as_bool())
-                .unwrap_or(false);
-            let position = self
-                .property("time-pos")?
-                .and_then(|value| value.as_f64())
-                .filter(|value| value.is_finite() && *value >= 0.0)
-                .map_or(Duration::ZERO, Duration::from_secs_f64);
-            let duration = self
-                .property("duration")?
-                .and_then(|value| value.as_f64())
-                .filter(|value| value.is_finite() && *value >= 0.0)
-                .map(Duration::from_secs_f64);
-            let paused = self
-                .property("pause")?
-                .and_then(|value| value.as_bool())
-                .unwrap_or(true);
-            let rounded_volume = self
-                .property("volume")?
-                .and_then(|value| value.as_f64())
-                .filter(|value| value.is_finite())
-                .unwrap_or(100.0)
-                .clamp(0.0, 100.0)
-                .round();
-            #[allow(
-                clippy::cast_possible_truncation,
-                clippy::cast_sign_loss,
-                reason = "the finite value is rounded and clamped to the full u8 subset 0..=100"
-            )]
-            let volume = rounded_volume as u8;
-            let speed = self
-                .property("speed")?
-                .and_then(|value| value.as_f64())
-                .unwrap_or(1.0);
-            let chapter = self.property("chapter")?.and_then(|value| value.as_i64());
-            let buffering = self
-                .property("paused-for-cache")?
-                .and_then(|value| value.as_bool())
-                .unwrap_or(false);
-            let buffered_ranges = self
-                .property("demuxer-cache-state")?
-                .as_ref()
-                .map_or_else(Vec::new, parse_buffered_ranges);
-            let title = self
-                .property("media-title")?
-                .and_then(|value| value.as_str().map(ToOwned::to_owned));
-            let stream_title = self.ipc.stream_title.clone();
-            Ok(PlaybackStatus {
-                idle,
-                live: false,
-                live_seekable_range: None,
-                position,
-                duration,
-                paused,
-                volume,
-                speed,
-                chapter,
-                buffering,
-                buffered_ranges,
-                title,
-                stream_title,
-            })
+            if !self.ipc.observations_configured {
+                configure_ipc(&mut self.ipc)?;
+            }
+            self.ipc.drain_ready()?;
+            if !self.ipc.status_initialized {
+                // Set this before reading: file-loaded can arrive inside any GET
+                // and invalidate a snapshot that spans two different media files.
+                self.ipc.status_initialized = true;
+                for name in STATUS_PROPERTIES {
+                    let value = match self.property(name) {
+                        Ok(value) => value.unwrap_or(Value::Null),
+                        Err(error) => {
+                            self.ipc.status_initialized = false;
+                            return Err(error);
+                        }
+                    };
+                    self.ipc.apply_status_property(name, &value);
+                }
+            }
+            let mut status = self.ipc.status.clone();
+            status.stream_title.clone_from(&self.ipc.stream_title);
+            Ok(status)
         }
 
         fn poll_event(&mut self) -> Result<Option<PlaybackEvent>> {
@@ -1063,9 +1153,7 @@ mod backend {
                 return Ok(Some(event));
             }
 
-            // A cheap request causes mpv to flush lifecycle and log messages
-            // already ahead of its response on the ordered IPC stream.
-            let result = self.send(&[json!("get_property"), json!("idle-active")]);
+            let result = self.ipc.drain_ready();
             if let Some(event) = self.ipc.events.pop_front() {
                 return Ok(Some(event));
             }
@@ -1601,7 +1689,7 @@ mod backend {
         #[test]
         fn ipc_configuration_includes_the_icy_title_subscription() {
             assert_eq!(
-                ipc_configuration_commands(),
+                &ipc_configuration_commands()[..3],
                 [
                     vec![json!("request_log_messages"), json!("warn")],
                     vec![
@@ -1616,6 +1704,18 @@ mod backend {
                     ],
                 ]
             );
+            let commands = ipc_configuration_commands();
+            assert_eq!(commands.len(), 3 + STATUS_PROPERTIES.len());
+            for (index, property) in STATUS_PROPERTIES.iter().enumerate() {
+                assert_eq!(
+                    commands[index + 3],
+                    vec![
+                        json!("observe_property"),
+                        json!(STATUS_OBSERVER_BASE + index as u64),
+                        json!(property)
+                    ]
+                );
+            }
         }
 
         fn backend_with_properties(
@@ -2660,6 +2760,216 @@ mod backend {
             assert_eq!(status.stream_title.as_deref(), Some("Artist — Work"));
             backend.shutdown().expect("shut down mock backend");
             server_thread.join().expect("mock status server");
+        }
+
+        /// An unchanged snapshot must not issue another batch of property requests.
+        #[test]
+        fn repeated_status_uses_observed_properties_without_more_ipc_requests() {
+            let (mut backend, commands, server) = backend_with_command_recorder();
+            backend.status().expect("initial property snapshot");
+            let initial = commands.try_iter().collect::<Vec<_>>();
+            assert!(initial.iter().any(|command| command[0] == "get_property"));
+            backend.status().expect("cached property snapshot");
+            assert!(
+                commands.try_recv().is_err(),
+                "status must not repeatedly query mpv"
+            );
+            backend.shutdown().expect("shutdown");
+            server.join().expect("mock server");
+        }
+
+        /// A lifecycle boundary inside a GET cannot bless the interrupted snapshot.
+        #[test]
+        fn file_loaded_during_snapshot_preserves_resynchronization() {
+            let (mut backend, commands, server) = backend_with_command_recorder_script(
+                vec![
+                    json!({"request_id": 1, "error": "success", "data": false}),
+                    json!({"event": "file-loaded"}),
+                ],
+                None,
+            );
+            // Finish the first GET before the boundary, consumed by the second GET.
+            // The fixture's ordinary duplicate first acknowledgement is safely ignored.
+            backend.ipc.observations_configured = true;
+            backend.status().unwrap();
+            let first = commands.try_iter().collect::<Vec<_>>();
+            assert_eq!(first.len(), STATUS_PROPERTIES.len());
+            assert_eq!(first[0], vec![json!("get_property"), json!("idle-active")]);
+            assert!(
+                !backend.ipc.status_initialized,
+                "file-loaded must retain its snapshot invalidation"
+            );
+            backend.status().unwrap();
+            assert_eq!(commands.try_iter().count(), STATUS_PROPERTIES.len());
+            assert!(backend.ipc.status_initialized);
+            backend.status().unwrap();
+            assert!(
+                commands.try_recv().is_err(),
+                "the replacement only needs one complete snapshot"
+            );
+            backend.shutdown().unwrap();
+            server.join().unwrap();
+        }
+
+        /// A failed initial GET leaves the next snapshot eligible for a complete retry.
+        #[test]
+        fn failed_snapshot_remains_uninitialized() {
+            let (mut backend, commands, server) = backend_with_command_recorder_script(
+                vec![json!({"request_id": 1, "error": "mock snapshot failure"})],
+                None,
+            );
+            backend.ipc.observations_configured = true;
+            assert!(backend.status().is_err());
+            assert!(!backend.ipc.status_initialized);
+            assert_eq!(commands.try_iter().count(), 1);
+            backend.status().unwrap();
+            assert_eq!(commands.try_iter().count(), STATUS_PROPERTIES.len());
+            assert!(backend.ipc.status_initialized);
+            backend.shutdown().unwrap();
+            server.join().unwrap();
+        }
+
+        /// Ordered observations update a complete cached snapshot without status GETs.
+        #[test]
+        fn property_notifications_update_seek_pause_cache_and_metadata() {
+            let values = [
+                json!(false),
+                json!(12.5),
+                json!(42.0),
+                json!(false),
+                json!(37.6),
+                json!(1.5),
+                json!(2),
+                json!(true),
+                json!({"seekable-ranges": [{"start": 1.0, "end": 20.0}]}),
+                json!("Fixture title"),
+            ];
+            let mut events = STATUS_PROPERTIES.iter().enumerate().map(|(index, name)| json!({"event": "property-change", "id": STATUS_OBSERVER_BASE + index as u64, "name": name, "data": values[index]})).collect::<Vec<_>>();
+            events.push(json!({"event": "property-change", "id": ICY_TITLE_OBSERVER_ID, "name": ICY_TITLE_PROPERTY, "data": "Artist - Song"}));
+            let (mut backend, commands, server) =
+                backend_with_command_recorder_script(events, None);
+            backend.ipc.status_initialized = true;
+            backend.ipc.observations_configured = true;
+            backend.command(PlayerCommand::SetVolume(38)).unwrap();
+            assert_eq!(commands.try_iter().count(), 1);
+            let status = backend.status().unwrap();
+            assert!(!status.idle && !status.paused && status.buffering);
+            assert_eq!(status.position, Duration::from_millis(12_500));
+            assert_eq!(status.duration, Some(Duration::from_secs(42)));
+            assert_eq!(status.volume, 38);
+            assert_eq!(status.speed, 1.5);
+            assert_eq!(status.chapter, Some(2));
+            assert_eq!(status.title.as_deref(), Some("Fixture title"));
+            assert_eq!(status.stream_title.as_deref(), Some("Artist - Song"));
+            assert_eq!(
+                status.buffered_ranges,
+                [BufferedRange {
+                    start: Duration::from_secs(1),
+                    end: Duration::from_secs(20)
+                }]
+            );
+            assert!(
+                commands.try_recv().is_err(),
+                "notifications avoid repeated property GETs"
+            );
+            for (index, name) in STATUS_PROPERTIES.iter().enumerate() {
+                backend.ipc.handle_event(&json!({"event": "property-change", "id": STATUS_OBSERVER_BASE + index as u64, "name": name}));
+            }
+            let missing = backend.status().unwrap();
+            assert_eq!(missing.position, Duration::ZERO);
+            assert!(
+                missing.paused
+                    && missing.duration.is_none()
+                    && missing.title.is_none()
+                    && missing.buffered_ranges.is_empty()
+            );
+            assert_eq!(missing.volume, 100);
+            backend.shutdown().unwrap();
+            server.join().unwrap();
+        }
+
+        /// Unknown observation IDs cannot overwrite the cache, and new files resync once.
+        #[test]
+        fn replacement_clears_file_metadata_and_reinitializes_observed_status() {
+            let (mut backend, commands, server) = backend_with_command_recorder();
+            backend.status().unwrap();
+            commands.try_iter().for_each(drop);
+            backend
+                .ipc
+                .apply_status_property("media-title", &json!("Old item"));
+            backend.ipc.apply_status_property("volume", &json!(70));
+            backend.ipc.handle_event(&json!({"event": "property-change", "id": STATUS_OBSERVER_BASE, "name": "volume", "data": 1}));
+            assert_eq!(backend.ipc.status.volume, 70);
+            backend.ipc.handle_event(&json!({"event": "start-file"}));
+            assert!(backend.ipc.status.title.is_none());
+            assert_eq!(backend.ipc.status.volume, 70);
+            backend.ipc.handle_event(&json!({"event": "file-loaded"}));
+            backend.status().unwrap();
+            assert_eq!(
+                commands
+                    .try_iter()
+                    .filter(|command| command[0] == "get_property")
+                    .count(),
+                STATUS_PROPERTIES.len()
+            );
+            backend.status().unwrap();
+            assert!(commands.try_recv().is_err());
+            backend.shutdown().unwrap();
+            server.join().unwrap();
+        }
+
+        /// Lifecycle events parsed during a status request still wake their supervisor.
+        #[test]
+        fn newly_queued_lifecycle_events_rearm_readiness() {
+            struct Notice(std::sync::mpsc::Sender<()>);
+            impl std::task::Wake for Notice {
+                fn wake(self: std::sync::Arc<Self>) {
+                    let _ = self.0.send(());
+                }
+            }
+            let (client, _server) = UnixStream::pair().unwrap();
+            let mut ipc = MpvIpc::new(IpcLink::over(client));
+            let (sender, receiver) = std::sync::mpsc::channel();
+            ipc.link
+                .set_waker(Some(std::task::Waker::from(std::sync::Arc::new(Notice(
+                    sender,
+                )))));
+            receiver.try_iter().for_each(drop);
+            ipc.handle_event(&json!({"event": "file-loaded"}));
+            assert!(
+                receiver.try_recv().is_ok(),
+                "parsed lifecycle must wake even when no unread transport lines remain"
+            );
+        }
+
+        /// A bad frame cannot strand complete events already queued behind it.
+        #[test]
+        fn malformed_unsolicited_frame_rearms_remaining_readiness() {
+            struct Notice(std::sync::mpsc::Sender<()>);
+            impl std::task::Wake for Notice {
+                fn wake(self: std::sync::Arc<Self>) {
+                    let _ = self.0.send(());
+                }
+            }
+            let (client, mut server) = UnixStream::pair().unwrap();
+            let mut ipc = MpvIpc::new(IpcLink::over(client));
+            let (sender, receiver) = std::sync::mpsc::channel();
+            ipc.link
+                .set_waker(Some(std::task::Waker::from(std::sync::Arc::new(Notice(
+                    sender,
+                )))));
+            receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+            server.write_all(b"malformed\n{\"event\":\"property-change\",\"id\":14,\"name\":\"volume\",\"data\":42}\n").unwrap();
+            for _ in 0..2 {
+                receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+            }
+            assert!(ipc.drain_ready().is_err());
+            assert!(
+                receiver.try_recv().is_ok(),
+                "parse errors must not consume the final wake for remaining lines"
+            );
+            ipc.drain_ready().unwrap();
+            assert_eq!(ipc.status.volume, 42);
         }
 
         /// Authored truncation markers remain ASCII without changing original punctuation.
