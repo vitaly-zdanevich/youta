@@ -3619,11 +3619,12 @@ impl ViewModel {
             || self.bug_report_popup.as_ref().is_some_and(|popup| {
                 matches!(popup.submission, GitHubIssueSubmissionView::Submitting)
             })
-            || self
-                .youtube_setup_popup
-                .as_ref()
-                .and_then(|setup| setup.invidious_instances.as_ref())
-                .is_some_and(|picker| picker.loading)
+            || (cfg!(feature = "invidious")
+                && self
+                    .youtube_setup_popup
+                    .as_ref()
+                    .and_then(|setup| setup.invidious_instances.as_ref())
+                    .is_some_and(|picker| picker.loading))
         {
             return true;
         }
@@ -5191,6 +5192,38 @@ mod tests {
         });
         assert!(view.needs_animation_tick());
         view.bug_report_popup.as_mut().unwrap().submission = GitHubIssueSubmissionView::Idle;
+        assert!(!view.needs_animation_tick());
+    }
+
+    /// A provider omitted at compile time cannot render a picker or require its frames.
+    #[test]
+    fn invidious_picker_animation_follows_the_provider_feature() {
+        let mut view = ViewModel {
+            youtube_setup_popup: Some(YouTubeSetupPopupView {
+                invidious_instances: Some(InvidiousInstancePickerView {
+                    loading: true,
+                    ..InvidiousInstancePickerView::default()
+                }),
+                ..YouTubeSetupPopupView::default()
+            }),
+            ..ViewModel::default()
+        };
+        assert_eq!(view.needs_animation_tick(), cfg!(feature = "invidious"));
+        view.search_activity = Some(SearchActivity::YouTube);
+        assert!(
+            view.needs_animation_tick(),
+            "other visible indicators still animate"
+        );
+        view.search_activity = None;
+        view.youtube_setup_popup
+            .as_mut()
+            .unwrap()
+            .invidious_instances
+            .as_mut()
+            .unwrap()
+            .loading = false;
+        assert!(!view.needs_animation_tick());
+        view.youtube_setup_popup = None;
         assert!(!view.needs_animation_tick());
     }
 
