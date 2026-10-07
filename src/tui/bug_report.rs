@@ -149,7 +149,7 @@ pub(super) fn render_popup(
         if field == BugReportField::Title {
             let mut displayed = value.to_owned();
             if selected {
-                displayed.insert_str(rename_cursor_boundary(value, cursor), "▏");
+                displayed.insert_str(editor_cursor_boundary(value, cursor), "▏");
             }
             let viewport = rename_field_viewport(&displayed, cursor, text_area.width);
             frame.render_widget(

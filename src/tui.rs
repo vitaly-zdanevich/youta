@@ -47,6 +47,7 @@ use ratatui::{Terminal, TerminalOptions, Viewport};
 use ratatui_image::StatefulImage as TerminalImage;
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::app::editor_cursor_boundary;
 #[cfg(test)]
 use crate::config::VideoSummaryBackend;
 #[cfg(feature = "commons-upload")]
@@ -14754,7 +14755,7 @@ fn rename_field_viewport(value: &str, cursor_byte: usize, field_width: u16) -> R
     if field_width == 0 {
         return RenameFieldViewport::default();
     }
-    let cursor_byte = rename_cursor_boundary(value, cursor_byte);
+    let cursor_byte = editor_cursor_boundary(value, cursor_byte);
     let cursor_width = terminal_text_width(&value[..cursor_byte]);
     let desired_scroll = cursor_width.saturating_sub(field_width.saturating_sub(1));
     let mut viewport = RenameFieldViewport {
@@ -14820,21 +14821,6 @@ fn render_local_rename_cursor(frame: &mut Frame<'_>, view: &ViewModel, enabled: 
         field_area.x.saturating_add(viewport.cursor_column),
         field_area.y,
     ));
-}
-
-/// Clamps a possibly stale rename cursor to the nearest preceding grapheme
-/// boundary so rendering never splits UTF-8 or a visible character cluster.
-fn rename_cursor_boundary(value: &str, requested: usize) -> usize {
-    let requested = requested.min(value.len());
-    if requested == value.len() {
-        return requested;
-    }
-    value
-        .grapheme_indices(true)
-        .map(|(index, _)| index)
-        .take_while(|index| *index <= requested)
-        .last()
-        .unwrap_or_default()
 }
 
 /// Masks the credential character count without exceeding the ASCII suffix's cell budget.

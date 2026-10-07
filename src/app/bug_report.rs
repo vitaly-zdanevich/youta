@@ -172,7 +172,7 @@ impl AppController {
             });
             return;
         }
-        *cursor = private_note_cursor_boundary(text, *cursor);
+        *cursor = editor_cursor_boundary(text, *cursor);
         text.insert(*cursor, character);
         let inserted_end = cursor.saturating_add(character.len_utf8());
         *cursor = text
@@ -197,7 +197,7 @@ impl AppController {
         let Some((text, cursor)) = selected_text(popup) else {
             return;
         };
-        *cursor = private_note_cursor_boundary(text, *cursor);
+        *cursor = editor_cursor_boundary(text, *cursor);
         let other = moved_private_note_cursor(
             text,
             *cursor,
@@ -293,8 +293,7 @@ impl AppController {
         }
         let title = bounded_issue_title(title);
         popup.title.clone_from(&title);
-        popup.title_cursor_byte =
-            private_note_cursor_boundary(&popup.title, popup.title_cursor_byte);
+        popup.title_cursor_byte = editor_cursor_boundary(&popup.title, popup.title_cursor_byte);
         let screenshot = self
             .bug_report
             .screenshot

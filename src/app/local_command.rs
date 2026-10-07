@@ -67,7 +67,7 @@ impl AppController {
                 }
                 self.edit_local_command(|value, cursor| {
                     if value.len().saturating_add(character.len_utf8()) <= COMMAND_LIMIT {
-                        let at = rename_cursor_boundary(value, *cursor);
+                        let at = editor_cursor_boundary(value, *cursor);
                         value.insert(at, character);
                         *cursor = at.saturating_add(character.len_utf8());
                     }
@@ -80,13 +80,13 @@ impl AppController {
                 }
             }
             UiAction::DeleteLocalCommandCharacter => self.edit_local_command(|value, cursor| {
-                let end = rename_cursor_boundary(value, *cursor);
+                let end = editor_cursor_boundary(value, *cursor);
                 let start = moved_private_note_cursor(value, end, PrivateNoteCursorMotion::Left);
                 value.drain(start..end);
                 *cursor = start;
             }),
             UiAction::DeleteLocalCommandForward => self.edit_local_command(|value, cursor| {
-                let start = rename_cursor_boundary(value, *cursor);
+                let start = editor_cursor_boundary(value, *cursor);
                 let end = moved_private_note_cursor(value, start, PrivateNoteCursorMotion::Right);
                 value.drain(start..end);
                 *cursor = start;

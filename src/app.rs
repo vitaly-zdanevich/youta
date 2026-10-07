@@ -568,8 +568,11 @@ fn one_line_excerpt(value: &str, maximum_characters: usize) -> String {
     excerpt
 }
 
-/// Clamps an editable text cursor to a preceding grapheme boundary.
-fn rename_cursor_boundary(value: &str, requested: usize) -> usize {
+/// Clamps an editor byte offset to the preceding extended grapheme boundary.
+///
+/// Shared by controller edits and terminal rendering so stale or interior-byte
+/// cursors never split UTF-8, combining characters, or joined emoji.
+pub(crate) fn editor_cursor_boundary(value: &str, requested: usize) -> usize {
     let requested = requested.min(value.len());
     if requested == value.len() {
         return requested;
@@ -582,11 +585,6 @@ fn rename_cursor_boundary(value: &str, requested: usize) -> usize {
         .unwrap_or_default()
 }
 
-/// Clamps a private-note cursor to the preceding grapheme boundary.
-fn private_note_cursor_boundary(value: &str, requested: usize) -> usize {
-    rename_cursor_boundary(value, requested)
-}
-
 /// Deletes the Vim-style word immediately before one UTF-8 editor cursor.
 ///
 /// Trailing whitespace is removed before the preceding keyword or
@@ -595,7 +593,7 @@ fn private_note_cursor_boundary(value: &str, requested: usize) -> usize {
 /// A cursor at the start of a non-first line removes only that newline, and no
 /// operation ever splits an extended grapheme cluster.
 fn delete_previous_editor_word(value: &mut String, cursor_byte: &mut usize) -> bool {
-    let cursor = rename_cursor_boundary(value, *cursor_byte);
+    let cursor = editor_cursor_boundary(value, *cursor_byte);
     *cursor_byte = cursor;
     if cursor == 0 {
         return false;
@@ -664,7 +662,7 @@ fn moved_private_note_cursor(
     requested: usize,
     motion: PrivateNoteCursorMotion,
 ) -> usize {
-    let cursor = private_note_cursor_boundary(value, requested);
+    let cursor = editor_cursor_boundary(value, requested);
     match motion {
         PrivateNoteCursorMotion::Left => value[..cursor]
             .grapheme_indices(true)
@@ -7702,7 +7700,7 @@ impl AppController {
         if character.is_control() {
             return;
         }
-        let cursor = rename_cursor_boundary(&self.view.search_query, self.view.search_cursor_byte);
+        let cursor = editor_cursor_boundary(&self.view.search_query, self.view.search_cursor_byte);
         self.view.search_query.insert(cursor, character);
         self.view.search_cursor_byte = cursor.saturating_add(character.len_utf8());
         self.refresh_live_radio_filter();
@@ -7710,7 +7708,7 @@ impl AppController {
 
     /// Removes one grapheme before the cursor and immediately broadens a Radio filter.
     fn delete_search_input_character(&mut self) {
-        let cursor = rename_cursor_boundary(&self.view.search_query, self.view.search_cursor_byte);
+        let cursor = editor_cursor_boundary(&self.view.search_query, self.view.search_cursor_byte);
         let Some((start, _)) = self.view.search_query[..cursor]
             .grapheme_indices(true)
             .next_back()
@@ -7734,7 +7732,7 @@ impl AppController {
 
     /// Moves the search insertion point by one complete displayed grapheme.
     fn move_search_input_cursor(&mut self, direction: i8) {
-        let cursor = rename_cursor_boundary(&self.view.search_query, self.view.search_cursor_byte);
+        let cursor = editor_cursor_boundary(&self.view.search_query, self.view.search_cursor_byte);
         self.view.search_cursor_byte = if direction < 0 {
             self.view.search_query[..cursor]
                 .grapheme_indices(true)
@@ -18633,7 +18631,7 @@ impl AppController {
             ));
             return;
         }
-        let cursor = private_note_cursor_boundary(&popup.body, popup.cursor_byte);
+        let cursor = editor_cursor_boundary(&popup.body, popup.cursor_byte);
         popup.body.insert(cursor, character);
         popup.cursor_byte = cursor.saturating_add(character.len_utf8());
         popup.follow_cursor = true;
@@ -18651,7 +18649,7 @@ impl AppController {
         let Some(popup) = self.view.private_note_popup.as_mut() else {
             return;
         };
-        let cursor = private_note_cursor_boundary(&popup.body, popup.cursor_byte);
+        let cursor = editor_cursor_boundary(&popup.body, popup.cursor_byte);
         let Some(start) = popup.body[..cursor]
             .grapheme_indices(true)
             .next_back()
@@ -32264,7 +32262,7 @@ impl AppController {
             return;
         };
         if value.len().saturating_add(character.len_utf8()) <= 255 {
-            let cursor = rename_cursor_boundary(value, *cursor_byte);
+            let cursor = editor_cursor_boundary(value, *cursor_byte);
             value.insert(cursor, character);
             *cursor_byte = cursor.saturating_add(character.len_utf8());
             *error = None;
@@ -32279,7 +32277,7 @@ impl AppController {
         else {
             return;
         };
-        let cursor = rename_cursor_boundary(value, *cursor_byte);
+        let cursor = editor_cursor_boundary(value, *cursor_byte);
         *cursor_byte = if direction < 0 {
             value[..cursor]
                 .grapheme_indices(true)
@@ -32302,7 +32300,7 @@ impl AppController {
             error,
         }) = self.view.local_file_popup.as_mut()
         {
-            let cursor = rename_cursor_boundary(value, *cursor_byte);
+            let cursor = editor_cursor_boundary(value, *cursor_byte);
             let previous = value[..cursor]
                 .grapheme_indices(true)
                 .next_back()
@@ -47413,6 +47411,31 @@ pub fn is_confined_path(root: &Path, candidate: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// Editing and rendering clamp byte offsets without splitting visible text.
+    #[test]
+    fn editor_cursor_clamps_to_complete_graphemes() {
+        let cases: &[(&str, &[(usize, usize)])] = &[
+            ("", &[(0, 0), (usize::MAX, 0)]),
+            ("abc", &[(0, 0), (1, 1), (2, 2), (3, 3), (usize::MAX, 3)]),
+            ("é", &[(0, 0), (1, 0), (2, 2), (usize::MAX, 2)]),
+            ("e\u{301}x", &[(0, 0), (1, 0), (2, 0), (3, 3), (4, 4)]),
+            ("a🇧🇾b", &[(0, 0), (1, 1), (4, 1), (8, 1), (9, 9), (10, 10)]),
+            (
+                "👩‍💻!",
+                &[(0, 0), (3, 0), (4, 0), (7, 0), (10, 0), (11, 11), (12, 12)],
+            ),
+        ];
+        for (text, offsets) in cases {
+            for (requested, expected) in *offsets {
+                assert_eq!(
+                    editor_cursor_boundary(text, *requested),
+                    *expected,
+                    "text {text:?}, byte offset {requested}"
+                );
+            }
+        }
+    }
+
     #[cfg(feature = "archive-org")]
     #[path = "archive_playback_choice.rs"]
     mod archive_playback_choice_tests;
