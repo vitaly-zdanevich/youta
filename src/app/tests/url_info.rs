@@ -2,10 +2,15 @@
 
 use super::*;
 
+/// Uses a drive-qualified path on Windows without creating or probing a fixture file.
+fn url_info_fixture_path(name: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("youta-url-info-{name}.mp3"))
+}
+
 /// Installs a tagged local item without probing the filesystem.
 fn url_info_controller() -> AppController {
     let (mut controller, _) = controller_with_mock_statuses([]);
-    let path = PathBuf::from("/tmp/youta-url-info-fixture.mp3");
+    let path = url_info_fixture_path("fixture");
     select_url_info_local(
         &mut controller,
         &path,
@@ -17,6 +22,14 @@ fn url_info_controller() -> AppController {
 
 /// Changes selection using in-memory rows and tags, without any metadata worker.
 fn select_url_info_local(controller: &mut AppController, path: &Path, comment: &str) {
+    assert!(
+        path.is_absolute(),
+        "Local fixtures need native absolute paths"
+    );
+    assert_eq!(
+        local_path_from_media_id(&local_media_id(path)).as_deref(),
+        Some(path)
+    );
     let mut item = local_media_item_stub(path.to_owned(), Some(10));
     item.comment = Some(comment.into());
     controller.local_results = vec![item];
@@ -167,7 +180,7 @@ fn url_info_late_local_completion_cannot_cross_selection_or_poison_cache() {
         .unwrap();
     select_url_info_local(
         &mut controller,
-        Path::new("/tmp/youta-url-info-other.mp3"),
+        &url_info_fixture_path("other"),
         "See https://example.com/page. Original comment.",
     );
     controller.refresh_url_info();
@@ -246,7 +259,7 @@ fn url_info_completed_results_are_cached_by_url_but_never_auto_expanded() {
     );
     select_url_info_local(
         &mut controller,
-        Path::new("/tmp/youta-url-info-cache-reuse.mp3"),
+        &url_info_fixture_path("cache-reuse"),
         "https://example.com/page#another-fragment",
     );
     controller.refresh_url_info();
