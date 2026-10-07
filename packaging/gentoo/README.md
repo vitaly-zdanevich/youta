@@ -17,9 +17,20 @@ the provider from the terminal and optional desktop builds. Configuration,
 desktop compilation, and desktop tests all disable Cargo defaults and select
 the feature explicitly from USE.
 
-`+cmd` enables the terminal Local-tab Bash command prompt by default and requires
-`local` and `tui`. `USE="-cmd"` omits its runner, editor, and command-history
-implementation; the desktop does not provide this terminal-only prompt.
+`+cmd` enables provider-filtered command buttons in the TUI and GUI, plus the
+terminal-only Local-tab `:` Bash prompt. It requires Bash and at least one of
+`tui` or `gui`; it no longer requires the `local` USE flag. The feature is
+selected explicitly for both frontend builds. `USE="-cmd"` omits the buttons,
+runner, terminal editor, and command-history implementation from both.
+
+Buttons use the extensionless `~/.config/youta/commands` TOML file. Youta creates
+a disabled `commands.sample`; rename it to `commands` and restart to enable it.
+An omitted `provider` matches every eligible provider. `%` passes the selected
+original URL (full Local path); `%d` reuses a downloaded file or waits for the
+normal download workflow before execution. The GUI uses a blocking output
+dialog without standard input; the TUI uses its foreground terminal. See the
+[command-button configuration and safety notes](../../README.md#local-files-and-archives)
+and [sample](../../commands.sample) for fields, hotkeys, and examples.
 
 The binary package cannot remove a compiled provider without separate
 upstream release variants. Use `media-sound/youta`, not `youta-bin`, when

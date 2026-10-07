@@ -7,6 +7,7 @@ import { highlightRanges } from '../searchHighlights';
 import { Artwork } from "./Artwork";
 import { Description, WikidataSpoiler } from "./Description";
 import { SearchHighlight } from './SearchHighlight';
+import { CustomCommandButtons } from './CustomCommands';
 
 /**
  * Pixels the reducer's scroll counter steps by.
@@ -509,6 +510,7 @@ export function Details({ view, kind }: { view: ViewModel; kind: InformationPane
         {view.screen === "Downloaded" ? (
           <Action onClick={() => void dispatch("RequestDownloadedTrash")}>Move to Trash</Action>
         ) : null}
+		<CustomCommandButtons buttons={view.custom_command_buttons ?? []} />
 		{details.local_copyable ? (
 			<Action onClick={() => void dispatch('BeginLocalCopy')}>Copy</Action>
 		) : null}

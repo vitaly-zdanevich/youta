@@ -441,8 +441,8 @@ or a second
 Enter a Bash command for the selected Local file or folder in the seek-bar area.
 The default-on
 .B cmd
-build feature requires Bash and a Unix terminal; commands are unavailable in
-the GUI and inside read-only archive folders.
+build feature requires Bash; the colon editor also requires a Unix terminal
+and is unavailable in the GUI and inside read-only archive folders.
 .B Enter
 runs the command in the displayed directory with terminal input and output;
 .B Esc
@@ -490,6 +490,9 @@ Omit cmd from an explicit Cargo
 build or use Gentoo
 .B USE=\(dq\-cmd\(dq
 to remove command support.
+.IP
+The same default-on feature also provides configured command buttons in
+terminal and GUI Details; see CUSTOM COMMAND BUTTONS below.
 .TP
 .B r
 Rename the selected Local entry when supported.
@@ -753,6 +756,63 @@ Omit the
 Cargo feature, or use Gentoo
 .BR USE="-cache" ,
 to remove RAM audio caching from both frontends.
+.SH CUSTOM COMMAND BUTTONS
+The default-on Cargo feature and Gentoo USE flag
+.B cmd
+enable buttons in both the TUI and GUI. Youta creates a disabled
+.I commands.sample
+in the application directory without replacing an existing sample.
+Rename it to the extensionless
+.I commands
+file to enable it. Restart Youta to reload changes.
+.PP
+The file is TOML with one
+.B [[commands]]
+table per button. Fields
+.B name
+and
+.B command
+are required.
+.B description
+is an optional configuration note and is never displayed.
+Optional
+.B provider
+restricts the button to the selected item's actual source, not its tab;
+examples are local, youtube, and rss. Omit it for all eligible providers.
+Optional
+.B font_color
+and
+.B background_color
+accept #rgb or #rrggbb values.
+.PP
+An unquoted
+.B %
+passes the original selected provider URL as one argument.
+.B %d
+passes a downloaded file path: reuse a completed download, or use the normal
+download/format chooser and wait for completion before executing.
+Failed or cancelled downloads never execute the command.
+For Local items both macros pass the same full filesystem path.
+Suffixes such as
+.B %d.flac
+are supported; quoted or escaped percent signs remain literal.
+Buttons are unavailable inside read-only archive folders.
+.PP
+Optional
+.B hotkey
+accepts a character, named key, or F1-F24 with Ctrl+, Alt+, or Shift+ modifiers.
+It overrides built-in shortcuts only in the normal eligible selection context,
+never while an editor or popup owns input.
+.B Ctrl+C
+and
+.B Ctrl+Alt+B
+are reserved. Shortcuts may repeat only for disjoint provider filters.
+Nothing runs until a button or its hotkey is invoked.
+.PP
+The TUI runs commands in its foreground terminal. The GUI blocks interaction
+in an output dialog until completion, captures bounded stdout and stderr,
+and provides no standard input. Commands use Bash with the user's permissions;
+they are not sandboxed and may modify or delete files.
 .SH CONFIGURATION
 On Linux the default application directory is
 .IR $XDG_CONFIG_HOME/youta ,
@@ -799,6 +859,14 @@ Provider credentials.
 .TP
 .I subscriptions.opml
 Portable local subscriptions to RSS, podcast, and compatible channel feeds.
+.TP
+.I commands
+Optional extensionless TOML command-button configuration for the cmd feature.
+Restart Youta after edits; see CUSTOM COMMAND BUTTONS.
+.TP
+.I commands.sample
+Disabled command-button example, generated only if absent. Never loaded or
+executed; rename to commands to enable it.
 .TP
 .I cmd-log
 Plaintext Local command history: the latest 100 submitted commands,

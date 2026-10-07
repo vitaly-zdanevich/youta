@@ -20,6 +20,8 @@ mod bandcamp_resolver;
 mod bug_report;
 #[cfg(all(feature = "yt-dlp", feature = "backend-mpv"))]
 mod cached_download;
+#[cfg(feature = "cmd")]
+mod custom_commands;
 mod deadlines;
 #[cfg(feature = "yt-dlp")]
 mod download_choice;
@@ -4949,6 +4951,9 @@ pub struct AppController {
     /// Private Local command history and the one captured foreground execution.
     #[cfg(feature = "cmd")]
     local_command: local_command::LocalCommandState,
+    /// Validated custom buttons and one frontend-owned command execution.
+    #[cfg(feature = "cmd")]
+    custom_commands: custom_commands::CustomCommands,
     /// Session-only URLs and isolated bounded HTTP folder work.
     #[cfg(feature = "web-browser")]
     web: web::WebState,
@@ -6500,6 +6505,8 @@ impl AppController {
             local_listing: None,
             #[cfg(feature = "cmd")]
             local_command: local_command::LocalCommandState::default(),
+            #[cfg(feature = "cmd")]
+            custom_commands: custom_commands::CustomCommands::default(),
             #[cfg(feature = "lan-sharing")]
             lan_share_server: None,
             #[cfg(feature = "lan-sharing")]
@@ -35689,6 +35696,17 @@ impl UiController for AppController {
 
     fn dispatch(&mut self, action: UiAction) {
         #[cfg(feature = "cmd")]
+        if self.custom_commands.running || self.view.custom_command_output.is_some() {
+            match action {
+                UiAction::DismissCustomCommandOutput if !self.custom_commands.running => {
+                    self.view.custom_command_output = None;
+                }
+                UiAction::SetTerminalWindowPixels { .. }
+                | UiAction::SetExternalOpenerAvailable(_) => {}
+                _ => return,
+            }
+        }
+        #[cfg(feature = "cmd")]
         if (self.view.local_command.is_some() || self.local_command.running)
             && !local_command::command_action(&action)
             && !matches!(
@@ -37115,6 +37133,10 @@ impl UiController for AppController {
             | UiAction::DismissLocalCommand => {
                 self.dispatch_local_command(action);
             }
+            #[cfg(feature = "cmd")]
+            UiAction::RunCustomCommand(index) => self.run_custom_command(index),
+            #[cfg(feature = "cmd")]
+            UiAction::DismissCustomCommandOutput => {}
             UiAction::BeginLocalRename => self.begin_local_rename(),
             UiAction::AppendLocalRenameCharacter(character) => {
                 self.append_local_rename_character(character);
@@ -37199,6 +37221,8 @@ impl UiController for AppController {
         }
         self.refresh_playback_preparation_activity();
         self.refresh_email_links();
+        #[cfg(feature = "cmd")]
+        self.refresh_custom_command_buttons();
     }
 
     fn take_clipboard_request(&mut self) -> Option<ClipboardRequest> {
@@ -37299,6 +37323,24 @@ impl UiController for AppController {
     #[cfg(feature = "cmd")]
     fn report_local_command_result(&mut self, result: Result<(), String>) {
         self.finish_local_command(result);
+    }
+
+    #[cfg(feature = "cmd")]
+    fn set_custom_command_mode(&mut self, mode: crate::view::CustomCommandMode) {
+        self.configure_custom_commands(mode);
+    }
+
+    #[cfg(feature = "cmd")]
+    fn take_custom_command_plan(&mut self) -> Option<crate::local_command::ShellCommandPlan> {
+        self.custom_commands.pending.take()
+    }
+
+    #[cfg(feature = "cmd")]
+    fn report_custom_command_result(
+        &mut self,
+        result: Result<crate::local_command::CommandOutput, String>,
+    ) {
+        self.finish_custom_command(result);
     }
 
     #[cfg(feature = "local-browser")]
@@ -37474,6 +37516,8 @@ impl UiController for AppController {
         }
         self.refresh_playback_preparation_activity();
         self.refresh_email_links();
+        #[cfg(feature = "cmd")]
+        self.refresh_custom_command_buttons();
     }
 }
 
@@ -47447,6 +47491,9 @@ mod tests {
     #[cfg(all(feature = "yt-dlp", feature = "backend-mpv"))]
     #[path = "cached_download.rs"]
     mod cached_download_tests;
+    #[cfg(all(feature = "cmd", feature = "yt-dlp"))]
+    #[path = "custom_commands.rs"]
+    mod custom_command_tests;
     #[cfg(feature = "yt-dlp")]
     #[path = "download_choice.rs"]
     mod download_choice_tests;

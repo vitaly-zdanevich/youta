@@ -80,6 +80,7 @@ export type UnitUiAction =
 	| 'SubmitBugReport'
 	| 'CopyBugReport'
 	| 'DismissBugReport'
+	| 'DismissCustomCommandOutput'
 	| 'OpenBugReportResult'
 	| 'ActivateLocalMoveDestination'
 	| 'ActivateSelection'
@@ -241,6 +242,7 @@ export type UnitUiAction =
  * generations, and explicit null values are part of the wire contract.
  */
 export interface UiActionPayloads {
+	RunCustomCommand: number;
 	SelectBugReportField: BugReportField;
 	MoveBugReportField: number;
 	AppendBugReportCharacter: string;

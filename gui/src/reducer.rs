@@ -32,10 +32,14 @@ use serde::Serialize;
 use youta::app::AppController;
 use youta::config::Config;
 use youta::keymap::{KeyPress, PopupGeometry, key_action};
+#[cfg(feature = "cmd")]
+use youta::local_command::{CommandOutput, ShellCommandPlan};
 use youta::persistence::{ANOTHER_INSTANCE_MESSAGE, PersistenceError, StateStore};
 use youta::playback::configured_playback_factory;
 use youta::providers::configured_youtube_provider;
 use youta::text_file_open::{TextFileOpenLifecycle, spawn_detached_text_file_open};
+#[cfg(feature = "cmd")]
+use youta::view::CustomCommandMode;
 use youta::view::{UiAction, UiController, ViewModel, WaveformView};
 use youta::waveform::Peak;
 
@@ -292,6 +296,9 @@ pub enum FrontendAction {
 enum Message {
     /// Queued worker responses are ready; the reducer remains their sole consumer.
     WorkerReady,
+    /// A desktop shell worker completed; only the reducer publishes its private output.
+    #[cfg(feature = "cmd")]
+    CustomCommandFinished(Result<CommandOutput, String>),
     /// A semantic action from the window.
     Action(UiAction),
     /// Renderer capture with no provider or application policy in the frontend.
@@ -503,6 +510,8 @@ pub fn start<R: Runtime>(
     let published_artwork = Arc::clone(&artwork);
     let exit_authorization = ExitAuthorization::default();
     let reducer_exit_authorization = exit_authorization.clone();
+    #[cfg(feature = "cmd")]
+    let command_sender = Arc::clone(&action_sender);
 
     thread::Builder::new()
         .name("youta-reducer".to_owned())
@@ -530,6 +539,8 @@ pub fn start<R: Runtime>(
             // browsing costs no decoder process, exactly as in the terminal.
             let playback = configured_playback_factory(&config);
             let mut controller = AppController::new(config, store, provider, playback);
+            #[cfg(feature = "cmd")]
+            controller.set_custom_command_mode(CustomCommandMode::Dialog);
             controller.set_worker_waker(Some(Waker::from(worker_wake.clone())));
 
             published_artwork.record(controller.view());
@@ -547,6 +558,8 @@ pub fn start<R: Runtime>(
                 &focus,
                 &reducer_exit_authorization,
                 &worker_wake,
+                #[cfg(feature = "cmd")]
+                &command_sender,
             );
             controller.set_worker_waker(None);
             // Every exit from `run` lands here, so the player process is killed
@@ -603,6 +616,8 @@ fn apply<R: Runtime>(app: &AppHandle<R>, controller: &mut AppController, message
             None => {}
         },
         Message::WorkerReady => {}
+        #[cfg(feature = "cmd")]
+        Message::CustomCommandFinished(result) => controller.report_custom_command_result(result),
         Message::Stop => return false,
     }
     true
@@ -676,7 +691,7 @@ impl TrafficMeter {
 
 /// Performs the side effects the controller planned but cannot carry out.
 ///
-/// Both of these are deliberately not the reducer's to do. The controller
+/// These are deliberately not the reducer's to do. The controller
 /// decides *that* a link should be copied and *which* command opens a text
 /// file; how a clipboard is reached and how a child process is started differ
 /// between a terminal and a window, so each front-end supplies its own half.
@@ -685,7 +700,11 @@ impl TrafficMeter {
 /// written to its own tty. Neither exists here — a window has the platform
 /// clipboard directly, and an escape sequence would be written into a stdout
 /// nobody reads and then reported as a successful copy.
-fn serve_side_effects<R: Runtime>(app: &AppHandle<R>, controller: &mut AppController) {
+fn serve_side_effects<R: Runtime>(
+    app: &AppHandle<R>,
+    controller: &mut AppController,
+    #[cfg(feature = "cmd")] command_sender: &Arc<Sender<Message>>,
+) {
     if let Some(request) = controller.take_clipboard_request() {
         controller.report_clipboard_result(
             app.clipboard()
@@ -705,6 +724,28 @@ fn serve_side_effects<R: Runtime>(app: &AppHandle<R>, controller: &mut AppContro
             spawn_detached_text_file_open(&plan).map(|()| TextFileOpenLifecycle::Detached),
         );
     }
+    #[cfg(feature = "cmd")]
+    if let Some(plan) = controller.take_custom_command_plan()
+        && let Err(error) = spawn_custom_command(plan, Arc::clone(command_sender))
+    {
+        controller.report_custom_command_result(Err(error));
+    }
+}
+
+/// Runs Bash away from reducer ticks and wakes the inbox with its bounded result.
+#[cfg(feature = "cmd")]
+fn spawn_custom_command(
+    plan: ShellCommandPlan,
+    sender: Arc<Sender<Message>>,
+) -> Result<(), String> {
+    thread::Builder::new()
+        .name("youta-custom-command".to_owned())
+        .spawn(move || {
+            let result = plan.capture_output();
+            let _ = sender.send(Message::CustomCommandFinished(result));
+        })
+        .map(|_| ())
+        .map_err(|error| format!("cannot start the command worker: {error}"))
 }
 
 /// Applies actions, pumps workers, and publishes the view when it changes.
@@ -717,6 +758,7 @@ fn run<R: Runtime>(
     focus: &WindowFocus,
     exit_authorization: &ExitAuthorization,
     worker_wake: &ReducerWake,
+    #[cfg(feature = "cmd")] command_sender: &Arc<Sender<Message>>,
 ) {
     let mut last = controller.view().clone();
     let mut traffic = TrafficMeter::new();
@@ -736,13 +778,8 @@ fn run<R: Runtime>(
     loop {
         let wait = redraw_delay(controller.view()).min(controller.next_tick_delay());
         match actions.recv_timeout(wait) {
-            Ok(
-                message @ (Message::WorkerReady
-                | Message::Action(_)
-                | Message::Frontend(_)
-                | Message::Key { .. }
-                | Message::Media(_)),
-            ) => {
+            Ok(Message::Stop) | Err(RecvTimeoutError::Disconnected) => return,
+            Ok(message) => {
                 if !apply(app, controller, message) {
                     return;
                 }
@@ -759,14 +796,18 @@ fn run<R: Runtime>(
                     }
                 }
             }
-            Ok(Message::Stop) | Err(RecvTimeoutError::Disconnected) => return,
             Err(RecvTimeoutError::Timeout) => {}
         }
 
         // Clear before consuming responses, so a completion arriving after its
         // queue was drained can enqueue another wake instead of being lost.
         worker_wake.acknowledge();
-        serve_side_effects(app, controller);
+        serve_side_effects(
+            app,
+            controller,
+            #[cfg(feature = "cmd")]
+            command_sender,
+        );
         controller.tick();
 
         // `ViewModel` derives `PartialEq`, so an unchanged frame costs one
@@ -888,6 +929,33 @@ mod tests {
         ));
         wake.acknowledge();
         waker.wake_by_ref();
+    }
+
+    /// A shell worker wakes the existing inbox with its result, without reducer polling.
+    #[cfg(all(feature = "cmd", unix))]
+    #[test]
+    fn custom_command_worker_returns_one_private_completion_message() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (sender, inbox) = channel();
+        let plan = youta::local_command::ShellCommandPlan {
+            template: "printf 'worker fixture'; printf 'failure fixture' >&2; exit 3".to_owned(),
+            argument: "https://example.org/selected-item".into(),
+            downloaded_path: None,
+            directory: temporary.path().to_owned(),
+        };
+        super::spawn_custom_command(plan, Arc::new(sender)).unwrap();
+        let Message::CustomCommandFinished(result) = inbox
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+        else {
+            panic!("expected command completion");
+        };
+        let output = result.unwrap();
+        assert!(!output.success);
+        assert!(output.output.contains("worker fixture"));
+        assert!(output.output.contains("failure fixture"));
+        assert!(!format!("{output:?}").contains("fixture"));
+        assert!(inbox.try_recv().is_err());
     }
 
     /// Builds a reducer over a private configuration directory.

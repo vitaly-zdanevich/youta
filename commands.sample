@@ -1,0 +1,36 @@
+# Optional command buttons for Youta. This sample is disabled.
+# Rename this file to commands in the same directory to enable it, then restart
+# Youta. Only commands is loaded; edits are read when Youta starts.
+#
+# Add one [[commands]] table per button. name and command are required.
+# description is only a configuration note; Youta never displays it.
+# provider is optional: omit it to offer the button for every provider, or set
+# a canonical provider name such as 'local', 'youtube', 'rss', or 'bandcamp'.
+#
+# Commands use Bash. An unquoted argument-start % passes the original selected
+# provider URL as one argument. %d passes its downloaded file path: Youta reuses
+# an existing download, or uses the normal download/format chooser and waits
+# for the download to finish before running the command. Failed or cancelled
+# downloads do not run commands. For Local selections, % and %d both pass the
+# full selected filesystem path. %.flac or %d.flac appends a suffix.
+# Quoted/escaped percent signs remain literal, so printf '%s\n' % keeps its
+# format. For complex Bash grammar, use the quoted "$1" argument instead of %.
+# Selected targets are never interpolated as shell source.
+# No command runs until you click its button or press its configured hotkey.
+#
+# hotkey is optional: use a character, a named key such as Delete, or F1-F24,
+# optionally prefixed with Ctrl+, Alt+, or Shift+. Hotkeys override built-in
+# shortcuts only for a normal eligible selection, never while an editor or
+# popup owns input. Ctrl+C and Ctrl+Alt+B are reserved. Shortcuts must be unique
+# within a provider; different provider filters may reuse a shortcut.
+# For printable shifted punctuation, use the resulting character itself.
+# font_color and background_color are optional #rgb or #rrggbb colors.
+
+[[commands]]
+name = 'Convert to FLAC'
+description = 'Create a FLAC copy beside the selected local file without overwriting existing output.'
+command = 'ffmpeg -n -i % %.flac'
+provider = 'local'
+hotkey = 'Ctrl+Alt+F'
+font_color = '#fff'
+background_color = '#245'

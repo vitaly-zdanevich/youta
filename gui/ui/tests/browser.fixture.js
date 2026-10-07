@@ -144,6 +144,41 @@
 		description: 'Complete fixture description.\nSecond paragraph remains visible.',
 		webpage_url: 'https://archive.org/details/fixture',
 	});
+	/** Configured actions work for provider and Local selections through the same private dialog. */
+	async function checkCustomCommands() {
+		const previous = clone(view);
+		const control = { id: 9, name: 'Fixture command', hotkey: 'Ctrl+Alt+F', font_color: '#ffffff', background_color: '#224455' };
+		for (const [screen, source] of [['Search', 'you-tube'], ['Local', 'local']]) {
+			const selected = { source, external_id: source === 'local' ? '/tmp/fixture.mp3' : 'fixture-video' };
+			snapshot({ screen, details: details('Custom command selection', selected), rows: [row('Selected', selected)],
+				custom_command_buttons: [control], custom_command_output: null });
+			const run = await until(() => button('[Ctrl+Alt+F] Fixture command'), `${screen} configured button`);
+			assert(getComputedStyle(run).color === 'rgb(255, 255, 255)' && getComputedStyle(run).backgroundColor === 'rgb(34, 68, 85)',
+				`${screen} configured colors reach the rendered button`);
+			await action({ RunCustomCommand: 9 }, () => run.click(), `${screen} command click carries the stable configured id`);
+		}
+		await key('f', { Char: 'f' }, { ctrlKey: true, altKey: true });
+		const running = { name: control.name, running: true, output: '', failed: false };
+		snapshot({ custom_command_output: running });
+		await until(() => dialog()?.textContent.includes('Running'), 'running custom command dialog');
+		assert([...dialog().querySelectorAll('button')].every((node) => node.disabled), 'Running commands cannot dismiss their output dialog');
+		const beforeClose = calls.length;
+		button('Close', dialog()).click();
+		assert(calls.length === beforeClose, 'Disabled command Close never dispatches');
+		const output = '<script>private command output</script>\nsecond line';
+		snapshot({ custom_command_output: { ...running, running: false, failed: true, output } });
+		await until(() => dialog()?.querySelector('[data-custom-command-output]')?.textContent.includes(output), 'literal command output');
+		assert(!dialog().querySelector('script') && dialog().textContent.includes('Command failed.'), 'Command output remains selectable text and reports failure');
+		const beforeReport = calls.length;
+		document.dispatchEvent(new KeyboardEvent('keydown', { key: 'b', ctrlKey: true, altKey: true, bubbles: true, cancelable: true }));
+		await until(() => calls.slice(beforeReport).some((call) => call.command === 'frontend'), 'private output report capture');
+		assert(calls.slice(beforeReport).find((call) => call.command === 'frontend').args.action.OpenBugReport.screenshot === null,
+			'Command output is excluded from bug-report screenshots');
+		await action('DismissCustomCommandOutput', () => button('Close', dialog()).click(), 'Completed command closes through the reducer');
+		snapshot({ ...previous, custom_command_buttons: undefined, custom_command_output: undefined });
+		await until(() => !button('[Ctrl+Alt+F] Fixture command') && !dialog(), 'feature-trimmed custom commands');
+	}
+
 	/** Core-projected email spans stay literal, selectable and explicitly activated through native actions. */
 	async function checkEmailLinks() {
 		const previous = clone(view);
@@ -1097,6 +1132,7 @@
 		await checkLocalFullPath();
 		await checkLocalTrackMetadata();
 		await checkLocalActionOrder();
+		await checkCustomCommands();
 		await checkLocalCopy();
 		await checkArchiveLocalUpload();
 		await checkEvernoteButton();

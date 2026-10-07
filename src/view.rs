@@ -1577,6 +1577,63 @@ impl Default for PlaylistPopupView {
     }
 }
 
+/// Frontend-owned execution transport for explicitly invoked custom commands.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg(feature = "cmd")]
+pub enum CustomCommandMode {
+    /// This frontend cannot execute configured commands.
+    #[default]
+    Unavailable,
+    /// Surrender the controlling terminal and retain its output until a key press.
+    Terminal,
+    /// Run without terminal input and retain bounded output in a desktop dialog.
+    Dialog,
+}
+
+/// Public command control; shell source and configuration descriptions never cross IPC.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+#[cfg(feature = "cmd")]
+pub struct CustomCommandButtonView {
+    /// Stable zero-based index in the loaded command configuration.
+    pub id: usize,
+    /// User-authored button name.
+    pub name: String,
+    /// Human-readable optional shortcut.
+    pub hotkey: Option<String>,
+    /// Validated six-digit RGB foreground color.
+    pub font_color: Option<String>,
+    /// Validated six-digit RGB background color.
+    pub background_color: Option<String>,
+    /// Parsed shortcut consumed by the shared Rust keymap, never JavaScript.
+    #[serde(skip)]
+    pub binding: Option<crate::local_command::buttons::Hotkey>,
+}
+
+/// Explicit command-output dialog; never captured in bug-report screenshots or Debug.
+#[derive(Clone, Default, Eq, PartialEq, Serialize)]
+#[cfg(feature = "cmd")]
+pub struct CustomCommandOutputView {
+    /// Name of the invoked button, not its command template.
+    pub name: String,
+    /// The command still owns the UI and cannot be dismissed yet.
+    pub running: bool,
+    /// Bounded output visible only in this explicit dialog.
+    pub output: String,
+    /// Whether starting or executing the command failed.
+    pub failed: bool,
+}
+
+#[cfg(feature = "cmd")]
+impl std::fmt::Debug for CustomCommandOutputView {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CustomCommandOutputView")
+            .field("running", &self.running)
+            .field("failed", &self.failed)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Private one-line shell input owned by the terminal's Local command mode.
 #[derive(Clone, Default, Eq, PartialEq)]
 #[cfg(feature = "cmd")]
@@ -3461,6 +3518,12 @@ pub struct ViewModel {
     )]
     #[cfg(feature = "cmd")]
     pub local_command: Option<LocalCommandView>,
+    /// Custom controls matching the selected provider, without executable source.
+    #[cfg(feature = "cmd")]
+    pub custom_command_buttons: Vec<CustomCommandButtonView>,
+    /// Foreground desktop command progress and its retained, bounded output.
+    #[cfg(feature = "cmd")]
+    pub custom_command_output: Option<CustomCommandOutputView>,
     /// Whether this build can supervise a full-channel `yt-dlp` download.
     pub channel_download_supported: bool,
     /// Review-first confirmation for downloading every public channel upload.
@@ -3483,7 +3546,7 @@ impl ViewModel {
     #[must_use]
     pub fn bug_report_screenshot_allowed(&self) -> bool {
         #[cfg(feature = "cmd")]
-        if self.local_command.is_some() {
+        if self.local_command.is_some() || self.custom_command_output.is_some() {
             return false;
         }
         if self.bug_report_popup.is_some()
@@ -3888,6 +3951,10 @@ impl Default for ViewModel {
             local_command_available: false,
             #[cfg(feature = "cmd")]
             local_command: None,
+            #[cfg(feature = "cmd")]
+            custom_command_buttons: Vec::new(),
+            #[cfg(feature = "cmd")]
+            custom_command_output: None,
             channel_download_supported: cfg!(feature = "yt-dlp"),
             #[cfg(feature = "yt-dlp")]
             channel_download_popup: None,
@@ -4799,6 +4866,12 @@ pub enum UiAction {
     /// Close the Local shell prompt without executing anything.
     #[cfg(feature = "cmd")]
     DismissLocalCommand,
+    /// Invoke one configured command against the exact selected target.
+    #[cfg(feature = "cmd")]
+    RunCustomCommand(usize),
+    /// Close the retained command output after the process has exited.
+    #[cfg(feature = "cmd")]
+    DismissCustomCommandOutput,
     /// Open a basename editor for the selected regular local file.
     BeginLocalRename,
     /// Add one printable character to the local rename basename.
@@ -5015,6 +5088,24 @@ pub trait UiController {
     /// Refreshes the captured Local folder after its foreground shell returns.
     #[cfg(feature = "cmd")]
     fn report_local_command_result(&mut self, _result: Result<(), String>) {}
+
+    /// Advertises the frontend's custom-command execution and output transport.
+    #[cfg(feature = "cmd")]
+    fn set_custom_command_mode(&mut self, _mode: CustomCommandMode) {}
+
+    /// Takes one explicitly invoked, target-bound custom command exactly once.
+    #[cfg(feature = "cmd")]
+    fn take_custom_command_plan(&mut self) -> Option<crate::local_command::ShellCommandPlan> {
+        None
+    }
+
+    /// Accepts the completed foreground command and refreshes any captured Local folder.
+    #[cfg(feature = "cmd")]
+    fn report_custom_command_result(
+        &mut self,
+        _result: Result<crate::local_command::CommandOutput, String>,
+    ) {
+    }
 }
 
 #[cfg(test)]

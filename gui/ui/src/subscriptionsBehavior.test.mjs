@@ -99,6 +99,7 @@ function detailsRequire(name) {
 	if (name === './Artwork') return { Artwork: () => null };
 	if (name === './Description') return { Description: () => null, WikidataSpoiler: () => null };
 	if (name === './SearchHighlight') return { SearchHighlight: ({ text }) => text };
+	if (name === './CustomCommands') return { CustomCommandButtons: () => null };
 	return require(name);
 }
 

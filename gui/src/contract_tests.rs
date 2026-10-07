@@ -162,6 +162,8 @@ fn field_belongs_to_disabled_feature(interface: &str, field: &str) -> bool {
     interface == "ViewModel"
         && ((!cfg!(feature = "ascii-visualizer")
             && matches!(field, "ascii_visualizer" | "ascii_visualizer_supported"))
+            || (!cfg!(feature = "cmd")
+                && matches!(field, "custom_command_buttons" | "custom_command_output"))
             || (!cfg!(feature = "commons-upload")
                 && matches!(
                     field,
@@ -210,6 +212,7 @@ fn field_belongs_to_disabled_feature(interface: &str, field: &str) -> bool {
 fn action_belongs_to_disabled_feature(name: &str) -> bool {
     action_contract::action_belongs_to_disabled_feature(name, |feature| match feature {
         "ascii-visualizer" => cfg!(feature = "ascii-visualizer"),
+        "cmd" => cfg!(feature = "cmd"),
         "commons-upload" => cfg!(feature = "commons-upload"),
         "s3-upload" => cfg!(feature = "s3-upload"),
         "archive-upload" => cfg!(feature = "archive-upload"),
@@ -223,6 +226,14 @@ fn action_belongs_to_disabled_feature(name: &str) -> bool {
 
 #[test]
 fn optional_contract_exemptions_follow_the_compiled_feature_set() {
+    assert_eq!(
+        field_belongs_to_disabled_feature("ViewModel", "custom_command_buttons"),
+        !cfg!(feature = "cmd")
+    );
+    assert_eq!(
+        action_belongs_to_disabled_feature("RunCustomCommand"),
+        !cfg!(feature = "cmd")
+    );
     assert_eq!(
         field_belongs_to_disabled_feature("ViewModel", "ascii_visualizer"),
         !cfg!(feature = "ascii-visualizer")
@@ -445,6 +456,17 @@ fn the_typescript_contract_names_only_fields_the_reducer_emits() {
         );
     }
     emitted.insert("DetailView", emitted_keys(&DetailView::default()));
+    #[cfg(feature = "cmd")]
+    {
+        emitted.insert(
+            "CustomCommandButtonView",
+            emitted_keys(&youta::view::CustomCommandButtonView::default()),
+        );
+        emitted.insert(
+            "CustomCommandOutputView",
+            emitted_keys(&youta::view::CustomCommandOutputView::default()),
+        );
+    }
     emitted.insert(
         "SoundCloudDetailsView",
         emitted_keys(&SoundCloudDetailsView::default()),

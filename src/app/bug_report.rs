@@ -74,6 +74,10 @@ fn selected_text(popup: &mut BugReportPopupView) -> Option<(&mut String, &mut us
 impl AppController {
     /// Opens a new composer once, preserving all covered editor and diagnostic state.
     pub(super) fn open_bug_report_composer(&mut self, screenshot: Option<String>) {
+        #[cfg(feature = "cmd")]
+        if self.custom_commands.running || self.view.custom_command_output.is_some() {
+            return;
+        }
         if self.view.bug_report_popup.is_some()
             || self.view.local_file_progress.is_some()
             || self.local_move_is_executing()

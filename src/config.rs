@@ -294,8 +294,9 @@ impl Config {
     ///
     /// Existing Unix directories are tightened to mode `0700`. A conservative
     /// default `.gitignore` is created only when none exists; an existing file
-    /// remains entirely under user control. The operation does not create or
-    /// modify the user's TOML configuration.
+    /// remains entirely under user control. With `cmd`, the disabled command
+    /// sample is also created once. The operation does not create or modify
+    /// the user's active TOML configuration or command definitions.
     ///
     /// # Errors
     ///
@@ -307,6 +308,8 @@ impl Config {
         create_private_directory(&self.secrets_dir())?;
         create_private_directory(&self.downloads_dir())?;
         ensure_youta_gitignore(&self.gitignore_file())?;
+        #[cfg(feature = "cmd")]
+        crate::local_command::buttons::ensure_sample(self.config_dir())?;
         Ok(())
     }
 
@@ -4130,6 +4133,40 @@ youtube_api_key = "keep-this-existing-secret"
         assert_eq!(
             fs::read_to_string(root.join(".gitignore")).expect("preserved .gitignore"),
             custom
+        );
+    }
+
+    /// Directory preparation ships disabled examples without enabling user commands.
+    #[cfg(feature = "cmd")]
+    #[test]
+    fn command_sample_is_created_once_without_creating_active_configuration() {
+        let directory = tempdir().expect("temporary directory");
+        let config = Config::for_dir(directory.path().join("youta"));
+        config
+            .ensure_directories()
+            .expect("create disabled command sample");
+        let sample = config.config_dir().join("commands.sample");
+        assert!(
+            fs::read_to_string(&sample)
+                .unwrap()
+                .contains("ffmpeg -n -i % %.flac")
+        );
+        assert!(!config.config_dir().join("commands").exists());
+        assert!(!config.config_file().exists());
+        fs::write(&sample, "# keep this sample edit\n").unwrap();
+        fs::write(
+            config.config_dir().join("commands"),
+            "# keep active commands\n",
+        )
+        .unwrap();
+        config.ensure_directories().expect("preserve command files");
+        assert_eq!(
+            fs::read_to_string(sample).unwrap(),
+            "# keep this sample edit\n"
+        );
+        assert_eq!(
+            fs::read_to_string(config.config_dir().join("commands")).unwrap(),
+            "# keep active commands\n"
         );
     }
 

@@ -855,6 +855,103 @@ fn command_prompt_is_default_but_independently_removable() {
             "{profile}"
         );
     }
+    let gui: toml::Value = toml::from_str(&read_repository_file("gui/Cargo.toml")).unwrap();
+    assert!(feature_entries(&gui, "default").contains(&"cmd"));
+    assert_eq!(feature_entries(&gui, "cmd"), ["youta/cmd"]);
+    assert_eq!(
+        gui["dependencies"]["youta"]["default-features"].as_bool(),
+        Some(false)
+    );
+    assert!(
+        !gui["dependencies"]["youta"]["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|feature| feature.as_str() == Some("cmd")),
+        "the GUI dependency must not force command support when its feature is disabled"
+    );
+}
+
+/// Mocked phases must build and test the same command capability without running Cargo.
+#[cfg(unix)]
+#[test]
+fn gentoo_command_use_controls_terminal_and_both_desktop_phases() {
+    let script = r#"
+inherit() { :; }
+use() { [[ " ${USE_FIXTURE} " == *" $1 "* ]]; }
+usev() { if use "$1"; then printf '%s\n' "${2:-$1}"; fi; }
+usex() { if use "$1"; then printf '%s' "$2"; else printf '%s' "$3"; fi; }
+die() { printf '%s\n' "$*" >&2; exit 1; }
+cargo_src_configure() { printf 'TUI'; printf '|%s' "${myfeatures[@]}"; printf '\n'; }
+cargo_src_compile() { :; }
+cargo_src_test() { :; }
+cargo_env() { printf 'GUI'; printf '|%s' "$@"; printf '\n'; }
+source "$1"
+[[ " ${IUSE} " == *"+cmd"* ]] || exit 1
+[[ ${REQUIRED_USE} == *"cmd? ( || ( tui gui ) )"* ]] || exit 1
+src_configure
+src_compile
+src_test
+"#;
+    for enabled in [false, true] {
+        for ascii_visualizer in [false, true] {
+            let output = Command::new("bash")
+                .args(["-ec", script, "gentoo-command-phases-test"])
+                .arg(repository_path("packaging/gentoo/youta.ebuild"))
+                .env(
+                    "USE_FIXTURE",
+                    format!(
+                        "tui gui {} {}",
+                        if enabled { "cmd" } else { "" },
+                        if ascii_visualizer {
+                            "ascii-visualizer"
+                        } else {
+                            ""
+                        },
+                    ),
+                )
+                .env("PN", "youta")
+                .env("PV", "99.0.0")
+                .env("P", "youta-99.0.0")
+                .env("CARGO", "cargo")
+                .output()
+                .expect("run mocked command packaging phases");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let trace = String::from_utf8(output.stdout).unwrap();
+            let tui = trace.lines().find(|line| line.starts_with("TUI|")).unwrap();
+            assert_eq!(tui.split('|').any(|feature| feature == "cmd"), enabled);
+            for operation in ["build", "test"] {
+                let prefix = format!("GUI|cargo|{operation}|");
+                let fields = trace
+                    .lines()
+                    .find(|line| line.starts_with(&prefix))
+                    .unwrap()
+                    .split('|')
+                    .collect::<Vec<_>>();
+                assert!(fields.contains(&"--no-default-features"));
+                let features = fields
+                    .windows(2)
+                    .find_map(|pair| (pair[0] == "--features").then_some(pair[1]))
+                    .unwrap_or("");
+                assert_eq!(
+                    features.split(',').any(|feature| feature == "cmd"),
+                    enabled,
+                    "GUI {operation} must follow the cmd USE flag"
+                );
+                assert_eq!(
+                    features
+                        .split(',')
+                        .any(|feature| feature == "ascii-visualizer"),
+                    ascii_visualizer,
+                    "GUI {operation} must preserve other feature separators"
+                );
+            }
+        }
+    }
 }
 
 #[test]

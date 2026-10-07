@@ -726,6 +726,23 @@ export interface LocalFileProgressView {
 	total_entries: number;
 }
 
+/** Public display metadata only; command templates and descriptions stay in Rust. */
+export interface CustomCommandButtonView {
+	id: number;
+	name: string;
+	hotkey: string | null;
+	font_color: string | null;
+	background_color: string | null;
+}
+
+/** Private, bounded output displayed only after an explicit command invocation. */
+export interface CustomCommandOutputView {
+	name: string;
+	running: boolean;
+	output: string;
+	failed: boolean;
+}
+
 /** The selected playable item, when playlist actions apply to it. */
 export interface PlaylistItemView {
   media_id: MediaId;
@@ -1074,6 +1091,8 @@ export interface ViewModel {
   queue_popup: QueuePopupView | null;
   local_file_popup: LocalFilePopupView | null;
 	local_file_progress: LocalFileProgressView | null;
+	custom_command_buttons?: CustomCommandButtonView[];
+	custom_command_output?: CustomCommandOutputView | null;
   // Redacted projections expose editor controls without returning credentials.
 	youtube_provider_editor: YouTubeProviderEditorView | null;
   yandex_music_setup_open: boolean;

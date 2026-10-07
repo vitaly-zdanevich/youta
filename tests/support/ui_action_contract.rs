@@ -10,6 +10,8 @@ pub(crate) fn action_belongs_to_disabled_feature(
     has_feature: impl Fn(&str) -> bool,
 ) -> bool {
     (!has_feature("ascii-visualizer") && name == "DismissAsciiVisualizer")
+        || (!has_feature("cmd")
+            && matches!(name, "RunCustomCommand" | "DismissCustomCommandOutput"))
         || (!has_feature("commons-upload")
             && matches!(
                 name,

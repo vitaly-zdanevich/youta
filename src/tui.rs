@@ -1043,6 +1043,12 @@ pub fn run(controller: &mut impl UiController, settings: &UiSettings) -> io::Res
     controller.set_worker_waker(Some(input.worker_waker()));
     #[cfg(feature = "cmd")]
     controller.set_local_command_available(cfg!(unix) && io::stdin().is_terminal());
+    #[cfg(feature = "cmd")]
+    controller.set_custom_command_mode(if cfg!(unix) && io::stdin().is_terminal() {
+        crate::view::CustomCommandMode::Terminal
+    } else {
+        crate::view::CustomCommandMode::Unavailable
+    });
     let result = run_with_input(
         controller,
         settings,
@@ -1054,6 +1060,8 @@ pub fn run(controller: &mut impl UiController, settings: &UiSettings) -> io::Res
     controller.set_worker_waker(None);
     #[cfg(feature = "cmd")]
     controller.set_local_command_available(false);
+    #[cfg(feature = "cmd")]
+    controller.set_custom_command_mode(crate::view::CustomCommandMode::Unavailable);
     result
 }
 
@@ -1233,6 +1241,20 @@ fn run_with_input(
             }
             let result = execute_local_command_plan(session, input, plan);
             controller.report_local_command_result(result);
+        }
+        #[cfg(feature = "cmd")]
+        if let Some(plan) = controller.take_custom_command_plan() {
+            if let Some(renderer) = renderer.as_deref_mut() {
+                renderer.clear();
+            }
+            let result =
+                local_command::execute_shell_command_plan(session, input, plan).map(|()| {
+                    crate::local_command::CommandOutput {
+                        output: String::new(),
+                        success: true,
+                    }
+                });
+            controller.report_custom_command_result(result);
         }
         controller.tick();
         thumbnail_renderer = renderer;
@@ -5375,6 +5397,42 @@ fn render_information_panel(
                 UiAction::GenerateVideoSummary,
             )
         });
+    // Reserve custom action rows before appending facts and description text.
+    #[cfg(feature = "cmd")]
+    let custom_command_buttons = view
+        .custom_command_buttons
+        .iter()
+        .map(|command| {
+            let mut style = theme.accent;
+            if let Some(color) = command
+                .font_color
+                .as_deref()
+                .and_then(|color| color.parse::<Color>().ok())
+            {
+                style = style.fg(color);
+            }
+            if let Some(color) = command
+                .background_color
+                .as_deref()
+                .and_then(|color| color.parse::<Color>().ok())
+            {
+                style = style.bg(color);
+            }
+            let label = match command.hotkey.as_deref().filter(|_| show_hotkeys) {
+                Some(key) => button(key, &command.name, true),
+                None => command.name.clone(),
+            };
+            push_left_detail_button(
+                &mut lines,
+                &right_buttons,
+                &mut next_left_row,
+                inner.width,
+                label,
+                style,
+                UiAction::RunCustomCommand(command.id),
+            )
+        })
+        .collect::<Vec<_>>();
     let local_visibility_button = (kind == InformationPanelKind::Local).then(|| {
         push_left_detail_button(
             &mut lines,
@@ -5749,6 +5807,8 @@ fn render_information_panel(
     detail_buttons.extend(auto_download_button);
     detail_buttons.extend(subscription_button);
     detail_buttons.extend(local_visibility_button);
+    #[cfg(feature = "cmd")]
+    detail_buttons.extend(custom_command_buttons);
     // Preserve the compact layout's established left-actions-first hit-map
     // order. The side rail independently sorts by visual row and column.
     detail_buttons.extend(right_buttons);
@@ -28507,6 +28567,75 @@ for encoded, expected in json.load(sys.stdin):
                 }
             }
         }
+    }
+
+    /// Custom rows reserve space ahead of metadata and keep their exact RGB hit targets.
+    #[cfg(feature = "cmd")]
+    #[test]
+    fn custom_command_buttons_preserve_details_and_colors() {
+        let view = ViewModel {
+            custom_command_buttons: vec![crate::view::CustomCommandButtonView {
+                id: 7,
+                name: "Convert audio".to_owned(),
+                hotkey: Some("Ctrl+K".to_owned()),
+                font_color: Some("#123456".to_owned()),
+                background_color: Some("#abcdef".to_owned()),
+                ..Default::default()
+            }],
+            details: Some(DetailView {
+                source: "YouTube".to_owned(),
+                length: "4:20".to_owned(),
+                description: "Description preserved".to_owned(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        let mut hits = HitMap::default();
+        terminal
+            .draw(|frame| {
+                render_details(
+                    frame,
+                    frame.area(),
+                    &view,
+                    true,
+                    0,
+                    &Theme::new(false),
+                    &mut hits,
+                    None,
+                )
+            })
+            .unwrap();
+        let (_, area) = hits
+            .detail_buttons
+            .iter()
+            .find(|(action, _)| *action == UiAction::RunCustomCommand(7))
+            .unwrap();
+        let cell = &terminal.backend().buffer()[(area.x, area.y)];
+        assert_eq!(cell.fg, Color::Rgb(0x12, 0x34, 0x56));
+        assert_eq!(cell.bg, Color::Rgb(0xab, 0xcd, 0xef));
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: area.x,
+                    row: area.y,
+                    modifiers: KeyModifiers::NONE
+                },
+                &hits,
+                &view
+            ),
+            Some(UiAction::RunCustomCommand(7))
+        );
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Length: 4:20"));
+        assert!(rendered.contains("Description preserved"));
     }
 
     /// Only the typed YouTube provider changes columns; other public-comment layouts stay put.

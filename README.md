@@ -144,8 +144,8 @@ in the seek-bar area. `Enter` runs it in the displayed directory, in the
 foreground; `Esc` cancels before execution. The TUI releases its terminal so
 the command can read input and display output. `Ctrl+C` interrupts the command;
 after it finishes, press any key to return to Youta and refresh the directory.
-This requires Bash and a Unix terminal; it is unavailable in the GUI and
-inside read-only archive folders.
+The `:` editor requires Bash and a Unix terminal; it is unavailable in the GUI
+and inside read-only archive folders.
 
 An unquoted `%` argument supplies the full selected path as one argument,
 including spaces or shell punctuation. For example:
@@ -179,10 +179,41 @@ while Youta is closed to clear command history. Youta writes it with owner-only
 permissions on Unix. **Commands may contain passwords or tokens: this file is
 included in configuration Git synchronization**, rather than excluded like a
 cache. Command text is excluded from diagnostics and bug-report screenshots.
-The standalone `cmd` Cargo feature is enabled by default; omit it from a
-`--no-default-features` build to remove the editor, runner, completion, and
-history. The [Gentoo source ebuild](packaging/gentoo/README.md) exposes the
-same default-on `cmd` USE flag; `USE="-cmd"` removes it.
+The standalone `cmd` Cargo feature is enabled by default in the TUI and GUI;
+omit it from a `--no-default-features` build to remove command buttons and the
+terminal editor, runner, completion, and history. The
+[Gentoo source ebuild](packaging/gentoo/README.md) exposes the same default-on
+`cmd` USE flag; `USE="-cmd"` removes command support from both frontends.
+
+Configured command buttons appear in Details in both frontends. Youta creates
+a disabled [`commands.sample`](commands.sample) in `~/.config/youta/` without
+replacing an existing sample. Rename it to the extensionless `commands` file
+to enable it, and restart Youta after configuration changes. This separate
+TOML file contains one `[[commands]]` table per button: `name` and `command`
+are required; `description` is only a configuration note, never displayed.
+Optional `provider` restricts the button to the selected item's actual source
+(for example, `'local'`, `'youtube'`, or `'rss'`), not the current tab; omitting
+it makes the button available for every eligible provider. Optional
+`font_color` and `background_color` accept `#rgb` or `#rrggbb` values.
+
+An unquoted `%` supplies the selected item's original URL, or its full path
+for Local items. `%d` supplies its downloaded file path: Youta reuses an
+existing completed download, or opens the normal download/format chooser and
+waits for the download before running the command. Failed or cancelled
+downloads never run the command. For Local items, `%` and `%d` both supply the
+same full path. Both macros pass one argument safely and support suffixes,
+such as `%d.flac`; the quoting rules above still apply. Commands are unavailable
+inside read-only archive folders.
+
+Optional `hotkey` accepts a character, named key, or `F1`-`F24`, with
+`Ctrl+`, `Alt+`, or `Shift+` modifiers. It overrides built-in shortcuts only in
+the normal eligible selection context, never while an editor or popup owns
+input. `Ctrl+C` and `Ctrl+Alt+B` are reserved. Matching providers cannot reuse
+a shortcut; disjoint provider filters can. Nothing runs until the button or
+its hotkey is invoked. The TUI runs the command in its foreground terminal;
+the GUI blocks interaction in an output dialog until completion, with no
+standard input and bounded stdout/stderr capture. These commands have the
+same unsandboxed permissions as the `:` editor.
 
 Selecting media shows filename metadata immediately while tags and bounded
 `ffprobe` codec/container details load off the TUI thread. A fixed-size RAM
@@ -1000,7 +1031,7 @@ leave it out of an explicit `--no-default-features` feature list:
 | `ascii-visualizer` | CAVA capture and fullscreen terminal/desktop spectrum renderers. |
 | `audio-quality` | Local spectral analysis and RustFFT. |
 | `cache` | Session RAM audio cache with a 90% system/container memory-pressure ceiling on Linux. |
-| `cmd` | Terminal Local-tab Bash commands, Tab completion, and persistent command history. |
+| `cmd` | TUI/GUI provider-filtered command buttons, plus terminal Local-tab Bash commands, completion, and history. |
 | `commons-upload` | Commons authentication, upload client, and review UI. |
 | `evernote` | Evernote client and audio-note UI. |
 | `gpm` | Linux virtual-console mouse input; opt in explicitly in either custom example. |
@@ -1376,6 +1407,8 @@ cache/searches.toml      regenerable search snapshots
 cache/providers.toml     regenerable provider metadata
 subscriptions.opml       portable RSS, podcast, and compatible channel feeds
 cmd-log                  plaintext Local command history (cmd feature)
+commands                 optional TOML command buttons (cmd feature)
+commands.sample          disabled command-button example; never executed
 ```
 
 The `state/` files are the canonical user-owned state for this backend.

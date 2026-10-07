@@ -49,7 +49,7 @@ REQUIRED_USE="
 	bandcamp? ( yt-dlp )
 	bbc-radio? ( radio )
 	bundled-sqlite? ( sqlite )
-	cmd? ( local tui )
+	cmd? ( || ( tui gui ) )
 	archive-upload? ( yt-dlp )
 	s3-upload? ( yt-dlp )
 	commons-upload? ( yt-dlp )
@@ -248,6 +248,9 @@ src_compile() {
 	# of the granular USE flags that shape the terminal executable.
 	if use gui; then
 		local gui_features=tauri/custom-protocol
+		if use cmd; then
+			gui_features+=,cmd
+		fi
 		if use archive-org; then
 			gui_features+=,archive-org
 		fi
@@ -312,6 +315,10 @@ src_test() {
 		local gui_test_features=
 		if use ascii-visualizer; then
 			gui_test_features=ascii-visualizer
+		fi
+		if use cmd; then
+			[[ -n ${gui_test_features} ]] && gui_test_features+=,
+			gui_test_features+=cmd
 		fi
 		if use archive-org; then
 			[[ -n ${gui_test_features} ]] && gui_test_features+=,

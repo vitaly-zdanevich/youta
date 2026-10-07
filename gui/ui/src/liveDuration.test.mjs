@@ -35,6 +35,7 @@ function component(name) {
 		if (path === './Artwork') return { Artwork: () => null };
 		if (path === './Description') return { Description: () => null, WikidataSpoiler: () => null };
 		if (path === './SearchHighlight') return { SearchHighlight: ({ text }) => text };
+		if (path === './CustomCommands') return { CustomCommandButtons: () => null };
 		if (path.startsWith('./')) return component(path.slice(2));
 		return require(path);
 	};

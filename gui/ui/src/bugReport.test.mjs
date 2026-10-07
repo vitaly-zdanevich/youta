@@ -16,7 +16,7 @@ test('bug report never reads private, credential, or existing report drafts', ()
 		'yandex_music_setup_open', 'youtube_provider_editor', 'commons_credentials_editor',
 		'evernote_credentials_editor', 's3_credentials_editor', 'archive_credentials_editor',
 		'evernote_popup', 'commons_upload_popup', 's3_upload_popup', 'archive_upload_popup',
-		'local_file_popup', 'local_file_progress', 'preferences_popup']) {
+		'local_file_popup', 'local_file_progress', 'preferences_popup', 'custom_command_output']) {
 		assert.equal(captureBugReportScreenshot({ [field]: true }, () => {
 			throw new Error(`Private DOM was read: ${field}`);
 		}), null);

@@ -52,6 +52,8 @@ impl AppController {
                 self.manual_downloads.queue = queue;
                 self.manual_downloads.pending_write = None;
                 self.refresh_download_queue_popup();
+                #[cfg(feature = "cmd")]
+                self.update_custom_command_download();
                 true
             }
             Err(error) => {
@@ -163,6 +165,57 @@ impl AppController {
             }
             Err(error) => self.view.status_line = error,
         }
+    }
+
+    /// Enqueues one captured command target without changing the user's marked batch.
+    #[cfg(feature = "cmd")]
+    pub(super) fn enqueue_custom_command_download(
+        &mut self,
+        source: DownloadSource,
+    ) -> Result<u64, String> {
+        if self.manual_downloads.blocked {
+            return Err("The download queue is unavailable; custom command was not run".to_owned());
+        }
+        if let Some(entry) = self.manual_downloads.queue.entries.iter().find(|entry| {
+            entry.source.media_id == source.media_id
+                && matches!(
+                    entry.state,
+                    DownloadQueueState::Queued | DownloadQueueState::Running
+                )
+        }) {
+            return Ok(entry.id);
+        }
+        let mut queue = self.manual_downloads.queue.clone();
+        let id = queue.next_id;
+        queue.next_id = id
+            .checked_add(1)
+            .ok_or("Download queue IDs are exhausted")?;
+        queue.entries.push(new_entry(id, source));
+        self.save_manual_download_queue(queue)
+            .then_some(id)
+            .ok_or_else(|| "Could not save the download for this command".to_owned())
+    }
+
+    /// Finds the latest validated completed output for the exact selected media identity.
+    #[cfg(feature = "cmd")]
+    pub(super) fn custom_command_download_path(&self, identity: &MediaId) -> Option<PathBuf> {
+        self.manual_downloads
+            .queue
+            .entries
+            .iter()
+            .rev()
+            .filter(|entry| {
+                entry.source.media_id == *identity && entry.state == DownloadQueueState::Completed
+            })
+            .find_map(|entry| self.custom_command_entry_path(entry))
+    }
+
+    /// Revalidates the output of one download, preserving the chosen job's format.
+    #[cfg(feature = "cmd")]
+    pub(super) fn custom_command_entry_path(&self, entry: &DownloadQueueEntry) -> Option<PathBuf> {
+        let directory = self.config.downloads_dir();
+        let path = directory.join(entry.completed_path.as_ref()?);
+        validated_relative_download(&directory, &path).map(|relative| directory.join(relative))
     }
 
     /// Enqueues the marked batch, or the current item when no marks are present.

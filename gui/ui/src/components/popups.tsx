@@ -88,6 +88,7 @@ export const LAYER = {
   youtubeCaptions: 14,
   audioQuality: 15,
 	unsubscribe: 15.5,
+	customCommand: 15.75,
   error: 16,
 } as const;
 

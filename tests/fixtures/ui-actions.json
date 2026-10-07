@@ -1,4 +1,6 @@
 [
+	{ "RunCustomCommand": 0 },
+	"DismissCustomCommandOutput",
 	"OpenBugReport",
 	"DeleteBugReportCharacter",
 	"DeleteBugReportForward",

@@ -12,7 +12,7 @@ export function captureBugReportScreenshot(view: ViewModel, readVisibleText: () 
 		|| view.s3_credentials_editor || view.archive_credentials_editor
 		|| view.evernote_popup || view.commons_upload_popup || view.s3_upload_popup
 		|| view.archive_upload_popup || view.local_file_popup || view.local_file_progress
-		|| view.preferences_popup || view.playlist_popup) return null;
+		|| view.preferences_popup || view.playlist_popup || view.custom_command_output) return null;
 	try {
 		const text = `GUI text snapshot (text only; no artwork)\n\n${readVisibleText()}`;
 		const bytes = new TextEncoder().encode(text);

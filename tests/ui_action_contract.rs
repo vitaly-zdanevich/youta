@@ -11,6 +11,7 @@ fn frontend_action_payload_fixtures_match_the_reducer() {
     action_contract::assert_fixture_contract(|name| {
         action_contract::action_belongs_to_disabled_feature(name, |feature| match feature {
             "ascii-visualizer" => cfg!(feature = "ascii-visualizer"),
+            "cmd" => cfg!(feature = "cmd"),
             "commons-upload" => cfg!(feature = "commons-upload"),
             "s3-upload" => cfg!(feature = "s3-upload"),
             "archive-upload" => cfg!(feature = "archive-upload"),

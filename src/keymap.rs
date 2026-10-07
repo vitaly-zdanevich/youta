@@ -1914,6 +1914,35 @@ pub fn key_action(
     page_rows: Option<usize>,
     popups: Option<PopupGeometry>,
 ) -> Option<UiAction> {
+    key_action_with_custom_command(
+        key,
+        view,
+        page_rows,
+        popups,
+        #[cfg(feature = "cmd")]
+        None,
+    )
+}
+
+/// Routes mouse/IPC custom-button activation through the same modal ownership as keys.
+#[cfg(feature = "cmd")]
+pub(crate) fn custom_command_button_action(view: &ViewModel, id: usize) -> Option<UiAction> {
+    key_action_with_custom_command(KeyPress::new(Key::F(0)), view, None, None, Some(id))
+}
+
+/// Shares editor/modal precedence with explicitly clicked command buttons.
+fn key_action_with_custom_command(
+    key: KeyPress,
+    view: &ViewModel,
+    page_rows: Option<usize>,
+    popups: Option<PopupGeometry>,
+    #[cfg(feature = "cmd")] custom_command: Option<usize>,
+) -> Option<UiAction> {
+    #[cfg(feature = "cmd")]
+    if let Some(output) = &view.custom_command_output {
+        return (!output.running && matches!(key.key, Key::Esc | Key::Enter))
+            .then_some(UiAction::DismissCustomCommandOutput);
+    }
     if view.local_file_progress.is_some() {
         return None;
     }
@@ -2012,7 +2041,14 @@ pub fn key_action(
             popups.video_comments.page_lines,
         );
     }
-    unfiltered_key_action(key, view, page_rows).filter(|action| {
+    unfiltered_key_action(
+        key,
+        view,
+        page_rows,
+        #[cfg(feature = "cmd")]
+        custom_command,
+    )
+    .filter(|action| {
         view.external_opener_available || !view.action_requires_external_opener(action)
     })
 }
@@ -2296,6 +2332,7 @@ fn unfiltered_key_action(
     key: KeyPress,
     view: &ViewModel,
     page_rows: Option<usize>,
+    #[cfg(feature = "cmd")] custom_command: Option<usize>,
 ) -> Option<UiAction> {
     if let Some(error) = view.error_popup.as_ref() {
         let yt_dlp_forbidden = error.yt_dlp_forbidden.as_ref();
@@ -3106,6 +3143,21 @@ fn unfiltered_key_action(
             _ => None,
         };
     }
+    #[cfg(feature = "cmd")]
+    {
+        if let Some(id) = custom_command {
+            return Some(UiAction::RunCustomCommand(id));
+        }
+        if let Some(button) = view.custom_command_buttons.iter().find(|button| {
+            button
+                .binding
+                .as_ref()
+                .is_some_and(|binding| binding.matches(key))
+        }) {
+            return Some(UiAction::RunCustomCommand(button.id));
+        }
+    }
+
     if is_delete_previous_word_key(key) {
         return None;
     }

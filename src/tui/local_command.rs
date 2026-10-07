@@ -3,7 +3,7 @@
 use std::io::Write;
 
 use super::*;
-use crate::local_command::LocalCommandPlan;
+use crate::local_command::{LocalCommandPlan, ShellCommandPlan};
 
 /// Surrenders the TTY to Bash and retains its output until one key is pressed.
 ///
@@ -15,6 +15,15 @@ pub(super) fn execute_local_command_plan(
     session: &mut TerminalSession,
     input: &mut TerminalInput,
     plan: LocalCommandPlan,
+) -> Result<(), String> {
+    execute_shell_command_plan(session, input, plan.into_shell_plan())
+}
+
+/// Hands the terminal to the same safe shell runner for provider-specific buttons.
+pub(super) fn execute_shell_command_plan(
+    session: &mut TerminalSession,
+    input: &mut TerminalInput,
+    plan: ShellCommandPlan,
 ) -> Result<(), String> {
     input.suspend();
     if let Err(error) = session.suspend() {
@@ -30,7 +39,7 @@ pub(super) fn execute_local_command_plan(
 }
 
 /// Uses inherited streams: output is neither buffered in RAM nor sent to logs.
-fn show_command_output(plan: &LocalCommandPlan) -> Result<(), String> {
+fn show_command_output(plan: &ShellCommandPlan) -> Result<(), String> {
     let result = plan
         .command()
         .and_then(|mut command| {
