@@ -1577,6 +1577,57 @@ impl Default for PlaylistPopupView {
     }
 }
 
+/// Private one-line shell input owned by the terminal's Local command mode.
+#[derive(Clone, Default, Eq, PartialEq)]
+#[cfg(feature = "cmd")]
+pub struct LocalCommandView {
+    /// Raw Bash template; unquoted percent placeholders are expanded only on execution.
+    pub command: String,
+    /// UTF-8 insertion offset, always clamped to a grapheme boundary.
+    pub cursor_byte: usize,
+    /// Optional reverse-history search above the command line.
+    pub history: Option<LocalCommandHistoryView>,
+}
+
+#[cfg(feature = "cmd")]
+impl std::fmt::Debug for LocalCommandView {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LocalCommandView")
+            .field("command", &"[REDACTED]")
+            .field("cursor_byte", &self.cursor_byte)
+            .field("history", &self.history)
+            .finish()
+    }
+}
+
+/// At most ten newest matching private command templates.
+#[derive(Clone, Default, Eq, PartialEq)]
+#[cfg(feature = "cmd")]
+pub struct LocalCommandHistoryView {
+    /// Case-sensitive substring sought in retained commands.
+    pub query: String,
+    /// UTF-8 insertion offset within the history query.
+    pub cursor_byte: usize,
+    /// Matching command templates in newest-first order.
+    pub matches: Vec<String>,
+    /// Selected match, or zero when the result list is empty.
+    pub selected: usize,
+}
+
+#[cfg(feature = "cmd")]
+impl std::fmt::Debug for LocalCommandHistoryView {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LocalCommandHistoryView")
+            .field("query", &"[REDACTED]")
+            .field("cursor_byte", &self.cursor_byte)
+            .field("match_count", &self.matches.len())
+            .field("selected", &self.selected)
+            .finish()
+    }
+}
+
 /// Explicit local or downloaded-file mutation awaiting input or confirmation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub enum LocalFilePopupView {
@@ -3400,6 +3451,16 @@ pub struct ViewModel {
     pub local_file_popup: Option<LocalFilePopupView>,
     /// Blocking foreground Copy/Move progress, absent while choosing a destination.
     pub local_file_progress: Option<LocalFileProgressView>,
+    /// Whether this frontend can hand a controlling terminal to Bash.
+    #[cfg(feature = "cmd")]
+    pub local_command_available: bool,
+    /// Private shell input; only its presence may cross the GUI/diagnostic boundary.
+    #[serde(
+        rename = "local_command_open",
+        serialize_with = "serialize_editor_presence"
+    )]
+    #[cfg(feature = "cmd")]
+    pub local_command: Option<LocalCommandView>,
     /// Whether this build can supervise a full-channel `yt-dlp` download.
     pub channel_download_supported: bool,
     /// Review-first confirmation for downloading every public channel upload.
@@ -3421,6 +3482,10 @@ impl ViewModel {
     /// Whether rendered cells can be captured without exposing a private editor.
     #[must_use]
     pub fn bug_report_screenshot_allowed(&self) -> bool {
+        #[cfg(feature = "cmd")]
+        if self.local_command.is_some() {
+            return false;
+        }
         if self.bug_report_popup.is_some()
             || self.private_note_popup.is_some()
             || self.youtube_setup_popup.is_some()
@@ -3819,6 +3884,10 @@ impl Default for ViewModel {
             yandex_music_actions: YandexMusicActionsView::default(),
             local_file_popup: None,
             local_file_progress: None,
+            #[cfg(feature = "cmd")]
+            local_command_available: false,
+            #[cfg(feature = "cmd")]
+            local_command: None,
             channel_download_supported: cfg!(feature = "yt-dlp"),
             #[cfg(feature = "yt-dlp")]
             channel_download_popup: None,
@@ -4691,6 +4760,45 @@ pub enum UiAction {
     SubmitPreferences,
     /// Close the preferences editor without saving.
     DismissPreferences,
+    /// Open a foreground Bash command line for the selected Local path.
+    #[cfg(feature = "cmd")]
+    BeginLocalCommand,
+    /// Insert one printable character into the command or its history query.
+    #[cfg(feature = "cmd")]
+    AppendLocalCommandCharacter(char),
+    /// Move the cursor in the focused command or history input.
+    #[cfg(feature = "cmd")]
+    MoveLocalCommandCursor(PrivateNoteCursorMotion),
+    /// Remove the complete grapheme before the focused command cursor.
+    #[cfg(feature = "cmd")]
+    DeleteLocalCommandCharacter,
+    /// Remove the complete grapheme after the focused command cursor.
+    #[cfg(feature = "cmd")]
+    DeleteLocalCommandForward,
+    /// Delete the previous Vim-style word in the focused command input.
+    #[cfg(feature = "cmd")]
+    DeleteLocalCommandWord,
+    /// Complete the literal command name or filename at the Local command cursor.
+    #[cfg(feature = "cmd")]
+    CompleteLocalCommand,
+    /// Recall an older or newer command, restoring the unsent draft at the end.
+    #[cfg(feature = "cmd")]
+    BrowseLocalCommandHistory(i8),
+    /// Open substring search over the retained command templates.
+    #[cfg(feature = "cmd")]
+    OpenLocalCommandHistory,
+    /// Move selection among the ten visible history matches.
+    #[cfg(feature = "cmd")]
+    MoveLocalCommandHistory(i8),
+    /// Run the command line or selected history match in the foreground.
+    #[cfg(feature = "cmd")]
+    SubmitLocalCommand,
+    /// Close history search while preserving the unsent command line.
+    #[cfg(feature = "cmd")]
+    DismissLocalCommandHistory,
+    /// Close the Local shell prompt without executing anything.
+    #[cfg(feature = "cmd")]
+    DismissLocalCommand,
     /// Open a basename editor for the selected regular local file.
     BeginLocalRename,
     /// Add one printable character to the local rename basename.
@@ -4893,11 +5001,60 @@ pub trait UiController {
     /// Reports the result after the event loop safely handled terminal state.
     #[cfg(feature = "local-browser")]
     fn report_text_file_open_result(&mut self, _result: Result<TextFileOpenLifecycle, String>) {}
+
+    /// Advertises a frontend that can exclusively hand its terminal to Bash.
+    #[cfg(feature = "cmd")]
+    fn set_local_command_available(&mut self, _available: bool) {}
+
+    /// Takes one explicitly submitted foreground shell command.
+    #[cfg(feature = "cmd")]
+    fn take_local_command_plan(&mut self) -> Option<crate::local_command::LocalCommandPlan> {
+        None
+    }
+
+    /// Refreshes the captured Local folder after its foreground shell returns.
+    #[cfg(feature = "cmd")]
+    fn report_local_command_result(&mut self, _result: Result<(), String>) {}
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Shell templates and reverse-search history can contain credentials and never leave IPC.
+    #[cfg(feature = "cmd")]
+    #[test]
+    fn local_command_text_is_redacted_from_debug_json_and_screenshots() {
+        let view = ViewModel {
+            local_command: Some(LocalCommandView {
+                command: "echo private-command-token".to_owned(),
+                cursor_byte: 5,
+                history: Some(LocalCommandHistoryView {
+                    query: "private-history-query".to_owned(),
+                    cursor_byte: 0,
+                    matches: vec!["echo private-history-token".to_owned()],
+                    selected: 0,
+                }),
+            }),
+            ..ViewModel::default()
+        };
+        let json = serde_json::to_string(&view).unwrap();
+        let debug = format!("{view:?}");
+        for secret in [
+            "private-command-token",
+            "private-history-query",
+            "private-history-token",
+        ] {
+            assert!(!json.contains(secret));
+            assert!(!debug.contains(secret));
+        }
+        assert_eq!(
+            serde_json::to_value(&view).unwrap()["local_command_open"],
+            true
+        );
+        assert!(!view.bug_report_screenshot_allowed());
+        assert!(!ViewModel::default().local_command_available);
+    }
 
     /// Idle workers notify completion; only visible indicators require timed frames.
     #[test]

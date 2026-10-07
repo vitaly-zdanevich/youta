@@ -51,6 +51,8 @@ pub mod links;
 #[cfg(feature = "local-archives")]
 pub mod local_archive;
 pub mod local_browser;
+#[cfg(feature = "cmd")]
+pub mod local_command;
 #[cfg(any(feature = "commons-upload", feature = "evernote"))]
 pub mod opus_export;
 pub mod persistence;

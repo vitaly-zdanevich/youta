@@ -32,7 +32,7 @@ KEYWORDS="~amd64 ~arm64 ~x86"
 
 IUSE="
 	+acoustid +alsa +ascii-visualizer +audio-quality archive-rar +archive-zip +archive-org +archive-upload apple-podcasts +bbc-radio
-	bandcamp bilibili bundled-sqlite cpu_flags_x86_sse2 dearrow discord +evernote
+	bandcamp bilibili bundled-sqlite +cmd cpu_flags_x86_sse2 dearrow discord +evernote
 	+commons-upload +funkwhale +generic-ytdlp google-drive gpm gpodder gui +invidious jack +jamendo
 	keyring +lan-sharing +lastfm +librivox +litres +local +local-archives +mpv native +nyan-cat odysee +peertube pipewire
 	podcast-index pulseaudio +qr +radio +rss rumble +rutube s3-upload +soundcloud +soundstream
@@ -49,6 +49,7 @@ REQUIRED_USE="
 	bandcamp? ( yt-dlp )
 	bbc-radio? ( radio )
 	bundled-sqlite? ( sqlite )
+	cmd? ( local tui )
 	archive-upload? ( yt-dlp )
 	s3-upload? ( yt-dlp )
 	commons-upload? ( yt-dlp )
@@ -80,6 +81,7 @@ RDEPEND="
 	acoustid? ( media-libs/chromaprint[tools] )
 	ascii-visualizer? ( media-sound/cava )
 	audio-quality? ( media-video/ffmpeg )
+	cmd? ( app-shells/bash )
 	sqlite? ( !bundled-sqlite? ( dev-db/sqlite:3 ) )
 	archive-rar? ( app-arch/unrar )
 	local-archives? ( app-arch/unrar )
@@ -172,6 +174,7 @@ src_configure() {
 		$(usev bbc-radio)
 		$(usev bilibili)
 		$(usev bundled-sqlite)
+		$(usev cmd)
 		$(usev commons-upload)
 		$(usev dearrow)
 		$(usev discord)

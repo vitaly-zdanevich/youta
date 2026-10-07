@@ -86,6 +86,46 @@ fn trace_fields<'a>(trace: &'a str, phase: &str) -> Vec<&'a str> {
         .collect()
 }
 
+/// The source USE flag is default-on but never silently forced by Local browsing.
+#[test]
+fn command_prompt_use_flag_controls_its_independent_cargo_feature() {
+    let template = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("packaging/gentoo/youta.ebuild");
+    let script = r#"
+inherit() { :; }
+use() { [[ " ${USE_FIXTURE} " == *" $1 "* ]]; }
+usev() { if use "$1"; then printf '%s\n' "${2:-$1}"; fi; }
+cargo_src_configure() { printf '%s\n' "${myfeatures[@]}"; }
+source "$1"
+[[ " ${IUSE} " == *"+cmd"* ]] || exit 1
+src_configure
+"#;
+    for enabled in [false, true] {
+        let output = Command::new("bash")
+            .args(["-ec", script, "gentoo-cmd-test"])
+            .arg(&template)
+            .env(
+                "USE_FIXTURE",
+                if enabled {
+                    "tui local cmd"
+                } else {
+                    "tui local"
+                },
+            )
+            .env("PV", "99.0.0")
+            .env("P", "youta-99.0.0")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let features = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(features.lines().any(|feature| feature == "cmd"), enabled);
+        assert!(features.lines().any(|feature| feature == "local"));
+    }
+}
+
 /// Installs the terminal manual for both terminal-only and desktop packages.
 #[test]
 fn man_page_is_installed_with_and_without_the_desktop() {

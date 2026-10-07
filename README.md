@@ -121,8 +121,8 @@ The default remains filename order (`1, 10, 100, 2`). Folders stay first unless
 size sorting is active; equal sizes use the chosen filename order. This also
 applies inside local archives. Saving the preference keeps the same file selected.
 
-Youta never reorganizes folders automatically. Only explicit Rename, Move to
-Trash, and Move actions change selected entries. A durable move journal lets
+Youta never reorganizes folders automatically. Explicit Rename, Move to
+Trash, Move, and user-entered shell commands can change selected entries. A durable move journal lets
 startup finish or reconcile interrupted moves without guessing which copy is
 authoritative.
 
@@ -135,6 +135,52 @@ dismissal stay blocked until completion, with byte or entry progress when
 available. Copy support is the standalone `local-copy` feature.
 In the terminal UI, folder listings and transfer progress wake the interface
 when ready instead of waiting for a periodic response check.
+
+With the default `cmd` feature, press `:` on a selected Local file or folder
+to enter a [Bash command](https://www.gnu.org/software/bash/manual/bash.html)
+in the seek-bar area. `Enter` runs it in the displayed directory, in the
+foreground; `Esc` cancels before execution. The TUI releases its terminal so
+the command can read input and display output. `Ctrl+C` interrupts the command;
+after it finishes, press any key to return to Youta and refresh the directory.
+This requires Bash and a Unix terminal; it is unavailable in the GUI and
+inside read-only archive folders.
+
+An unquoted `%` argument supplies the full selected path as one argument,
+including spaces or shell punctuation. For example:
+
+```sh
+ffmpeg -i % -c:a libmp3lame /tmp/output.mp3
+```
+
+`%.mp3` appends a suffix to the selected path. Quoted or escaped percent signs
+remain literal, so `printf '%s\n' %` works. For complex Bash syntax such as
+substitutions, arithmetic, or grouping, use `"$1"` instead of `%`; the original
+selected path is supplied as Bash's first positional parameter. Changing
+positional parameters with `set --` changes `$1`, but not the `%` shortcut.
+Commands run with your permissions and can modify or delete files; they are
+not sandboxed or limited to the selected entry. Bash startup files are not
+loaded.
+
+`Tab` completes command names from `PATH` and Bash builtins, or filenames
+relative to the displayed directory (also absolute paths and `~/`). It inserts
+the common prefix first; repeated `Tab` cycles through matches. Paths containing
+spaces and quotes are quoted automatically. Completion does not execute shell
+expansions or load programmable Bash completion scripts.
+`Up` / `Down` recall commands and restore the unfinished draft after the newest
+entry. `Ctrl+R` opens the ten newest matching commands; type a case-sensitive
+substring, choose with `Up` / `Down`, and press `Enter` to run it against the
+current selection. `Esc` closes history search without running anything.
+
+The latest 100 submitted commands persist as plain text, one command per line,
+in `~/.config/youta/cmd-log` (up to 8192 bytes per command). Delete this file
+while Youta is closed to clear command history. Youta writes it with owner-only
+permissions on Unix. **Commands may contain passwords or tokens: this file is
+included in configuration Git synchronization**, rather than excluded like a
+cache. Command text is excluded from diagnostics and bug-report screenshots.
+The standalone `cmd` Cargo feature is enabled by default; omit it from a
+`--no-default-features` build to remove the editor, runner, completion, and
+history. The [Gentoo source ebuild](packaging/gentoo/README.md) exposes the
+same default-on `cmd` USE flag; `USE="-cmd"` removes it.
 
 Selecting media shows filename metadata immediately while tags and bounded
 `ffprobe` codec/container details load off the TUI thread. A fixed-size RAM
@@ -928,6 +974,7 @@ leave it out of an explicit `--no-default-features` feature list:
 | `archive-upload` | Reviewed YouTube and Local audio/video uploads to Internet Archive. |
 | `ascii-visualizer` | CAVA capture and fullscreen terminal/desktop spectrum renderers. |
 | `audio-quality` | Local spectral analysis and RustFFT. |
+| `cmd` | Terminal Local-tab Bash commands, Tab completion, and persistent command history. |
 | `commons-upload` | Commons authentication, upload client, and review UI. |
 | `evernote` | Evernote client and audio-note UI. |
 | `gpm` | Linux virtual-console mouse input; opt in explicitly in either custom example. |
@@ -1302,6 +1349,7 @@ runtime/playback-checkpoint.toml
 cache/searches.toml      regenerable search snapshots
 cache/providers.toml     regenerable provider metadata
 subscriptions.opml       portable RSS, podcast, and compatible channel feeds
+cmd-log                  plaintext Local command history (cmd feature)
 ```
 
 The `state/` files are the canonical user-owned state for this backend.

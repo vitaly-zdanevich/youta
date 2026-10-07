@@ -259,6 +259,8 @@ jobs:
           cargo check --locked --no-default-features --features cli --bin youta
           cargo check --locked --no-default-features --features subscriptions --lib
           cargo check --locked --no-default-features --features tui
+          cargo check --locked --no-default-features --features cmd --lib
+          cargo check --locked --no-default-features --features tui,cmd
           cargo check --locked --no-default-features --features qr
           cargo check --locked --no-default-features --features images
           cargo check --locked --no-default-features --features waveform --lib

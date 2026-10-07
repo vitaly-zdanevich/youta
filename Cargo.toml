@@ -4,7 +4,7 @@ resolver = "3"
 
 [package]
 name = "youta"
-version = "0.93.7"
+version = "0.94.0"
 edition = "2024"
 rust-version = "1.95"
 description = "A low-resource YouTube TUI audio player and local subscription manager that uses yt-dlp and saves and shows listening progress"
@@ -37,6 +37,7 @@ default = [
     "archive-upload",
     "ascii-visualizer",
     "audio-quality",
+    "cmd",
     "commons-upload",
     "evernote",
     "gpm",
@@ -254,6 +255,9 @@ local = [
 ]
 # Read-only directory browsing and local-media playback.
 local-browser = []
+# Explicit foreground Bash commands and private, removable command history.
+# Keep outside `local`/`sources` so distributors can omit it independently.
+cmd = ["local-browser"]
 # Bounded HTTP directory listings with direct audio-only playback.
 web-browser = ["network", "local-browser", "dep:html5gum", "dep:percent-encoding", "dep:sha2"]
 # Tag, codec, and technical metadata extraction for Local and selected Web files.

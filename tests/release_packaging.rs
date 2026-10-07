@@ -814,6 +814,28 @@ fn yandex_music_feature_and_credentials_remain_optional_and_documented() {
     assert!(readme.contains("no stable first-class audiobook search or playback"));
 }
 
+/// Command execution can be omitted without losing browsing or other Local actions.
+#[test]
+fn command_prompt_is_default_but_independently_removable() {
+    let manifest = manifest();
+    assert!(feature_entries(&manifest, "default").contains(&"cmd"));
+    assert_eq!(feature_entries(&manifest, "cmd"), ["local-browser"]);
+    for profile in [
+        "local",
+        "local-browser",
+        "sources",
+        "app",
+        "app-core",
+        "controller",
+        "tui",
+    ] {
+        assert!(
+            !feature_closure(&manifest, profile).contains("cmd"),
+            "{profile}"
+        );
+    }
+}
+
 #[test]
 fn local_capability_umbrella_and_ratatui_features_remain_intentional() {
     let manifest = manifest();

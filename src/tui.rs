@@ -8,6 +8,10 @@ mod input;
 mod input_stream;
 #[cfg(all(test, target_os = "linux", feature = "local-browser"))]
 mod input_tests;
+#[cfg(feature = "cmd")]
+mod local_command;
+#[cfg(all(test, target_os = "linux", feature = "cmd"))]
+mod local_command_tests;
 #[cfg(test)]
 mod performance;
 
@@ -66,6 +70,8 @@ use crate::text_file_open::{
 use crate::thumbnails::{ThumbnailCapability, ThumbnailManager, ThumbnailProtocol, ThumbnailState};
 use crate::waveform::Peak;
 use input::TerminalInput;
+#[cfg(feature = "cmd")]
+use local_command::execute_local_command_plan;
 
 pub use crate::view::*;
 
@@ -1034,6 +1040,8 @@ pub fn run(controller: &mut impl UiController, settings: &UiSettings) -> io::Res
     controller.dispatch(UiAction::SetTerminalWindowPixels { width, height });
     let mut input = TerminalInput::new()?;
     controller.set_worker_waker(Some(input.worker_waker()));
+    #[cfg(feature = "cmd")]
+    controller.set_local_command_available(cfg!(unix) && io::stdin().is_terminal());
     let result = run_with_input(
         controller,
         settings,
@@ -1043,6 +1051,8 @@ pub fn run(controller: &mut impl UiController, settings: &UiSettings) -> io::Res
         openrc_managed,
     );
     controller.set_worker_waker(None);
+    #[cfg(feature = "cmd")]
+    controller.set_local_command_available(false);
     result
 }
 
@@ -1081,6 +1091,8 @@ fn run_with_input(
                     Some(renderer.as_mut()),
                 );
                 render_local_rename_cursor(frame, controller.view(), !virtual_cursor.active);
+                #[cfg(feature = "cmd")]
+                local_command::render_cursor(frame, controller.view(), !virtual_cursor.active);
                 render_virtual_cursor_overlay(frame, controller.view(), &mut virtual_cursor);
                 normalize_physical_linux_console_frame(frame, controller.view());
             })?
@@ -1089,6 +1101,8 @@ fn run_with_input(
                 fullscreen_artwork_area = frame.area();
                 render_frame(frame, controller.view(), settings, &mut hit_map, None);
                 render_local_rename_cursor(frame, controller.view(), !virtual_cursor.active);
+                #[cfg(feature = "cmd")]
+                local_command::render_cursor(frame, controller.view(), !virtual_cursor.active);
                 render_virtual_cursor_overlay(frame, controller.view(), &mut virtual_cursor);
                 normalize_physical_linux_console_frame(frame, controller.view());
             })?
@@ -1114,9 +1128,22 @@ fn run_with_input(
         if wait_outcome == WaitOutcome::TerminalEvent {
             match input.read()? {
                 Event::Key(key) => {
+                    #[cfg(feature = "cmd")]
+                    if controller.view().local_command.is_some() {
+                        virtual_cursor.active = false;
+                    }
                     let cursor_was_active = virtual_cursor.active;
                     let f8_pressed = key.kind == KeyEventKind::Press && key.code == KeyCode::F(8);
-                    match virtual_cursor.handle_key(key) {
+                    #[cfg(feature = "cmd")]
+                    let command_editor_open = controller.view().local_command.is_some();
+                    #[cfg(not(feature = "cmd"))]
+                    let command_editor_open = false;
+                    let cursor_action = if command_editor_open {
+                        VirtualCursorKey::PassThrough
+                    } else {
+                        virtual_cursor.handle_key(key)
+                    };
+                    match cursor_action {
                         VirtualCursorKey::PassThrough => {
                             if let Some(action) = key_action_with_page_rows(
                                 key,
@@ -1197,6 +1224,14 @@ fn run_with_input(
             }
             let result = execute_text_file_open_plan(session, input, plan);
             controller.report_text_file_open_result(result);
+        }
+        #[cfg(feature = "cmd")]
+        if let Some(plan) = controller.take_local_command_plan() {
+            if let Some(renderer) = renderer.as_deref_mut() {
+                renderer.clear();
+            }
+            let result = execute_local_command_plan(session, input, plan);
+            controller.report_local_command_result(result);
         }
         controller.tick();
         thumbnail_renderer = renderer;
@@ -2106,6 +2141,8 @@ enum InformationPanelOwner {
 fn render(frame: &mut Frame<'_>, view: &ViewModel, settings: &UiSettings, hit_map: &mut HitMap) {
     render_frame(frame, view, settings, hit_map, None);
     render_local_rename_cursor(frame, view, true);
+    #[cfg(feature = "cmd")]
+    local_command::render_cursor(frame, view, true);
     normalize_physical_linux_console_frame(frame, view);
 }
 
@@ -2457,6 +2494,8 @@ fn render_frame(
         || view.download_queue_popup.is_some()
         || view.video_comments_popup.is_some()
         || view.error_popup.is_some();
+    #[cfg(feature = "cmd")]
+    let thumbnail_is_obscured = thumbnail_is_obscured || view.local_command.is_some();
     #[cfg(feature = "yt-dlp")]
     let thumbnail_is_obscured = thumbnail_is_obscured || view.channel_download_popup.is_some();
     #[cfg(feature = "youtube-captions")]
@@ -2782,6 +2821,8 @@ fn render_frame(
     if let Some(popup) = view.unsubscribe_popup.as_ref() {
         render_unsubscribe_popup(frame, popup, &theme, hit_map);
     }
+    #[cfg(feature = "cmd")]
+    local_command::render_history(frame, view, &theme);
     if let Some(error) = view.error_popup.as_ref() {
         render_error_popup(
             frame,
@@ -7509,6 +7550,11 @@ fn render_seek_bar(
     hit_map.seek_markers.clear();
     hit_map.waveform_seek = None;
     hit_map.now_playing = None;
+    #[cfg(feature = "cmd")]
+    if let Some(editor) = view.local_command.as_ref() {
+        local_command::render_command(frame, area, editor, theme);
+        return;
+    }
     #[cfg(feature = "youtube-captions")]
     let area = if let Some(caption) = view
         .youtube_caption_line
@@ -8185,6 +8231,10 @@ fn playback_activity_text_area(area: Rect, terminal: Rect, view: &ViewModel) -> 
 
 /// Draws TTY-safe playback feedback at the physical bottom-left without a new row.
 fn render_playback_start_activity(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
+    #[cfg(feature = "cmd")]
+    if view.local_command.is_some() {
+        return;
+    }
     let area = frame.area();
     if !view.playback_activity_pending() || area.is_empty() {
         return;
@@ -8252,6 +8302,10 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
     }
     if cfg!(feature = "local-trash") {
         local_actions.push("Delete");
+    }
+    #[cfg(feature = "cmd")]
+    if view.local_command_available {
+        local_actions.push(": Bash command");
     }
     if view.audio_quality_supported {
         local_actions.push("V audio quality");
@@ -15227,6 +15281,11 @@ fn key_action_with_page_rows(
 }
 
 fn mouse_action(mouse: MouseEvent, hit_map: &HitMap, view: &ViewModel) -> Option<UiAction> {
+    #[cfg(feature = "cmd")]
+    if view.local_command.is_some() && view.error_popup.is_none() && view.bug_report_popup.is_none()
+    {
+        return None;
+    }
     if view.local_file_progress.is_some() {
         return None;
     }

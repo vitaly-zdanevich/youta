@@ -437,6 +437,60 @@ or a second
 .BR Delete .
 .SS Local files and Radio
 .TP
+.B :
+Enter a Bash command for the selected Local file or folder in the seek-bar area.
+The default-on
+.B cmd
+build feature requires Bash and a Unix terminal; commands are unavailable in
+the GUI and inside read-only archive folders.
+.B Enter
+runs the command in the displayed directory with terminal input and output;
+.B Esc
+cancels before execution.
+.B Ctrl+C
+interrupts the command. After it finishes, any key returns to Youta and
+refreshes the directory. Commands run with your permissions and may modify
+or delete files;
+they are not sandboxed. Bash startup files are not loaded.
+.IP
+Use an unquoted
+.B %
+argument for the full selected path, safely passed as one argument, or
+.B %.mp3
+to append a suffix. Quoted and escaped percent signs remain literal.
+For substitutions, arithmetic, grouping, and other complex Bash syntax, use
+.B \(dq$1\(dq
+instead of the percent shortcut: the selected path is Bash's first positional
+parameter. Changing positional parameters changes $1 but not the percent
+shortcut.
+.IP
+While entering a command,
+.B Tab
+completes command names from PATH and Bash builtins, or filenames relative to
+the displayed directory. Absolute paths and ~/ are also supported. The first
+Tab inserts a common prefix; repeated Tab cycles matches. Spaces and quotes
+are quoted automatically. Completion neither executes shell expansions nor
+loads programmable Bash completion scripts.
+.B Up/Down
+recall previous commands and restore the unsent draft past the newest entry.
+.B Ctrl+R
+opens the ten newest matching commands. Type a case-sensitive substring,
+select with
+.BR Up/Down ,
+and press
+.B Enter
+to execute against the current selection, or
+.B Esc
+to close history search.
+.IP
+The standalone Cargo feature and Gentoo USE flag are both named
+.BR cmd .
+Omit cmd from an explicit Cargo
+.B \-\-no-default-features
+build or use Gentoo
+.B USE=\(dq\-cmd\(dq
+to remove command support.
+.TP
 .B r
 Rename the selected Local entry when supported.
 .TP
@@ -721,6 +775,14 @@ Provider credentials.
 .TP
 .I subscriptions.opml
 Portable local subscriptions to RSS, podcast, and compatible channel feeds.
+.TP
+.I cmd-log
+Plaintext Local command history: the latest 100 submitted commands,
+one per line,
+up to 8192 bytes each. Requires the cmd feature. Delete while Youta is closed to
+clear it. Written with owner-only Unix permissions; included in configuration
+Git synchronization. Commands may contain passwords or tokens. Command text is
+excluded from diagnostics and bug-report screenshots.
 .TP
 .I state/*.toml
 Canonical progress, history, notes, bookmarks, statistics, playlists, and

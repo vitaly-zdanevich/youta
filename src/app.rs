@@ -26,6 +26,8 @@ mod download_choice;
 mod email_links;
 mod end_pause;
 mod invidious_instances;
+#[cfg(feature = "cmd")]
+mod local_command;
 #[cfg(feature = "local-copy")]
 mod local_copy;
 mod local_file_dates;
@@ -4946,6 +4948,9 @@ pub struct AppController {
     pending_playlist_replay: Option<PendingPlaylistReplay>,
     /// Current bounded, non-recursive directory snapshot for the Local tab.
     local_listing: Option<crate::local_browser::LocalDirectoryListing>,
+    /// Private Local command history and the one captured foreground execution.
+    #[cfg(feature = "cmd")]
+    local_command: local_command::LocalCommandState,
     /// Session-only URLs and isolated bounded HTTP folder work.
     #[cfg(feature = "web-browser")]
     web: web::WebState,
@@ -6495,6 +6500,8 @@ impl AppController {
             private_note_editor: None,
             pending_playlist_replay: None,
             local_listing: None,
+            #[cfg(feature = "cmd")]
+            local_command: local_command::LocalCommandState::default(),
             #[cfg(feature = "lan-sharing")]
             lan_share_server: None,
             #[cfg(feature = "lan-sharing")]
@@ -35662,6 +35669,20 @@ impl UiController for AppController {
     }
 
     fn dispatch(&mut self, action: UiAction) {
+        #[cfg(feature = "cmd")]
+        if (self.view.local_command.is_some() || self.local_command.running)
+            && !local_command::command_action(&action)
+            && !matches!(
+                action,
+                UiAction::SetTerminalWindowPixels { .. }
+                    | UiAction::SetExternalOpenerAvailable(_)
+                    | UiAction::OpenBugReport
+            )
+            && self.view.error_popup.is_none()
+            && self.view.bug_report_popup.is_none()
+        {
+            return;
+        }
         // Filesystem work runs on the worker so progress can repaint, but its
         // accepted operation owns the UI until completion, including queued IPC.
         if self.local_move_is_executing()
@@ -37059,6 +37080,22 @@ impl UiController for AppController {
                 self.view.preferences_popup = None;
                 self.view.status_line = "Preferences were not changed".to_owned();
             }
+            #[cfg(feature = "cmd")]
+            UiAction::BeginLocalCommand
+            | UiAction::AppendLocalCommandCharacter(_)
+            | UiAction::MoveLocalCommandCursor(_)
+            | UiAction::DeleteLocalCommandCharacter
+            | UiAction::DeleteLocalCommandForward
+            | UiAction::DeleteLocalCommandWord
+            | UiAction::CompleteLocalCommand
+            | UiAction::BrowseLocalCommandHistory(_)
+            | UiAction::OpenLocalCommandHistory
+            | UiAction::MoveLocalCommandHistory(_)
+            | UiAction::SubmitLocalCommand
+            | UiAction::DismissLocalCommandHistory
+            | UiAction::DismissLocalCommand => {
+                self.dispatch_local_command(action);
+            }
             UiAction::BeginLocalRename => self.begin_local_rename(),
             UiAction::AppendLocalRenameCharacter(character) => {
                 self.append_local_rename_character(character);
@@ -37225,6 +37262,24 @@ impl UiController for AppController {
     #[cfg(feature = "local-browser")]
     fn take_text_file_open_plan(&mut self) -> Option<TextFileOpenPlan> {
         self.pending_text_file_open.take()
+    }
+
+    #[cfg(feature = "cmd")]
+    fn set_local_command_available(&mut self, available: bool) {
+        self.view.local_command_available = available;
+        if !available {
+            self.dismiss_local_command();
+        }
+    }
+
+    #[cfg(feature = "cmd")]
+    fn take_local_command_plan(&mut self) -> Option<crate::local_command::LocalCommandPlan> {
+        self.local_command.pending.take()
+    }
+
+    #[cfg(feature = "cmd")]
+    fn report_local_command_result(&mut self, result: Result<(), String>) {
+        self.finish_local_command(result);
     }
 
     #[cfg(feature = "local-browser")]

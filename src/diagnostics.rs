@@ -492,6 +492,7 @@ pub fn enabled_compile_features() -> Vec<&'static str> {
         "bilibili",
         "bundled-sqlite",
         "cli",
+        "cmd",
         "dearrow",
         "discord",
         "evernote",

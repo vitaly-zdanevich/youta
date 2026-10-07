@@ -17,6 +17,10 @@ the provider from the terminal and optional desktop builds. Configuration,
 desktop compilation, and desktop tests all disable Cargo defaults and select
 the feature explicitly from USE.
 
+`+cmd` enables the terminal Local-tab Bash command prompt by default and requires
+`local` and `tui`. `USE="-cmd"` omits its runner, editor, and command-history
+implementation; the desktop does not provide this terminal-only prompt.
+
 The binary package cannot remove a compiled provider without separate
 upstream release variants. Use `media-sound/youta`, not `youta-bin`, when
 individual provider removal is required; no unsupported binary USE toggle

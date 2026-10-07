@@ -267,6 +267,146 @@ mod wire_tests {
     };
     #[cfg(feature = "evernote")]
     use crate::view::{EvernoteNoteField, EvernoteNotePhase, EvernoteNotePopupView};
+    #[cfg(feature = "cmd")]
+    use crate::view::{LocalCommandHistoryView, LocalCommandView, Screen};
+
+    /// Local exposes a command prompt instead of silently ignoring the colon key.
+    #[test]
+    #[cfg(feature = "cmd")]
+    fn local_colon_opens_a_command_prompt() {
+        let view = ViewModel {
+            screen: crate::view::Screen::Local,
+            local_command_available: true,
+            ..ViewModel::default()
+        };
+        assert_eq!(
+            key_action(KeyPress::new(Key::Char(':')), &view, None, None),
+            Some(UiAction::BeginLocalCommand)
+        );
+    }
+
+    /// Only a terminal-enabled Local list can enter shell mode, even with Shift-produced ':'.
+    #[test]
+    #[cfg(feature = "cmd")]
+    fn local_command_shortcut_requires_frontend_capability_and_respects_other_editors() {
+        for screen in [Screen::Local, Screen::Search] {
+            for available in [false, true] {
+                let mut view = ViewModel {
+                    screen,
+                    local_command_available: available,
+                    ..ViewModel::default()
+                };
+                for shift in [false, true] {
+                    let key = KeyPress {
+                        shift,
+                        ..KeyPress::new(Key::Char(':'))
+                    };
+                    assert_eq!(
+                        key_action(key, &view, None, None),
+                        (screen == Screen::Local && available)
+                            .then_some(UiAction::BeginLocalCommand)
+                    );
+                }
+                view.search_editing = true;
+                assert_eq!(
+                    key_action(KeyPress::new(Key::Char(':')), &view, None, None),
+                    Some(UiAction::AppendSearch(':'))
+                );
+            }
+        }
+    }
+
+    /// Private command/history input owns typing, arrows and cancellation, not media controls.
+    #[test]
+    #[cfg(feature = "cmd")]
+    fn local_command_and_history_own_keyboard_input() {
+        let mut view = ViewModel {
+            local_command: Some(LocalCommandView::default()),
+            ..ViewModel::default()
+        };
+        for (key, expected) in [
+            (Key::Char('q'), UiAction::AppendLocalCommandCharacter('q')),
+            (Key::Char(' '), UiAction::AppendLocalCommandCharacter(' ')),
+            (Key::Char('%'), UiAction::AppendLocalCommandCharacter('%')),
+            (Key::Enter, UiAction::SubmitLocalCommand),
+            (Key::Up, UiAction::BrowseLocalCommandHistory(-1)),
+            (Key::Down, UiAction::BrowseLocalCommandHistory(1)),
+            (Key::Esc, UiAction::DismissLocalCommand),
+            (Key::Delete, UiAction::DeleteLocalCommandForward),
+        ] {
+            assert_eq!(
+                key_action(KeyPress::new(key), &view, None, None),
+                Some(expected)
+            );
+        }
+        assert_eq!(
+            key_action(KeyPress::new(Key::Tab), &view, None, None),
+            Some(UiAction::CompleteLocalCommand)
+        );
+        assert_eq!(
+            key_action(
+                KeyPress {
+                    ctrl: true,
+                    ..KeyPress::new(Key::Char('r'))
+                },
+                &view,
+                None,
+                None
+            ),
+            Some(UiAction::OpenLocalCommandHistory)
+        );
+        assert_eq!(
+            key_action(
+                KeyPress {
+                    ctrl: true,
+                    ..KeyPress::new(Key::Char('c'))
+                },
+                &view,
+                None,
+                None
+            ),
+            Some(UiAction::DismissLocalCommand)
+        );
+        assert_eq!(
+            key_action(
+                KeyPress {
+                    ctrl: true,
+                    ..KeyPress::new(Key::Char('w'))
+                },
+                &view,
+                None,
+                None
+            ),
+            Some(UiAction::DeleteLocalCommandWord)
+        );
+        view.local_command.as_mut().unwrap().history = Some(LocalCommandHistoryView::default());
+        assert_eq!(key_action(KeyPress::new(Key::Tab), &view, None, None), None);
+        for (key, expected) in [
+            (Key::Up, UiAction::MoveLocalCommandHistory(-1)),
+            (Key::Down, UiAction::MoveLocalCommandHistory(1)),
+            (Key::Esc, UiAction::DismissLocalCommandHistory),
+            (Key::Enter, UiAction::SubmitLocalCommand),
+        ] {
+            assert_eq!(
+                key_action(KeyPress::new(key), &view, None, None),
+                Some(expected)
+            );
+        }
+    }
+
+    /// Tab belongs to the Local command editor and requests literal completion.
+    #[test]
+    #[cfg(feature = "cmd")]
+    fn local_command_tab_requests_completion() {
+        let view = ViewModel {
+            local_command: Some(LocalCommandView::default()),
+            ..ViewModel::default()
+        };
+        assert_eq!(
+            key_action(KeyPress::new(Key::Tab), &view, None, None),
+            Some(UiAction::CompleteLocalCommand)
+        );
+    }
 
     /// Copy is an unmodified Local shortcut and shares existing batch marks.
     #[test]
@@ -1790,6 +1930,12 @@ pub fn key_action(
     if let Some(popup) = view.bug_report_popup.as_ref() {
         return bug_report_key_action(key, popup, view.external_opener_available);
     }
+    #[cfg(feature = "cmd")]
+    if view.error_popup.is_none()
+        && let Some(command) = view.local_command.as_ref()
+    {
+        return local_command_key_action(key, command);
+    }
     if view.error_popup.is_none()
         && let Some(popup) = view.unsubscribe_popup.as_ref()
     {
@@ -1869,6 +2015,51 @@ pub fn key_action(
     unfiltered_key_action(key, view, page_rows).filter(|action| {
         view.external_opener_available || !view.action_requires_external_opener(action)
     })
+}
+
+/// Keeps shell typing and history navigation from triggering playback or tab actions.
+#[cfg(feature = "cmd")]
+fn local_command_key_action(key: KeyPress, command: &LocalCommandView) -> Option<UiAction> {
+    if key.ctrl && !key.alt && matches!(key.key, Key::Char('r' | 'R')) {
+        return Some(UiAction::OpenLocalCommandHistory);
+    }
+    if is_delete_previous_word_key(key) {
+        return Some(UiAction::DeleteLocalCommandWord);
+    }
+    if key.ctrl && !key.alt && matches!(key.key, Key::Char('c' | 'C')) {
+        return Some(UiAction::DismissLocalCommand);
+    }
+    if key.chorded() {
+        return None;
+    }
+    match key.key {
+        Key::Esc if command.history.is_some() => Some(UiAction::DismissLocalCommandHistory),
+        Key::Esc => Some(UiAction::DismissLocalCommand),
+        Key::Enter => Some(UiAction::SubmitLocalCommand),
+        Key::Up if command.history.is_some() => Some(UiAction::MoveLocalCommandHistory(-1)),
+        Key::Down if command.history.is_some() => Some(UiAction::MoveLocalCommandHistory(1)),
+        Key::Up => Some(UiAction::BrowseLocalCommandHistory(-1)),
+        Key::Down => Some(UiAction::BrowseLocalCommandHistory(1)),
+        Key::Left => Some(UiAction::MoveLocalCommandCursor(
+            PrivateNoteCursorMotion::Left,
+        )),
+        Key::Right => Some(UiAction::MoveLocalCommandCursor(
+            PrivateNoteCursorMotion::Right,
+        )),
+        Key::Home => Some(UiAction::MoveLocalCommandCursor(
+            PrivateNoteCursorMotion::Home,
+        )),
+        Key::End => Some(UiAction::MoveLocalCommandCursor(
+            PrivateNoteCursorMotion::End,
+        )),
+        Key::Backspace => Some(UiAction::DeleteLocalCommandCharacter),
+        Key::Delete => Some(UiAction::DeleteLocalCommandForward),
+        Key::Tab if command.history.is_none() => Some(UiAction::CompleteLocalCommand),
+        Key::Char(character) if !character.is_control() => {
+            Some(UiAction::AppendLocalCommandCharacter(character))
+        }
+        _ => None,
+    }
 }
 
 /// Keeps the manual composer above covered editors and never submits on plain Enter.
@@ -2964,6 +3155,12 @@ fn unfiltered_key_action(
             Some(UiAction::ShareYouTubeChannelPodcast)
         }
         Key::Char('/') => Some(UiAction::BeginSearch),
+        #[cfg(feature = "cmd")]
+        Key::Char(':')
+            if !key.chorded() && view.screen == Screen::Local && view.local_command_available =>
+        {
+            Some(UiAction::BeginLocalCommand)
+        }
         Key::Char('R') if view.screen == Screen::Web => Some(UiAction::RefreshWeb),
         Key::Char('p') | Key::F(7) => Some(UiAction::OpenPreferences),
         Key::Tab if reverse_tab(key) => Some(UiAction::ShowScreen(
