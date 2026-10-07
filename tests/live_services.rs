@@ -5,6 +5,62 @@
 //! accidental local runs offline while preserving checks against changing
 //! production services.
 
+/// Follows one fresh public Mirsoft chooser and inspects only its on-site ZIP.
+///
+/// This explicit opt-in makes the provider's plaintext HTTP and small download
+/// intentional; normal tests neither contact Mirsoft nor require credentials.
+#[cfg(feature = "tracker-music")]
+#[test]
+#[ignore = "requires opted-in plaintext HTTP access to one public Mirsoft soundtrack"]
+fn mirsoft_selected_soundtrack_prepares_from_onsite_download() {
+    use youta::providers::tracker::{
+        TrackerArchiveHub, TrackerArchiveSource, TrackerSearchRequest,
+    };
+    use youta::tracker_media::{
+        TrackerMediaLimits, TrackerMediaPreparer, TrackerMediaRequest, UreqTrackerTransport,
+    };
+
+    assert_eq!(
+        std::env::var("YOUTA_RUN_LIVE_MIRSOFT_TEST").as_deref(),
+        Ok("1"),
+        "set YOUTA_RUN_LIVE_MIRSOFT_TEST=1 to allow this live HTTP test"
+    );
+    let page = TrackerArchiveHub::new(true)
+        .search(
+            TrackerArchiveSource::Mirsoft,
+            &TrackerSearchRequest::new("Lotus 3"),
+        )
+        .expect("one bounded Mirsoft search");
+    let selected = page
+        .items
+        .into_iter()
+        .find(|item| item.title == "Lotus 3: Game rip")
+        .expect("small public soundtrack fixture");
+    let mut request = TrackerMediaRequest::new(selected.download_url.expect("download chooser"));
+    request.allow_insecure_http = true;
+    request.source_label = Some("Mirsoft Game MODs".to_owned());
+    request.expected_format = selected.format;
+    let temporary = tempfile::tempdir().expect("private test cache");
+    let mut preparer = TrackerMediaPreparer::new(
+        temporary.path(),
+        UreqTrackerTransport::default(),
+        TrackerMediaLimits::default(),
+    )
+    .expect("bounded preparer");
+    let modules = preparer.prepare(&request).expect("on-site ZIP preparation");
+    assert!(!modules.is_empty());
+    assert!(
+        modules
+            .iter()
+            .all(|module| module.size_bytes > 0 && module.path.is_file())
+    );
+    assert_eq!(
+        preparer.prepare(&request).expect("reuse prepared cache"),
+        modules
+    );
+    eprintln!("Mirsoft on-site archive prepared {} modules", modules.len());
+}
+
 #[cfg(all(feature = "apple-podcasts", feature = "backend-mpv", feature = "rss"))]
 use std::time::{Duration, Instant};
 

@@ -488,6 +488,15 @@ all other plain-HTTP provider URLs. The adapter sends no cookie, token, API
 key, or user data; downloaded bytes and metadata remain vulnerable to network
 observation or modification. An HTTP redirect never overrides this gate.
 
+Mirsoft's `wogm_download.php` search link is an HTML location chooser, not
+the soundtrack archive. On selected-item preparation, the bounded preparer
+reads at most 2 MiB of that chooser and follows only the explicit same-origin
+"On Site download" endpoint. It does not synthesize download tokens, send
+cookies, visit mirrors, or follow another HTML chooser. The combined response
+chain is validated before archive inspection; existing archive size,
+extraction, and private-cache rules remain in effect. Other providers' HTML
+error pages are still rejected as non-media.
+
 Playback is delegated to `mpv`/FFmpeg only when libopenmpt support is detected.
 UnExoticA and Modland also contain exotic Amiga formats outside libopenmpt's
 scope; those remain unplayable until a separately sandboxed UADE backend is

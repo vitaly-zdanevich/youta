@@ -647,9 +647,12 @@ resolver:
   `allmods.zip` index and direct files avoid page scraping. Mirsoft Game Music
   Base is enabled by default at the user's request, but currently works only
   over HTTP; Youta shows a one-time transport warning and
-  `providers.allow_insecure_http = false` disables it. Scene.org offers an
-  official search API; AMP, UnExoticA, Aminet, and modules.pl need separate,
-  rate-limited adapters. Playback requires a compatible decoder such as
+  `providers.allow_insecure_http = false` disables it.
+  [Mirsoft](http://www.mirsoft.info/gamemods.php)'s download chooser is resolved
+  only when preparing a selected soundtrack: Youta follows its explicit on-site
+  link, not third-party mirrors, then validates and caches the archive's modules.
+  Scene.org offers an official search API; AMP, UnExoticA, Aminet, and modules.pl
+  need separate, rate-limited adapters. Playback requires a compatible decoder such as
   libopenmpt, and some exotic Amiga formats need a future UADE backend.
   Archive availability does not grant a free license or re-upload rights.
 
@@ -3051,6 +3054,14 @@ on every push; run it locally with:
 
 ```sh
 YOUTA_RUN_LIVE_LIBRIVOX_TEST=1 cargo test --locked --test live_services --no-default-features --features librivox -- --ignored --exact librivox_catalogue_book_author_and_audio_are_usable --nocapture
+```
+
+The Mirsoft smoke searches for one small soundtrack, follows its on-site
+download chooser, and verifies archive extraction and cache reuse. It requires
+an explicit opt-in because Mirsoft uses plaintext HTTP:
+
+```sh
+YOUTA_RUN_LIVE_MIRSOFT_TEST=1 cargo test --locked --test live_services --no-default-features --features tracker-music -- --ignored --exact mirsoft_selected_soundtrack_prepares_from_onsite_download --nocapture
 ```
 
 The authenticated Yandex Music smoke is intentionally local and opt-in because

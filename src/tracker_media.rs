@@ -9,7 +9,7 @@
 
 use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, Read, Write};
+use std::io::{self, BufReader, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -28,6 +28,8 @@ const XPK_HEADER_BYTES: usize = 36;
 const XPK_PREVIEW_START: usize = 16;
 const XPK_PREVIEW_END: usize = 32;
 const MAX_REDIRECTS: usize = 8;
+/// A selected Mirsoft location chooser is HTML, never an unbounded archive crawl.
+const MAX_MIRSOFT_PAGE_BYTES: u64 = 2 * 1024 * 1024;
 const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 static NEXT_STAGING_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -352,6 +354,11 @@ pub enum TrackerPrepareError {
     /// The transport could not fetch the selected result.
     #[error("tracker download failed: {0}")]
     Transport(#[from] TrackerTransportError),
+    /// A known Mirsoft chooser did not supply its explicit, safe on-site link.
+    #[error(
+        "Mirsoft Game MODs did not provide a usable on-site download; search again or open the original page"
+    )]
+    MirsoftDownloadUnavailable,
     /// The advertised or streamed response exceeded its compressed limit.
     #[error("tracker download exceeds the {limit}-byte compressed limit")]
     DownloadTooLarge {
@@ -511,8 +518,7 @@ impl<T: TrackerTransport> TrackerMediaPreparer<T> {
         request: &TrackerMediaRequest,
         staging_path: &Path,
     ) -> Result<Vec<PreparedTrackerModule>, TrackerPrepareError> {
-        let response = self.transport.fetch(&request.source_url)?;
-        validate_response_urls(&request.source_url, &response, request.allow_insecure_http)?;
+        let response = self.fetch_payload_response(request)?;
         if response
             .content_length
             .is_some_and(|length| length > self.limits.max_download_bytes)
@@ -571,6 +577,85 @@ impl<T: TrackerTransport> TrackerMediaPreparer<T> {
         }
         modules.sort_by(|left, right| left.path.cmp(&right.path));
         Ok(modules)
+    }
+
+    /// Resolves at most one Mirsoft location chooser before inspecting media bytes.
+    ///
+    /// The public on-site link is followed exactly as published, without cookies,
+    /// token synthesis, mirrors, or recursive HTML resolution. Other providers'
+    /// HTML responses remain invalid payloads. Each transport fetch is bounded;
+    /// the combined response chain must also satisfy the original URL policy
+    /// and redirect limit. HTML has its own small streamed byte limit.
+    fn fetch_payload_response(
+        &mut self,
+        request: &TrackerMediaRequest,
+    ) -> Result<TrackerTransportResponse, TrackerPrepareError> {
+        use crate::providers::tracker::{is_mirsoft_download_page, mirsoft_onsite_download_url};
+
+        let mut response = self.transport.fetch(&request.source_url)?;
+        validate_response_urls(&request.source_url, &response, request.allow_insecure_http)?;
+        if !is_mirsoft_download_page(&request.source_url)
+            || !is_mirsoft_download_page(&response.final_url)
+        {
+            return Ok(response);
+        }
+        let download_limit = self.limits.max_download_bytes;
+        if response
+            .content_length
+            .is_some_and(|length| length > download_limit)
+        {
+            return Err(TrackerPrepareError::DownloadTooLarge {
+                limit: download_limit,
+            });
+        }
+        let mut prefix = Vec::new();
+        response
+            .body
+            .by_ref()
+            .take((PREFIX_BYTES as u64).min(download_limit.saturating_add(1)))
+            .read_to_end(&mut prefix)?;
+        if payload_description(&prefix) != "HTML response" {
+            response.body = Box::new(Cursor::new(prefix).chain(response.body));
+            return Ok(response);
+        }
+        let page_limit = MAX_MIRSOFT_PAGE_BYTES.min(download_limit);
+        if prefix.len() as u64 > page_limit
+            || response
+                .content_length
+                .is_some_and(|length| length > page_limit)
+        {
+            return Err(TrackerPrepareError::DownloadTooLarge { limit: page_limit });
+        }
+        response
+            .body
+            .by_ref()
+            .take(
+                page_limit
+                    .saturating_sub(prefix.len() as u64)
+                    .saturating_add(1),
+            )
+            .read_to_end(&mut prefix)?;
+        if prefix.len() as u64 > page_limit {
+            return Err(TrackerPrepareError::DownloadTooLarge { limit: page_limit });
+        }
+        let target =
+            mirsoft_onsite_download_url(&String::from_utf8_lossy(&prefix), &response.final_url)
+                .ok_or(TrackerPrepareError::MirsoftDownloadUnavailable)?;
+        let mut redirects = response.redirects;
+        if redirects.last().unwrap_or(&request.source_url) != &response.final_url {
+            redirects.push(response.final_url);
+        }
+        redirects.push(target.clone());
+        if redirects.len() > MAX_REDIRECTS {
+            return Err(TrackerPrepareError::UnsafeRedirect);
+        }
+        // Drop the consumed HTML reader before opening the archive connection.
+        drop(response.body);
+        let mut archive = self.transport.fetch(&target)?;
+        redirects.append(&mut archive.redirects);
+        archive.redirects = redirects;
+        validate_response_urls(&request.source_url, &archive, request.allow_insecure_http)?;
+        Ok(archive)
     }
 
     fn prepare_raw(
@@ -2007,6 +2092,346 @@ mod tests {
         assert!(message.contains("detected: HTML response"));
         assert!(!message.contains("do-not-report"));
         assert!(!message.contains("https://"));
+    }
+
+    /// Mirrors Mirsoft's chooser, without retaining a live site's expiring token.
+    const MIRSOFT_DOWNLOAD_PAGE: &str = r#"<!DOCTYPE html><html><body>
+        <a href="/gamemods.php">World of Game MODs</a>
+        <h2>SELECT DOWNLOAD LOCATION</h2><ul>
+        <li><a href="./wogm_download.php?data=fresh-onsite-token"> On Site download</a>
+        <b>[Norway]</b></li>
+        <li><a href="./wogm_download.php?data=mirror-token">Mwyann (Mirror 12)</a></li>
+        </ul></body></html>"#;
+
+    /// Records exact selected requests so an accidental mirror fetch fails the test.
+    #[derive(Default)]
+    struct MirsoftTransport {
+        expected: VecDeque<(Url, MockResponse)>,
+        requested: Vec<Url>,
+    }
+
+    impl TrackerTransport for MirsoftTransport {
+        fn fetch(&mut self, url: &Url) -> Result<TrackerTransportResponse, TrackerTransportError> {
+            self.requested.push(url.clone());
+            let (expected, response) = self.expected.pop_front().expect("expected request");
+            assert_eq!(url, &expected);
+            let mut result =
+                TrackerTransportResponse::new(response.final_url, Cursor::new(response.body))
+                    .with_redirects(response.redirects);
+            if let Some(length) = response.advertised_length {
+                result = result.with_content_length(length);
+            }
+            Ok(result)
+        }
+    }
+
+    /// Builds a selected chooser followed by its same-host on-site archive response.
+    fn mirsoft_transport(landing: &[u8], payload: Vec<u8>) -> MirsoftTransport {
+        let initial = Url::parse("http://www.mirsoft.info/wogm_download.php?data=search-token")
+            .expect("selected Mirsoft URL");
+        let onsite =
+            Url::parse("http://www.mirsoft.info/wogm_download.php?data=fresh-onsite-token")
+                .expect("on-site Mirsoft URL");
+        let archive =
+            Url::parse("http://www.mirsoft.info/gamemods/Fixture.zip").expect("archive URL");
+        MirsoftTransport {
+            expected: VecDeque::from([
+                (
+                    initial.clone(),
+                    MockResponse {
+                        final_url: initial,
+                        redirects: Vec::new(),
+                        advertised_length: None,
+                        body: landing.to_vec(),
+                    },
+                ),
+                (
+                    onsite,
+                    MockResponse {
+                        final_url: archive.clone(),
+                        redirects: vec![archive],
+                        advertised_length: None,
+                        body: payload,
+                    },
+                ),
+            ]),
+            requested: Vec::new(),
+        }
+    }
+
+    /// A chooser is resolved only on preparation, then the verified modules are cached.
+    #[test]
+    fn mirsoft_landing_page_resolves_only_onsite_then_reuses_prepared_cache() {
+        let temporary = tempfile::tempdir().expect("storage root");
+        let module = s3m_fixture();
+        let transport = mirsoft_transport(
+            MIRSOFT_DOWNLOAD_PAGE.as_bytes(),
+            zip_fixture(&[("Fixture.s3m", &module)]),
+        );
+        let mut request = TrackerMediaRequest::new(transport.expected[0].0.clone());
+        request.allow_insecure_http = true;
+        request.source_label = Some("Mirsoft Game MODs".to_owned());
+        request.expected_format = Some("archive".to_owned());
+        let mut preparer =
+            TrackerMediaPreparer::new(temporary.path(), transport, TrackerMediaLimits::default())
+                .expect("preparer");
+
+        let modules = preparer
+            .prepare(&request)
+            .expect("resolve chooser and extract ZIP");
+        assert_eq!(modules.len(), 1);
+        assert_eq!(fs::read(&modules[0].path).unwrap(), module);
+        assert_eq!(preparer.transport.requested.len(), 2);
+        assert!(preparer.transport.expected.is_empty());
+        assert_eq!(preparer.prepare(&request).expect("reuse cache"), modules);
+        assert_eq!(preparer.transport.requested.len(), 2);
+    }
+
+    /// Plaintext opt-out must reject a chooser before either request is made.
+    #[test]
+    fn mirsoft_chooser_respects_http_opt_out_before_network_access() {
+        let temporary = tempfile::tempdir().expect("storage root");
+        let transport = mirsoft_transport(MIRSOFT_DOWNLOAD_PAGE.as_bytes(), Vec::new());
+        let request = TrackerMediaRequest::new(transport.expected[0].0.clone());
+        let mut preparer =
+            TrackerMediaPreparer::new(temporary.path(), transport, TrackerMediaLimits::default())
+                .expect("preparer");
+        assert!(matches!(
+            preparer.prepare(&request),
+            Err(TrackerPrepareError::UnsafeUrl)
+        ));
+        assert!(preparer.transport.requested.is_empty());
+    }
+
+    /// A denied or malformed chooser never turns into a mirror or arbitrary fetch.
+    #[test]
+    fn mirsoft_missing_or_unsafe_onsite_link_fails_without_token_leaks() {
+        for html in [
+            "<!DOCTYPE html><h2>Download expired</h2>",
+            "<!DOCTYPE html><a href='http://outside.example/file.zip'>On Site download</a>",
+            "<!DOCTYPE html><a href='./wogm_download.php?data=search-token'>On Site download</a>",
+        ] {
+            let temporary = tempfile::tempdir().expect("storage root");
+            let transport = mirsoft_transport(html.as_bytes(), Vec::new());
+            let mut request = TrackerMediaRequest::new(transport.expected[0].0.clone());
+            request.allow_insecure_http = true;
+            let mut preparer = TrackerMediaPreparer::new(
+                temporary.path(),
+                transport,
+                TrackerMediaLimits::default(),
+            )
+            .expect("preparer");
+            let error = preparer.prepare(&request).expect_err("invalid chooser");
+            assert!(matches!(
+                error,
+                TrackerPrepareError::MirsoftDownloadUnavailable
+            ));
+            let message = error.to_string();
+            assert!(message.contains("Mirsoft Game MODs"));
+            assert!(!message.contains("search-token"));
+            assert!(!message.contains("http://"));
+            assert_eq!(preparer.transport.requested.len(), 1);
+            assert_eq!(fs::read_dir(preparer.cache_root()).unwrap().count(), 0);
+        }
+    }
+
+    /// A second HTML response is not another chooser: there is no recursive crawl.
+    #[test]
+    fn mirsoft_continuation_cannot_follow_another_html_page() {
+        let temporary = tempfile::tempdir().expect("storage root");
+        let mut transport = mirsoft_transport(
+            MIRSOFT_DOWNLOAD_PAGE.as_bytes(),
+            MIRSOFT_DOWNLOAD_PAGE.as_bytes().to_vec(),
+        );
+        transport.expected[1].1.final_url = transport.expected[1].0.clone();
+        transport.expected[1].1.redirects.clear();
+        let mut request = TrackerMediaRequest::new(transport.expected[0].0.clone());
+        request.allow_insecure_http = true;
+        let mut preparer =
+            TrackerMediaPreparer::new(temporary.path(), transport, TrackerMediaLimits::default())
+                .expect("preparer");
+        assert!(matches!(
+            preparer.prepare(&request),
+            Err(TrackerPrepareError::NoSupportedModule {
+                detected: "HTML response",
+                ..
+            })
+        ));
+        assert_eq!(preparer.transport.requested.len(), 2);
+        assert_eq!(fs::read_dir(preparer.cache_root()).unwrap().count(), 0);
+    }
+
+    /// A direct ZIP delivered by Mirsoft retains every sniffed prefix byte.
+    #[test]
+    fn mirsoft_direct_archive_does_not_add_a_chooser_request() {
+        let temporary = tempfile::tempdir().expect("storage root");
+        let module = s3m_fixture();
+        let mut zip = zip_fixture(&[("fixture.s3m", &module)]);
+        // A valid ZIP comment extends past the sniffed prefix, exercising its
+        // byte-for-byte reconstruction with the still-streaming body tail.
+        let comment = vec![b'x'; PREFIX_BYTES * 2];
+        let comment_length = u16::try_from(comment.len()).unwrap().to_le_bytes();
+        let end = zip.len();
+        zip[end - 2..].copy_from_slice(&comment_length);
+        zip.extend_from_slice(&comment);
+        let mut transport = mirsoft_transport(&zip, Vec::new());
+        transport.expected.truncate(1);
+        let mut request = TrackerMediaRequest::new(transport.expected[0].0.clone());
+        request.allow_insecure_http = true;
+        let mut preparer =
+            TrackerMediaPreparer::new(temporary.path(), transport, TrackerMediaLimits::default())
+                .expect("preparer");
+        let modules = preparer.prepare(&request).expect("direct ZIP");
+        assert_eq!(fs::read(&modules[0].path).unwrap(), module);
+        assert_eq!(preparer.transport.requested.len(), 1);
+    }
+
+    /// Other sites cannot opt into Mirsoft HTML resolution by imitating its markup.
+    #[test]
+    fn mirsoft_lookalike_html_on_another_host_stays_an_invalid_payload() {
+        let temporary = tempfile::tempdir().expect("storage root");
+        let url = "https://other.example/wogm_download.php?data=search-token";
+        let transport = MockTransport::once(url, MIRSOFT_DOWNLOAD_PAGE.as_bytes().to_vec());
+        let mut preparer =
+            TrackerMediaPreparer::new(temporary.path(), transport, TrackerMediaLimits::default())
+                .expect("preparer");
+        assert!(matches!(
+            preparer.prepare(&request(url)),
+            Err(TrackerPrepareError::NoSupportedModule {
+                detected: "HTML response",
+                ..
+            })
+        ));
+        assert_eq!(preparer.transport.calls, 1);
+    }
+
+    /// The HTML-specific cap is smaller than the archive cap and enforced on streams.
+    #[test]
+    fn mirsoft_chooser_has_a_bounded_html_body() {
+        let temporary = tempfile::tempdir().expect("storage root");
+        let mut html = MIRSOFT_DOWNLOAD_PAGE.as_bytes().to_vec();
+        html.resize(usize::try_from(MAX_MIRSOFT_PAGE_BYTES).unwrap() + 1, b' ');
+        let transport = mirsoft_transport(&html, Vec::new());
+        let mut request = TrackerMediaRequest::new(transport.expected[0].0.clone());
+        request.allow_insecure_http = true;
+        let mut preparer =
+            TrackerMediaPreparer::new(temporary.path(), transport, TrackerMediaLimits::default())
+                .expect("preparer");
+        assert!(matches!(
+            preparer.prepare(&request),
+            Err(TrackerPrepareError::DownloadTooLarge {
+                limit: MAX_MIRSOFT_PAGE_BYTES
+            })
+        ));
+        assert_eq!(preparer.transport.requested.len(), 1);
+        assert_eq!(fs::read_dir(preparer.cache_root()).unwrap().count(), 0);
+    }
+
+    /// The chooser cap also applies when Content-Length advertises excess bytes.
+    #[test]
+    fn mirsoft_chooser_rejects_an_oversized_advertised_html_body() {
+        let temporary = tempfile::tempdir().expect("storage root");
+        let mut transport = mirsoft_transport(MIRSOFT_DOWNLOAD_PAGE.as_bytes(), Vec::new());
+        transport.expected[0].1.advertised_length = Some(MAX_MIRSOFT_PAGE_BYTES + 1);
+        let mut request = TrackerMediaRequest::new(transport.expected[0].0.clone());
+        request.allow_insecure_http = true;
+        let mut preparer =
+            TrackerMediaPreparer::new(temporary.path(), transport, TrackerMediaLimits::default())
+                .expect("preparer");
+        assert!(matches!(
+            preparer.prepare(&request),
+            Err(TrackerPrepareError::DownloadTooLarge {
+                limit: MAX_MIRSOFT_PAGE_BYTES
+            })
+        ));
+        assert_eq!(preparer.transport.requested.len(), 1);
+    }
+
+    /// A first-hop HTTPS upgrade cannot be undone by the on-site archive response.
+    #[test]
+    fn mirsoft_onsite_chain_cannot_downgrade_after_an_https_upgrade() {
+        let temporary = tempfile::tempdir().expect("storage root");
+        let mut transport = mirsoft_transport(MIRSOFT_DOWNLOAD_PAGE.as_bytes(), Vec::new());
+        transport.expected[0]
+            .1
+            .final_url
+            .set_scheme("https")
+            .unwrap();
+        transport.expected[1].0.set_scheme("https").unwrap();
+        let mut request = TrackerMediaRequest::new(transport.expected[0].0.clone());
+        request.allow_insecure_http = true;
+        let mut preparer =
+            TrackerMediaPreparer::new(temporary.path(), transport, TrackerMediaLimits::default())
+                .expect("preparer");
+        assert!(matches!(
+            preparer.prepare(&request),
+            Err(TrackerPrepareError::UnsafeRedirect)
+        ));
+        assert_eq!(preparer.transport.requested.len(), 2);
+    }
+
+    /// Individually bounded fetches cannot publish an excessive combined redirect chain.
+    #[test]
+    fn mirsoft_onsite_chain_preserves_the_combined_redirect_limit() {
+        let temporary = tempfile::tempdir().expect("storage root");
+        let mut transport = mirsoft_transport(MIRSOFT_DOWNLOAD_PAGE.as_bytes(), Vec::new());
+        transport.expected[1].1.redirects =
+            vec![transport.expected[1].1.final_url.clone(); MAX_REDIRECTS];
+        let mut request = TrackerMediaRequest::new(transport.expected[0].0.clone());
+        request.allow_insecure_http = true;
+        let mut preparer =
+            TrackerMediaPreparer::new(temporary.path(), transport, TrackerMediaLimits::default())
+                .expect("preparer");
+        assert!(matches!(
+            preparer.prepare(&request),
+            Err(TrackerPrepareError::UnsafeRedirect)
+        ));
+        assert_eq!(preparer.transport.requested.len(), 2);
+    }
+
+    /// Resolving the chooser never relaxes final archive host/HTTPS policy.
+    #[test]
+    fn mirsoft_onsite_archive_still_validates_redirects() {
+        let temporary = tempfile::tempdir().expect("storage root");
+        let mut transport = mirsoft_transport(MIRSOFT_DOWNLOAD_PAGE.as_bytes(), Vec::new());
+        transport.expected[1].1.final_url = Url::parse("http://outside.example/file.zip").unwrap();
+        let mut request = TrackerMediaRequest::new(transport.expected[0].0.clone());
+        request.allow_insecure_http = true;
+        let mut preparer =
+            TrackerMediaPreparer::new(temporary.path(), transport, TrackerMediaLimits::default())
+                .expect("preparer");
+        assert!(matches!(
+            preparer.prepare(&request),
+            Err(TrackerPrepareError::UnsafeRedirect)
+        ));
+        assert_eq!(preparer.transport.requested.len(), 2);
+    }
+
+    /// Archive bytes keep the configured download cap after the smaller chooser.
+    #[test]
+    fn mirsoft_onsite_archive_still_obeys_download_limit() {
+        let temporary = tempfile::tempdir().expect("storage root");
+        let html = MIRSOFT_DOWNLOAD_PAGE.as_bytes();
+        let transport = mirsoft_transport(html, vec![0; html.len() + 1]);
+        let mut request = TrackerMediaRequest::new(transport.expected[0].0.clone());
+        request.allow_insecure_http = true;
+        let limit = html.len() as u64;
+        let mut preparer = TrackerMediaPreparer::new(
+            temporary.path(),
+            transport,
+            TrackerMediaLimits {
+                max_download_bytes: limit,
+                ..TrackerMediaLimits::default()
+            },
+        )
+        .expect("preparer");
+        assert!(
+            matches!(preparer.prepare(&request), Err(TrackerPrepareError::DownloadTooLarge {
+            limit: actual
+        }) if actual == limit)
+        );
+        assert_eq!(preparer.transport.requested.len(), 2);
+        assert_eq!(fs::read_dir(preparer.cache_root()).unwrap().count(), 0);
     }
 
     #[test]

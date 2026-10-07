@@ -829,6 +829,50 @@ fn parse_mirsoft(html: &str, base: &Url) -> Vec<TrackerSearchResult> {
     results
 }
 
+/// Recognizes Mirsoft's credential-free public download-selection endpoint.
+///
+/// This narrow predicate permits HTML resolution only for the known provider,
+/// not arbitrary tracker downloads that happen to return an error document.
+pub(crate) fn is_mirsoft_download_page(url: &Url) -> bool {
+    if !matches!(url.scheme(), "http" | "https")
+        || !matches!(url.host_str(), Some("www.mirsoft.info" | "mirsoft.info"))
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some()
+        || url.path() != "/wogm_download.php"
+        || url.fragment().is_some()
+    {
+        return false;
+    }
+    let mut data_values = url.query_pairs().filter(|(name, _)| name == "data");
+    data_values
+        .next()
+        .is_some_and(|(_, value)| !value.trim().is_empty())
+        && data_values.next().is_none()
+}
+
+/// Selects Mirsoft's explicit same-origin "On Site download" continuation.
+///
+/// Only a bounded number of anchors are inspected. Navigation links, mirrors,
+/// credentials, fragments, and self-loops cannot become follow-up requests.
+/// HTML parsing normalizes nested label text and decodes attribute entities;
+/// URL query encoding remains intact for the provider's opaque download token.
+pub(crate) fn mirsoft_onsite_download_url(html: &str, page: &Url) -> Option<Url> {
+    if !is_mirsoft_download_page(page) {
+        return None;
+    }
+    extract_anchors(html, 128)
+        .into_iter()
+        .filter(|anchor| anchor.text.trim().eq_ignore_ascii_case("On Site download"))
+        .find_map(|anchor| {
+            let target = page.join(anchor.href.trim()).ok()?;
+            (is_mirsoft_download_page(&target)
+                && validate_same_origin(page, &target).is_ok()
+                && target != *page)
+                .then_some(target)
+        })
+}
+
 fn parse_amp(html: &str, base: &Url) -> Vec<TrackerSearchResult> {
     let mut results = Vec::new();
     for block in elements_with_any_class(html, "tr", &["tr0", "tr1"], MAX_RESULTS_PER_PAGE) {
@@ -1698,6 +1742,17 @@ mod tests {
         <TD><a href="./wogm_download.php?data=safe-token">Download</a></TD></TR>
     "#;
 
+    const MIRSOFT_DOWNLOAD_FIXTURE: &str = r#"
+		<html><body>
+		<a href="./gamemods.php">World of Game MODs</a>
+		<h2>SELECT DOWNLOAD LOCATION</h2>
+		<ul>
+		<li><a href="./wogm_download.php?data=fresh%2Bonsite%3Dtoken&amp;unused=1">
+			On <b>Site</b> download</a> <b>[Norway]</b></li>
+		<li><a href="http://mirror12.mirsoft.info/Lotus3.zip">Mirror download</a></li>
+		</ul></body></html>
+	"#;
+
     const AMP_FIXTURE: &str = r#"
         <tr class="tr0">
           <td><a href="downmod.php?index=68102&amp;application=AMP">Lotus title</a></td>
@@ -1808,6 +1863,114 @@ mod tests {
                 .as_ref()
                 .is_some_and(|url| url.scheme() == "http")
         );
+    }
+
+    #[test]
+    fn mirsoft_download_page_recognizes_only_the_exact_public_endpoint() {
+        for valid in [
+            "http://www.mirsoft.info/wogm_download.php?data=token",
+            "https://www.mirsoft.info:443/wogm_download.php?data=token",
+            "http://mirsoft.info:80/wogm_download.php?data=fresh%2Btoken%3D",
+        ] {
+            assert!(is_mirsoft_download_page(
+                &Url::parse(valid).expect("valid fixture URL")
+            ));
+        }
+        for invalid in [
+            "http://www.mirsoft.info.evil.example/wogm_download.php?data=token",
+            "http://mirror12.mirsoft.info/wogm_download.php?data=token",
+            "http://user:password@www.mirsoft.info/wogm_download.php?data=token",
+            "http://www.mirsoft.info:8080/wogm_download.php?data=token",
+            "ftp://www.mirsoft.info/wogm_download.php?data=token",
+            "http://www.mirsoft.info/gamemods.php?data=token",
+            "http://www.mirsoft.info/wogm_download.php/extra?data=token",
+            "http://www.mirsoft.info/wogm_download.php",
+            "http://www.mirsoft.info/wogm_download.php?data=",
+            "http://www.mirsoft.info/wogm_download.php?data=%20",
+            "http://www.mirsoft.info/wogm_download.php?data=first&data=second",
+            "http://www.mirsoft.info/wogm_download.php?data=token#download",
+        ] {
+            assert!(
+                !is_mirsoft_download_page(&Url::parse(invalid).expect("parseable fixture URL")),
+                "unexpectedly accepted {invalid}",
+            );
+        }
+    }
+
+    #[test]
+    fn mirsoft_download_page_selects_the_onsite_link_without_visiting_mirrors() {
+        let page = Url::parse("http://www.mirsoft.info/wogm_download.php?data=landing-token")
+            .expect("page URL");
+        let target = mirsoft_onsite_download_url(MIRSOFT_DOWNLOAD_FIXTURE, &page)
+            .expect("explicit On Site download link");
+        assert_eq!(
+            target.as_str(),
+            "http://www.mirsoft.info/wogm_download.php?data=fresh%2Bonsite%3Dtoken&unused=1",
+        );
+        assert_eq!(
+            target
+                .query_pairs()
+                .find(|(key, _)| key == "data")
+                .map(|(_, value)| value.into_owned()),
+            Some("fresh+onsite=token".to_owned()),
+        );
+    }
+
+    #[test]
+    fn mirsoft_onsite_link_accepts_case_whitespace_and_same_origin_absolute_urls() {
+        let page = Url::parse("https://mirsoft.info/wogm_download.php?data=landing-token")
+            .expect("page URL");
+        let html = "<a href='https://mirsoft.info/wogm_download.php?data=onsite'> ON\n SITE &nbsp; DOWNLOAD </a>";
+        let target = mirsoft_onsite_download_url(html, &page).expect("normalized link label");
+        assert_eq!(
+            target.as_str(),
+            "https://mirsoft.info/wogm_download.php?data=onsite"
+        );
+    }
+
+    #[test]
+    fn mirsoft_onsite_link_rejects_unsafe_targets_and_self_loops() {
+        let page = Url::parse("http://www.mirsoft.info/wogm_download.php?data=landing-token")
+            .expect("page URL");
+        for href in [
+            "./wogm_download.php?data=landing-token",
+            "#download",
+            "./wogm_download.php?data=onsite#download",
+            "./wogm_download.php?data=",
+            "./wogm_download.php?data=one&amp;data=two",
+            "./gamemods/Lotus%203.zip",
+            "//mirror12.mirsoft.info/wogm_download.php?data=onsite",
+            "//www.mirsoft.info.evil.example/wogm_download.php?data=onsite",
+            "http://mirsoft.info/wogm_download.php?data=onsite",
+            "https://www.mirsoft.info/wogm_download.php?data=onsite",
+            "http://www.mirsoft.info:8080/wogm_download.php?data=onsite",
+            "http://user:password@www.mirsoft.info/wogm_download.php?data=onsite",
+            "file:///tmp/onsite.zip",
+            "javascript:download()",
+        ] {
+            let html = format!("<a href='{href}'>On Site download</a>");
+            assert!(
+                mirsoft_onsite_download_url(&html, &page).is_none(),
+                "accepted {href}"
+            );
+        }
+    }
+
+    #[test]
+    fn mirsoft_onsite_link_requires_an_explicit_label_and_a_trusted_landing_page() {
+        let page = Url::parse("http://www.mirsoft.info/wogm_download.php?data=landing-token")
+            .expect("page URL");
+        for html in [
+            "<html><h2>Download unavailable</h2></html>",
+            "<a href='./wogm_download.php?data=mirror'>Mirror download</a>",
+            "<a href='./wogm_download.php?data=onsite'>Download</a>",
+            "<a href='./wogm_download.php?data=onsite'>On Site download instructions</a>",
+        ] {
+            assert!(mirsoft_onsite_download_url(html, &page).is_none());
+        }
+        let untrusted = Url::parse("http://evil.example/wogm_download.php?data=landing-token")
+            .expect("untrusted page URL");
+        assert!(mirsoft_onsite_download_url(MIRSOFT_DOWNLOAD_FIXTURE, &untrusted).is_none());
     }
 
     #[test]
