@@ -4848,6 +4848,14 @@ pub trait UiController {
     /// passing `None` detaches the frontend without changing queued responses.
     fn set_worker_waker(&mut self, _waker: Option<std::task::Waker>) {}
 
+    /// Bounds a frontend wait by scheduled controller work, not response polling.
+    ///
+    /// A one-second fallback retains maintenance for sources without notifications.
+    /// Frontends may use a shorter playback or animation redraw deadline.
+    fn next_tick_delay(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(1)
+    }
+
     /// Reports visible Archive result slots, excluding the continuation/footer rows.
     /// Frontends without terminal geometry may retain the controller's default.
     fn set_archive_org_search_page_capacity(&mut self, _rows: usize) {}

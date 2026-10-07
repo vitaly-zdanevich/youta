@@ -1107,7 +1107,7 @@ fn run_with_input(
             break;
         }
 
-        let wait = event_wait(controller.view(), settings);
+        let wait = event_wait(controller.view(), settings).min(controller.next_tick_delay());
         let wait_outcome = wait_for_event_or_thumbnail(wait, renderer.as_deref_mut(), |timeout| {
             input.poll(timeout)
         })?;

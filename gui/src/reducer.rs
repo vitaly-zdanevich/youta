@@ -16,6 +16,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::task::Waker;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -40,6 +41,12 @@ use youta::waveform::Peak;
 
 use crate::desktop::{Announced, WindowFocus};
 use crate::media_keys::MediaCommand;
+
+#[path = "reducer_wake.rs"]
+mod reducer_wake;
+use reducer_wake::InboxWake;
+
+type ReducerWake = InboxWake<Message>;
 
 /// Event name carrying a changed snapshot to the window.
 pub const VIEW_EVENT: &str = "youta://view";
@@ -248,11 +255,18 @@ fn local_artwork_urls(view: &ViewModel) -> impl Iterator<Item = &Url> {
         .filter(|url| url.scheme() == "file")
 }
 
-/// Reducer wake-up period.
-///
-/// The reducer also wakes immediately for every dispatched action, so this only
-/// bounds how long a worker response waits before reaching the window.
-const TICK: Duration = Duration::from_millis(100);
+/// Redraw deadlines; worker completions wake independently through the inbox.
+const ACTIVE_TICK: Duration = Duration::from_millis(100);
+const IDLE_TICK: Duration = Duration::from_secs(1);
+
+/// Retains smooth playback and spinners without repeatedly rebuilding idle views.
+fn redraw_delay(view: &ViewModel) -> Duration {
+    if (!view.playback.idle && !view.playback.paused) || view.needs_animation_tick() {
+        ACTIVE_TICK
+    } else {
+        IDLE_TICK
+    }
+}
 
 /// Actions applied before the next snapshot is published.
 const MAX_ACTIONS_PER_TICK: usize = 64;
@@ -276,6 +290,8 @@ pub enum FrontendAction {
 
 /// One item on the reducer's inbox.
 enum Message {
+    /// Queued worker responses are ready; the reducer remains their sole consumer.
+    WorkerReady,
     /// A semantic action from the window.
     Action(UiAction),
     /// Renderer capture with no provider or application policy in the frontend.
@@ -330,7 +346,7 @@ impl ExitAuthorization {
 
 /// Handle used by IPC commands to reach the reducer thread.
 pub struct ReducerHandle {
-    actions: Sender<Message>,
+    actions: Arc<Sender<Message>>,
     latest: Arc<Mutex<ViewModel>>,
     artwork: Arc<PublishedArtwork>,
     /// A `Receiver` is `Send` but not `Sync`, and Tauri shares managed state
@@ -475,6 +491,8 @@ pub fn start<R: Runtime>(
     focus: WindowFocus,
 ) -> Result<ReducerHandle, String> {
     let (action_sender, action_receiver) = channel();
+    let action_sender = Arc::new(action_sender);
+    let worker_wake = Arc::new(ReducerWake::new(&action_sender, || Message::WorkerReady));
     let (ready_sender, ready_receiver) = channel();
     // Never sent on: the thread drops this sender as its last act, which is what
     // `shutdown` waits for.
@@ -512,6 +530,7 @@ pub fn start<R: Runtime>(
             // browsing costs no decoder process, exactly as in the terminal.
             let playback = configured_playback_factory(&config);
             let mut controller = AppController::new(config, store, provider, playback);
+            controller.set_worker_waker(Some(Waker::from(worker_wake.clone())));
 
             published_artwork.record(controller.view());
             *published.lock().unwrap_or_else(PoisonError::into_inner) = controller.view().clone();
@@ -527,7 +546,9 @@ pub fn start<R: Runtime>(
                 &published_artwork,
                 &focus,
                 &reducer_exit_authorization,
+                &worker_wake,
             );
+            controller.set_worker_waker(None);
             // Every exit from `run` lands here, so the player process is killed
             // and durable state is flushed whether the user quit, closed the
             // window, or the window itself went away.
@@ -581,6 +602,7 @@ fn apply<R: Runtime>(app: &AppHandle<R>, controller: &mut AppController, message
             Some(MediaCommand::Show) => crate::desktop::show_window(app),
             None => {}
         },
+        Message::WorkerReady => {}
         Message::Stop => return false,
     }
     true
@@ -694,6 +716,7 @@ fn run<R: Runtime>(
     artwork: &Arc<PublishedArtwork>,
     focus: &WindowFocus,
     exit_authorization: &ExitAuthorization,
+    worker_wake: &ReducerWake,
 ) {
     let mut last = controller.view().clone();
     let mut traffic = TrafficMeter::new();
@@ -711,9 +734,11 @@ fn run<R: Runtime>(
         media.publish(&last);
     }
     loop {
-        match actions.recv_timeout(TICK) {
+        let wait = redraw_delay(controller.view()).min(controller.next_tick_delay());
+        match actions.recv_timeout(wait) {
             Ok(
-                message @ (Message::Action(_)
+                message @ (Message::WorkerReady
+                | Message::Action(_)
                 | Message::Frontend(_)
                 | Message::Key { .. }
                 | Message::Media(_)),
@@ -738,6 +763,9 @@ fn run<R: Runtime>(
             Err(RecvTimeoutError::Timeout) => {}
         }
 
+        // Clear before consuming responses, so a completion arriving after its
+        // queue was drained can enqueue another wake instead of being lost.
+        worker_wake.acknowledge();
         serve_side_effects(app, controller);
         controller.tick();
 
@@ -818,6 +846,50 @@ mod tests {
     use youta::config::Config;
     use youta::view::UiAction;
 
+    /// Unchanged idle snapshots must not force the old ten checks per second.
+    #[test]
+    fn idle_wait_keeps_playback_and_animation_deadlines() {
+        use std::time::Duration;
+
+        let mut view = ViewModel::default();
+        assert_eq!(super::redraw_delay(&view), Duration::from_secs(1));
+        view.local_artwork_pending = true;
+        assert_eq!(super::redraw_delay(&view), Duration::from_secs(1));
+        view.playback.idle = false;
+        view.playback.paused = false;
+        assert_eq!(super::redraw_delay(&view), Duration::from_millis(100));
+        view.playback.paused = true;
+        assert_eq!(super::redraw_delay(&view), Duration::from_secs(1));
+        view.search_activity = Some(youta::view::SearchActivity::YouTube);
+        assert_eq!(super::redraw_delay(&view), Duration::from_millis(100));
+    }
+
+    /// Bursts need one wake, and completions during reduction need a fresh wake.
+    #[test]
+    fn worker_wakes_coalesce_and_rearm_before_draining_results() {
+        use std::task::Waker;
+
+        let (sender, inbox) = channel();
+        let sender = Arc::new(sender);
+        let wake = Arc::new(super::ReducerWake::new(&sender, || Message::WorkerReady));
+        let waker = Waker::from(wake.clone());
+        for _ in 0..100 {
+            waker.wake_by_ref();
+        }
+        assert!(matches!(inbox.try_recv(), Ok(Message::WorkerReady)));
+        assert!(inbox.try_recv().is_err());
+        wake.acknowledge();
+        waker.wake_by_ref();
+        assert!(matches!(inbox.try_recv(), Ok(Message::WorkerReady)));
+        drop(sender);
+        assert!(matches!(
+            inbox.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Disconnected)
+        ));
+        wake.acknowledge();
+        waker.wake_by_ref();
+    }
+
     /// Builds a reducer over a private configuration directory.
     ///
     /// The mock app is returned so the caller's binding keeps it alive for as
@@ -888,7 +960,7 @@ mod tests {
         let (actions, inbox) = channel();
         let (_finished_sender, finished) = channel();
         let handle = ReducerHandle {
-            actions,
+            actions: Arc::new(actions),
             latest: Arc::new(Mutex::new(ViewModel::default())),
             artwork: Arc::new(PublishedArtwork::default()),
             finished: Mutex::new(finished),
@@ -932,7 +1004,7 @@ mod tests {
         let (actions, inbox) = channel();
         let (_finished_sender, finished) = channel();
         let handle = ReducerHandle {
-            actions,
+            actions: Arc::new(actions),
             latest: Arc::new(Mutex::new(ViewModel::default())),
             artwork: Arc::new(PublishedArtwork::default()),
             finished: Mutex::new(finished),

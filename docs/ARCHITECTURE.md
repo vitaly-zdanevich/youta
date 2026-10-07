@@ -891,7 +891,10 @@ provider replies, artwork and waveform completions share this mechanism.
 Thumbnail cache hits and errors wake through the same path; cache-only
 prefetch remains silent, and disabling TTY artwork detaches its notifications.
 Notifications are coalesced and never consume the controller's response queue.
-Normal playback and animation deadlines remain; artwork and
+The desktop reducer uses a coalesced inbox message for completions, retaining
+100 ms playback/animation redraws but a one-second idle maintenance bound.
+Controller scheduling deadlines shorten that bound for debounced metadata
+and retries. Normal playback and animation deadlines remain; artwork and
 waveforms no longer introduce separate response checks. Before a foreground editor starts, Youta drops
 the input stream and waits for its outstanding task-waker leases to end, so
 no background terminal reader can consume the editor's keys. Input resumes

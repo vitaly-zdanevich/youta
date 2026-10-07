@@ -12,6 +12,17 @@ pub(super) struct ScheduledSoundCloudWikidata {
 }
 
 impl AppController {
+    /// Exposes the lazy lookup's deadline without exposing its selected identity.
+    pub(in crate::app) fn soundcloud_wikidata_deadline(&self) -> Option<Instant> {
+        if self.soundcloud.pending_wikidata.is_some() {
+            return None;
+        }
+        self.soundcloud
+            .scheduled_wikidata
+            .as_ref()
+            .and_then(|work| work.due_at)
+    }
+
     /// Reads P3040 identity from the original page, never from a proxy or stream URL.
     fn selected_soundcloud_wikidata_id(&self) -> Option<String> {
         if self.view.screen != Screen::SoundCloud {

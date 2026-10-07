@@ -20,6 +20,7 @@ mod bandcamp_resolver;
 mod bug_report;
 #[cfg(all(feature = "yt-dlp", feature = "backend-mpv"))]
 mod cached_download;
+mod deadlines;
 #[cfg(feature = "yt-dlp")]
 mod download_choice;
 mod email_links;
@@ -35631,6 +35632,10 @@ impl AppController {
 }
 
 impl UiController for AppController {
+    fn next_tick_delay(&self) -> Duration {
+        self.scheduled_tick_delay(Instant::now())
+    }
+
     fn open_bug_report(&mut self, screenshot: Option<String>) {
         self.open_bug_report_composer(screenshot);
     }
