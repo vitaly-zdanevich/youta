@@ -4,6 +4,7 @@ import importlib.util
 from contextlib import redirect_stderr, redirect_stdout
 import io
 from pathlib import Path
+import re
 import sys
 import tempfile
 import unittest
@@ -20,7 +21,7 @@ SPEC.loader.exec_module(production_loc)
 class ProductionLocTests(unittest.TestCase):
 	'''Use miniature repositories to separate runtime code from test scaffolding.'''
 
-	def count_fixture(self, files, untracked=None, *, tests=False):
+	def count_fixture(self, files, untracked=None, *, tests=False, total=False):
 		'''Count tracked fixture files without reading the real working tree.'''
 		with tempfile.TemporaryDirectory() as temporary:
 			root = Path(temporary)
@@ -29,7 +30,71 @@ class ProductionLocTests(unittest.TestCase):
 				path.parent.mkdir(parents=True, exist_ok=True)
 				path.write_text(content, encoding='utf-8')
 			counter = production_loc.test_counts if tests else production_loc.production_counts
+			if total:
+				counter = production_loc.total_counts
 			return counter(root, set(files))
+
+	def test_repository_total_includes_gui_tooling_tests_examples_and_generated_source(self):
+		'''The broad total covers tracked source outside the production module graph.'''
+		files = {
+			'src/lib.rs': 'pub fn run() {}\n#[cfg(test)]\nmod checks { #[test] fn works() {} }\n',
+			'src/orphan.rs': 'fn not_linked() {}\n',
+			'src/providers/stations_generated.rs': '// Generated data\npub const STATIONS: &[u8] = &[1];\n',
+			'gui/src/main.rs': 'fn main() {}\n',
+			'gui/build.rs': 'fn main() {}\n',
+			'gui/ui/src/App.tsx': 'export const App = () => <main />;\n',
+			'gui/ui/src/app.css': 'main { color: black; }\n',
+			'gui/ui/index.html': '<main></main>\n',
+			'gui/ui/vite.config.ts': 'export default {};\n',
+			'gui/ui/tests/browser.test.mjs': 'test("app", () => {});\n',
+			'build.rs': 'fn main() {}\n',
+			'scripts/measure.py': "'''Documentation.'''\nprint('count')\n",
+			'scripts/test-live.sh': '#!/bin/sh\n# comment\nprintf test\n',
+			'tests/fixtures/terminal.py': 'print("fixture")\n',
+			'tests/integration.rs': '#[test]\nfn works() {}\n',
+			'examples/example.rs': 'fn main() {}\n',
+			'.github/workflows/ci.yml': '# CI\nname: CI\n',
+			'packaging/gentoo/youta.ebuild': '# Packaging\nEAPI=8\n',
+			'src/playback/bridge.lua': '-- Hook\nreturn true\n',
+		}
+		counts = self.count_fixture(files, total=True)
+		self.assertEqual(counts, {name: 3 if name == 'src/lib.rs' else 2 if name == 'tests/integration.rs' else 1 for name in files})
+
+	def test_repository_total_excludes_dependency_trees_build_output_and_non_code(self):
+		'''Even accidentally tracked dependencies and bundles are not first-party code.'''
+		excluded = {
+			'vendor/dependency/src/lib.rs': 'fn dependency() {}\n',
+			'gui/ui/node_modules/dependency/main.js': 'const dependency = 1;\n',
+			'.venv/lib/site-packages/package.py': 'dependency = True\n',
+			'third_party/helper.rs': 'fn dependency() {}\n',
+			'target/generated.rs': 'fn generated() {}\n',
+			'gui/ui/dist/main.js': 'const bundled = 1;\n',
+			'coverage/report.js': 'const report = 1;\n',
+			'Cargo.toml': '[package]\nname = "fixture"\n',
+			'Cargo.lock': '# Lockfile\n',
+			'gui/ui/package.json': '{"name": "fixture"}\n',
+			'src/providers/stations_generated.json': '{"stations": []}\n',
+			'gui/gen/schemas/desktop-schema.json': '{"generated": true}\n',
+			'README.md': '# Documentation\n',
+			'docs/badges/total-code.svg': '<svg></svg>\n',
+		}
+		counts = self.count_fixture({'src/lib.rs': 'fn own_code() {}\n', **excluded}, untracked={
+			'scripts/scratch.py': 'print("untracked")\n',
+		}, total=True)
+		self.assertEqual(counts, {'src/lib.rs': 1})
+
+	def test_repository_total_refuses_symlinked_source_files_and_parents(self):
+		'''Tracked paths must not escape the checkout or count aliased files twice.'''
+		with tempfile.TemporaryDirectory() as temporary:
+			root = Path(temporary)
+			(root / 'actual').mkdir()
+			(root / 'actual' / 'code.py').write_text('print("source")\n', encoding='utf-8')
+			(root / 'alias').symlink_to(root / 'actual', target_is_directory=True)
+			(root / 'alias.py').symlink_to(root / 'actual' / 'code.py')
+			for name in ('alias/code.py', 'alias.py', '../outside.py'):
+				with self.subTest(name=name):
+					with self.assertRaises(ValueError):
+						production_loc.total_counts(root, {name})
 
 	def test_test_count_includes_inline_helpers_and_separate_modules_once(self):
 		'''Test-only syntax is counted even in otherwise production Rust files.'''
@@ -358,14 +423,14 @@ class ProductionLocTests(unittest.TestCase):
 
 	def test_badge_is_deterministic_self_contained_and_displays_the_count(self):
 		'''Rendering a count must produce a valid SVG without external assets.'''
-		for tests in (False, True):
-			with self.subTest(tests=tests):
-				badge = production_loc.badge_svg(12345, tests=tests)
-				self.assertEqual(badge, production_loc.badge_svg(12345, tests=tests))
+		for scope, label in [('production', 'production code'), ('test', 'test code'), ('total', 'lines of code total, without deps')]:
+			with self.subTest(scope=scope):
+				badge = production_loc.badge_svg(12345, scope=scope)
+				self.assertEqual(badge, production_loc.badge_svg(12345, scope=scope))
 				root = ET.fromstring(badge)
 				self.assertEqual(root.tag, '{http://www.w3.org/2000/svg}svg')
 				self.assertIn('12345', ''.join(root.itertext()).replace(',', '').replace(' ', ''))
-				self.assertIn('test code' if tests else 'production code', root.attrib['aria-label'])
+				self.assertIn(label, root.attrib['aria-label'])
 				self.assertNotIn('<script', badge)
 				self.assertNotIn('<image', badge)
 				self.assertNotIn('href=', badge)
@@ -386,11 +451,13 @@ class ProductionLocTests(unittest.TestCase):
 			source.write_text('pub fn production() {}\n', encoding='utf-8')
 			badge = root / production_loc.BADGE
 			test_badge = root / production_loc.TEST_BADGE
+			total_badge = root / production_loc.TOTAL_BADGE
+			tracked = ['src/lib.rs']
 
 			def invoke(mode):
 				'''Run the actual command entry point against an isolated repository.'''
 				with mock.patch.object(production_loc, 'ROOT', root):
-					with mock.patch.object(production_loc.subprocess, 'check_output', return_value=b'src/lib.rs\0'):
+					with mock.patch.object(production_loc.subprocess, 'check_output', return_value='\0'.join(tracked).encode()):
 						with mock.patch.object(sys, 'argv', ['production_loc.py', mode]):
 							with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
 								production_loc.main()
@@ -400,7 +467,8 @@ class ProductionLocTests(unittest.TestCase):
 			self.assertEqual(missing.exception.code, 1)
 			invoke('--write')
 			self.assertEqual(badge.read_text(encoding='utf-8'), production_loc.badge_svg(1))
-			self.assertEqual(test_badge.read_text(encoding='utf-8'), production_loc.badge_svg(0, tests=True))
+			self.assertEqual(test_badge.read_text(encoding='utf-8'), production_loc.badge_svg(0, scope='test'))
+			self.assertEqual(total_badge.read_text(encoding='utf-8'), production_loc.badge_svg(1, scope='total'))
 			invoke('--check')
 			source.write_text('pub fn production() {}\npub fn additional() {}\n', encoding='utf-8')
 			with self.assertRaises(SystemExit) as stale:
@@ -416,7 +484,26 @@ class ProductionLocTests(unittest.TestCase):
 			self.assertEqual(stale_tests.exception.code, 1)
 			invoke('--write')
 			self.assertEqual(badge.read_text(encoding='utf-8'), production_loc.badge_svg(2))
-			self.assertEqual(test_badge.read_text(encoding='utf-8'), production_loc.badge_svg(2, tests=True))
+			self.assertEqual(test_badge.read_text(encoding='utf-8'), production_loc.badge_svg(2, scope='test'))
+			self.assertEqual(total_badge.read_text(encoding='utf-8'), production_loc.badge_svg(4, scope='total'))
+			invoke('--check')
+			# Tooling belongs only to the repository-wide total.
+			(root / 'scripts').mkdir()
+			(root / 'scripts/tool.py').write_text('print("tool")\n', encoding='utf-8')
+			tracked.append('scripts/tool.py')
+			with self.assertRaises(SystemExit) as stale_total:
+				invoke('--check')
+			self.assertEqual(stale_total.exception.code, 1)
+			invoke('--write')
+			self.assertEqual(badge.read_text(encoding='utf-8'), production_loc.badge_svg(2))
+			self.assertEqual(test_badge.read_text(encoding='utf-8'), production_loc.badge_svg(2, scope='test'))
+			self.assertEqual(total_badge.read_text(encoding='utf-8'), production_loc.badge_svg(5, scope='total'))
+			invoke('--check')
+			total_badge.unlink()
+			with self.assertRaises(SystemExit) as missing_total:
+				invoke('--check')
+			self.assertEqual(missing_total.exception.code, 1)
+			invoke('--write')
 			invoke('--check')
 			test_badge.unlink()
 			with self.assertRaises(SystemExit) as missing_tests:
@@ -424,10 +511,10 @@ class ProductionLocTests(unittest.TestCase):
 			self.assertEqual(missing_tests.exception.code, 1)
 
 	def test_readme_places_three_code_badges_on_a_dedicated_row(self):
-		'''Production, tests, and Sonar counts share their own Markdown paragraph.'''
+		'''Production, tests, and repository totals share their own Markdown paragraph.'''
 		root = Path(__file__).parents[2]
 		lines = (root / 'README.md').read_text(encoding='utf-8').splitlines()
-		position = next(index for index, line in enumerate(lines) if 'metric=ncloc' in line)
+		position = next(index for index, line in enumerate(lines) if line.startswith('![lines of code total, without deps]'))
 		self.assertGreater(position, 2)
 		self.assertIn('docs/badges/production-code.svg', lines[position - 2])
 		self.assertIn('docs/badges/test-code.svg', lines[position - 1])
@@ -436,6 +523,16 @@ class ProductionLocTests(unittest.TestCase):
 		self.assertIn('docs/PRODUCTION_CODE.md', lines[position - 2])
 		self.assertTrue((root / 'docs/badges/production-code.svg').is_file())
 		self.assertTrue((root / 'docs/PRODUCTION_CODE.md').is_file())
+
+	def test_total_badge_uses_local_repository_count_and_requested_visible_label(self):
+		'''The total must not silently fall back to SonarCloud's src-only scope.'''
+		root = Path(__file__).parents[2]
+		readme = (root / 'README.md').read_text(encoding='utf-8')
+		match = re.search(r'!\[lines of code total, without deps\]\(([^ )]+)', readme)
+		self.assertIsNotNone(match)
+		self.assertEqual(match.group(1), 'docs/badges/total-code.svg')
+		badge = production_loc.badge_svg(12345, scope='total')
+		self.assertIn('lines of code total, without deps: 12,345', ET.fromstring(badge).attrib['aria-label'])
 
 
 if __name__ == '__main__':

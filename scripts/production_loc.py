@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-'''Reproduce the README production/test code badges without compiling dependencies.
+'''Reproduce the README source-code badges without compiling dependencies.
 
 Follow Rust modules from the application/build entry points, masking syntax
 that cannot exist with cfg(test) disabled. Other features/platforms remain
@@ -25,8 +25,12 @@ import tree_sitter_rust
 ROOT = Path(__file__).resolve().parents[1]
 BADGE = Path('docs/badges/production-code.svg')
 TEST_BADGE = Path('docs/badges/test-code.svg')
+TOTAL_BADGE = Path('docs/badges/total-code.svg')
 RUST_ROOTS = ('src/lib.rs', 'src/main.rs', 'build.rs', 'gui/src/main.rs', 'gui/build.rs')
 COMMENTS = {'line_comment', 'block_comment'}
+# Source languages used by this repository; data/manifests are not code lines.
+SOURCE_SUFFIXES = {'.rs', '.py', '.sh', '.lua', '.ts', '.tsx', '.js', '.mjs', '.css', '.html', '.ebuild'}
+NON_SOURCE_DIRECTORIES = {'vendor', 'third_party', 'third-party', 'node_modules', 'target', 'dist', 'coverage', '.venv', 'venv', '__pycache__'}
 
 
 def groups(node):
@@ -242,37 +246,66 @@ def test_counts(root, tracked):
 	return dict(sorted(counts.items()))
 
 
-def badge_svg(count, *, tests=False):
+def total_counts(root, tracked):
+	'''Count all tracked first-party source, including tests, tooling and generated code.'''
+	counts = {}
+	for name in sorted(tracked):
+		path = PurePosixPath(name)
+		workflow = name.startswith('.github/workflows/') and path.suffix in {'.yml', '.yaml'}
+		if path.suffix not in SOURCE_SUFFIXES and not workflow:
+			continue
+		if set(path.parts) & NON_SOURCE_DIRECTORIES:
+			continue
+		if path.is_absolute() or '..' in path.parts or any((root / part).is_symlink() for part in (path, *path.parents)):
+			raise ValueError(f'Unexpected source path: {path}')
+		counts[name] = code_lines((root / path).read_text(encoding='utf-8'), name)
+	return counts
+
+
+def badge_svg(count, *, scope='production'):
 	'''Render a deterministic local badge with an accessible exact count.'''
 	value = f'{count:,}'
-	label = 'test code' if tests else 'production code'
-	excluded = 'generated data and dependencies' if tests else 'tests, generated data and dependencies'
-	return f'''<svg xmlns="http://www.w3.org/2000/svg" width="190" height="20" role="img" aria-label="{label}: {value} lines">
+	label, excluded, label_width = {
+		'production': ('production code', 'tests, generated data and dependencies', 115),
+		'test': ('test code', 'generated data and dependencies', 115),
+		'total': ('lines of code total, without deps', 'dependencies and build output', 195),
+	}[scope]
+	width = label_width + 75
+	return f'''<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="20" role="img" aria-label="{label}: {value} lines">
 	<title>{label.capitalize()}: {value} lines; excludes {excluded}</title>
 	<linearGradient id="shade" x2="0" y2="100%"><stop offset="0" stop-color="#fff" stop-opacity=".1"/><stop offset="1" stop-opacity=".1"/></linearGradient>
-	<clipPath id="round"><rect width="190" height="20" rx="3"/></clipPath>
-	<g clip-path="url(#round)"><path fill="#555" d="M0 0h115v20H0z"/><path fill="#007ec6" d="M115 0h75v20h-75z"/><path fill="url(#shade)" d="M0 0h190v20H0z"/></g>
+	<clipPath id="round"><rect width="{width}" height="20" rx="3"/></clipPath>
+	<g clip-path="url(#round)"><path fill="#555" d="M0 0h{label_width}v20H0z"/><path fill="#007ec6" d="M{label_width} 0h75v20h-75z"/><path fill="url(#shade)" d="M0 0h{width}v20H0z"/></g>
 	<g fill="#fff" text-anchor="middle" font-family="Verdana,Geneva,DejaVu Sans,sans-serif" font-size="11">
-		<text x="57.5" y="15" fill="#010101" fill-opacity=".3">{label}</text><text x="57.5" y="14">{label}</text>
-		<text x="152.5" y="15" fill="#010101" fill-opacity=".3">{value}</text><text x="152.5" y="14">{value}</text>
+		<text x="{label_width / 2:g}" y="15" fill="#010101" fill-opacity=".3">{label}</text><text x="{label_width / 2:g}" y="14">{label}</text>
+		<text x="{label_width + 37.5:g}" y="15" fill="#010101" fill-opacity=".3">{value}</text><text x="{label_width + 37.5:g}" y="14">{value}</text>
 	</g>
 </svg>
 '''
 
 
 def main():
-	'''Print per-file counts, regenerate both SVGs, or reject either stale badge.'''
+	'''Print per-file counts, regenerate all SVGs, or reject any stale badge.'''
 	parser = argparse.ArgumentParser(description=__doc__)
 	mode = parser.add_mutually_exclusive_group()
-	mode.add_argument('--write', action='store_true', help='regenerate both checked-in SVGs')
-	mode.add_argument('--check', action='store_true', help='fail if either checked-in SVG is stale')
+	mode.add_argument('--write', action='store_true', help='regenerate all checked-in SVGs')
+	mode.add_argument('--check', action='store_true', help='fail if any checked-in SVG is stale')
 	args = parser.parse_args()
 	tracked = set(subprocess.check_output(['git', 'ls-files', '-z'], cwd=ROOT).decode().split('\0')) - {''}
 	counts = production_counts(ROOT, tracked)
 	tests = test_counts(ROOT, tracked)
+	repository = total_counts(ROOT, tracked)
 	total = sum(counts.values())
-	print(json.dumps({'total': total, 'files': counts, 'tests': {'total': sum(tests.values()), 'files': tests}}, indent=2))
-	for badge, svg in [(BADGE, badge_svg(total)), (TEST_BADGE, badge_svg(sum(tests.values()), tests=True))]:
+	print(json.dumps({
+		'total': total, 'files': counts,
+		'tests': {'total': sum(tests.values()), 'files': tests},
+		'repository': {'total': sum(repository.values()), 'files': repository},
+	}, indent=2))
+	for badge, svg in [
+		(BADGE, badge_svg(total)),
+		(TEST_BADGE, badge_svg(sum(tests.values()), scope='test')),
+		(TOTAL_BADGE, badge_svg(sum(repository.values()), scope='total')),
+	]:
 		if args.write:
 			(ROOT / badge).parent.mkdir(parents=True, exist_ok=True)
 			(ROOT / badge).write_text(svg, encoding='utf-8')

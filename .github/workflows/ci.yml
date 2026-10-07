@@ -36,7 +36,7 @@ env:
 
 jobs:
   production-code:
-    name: Production/test code badges
+    name: Source-code badges
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     steps:
@@ -49,12 +49,12 @@ jobs:
           "${RUNNER_TEMP}/production-loc/bin/python" -m pip install \
             -r scripts/production-loc-requirements.txt
 
-      - name: Test production/test code classification
+      - name: Test source-code classification
         run: >-
           "${RUNNER_TEMP}/production-loc/bin/python" -m unittest discover
           -s scripts/tests -p 'test_production_loc.py'
 
-      - name: Check both README code badges are current
+      - name: Check all README code badges are current
         run: '"${RUNNER_TEMP}/production-loc/bin/python" scripts/production_loc.py --check'
 
   lint:

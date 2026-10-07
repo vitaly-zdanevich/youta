@@ -54,12 +54,6 @@ It does not compile or expand macros, fetch application dependencies, or measure
 runtime feature combinations. Parse errors, unresolved modules, and unsupported
 conditional module paths fail instead of silently publishing a partial count.
 
-The adjacent SonarCloud badge has a different scope: it analyzes `src/`,
-including inline tests and generated data, but not the desktop frontend.
-None of the three badges includes downloaded dependency source. The SonarCloud
-number is not the sum of the two local badges: its scope and counting rules
-differ, and its result comes from the most recent completed analysis.
-
 ## Interpreting size and finding code
 
 A large source count does not demonstrate dead code. Tests exercise behavior;
