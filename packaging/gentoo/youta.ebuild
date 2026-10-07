@@ -37,7 +37,7 @@ IUSE="
 	keyring +lan-sharing +lastfm +librivox +litres +local +local-archives +mpv native +nyan-cat odysee +peertube pipewire
 	podcast-index pulseaudio +qr +radio +rss rumble +rutube s3-upload +soundcloud +soundstream
 	+sponsorblock sqlite ssh +summary telegram test +images torrent +tracker-music +tui +vimeo vk
-	+waveform +web-browser webdav +wikidata wikimedia yandex-disk yandex-music +youtube-music
+	+url-info +waveform +web-browser webdav +wikidata wikimedia yandex-disk yandex-music +youtube-music
 	+youtube-captions +youtube-official +yt-dlp
 "
 
@@ -50,6 +50,7 @@ REQUIRED_USE="
 	bbc-radio? ( radio )
 	bundled-sqlite? ( sqlite )
 	cmd? ( || ( tui gui ) )
+	url-info? ( || ( tui gui ) )
 	archive-upload? ( yt-dlp )
 	s3-upload? ( yt-dlp )
 	commons-upload? ( yt-dlp )
@@ -176,6 +177,7 @@ src_configure() {
 		$(usev bilibili)
 		$(usev bundled-sqlite)
 		$(usev cmd)
+		$(usev url-info)
 		$(usev commons-upload)
 		$(usev dearrow)
 		$(usev discord)
@@ -248,6 +250,9 @@ src_compile() {
 	# of the granular USE flags that shape the terminal executable.
 	if use gui; then
 		local gui_features=tauri/custom-protocol
+		if use url-info; then
+			gui_features+=,url-info
+		fi
 		if use cmd; then
 			gui_features+=,cmd
 		fi
@@ -313,8 +318,12 @@ src_test() {
 	if use gui; then
 		local gui_feature_args=()
 		local gui_test_features=
+		if use url-info; then
+			gui_test_features=url-info
+		fi
 		if use ascii-visualizer; then
-			gui_test_features=ascii-visualizer
+			[[ -n ${gui_test_features} ]] && gui_test_features+=,
+			gui_test_features+=ascii-visualizer
 		fi
 		if use cmd; then
 			[[ -n ${gui_test_features} ]] && gui_test_features+=,

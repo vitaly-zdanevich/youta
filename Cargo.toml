@@ -4,7 +4,7 @@ resolver = "3"
 
 [package]
 name = "youta"
-version = "0.96.0"
+version = "0.97.0"
 edition = "2024"
 rust-version = "1.95"
 description = "A low-resource YouTube TUI audio player and local subscription manager that uses yt-dlp and saves and shows listening progress"
@@ -49,6 +49,7 @@ default = [
     "qr",
     "sponsorblock",
     "summary",
+    "url-info",
     "web-browser",
     "youtube-captions",
 ]
@@ -212,6 +213,8 @@ keyring = []
 
 # Shared networking and first-class sources.
 network = ["dep:ureq"]
+# Explicit website metadata and public RDAP lookups for Local comments.
+url-info = ["network", "dep:html5gum"]
 # Explicit reviewed public transfers to Internet Archive, removable independently
 # of Archive browsing, Commons and Evernote. Private staging and credentials stay
 # behind this feature; no upload runs without a separate confirmation.

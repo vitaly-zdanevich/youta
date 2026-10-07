@@ -867,7 +867,9 @@ fn parse_url_links(description: &str) -> Vec<DescriptionLink> {
 }
 
 /// Shares URL boundaries between navigation, hashtag exclusion, and URL decoding.
-fn description_url_ranges(description: &str) -> impl Iterator<Item = (usize, usize)> + '_ {
+pub(crate) fn description_url_ranges(
+    description: &str,
+) -> impl Iterator<Item = (usize, usize)> + '_ {
     let mut index = 0;
     std::iter::from_fn(move || {
         while index < description.len() {

@@ -841,9 +841,26 @@ pub struct ArchiveOrgFileCountsView {
     pub playable: u64,
 }
 
+/// On-demand public metadata for one Local-comment or `YouTube`-description URL.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct UrlInfoView {
+    /// Exact normalized HTTP(S) URL; fragments are not sent to servers.
+    pub url: String,
+    /// Whether this disclosure is currently visible.
+    pub expanded: bool,
+    /// An explicitly requested lookup is queued or running.
+    pub loading: bool,
+    /// Bounded plain-text facts or a partial-failure explanation.
+    pub lines: Vec<String>,
+}
+
 /// Details for the selected media item.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct DetailView {
+    /// Explicitly requested website/domain facts, separate from original comment text.
+    pub url_info: Vec<UrlInfoView>,
+    /// First visible entry in the terminal's compact URL-information rail.
+    pub url_info_offset: usize,
     /// Stable identity of the selected media used by description timecodes.
     pub media_id: Option<MediaId>,
     /// Display title.
@@ -4120,6 +4137,12 @@ pub enum UiAction {
     ActivateDetailLink(usize),
     /// Expand or collapse lazy Wikidata properties for an external-link row.
     ToggleWikidataStatements(usize),
+    /// Explicitly fetch or hide public website and registration facts.
+    ToggleUrlInfo(usize),
+    /// Scroll the URL-information controls without contacting any server.
+    MoveUrlInfo(i32),
+    /// Open the original URL associated with a metadata disclosure.
+    OpenUrlInfo(usize),
     /// Open one validated Wikidata item, identifier, Commons page, or
     /// Wikipedia article.
     OpenWikidataValue(String),
@@ -4944,6 +4967,7 @@ impl UiAction {
             Self::ActivateDetailLink(_)
                 | Self::ActivateCommentEmail { .. }
                 | Self::OpenWikidataValue(_)
+                | Self::OpenUrlInfo(_)
                 | Self::OpenInBrowser
                 | Self::OpenChannelInBrowser
                 | Self::CopyAndOpenGitHubIssue

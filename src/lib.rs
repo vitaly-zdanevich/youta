@@ -74,6 +74,8 @@ pub mod subscriptions;
 pub(crate) mod terminal_environment;
 #[cfg(feature = "local-browser")]
 pub mod text_file_open;
+#[cfg(all(feature = "url-info", feature = "controller"))]
+pub(crate) mod url_info;
 pub mod waveform;
 #[cfg(feature = "web-browser")]
 pub mod web_browser;

@@ -179,6 +179,72 @@
 		await until(() => !button('[Ctrl+Alt+F] Fixture command') && !dialog(), 'feature-trimmed custom commands');
 	}
 
+	/** URL facts load only through explicit indexed actions; snapshots own loading and expansion. */
+	async function checkUrlInformation() {
+		const previous = clone(view);
+		const urls = ['https://first.example/music', 'https://second.example/story?a=1&b=2'];
+		const description = `Описание: ${urls[0]}\n${urls[1]}\n<script>literal description</script>`;
+		const entries = urls.map((url) => ({ url, expanded: false, loading: false, lines: [] }));
+		const fixture = { ...details('YouTube URL information', { source: 'you-tube', external_id: 'url-info-video' }),
+			source: 'YouTube', description, url_info: entries, url_info_offset: 1 };
+		const region = () => document.querySelector('[aria-label="URL information"]');
+		const infoCalls = (start) => calls.slice(start).filter((call) => call.command === 'dispatch'
+			&& (Object.hasOwn(call.args.action, 'ToggleUrlInfo') || Object.hasOwn(call.args.action, 'OpenUrlInfo')));
+		const start = calls.length;
+		snapshot({ screen: 'Search', details: fixture, details_focused: false, external_opener_available: false });
+		const panel = await until(() => region()?.querySelectorAll('button').length === 4 && region(), 'YouTube URL information');
+		assert(document.querySelector('[data-description]').textContent === description, 'URL information preserves the complete Unicode description');
+		assert([...panel.querySelectorAll('button')].map((node) => node.textContent).join('|') === `${urls[0]}|Info|${urls[1]}|Info`,
+			'GUI displays all URL entries despite the terminal rail offset');
+		assert(!panel.querySelector('p') && !panel.querySelector('[aria-expanded=true]'), 'URL facts initially remain collapsed');
+		assert(infoCalls(start).length === 0, 'Rendering YouTube URLs never requests metadata or opens a browser');
+		for (const url of urls) {
+			const open = button(url, panel);
+			assert(open.disabled && open.title === 'No external opener available', 'URL opening is disabled without an external opener');
+			open.click();
+		}
+		const secondRow = button(urls[1], panel).parentElement;
+		const info = button('Info', secondRow);
+		info.focus();
+		info.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+		assert(infoCalls(start).length === 0, 'Disabled URL clicks, focus and hover do not start URL lookups');
+		const clicked = calls.length;
+		await action({ ToggleUrlInfo: 1 }, () => info.click(), 'URL Info requests only the selected core URL index');
+		assert(calls.slice(clicked).filter((call) => call.command === 'dispatch').length === 1,
+			'URL Info does not bubble into an extra Details action');
+		assert(!panel.querySelector('p'), 'Info waits for the core loading snapshot rather than inventing browser state');
+		snapshot({ details: { ...fixture, url_info: [entries[0], { ...entries[1], expanded: true, loading: true }] } });
+		await until(() => region()?.querySelector('[role=status]')?.textContent === 'Loading...', 'URL metadata loading snapshot');
+		assert(button('Hide', region()).getAttribute('aria-expanded') === 'true' && !button('Hide', region()).disabled,
+			'Pending URL metadata can be collapsed without needing a browser');
+		const lines = ['Title: <img src=x onerror=alert(1)>', 'Description: music & sound', 'Domain registered: 2001-01-01'];
+		const ready = { ...fixture, url_info: [entries[0], { ...entries[1], expanded: true, lines }] };
+		snapshot({ details: ready });
+		await until(() => region()?.querySelectorAll('p').length === lines.length && !region().querySelector('[role=status]'), 'URL metadata ready snapshot');
+		assert([...region().querySelectorAll('p')].every((node, index) => node.textContent === lines[index]),
+			'Website and RDAP facts preserve literal text including markup-looking content');
+		assert(!region().querySelector('img, script, iframe, a'), 'URL metadata never creates provider-controlled markup or links');
+		assert([...region().querySelectorAll('p')].every((node) => node.classList.contains('text-ink-faint')
+			&& getComputedStyle(node).color !== getComputedStyle(document.querySelector('[data-description]')).color),
+			'URL facts use a muted color distinct from the original description');
+		assert(document.querySelector('[data-description]').textContent === description, 'Completed URL facts never rewrite original description bytes');
+		snapshot({ external_opener_available: true });
+		await until(() => !button(urls[1], region()).disabled, 'URL browser opener available');
+		await action({ OpenUrlInfo: 1 }, () => button(urls[1], region()).click(), 'Opening a URL dispatches its index without a raw URL');
+		const keyboardStart = calls.length;
+		const enter = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true });
+		button(urls[1], region()).focus();
+		await action({ OpenUrlInfo: 1 }, () => button(urls[1], region()).dispatchEvent(enter), 'Focused URL Enter opens only that URL');
+		assert(enter.defaultPrevented && !calls.slice(keyboardStart).some((call) => call.command === 'key'),
+			'URL keyboard activation never falls through to playback');
+		await action({ ToggleUrlInfo: 1 }, () => button('Hide', region()).click(), 'URL Hide dispatches the same index as Info');
+		snapshot({ details: { ...fixture, url_info: [entries[0], { ...entries[1], lines }] } });
+		await until(() => region()?.querySelectorAll('button[aria-expanded=false]').length === 2, 'URL metadata collapsed snapshot');
+		assert(!region().querySelector('p'), 'Collapsing URL facts hides retained metadata without changing the original description');
+		snapshot(previous);
+		await until(() => !region(), 'URL information fixture cleanup');
+	}
+
 	/** Core-projected email spans stay literal, selectable and explicitly activated through native actions. */
 	async function checkEmailLinks() {
 		const previous = clone(view);
@@ -1128,6 +1194,7 @@
 		await checkRadioPresentation();
 		await checkYouTubeSearchControls();
 		await checkEmailLinks();
+		await checkUrlInformation();
 		await checkLiveDuration();
 		await checkLocalFullPath();
 		await checkLocalTrackMetadata();

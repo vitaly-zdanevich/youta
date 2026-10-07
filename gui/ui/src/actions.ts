@@ -251,6 +251,10 @@ export interface UiActionPayloads {
 	SelectPreferencesField: PreferencesField;
 	ActivateDescriptionVideo: { video_id: string; start_seconds: number | null; };
 	ActivateDetailLink: number;
+	/** Index into the current Details URL metadata; never a frontend-supplied URL. */
+	ToggleUrlInfo: number;
+	OpenUrlInfo: number;
+	MoveUrlInfo: number;
 	ActivateQueuePopupRow: number;
 	ActivateTimecode: { media_id: MediaId; seconds: number };
 	ActivateWaveformTimecode: { media_id: MediaId; generation: number; seconds: number; };

@@ -222,6 +222,15 @@ export interface ArchiveOrgFileCountsView {
 	playable: number;
 }
 
+/** Lazily requested website and domain facts supplementing one description URL. */
+export interface UrlInfoView {
+	url: string;
+	expanded: boolean;
+	loading: boolean;
+	/** Plain text only; all fetching and parsing belong to the core. */
+	lines: string[];
+}
+
 /**
  * The Details panel.
  *
@@ -230,6 +239,9 @@ export interface ArchiveOrgFileCountsView {
 export interface DetailView {
 	search_highlights: DetailHighlightView[];
 	description_url_escapes: DetailUrlEscapeView[];
+	url_info: UrlInfoView[];
+	/** Core-owned terminal rail offset; the GUI displays all entries with native scrolling. */
+	url_info_offset: number;
   media_id: MediaId | null;
   title: string;
   source: string;

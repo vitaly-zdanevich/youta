@@ -437,6 +437,26 @@ or a second
 .BR Delete .
 .SS Local files and Radio
 .TP
+.B i
+Open or hide Info for the first visible URL in Local file comments or YouTube
+descriptions. Each HTTP(S) URL has an independent Info control. Alt+i moves to
+the next URL; Alt+Shift+i moves to the previous URL without fetching it.
+Info fetches the HTML title/description and public RDAP registration facts:
+dates, registrar, registrant when public, nameservers and status. Redacted
+owner details remain unavailable. Registration dates are not website age or
+a trust score. Muted facts temporarily occupy the scrollable terminal Details
+body; Hide restores the unchanged original description.
+Only explicit requests contact websites and IANA-discovered RDAP services.
+Website queries are sent to that website; browser cookies and credentials are
+not used. Private networks and nonstandard ports are rejected, including
+redirects and resolved addresses. Scripts/resources are not loaded.
+Lookups have an eight-second shared network budget and preserve partial results.
+Up to 64 recent results stay cached in RAM until exit, without expiry or a
+Refresh button. No browser or API key is required, including on a physical TTY.
+The default-on
+.B url-info
+Cargo feature and Gentoo USE flag can be disabled independently.
+.TP
 .B :
 Enter a Bash command for the selected Local file or folder in the seek-bar area.
 The default-on

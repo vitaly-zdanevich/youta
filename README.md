@@ -138,6 +138,31 @@ available. Copy support is the standalone `local-copy` feature.
 In the terminal UI, folder listings and transfer progress wake the interface
 when ready instead of waiting for a periodic response check.
 
+URLs in Local file comments and YouTube descriptions have an **Info** control.
+It fetches the website's HTML title/description and public
+[RDAP registration data](https://lookup.icann.org/en/faq) only when opened:
+registration/change/expiry dates, registrar, public registrant details, domain
+status and nameservers. No API key or browser is needed. Owner details may be
+redacted; registration dates are not website age, and none of these facts is a
+trust score or backlink count. Fetched text is muted and leaves the original
+comment/description unchanged. In the TUI, Info temporarily shows the facts in
+the scrollable Details body; **Hide** restores the description.
+
+Press `i` for the first visible URL's Info; `Alt+i` / `Alt+Shift+i` move to the
+next/previous URL without fetching it. The compact TUI URL rail also has
+clickable previous/next controls. Each unique HTTP(S) URL gets its own control;
+lookups are never automatic on selection. Results stay in RAM until exit, with
+up to 64 recent cached URLs and no expiry timer or Refresh button. Each explicit
+request has a shared eight-second network budget; partial results and errors
+remain visible. Requests do not use
+browser cookies or credentials and reject private-network destinations, including
+redirects and DNS results. Only public ports 80/443 are supported; scripts and
+page resources are not loaded. Opening Info contacts the website (including its
+query string) and the authoritative RDAP service discovered through
+[IANA's bootstrap registry](https://www.iana.org/assignments/rdap-dns).
+Disable the default-on `url-info` Cargo feature or Gentoo USE flag to omit
+this capability from either frontend.
+
 With the default `cmd` feature, press `:` on a selected Local file or folder
 to enter a [Bash command](https://www.gnu.org/software/bash/manual/bash.html)
 in the seek-bar area. `Enter` runs it in the displayed directory, in the
@@ -1001,7 +1026,7 @@ dependencies, or the optional Linux virtual-console mouse client with:
 
 ```sh
 cargo build --release --locked --no-default-features \
-	--features app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,commons-upload,evernote,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,web-browser,youtube-captions
+	--features app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,commons-upload,evernote,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info,web-browser,youtube-captions
 ```
 
 The `app` profile includes the experimental YandexMusic adapter but does not
@@ -1012,7 +1037,7 @@ with:
 
 ```sh
 cargo build --release --locked --no-default-features \
-	--features app-core,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,commons-upload,evernote,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,web-browser,youtube-captions
+	--features app-core,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,commons-upload,evernote,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info,web-browser,youtube-captions
 ```
 
 Omit `images` from that command for the Yandex-free text-only variant. Omit
@@ -1032,6 +1057,7 @@ leave it out of an explicit `--no-default-features` feature list:
 | `audio-quality` | Local spectral analysis and RustFFT. |
 | `cache` | Session RAM audio cache with a 90% system/container memory-pressure ceiling on Linux. |
 | `cmd` | TUI/GUI provider-filtered command buttons, plus terminal Local-tab Bash commands, completion, and history. |
+| `url-info` | On-demand website title/description and public RDAP facts for Local comments and YouTube descriptions. |
 | `commons-upload` | Commons authentication, upload client, and review UI. |
 | `evernote` | Evernote client and audio-note UI. |
 | `gpm` | Linux virtual-console mouse input; opt in explicitly in either custom example. |

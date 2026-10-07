@@ -47,6 +47,8 @@ mod radio_evernote;
 mod s3_upload;
 mod soundcloud;
 mod subscription_confirmation;
+#[cfg(feature = "url-info")]
+mod url_info;
 #[cfg(feature = "web-browser")]
 mod web;
 #[cfg(all(feature = "web-browser", feature = "local-metadata"))]
@@ -5600,6 +5602,9 @@ pub struct AppController {
     url_open_pending: usize,
     /// Bounded email projections shared by all description and comment providers.
     email_projection: email_links::EmailProjectionCache,
+    /// Explicit URL lookups; selection alone never contacts a website.
+    #[cfg(feature = "url-info")]
+    url_info: url_info::UrlInfoState,
     playback_queue: PlaybackQueue,
     playback_phase: PlaybackPhase,
     /// The backend still owns the finite `YouTube` timeline after natural EOF.
@@ -6924,6 +6929,8 @@ impl AppController {
             url_open_result_sender,
             url_open_pending: 0,
             email_projection: email_links::EmailProjectionCache::default(),
+            #[cfg(feature = "url-info")]
+            url_info: url_info::UrlInfoState::default(),
             playback_queue: PlaybackQueue::default(),
             playback_phase: PlaybackPhase::Idle,
             playback_held_at_end: false,
@@ -36022,7 +36029,32 @@ impl UiController for AppController {
                 self.activate_detail_link(index);
             }
             UiAction::ToggleWikidataStatements(index) => {
+                #[cfg(feature = "url-info")]
+                self.url_info.collapse();
                 self.toggle_wikidata_statements(index);
+            }
+            UiAction::ToggleUrlInfo(index) => {
+                #[cfg(feature = "url-info")]
+                self.toggle_url_info(index);
+                #[cfg(not(feature = "url-info"))]
+                let _ = index;
+            }
+            UiAction::MoveUrlInfo(delta) => {
+                #[cfg(feature = "url-info")]
+                self.move_url_info(delta);
+                #[cfg(not(feature = "url-info"))]
+                let _ = delta;
+            }
+            UiAction::OpenUrlInfo(index) => {
+                if let Some(url) = self
+                    .view
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.url_info.get(index))
+                    .map(|info| info.url.clone())
+                {
+                    self.open_external_url(&url);
+                }
             }
             UiAction::OpenWikidataValue(url) => {
                 self.open_wikidata_value(&url);
@@ -37221,6 +37253,8 @@ impl UiController for AppController {
         }
         self.refresh_playback_preparation_activity();
         self.refresh_email_links();
+        #[cfg(feature = "url-info")]
+        self.refresh_url_info();
         #[cfg(feature = "cmd")]
         self.refresh_custom_command_buttons();
     }
@@ -37516,6 +37550,8 @@ impl UiController for AppController {
         }
         self.refresh_playback_preparation_activity();
         self.refresh_email_links();
+        #[cfg(feature = "url-info")]
+        self.refresh_url_info();
         #[cfg(feature = "cmd")]
         self.refresh_custom_command_buttons();
     }
@@ -47532,6 +47568,9 @@ mod tests {
     #[cfg(feature = "s3-upload")]
     #[path = "s3_upload.rs"]
     mod s3_upload_tests;
+    #[cfg(feature = "url-info")]
+    #[path = "url_info.rs"]
+    mod url_info_tests;
     #[cfg(all(feature = "web-browser", feature = "local-metadata"))]
     #[path = "web_metadata.rs"]
     mod web_metadata_tests;

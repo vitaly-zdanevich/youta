@@ -1,7 +1,7 @@
 import { useEffect, useRef } from "react";
 import type { ReactNode } from "react";
 
-import type { DetailHighlightField, DetailLinkView, DetailView, InformationPanelKind, ViewModel } from "../contract";
+import type { DetailHighlightField, DetailLinkView, DetailView, InformationPanelKind, UrlInfoView, ViewModel } from "../contract";
 import { dispatch } from "../ipc";
 import { highlightRanges } from '../searchHighlights';
 import { Artwork } from "./Artwork";
@@ -169,6 +169,61 @@ function Action({
       {children}
     </button>
   );
+}
+
+/** Explicit URL controls own Enter/Space so they cannot activate playback too. */
+function UrlInfoButton({ children, index, toggle, expanded, disabled = false, title }: {
+	children: ReactNode;
+	index: number;
+	toggle: boolean;
+	expanded?: boolean;
+	disabled?: boolean;
+	title: string;
+}) {
+	const activate = () => {
+		if (!disabled) void dispatch(toggle ? { ToggleUrlInfo: index } : { OpenUrlInfo: index });
+	};
+	return <button type='button' disabled={disabled} aria-expanded={expanded} title={title}
+		onClick={(event) => {
+			event.stopPropagation();
+			activate();
+		}}
+		onKeyDown={(event) => {
+			if (event.ctrlKey || event.altKey || event.metaKey || (event.key !== 'Enter' && event.key !== ' ')) return;
+			event.preventDefault();
+			event.stopPropagation();
+			if (!event.repeat) activate();
+		}}
+		className={`rounded-[3px] text-left underline decoration-dotted underline-offset-2 disabled:cursor-default disabled:no-underline not-disabled:hover:text-accent focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-accent ${toggle ? 'shrink-0 text-ink-faint' : 'min-w-0 break-all text-ink'}`}>
+		{children}
+	</button>;
+}
+
+/** Metadata remains separate from the original comment and its byte-indexed links. */
+function UrlInformation({ entries, externalOpenerAvailable }: {
+	entries: readonly UrlInfoView[];
+	externalOpenerAvailable: boolean;
+}) {
+	if (entries.length === 0) return null;
+	return <section aria-label='URL information' className='mt-2 grid gap-2 text-xs'>
+		{entries.map((entry, index) => <div key={`${entry.url}-${index}`}>
+			<div className='flex items-baseline gap-2'>
+				<UrlInfoButton index={index} toggle={false} disabled={!externalOpenerAvailable}
+					title={externalOpenerAvailable ? 'Open URL in browser' : 'No external opener available'}>
+					{entry.url}
+				</UrlInfoButton>
+				<UrlInfoButton index={index} toggle expanded={entry.expanded}
+					title={entry.expanded ? 'Hide URL information' : 'Show website and domain information'}>
+					{entry.expanded ? 'Hide' : 'Info'}
+				</UrlInfoButton>
+			</div>
+			{entry.expanded ? <div className='mt-1'>
+				{entry.loading ? <p role='status' className='m-0 text-ink-faint'>Loading...</p> : null}
+				{entry.lines.map((line, lineIndex) => <p key={lineIndex}
+					className='m-0 whitespace-pre-wrap break-words text-ink-faint'>{line}</p>)}
+			</div> : null}
+		</div>)}
+	</section>;
 }
 
 /** The external-link list, with its lazily expanded Wikidata spoilers. */
@@ -588,6 +643,9 @@ export function Details({ view, kind }: { view: ViewModel; kind: InformationPane
 				revealLink={view.detail_link_reveal}
 				externalOpenerAvailable={view.external_opener_available}
       />
+
+      <UrlInformation entries={details.url_info ?? []}
+				externalOpenerAvailable={view.external_opener_available} />
 
       {kind === "Local" && audioQuality !== null ? (
         <section

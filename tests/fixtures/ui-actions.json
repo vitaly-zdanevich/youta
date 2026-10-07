@@ -384,5 +384,8 @@
 	{"SubmitArchiveUpload":1},
 	{"SubmitS3Upload":1},
 	{"ToggleDownloadMarkAt":1},
-	{"ToggleWikidataStatements":1}
+	{"ToggleWikidataStatements":1},
+	{"ToggleUrlInfo":0},
+	{"MoveUrlInfo":1},
+	{"OpenUrlInfo":0}
 ]

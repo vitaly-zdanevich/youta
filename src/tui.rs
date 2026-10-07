@@ -6131,7 +6131,9 @@ fn render_information_panel(
         remaining_height = inner.bottom().saturating_sub(cursor_y);
     }
     if !details.links.is_empty() && remaining_height > 0 {
-        let description_reserve = if has_details_body {
+        let description_reserve = if !details.url_info.is_empty() {
+            remaining_height.min(6)
+        } else if has_details_body {
             remaining_height.min(1)
         } else {
             0
@@ -6364,6 +6366,120 @@ fn render_information_panel(
         }
     }
 
+    // URL facts have their own disclosure and scrollable body. Never splice
+    // fetched text into the original comment's byte-indexed links/highlights.
+    let url_start = details
+        .url_info_offset
+        .min(details.url_info.len().saturating_sub(1));
+    let url_rows = usize::from(remaining_height.saturating_sub(2).clamp(1, 3));
+    for (index, info) in details
+        .url_info
+        .iter()
+        .enumerate()
+        .skip(url_start)
+        .take(url_rows)
+    {
+        if remaining_height <= 1 {
+            break;
+        }
+        let label = if index == url_start {
+            if info.expanded {
+                "[i] Hide "
+            } else {
+                "[i] Info "
+            }
+        } else if info.expanded {
+            "[Hide] "
+        } else {
+            "[Info] "
+        };
+        let control_width = terminal_text_width(label).min(inner.width);
+        let row = Rect::new(inner.x, cursor_y, inner.width, 1);
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(label, theme.accent),
+                Span::styled(
+                    info.url.clone(),
+                    if view.external_opener_available {
+                        theme.accent.add_modifier(Modifier::UNDERLINED)
+                    } else {
+                        theme.muted
+                    },
+                ),
+            ])),
+            row,
+        );
+        hit_map.detail_buttons.push((
+            UiAction::ToggleUrlInfo(index),
+            Rect::new(row.x, row.y, control_width, 1),
+        ));
+        if view.external_opener_available && control_width < row.width {
+            hit_map.detail_buttons.push((
+                UiAction::OpenUrlInfo(index),
+                Rect::new(row.x + control_width, row.y, row.width - control_width, 1),
+            ));
+        }
+        if show_text_selection {
+            capture_selectable_details_row(frame, hit_map, row);
+        }
+        cursor_y = cursor_y.saturating_add(1);
+        remaining_height = inner.bottom().saturating_sub(cursor_y);
+    }
+    if details.url_info.len() > 1 && remaining_height > 1 {
+        let row = Rect::new(inner.x, cursor_y, inner.width, 1);
+        let previous = "[<] ";
+        let next = "[>] ";
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    previous,
+                    if url_start > 0 {
+                        theme.accent
+                    } else {
+                        theme.muted
+                    },
+                ),
+                Span::styled(
+                    next,
+                    if url_start + 1 < details.url_info.len() {
+                        theme.accent
+                    } else {
+                        theme.muted
+                    },
+                ),
+                Span::styled(
+                    format!("URL {} of {}", url_start + 1, details.url_info.len()),
+                    theme.muted,
+                ),
+            ])),
+            row,
+        );
+        if url_start > 0 {
+            hit_map.detail_buttons.push((
+                UiAction::MoveUrlInfo(-1),
+                Rect::new(row.x, row.y, 4.min(row.width), 1),
+            ));
+        }
+        if url_start + 1 < details.url_info.len() && row.width > 4 {
+            hit_map.detail_buttons.push((
+                UiAction::MoveUrlInfo(1),
+                Rect::new(row.x + 4, row.y, 4.min(row.width - 4), 1),
+            ));
+        }
+        cursor_y = cursor_y.saturating_add(1);
+        remaining_height = inner.bottom().saturating_sub(cursor_y);
+    }
+    let expanded_url_info = details
+        .url_info
+        .iter()
+        .find(|info| info.expanded)
+        .map(|info| {
+            if info.loading {
+                "Loading website and RDAP information...".to_owned()
+            } else {
+                info.lines.join("\n")
+            }
+        });
     let expanded_wikidata_text = details.expanded_wikidata_item.as_deref().map(|item_id| {
         expanded_wikidata_entity.map_or_else(
             || {
@@ -6377,8 +6493,13 @@ fn render_information_panel(
         )
     });
     let details_body = compose_details_body(details);
-    let body_is_wikidata = expanded_wikidata_text.is_some();
-    let body_source = expanded_wikidata_text.unwrap_or(details_body.as_str());
+    let body_is_url_info = expanded_url_info.is_some();
+    let body_is_wikidata = !body_is_url_info && expanded_wikidata_text.is_some();
+    let body_is_metadata = body_is_url_info || body_is_wikidata;
+    let body_source = expanded_url_info
+        .as_deref()
+        .or(expanded_wikidata_text)
+        .unwrap_or(details_body.as_str());
     let wikidata_value_links = expanded_wikidata_entity
         .map(|entity| entity.value_links.as_slice())
         .unwrap_or_default();
@@ -6435,8 +6556,8 @@ fn render_information_panel(
         let description_lines = wrap_description_source_with_character_width(
             body_source,
             usize::from(description_text_area.width.max(1)),
-            if body_is_wikidata { &[] } else { &video_links },
-            if body_is_wikidata {
+            if body_is_metadata { &[] } else { &video_links },
+            if body_is_metadata {
                 &[]
             } else {
                 &details.description_url_escapes
@@ -6462,7 +6583,7 @@ fn render_information_panel(
         let visible_lines = usize::from(description_text_area.height);
         let maximum_offset = description_lines.len().saturating_sub(visible_lines);
         let mut offset = view.details_scroll.min(maximum_offset);
-        if !body_is_wikidata
+        if !body_is_metadata
             && let Some(index) = view
                 .detail_link_reveal
                 .filter(|index| view.selected_detail_link == Some(*index))
@@ -6490,10 +6611,10 @@ fn render_information_panel(
             .skip(offset)
             .take(visible_lines)
             .enumerate();
-        let active_chapter_line = (!body_is_wikidata)
+        let active_chapter_line = (!body_is_metadata)
             .then(|| active_description_chapter_line(view, details))
             .flatten();
-        let mapped_description = !body_is_wikidata && !details.description_url_escapes.is_empty();
+        let mapped_description = !body_is_metadata && !details.description_url_escapes.is_empty();
         let mut previous_copy_source_end = None;
         for (visible_index, source_line) in visible {
             let row = description_text_area.y.saturating_add(
@@ -6507,7 +6628,9 @@ fn render_information_panel(
             let active_line = active_chapter_line.as_ref().is_some_and(|active| {
                 source_line.start_byte < active.end && source_line.end_byte > active.start
             });
-            let line_style = if active_line {
+            let line_style = if body_is_url_info {
+                theme.muted
+            } else if active_line {
                 theme.active_chapter.add_modifier(Modifier::BOLD)
             } else {
                 theme.base
@@ -6542,7 +6665,11 @@ fn render_information_panel(
                         start_byte,
                         end_byte,
                     } => {
-                        if body_is_wikidata {
+                        if body_is_url_info {
+                            let text = &body_source[start_byte..end_byte];
+                            spans.push(Span::styled(text.to_owned(), theme.muted));
+                            cell_cursor = cell_cursor.saturating_add(terminal_text_width(text));
+                        } else if body_is_wikidata {
                             append_wikidata_source_spans(
                                 body_source,
                                 wikidata_value_links,
@@ -39760,6 +39887,99 @@ prose 07:25 remains clickable but is not a chapter";
         assert_eq!(
             hit_map.youtube_setup_buttons.len(),
             5 + 2 * usize::from(cfg!(feature = "invidious"))
+        );
+    }
+
+    #[test]
+    fn url_info_controls_are_bounded_and_facts_are_muted_without_comment_link_actions() {
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        let mut view = ViewModel {
+            screen: Screen::Local,
+            details: Some(DetailView {
+                description: "Original comment https://example.com/".into(),
+                url_info: (0..20)
+                    .map(|index| crate::view::UrlInfoView {
+                        url: format!("https://example.com/{index}"),
+                        expanded: index == 12,
+                        lines: vec!["Title: Fetched website".into()],
+                        ..crate::view::UrlInfoView::default()
+                    })
+                    .collect(),
+                url_info_offset: 12,
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut hits = HitMap::default();
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hits))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let text = buffer
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(text.contains("Title: Fetched website"));
+        assert!(text.contains("URL 13 of 20"));
+        let start = buffer
+            .content()
+            .windows(6)
+            .position(|cells| {
+                cells
+                    .iter()
+                    .map(ratatui::buffer::Cell::symbol)
+                    .collect::<String>()
+                    == "Title:"
+            })
+            .unwrap();
+        assert_eq!(buffer.content()[start].fg, Color::DarkGray);
+        assert_eq!(
+            hits.detail_buttons
+                .iter()
+                .filter(|(action, _)| matches!(action, UiAction::ToggleUrlInfo(_)))
+                .count(),
+            3
+        );
+        assert!(
+            hits.detail_buttons
+                .iter()
+                .any(|(action, _)| *action == UiAction::ToggleUrlInfo(12))
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE), &view),
+            Some(UiAction::ToggleUrlInfo(12))
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::ALT), &view),
+            Some(UiAction::MoveUrlInfo(1))
+        );
+        assert_eq!(
+            key_action(
+                KeyEvent::new(KeyCode::Char('I'), KeyModifiers::ALT | KeyModifiers::SHIFT),
+                &view
+            ),
+            Some(UiAction::MoveUrlInfo(-1))
+        );
+        view.external_opener_available = false;
+        hits = HitMap::default();
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hits))
+            .unwrap();
+        assert!(
+            !hits
+                .detail_buttons
+                .iter()
+                .any(|(action, _)| matches!(action, UiAction::OpenUrlInfo(_)))
+        );
+        assert!(
+            hits.detail_buttons
+                .iter()
+                .any(|(action, _)| matches!(action, UiAction::ToggleUrlInfo(_)))
+        );
+        assert_eq!(
+            view.details.as_ref().unwrap().description,
+            "Original comment https://example.com/"
         );
     }
 

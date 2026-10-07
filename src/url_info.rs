@@ -1,0 +1,1665 @@
+//! Bounded, public-network website metadata and domain-registration facts.
+//!
+//! Only an explicit controller request reaches this client. Website declarations
+//! are unverified claims; registry dates are not website age or a trust rating.
+//! Explicit website requests preserve their query strings without sharing them
+//! with registration services. No cookies, URL credentials, browser state,
+//! scripts, or related resources are loaded. Registration entities are parsed
+//! locally, never crawled. Website metadata uses at most the first 256 KiB;
+//! registration JSON must fit completely within its separate response limit.
+
+use std::io::Read;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
+use html5gum::{DefaultEmitter, Token, Tokenizer};
+use serde_json::Value;
+use ureq::unversioned::resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver};
+use ureq::unversioned::transport::{DefaultConnector, NextTimeout};
+use url::{Host, Url};
+
+use crate::domain::{ip_address_is_non_public, remote_url_has_non_public_host};
+
+const BOOTSTRAP_URL: &str = "https://data.iana.org/rdap/dns.json";
+const LOOKUP_TIMEOUT: Duration = Duration::from_secs(8);
+const MAX_HTML_BYTES: usize = 256 * 1024;
+const MAX_JSON_BYTES: usize = 512 * 1024;
+const MAX_JSON_DEPTH: usize = 24;
+const MAX_JSON_NODES: usize = 32_768;
+const MAX_HTML_TOKENS: usize = 16_384;
+const MAX_URL_BYTES: usize = 4_096;
+const MAX_FIELD_BYTES: usize = 1_024;
+const MAX_FACTS: usize = 48;
+const MAX_FACT_BYTES: usize = 16 * 1024;
+const MAX_REDIRECTS: usize = 3;
+const MAX_REQUESTS: usize = 24;
+const MAX_DOMAIN_ATTEMPTS: usize = 5;
+const MAX_BOOTSTRAP_SUFFIXES: usize = 4_096;
+
+/// One session's cached IANA endpoint map; neither response bodies nor page claims persist.
+#[derive(Default)]
+pub(crate) struct UrlInfoClient {
+    bootstrap: Option<Vec<BootstrapService>>,
+}
+
+impl UrlInfoClient {
+    /// Returns bounded website and registration facts, retaining either partial result.
+    ///
+    /// The caller must use a worker. One shared eight-second budget covers DNS,
+    /// requests, redirects, and body reads. Cancellation is checked between reads.
+    /// Errors are fixed explanations and never echo credentials or request queries.
+    pub(crate) fn lookup(&mut self, url: &Url, cancelled: &AtomicBool) -> Vec<String> {
+        self.lookup_with(url, cancelled, &UreqTransport::default())
+    }
+
+    /// Keeps all URL and redirect policy in the same path for real and mocked transports.
+    fn lookup_with(
+        &mut self,
+        url: &Url,
+        cancelled: &AtomicBool,
+        transport: &impl HttpTransport,
+    ) -> Vec<String> {
+        let mut facts = Facts::default();
+        if let Err(error) = validate_public_url(url) {
+            facts.add("URL info", &error.message());
+            return facts.finish();
+        }
+        let mut budget = Budget::new(cancelled);
+        match fetch_document(transport, url, DocumentKind::Html, &mut budget) {
+            Ok(page) => {
+                facts.add(
+                    "Website response",
+                    &format!("HTTP {}", page.response.status),
+                );
+                facts.add("Final URL", page.url.as_str());
+                facts.add(
+                    "Transport",
+                    if page.url.scheme() == "https" {
+                        "HTTPS (encrypted connection, not a trust rating)"
+                    } else {
+                        "HTTP (unencrypted connection)"
+                    },
+                );
+                if (200..300).contains(&page.response.status) {
+                    match html_facts(&page.response.body) {
+                        Ok(values) => facts.extend(values),
+                        Err(error) => facts.add("Website metadata", &error.message()),
+                    }
+                }
+            }
+            Err(error) => facts.add("Website", &error.message()),
+        }
+        if cancelled.load(Ordering::Relaxed) {
+            return facts.finish();
+        }
+        let Some(Host::Domain(host)) = url.host() else {
+            facts.add(
+                "Registration",
+                "Domain registration is not applicable to an IP address",
+            );
+            return facts.finish();
+        };
+        let host = host.trim_end_matches('.').to_ascii_lowercase();
+        match self.registration(&host, transport, &mut budget) {
+            Ok(values) => facts.extend(values),
+            Err(error) => facts.add("Registration", &error.message()),
+        }
+        facts.finish()
+    }
+
+    /// Tries a parent only after a registry 404, never guessing a registrable suffix.
+    fn registration(
+        &mut self,
+        host: &str,
+        transport: &impl HttpTransport,
+        budget: &mut Budget<'_>,
+    ) -> Result<Vec<String>, Failure> {
+        if !valid_domain(host) {
+            return Err(Failure::Unavailable);
+        }
+        if self.bootstrap.is_none() {
+            let source = Url::parse(BOOTSTRAP_URL).map_err(|_| Failure::InvalidDocument)?;
+            let response = fetch_document(transport, &source, DocumentKind::Json, budget)?;
+            check_status(response.response.status)?;
+            self.bootstrap = Some(parse_bootstrap(&parse_json(&response.response.body)?)?);
+        }
+        let service = self
+            .bootstrap
+            .as_ref()
+            .and_then(|services| {
+                services
+                    .iter()
+                    .filter(|service| {
+                        host == service.suffix
+                            || host
+                                .strip_suffix(&service.suffix)
+                                .is_some_and(|prefix| prefix.ends_with('.'))
+                    })
+                    .max_by_key(|service| service.suffix.len())
+            })
+            .ok_or(Failure::Unavailable)?;
+        let mut candidate = host;
+        for _ in 0..MAX_DOMAIN_ATTEMPTS {
+            if !candidate.contains('.') {
+                break;
+            }
+            let mut source = service.endpoint.clone();
+            {
+                let mut path = source
+                    .path_segments_mut()
+                    .map_err(|_| Failure::InvalidDocument)?;
+                path.pop_if_empty().push("domain").push(candidate);
+            }
+            let response = fetch_document(transport, &source, DocumentKind::Json, budget)?;
+            if response.response.status == 404 {
+                candidate = candidate.split_once('.').map_or("", |(_, parent)| parent);
+                continue;
+            }
+            check_status(response.response.status)?;
+            let mut facts = Facts::default();
+            facts.extend(rdap_facts(
+                &parse_json(&response.response.body)?,
+                candidate,
+            )?);
+            facts.add("RDAP source", response.url.as_str());
+            return Ok(facts.finish());
+        }
+        Err(Failure::NotFound)
+    }
+}
+
+/// Fixed errors omit request URLs and third-party response/error bodies.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Failure {
+    InvalidUrl,
+    Transport,
+    Timeout,
+    Cancelled,
+    Budget,
+    TooLarge,
+    InvalidDocument,
+    Redirect,
+    WrongType,
+    NotFound,
+    RateLimited,
+    Status(u16),
+    Mismatch,
+    Unavailable,
+}
+
+impl Failure {
+    fn message(self) -> String {
+        match self {
+			Self::InvalidUrl => "Only public HTTP(S) URLs on ports 80/443 without URL credentials are supported".to_owned(),
+			Self::Transport => "Could not connect to the public server".to_owned(),
+			Self::Timeout => "The URL information time limit was reached".to_owned(),
+			Self::Cancelled => "Lookup cancelled".to_owned(),
+			Self::Budget => "The request limit was reached".to_owned(),
+			Self::TooLarge => "The response exceeded the size limit".to_owned(),
+			Self::InvalidDocument => "The server returned unsupported or malformed metadata".to_owned(),
+			Self::Redirect => "The redirect was unsafe or exceeded the redirect limit".to_owned(),
+			Self::WrongType => "The response was not the expected HTML or JSON document".to_owned(),
+			Self::NotFound => "No matching registration record was published for this hostname or its queried parents".to_owned(),
+			Self::RateLimited => "The registration service rate-limited this lookup; try later".to_owned(),
+			Self::Status(status) => format!("The server returned HTTP {status}"),
+			Self::Mismatch => "The registration response did not identify the requested domain".to_owned(),
+			Self::Unavailable => "No supported registration service is published for this domain".to_owned(),
+		}
+    }
+}
+
+/// A finite operation-wide deadline and request count, including bootstrap and redirects.
+struct Budget<'a> {
+    deadline: Instant,
+    remaining_requests: usize,
+    cancelled: &'a AtomicBool,
+}
+
+impl<'a> Budget<'a> {
+    fn new(cancelled: &'a AtomicBool) -> Self {
+        Self {
+            deadline: Instant::now() + LOOKUP_TIMEOUT,
+            remaining_requests: MAX_REQUESTS,
+            cancelled,
+        }
+    }
+
+    fn remaining(&self) -> Result<Duration, Failure> {
+        if self.cancelled.load(Ordering::Relaxed) {
+            return Err(Failure::Cancelled);
+        }
+        self.deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or(Failure::Timeout)
+    }
+
+    fn request(&mut self) -> Result<Duration, Failure> {
+        let remaining = self.remaining()?;
+        if self.remaining_requests == 0 {
+            return Err(Failure::Budget);
+        }
+        self.remaining_requests -= 1;
+        Ok(remaining)
+    }
+}
+
+/// Different body limits and MIME checks apply to website and registration documents.
+#[derive(Clone, Copy)]
+enum DocumentKind {
+    Html,
+    Json,
+}
+
+impl DocumentKind {
+    fn limit(self) -> usize {
+        match self {
+            Self::Html => MAX_HTML_BYTES,
+            Self::Json => MAX_JSON_BYTES,
+        }
+    }
+    fn accepts(self, content_type: &str) -> bool {
+        let content_type = content_type.split(';').next().unwrap_or("").trim();
+        match self {
+            Self::Html => {
+                content_type.eq_ignore_ascii_case("text/html")
+                    || content_type.eq_ignore_ascii_case("application/xhtml+xml")
+            }
+            Self::Json => {
+                content_type.eq_ignore_ascii_case("application/json")
+                    || content_type.eq_ignore_ascii_case("application/rdap+json")
+            }
+        }
+    }
+}
+
+/// One bounded HTTP response; redirect and error bodies are deliberately not retained.
+#[derive(Debug)]
+struct HttpResponse {
+    status: u16,
+    location: Option<String>,
+    content_type: String,
+    body: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct FetchedDocument {
+    url: Url,
+    response: HttpResponse,
+}
+
+/// Injectable I/O boundary; callers independently enforce redirects and document budgets.
+trait HttpTransport {
+    fn fetch(
+        &self,
+        url: &Url,
+        kind: DocumentKind,
+        timeout: Duration,
+        cancelled: &AtomicBool,
+    ) -> Result<HttpResponse, Failure>;
+}
+
+/// Validates every destination before the transport can perform DNS or HTTP I/O.
+fn validate_public_url(url: &Url) -> Result<(), Failure> {
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || !matches!(url.port_or_known_default(), Some(80 | 443))
+        || url.as_str().len() > MAX_URL_BYTES
+        || remote_url_has_non_public_host(url)
+        || url.as_str().chars().any(char::is_control)
+    {
+        return Err(Failure::InvalidUrl);
+    }
+    Ok(())
+}
+
+/// Redirects share the operation deadline and may never downgrade an encrypted request.
+fn fetch_document(
+    transport: &impl HttpTransport,
+    url: &Url,
+    kind: DocumentKind,
+    budget: &mut Budget<'_>,
+) -> Result<FetchedDocument, Failure> {
+    let mut current = url.clone();
+    current.set_fragment(None);
+    for redirects in 0..=MAX_REDIRECTS {
+        validate_public_url(&current)?;
+        if matches!(kind, DocumentKind::Json) && current.scheme() != "https" {
+            return Err(Failure::InvalidUrl);
+        }
+        let response = transport.fetch(&current, kind, budget.request()?, budget.cancelled)?;
+        budget.remaining()?;
+        if matches!(response.status, 301 | 302 | 303 | 307 | 308) {
+            if redirects == MAX_REDIRECTS {
+                return Err(Failure::Redirect);
+            }
+            let location = response
+                .location
+                .as_deref()
+                .filter(|value| value.len() <= MAX_URL_BYTES)
+                .ok_or(Failure::Redirect)?;
+            let mut next = current.join(location).map_err(|_| Failure::Redirect)?;
+            validate_public_url(&next).map_err(|_| Failure::Redirect)?;
+            if current.scheme() == "https" && next.scheme() != "https" {
+                return Err(Failure::Redirect);
+            }
+            next.set_fragment(None);
+            current = next;
+            continue;
+        }
+        if response.body.len() > kind.limit() {
+            return Err(Failure::TooLarge);
+        }
+        if (200..300).contains(&response.status) && !kind.accepts(&response.content_type) {
+            return Err(Failure::WrongType);
+        }
+        return Ok(FetchedDocument {
+            url: current,
+            response,
+        });
+    }
+    Err(Failure::Redirect)
+}
+
+/// Each hop gets a fresh credential-free agent, so cookies cannot cross requests.
+#[derive(Default)]
+struct UreqTransport {
+    #[cfg(test)]
+    allow_loopback: bool,
+}
+
+impl HttpTransport for UreqTransport {
+    fn fetch(
+        &self,
+        url: &Url,
+        kind: DocumentKind,
+        timeout: Duration,
+        cancelled: &AtomicBool,
+    ) -> Result<HttpResponse, Failure> {
+        #[cfg(test)]
+        let test_loopback = self.allow_loopback
+            && matches!(url.host(), Some(Host::Ipv4(ip)) if ip.is_loopback())
+            && url.scheme() == "http"
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none();
+        #[cfg(not(test))]
+        let test_loopback = false;
+        if !test_loopback {
+            validate_public_url(url)?;
+        }
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(Failure::Cancelled);
+        }
+        if timeout.is_zero() {
+            return Err(Failure::Timeout);
+        }
+        let config = ureq::Agent::config_builder()
+            .timeout_global(Some(timeout))
+            .timeout_resolve(Some(timeout))
+            .timeout_connect(Some(timeout))
+            .max_redirects(0)
+            .http_status_as_error(false)
+            .proxy(None)
+            .user_agent(concat!("youta/", env!("CARGO_PKG_VERSION")))
+            .build();
+        let resolver = PublicResolver {
+            inner: DefaultResolver::default(),
+            #[cfg(test)]
+            allow_loopback: test_loopback,
+        };
+        let agent = ureq::Agent::with_parts(config, DefaultConnector::default(), resolver);
+        let mut response = agent
+            .get(url.as_str())
+            .header(
+                "Accept",
+                match kind {
+                    DocumentKind::Html => "text/html,application/xhtml+xml",
+                    DocumentKind::Json => "application/rdap+json,application/json",
+                },
+            )
+            .call()
+            .map_err(|error| match error {
+                ureq::Error::Timeout(_) => Failure::Timeout,
+                _ => Failure::Transport,
+            })?;
+        let status = response.status().as_u16();
+        let location = response
+            .headers()
+            .get("location")
+            .map(|value| value.to_str().map(str::to_owned))
+            .transpose()
+            .map_err(|_| Failure::Redirect)?;
+        if location
+            .as_ref()
+            .is_some_and(|value| value.len() > MAX_URL_BYTES)
+        {
+            return Err(Failure::Redirect);
+        }
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_owned();
+        let body = if (200..300).contains(&status) {
+            if !kind.accepts(&content_type) {
+                return Err(Failure::WrongType);
+            }
+            if matches!(kind, DocumentKind::Json)
+                && response
+                    .body()
+                    .content_length()
+                    .is_some_and(|length| length > kind.limit() as u64)
+            {
+                return Err(Failure::TooLarge);
+            }
+            let reader = response
+                .body_mut()
+                .with_config()
+                .limit((kind.limit() + 1) as u64)
+                .reader();
+            match kind {
+                // A large page can still publish useful metadata in its head. Stop
+                // at the decoded-byte prefix without waiting for the remaining body.
+                DocumentKind::Html => read_body(
+                    reader.take(MAX_HTML_BYTES as u64),
+                    MAX_HTML_BYTES,
+                    cancelled,
+                )?,
+                DocumentKind::Json => read_body(reader, MAX_JSON_BYTES, cancelled)?,
+            }
+        } else {
+            Vec::new()
+        };
+        Ok(HttpResponse {
+            status,
+            location,
+            content_type,
+            body,
+        })
+    }
+}
+
+/// DNS filtering pins actual connections to public addresses; literal checks alone are insufficient.
+#[derive(Debug, Default)]
+struct PublicResolver {
+    inner: DefaultResolver,
+    #[cfg(test)]
+    allow_loopback: bool,
+}
+
+impl Resolver for PublicResolver {
+    fn resolve(
+        &self,
+        uri: &ureq::http::Uri,
+        config: &ureq::config::Config,
+        timeout: NextTimeout,
+    ) -> Result<ResolvedSocketAddrs, ureq::Error> {
+        let resolved = self.inner.resolve(uri, config, timeout)?;
+        let mut public = self.empty();
+        for address in &resolved {
+            #[cfg(test)]
+            if self.allow_loopback && address.ip().is_loopback() {
+                public.push(*address);
+                continue;
+            }
+            if !ip_address_is_non_public(address.ip()) {
+                public.push(*address);
+            }
+        }
+        if public.is_empty() {
+            Err(ureq::Error::HostNotFound)
+        } else {
+            Ok(public)
+        }
+    }
+}
+
+/// Cancellation and the decoded-byte limit are checked between bounded reads.
+fn read_body(
+    mut reader: impl Read,
+    limit: usize,
+    cancelled: &AtomicBool,
+) -> Result<Vec<u8>, Failure> {
+    let mut body = Vec::new();
+    let mut chunk = [0_u8; 8_192];
+    loop {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(Failure::Cancelled);
+        }
+        let length = reader.read(&mut chunk).map_err(|_| Failure::Transport)?;
+        if length == 0 {
+            return Ok(body);
+        }
+        if body.len().saturating_add(length) > limit {
+            return Err(Failure::TooLarge);
+        }
+        body.extend_from_slice(&chunk[..length]);
+    }
+}
+
+/// Bounds every line and the combined projection, including all untrusted field values.
+#[derive(Default)]
+struct Facts {
+    lines: Vec<String>,
+    bytes: usize,
+}
+
+impl Facts {
+    fn add(&mut self, label: &str, value: &str) {
+        let value = safe_text(value);
+        if !value.is_empty() {
+            self.line(format!("{label}: {value}"));
+        }
+    }
+    fn line(&mut self, line: String) {
+        let line = safe_text(&line);
+        if !line.is_empty()
+            && self.lines.len() < MAX_FACTS
+            && self.bytes.saturating_add(line.len()) <= MAX_FACT_BYTES
+        {
+            self.bytes += line.len();
+            self.lines.push(line);
+        }
+    }
+    fn extend(&mut self, lines: Vec<String>) {
+        for line in lines {
+            self.line(line);
+        }
+    }
+    fn finish(self) -> Vec<String> {
+        self.lines
+    }
+}
+
+/// Reduces declared text to one bounded, terminal-safe line, excluding embedded markup.
+fn safe_text(value: &str) -> String {
+    let mut result = String::new();
+    let mut space = false;
+    let mut tag = false;
+    for character in value.chars().take(MAX_FIELD_BYTES * 4) {
+        if character == '<' {
+            tag = true;
+            continue;
+        }
+        if character == '>' && tag {
+            tag = false;
+            continue;
+        }
+        if tag {
+            continue;
+        }
+        if character.is_whitespace() {
+            space = !result.is_empty();
+            continue;
+        }
+        if character.is_control()
+            || matches!(character, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}')
+        {
+            continue;
+        }
+        if result.len() + usize::from(space) + character.len_utf8() > MAX_FIELD_BYTES {
+            break;
+        }
+        if space {
+            result.push(' ');
+            space = false;
+        }
+        result.push(character);
+    }
+    result
+}
+
+/// Tokenizes only a bounded page prefix; scripts, styles, body text, and templates are not facts.
+fn html_facts(html: &[u8]) -> Result<Vec<String>, Failure> {
+    if html.len() > MAX_HTML_BYTES {
+        return Err(Failure::TooLarge);
+    }
+    let mut fields = std::collections::BTreeMap::<&str, String>::new();
+    let mut title = String::new();
+    let mut in_title = false;
+    let mut hidden_depth = 0_usize;
+    let mut emitter = DefaultEmitter::default();
+    emitter.naively_switch_states(true);
+    for token in Tokenizer::new_with_emitter(html, emitter).take(MAX_HTML_TOKENS) {
+        let Ok(token) = token;
+        match token {
+            Token::StartTag(tag) => {
+                let name = tag.name.as_slice();
+                if matches!(name, b"template" | b"noscript") {
+                    hidden_depth = hidden_depth.saturating_add(1);
+                    continue;
+                }
+                if hidden_depth > 0 {
+                    continue;
+                }
+                if name == b"body" {
+                    break;
+                }
+                if name == b"title" {
+                    in_title = title.is_empty();
+                }
+                let attribute = |name: &[u8]| {
+                    tag.attributes
+                        .get(name)
+                        .and_then(|value| std::str::from_utf8(value.value.as_ref()).ok())
+                        .filter(|value| value.len() <= 8_192)
+                };
+                if name == b"html"
+                    && let Some(language) = attribute(b"lang")
+                {
+                    let language = safe_text(language);
+                    if !language.is_empty() {
+                        fields.entry("language").or_insert(language);
+                    }
+                }
+                if name != b"meta" {
+                    continue;
+                }
+                let key = attribute(b"name")
+                    .or_else(|| attribute(b"property"))
+                    .unwrap_or("")
+                    .trim()
+                    .to_ascii_lowercase();
+                let field = match key.as_str() {
+                    "description" => "description",
+                    "og:description" => "fallback-description",
+                    "og:title" => "fallback-title",
+                    "author" => "author",
+                    "og:site_name" => "site",
+                    "language" | "og:locale" => "language",
+                    _ => continue,
+                };
+                if let Some(value) = attribute(b"content") {
+                    let value = safe_text(value);
+                    if !value.is_empty() {
+                        fields.entry(field).or_insert(value);
+                    }
+                }
+            }
+            Token::EndTag(tag) => {
+                if matches!(tag.name.as_slice(), b"template" | b"noscript") {
+                    hidden_depth = hidden_depth.saturating_sub(1);
+                }
+                if tag.name.as_slice() == b"title" {
+                    in_title = false;
+                }
+                if tag.name.as_slice() == b"head" && hidden_depth == 0 {
+                    break;
+                }
+            }
+            Token::String(value) if in_title && hidden_depth == 0 => {
+                if title.len() < MAX_FIELD_BYTES {
+                    let text = String::from_utf8_lossy(value.value.as_ref());
+                    let mut end = text.len().min(MAX_FIELD_BYTES - title.len());
+                    while !text.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    title.push_str(&text[..end]);
+                }
+            }
+            _ => {}
+        }
+    }
+    let title = safe_text(&title);
+    let mut facts = Facts::default();
+    facts.add(
+        "Title",
+        if title.is_empty() {
+            fields.get("fallback-title").map_or("", String::as_str)
+        } else {
+            &title
+        },
+    );
+    facts.add(
+        "Description",
+        fields
+            .get("description")
+            .or_else(|| fields.get("fallback-description"))
+            .map_or("", String::as_str),
+    );
+    for (key, label) in [
+        ("author", "Author (website claim)"),
+        ("site", "Site"),
+        ("language", "Language"),
+    ] {
+        if let Some(value) = fields.get(key) {
+            facts.add(label, value);
+        }
+    }
+    Ok(facts.finish())
+}
+
+/// JSON recursion and aggregate node counts are independently bounded after byte-limited parsing.
+fn parse_json(bytes: &[u8]) -> Result<Value, Failure> {
+    if bytes.len() > MAX_JSON_BYTES {
+        return Err(Failure::TooLarge);
+    }
+    let value: Value = serde_json::from_slice(bytes).map_err(|_| Failure::InvalidDocument)?;
+    let mut stack = vec![(&value, 0_usize)];
+    let mut visited = 0_usize;
+    while let Some((node, depth)) = stack.pop() {
+        visited += 1;
+        if depth > MAX_JSON_DEPTH || visited > MAX_JSON_NODES {
+            return Err(Failure::InvalidDocument);
+        }
+        match node {
+            Value::Array(items) => stack.extend(items.iter().map(|item| (item, depth + 1))),
+            Value::Object(items) => stack.extend(items.values().map(|item| (item, depth + 1))),
+            _ => {}
+        }
+    }
+    Ok(value)
+}
+
+/// One validated IANA suffix-to-HTTPS-endpoint mapping.
+struct BootstrapService {
+    suffix: String,
+    endpoint: Url,
+}
+
+/// Rejects invalid endpoint data instead of letting registry metadata choose arbitrary transports.
+fn parse_bootstrap(value: &Value) -> Result<Vec<BootstrapService>, Failure> {
+    let services = value
+        .get("services")
+        .and_then(Value::as_array)
+        .ok_or(Failure::InvalidDocument)?;
+    let mut result = Vec::new();
+    for service in services.iter().take(MAX_BOOTSTRAP_SUFFIXES) {
+        let Some(pair) = service.as_array().filter(|pair| pair.len() == 2) else {
+            continue;
+        };
+        let Some(suffixes) = pair[0].as_array() else {
+            continue;
+        };
+        let Some(endpoints) = pair[1].as_array() else {
+            continue;
+        };
+        let endpoint = endpoints
+            .iter()
+            .take(8)
+            .filter_map(Value::as_str)
+            .filter_map(|value| Url::parse(value).ok())
+            .find(|url| {
+                url.scheme() == "https" && url.query().is_none() && validate_public_url(url).is_ok()
+            });
+        let Some(endpoint) = endpoint else {
+            continue;
+        };
+        for suffix in suffixes
+            .iter()
+            .take(MAX_BOOTSTRAP_SUFFIXES)
+            .filter_map(Value::as_str)
+        {
+            let suffix = suffix.trim_end_matches('.').to_ascii_lowercase();
+            if valid_domain(&suffix) {
+                if result.len() == MAX_BOOTSTRAP_SUFFIXES {
+                    return Err(Failure::TooLarge);
+                }
+                result.push(BootstrapService {
+                    suffix,
+                    endpoint: endpoint.clone(),
+                });
+            }
+        }
+    }
+    if result.is_empty() {
+        Err(Failure::Unavailable)
+    } else {
+        Ok(result)
+    }
+}
+
+/// Domain query labels are ASCII/IDNA hostnames, not URL paths or public-suffix guesses.
+fn valid_domain(domain: &str) -> bool {
+    !domain.is_empty()
+        && domain.len() <= 253
+        && domain.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+}
+
+fn check_status(status: u16) -> Result<(), Failure> {
+    match status {
+        200..=299 => Ok(()),
+        404 => Err(Failure::NotFound),
+        429 => Err(Failure::RateLimited),
+        _ => Err(Failure::Status(status)),
+    }
+}
+
+/// Projects a matching domain object without following its links or confusing contact roles.
+fn rdap_facts(value: &Value, candidate: &str) -> Result<Vec<String>, Failure> {
+    if value.get("objectClassName").and_then(Value::as_str) != Some("domain")
+        || !value
+            .get("ldhName")
+            .and_then(Value::as_str)
+            .is_some_and(|name| name.trim_end_matches('.').eq_ignore_ascii_case(candidate))
+    {
+        return Err(Failure::Mismatch);
+    }
+    let mut facts = Facts::default();
+    facts.add("Domain", candidate);
+    if let Some(events) = value.get("events").and_then(Value::as_array) {
+        for event in events.iter().take(32) {
+            let label = match event.get("eventAction").and_then(Value::as_str) {
+                Some("registration") => "Registered",
+                Some("last changed") => "Changed",
+                Some("expiration") => "Expires",
+                _ => continue,
+            };
+            if let Some(date) = event.get("eventDate").and_then(Value::as_str) {
+                facts.add(label, date);
+            }
+        }
+    }
+    let mut registrant = false;
+    let mut remaining = 32;
+    entity_facts(
+        value.get("entities"),
+        0,
+        &mut remaining,
+        &mut registrant,
+        &mut facts,
+    );
+    if !registrant {
+        facts.add("Registrant", "not published (may be withheld or redacted)");
+    }
+    if value
+        .get("redacted")
+        .and_then(Value::as_array)
+        .is_some_and(|fields| !fields.is_empty())
+    {
+        facts.add(
+            "Registration privacy",
+            "The server explicitly marks some fields as redacted",
+        );
+    }
+    if let Some(nameservers) = value.get("nameservers").and_then(Value::as_array) {
+        let names = nameservers
+            .iter()
+            .take(16)
+            .filter_map(|entry| entry.get("ldhName").and_then(Value::as_str))
+            .map(safe_text)
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>()
+            .join(", ");
+        facts.add("Nameservers", &names);
+    }
+    if let Some(status) = value.get("status").and_then(Value::as_array) {
+        let status = status
+            .iter()
+            .take(16)
+            .filter_map(Value::as_str)
+            .map(safe_text)
+            .collect::<Vec<_>>()
+            .join(", ");
+        facts.add("Domain status", &status);
+    }
+    if let Some(signed) = value
+        .get("secureDNS")
+        .and_then(|dns| dns.get("delegationSigned"))
+        .and_then(Value::as_bool)
+    {
+        facts.add(
+            "DNSSEC",
+            if signed {
+                "signed delegation (published by registry)"
+            } else {
+                "unsigned delegation (published by registry)"
+            },
+        );
+    }
+    facts.add(
+        "Registration note",
+        "Registry registration records are not site age or a trust rating",
+    );
+    Ok(facts.finish())
+}
+
+/// Only registrar and registrant names/organizations are displayed, with finite nesting and counts.
+fn entity_facts(
+    entities: Option<&Value>,
+    depth: usize,
+    remaining: &mut usize,
+    registrant: &mut bool,
+    facts: &mut Facts,
+) {
+    if depth > 3 {
+        return;
+    }
+    let Some(entities) = entities.and_then(Value::as_array) else {
+        return;
+    };
+    for entity in entities.iter().take(32) {
+        if *remaining == 0 {
+            return;
+        }
+        *remaining -= 1;
+        let roles = entity.get("roles").and_then(Value::as_array);
+        let has_role = |role: &str| {
+            roles.is_some_and(|roles| {
+                roles
+                    .iter()
+                    .take(8)
+                    .any(|value| value.as_str() == Some(role))
+            })
+        };
+        let is_registrant = has_role("registrant");
+        if has_role("registrar") || is_registrant {
+            let mut values = Vec::new();
+            if let Some(card) = entity
+                .get("vcardArray")
+                .and_then(Value::as_array)
+                .and_then(|card| card.get(1))
+                .and_then(Value::as_array)
+            {
+                for property in card.iter().take(32).filter_map(Value::as_array) {
+                    if property.len() < 4 || !matches!(property[0].as_str(), Some("fn" | "org")) {
+                        continue;
+                    }
+                    if let Some(value) = property[3].as_str() {
+                        values.push(safe_text(value));
+                    } else if let Some(parts) = property[3].as_array() {
+                        values.extend(
+                            parts
+                                .iter()
+                                .take(8)
+                                .filter_map(Value::as_str)
+                                .map(safe_text),
+                        );
+                    }
+                }
+            }
+            if let Some(handle) = entity.get("handle").and_then(Value::as_str) {
+                let handle = safe_text(handle);
+                if !handle.is_empty() {
+                    values.push(format!("handle {handle}"));
+                }
+            }
+            values.retain(|value| !value.is_empty());
+            values.dedup();
+            if !values.is_empty() {
+                facts.add(
+                    if is_registrant {
+                        "Registrant (public)"
+                    } else {
+                        "Registrar"
+                    },
+                    &values.join("; "),
+                );
+                *registrant |= is_registrant;
+            }
+        }
+        entity_facts(
+            entity.get("entities"),
+            depth + 1,
+            remaining,
+            registrant,
+            facts,
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+
+    /// Scripted responses exercise the real redirect and registration policy without DNS.
+    #[derive(Default)]
+    struct MockTransport {
+        responses: RefCell<VecDeque<(String, Result<HttpResponse, Failure>)>>,
+        requests: RefCell<Vec<String>>,
+    }
+
+    impl MockTransport {
+        fn push(&self, url: &str, status: u16, body: impl Into<Vec<u8>>) {
+            self.responses.borrow_mut().push_back((
+                url.to_owned(),
+                Ok(HttpResponse {
+                    status,
+                    location: None,
+                    content_type: if body_is_json_url(url) {
+                        "application/rdap+json"
+                    } else {
+                        "text/html"
+                    }
+                    .to_owned(),
+                    body: body.into(),
+                }),
+            ));
+        }
+
+        fn redirect(&self, url: &str, location: &str) {
+            self.responses.borrow_mut().push_back((
+                url.to_owned(),
+                Ok(HttpResponse {
+                    status: 302,
+                    location: Some(location.to_owned()),
+                    content_type: String::new(),
+                    body: Vec::new(),
+                }),
+            ));
+        }
+    }
+
+    /// Fixture endpoints ending in JSON or containing domain/ return registration documents.
+    fn body_is_json_url(url: &str) -> bool {
+        url.ends_with(".json") || url.contains("/domain/")
+    }
+
+    impl HttpTransport for MockTransport {
+        fn fetch(
+            &self,
+            url: &Url,
+            _: DocumentKind,
+            _: Duration,
+            _: &AtomicBool,
+        ) -> Result<HttpResponse, Failure> {
+            self.requests.borrow_mut().push(url.to_string());
+            let (expected, response) = self
+                .responses
+                .borrow_mut()
+                .pop_front()
+                .expect("unexpected request");
+            assert_eq!(url.as_str(), expected);
+            response
+        }
+    }
+
+    /// Default bootstrap fixtures deliberately use a multi-label registry suffix.
+    fn bootstrap() -> Vec<u8> {
+        serde_json::to_vec(&json!({ "services": [
+            [["uk"], ["https://general.example/rdap/"]],
+            [["co.uk"], ["https://registry.example/rdap/"]]
+        ]}))
+        .unwrap()
+    }
+
+    /// Domain payloads must identify the exact candidate being queried.
+    fn domain(name: &str) -> Vec<u8> {
+        serde_json::to_vec(&json!({ "objectClassName": "domain", "ldhName": name })).unwrap()
+    }
+
+    /// Metadata lookups never contact private endpoints or URL-embedded credentials.
+    #[test]
+    fn public_url_validation_rejects_private_addresses_credentials_and_ports() {
+        for raw in [
+            "https://example.com/",
+            "http://example.com:80/page#fragment",
+            "https://example.com:443/page",
+            "https://example.com/?q=ordinary&lang=en",
+        ] {
+            assert!(
+                validate_public_url(&Url::parse(raw).unwrap()).is_ok(),
+                "{raw}"
+            );
+        }
+        for raw in [
+            "http://127.0.0.1/",
+            "http://[::1]/",
+            "http://[::ffff:127.0.0.1]/",
+            "http://10.0.0.1/",
+            "http://169.254.169.254/",
+            "http://localhost/",
+            "http://host.internal/",
+            "http://host.local/",
+            "https://user:secret@example.com/",
+            "https://example.com:8443/",
+            "file:///etc/passwd",
+            "ftp://example.com/file",
+            "http://printer/",
+        ] {
+            assert!(
+                validate_public_url(&Url::parse(raw).unwrap()).is_err(),
+                "{raw}"
+            );
+            let transport = MockTransport::default();
+            let facts = UrlInfoClient::default().lookup_with(
+                &Url::parse(raw).unwrap(),
+                &AtomicBool::new(false),
+                &transport,
+            );
+            assert!(transport.requests.borrow().is_empty());
+            assert!(!facts.join("\n").contains("secret"));
+        }
+    }
+
+    /// HTML declarations are parsed as data, with standard description taking precedence.
+    #[test]
+    fn html_metadata_ignores_scripts_body_and_templates_and_decodes_entities() {
+        let facts = html_facts(
+            br#"<!doctype html><html lang='en'><head>
+			<title> Artist &amp; Friends </title>
+			<script>document.write('<meta name="description" content="script secret">')</script>
+			<template><meta name='author' content='template secret'></template>
+			<meta property='og:description' content='Fallback'>
+			<meta NAME='description' content='A &amp; B'>
+			<meta name='author' content='The artist'><meta property='og:site_name' content='Artist site'>
+			</head><body><meta name='description' content='body secret'></body></html>"#,
+        )
+        .unwrap();
+        assert!(facts.contains(&"Title: Artist & Friends".to_owned()));
+        assert!(facts.contains(&"Description: A & B".to_owned()));
+        assert!(facts.contains(&"Author (website claim): The artist".to_owned()));
+        assert!(facts.contains(&"Site: Artist site".to_owned()));
+        assert!(facts.contains(&"Language: en".to_owned()));
+        assert!(!facts.join("\n").contains("secret"));
+        assert_eq!(
+            html_facts(b"<meta property='og:description' content='Fallback'>").unwrap(),
+            ["Description: Fallback"]
+        );
+        assert_eq!(
+            html_facts(
+                br#"<meta name="description" content="&quot;A &amp; B&quot; &#39;quoted&#39;">"#
+            )
+            .unwrap(),
+            ["Description: \"A & B\" 'quoted'"]
+        );
+    }
+
+    /// Explicit website queries survive redirects but never reach IANA or RDAP.
+    #[test]
+    fn website_queries_reach_only_the_website_not_registration_services() {
+        let transport = MockTransport::default();
+        let url =
+            Url::parse("https://artist.co.uk/music?q=one%20two&lang=en#private-fragment").unwrap();
+        transport.redirect(
+            "https://artist.co.uk/music?q=one%20two&lang=en",
+            "/results?q=one%20two&lang=en",
+        );
+        transport.push(
+            "https://artist.co.uk/results?q=one%20two&lang=en",
+            200,
+            b"<title>Search results</title>".to_vec(),
+        );
+        transport.push(BOOTSTRAP_URL, 200, bootstrap());
+        transport.push(
+            "https://registry.example/rdap/domain/artist.co.uk",
+            200,
+            domain("artist.co.uk"),
+        );
+        let facts = UrlInfoClient::default()
+            .lookup_with(&url, &AtomicBool::new(false), &transport)
+            .join("\n");
+        assert!(facts.contains("Title: Search results"));
+        assert!(facts.contains("Domain: artist.co.uk"));
+        assert!(facts.contains("Final URL: https://artist.co.uk/results?q=one%20two&lang=en"));
+        assert!(!facts.contains("private-fragment"));
+        let requests = transport.requests.borrow();
+        assert_eq!(requests.len(), 4);
+        assert!(
+            requests[2..]
+                .iter()
+                .all(|request| !request.contains('?') && !request.contains("one%20two"))
+        );
+        assert!(transport.responses.borrow().is_empty());
+    }
+
+    /// All rendered text has finite size and cannot inject terminal controls or bidi overrides.
+    #[test]
+    fn returned_text_and_documents_are_bounded() {
+        let text = safe_text(&format!(
+            " \u{1b}[31mA\nB\t\u{202e}{}",
+            "x".repeat(MAX_FIELD_BYTES * 2)
+        ));
+        assert!(text.len() <= MAX_FIELD_BYTES);
+        assert!(!text.chars().any(char::is_control));
+        assert!(!text.contains('\u{202e}'));
+        assert!(html_facts(&vec![b'x'; MAX_HTML_BYTES + 1]).is_err());
+        assert!(parse_json(&vec![b' '; MAX_JSON_BYTES + 1]).is_err());
+        let nested = format!(
+            "{}0{}",
+            "[".repeat(MAX_JSON_DEPTH + 1),
+            "]".repeat(MAX_JSON_DEPTH + 1)
+        );
+        assert!(parse_json(nested.as_bytes()).is_err());
+        let mut facts = Facts::default();
+        for _ in 0..1_000 {
+            facts.add("Value", &"x".repeat(MAX_FIELD_BYTES * 2));
+        }
+        let lines = facts.finish();
+        assert!(lines.len() <= MAX_FACTS);
+        assert!(lines.iter().map(String::len).sum::<usize>() <= MAX_FACT_BYTES);
+    }
+
+    /// Public registrant fields are labeled separately from registrar identity and redaction.
+    #[test]
+    fn rdap_fields_are_role_aware_bounded_and_match_the_requested_domain() {
+        let value = json!({
+            "objectClassName": "domain", "ldhName": "EXAMPLE.COM",
+            "events": [{"eventAction":"registration", "eventDate":"2000-01-01T00:00:00Z"},
+                {"eventAction":"last changed", "eventDate":"2025-01-01T00:00:00Z"},
+                {"eventAction":"expiration", "eventDate":"2030-01-01T00:00:00Z"}],
+            "entities": [
+                {"roles":["registrar"], "handle":"REG-1", "vcardArray":["vcard", [["fn", {}, "text", "Registry Company"]]]},
+                {"roles":["registrant"], "vcardArray":["vcard", [["org", {}, "text", ["Public Organization"]]]]},
+                {"roles":["technical"], "vcardArray":["vcard", [["fn", {}, "text", "Not an owner"]]]}
+            ],
+            "nameservers":[{"ldhName":"ns1.example.com"}], "status":["active"],
+            "secureDNS":{"delegationSigned":true}, "redacted":[{"name":{"type":"Registrant Name"}}]
+        });
+        let facts = rdap_facts(&value, "example.com").unwrap().join("\n");
+        for expected in [
+            "Registered: 2000",
+            "Changed: 2025",
+            "Expires: 2030",
+            "Registrar: Registry Company",
+            "REG-1",
+            "Registrant (public): Public Organization",
+            "Nameservers: ns1.example.com",
+            "DNSSEC: signed",
+            "redact",
+        ] {
+            assert!(facts.contains(expected), "missing {expected}: {facts}");
+        }
+        assert!(!facts.contains("Not an owner"));
+        assert!(rdap_facts(&value, "other.com").is_err());
+        assert!(
+            rdap_facts(
+                &json!({"objectClassName":"entity","ldhName":"example.com"}),
+                "example.com"
+            )
+            .is_err()
+        );
+        let absent = rdap_facts(
+            &json!({"objectClassName":"domain","ldhName":"example.com"}),
+            "example.com",
+        )
+        .unwrap()
+        .join("\n");
+        assert!(absent.contains("Registrant: not published"));
+        assert!(!absent.contains("Registrant: redacted"));
+    }
+
+    /// Parent retries occur only after authoritative 404s and bootstrap data is session-cached.
+    #[test]
+    fn lookup_uses_longest_bootstrap_suffix_retries_404_and_reuses_bootstrap() {
+        let transport = MockTransport::default();
+        let url = Url::parse("https://www.artist.co.uk/music").unwrap();
+        transport.push(url.as_str(), 200, b"<title>Artist</title>".to_vec());
+        transport.push(BOOTSTRAP_URL, 200, bootstrap());
+        transport.push(
+            "https://registry.example/rdap/domain/www.artist.co.uk",
+            404,
+            Vec::new(),
+        );
+        transport.push(
+            "https://registry.example/rdap/domain/artist.co.uk",
+            200,
+            domain("artist.co.uk"),
+        );
+        let mut client = UrlInfoClient::default();
+        let facts = client
+            .lookup_with(&url, &AtomicBool::new(false), &transport)
+            .join("\n");
+        assert!(facts.contains("Title: Artist"));
+        assert!(facts.contains("Domain: artist.co.uk"));
+        assert!(facts.contains("not site age or a trust rating"));
+        transport.push(url.as_str(), 200, Vec::new());
+        transport.push(
+            "https://registry.example/rdap/domain/www.artist.co.uk",
+            200,
+            domain("www.artist.co.uk"),
+        );
+        client.lookup_with(&url, &AtomicBool::new(false), &transport);
+        assert!(transport.responses.borrow().is_empty());
+        assert_eq!(
+            transport
+                .requests
+                .borrow()
+                .iter()
+                .filter(|url| *url == BOOTSTRAP_URL)
+                .count(),
+            1
+        );
+    }
+
+    /// Rate limits, mismatched objects, and transport errors never probe a parent domain.
+    #[test]
+    fn rdap_failure_preserves_website_facts_without_parent_guessing() {
+        for (status, body) in [
+            (429, Vec::new()),
+            (503, Vec::new()),
+            (200, domain("other.co.uk")),
+        ] {
+            let transport = MockTransport::default();
+            transport.push(
+                "https://www.artist.co.uk/",
+                200,
+                b"<meta name='description' content='Page survives'>".to_vec(),
+            );
+            transport.push(BOOTSTRAP_URL, 200, bootstrap());
+            transport.push(
+                "https://registry.example/rdap/domain/www.artist.co.uk",
+                status,
+                body,
+            );
+            let facts = UrlInfoClient::default()
+                .lookup_with(
+                    &Url::parse("https://www.artist.co.uk/").unwrap(),
+                    &AtomicBool::new(false),
+                    &transport,
+                )
+                .join("\n");
+            assert!(facts.contains("Description: Page survives"));
+            assert!(facts.contains("Registration:"));
+            assert_eq!(transport.requests.borrow().len(), 3);
+        }
+    }
+
+    /// Redirect policy is enforced before any subsequent request, even with an injected transport.
+    #[test]
+    fn redirects_reject_private_credential_and_downgrade_targets() {
+        for target in [
+            "http://127.0.0.1/",
+            "https://user:pass@example.com/",
+            "http://public.example/",
+        ] {
+            let transport = MockTransport::default();
+            transport.redirect("https://artist.example/", target);
+            let cancelled = AtomicBool::new(false);
+            let mut budget = Budget::new(&cancelled);
+            assert!(
+                fetch_document(
+                    &transport,
+                    &Url::parse("https://artist.example/").unwrap(),
+                    DocumentKind::Html,
+                    &mut budget
+                )
+                .is_err()
+            );
+            assert_eq!(transport.requests.borrow().len(), 1);
+        }
+    }
+
+    /// Resource limits stop both redirect chains and already-cancelled lookups without extra I/O.
+    #[test]
+    fn redirect_request_and_cancellation_budgets_are_finite() {
+        let transport = MockTransport::default();
+        for index in 0..=MAX_REDIRECTS {
+            transport.redirect(
+                &format!("https://artist.example/{index}"),
+                &format!("/{next}", next = index + 1),
+            );
+        }
+        let cancelled = AtomicBool::new(false);
+        let mut budget = Budget::new(&cancelled);
+        assert_eq!(
+            fetch_document(
+                &transport,
+                &Url::parse("https://artist.example/0").unwrap(),
+                DocumentKind::Html,
+                &mut budget
+            )
+            .unwrap_err(),
+            Failure::Redirect
+        );
+        assert_eq!(transport.requests.borrow().len(), MAX_REDIRECTS + 1);
+        budget.remaining_requests = 0;
+        assert_eq!(budget.request().unwrap_err(), Failure::Budget);
+        budget.deadline = Instant::now();
+        assert_eq!(budget.remaining().unwrap_err(), Failure::Timeout);
+        let unused = MockTransport::default();
+        UrlInfoClient::default().lookup_with(
+            &Url::parse("https://artist.example/").unwrap(),
+            &AtomicBool::new(true),
+            &unused,
+        );
+        assert!(unused.requests.borrow().is_empty());
+    }
+
+    /// Website redirects expose only their validated final destination and actual HTTP status.
+    #[test]
+    fn website_redirects_preserve_facts_when_no_rdap_service_exists() {
+        let transport = MockTransport::default();
+        transport.redirect(
+            "http://artist.example/start",
+            "https://artist.example/final",
+        );
+        transport.push(
+            "https://artist.example/final",
+            200,
+            b"<title>Redirected title</title>".to_vec(),
+        );
+        transport.push(BOOTSTRAP_URL, 200, bootstrap());
+        let facts = UrlInfoClient::default()
+            .lookup_with(
+                &Url::parse("http://artist.example/start#private-fragment").unwrap(),
+                &AtomicBool::new(false),
+                &transport,
+            )
+            .join("\n");
+        assert!(facts.contains("Website response: HTTP 200"));
+        assert!(facts.contains("Final URL: https://artist.example/final"));
+        assert!(facts.contains("Transport: HTTPS"));
+        assert!(facts.contains("Title: Redirected title"));
+        assert!(facts.contains("No supported registration service"));
+        assert!(!facts.contains("private-fragment"));
+    }
+
+    /// Invalid bootstrap endpoints cannot become fetch targets and RDAP never guesses beyond its cap.
+    #[test]
+    fn bootstrap_endpoint_policy_and_domain_attempt_bounds_are_enforced() {
+        for endpoint in [
+            "http://registry.example/",
+            "https://127.0.0.1/",
+            "https://registry.example/?secret=x",
+            "https://registry.example:8443/",
+        ] {
+            assert!(parse_bootstrap(&json!({"services":[[["com"],[endpoint]]]})).is_err());
+        }
+        for (host, attempts) in [("a.b.c.d.e.f.co.uk", 5), ("artist.co.uk", 2)] {
+            let transport = MockTransport::default();
+            let original = format!("https://{host}/");
+            transport.push(&original, 503, Vec::new());
+            transport.push(BOOTSTRAP_URL, 200, bootstrap());
+            let mut candidate = host;
+            for _ in 0..attempts {
+                transport.push(
+                    &format!("https://registry.example/rdap/domain/{candidate}"),
+                    404,
+                    Vec::new(),
+                );
+                candidate = candidate.split_once('.').unwrap().1;
+            }
+            let facts = UrlInfoClient::default()
+                .lookup_with(
+                    &Url::parse(&original).unwrap(),
+                    &AtomicBool::new(false),
+                    &transport,
+                )
+                .join("\n");
+            assert!(facts.contains("No matching registration record"));
+            assert_eq!(transport.requests.borrow().len(), attempts + 2);
+            assert!(transport.responses.borrow().is_empty());
+        }
+    }
+
+    /// Byte limits apply to chunked/unknown-size bodies and cancellation also covers body reads.
+    #[test]
+    fn body_reading_rejects_overflow_cancellation_and_io_errors() {
+        let cancelled = AtomicBool::new(false);
+        assert_eq!(read_body(&b"exact"[..], 5, &cancelled).unwrap(), b"exact");
+        assert_eq!(
+            read_body(&b"overflow"[..], 5, &cancelled).unwrap_err(),
+            Failure::TooLarge
+        );
+        assert_eq!(
+            read_body(&b"unused"[..], 5, &AtomicBool::new(true)).unwrap_err(),
+            Failure::Cancelled
+        );
+        struct Broken;
+        impl Read for Broken {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("private transport details"))
+            }
+        }
+        let error = read_body(Broken, 5, &cancelled).unwrap_err();
+        assert_eq!(error, Failure::Transport);
+        assert!(!error.message().contains("private"));
+    }
+
+    /// Large websites retain bounded head metadata; registration JSON is never truncated.
+    #[test]
+    fn http_transport_keeps_large_html_head_but_rejects_oversized_json() {
+        use std::io::Write;
+        use std::net::TcpListener;
+        use std::thread;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            for index in 0..3 {
+                let (mut stream, _) = loop {
+                    assert!(Instant::now() < deadline, "mock large-document deadline");
+                    match listener.accept() {
+                        Ok(connection) => break connection,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("mock accept failed: {error}"),
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut byte = [0_u8; 1];
+                while !request.ends_with(b"\r\n\r\n") {
+                    assert!(request.len() < 8_192);
+                    stream.read_exact(&mut byte).unwrap();
+                    request.push(byte[0]);
+                }
+                let headers = match index {
+                    0 => format!(
+                        "Content-Type: text/html\r\nContent-Length: {}\r\n",
+                        MAX_HTML_BYTES * 2
+                    ),
+                    1 => "Content-Type: text/html\r\n".into(),
+                    _ => format!(
+                        "Content-Type: application/rdap+json\r\nContent-Length: {}\r\n",
+                        MAX_JSON_BYTES + 1
+                    ),
+                };
+                stream
+                    .write_all(
+                        format!("HTTP/1.1 200 OK\r\n{headers}Connection: close\r\n\r\n").as_bytes(),
+                    )
+                    .unwrap();
+                if index < 2 {
+                    let mut body = b"<head><title>Large page</title><meta name='description' content='Useful head'></head><body>".to_vec();
+                    // The known-size response intentionally omits its tail. A prefix
+                    // lookup succeeds without waiting for the remaining advertised bytes.
+                    body.resize(MAX_HTML_BYTES + usize::from(index == 1), b'x');
+                    let _ = stream.write_all(&body);
+                }
+            }
+        });
+        let url = Url::parse(&format!("http://{address}/page")).unwrap();
+        let transport = UreqTransport {
+            allow_loopback: true,
+        };
+        let cancelled = AtomicBool::new(false);
+        for _ in 0..2 {
+            let response = transport
+                .fetch(&url, DocumentKind::Html, Duration::from_secs(2), &cancelled)
+                .unwrap();
+            assert_eq!(response.body.len(), MAX_HTML_BYTES);
+            assert_eq!(
+                html_facts(&response.body).unwrap(),
+                ["Title: Large page", "Description: Useful head"]
+            );
+        }
+        assert_eq!(
+            transport
+                .fetch(&url, DocumentKind::Json, Duration::from_secs(2), &cancelled)
+                .unwrap_err(),
+            Failure::TooLarge
+        );
+        server.join().unwrap();
+    }
+
+    /// A real local HTTP fixture is reachable only through the test-only transport exception.
+    #[test]
+    fn http_transport_never_replays_cookie_authorization_or_referer_headers() {
+        use std::io::Write;
+        use std::net::TcpListener;
+        use std::thread;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut requests = Vec::new();
+            while requests.len() < 2 {
+                assert!(Instant::now() < deadline, "mock HTTP request deadline");
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("mock accept failed: {error}"),
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut byte = [0_u8; 1];
+                while !request.ends_with(b"\r\n\r\n") {
+                    assert!(request.len() < 8_192);
+                    stream.read_exact(&mut byte).unwrap();
+                    request.push(byte[0]);
+                }
+                requests.push(String::from_utf8(request).unwrap());
+                stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nSet-Cookie: secret=must-not-replay\r\nContent-Length: 16\r\nConnection: close\r\n\r\n<title>x</title>").unwrap();
+            }
+            requests
+        });
+        let url = Url::parse(&format!("http://{address}/page")).unwrap();
+        let cancelled = AtomicBool::new(false);
+        assert_eq!(
+            UreqTransport::default()
+                .fetch(&url, DocumentKind::Html, Duration::from_secs(1), &cancelled)
+                .unwrap_err(),
+            Failure::InvalidUrl
+        );
+        let transport = UreqTransport {
+            allow_loopback: true,
+        };
+        for _ in 0..2 {
+            let response = transport
+                .fetch(&url, DocumentKind::Html, Duration::from_secs(2), &cancelled)
+                .unwrap();
+            assert_eq!(response.body, b"<title>x</title>");
+        }
+        for request in server.join().unwrap() {
+            let request = request.to_ascii_lowercase();
+            for header in [
+                "\r\ncookie:",
+                "\r\nauthorization:",
+                "\r\nproxy-authorization:",
+                "\r\nreferer:",
+            ] {
+                assert!(!request.contains(header));
+            }
+        }
+    }
+}

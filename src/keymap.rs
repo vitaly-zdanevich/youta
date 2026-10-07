@@ -3405,6 +3405,25 @@ fn unfiltered_key_action(
         {
             Some(UiAction::OpenRssSubscriptionPopup)
         }
+        Key::Char('i' | 'I')
+            if alt
+                && view
+                    .details
+                    .as_ref()
+                    .is_some_and(|details| !details.url_info.is_empty()) =>
+        {
+            Some(UiAction::MoveUrlInfo(
+                if key.shift || key.key == Key::Char('I') {
+                    -1
+                } else {
+                    1
+                },
+            ))
+        }
+        Key::Char('i') if !key.modified() => view.details.as_ref().and_then(|details| {
+            (!details.url_info.is_empty())
+                .then_some(UiAction::ToggleUrlInfo(details.url_info_offset))
+        }),
         Key::Char('W') => wikidata_link_index.map(UiAction::ToggleWikidataStatements),
         Key::Char('h')
             if !key.modified()
