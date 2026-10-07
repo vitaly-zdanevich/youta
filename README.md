@@ -3410,6 +3410,6 @@ Youta is licensed under the [MIT License](LICENSE).
 ## Talks and articles
 
 - [Youta talk and meetup in Batumi](https://www.youtube.com/watch?v=swzZX4Y30Ak)
-  — August 2026, in Russian.
-- [Article about Youta on Habr](https://habr.com/en/posts/1081424/).
+  — August 2026, in Russian
+- [Article about Youta on Habr](https://habr.com/en/posts/1081424/)
 - [linux.org.ru](https://www.linux.org.ru/forum/multimedia/18378245)
