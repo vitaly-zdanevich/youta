@@ -8,11 +8,13 @@ use std::thread::{self, JoinHandle};
 
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 
+use super::ResponseSender;
 use crate::config::BandcampAudioFormat;
 use crate::playback::Result as PlaybackResult;
 use crate::providers::bandcamp::{
     BandcampMediaUrl, BandcampResolution, BandcampResolvePurpose, BandcampResolver,
 };
+use crate::worker_wake::WorkerNotifier;
 
 /// Resolve operation used by the bounded Bandcamp playback worker.
 pub(super) trait BandcampResolveClient: Send {
@@ -60,6 +62,8 @@ pub(super) struct BandcampResolverOwner<C> {
     lifecycle: Lifecycle,
     generation: u64,
     pending: Option<Pending<C>>,
+    /// Shared frontend completion signal without transferring response ownership.
+    notifier: WorkerNotifier,
 }
 
 /// Complete lifecycle states prevent partially initialized channel combinations.
@@ -106,7 +110,14 @@ impl<C> BandcampResolverOwner<C> {
             lifecycle: Lifecycle::Dormant(resolver),
             generation: 0,
             pending: None,
+            notifier: WorkerNotifier::default(),
         }
+    }
+
+    /// Connects lazily started resolver responses to the controller's wake registration.
+    pub(super) fn with_notifier(mut self, notifier: WorkerNotifier) -> Self {
+        self.notifier = notifier;
+        self
     }
 
     /// Starts lazily and replaces queued obsolete work after an explicit action.
@@ -208,6 +219,7 @@ impl<C> BandcampResolverOwner<C> {
         let (request_sender, request_receiver) = bounded(1);
         let request_drain = request_receiver.clone();
         let (response_sender, response_receiver) = bounded(1);
+        let response_sender = ResponseSender::new(response_sender, self.notifier.clone());
         let response_drain = response_receiver.clone();
         let thread = thread::Builder::new()
             .name("youta-bandcamp-resolver".to_owned())
@@ -232,7 +244,7 @@ impl<C> Drop for BandcampResolverOwner<C> {
 /// Resolves at most one active and one queued action, keeping only the newest result.
 fn worker_loop(
     requests: Receiver<Command>,
-    responses: Sender<Completion>,
+    responses: ResponseSender<Completion>,
     response_drain: Receiver<Completion>,
     resolver: Box<dyn BandcampResolveClient>,
 ) {
@@ -403,6 +415,32 @@ mod tests {
             Err(SubmitError::Unavailable),
         );
         assert!(!owner.cancel());
+    }
+
+    /// Resolver completion wakes once its result is readable, without a polling timer.
+    #[test]
+    fn bandcamp_resolution_notifies_after_publication() {
+        struct Signal(Sender<()>);
+        impl std::task::Wake for Signal {
+            fn wake(self: Arc<Self>) {
+                let _ = self.0.send(());
+            }
+        }
+        let (owner, calls, _) = controlled_owner::<()>();
+        let notifier = WorkerNotifier::default();
+        let (signal, notified) = unbounded();
+        notifier.set_waker(Some(std::task::Waker::from(Arc::new(Signal(signal)))));
+        notified.recv().unwrap();
+        let mut owner = owner.with_notifier(notifier);
+        owner
+            .request(media("wake"), BandcampAudioFormat::BestAvailable, ())
+            .unwrap();
+        calls.recv_timeout(READY_TIMEOUT).unwrap().finish(true);
+        notified.recv_timeout(READY_TIMEOUT).unwrap();
+        assert!(
+            owner.poll().is_some(),
+            "notification must follow result publication"
+        );
     }
 
     #[test]

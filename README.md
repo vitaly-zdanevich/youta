@@ -1841,6 +1841,9 @@ another decode or protocol-encoding pass. Local entries include a filesystem
 fingerprint in that RAM key, so replacing an image at the same path invalidates
 the prepared result.
 
+Background source results notify the interface when they finish, without waiting
+for the next periodic response check.
+
 A directly attached Linux virtual console (`TERM=linux`, with output resolved
 to `/dev/ttyN`) uses Unicode half-block cells as a conservative artwork
 fallback by default. The focused Preferences editor can disable this fallback

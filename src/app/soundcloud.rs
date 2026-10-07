@@ -175,7 +175,7 @@ impl AppController {
         self.poll_soundcloud_worker();
     }
 
-    /// Starts a visible saved query after viewport reporting, then polls finished threads.
+    /// Starts a visible saved query after viewport reporting, then drains published replies.
     ///
     /// Hidden saved queries remain dormant. New input supersedes restoration, and
     /// frontends without a geometry hint retain the normal bounded page-size fallback.
@@ -205,21 +205,22 @@ impl AppController {
                     self.finish_search_activity(SearchActivity::SoundCloud);
                 }
             }
-            if self
-                .soundcloud
-                .worker
-                .as_ref()
-                .is_some_and(|worker| worker.thread.is_finished())
-            {
+            let completed = self.soundcloud.worker.as_ref().and_then(|worker| {
+                match worker.response.try_recv() {
+                    Ok(result) => Some(result),
+                    Err(TryRecvError::Disconnected) => Some(Err(
+                        "The Soundcloak search worker stopped without a result".to_owned(),
+                    )),
+                    Err(TryRecvError::Empty) => None,
+                }
+            });
+            if let Some(result) = completed {
                 let worker = self
                     .soundcloud
                     .worker
                     .take()
-                    .expect("finished worker exists");
-                let result = worker.response.try_recv().unwrap_or_else(|_| {
-                    Err("The Soundcloak search worker stopped without a result".to_owned())
-                });
-                let _ = worker.thread.join();
+                    .expect("published worker exists");
+                reap_published_worker(worker.thread);
                 self.apply_soundcloud_page(worker.job, result);
             }
             self.poll_soundcloud_catalog();
@@ -239,6 +240,7 @@ impl AppController {
             let request = job.request.clone();
             let tag = job.tag.clone();
             let (sender, response) = bounded(1);
+            let sender = ResponseSender::new(sender, self.worker_notifier.clone());
             match thread::Builder::new()
                 .name("youta-soundcloak".to_owned())
                 .spawn(move || {
@@ -661,6 +663,41 @@ fn queue_item_from_soundcloud(track: &SoundcloakTrack) -> QueueItem {
         start_at_seconds: None,
         added_at: unix_time(),
     }
+}
+
+/// A result can be visible before its worker finishes final thread cleanup.
+#[cfg(all(test, feature = "soundcloud"))]
+#[test]
+fn published_soundcloud_result_does_not_wait_for_thread_exit() {
+    let mut app = tests::controller();
+    let (sender, response) = bounded(1);
+    assert!(
+        sender
+            .send(Err("fixture search failure".to_owned()))
+            .is_ok()
+    );
+    let (release, held) = bounded::<()>(1);
+    app.soundcloud.worker = Some(SearchWorker {
+        job: SearchJob {
+            generation: app.soundcloud.generation,
+            request: SoundcloakSearchRequest {
+                query: "fixture".into(),
+                page: 1,
+                limit: 50,
+                query_urn: None,
+            },
+            tag: None,
+        },
+        response,
+        thread: thread::spawn(move || {
+            let _sender = sender;
+            let _ = held.recv_timeout(Duration::from_secs(5));
+        }),
+    });
+    app.poll_soundcloud_worker();
+    assert!(app.soundcloud.worker.is_none());
+    assert!(app.view.status_line.contains("fixture search failure"));
+    release.send(()).unwrap();
 }
 
 #[cfg(all(test, feature = "soundcloud"))]

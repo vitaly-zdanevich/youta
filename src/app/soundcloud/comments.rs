@@ -68,25 +68,25 @@ impl AppController {
         self.soundcloud.comments.pending = None;
     }
 
-    /// Polls finished workers and starts at most one latest explicit comments request.
+    /// Drains published replies and starts at most one latest explicit comments request.
     pub(in crate::app) fn poll_soundcloud_comments(&mut self) {
-        if self
-            .soundcloud
-            .comments
-            .worker
-            .as_ref()
-            .is_some_and(|worker| worker.thread.is_finished())
-        {
+        let completed = self.soundcloud.comments.worker.as_ref().and_then(|worker| {
+            match worker.response.try_recv() {
+                Ok(result) => Some(result),
+                Err(TryRecvError::Disconnected) => Some(Err(
+                    "Soundcloak comments worker stopped without a result".into(),
+                )),
+                Err(TryRecvError::Empty) => None,
+            }
+        });
+        if let Some(result) = completed {
             let worker = self
                 .soundcloud
                 .comments
                 .worker
                 .take()
-                .expect("finished comments worker");
-            let result = worker.response.try_recv().unwrap_or_else(|_| {
-                Err("Soundcloak comments worker stopped without a result".into())
-            });
-            let _ = worker.thread.join();
+                .expect("published comments worker");
+            reap_published_worker(worker.thread);
             self.apply_soundcloud_comments(worker.job, result);
         }
         if self.soundcloud.comments.worker.is_some() {
@@ -105,6 +105,7 @@ impl AppController {
         let track_id = job.track_id.clone();
         let instance = self.soundcloak_instance_label().to_owned();
         let (sender, response) = bounded(1);
+        let sender = ResponseSender::new(sender, self.worker_notifier.clone());
         match thread::Builder::new()
             .name("youta-soundcloak-comments".into())
             .spawn(move || {
@@ -205,6 +206,31 @@ impl AppController {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    #[test]
+    fn published_comments_result_does_not_wait_for_thread_exit() {
+        let (mut app, _transport) = controller();
+        let (sender, response) = bounded(1);
+        assert!(sender.send(Ok(Vec::new())).is_ok());
+        let (release, held) = bounded::<()>(1);
+        app.soundcloud.comments.worker = Some(CommentsWorker {
+            job: CommentsJob {
+                generation: app.youtube_video_comments_generation,
+                track_id: "123".into(),
+                canonical: "https://soundcloud.com/fixture/track".into(),
+                title: "Fixture".into(),
+            },
+            response,
+            thread: thread::spawn(move || {
+                let _sender = sender;
+                let _ = held.recv_timeout(Duration::from_secs(5));
+            }),
+        });
+        app.poll_soundcloud_comments();
+        assert!(app.soundcloud.comments.worker.is_none());
+        assert_eq!(app.soundcloud.comments.cache.len(), 1);
+        release.send(()).unwrap();
+    }
 
     /// Serves comments only; an unexpected passive search/artwork request fails immediately.
     struct CommentsTransport(Mutex<Vec<url::Url>>);

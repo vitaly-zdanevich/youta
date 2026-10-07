@@ -361,23 +361,23 @@ impl AppController {
 
     /// Drains stale work before starting the latest catalogue intent. Search shares this lane.
     pub(super) fn poll_soundcloud_catalog(&mut self) {
-        if self
-            .soundcloud
-            .catalog
-            .worker
-            .as_ref()
-            .is_some_and(|worker| worker.thread.is_finished())
-        {
+        let completed = self.soundcloud.catalog.worker.as_ref().and_then(|worker| {
+            match worker.response.try_recv() {
+                Ok(result) => Some(result),
+                Err(TryRecvError::Disconnected) => Some(Err(
+                    "Soundcloak catalogue worker stopped without a result".into(),
+                )),
+                Err(TryRecvError::Empty) => None,
+            }
+        });
+        if let Some(result) = completed {
             let worker = self
                 .soundcloud
                 .catalog
                 .worker
                 .take()
-                .expect("finished catalogue worker");
-            let result = worker.response.try_recv().unwrap_or_else(|_| {
-                Err("Soundcloak catalogue worker stopped without a result".into())
-            });
-            let _ = worker.thread.join();
+                .expect("published catalogue worker");
+            reap_published_worker(worker.thread);
             self.apply_soundcloud_catalog(worker.job, result);
         }
         if self.soundcloud.catalog.worker.is_some()
@@ -400,6 +400,7 @@ impl AppController {
         };
         let task = job.clone();
         let (sender, response) = bounded(1);
+        let sender = ResponseSender::new(sender, self.worker_notifier.clone());
         match thread::Builder::new()
             .name("youta-soundcloak-catalog".into())
             .spawn(move || {
@@ -943,6 +944,38 @@ mod integration_tests;
 #[cfg(all(test, feature = "soundcloud"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn published_artist_result_does_not_wait_for_thread_exit() {
+        let mut app = super::super::tests::controller();
+        let (sender, response) = bounded(1);
+        assert!(
+            sender
+                .send(Err("fixture catalogue failure".to_owned()))
+                .is_ok()
+        );
+        let (release, held) = bounded::<()>(1);
+        app.soundcloud.catalog.worker = Some(Worker {
+            job: Job {
+                generation: app.soundcloud.catalog.generation,
+                limit: 50,
+                append: false,
+                request: Request::Artist {
+                    url: url::Url::parse("https://soundcloud.com/fixture").unwrap(),
+                    albums: false,
+                },
+            },
+            response,
+            thread: thread::spawn(move || {
+                let _sender = sender;
+                let _ = held.recv_timeout(Duration::from_secs(5));
+            }),
+        });
+        app.poll_soundcloud_catalog();
+        assert!(app.soundcloud.catalog.worker.is_none());
+        assert!(app.view.status_line.contains("fixture catalogue failure"));
+        release.send(()).unwrap();
+    }
 
     #[test]
     fn soundcloud_artist_action_keeps_a_cached_back_destination_and_loads_tracks() {

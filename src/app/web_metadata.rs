@@ -172,22 +172,25 @@ impl AppController {
     /// Drains completed work and starts only the latest settled selection.
     pub(super) fn poll_web_metadata(&mut self) {
         self.sync_web_metadata_selection();
-        if self
-            .web
-            .metadata
-            .worker
-            .as_ref()
-            .is_some_and(|worker| worker.thread.is_finished())
-        {
+        let completed =
+            self.web
+                .metadata
+                .worker
+                .as_ref()
+                .and_then(|worker| match worker.response.try_recv() {
+                    Ok(result) => Some(result),
+                    Err(TryRecvError::Disconnected) => Some(LoadedWebMetadata::default()),
+                    Err(TryRecvError::Empty) => None,
+                });
+        if let Some(result) = completed {
             let worker = self
                 .web
                 .metadata
                 .worker
                 .take()
-                .expect("finished metadata worker");
-            let _ = worker.thread.join();
+                .expect("published metadata worker");
+            reap_published_worker(worker.thread);
             if !worker.cancelled.load(AtomicOrdering::Relaxed) {
-                let result = worker.response.try_recv().unwrap_or_default();
                 let current = self
                     .selected_web_entry()
                     .is_some_and(|entry| entry.url == worker.url);
@@ -224,6 +227,7 @@ impl AppController {
         let executable = self.config.providers.ffprobe_executable.clone();
         let cache_directory = self.config.thumbnail_cache_dir();
         let (sender, response) = bounded(1);
+        let sender = ResponseSender::new(sender, self.worker_notifier.clone());
         if let Ok(thread) = thread::Builder::new()
             .name("youta-web-metadata".to_owned())
             .spawn(move || {
@@ -333,4 +337,39 @@ fn web_metadata_description(filename: &str, metadata: Option<&WebMediaMetadata>)
     lines.push(String::new());
     lines.push("Audio only. With Autoplay enabled, playback continues through this folder in the displayed order.".to_owned());
     lines.join("\n")
+}
+
+#[cfg(test)]
+mod notification_tests {
+    use super::*;
+
+    #[test]
+    fn published_web_metadata_result_does_not_wait_for_thread_exit() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = AppController::new(
+            Config::for_dir(directory.path()),
+            StateStore::open_in_memory().unwrap(),
+            None,
+            None,
+        );
+        let (sender, response) = bounded(1);
+        assert!(sender.send(LoadedWebMetadata::default()).is_ok());
+        let (release, held) = bounded::<()>(1);
+        app.web.metadata.worker = Some(WebMetadataWorker {
+            url: url::Url::parse("https://files.example/fixture.opus").unwrap(),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            response,
+            thread: thread::spawn(move || {
+                let _sender = sender;
+                let _ = held.recv_timeout(Duration::from_secs(5));
+            }),
+        });
+        app.poll_web_metadata();
+        assert!(app.web.metadata.worker.is_none());
+        assert!(
+            app.web.metadata.cache.is_empty(),
+            "a cancelled selection still must not populate the cache"
+        );
+        release.send(()).unwrap();
+    }
 }

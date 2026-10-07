@@ -174,6 +174,49 @@ mod archive_original {
 struct DeferredCacheService;
 struct DeferredCacheJob;
 
+/// A ready result can register through the controller before any later polling turn.
+#[test]
+fn cached_download_begin_attaches_shared_completion_wake() {
+    struct WakingJob;
+    impl CachedDownloadJob for WakingJob {
+        fn set_worker_waker(&mut self, waker: Option<std::task::Waker>) {
+            waker
+                .expect("cache owner registers its completion wake")
+                .wake();
+        }
+        fn poll(&mut self) -> Option<Result<Box<dyn CachedDownloadArtifact>, ()>> {
+            None
+        }
+    }
+    struct RecordedWake(Sender<()>);
+    impl std::task::Wake for RecordedWake {
+        fn wake(self: Arc<Self>) {
+            let _ = self.0.send(());
+        }
+    }
+    let (mut controller, _requests, _directory, _result, _dropped, _starts) = cached_controller();
+    let item = controller.playback_queue.current().unwrap().clone();
+    let request = DownloadRequest {
+        source_url: item.media.webpage_url.clone(),
+        destination: controller.config.downloads_dir(),
+        format: DownloadFormat::OpusWithoutTranscoding,
+        scope: DownloadScope::SingleItem,
+        playlist_start: None,
+        skip_shorts: false,
+        write_thumbnail: false,
+        archive_path: None,
+    };
+    let (sender, wakes) = unbounded();
+    controller
+        .worker_notifier
+        .set_waker(Some(std::task::Waker::from(Arc::new(RecordedWake(sender)))));
+    wakes.recv_timeout(Duration::from_secs(5)).unwrap();
+    controller.begin_cached_download(&item, &request, Box::new(WakingJob));
+    wakes.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(controller.pending_cached_download.is_some());
+    controller.shutdown();
+}
+
 impl CachedDownloadJob for DeferredCacheJob {
     fn poll(&mut self) -> Option<Result<Box<dyn CachedDownloadArtifact>, ()>> {
         None

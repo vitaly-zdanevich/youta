@@ -72,23 +72,23 @@ impl AppController {
 
     /// Polls the bounded playback resolver independently of search navigation.
     pub(in crate::app) fn poll_soundcloud_playback(&mut self) {
-        if self
-            .soundcloud
-            .playback
-            .worker
-            .as_ref()
-            .is_some_and(|worker| worker.thread.is_finished())
-        {
+        let completed = self.soundcloud.playback.worker.as_ref().and_then(|worker| {
+            match worker.response.try_recv() {
+                Ok(result) => Some(result),
+                Err(TryRecvError::Disconnected) => Some(Err(
+                    "The Soundcloak playback worker stopped without a result".to_owned(),
+                )),
+                Err(TryRecvError::Empty) => None,
+            }
+        });
+        if let Some(result) = completed {
             let worker = self
                 .soundcloud
                 .playback
                 .worker
                 .take()
-                .expect("finished worker exists");
-            let result = worker.response.try_recv().unwrap_or_else(|_| {
-                Err("The Soundcloak playback worker stopped without a result".to_owned())
-            });
-            let _ = worker.thread.join();
+                .expect("published worker exists");
+            reap_published_worker(worker.thread);
             if worker.job.generation == self.soundcloud.playback.generation {
                 self.apply_soundcloud_playback(worker.job, result);
             }
@@ -108,6 +108,7 @@ impl AppController {
         };
         let canonical = job.canonical.clone();
         let (sender, response) = bounded(1);
+        let sender = ResponseSender::new(sender, self.worker_notifier.clone());
         match thread::Builder::new()
             .name("soundcloak-playback".to_owned())
             .spawn(move || {
@@ -363,6 +364,37 @@ mod tests {
     use crate::providers::{ProviderError, soundcloak::SoundcloakTransport};
     use std::collections::VecDeque;
     use std::sync::Mutex;
+
+    #[test]
+    fn published_playback_result_does_not_wait_for_thread_exit() {
+        let mut app = super::super::tests::controller();
+        let track = super::super::tests::track("published");
+        let (sender, response) = bounded(1);
+        assert!(
+            sender
+                .send(Err("fixture playback failure".to_owned()))
+                .is_ok()
+        );
+        let (release, held) = bounded::<()>(1);
+        app.soundcloud.playback.worker = Some(PlaybackWorker {
+            job: PlaybackJob {
+                generation: app.soundcloud.playback.generation,
+                item: queue_item_from_soundcloud(&track),
+                canonical: track.webpage_url,
+                queue_cursor_already_positioned: false,
+                origin: None,
+            },
+            response,
+            thread: thread::spawn(move || {
+                let _sender = sender;
+                let _ = held.recv_timeout(Duration::from_secs(5));
+            }),
+        });
+        app.poll_soundcloud_playback();
+        assert!(app.soundcloud.playback.worker.is_none());
+        assert!(app.view.status_line.contains("fixture playback failure"));
+        release.send(()).unwrap();
+    }
 
     /// Mock metadata is the only input to the actual provider parser.
     fn metadata(slug: &str, preview: bool) -> Vec<u8> {

@@ -88,7 +88,55 @@ struct ArchiveUploadWorker {
     cancellation: Arc<AtomicBool>,
     progress: Arc<Mutex<(ArchiveUploadPhase, u64, Option<u64>)>>,
     started: Instant,
-    thread: JoinHandle<Result<ArchiveUploadResult, String>>,
+    /// Final result is published before notification, independently of thread teardown.
+    response: Receiver<Result<ArchiveUploadResult, String>>,
+    thread: JoinHandle<()>,
+}
+
+#[cfg(test)]
+mod wake_tests {
+    use super::*;
+
+    /// The final queue entry retires ownership before thread cleanup can finish.
+    #[test]
+    fn archive_upload_result_does_not_wait_for_thread_exit() {
+        let directory = crate::test_support::canonical_tempdir("archive upload wake");
+        let mut controller = AppController::new(
+            Config::for_dir(directory.path()),
+            StateStore::open_in_memory().unwrap(),
+            None,
+            None,
+        );
+        for disconnected in [false, true] {
+            let (sender, response) = bounded(1);
+            let (published, publication) = bounded(1);
+            let (release, released) = bounded(1);
+            let thread = thread::spawn(move || {
+                if !disconnected {
+                    let _ = sender.send(Err("fixture failure".to_owned()));
+                }
+                drop(sender);
+                published.send(()).unwrap();
+                let _ = released.recv_timeout(Duration::from_secs(5));
+            });
+            publication.recv_timeout(Duration::from_secs(5)).unwrap();
+            controller.archive_upload.worker = Some(ArchiveUploadWorker {
+                generation: 1,
+                cancellation: Arc::new(AtomicBool::new(false)),
+                progress: Arc::new(Mutex::new((ArchiveUploadPhase::Preparing, 0, None))),
+                started: Instant::now(),
+                response,
+                thread,
+            });
+            controller.poll_archive_upload();
+            let retired = controller.archive_upload.worker.is_none();
+            release.send(()).unwrap();
+            assert!(
+                retired,
+                "published results and disconnects must not wait for thread exit"
+            );
+        }
+    }
 }
 
 /// Secrets and source ownership stay outside the serializable view model.
@@ -364,14 +412,27 @@ impl AppController {
         let progress = Arc::new(Mutex::new((ArchiveUploadPhase::Preparing, 0, None)));
         let worker_cancel = Arc::clone(&cancellation);
         let worker_progress = Arc::clone(&progress);
+        let (sender, response) = bounded(1);
+        let sender = ResponseSender::new(sender, self.worker_notifier.clone());
+        let notifier = self.worker_notifier.clone();
         let thread = thread::Builder::new()
             .name("archive-upload".to_owned())
             .spawn(move || {
-                service.run(job, &worker_cancel, &mut |phase, bytes, total| {
+                let mut last_notification = Instant::now() - Duration::from_millis(100);
+                let mut last_phase = ArchiveUploadPhase::Preparing;
+                let result = service.run(job, &worker_cancel, &mut |phase, bytes, total| {
                     *worker_progress
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner) = (phase, bytes, total);
-                })
+                    if phase != last_phase
+                        || last_notification.elapsed() >= Duration::from_millis(100)
+                    {
+                        last_phase = phase;
+                        last_notification = Instant::now();
+                        notifier.wake();
+                    }
+                });
+                let _ = sender.send(result);
             });
         match thread {
             Ok(thread) => {
@@ -380,6 +441,7 @@ impl AppController {
                     cancellation,
                     progress,
                     started: Instant::now(),
+                    response,
                     thread,
                 });
                 let popup = self.view.archive_upload_popup.as_mut().unwrap();
@@ -422,16 +484,16 @@ impl AppController {
             popup.animation_frame =
                 usize::try_from(worker.started.elapsed().as_millis() / 300).unwrap_or(0);
         }
-        if !worker.thread.is_finished() {
-            return;
-        }
-        let worker = self.archive_upload.worker.take().unwrap();
-        let result = worker.thread.join().unwrap_or_else(|_| {
-            Err(
+        let result = match worker.response.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => Err(
                 "Archive upload worker stopped unexpectedly; check the item before trying again"
                     .to_owned(),
-            )
-        });
+            ),
+        };
+        let worker = self.archive_upload.worker.take().unwrap();
+        reap_published_worker(worker.thread);
         let Some(popup) = self
             .view
             .archive_upload_popup

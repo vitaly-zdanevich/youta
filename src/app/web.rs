@@ -107,6 +107,7 @@ impl AppController {
             return;
         };
         let (sender, response) = bounded(1);
+        let sender = ResponseSender::new(sender, self.worker_notifier.clone());
         match thread::Builder::new()
             .name("youta-web".to_owned())
             .spawn(move || {
@@ -131,18 +132,20 @@ impl AppController {
 
     /// Drains only completed work, without waiting in the rendering loop.
     pub(super) fn poll_web_worker(&mut self) {
-        if self
-            .web
-            .worker
-            .as_ref()
-            .is_some_and(|worker| worker.thread.is_finished())
-        {
-            let worker = self.web.worker.take().expect("finished Web worker");
-            let _ = worker.thread.join();
-            let result = worker
-                .response
-                .try_recv()
-                .unwrap_or_else(|_| Err("Web directory worker stopped unexpectedly".to_owned()));
+        let completed =
+            self.web
+                .worker
+                .as_ref()
+                .and_then(|worker| match worker.response.try_recv() {
+                    Ok(result) => Some(result),
+                    Err(TryRecvError::Disconnected) => {
+                        Some(Err("Web directory worker stopped unexpectedly".to_owned()))
+                    }
+                    Err(TryRecvError::Empty) => None,
+                });
+        if let Some(result) = completed {
+            let worker = self.web.worker.take().expect("published Web worker");
+            reap_published_worker(worker.thread);
             self.handle_web_response(worker.generation, result);
         }
         self.start_web_worker();
@@ -385,6 +388,53 @@ pub(super) fn queue_item_from_web(entry: &WebEntry) -> Option<QueueItem> {
 #[cfg(test)]
 mod startup_tests {
     use super::*;
+
+    #[test]
+    fn published_web_result_does_not_wait_for_thread_exit() {
+        let (_directory, mut app) = controller();
+        let (sender, response) = bounded(1);
+        assert!(sender.send(Err("fixture Web failure".to_owned())).is_ok());
+        let (release, held) = bounded::<()>(1);
+        app.web.pending = true;
+        app.web.worker = Some(WebWorker {
+            generation: app.web.generation,
+            response,
+            thread: thread::spawn(move || {
+                let _sender = sender;
+                let _ = held.recv_timeout(Duration::from_secs(5));
+            }),
+        });
+        app.poll_web_worker();
+        assert!(app.web.worker.is_none());
+        assert!(!app.web.pending);
+        assert!(app.web.message.contains("fixture Web failure"));
+        release.send(()).unwrap();
+    }
+
+    /// An empty live channel is pending; a closed one resolves failure without a join.
+    #[test]
+    fn disconnected_web_result_does_not_wait_for_thread_exit() {
+        let (_directory, mut app) = controller();
+        let (sender, response) = bounded(1);
+        let (release, held) = bounded::<()>(1);
+        app.web.pending = true;
+        app.web.worker = Some(WebWorker {
+            generation: app.web.generation,
+            response,
+            thread: thread::spawn(move || {
+                let _ = held.recv_timeout(Duration::from_secs(5));
+            }),
+        });
+        app.poll_web_worker();
+        assert!(app.web.worker.is_some());
+        assert!(app.web.pending);
+        drop(sender);
+        app.poll_web_worker();
+        assert!(app.web.worker.is_none());
+        assert!(!app.web.pending);
+        assert!(app.web.message.contains("worker stopped unexpectedly"));
+        release.send(()).unwrap();
+    }
 
     /// Owns an isolated controller without provider or playback network work.
     fn controller() -> (tempfile::TempDir, AppController) {

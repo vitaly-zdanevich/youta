@@ -314,7 +314,7 @@ fn bug_report_definite_failure_allows_edits_and_explicit_retry() {
 
 /// Holds mocked completions so tests can send stale worker ownership explicitly.
 struct DeferredBugReportActions {
-    submissions: Arc<Mutex<Vec<(u64, Sender<GitHubIssueSubmissionCompletion>)>>>,
+    submissions: Arc<Mutex<Vec<(u64, ResponseSender<GitHubIssueSubmissionCompletion>)>>>,
 }
 
 impl DiagnosticActionHandler for DeferredBugReportActions {
@@ -329,7 +329,7 @@ impl DiagnosticActionHandler for DeferredBugReportActions {
         _: String,
         _: String,
         generation: u64,
-        results: Sender<GitHubIssueSubmissionCompletion>,
+        results: ResponseSender<GitHubIssueSubmissionCompletion>,
     ) -> Result<(), String> {
         self.submissions.lock().unwrap().push((generation, results));
         Ok(())

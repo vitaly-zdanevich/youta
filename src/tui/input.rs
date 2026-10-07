@@ -1,4 +1,4 @@
-//! One blocking readiness wait for terminal input, GPM, and Local worker replies.
+//! One blocking readiness wait for terminal input, GPM, and worker replies.
 
 use std::collections::VecDeque;
 use std::io;
@@ -110,7 +110,7 @@ impl TerminalInput {
         self.readiness.worker_waker()
     }
 
-    /// Waits until input, a Local completion, or the ordinary animation deadline.
+    /// Waits until input, a worker completion, or the ordinary animation deadline.
     pub(super) fn poll(&mut self, timeout: Duration) -> io::Result<WaitOutcome> {
         let started = Instant::now();
         let mut waited = false;

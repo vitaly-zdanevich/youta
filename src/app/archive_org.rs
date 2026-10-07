@@ -466,6 +466,7 @@ impl AppController {
         let work = job.clone();
         let client = self.archive_org.client.clone();
         let (sender, response) = bounded(1);
+        let sender = ResponseSender::new(sender, self.worker_notifier.clone());
         match thread::Builder::new()
             .name("youta-archive".to_owned())
             .spawn(move || {
@@ -499,7 +500,7 @@ impl AppController {
         }
     }
 
-    /// Polls only finished threads, so network delays cannot stop terminal input.
+    /// Drains published replies without waiting for network I/O or final thread cleanup.
     pub(super) fn poll_archive_org_worker(&mut self) {
         self.cancel_stale_archive_now_playing_navigation();
         // Restored tabs wait until the frontend has had a frame to report its
@@ -507,22 +508,24 @@ impl AppController {
         if self.view.screen == Screen::ArchiveOrg && !self.archive_org.initialized {
             self.populate_archive_org();
         }
-        if self
-            .archive_org
-            .worker
-            .as_ref()
-            .is_some_and(|worker| worker.thread.is_finished())
-        {
+        let completed =
+            self.archive_org
+                .worker
+                .as_ref()
+                .and_then(|worker| match worker.response.try_recv() {
+                    Ok(result) => Some(result),
+                    Err(TryRecvError::Disconnected) => {
+                        Some(Err("Archive.org worker stopped unexpectedly".to_owned()))
+                    }
+                    Err(TryRecvError::Empty) => None,
+                });
+        if let Some(result) = completed {
             let worker = self
                 .archive_org
                 .worker
                 .take()
-                .expect("finished Archive.org worker");
-            let _ = worker.thread.join();
-            let result = worker
-                .response
-                .try_recv()
-                .unwrap_or_else(|_| Err("Archive.org worker stopped unexpectedly".to_owned()));
+                .expect("published Archive.org worker");
+            reap_published_worker(worker.thread);
             self.handle_archive_response(worker.job, result);
         }
         self.start_archive_worker();
@@ -1472,6 +1475,36 @@ fn append_searchable_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn published_archive_result_does_not_wait_for_thread_exit() {
+        let (_directory, mut app) = lookup_controller();
+        let (sender, response) = bounded(1);
+        assert!(
+            sender
+                .send(Err("fixture Archive failure".to_owned()))
+                .is_ok()
+        );
+        let (release, held) = bounded::<()>(1);
+        app.archive_org.worker = Some(ArchiveWorker {
+            job: ArchiveJob {
+                generation: app.archive_org.generation,
+                kind: ArchiveRequest::Details {
+                    identifier: "fixture".into(),
+                    open: false,
+                },
+                due: Instant::now(),
+            },
+            response,
+            thread: thread::spawn(move || {
+                let _sender = sender;
+                let _ = held.recv_timeout(Duration::from_secs(5));
+            }),
+        });
+        app.poll_archive_org_worker();
+        assert!(app.archive_org.worker.is_none());
+        release.send(()).unwrap();
+    }
 
     /// URL readability is a cached display projection, never a rewrite of full metadata.
     #[test]

@@ -28,13 +28,19 @@ impl Wake for WakeCount {
 /// Builds an immediate response observer without a timer or frontend thread.
 fn response_probe(
     responses: Receiver<LocalBrowseResponse>,
-) -> (Waker, Receiver<Result<LocalBrowseResponse, TryRecvError>>) {
+) -> (
+    WorkerNotifier,
+    Receiver<Result<LocalBrowseResponse, TryRecvError>>,
+) {
     let (notifications, observed) = unbounded();
     let waker = Waker::from(Arc::new(ResponseProbe {
         responses,
         notifications,
     }));
-    (waker, observed)
+    let notifier = WorkerNotifier::default();
+    notifier.set_waker(Some(waker));
+    assert!(matches!(observed.recv().unwrap(), Err(TryRecvError::Empty)));
+    (notifier, observed)
 }
 
 #[test]
@@ -44,11 +50,7 @@ fn local_browse_wakes_after_success_error_and_disconnect_are_observable() {
     let (responses, response_receiver) = unbounded();
     let (waker, notifications) = response_probe(response_receiver);
     let worker = thread::spawn(move || {
-        local_browse_worker(
-            request_receiver,
-            responses,
-            Arc::new(Mutex::new(Some(waker))),
-        );
+        local_browse_worker(request_receiver, responses, waker);
     });
     for (generation, directory, succeeds) in [
         (1, fixture.path().to_owned(), true),
@@ -95,11 +97,7 @@ fn local_copy_and_move_destination_completion_wakes_after_success_and_error() {
     let (responses, response_receiver) = unbounded();
     let (waker, notifications) = response_probe(response_receiver);
     let worker = thread::spawn(move || {
-        local_browse_worker(
-            request_receiver,
-            responses,
-            Arc::new(Mutex::new(Some(waker))),
-        );
+        local_browse_worker(request_receiver, responses, waker);
     });
     // Both choosers intentionally share this directory-only request variant.
     for (generation, directory, succeeds) in [
@@ -135,6 +133,8 @@ fn local_copy_and_move_destination_completion_wakes_after_success_and_error() {
 fn local_browse_registration_wakes_for_results_completed_before_registration() {
     let (mut controller, _) = controller_with_mock_statuses([]);
     controller.shutdown_local_browse_worker();
+    // Isolate this registration from unrelated provider workers started by the harness.
+    controller.worker_notifier = WorkerNotifier::default();
     let (responses, response_receiver) = unbounded();
     controller.local_browse_responses = response_receiver;
     assert!(
@@ -147,7 +147,7 @@ fn local_browse_registration_wakes_for_results_completed_before_registration() {
     );
     drop(responses);
     let count = Arc::new(WakeCount::default());
-    controller.set_local_browse_waker(Some(Waker::from(Arc::clone(&count))));
+    controller.set_worker_waker(Some(Waker::from(Arc::clone(&count))));
     assert_eq!(count.0.load(Ordering::SeqCst), 1);
     assert!(
         matches!(
@@ -166,13 +166,11 @@ fn local_browse_registration_wakes_for_results_completed_before_registration() {
 fn local_browse_detachment_stops_notifications_without_dropping_results() {
     let (mut controller, _) = controller_with_mock_statuses([]);
     controller.shutdown_local_browse_worker();
+    controller.worker_notifier = WorkerNotifier::default();
     let (sender, responses) = unbounded();
-    let publisher = LocalBrowseResponseSender {
-        sender: Some(sender),
-        waker: Arc::clone(&controller.local_browse_waker),
-    };
+    let publisher = LocalBrowseResponseSender::new(sender, controller.worker_notifier.clone());
     let count = Arc::new(WakeCount::default());
-    controller.set_local_browse_waker(Some(Waker::from(Arc::clone(&count))));
+    controller.set_worker_waker(Some(Waker::from(Arc::clone(&count))));
     assert_eq!(count.0.load(Ordering::SeqCst), 1);
     assert!(
         publisher
@@ -183,7 +181,7 @@ fn local_browse_detachment_stops_notifications_without_dropping_results() {
             .is_ok()
     );
     assert_eq!(count.0.load(Ordering::SeqCst), 2);
-    controller.set_local_browse_waker(None);
+    controller.set_worker_waker(None);
     assert!(
         publisher
             .send(LocalBrowseResponse::Browse {
@@ -210,10 +208,7 @@ fn local_browse_unwind_wakes_only_after_worker_sender_disconnects() {
     let (sender, responses) = unbounded();
     let (waker, notifications) = response_probe(responses);
     let worker = thread::spawn(move || {
-        let _publisher = LocalBrowseResponseSender {
-            sender: Some(sender),
-            waker: Arc::new(Mutex::new(Some(waker))),
-        };
+        let _publisher = LocalBrowseResponseSender::new(sender, waker);
         panic!("simulated filesystem worker failure");
     });
     assert!(worker.join().is_err());
@@ -281,10 +276,7 @@ fn local_destination_chooser_stops_loading_after_worker_disconnect() {
 fn local_transfer_progress_wakes_after_enqueueing_its_payload() {
     let (sender, responses) = unbounded();
     let (waker, notifications) = response_probe(responses);
-    let publisher = LocalBrowseResponseSender {
-        sender: Some(sender),
-        waker: Arc::new(Mutex::new(Some(waker))),
-    };
+    let publisher = LocalBrowseResponseSender::new(sender, waker);
     let progress = crate::local_move::LocalTransferProgress {
         completed_bytes: 2,
         total_bytes: Some(3),

@@ -10,18 +10,25 @@ pub(super) struct ManualBugReportState {
     screenshot: Option<String>,
     generation: u64,
     pub(super) pending: Option<u64>,
-    sender: Sender<GitHubIssueSubmissionCompletion>,
+    sender: ResponseSender<GitHubIssueSubmissionCompletion>,
     results: Receiver<GitHubIssueSubmissionCompletion>,
 }
 
 impl Default for ManualBugReportState {
     fn default() -> Self {
+        Self::new(WorkerNotifier::default())
+    }
+}
+
+impl ManualBugReportState {
+    /// Shares the controller's frontend notification without exposing report text.
+    pub(super) fn new(notifier: WorkerNotifier) -> Self {
         let (sender, results) = unbounded();
         Self {
             screenshot: None,
             generation: 0,
             pending: None,
-            sender,
+            sender: ResponseSender::new(sender, notifier),
             results,
         }
     }
@@ -338,6 +345,7 @@ impl AppController {
     /// Applies only this composer's completions and advances its pending spinner.
     pub(super) fn poll_bug_report_submission(&mut self) {
         if let Some(popup) = self.view.bug_report_popup.as_mut()
+            && self.animation_tick_due
             && popup.submission == GitHubIssueSubmissionView::Submitting
         {
             popup.animation_frame = popup.animation_frame.wrapping_add(1);

@@ -149,7 +149,7 @@ impl AppController {
         }
     }
 
-    /// Polls without waiting, retires finished workers, and advances the spinner.
+    /// Drains published replies without waiting and advances the due spinner frame.
     #[cfg(feature = "invidious")]
     pub(super) fn poll_invidious_instances(&mut self) {
         if let Some(list) = self
@@ -157,25 +157,26 @@ impl AppController {
             .youtube_setup_popup
             .as_mut()
             .and_then(|popup| popup.invidious_instances.as_mut())
-            .filter(|list| list.loading)
+            .filter(|list| list.loading && self.animation_tick_due)
         {
             list.loading_frame = list.loading_frame.wrapping_add(1);
         }
-        if self
-            .invidious_instances
-            .worker
-            .as_ref()
-            .is_some_and(|worker| worker.thread.is_finished())
-        {
+        let completed = self.invidious_instances.worker.as_ref().and_then(|worker| {
+            match worker.response.try_recv() {
+                Ok(result) => Some(result),
+                Err(TryRecvError::Disconnected) => Some(Err(
+                    "The instance directory worker stopped; retry the list".to_owned(),
+                )),
+                Err(TryRecvError::Empty) => None,
+            }
+        });
+        if let Some(result) = completed {
             let worker = self
                 .invidious_instances
                 .worker
                 .take()
-                .expect("finished worker");
-            let result = worker.response.try_recv().unwrap_or_else(|_| {
-                Err("The instance directory worker stopped; retry the list".to_owned())
-            });
-            let _ = worker.thread.join();
+                .expect("published worker");
+            reap_published_worker(worker.thread);
             if worker.generation == self.invidious_instances.generation
                 && let Some(popup) = self.view.youtube_setup_popup.as_mut()
                 && let Some(list) = popup.invidious_instances.as_mut()
@@ -203,6 +204,7 @@ impl AppController {
         let generation = self.invidious_instances.generation;
         let loader = Arc::clone(&self.invidious_instances.loader);
         let (sender, response) = bounded(1);
+        let sender = ResponseSender::new(sender, self.worker_notifier.clone());
         match thread::Builder::new()
             .name("youta-invidious-directory".to_owned())
             .spawn(move || {
@@ -253,6 +255,25 @@ fn invidious_picker_without_feature_keeps_manual_setup_and_reports_unavailable()
 #[cfg(all(test, feature = "invidious"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn published_directory_result_does_not_wait_for_thread_exit() {
+        let (_directory, mut app) = fixture();
+        let (sender, response) = bounded(1);
+        assert!(sender.send(Ok(Vec::new())).is_ok());
+        let (release, held) = bounded::<()>(1);
+        app.invidious_instances.worker = Some(DirectoryWorker {
+            generation: app.invidious_instances.generation,
+            response,
+            thread: thread::spawn(move || {
+                let _sender = sender;
+                let _ = held.recv_timeout(Duration::from_secs(5));
+            }),
+        });
+        app.poll_invidious_instances();
+        assert!(app.invidious_instances.worker.is_none());
+        release.send(()).unwrap();
+    }
 
     /// Uses only channel-backed mock requests; no network or stored credentials.
     fn fixture() -> (tempfile::TempDir, AppController) {

@@ -48,6 +48,7 @@ mod web;
 mod web_metadata;
 #[cfg(all(feature = "web-browser", feature = "local-metadata"))]
 mod web_probe;
+mod worker_notifications;
 mod youtube_hashtag;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -58,11 +59,24 @@ use std::io::BufRead;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+#[cfg(feature = "yt-dlp")]
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use self::worker_notifications::ResponseSender;
+#[cfg(any(
+    feature = "soundcloud",
+    feature = "archive-org",
+    feature = "invidious",
+    feature = "web-browser",
+    feature = "archive-upload",
+    feature = "s3-upload"
+))]
+use self::worker_notifications::reap_published_worker;
+use crate::worker_wake::WorkerNotifier;
 use chrono::{DateTime, Datelike, Local, NaiveDate};
 use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError, bounded, unbounded};
 #[cfg(feature = "yandex-music")]
@@ -741,7 +755,7 @@ trait DiagnosticActionHandler {
         title: String,
         report: String,
         generation: u64,
-        results: Sender<GitHubIssueSubmissionCompletion>,
+        results: ResponseSender<GitHubIssueSubmissionCompletion>,
     ) -> Result<(), String>;
     fn copy_and_open_github_issue(&self, title: &str, report: &str) -> Result<String, String>;
 }
@@ -760,7 +774,7 @@ impl DiagnosticActionHandler for SystemReportActions {
         title: String,
         report: String,
         generation: u64,
-        results: Sender<GitHubIssueSubmissionCompletion>,
+        results: ResponseSender<GitHubIssueSubmissionCompletion>,
     ) -> Result<(), String> {
         let actions = self.clone();
         thread::Builder::new()
@@ -3355,7 +3369,7 @@ fn official_youtube_page_dates(
 fn send_official_youtube_page_dates(
     provider: Option<&dyn Provider>,
     result: &Result<SearchPage, String>,
-    responses: &Sender<ProviderResponse>,
+    responses: &ResponseSender<ProviderResponse>,
 ) {
     if let Some(provider) = provider
         && let Ok(page) = result
@@ -3650,6 +3664,7 @@ impl ActiveDownload {
         collection: bool,
         estimated_total_files: Option<u64>,
         process: Box<dyn RunningDownload>,
+        notifier: WorkerNotifier,
     ) -> Result<Self, String> {
         Self::start_with_owner(
             title,
@@ -3658,6 +3673,7 @@ impl ActiveDownload {
             estimated_total_files,
             ActiveDownloadOwner::Manual,
             process,
+            notifier,
         )
     }
 
@@ -3668,6 +3684,7 @@ impl ActiveDownload {
         estimated_total_files: Option<u64>,
         owner: ActiveDownloadOwner,
         mut process: Box<dyn RunningDownload>,
+        notifier: WorkerNotifier,
     ) -> Result<Self, String> {
         let progress_reader = process
             .take_progress_reader()
@@ -3678,16 +3695,30 @@ impl ActiveDownload {
         let output = Arc::new(Mutex::new(DownloadOutputBuffer::default()));
 
         let progress_output = Arc::clone(&output);
+        let progress_notifier = notifier.clone();
         let progress_thread = thread::Builder::new()
             .name("youta-download-progress".to_owned())
-            .spawn(move || drain_download_reader(progress_reader, &progress_output, true))
+            .spawn(move || {
+                drain_download_reader_with_notifications(
+                    progress_reader,
+                    &progress_output,
+                    true,
+                    &progress_notifier,
+                )
+            })
             .map_err(|error| format!("cannot start the download progress reader: {error}"))?;
 
         let error_output = Arc::clone(&output);
         let error_thread = match thread::Builder::new()
             .name("youta-download-diagnostics".to_owned())
-            .spawn(move || drain_download_reader(error_reader, &error_output, false))
-        {
+            .spawn(move || {
+                drain_download_reader_with_notifications(
+                    error_reader,
+                    &error_output,
+                    false,
+                    &notifier,
+                )
+            }) {
             Ok(thread) => thread,
             Err(error) => {
                 let _ = process.cancel();
@@ -3728,11 +3759,30 @@ impl ActiveDownload {
 }
 
 #[cfg(feature = "yt-dlp")]
+#[cfg(test)]
 fn drain_download_reader(
-    mut reader: Box<dyn BufRead + Send>,
+    reader: Box<dyn BufRead + Send>,
     output: &Arc<Mutex<DownloadOutputBuffer>>,
     parse_progress: bool,
 ) {
+    drain_download_reader_with_notifications(
+        reader,
+        output,
+        parse_progress,
+        &WorkerNotifier::default(),
+    );
+}
+
+/// Wakes for bounded progress snapshots and always after reader EOF or failure.
+#[cfg(feature = "yt-dlp")]
+fn drain_download_reader_with_notifications(
+    mut reader: Box<dyn BufRead + Send>,
+    output: &Arc<Mutex<DownloadOutputBuffer>>,
+    parse_progress: bool,
+    notifier: &WorkerNotifier,
+) {
+    let _completion = notifier.completion_guard();
+    let mut last_notification = Instant::now() - Duration::from_millis(100);
     let mut line = Vec::with_capacity(1024);
     let mut truncated = false;
     loop {
@@ -3769,6 +3819,10 @@ fn drain_download_reader(
         line.extend_from_slice(&next.2);
         if next.1 {
             record_download_line(output, &line, truncated, parse_progress);
+            if last_notification.elapsed() >= Duration::from_millis(100) {
+                last_notification = Instant::now();
+                notifier.wake();
+            }
             line.clear();
             truncated = false;
         }
@@ -4716,7 +4770,7 @@ pub struct AppController {
     yandex_music_media_job_responses: Receiver<YandexMusicMediaJobResponse>,
     /// Sender cloned only into bounded-lifetime media workers.
     #[cfg(feature = "yandex-music")]
-    yandex_music_media_job_sender: Sender<YandexMusicMediaJobResponse>,
+    yandex_music_media_job_sender: ResponseSender<YandexMusicMediaJobResponse>,
     /// Sole encrypted playback preparation worker.
     #[cfg(feature = "yandex-music")]
     yandex_music_playback_thread: Option<JoinHandle<()>>,
@@ -4905,7 +4959,7 @@ pub struct AppController {
     youtube_podcast_feed_responses: Receiver<YouTubePodcastFeedResponse>,
     /// Sender cloned only into the current bounded feed-enumeration worker.
     #[cfg(feature = "lan-sharing")]
-    youtube_podcast_feed_response_sender: Sender<YouTubePodcastFeedResponse>,
+    youtube_podcast_feed_response_sender: ResponseSender<YouTubePodcastFeedResponse>,
     /// Sole flat channel-enumeration worker, joined after it finishes.
     #[cfg(feature = "lan-sharing")]
     youtube_podcast_feed_thread: Option<JoinHandle<()>>,
@@ -4972,7 +5026,7 @@ pub struct AppController {
     youtube_captions_responses: Receiver<YouTubeCaptionsWorkerResponse>,
     /// Sender cloned into the one short-lived caption thread.
     #[cfg(feature = "youtube-captions")]
-    youtube_captions_response_sender: Sender<YouTubeCaptionsWorkerResponse>,
+    youtube_captions_response_sender: ResponseSender<YouTubeCaptionsWorkerResponse>,
     /// Join handle for the active caption retrieval.
     #[cfg(feature = "youtube-captions")]
     youtube_captions_thread: Option<JoinHandle<()>>,
@@ -4996,7 +5050,7 @@ pub struct AppController {
     /// Injectable selected-file metadata boundary used by lazy workers.
     local_media_loader: Arc<dyn LocalMediaLoader>,
     /// Completion sender cloned into short-lived selected-file workers.
-    local_media_metadata_sender: Sender<LocalMediaMetadataResponse>,
+    local_media_metadata_sender: ResponseSender<LocalMediaMetadataResponse>,
     /// Completed selected-file metadata drained by the TUI event loop.
     local_media_metadata_responses: Receiver<LocalMediaMetadataResponse>,
     /// Latest-only requests for the dedicated local-audio quality worker.
@@ -5266,8 +5320,12 @@ pub struct AppController {
     local_browse_requests: Option<Sender<LocalBrowseRequest>>,
     /// Completed foreground Local listings from the isolated worker.
     local_browse_responses: Receiver<LocalBrowseResponse>,
-    /// Optional frontend completion signal, shared with the Local worker.
-    local_browse_waker: Arc<Mutex<Option<std::task::Waker>>>,
+    /// Frontend completion signal shared by every asynchronous controller worker.
+    worker_notifier: WorkerNotifier,
+    /// Monotonic boundary preventing worker bursts from accelerating ASCII spinners.
+    last_animation_tick: Instant,
+    /// Shared decision for all spinners during the current controller tick.
+    animation_tick_due: bool,
     /// Dedicated worker ensuring Local listings do not wait behind scans.
     local_browse_thread: Option<JoinHandle<()>>,
     provider_disconnect_reported: bool,
@@ -5464,7 +5522,7 @@ pub struct AppController {
     commons_upload_responses: Receiver<CommonsWorkerResponse>,
     /// Sender cloned into bounded Commons worker tasks.
     #[cfg(feature = "commons-upload")]
-    commons_upload_response_sender: Sender<CommonsWorkerResponse>,
+    commons_upload_response_sender: ResponseSender<CommonsWorkerResponse>,
     /// Sole Opus preparation/upload worker, joined after completion or shutdown.
     #[cfg(feature = "commons-upload")]
     commons_upload_thread: Option<JoinHandle<()>>,
@@ -5488,7 +5546,7 @@ pub struct AppController {
     evernote_responses: Receiver<EvernoteWorkerResponse>,
     /// Sender cloned into bounded Evernote worker tasks.
     #[cfg(feature = "evernote")]
-    evernote_response_sender: Sender<EvernoteWorkerResponse>,
+    evernote_response_sender: ResponseSender<EvernoteWorkerResponse>,
     /// Sole caption or note worker, joined after completion or shutdown.
     #[cfg(feature = "evernote")]
     evernote_thread: Option<JoinHandle<()>>,
@@ -5498,7 +5556,7 @@ pub struct AppController {
     /// Completions from the sole explicitly confirmed GitHub submission.
     github_issue_submission_results: Receiver<GitHubIssueSubmissionCompletion>,
     /// Sender cloned into the detached submission task.
-    github_issue_submission_result_sender: Sender<GitHubIssueSubmissionCompletion>,
+    github_issue_submission_result_sender: ResponseSender<GitHubIssueSubmissionCompletion>,
     /// Identity of the diagnostic report currently displayed.
     diagnostic_report_generation: u64,
     /// Report generation whose submission worker has not returned a result.
@@ -5528,7 +5586,7 @@ pub struct AppController {
     /// URL-free completions from detached system-opener tasks.
     url_open_results: Receiver<UrlOpenCompletion>,
     /// Sender cloned into each detached system-opener task.
-    url_open_result_sender: Sender<UrlOpenCompletion>,
+    url_open_result_sender: ResponseSender<UrlOpenCompletion>,
     /// Number of system-opener tasks that have not reported completion.
     url_open_pending: usize,
     /// Bounded email projections shared by all description and comment providers.
@@ -5616,7 +5674,9 @@ impl AppController {
         };
         #[cfg(feature = "yt-dlp")]
         let next_auto_download_check_at = Some(Instant::now());
+        let worker_notifier = WorkerNotifier::default();
         let (response_sender, provider_responses) = unbounded();
+        let response_sender = ResponseSender::new(response_sender, worker_notifier.clone());
         let (request_sender, request_receiver) = unbounded();
         #[cfg(feature = "sponsorblock")]
         let (sponsorblock_request_sender, sponsorblock_request_receiver) = bounded(1);
@@ -5624,6 +5684,9 @@ impl AppController {
         let sponsorblock_request_drain = sponsorblock_request_receiver.clone();
         #[cfg(feature = "sponsorblock")]
         let (sponsorblock_response_sender, sponsorblock_responses) = unbounded();
+        #[cfg(feature = "sponsorblock")]
+        let sponsorblock_response_sender =
+            ResponseSender::new(sponsorblock_response_sender, worker_notifier.clone());
         #[cfg(feature = "yandex-music")]
         let (yandex_music_request_sender, yandex_music_request_receiver) = bounded(1);
         #[cfg(feature = "yandex-music")]
@@ -5637,10 +5700,14 @@ impl AppController {
         let yandex_music_reaction_stopping = Arc::new(AtomicBool::new(false));
         #[cfg(feature = "yandex-music")]
         let (yandex_music_media_job_sender, yandex_music_media_job_responses) = unbounded();
+        #[cfg(feature = "yandex-music")]
+        let yandex_music_media_job_sender =
+            ResponseSender::new(yandex_music_media_job_sender, worker_notifier.clone());
         let (local_browse_response_sender, local_browse_responses) = unbounded();
         let (local_browse_request_sender, local_browse_request_receiver) = unbounded();
-        let local_browse_waker = Arc::new(Mutex::new(None));
         let (local_media_metadata_sender, local_media_metadata_responses) = unbounded();
+        let local_media_metadata_sender =
+            ResponseSender::new(local_media_metadata_sender, worker_notifier.clone());
         #[cfg(feature = "audio-quality")]
         let (local_audio_quality_request_sender, local_audio_quality_request_receiver) = bounded(1);
         #[cfg(feature = "audio-quality")]
@@ -5648,32 +5715,64 @@ impl AppController {
         #[cfg(feature = "audio-quality")]
         let (local_audio_quality_response_sender, local_audio_quality_responses) = unbounded();
         #[cfg(feature = "audio-quality")]
+        let local_audio_quality_response_sender =
+            ResponseSender::new(local_audio_quality_response_sender, worker_notifier.clone());
+        #[cfg(feature = "audio-quality")]
         let (local_audio_quality_batch_response_sender, local_audio_quality_batch_responses) =
             unbounded();
+        #[cfg(feature = "audio-quality")]
+        let local_audio_quality_batch_response_sender = ResponseSender::new(
+            local_audio_quality_batch_response_sender,
+            worker_notifier.clone(),
+        );
         #[cfg(feature = "summary")]
         let (video_summary_request_sender, video_summary_request_receiver) = bounded(1);
         #[cfg(feature = "summary")]
         let (video_summary_response_sender, video_summary_responses) = bounded(2);
+        #[cfg(feature = "summary")]
+        let video_summary_response_sender =
+            ResponseSender::new(video_summary_response_sender, worker_notifier.clone());
         #[cfg(feature = "youtube-captions")]
         let (youtube_captions_response_sender, youtube_captions_responses) = unbounded();
+        #[cfg(feature = "youtube-captions")]
+        let youtube_captions_response_sender =
+            ResponseSender::new(youtube_captions_response_sender, worker_notifier.clone());
         #[cfg(feature = "acoustid")]
         let (local_fingerprint_request_sender, local_fingerprint_request_receiver) = bounded(1);
         #[cfg(feature = "acoustid")]
         let local_fingerprint_request_drain = local_fingerprint_request_receiver.clone();
         #[cfg(feature = "acoustid")]
         let (local_fingerprint_response_sender, local_fingerprint_responses) = unbounded();
+        #[cfg(feature = "acoustid")]
+        let local_fingerprint_response_sender =
+            ResponseSender::new(local_fingerprint_response_sender, worker_notifier.clone());
         #[cfg(feature = "waveform")]
         let (local_waveform_request_sender, local_waveform_request_receiver) = bounded(1);
         #[cfg(feature = "waveform")]
         let local_waveform_request_drain = local_waveform_request_receiver.clone();
         #[cfg(feature = "waveform")]
         let (local_waveform_response_sender, local_waveform_responses) = unbounded();
+        #[cfg(feature = "waveform")]
+        let local_waveform_response_sender =
+            ResponseSender::new(local_waveform_response_sender, worker_notifier.clone());
         let (url_open_result_sender, url_open_results) = unbounded();
+        let url_open_result_sender =
+            ResponseSender::new(url_open_result_sender, worker_notifier.clone());
         let (github_issue_submission_result_sender, github_issue_submission_results) = unbounded();
+        let github_issue_submission_result_sender = ResponseSender::new(
+            github_issue_submission_result_sender,
+            worker_notifier.clone(),
+        );
         #[cfg(feature = "commons-upload")]
         let (commons_upload_response_sender, commons_upload_responses) = unbounded();
+        #[cfg(feature = "commons-upload")]
+        let commons_upload_response_sender =
+            ResponseSender::new(commons_upload_response_sender, worker_notifier.clone());
         #[cfg(feature = "evernote")]
         let (evernote_response_sender, evernote_responses) = unbounded();
+        #[cfg(feature = "evernote")]
+        let evernote_response_sender =
+            ResponseSender::new(evernote_response_sender, worker_notifier.clone());
         let allow_insecure_http = config.providers.allow_insecure_http;
         let mod_archive_api_key = config.providers.mod_archive_api_key.clone();
         let jamendo_client_id = config.providers.jamendo_client_id.clone();
@@ -5785,14 +5884,14 @@ impl AppController {
         let sponsorblock_requests = sponsorblock_thread
             .as_ref()
             .map(|_| sponsorblock_request_sender);
-        let worker_local_browse_waker = Arc::clone(&local_browse_waker);
+        let local_worker_notifier = worker_notifier.clone();
         let local_browse_thread_result = thread::Builder::new()
             .name("youta-local-browser".to_owned())
             .spawn(move || {
                 local_browse_worker(
                     local_browse_request_receiver,
                     local_browse_response_sender,
-                    worker_local_browse_waker,
+                    local_worker_notifier,
                 );
             });
         let (local_browse_thread, local_browse_thread_error) = match local_browse_thread_result {
@@ -6226,6 +6325,11 @@ impl AppController {
         ));
         #[cfg(feature = "lan-sharing")]
         let (youtube_podcast_feed_response_sender, youtube_podcast_feed_responses) = unbounded();
+        #[cfg(feature = "lan-sharing")]
+        let youtube_podcast_feed_response_sender = ResponseSender::new(
+            youtube_podcast_feed_response_sender,
+            worker_notifier.clone(),
+        );
         let mut controller = Self {
             config,
             store,
@@ -6631,7 +6735,9 @@ impl AppController {
             sponsorblock_thread,
             local_browse_requests,
             local_browse_responses,
-            local_browse_waker,
+            worker_notifier: worker_notifier.clone(),
+            last_animation_tick: Instant::now() - Duration::from_millis(100),
+            animation_tick_due: true,
             local_browse_thread,
             provider_disconnect_reported: false,
             local_browse_disconnect_reported: false,
@@ -6702,7 +6808,8 @@ impl AppController {
             #[cfg(feature = "yt-dlp")]
             youtube_prewarm_thread: None,
             #[cfg(feature = "bandcamp")]
-            bandcamp_resolution: BandcampResolverOwner::new(bandcamp_resolver),
+            bandcamp_resolution: BandcampResolverOwner::new(bandcamp_resolver)
+                .with_notifier(worker_notifier.clone()),
             #[cfg(feature = "yt-dlp")]
             youtube_prewarm_generation: 0,
             #[cfg(feature = "yt-dlp")]
@@ -6781,7 +6888,7 @@ impl AppController {
             #[cfg(feature = "evernote")]
             evernote_thread: None,
             report_actions: Box::new(SystemReportActions::new()),
-            bug_report: bug_report::ManualBugReportState::default(),
+            bug_report: bug_report::ManualBugReportState::new(worker_notifier.clone()),
             github_issue_submission_results,
             github_issue_submission_result_sender,
             diagnostic_report_generation: 0,
@@ -7080,8 +7187,9 @@ impl AppController {
 
     /// Advances the shared ASCII activity frame for searches or channel loads.
     fn advance_search_animation(&mut self) {
-        if self.view.search_activity.is_some()
-            || (self.view.subscriptions.loading && !self.view.subscriptions.loading_more)
+        if self.animation_tick_due
+            && (self.view.search_activity.is_some()
+                || (self.view.subscriptions.loading && !self.view.subscriptions.loading_more))
         {
             self.view.search_animation_frame = self.view.search_animation_frame.wrapping_add(1);
         }
@@ -7169,9 +7277,9 @@ impl AppController {
         }
     }
 
-    /// Advances the playback-start animation once per existing controller tick.
+    /// Advances playback-start feedback only on a scheduled animation tick.
     fn advance_playback_start_animation(&mut self) {
-        if self.view.playback_activity_pending() {
+        if self.animation_tick_due && self.view.playback_activity_pending() {
             self.view.playback_start_animation_frame =
                 self.view.playback_start_animation_frame.wrapping_add(1);
         }
@@ -9985,6 +10093,7 @@ impl AppController {
         let request_drain = request_receiver.clone();
         let (response_sender, response_receiver) = bounded(1);
         let response_drain = response_receiver.clone();
+        let response_sender = ResponseSender::new(response_sender, self.worker_notifier.clone());
         let thread = thread::Builder::new()
             .name("youta-youtube-prewarm".to_owned())
             .spawn(move || {
@@ -20501,6 +20610,7 @@ impl AppController {
             true,
             estimated_video_count,
             process,
+            self.worker_notifier.clone(),
         ) {
             Ok(active) => active,
             Err(error) => {
@@ -20757,6 +20867,7 @@ impl AppController {
             None,
             owner,
             process,
+            self.worker_notifier.clone(),
         ) {
             Ok(active) => active,
             Err(error) => {
@@ -20918,15 +21029,21 @@ impl AppController {
             }
         };
         let title = item.media.title;
-        let mut active =
-            match ActiveDownload::start(title.clone(), destination, false, None, process) {
-                Ok(active) => active,
-                Err(error) => {
-                    self.show_error_message("Download supervision could not start", error);
-                    self.finish_manual_download(Err(()));
-                    return;
-                }
-            };
+        let mut active = match ActiveDownload::start(
+            title.clone(),
+            destination,
+            false,
+            None,
+            process,
+            self.worker_notifier.clone(),
+        ) {
+            Ok(active) => active,
+            Err(error) => {
+                self.show_error_message("Download supervision could not start", error);
+                self.finish_manual_download(Err(()));
+                return;
+            }
+        };
         active.manual_queue_owner = self.manual_downloads.active;
         self.download_cancellation_notice_deadline = None;
         self.view.download = Some(DownloadView {
@@ -25391,7 +25508,7 @@ impl AppController {
     /// Advances the selected fingerprint button's ASCII activity frame.
     #[cfg(feature = "acoustid")]
     fn advance_local_fingerprint_animation(&mut self) {
-        if self.pending_local_fingerprint.is_some() {
+        if self.animation_tick_due && self.pending_local_fingerprint.is_some() {
             self.view.local_fingerprint_animation_frame =
                 self.view.local_fingerprint_animation_frame.wrapping_add(1);
         }
@@ -35521,17 +35638,8 @@ impl UiController for AppController {
         &self.view
     }
 
-    fn set_local_browse_waker(&mut self, waker: Option<std::task::Waker>) {
-        let previous = {
-            let mut registered = self
-                .local_browse_waker
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            std::mem::replace(&mut *registered, waker)
-        };
-        // Frontend callbacks, including their destructors, run outside the lock.
-        drop(previous);
-        wake_local_browse(&self.local_browse_waker);
+    fn set_worker_waker(&mut self, waker: Option<std::task::Waker>) {
+        self.worker_notifier.set_waker(waker);
     }
 
     #[cfg(feature = "archive-org")]
@@ -37120,6 +37228,12 @@ impl UiController for AppController {
     }
 
     fn tick(&mut self) {
+        let now = Instant::now();
+        self.animation_tick_due =
+            now.duration_since(self.last_animation_tick) >= Duration::from_millis(100);
+        if self.animation_tick_due {
+            self.last_animation_tick = now;
+        }
         self.poll_soundcloud_worker();
         #[cfg(feature = "soundcloud")]
         self.poll_soundcloud_comments();
@@ -37144,6 +37258,7 @@ impl UiController for AppController {
             self.drain_commons_upload_responses();
             self.maybe_start_commons_category_lookup();
             if let Some(popup) = self.view.commons_upload_popup.as_mut()
+                && self.animation_tick_due
                 && matches!(
                     popup.phase,
                     CommonsUploadPhase::PreparingAudio | CommonsUploadPhase::Uploading
@@ -37158,6 +37273,7 @@ impl UiController for AppController {
             #[cfg(feature = "radio")]
             self.maybe_offer_completed_radio_recording_to_evernote();
             if let Some(popup) = self.view.evernote_popup.as_mut()
+                && self.animation_tick_due
                 && matches!(
                     popup.phase,
                     EvernoteNotePhase::LoadingCaptions
@@ -37176,6 +37292,7 @@ impl UiController for AppController {
         {
             self.drain_youtube_podcast_feed_responses();
             if let Some(popup) = self.view.podcast_feed_options_popup.as_mut()
+                && self.animation_tick_due
                 && popup.phase == PodcastFeedOptionsPhase::Preparing
             {
                 popup.animation_frame = popup.animation_frame.wrapping_add(1);
@@ -37306,8 +37423,9 @@ fn url_opener_command(executable: &Path, target: &str) -> Command {
 fn spawn_url_opener_task(
     executable: PathBuf,
     target: String,
-    results: Sender<UrlOpenCompletion>,
+    results: impl Into<ResponseSender<UrlOpenCompletion>>,
 ) -> std::io::Result<()> {
+    let results = results.into();
     let opener_name = system_url_opener_name();
     thread::Builder::new()
         .name("youta-url-opener".to_owned())
@@ -37340,10 +37458,11 @@ fn spawn_url_opener_task(
 #[cfg(feature = "yt-dlp")]
 fn youtube_prewarm_worker(
     requests: Receiver<YouTubePrewarmCommand>,
-    responses: Sender<YouTubePrewarmCompletion>,
+    responses: impl Into<ResponseSender<YouTubePrewarmCompletion>>,
     response_drain: Receiver<YouTubePrewarmCompletion>,
     resolver: YouTubePrewarmResolver,
 ) {
+    let responses = responses.into();
     while let Ok(command) = requests.recv() {
         let YouTubePrewarmCommand::Resolve(job) = command else {
             break;
@@ -37393,47 +37512,8 @@ fn local_archive_display_path(
     }
 }
 
-/// Notifies the frontend outside the lock after work becomes observable.
-fn wake_local_browse(waker: &Mutex<Option<std::task::Waker>>) {
-    let registered = waker
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone();
-    if let Some(registered) = registered {
-        registered.wake();
-    }
-}
-
-/// Publishes Local work before notifying the frontend, including worker exit.
-struct LocalBrowseResponseSender {
-    /// Sole worker sender, detached before the final disconnect notification.
-    sender: Option<Sender<LocalBrowseResponse>>,
-    /// Frontend registration may change without restarting the worker.
-    waker: Arc<Mutex<Option<std::task::Waker>>>,
-}
-
-impl LocalBrowseResponseSender {
-    /// Queues one response before waking so the frontend cannot miss the payload.
-    /// A detached receiver ends the worker; its potentially large payload is not retried.
-    fn send(&self, response: LocalBrowseResponse) -> Result<(), ()> {
-        self.sender
-            .as_ref()
-            .expect("Local response sender is attached until worker exit")
-            .send(response)
-            .map_err(|_| ())?;
-        wake_local_browse(&self.waker);
-        Ok(())
-    }
-}
-
-impl Drop for LocalBrowseResponseSender {
-    fn drop(&mut self) {
-        // Also runs during unwinding: the receiver sees disconnection before
-        // its frontend wakes and clears any pending chooser or transfer state.
-        drop(self.sender.take());
-        wake_local_browse(&self.waker);
-    }
-}
+/// Local progress shares the same publish-before-wake contract as other workers.
+type LocalBrowseResponseSender = ResponseSender<LocalBrowseResponse>;
 
 /// Sends bounded-rate progress without flooding the UI channel on fast storage.
 #[cfg(any(feature = "local-move", feature = "local-copy"))]
@@ -37459,12 +37539,9 @@ fn local_transfer_progress_sender(
 fn local_browse_worker(
     requests: Receiver<LocalBrowseRequest>,
     responses: Sender<LocalBrowseResponse>,
-    waker: Arc<Mutex<Option<std::task::Waker>>>,
+    notifier: WorkerNotifier,
 ) {
-    let responses = LocalBrowseResponseSender {
-        sender: Some(responses),
-        waker,
-    };
+    let responses = LocalBrowseResponseSender::new(responses, notifier);
     while let Ok(request) = requests.recv() {
         let response = match request {
             LocalBrowseRequest::Browse {
@@ -37757,11 +37834,13 @@ fn format_local_audio_quality_batch_record(
 #[cfg(feature = "audio-quality")]
 fn local_audio_quality_worker(
     requests: Receiver<LocalAudioQualityWorkerRequest>,
-    responses: Sender<LocalAudioQualityWorkerResponse>,
-    batch_responses: Sender<LocalAudioQualityBatchWorkerResponse>,
+    responses: impl Into<ResponseSender<LocalAudioQualityWorkerResponse>>,
+    batch_responses: impl Into<ResponseSender<LocalAudioQualityBatchWorkerResponse>>,
     analyzer: Box<dyn AudioQualityAnalyzer>,
     metadata_loader: Arc<dyn LocalMediaLoader>,
 ) {
+    let responses = responses.into();
+    let batch_responses = batch_responses.into();
     'worker: while let Ok(command) = requests.recv() {
         match command {
             LocalAudioQualityWorkerRequest::Analyze {
@@ -37885,10 +37964,11 @@ fn local_audio_quality_worker(
 #[cfg(feature = "summary")]
 fn video_summary_worker(
     requests: Receiver<VideoSummaryWorkerRequest>,
-    responses: Sender<VideoSummaryWorkerResponse>,
+    responses: impl Into<ResponseSender<VideoSummaryWorkerResponse>>,
     caption_extractor: YouTubeCaptionExtractor,
     summarizer: CodexVideoSummarizer,
 ) {
+    let responses = responses.into();
     while let Ok(command) = requests.recv() {
         let VideoSummaryWorkerRequest::Generate {
             generation,
@@ -37992,9 +38072,10 @@ fn format_local_audio_quality_report(report: &AudioQualityReport) -> String {
 #[cfg(feature = "acoustid")]
 fn local_fingerprint_worker(
     requests: Receiver<LocalFingerprintWorkerRequest>,
-    responses: Sender<LocalFingerprintWorkerResponse>,
+    responses: impl Into<ResponseSender<LocalFingerprintWorkerResponse>>,
     mut identifier: Box<dyn AudioIdentifier>,
 ) {
+    let responses = responses.into();
     while let Ok(command) = requests.recv() {
         let LocalFingerprintWorkerRequest::Identify {
             generation,
@@ -38023,9 +38104,10 @@ fn local_fingerprint_worker(
 #[cfg(feature = "waveform")]
 fn local_waveform_worker(
     requests: Receiver<LocalWaveformWorkerRequest>,
-    responses: Sender<LocalWaveformWorkerResponse>,
+    responses: impl Into<ResponseSender<LocalWaveformWorkerResponse>>,
     extractor: Arc<dyn LocalWaveformExtractor>,
 ) {
+    let responses = responses.into();
     while let Ok(command) = requests.recv() {
         let LocalWaveformWorkerRequest::Generate {
             generation,
@@ -38267,10 +38349,11 @@ fn replace_latest_provider_request<T>(
 #[cfg(feature = "rss")]
 fn rss_provider_worker(
     requests: Receiver<RssProviderRequest>,
-    responses: Sender<ProviderResponse>,
+    responses: impl Into<ResponseSender<ProviderResponse>>,
     stopping: Arc<AtomicBool>,
     client: Box<dyn RssFeedClient>,
 ) {
+    let responses = responses.into();
     while let Ok(request) = requests.recv() {
         if stopping.load(AtomicOrdering::Acquire) {
             break;
@@ -38297,10 +38380,11 @@ fn rss_provider_worker(
 #[cfg(feature = "apple-podcasts")]
 fn apple_provider_worker(
     requests: Receiver<AppleProviderRequest>,
-    responses: Sender<ProviderResponse>,
+    responses: impl Into<ResponseSender<ProviderResponse>>,
     stopping: Arc<AtomicBool>,
     client: Box<dyn AppleProviderClient>,
 ) {
+    let responses = responses.into();
     while let Ok(request) = requests.recv() {
         if stopping.load(AtomicOrdering::Acquire) {
             break;
@@ -38344,10 +38428,11 @@ fn apple_provider_worker(
 #[cfg(feature = "librivox")]
 fn librivox_provider_worker(
     requests: Receiver<LibrivoxProviderRequest>,
-    responses: Sender<ProviderResponse>,
+    responses: impl Into<ResponseSender<ProviderResponse>>,
     stopping: Arc<AtomicBool>,
     client: Box<dyn LibrivoxProviderClient>,
 ) {
+    let responses = responses.into();
     while let Ok(request) = requests.recv() {
         if stopping.load(AtomicOrdering::Acquire) {
             break;
@@ -38399,10 +38484,11 @@ fn librivox_provider_worker(
 #[cfg(feature = "bandcamp")]
 fn bandcamp_search_worker(
     requests: Receiver<BandcampSearchRequest>,
-    responses: Sender<ProviderResponse>,
+    responses: impl Into<ResponseSender<ProviderResponse>>,
     stopping: Arc<AtomicBool>,
     client: Box<dyn BandcampSearchProvider>,
 ) {
+    let responses = responses.into();
     while let Ok(request) = requests.recv() {
         if stopping.load(AtomicOrdering::Acquire) {
             break;
@@ -38431,10 +38517,11 @@ fn bandcamp_search_worker(
 #[cfg(feature = "youtube-music")]
 fn youtube_music_provider_worker(
     requests: Receiver<YouTubeMusicProviderRequest>,
-    responses: Sender<ProviderResponse>,
+    responses: impl Into<ResponseSender<ProviderResponse>>,
     stopping: Arc<AtomicBool>,
     client: Box<dyn YouTubeMusicSearchProvider>,
 ) {
+    let responses = responses.into();
     while let Ok(request) = requests.recv() {
         if stopping.load(AtomicOrdering::Acquire) {
             break;
@@ -38627,10 +38714,11 @@ fn coalesce_yandex_music_reaction(
 #[cfg(feature = "yandex-music")]
 fn yandex_music_reaction_dispatcher_worker<S: YandexMusicReactionSynchronizer>(
     requests: Receiver<YandexMusicReactionWorkerRequest>,
-    responses: Sender<ProviderResponse>,
+    responses: impl Into<ResponseSender<ProviderResponse>>,
     mut synchronizer: S,
     stopping: Arc<AtomicBool>,
 ) {
+    let responses = responses.into();
     let mut deferred = None;
     let mut synchronized_generations = HashMap::<(String, String), u64>::new();
     loop {
@@ -38696,10 +38784,11 @@ fn yandex_music_reaction_dispatcher_worker<S: YandexMusicReactionSynchronizer>(
 #[cfg(feature = "yandex-music")]
 fn yandex_music_provider_worker(
     requests: Receiver<YandexMusicWorkerRequest>,
-    responses: Sender<ProviderResponse>,
+    responses: impl Into<ResponseSender<ProviderResponse>>,
     initial_token: Option<String>,
     stopping: Arc<AtomicBool>,
 ) {
+    let responses = responses.into();
     let mut client = initial_token
         .ok_or_else(|| "Yandex Music OAuth token is not configured".to_owned())
         .and_then(|token| YandexMusicClient::new(token).map_err(|error| error.to_string()));
@@ -38983,8 +39072,9 @@ fn spawn_yt_dlp_update_lookups(
     installed: bool,
     github: bool,
     gentoo_arch: Option<String>,
-    responses: Sender<ProviderResponse>,
+    responses: impl Into<ResponseSender<ProviderResponse>>,
 ) {
+    let responses = responses.into();
     let failure_responses = responses.clone();
     let failure_gentoo_arch = gentoo_arch.clone();
     let spawn = thread::Builder::new()
@@ -39116,9 +39206,10 @@ fn yandex_music_download_batch_worker(
     batch_title: String,
     items: Vec<YandexMusicDownloadItem>,
     destination_directory: PathBuf,
-    responses: Sender<YandexMusicMediaJobResponse>,
+    responses: impl Into<ResponseSender<YandexMusicMediaJobResponse>>,
     cancellation: Arc<AtomicBool>,
 ) {
+    let responses = responses.into();
     let client = match YandexMusicClient::new(token) {
         Ok(client) => client,
         Err(error) => {
@@ -39312,9 +39403,10 @@ fn provider_request_uses_youtube_provider(request: &ProviderRequest) -> bool {
 fn youtube_pagination_worker(
     provider: SharedYouTubeProvider,
     requests: Receiver<YouTubePaginationRequest>,
-    responses: Sender<ProviderResponse>,
+    responses: impl Into<ResponseSender<ProviderResponse>>,
     stopping: Arc<AtomicBool>,
 ) {
+    let responses = responses.into();
     while let Ok(work) = requests.recv() {
         if stopping.load(AtomicOrdering::Acquire) {
             break;
@@ -39367,8 +39459,9 @@ fn youtube_pagination_worker(
 #[cfg(feature = "sponsorblock")]
 fn sponsorblock_worker(
     requests: Receiver<SponsorBlockWorkerRequest>,
-    responses: Sender<SponsorBlockWorkerResponse>,
+    responses: impl Into<ResponseSender<SponsorBlockWorkerResponse>>,
 ) {
+    let responses = responses.into();
     let client = url::Url::parse(DEFAULT_SPONSORBLOCK_URL)
         .map_err(|error| error.to_string())
         .and_then(|base_url| SponsorBlockClient::new(base_url).map_err(|error| error.to_string()));
@@ -39404,7 +39497,7 @@ fn sponsorblock_worker(
 fn provider_worker(
     provider: Option<Box<dyn Provider>>,
     requests: Receiver<ProviderRequest>,
-    responses: Sender<ProviderResponse>,
+    responses: impl Into<ResponseSender<ProviderResponse>>,
     allow_insecure_http: bool,
     mod_archive_api_key: Option<String>,
     jamendo_client_id: Option<String>,
@@ -39415,6 +39508,7 @@ fn provider_worker(
     #[cfg(feature = "youtube-music")] youtube_music_client: Box<dyn YouTubeMusicSearchProvider>,
     provider_storage_root: PathBuf,
 ) {
+    let responses = responses.into();
     let provider = Arc::new(RwLock::new(YouTubeProviderState {
         epoch: 0,
         provider: provider.map(Arc::<dyn Provider>::from),
@@ -39613,7 +39707,7 @@ fn provider_worker(
 fn general_provider_worker(
     provider: SharedYouTubeProvider,
     requests: Receiver<GeneralProviderRequest>,
-    responses: Sender<ProviderResponse>,
+    responses: impl Into<ResponseSender<ProviderResponse>>,
     stopping: Arc<AtomicBool>,
     allow_insecure_http: bool,
     mod_archive_api_key: Option<String>,
@@ -39625,6 +39719,7 @@ fn general_provider_worker(
     #[cfg(feature = "youtube-music")] youtube_music_client: Box<dyn YouTubeMusicSearchProvider>,
     provider_storage_root: PathBuf,
 ) {
+    let responses = responses.into();
     #[cfg(feature = "rss")]
     let (rss_requests, rss_pending, rss_stopping, rss_thread, rss_start_error) = {
         let (rss_requests, rss_receiver) = bounded(1);
@@ -64233,11 +64328,7 @@ mod tests {
         let (request_sender, request_receiver) = unbounded();
         let (response_sender, response_receiver) = unbounded();
         let worker = thread::spawn(move || {
-            local_browse_worker(
-                request_receiver,
-                response_sender,
-                Arc::new(Mutex::new(None)),
-            );
+            local_browse_worker(request_receiver, response_sender, WorkerNotifier::default());
         });
 
         let plan = crate::local_move::validate_local_move(
@@ -72423,7 +72514,7 @@ mod tests {
             title: String,
             report: String,
             generation: u64,
-            results: Sender<GitHubIssueSubmissionCompletion>,
+            results: ResponseSender<GitHubIssueSubmissionCompletion>,
         ) -> Result<(), String> {
             self.calls
                 .lock()
@@ -72503,6 +72594,20 @@ mod tests {
         fn shutdown(&mut self) -> PlaybackResult<()> {
             Ok(())
         }
+    }
+
+    /// Worker completion bursts do not accelerate the existing 100 ms animation clock.
+    #[test]
+    fn rapid_ticks_do_not_advance_activity_animation() {
+        let (mut controller, _) = controller_with_mock_statuses(Vec::new());
+        controller.view.playback_starting = true;
+        controller.last_animation_tick = Instant::now();
+        controller.tick();
+        controller.tick();
+        assert_eq!(controller.view.playback_start_animation_frame, 0);
+        controller.last_animation_tick = Instant::now() - Duration::from_millis(100);
+        controller.tick();
+        assert_eq!(controller.view.playback_start_animation_frame, 1);
     }
 
     fn controller_with_mock_statuses(
@@ -77442,6 +77547,45 @@ mod tests {
         );
         assert!(controller.download_completion_notice_deadline.is_none());
         assert!(controller.download_cancellation_notice_deadline.is_none());
+    }
+
+    /// Pipe completion is visible immediately, while progress bursts remain coalesced.
+    #[cfg(feature = "yt-dlp")]
+    #[test]
+    fn download_reader_notifies_progress_and_final_output() {
+        struct Snapshot {
+            output: Arc<Mutex<DownloadOutputBuffer>>,
+            observed: Sender<u64>,
+        }
+        impl std::task::Wake for Snapshot {
+            fn wake(self: Arc<Self>) {
+                let bytes = self.output.lock().unwrap().progress.downloaded_bytes;
+                let _ = self.observed.send(bytes);
+            }
+        }
+        let output = Arc::new(Mutex::new(DownloadOutputBuffer::default()));
+        let (observed, snapshots) = unbounded();
+        let notifier = WorkerNotifier::default();
+        notifier.set_waker(Some(std::task::Waker::from(Arc::new(Snapshot {
+            output: output.clone(),
+            observed,
+        }))));
+        assert_eq!(snapshots.recv().unwrap(), 0);
+        drain_download_reader_with_notifications(
+            Box::new(Cursor::new(
+                b"youta-progress|1024|4096|NA|256|12\nyouta-progress|4096|4096|NA|256|0".to_vec(),
+            )),
+            &output,
+            true,
+            &notifier,
+        );
+        let snapshots = snapshots.try_iter().collect::<Vec<_>>();
+        assert_eq!(snapshots.first(), Some(&1024));
+        assert_eq!(
+            snapshots.last(),
+            Some(&4096),
+            "EOF must publish the unterminated final line before waking"
+        );
     }
 
     #[cfg(feature = "yt-dlp")]

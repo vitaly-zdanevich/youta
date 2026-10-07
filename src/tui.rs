@@ -1018,7 +1018,7 @@ pub fn run(controller: &mut impl UiController, settings: &UiSettings) -> io::Res
     let (width, height) = current_terminal_window_pixels();
     controller.dispatch(UiAction::SetTerminalWindowPixels { width, height });
     let mut input = TerminalInput::new()?;
-    controller.set_local_browse_waker(Some(input.worker_waker()));
+    controller.set_worker_waker(Some(input.worker_waker()));
     let result = run_with_input(
         controller,
         settings,
@@ -1027,7 +1027,7 @@ pub fn run(controller: &mut impl UiController, settings: &UiSettings) -> io::Res
         physical_linux_console,
         openrc_managed,
     );
-    controller.set_local_browse_waker(None);
+    controller.set_worker_waker(None);
     result
 }
 

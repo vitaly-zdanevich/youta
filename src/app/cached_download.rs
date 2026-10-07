@@ -51,6 +51,9 @@ pub(super) struct CachedDownloadPublished {
 
 /// A bounded background cache attempt; dropping it cancels without joining the UI.
 pub(super) trait CachedDownloadJob: Send {
+    /// Attaches a frontend completion callback without consuming a prepared result.
+    fn set_worker_waker(&mut self, _waker: Option<std::task::Waker>) {}
+
     /// Returns once; failure means normal downloading may be attempted instead.
     fn poll(&mut self) -> Option<Result<Box<dyn CachedDownloadArtifact>, ()>>;
 }
@@ -83,6 +86,8 @@ impl CachedDownloadService for SystemCachedDownloadService {
         let cancellation = Arc::new(AtomicBool::new(false));
         let export = handle.start(Arc::clone(&cancellation))?;
         let (sender, receiver) = bounded(1);
+        let notifier = WorkerNotifier::default();
+        let sender = ResponseSender::new(sender, notifier.clone());
         let config = config.clone();
         let destination = destination.to_owned();
         let thumbnail = thumbnail.cloned();
@@ -90,6 +95,8 @@ impl CachedDownloadService for SystemCachedDownloadService {
         thread::Builder::new()
             .name("youta-cache-download".to_owned())
             .spawn(move || {
+                // Release the preparation slot before the sender's final wake.
+                let responses = sender;
                 let _permit = permit;
                 let result = (|| {
                     let exported = export.wait(&worker_cancel).map_err(|_| ())?;
@@ -122,12 +129,13 @@ impl CachedDownloadService for SystemCachedDownloadService {
                         thumbnail_requested,
                     }) as Box<dyn CachedDownloadArtifact>)
                 })();
-                let _ = sender.send(result);
+                let _ = responses.send(result);
             })
             .ok()?;
         Some(Box::new(SystemCachedJob {
             receiver,
             cancellation,
+            notifier,
             _handle: handle,
         }))
     }
@@ -136,10 +144,15 @@ impl CachedDownloadService for SystemCachedDownloadService {
 struct SystemCachedJob {
     receiver: Receiver<Result<Box<dyn CachedDownloadArtifact>, ()>>,
     cancellation: Arc<AtomicBool>,
+    notifier: WorkerNotifier,
     _handle: PlaybackCacheHandle,
 }
 
 impl CachedDownloadJob for SystemCachedJob {
+    fn set_worker_waker(&mut self, waker: Option<std::task::Waker>) {
+        self.notifier.set_waker(waker);
+    }
+
     fn poll(&mut self) -> Option<Result<Box<dyn CachedDownloadArtifact>, ()>> {
         match self.receiver.try_recv() {
             Ok(result) => Some(result),
@@ -151,6 +164,7 @@ impl CachedDownloadJob for SystemCachedJob {
 
 impl Drop for SystemCachedJob {
     fn drop(&mut self) {
+        // The retiring worker still wakes any download deferred on its permit.
         self.cancellation.store(true, Ordering::Release);
     }
 }
@@ -293,8 +307,9 @@ impl AppController {
         &mut self,
         item: &QueueItem,
         request: &DownloadRequest,
-        job: Box<dyn CachedDownloadJob>,
+        mut job: Box<dyn CachedDownloadJob>,
     ) {
+        job.set_worker_waker(Some(self.worker_notifier.as_waker()));
         self.pending_cached_download = Some(PendingCachedDownload {
             item: item.clone(),
             request: request.clone(),

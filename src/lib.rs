@@ -123,6 +123,8 @@ pub mod thumbnails;
 pub mod app;
 #[cfg(feature = "ascii-visualizer")]
 pub mod ascii_visualizer;
+#[cfg(feature = "controller")]
+pub mod worker_wake;
 
 #[cfg(feature = "tui")]
 pub mod tui;

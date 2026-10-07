@@ -885,9 +885,9 @@ keyboard equivalent. Buttons can include their hotkey, and `?` opens the
 context-sensitive help layer.
 
 Terminal input uses Crossterm's `EventStream` with a shared `mio` wake handle,
-without an async runtime. The Local worker queues its results before waking
-the frontend; folder listings, Copy/Move destination listings, and transfer
-progress therefore do not shorten the idle interval to poll for replies.
+without an async runtime. Workers queue their results before waking the
+frontend; folder listings, Copy/Move destination listings, transfer progress,
+provider replies and selected-file metadata share this mechanism.
 Notifications are coalesced and never consume the controller's response queue.
 Normal playback and animation deadlines remain, as do the separate artwork
 and waveform response checks. Before a foreground editor starts, Youta drops

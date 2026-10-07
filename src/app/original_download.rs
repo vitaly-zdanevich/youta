@@ -112,6 +112,7 @@ impl AppController {
 struct OriginalDownloadJob {
     receiver: Receiver<Result<Box<dyn CachedDownloadArtifact>, ()>>,
     cancellation: Arc<AtomicBool>,
+    notifier: WorkerNotifier,
 }
 
 impl OriginalDownloadJob {
@@ -166,14 +167,18 @@ impl OriginalDownloadJob {
     ) -> Result<Option<Self>, ()> {
         let permit = gate.try_acquire().ok_or(())?;
         let (sender, receiver) = bounded(1);
+        let notifier = WorkerNotifier::default();
+        let sender = ResponseSender::new(sender, notifier.clone());
         let cancellation = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancellation);
         let worker = thread::Builder::new()
             .name("youta-original-download".to_owned())
             .spawn(move || {
+                // Cancellation can defer the next owner until this slot is released.
+                let responses = sender;
                 let _permit = permit;
                 let result = work(worker_cancel);
-                let _ = sender.send(result);
+                let _ = responses.send(result);
             });
         if worker.is_err() {
             return Ok(None);
@@ -181,11 +186,16 @@ impl OriginalDownloadJob {
         Ok(Some(Self {
             receiver,
             cancellation,
+            notifier,
         }))
     }
 }
 
 impl CachedDownloadJob for OriginalDownloadJob {
+    fn set_worker_waker(&mut self, waker: Option<std::task::Waker>) {
+        self.notifier.set_waker(waker);
+    }
+
     fn poll(&mut self) -> Option<Result<Box<dyn CachedDownloadArtifact>, ()>> {
         match self.receiver.try_recv() {
             Ok(result) => Some(result),
@@ -197,6 +207,7 @@ impl CachedDownloadJob for OriginalDownloadJob {
 
 impl Drop for OriginalDownloadJob {
     fn drop(&mut self) {
+        // Keep the relay until retirement; the controller detaches dead frontends.
         self.cancellation.store(true, Ordering::Release);
     }
 }
@@ -234,6 +245,111 @@ impl CachedDownloadArtifact for OriginalDownloadArtifact {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct RecordedWake(Sender<()>);
+
+    impl std::task::Wake for RecordedWake {
+        fn wake(self: Arc<Self>) {
+            let _ = self.0.send(());
+        }
+    }
+
+    /// The callback channel is unbounded so notification itself cannot block a worker.
+    fn recorded_wake() -> (std::task::Waker, Receiver<()>) {
+        let (sender, receiver) = unbounded();
+        (
+            std::task::Waker::from(Arc::new(RecordedWake(sender))),
+            receiver,
+        )
+    }
+
+    /// Successful preparation can be tested without publishing or touching any file.
+    struct UnpublishedArtifact;
+
+    impl CachedDownloadArtifact for UnpublishedArtifact {
+        fn publish(
+            self: Box<Self>,
+            _: &Path,
+            _: &str,
+            _: &str,
+        ) -> Result<CachedDownloadPublished, String> {
+            panic!("notification tests never publish prepared artifacts");
+        }
+    }
+
+    #[test]
+    fn original_download_wake_replays_work_completed_before_registration() {
+        let gate = CachePreparationGate::default();
+        let mut job = OriginalDownloadJob::start_worker(&gate, |_| Err(()))
+            .unwrap()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while job.receiver.is_empty() {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        let (waker, wakes) = recorded_wake();
+        job.set_worker_waker(Some(waker));
+        wakes.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(job.poll(), Some(Err(()))));
+    }
+
+    #[test]
+    fn original_download_wake_announces_success_failure_and_unwind() {
+        for outcome in 0..3 {
+            let gate = CachePreparationGate::default();
+            let (release, held) = bounded::<()>(1);
+            let mut job = OriginalDownloadJob::start_worker(&gate, move |_| {
+                held.recv_timeout(Duration::from_secs(5)).unwrap();
+                match outcome {
+                    0 => Ok(Box::new(UnpublishedArtifact)),
+                    1 => Err(()),
+                    _ => panic!("simulated original download worker failure"),
+                }
+            })
+            .unwrap()
+            .unwrap();
+            let (waker, wakes) = recorded_wake();
+            job.set_worker_waker(Some(waker));
+            wakes.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(job.poll().is_none());
+            release.send(()).unwrap();
+            wakes.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(matches!(job.poll(), Some(result) if result.is_ok() == (outcome == 0)));
+        }
+    }
+
+    #[test]
+    fn original_download_wake_retires_cancelled_worker_after_releasing_its_gate() {
+        let gate = CachePreparationGate::default();
+        let (release, held) = bounded::<()>(1);
+        let mut job = OriginalDownloadJob::start_worker(&gate, move |_| {
+            let _ = held.recv_timeout(Duration::from_secs(5));
+            Err(())
+        })
+        .unwrap()
+        .unwrap();
+        let (waker, wakes) = recorded_wake();
+        job.set_worker_waker(Some(waker));
+        wakes.recv_timeout(Duration::from_secs(5)).unwrap();
+        let cancelled = Arc::clone(&job.cancellation);
+        drop(job);
+        assert!(cancelled.load(Ordering::Acquire));
+        assert!(
+            gate.try_acquire().is_none(),
+            "the cancelled worker still owns its slot"
+        );
+        release.send(()).unwrap();
+        wakes.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            gate.try_acquire().is_some(),
+            "retirement wake follows slot release so a deferred download can start"
+        );
+        assert!(matches!(
+            wakes.recv_timeout(Duration::from_secs(5)),
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected)
+        ));
+    }
 
     /// A packet-cache worker and an original-file worker share one process resource slot.
     #[test]
