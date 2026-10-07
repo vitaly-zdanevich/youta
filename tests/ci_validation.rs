@@ -22,6 +22,23 @@ fn job<'a>(workflow: &'a str, name: &str) -> &'a str {
     &body[..end]
 }
 
+/// Native cache regressions must use the same minimum mpv as real playback.
+#[test]
+fn native_ram_cache_ci_checks_the_supported_mpv_version() {
+    let ci = workflow("ci.yml");
+    let cache_job = job(&ci, "ram-audio-cache");
+    assert!(cache_job.contains("runs-on: ubuntu-26.04"));
+    assert!(cache_job.contains("mpv --version"));
+    let version_check = cache_job
+        .find("dpkg --compare-versions")
+        .expect("reject unsupported mpv before testing playback");
+    let regression = cache_job
+        .find("--lib native_ram_cache -- --ignored --nocapture")
+        .expect("run the native cache regressions");
+    assert!(version_check < regression);
+    assert!(cache_job[version_check..regression].contains("0.38"));
+}
+
 /// Release publication must wait for the same complete suite used by branches.
 #[test]
 fn release_publication_requires_shared_ci_and_tag_validation() {

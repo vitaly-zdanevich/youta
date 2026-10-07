@@ -668,7 +668,8 @@ jobs:
 
   ram-audio-cache:
     name: Native RAM audio cache regression
-    runs-on: ubuntu-24.04
+    # Ubuntu 24.04's mpv 0.37 cannot accept the indexed loadfile command.
+    runs-on: ubuntu-26.04
     timeout-minutes: 360
     steps:
       - name: Check out sources
@@ -691,6 +692,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes ffmpeg mpv
+          mpv --version
+          dpkg --compare-versions \
+            "$(dpkg-query --show --showformat='${Version}' mpv)" \
+            ge \
+            0.38
 
       - name: Replay synthetic audio without its origin or a second extraction
         run: >-
