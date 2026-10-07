@@ -58,10 +58,8 @@ use std::io::BufRead;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-#[cfg(feature = "yt-dlp")]
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -5268,6 +5266,8 @@ pub struct AppController {
     local_browse_requests: Option<Sender<LocalBrowseRequest>>,
     /// Completed foreground Local listings from the isolated worker.
     local_browse_responses: Receiver<LocalBrowseResponse>,
+    /// Optional frontend completion signal, shared with the Local worker.
+    local_browse_waker: Arc<Mutex<Option<std::task::Waker>>>,
     /// Dedicated worker ensuring Local listings do not wait behind scans.
     local_browse_thread: Option<JoinHandle<()>>,
     provider_disconnect_reported: bool,
@@ -5639,6 +5639,7 @@ impl AppController {
         let (yandex_music_media_job_sender, yandex_music_media_job_responses) = unbounded();
         let (local_browse_response_sender, local_browse_responses) = unbounded();
         let (local_browse_request_sender, local_browse_request_receiver) = unbounded();
+        let local_browse_waker = Arc::new(Mutex::new(None));
         let (local_media_metadata_sender, local_media_metadata_responses) = unbounded();
         #[cfg(feature = "audio-quality")]
         let (local_audio_quality_request_sender, local_audio_quality_request_receiver) = bounded(1);
@@ -5784,10 +5785,15 @@ impl AppController {
         let sponsorblock_requests = sponsorblock_thread
             .as_ref()
             .map(|_| sponsorblock_request_sender);
+        let worker_local_browse_waker = Arc::clone(&local_browse_waker);
         let local_browse_thread_result = thread::Builder::new()
             .name("youta-local-browser".to_owned())
             .spawn(move || {
-                local_browse_worker(local_browse_request_receiver, local_browse_response_sender);
+                local_browse_worker(
+                    local_browse_request_receiver,
+                    local_browse_response_sender,
+                    worker_local_browse_waker,
+                );
             });
         let (local_browse_thread, local_browse_thread_error) = match local_browse_thread_result {
             Ok(handle) => (Some(handle), None),
@@ -6625,6 +6631,7 @@ impl AppController {
             sponsorblock_thread,
             local_browse_requests,
             local_browse_responses,
+            local_browse_waker,
             local_browse_thread,
             provider_disconnect_reported: false,
             local_browse_disconnect_reported: false,
@@ -34990,6 +34997,21 @@ impl AppController {
                             *error = Some("The Local filesystem worker stopped during Copy. Originals are unchanged; inspect the destination for completed or staged copies before retrying.".to_owned());
                         }
                     }
+                    // A chooser listing is not a transfer, so its pending state
+                    // needs clearing even when no filesystem mutation started.
+                    #[cfg(any(feature = "local-move", feature = "local-copy"))]
+                    if let Some(
+                        LocalFilePopupView::Move { pending, error, .. }
+                        | LocalFilePopupView::Copy { pending, error, .. },
+                    ) = self.view.local_file_popup.as_mut()
+                        && *pending
+                    {
+                        *pending = false;
+                        *error = Some(
+                            "The Local filesystem worker stopped while listing destinations"
+                                .to_owned(),
+                        );
+                    }
                     if report_disconnect && !self.local_browse_disconnect_reported {
                         self.local_browse_disconnect_reported = true;
                         self.show_error_message(
@@ -35497,6 +35519,19 @@ impl UiController for AppController {
     }
     fn view(&self) -> &ViewModel {
         &self.view
+    }
+
+    fn set_local_browse_waker(&mut self, waker: Option<std::task::Waker>) {
+        let previous = {
+            let mut registered = self
+                .local_browse_waker
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::replace(&mut *registered, waker)
+        };
+        // Frontend callbacks, including their destructors, run outside the lock.
+        drop(previous);
+        wake_local_browse(&self.local_browse_waker);
     }
 
     #[cfg(feature = "archive-org")]
@@ -37358,10 +37393,52 @@ fn local_archive_display_path(
     }
 }
 
+/// Notifies the frontend outside the lock after work becomes observable.
+fn wake_local_browse(waker: &Mutex<Option<std::task::Waker>>) {
+    let registered = waker
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if let Some(registered) = registered {
+        registered.wake();
+    }
+}
+
+/// Publishes Local work before notifying the frontend, including worker exit.
+struct LocalBrowseResponseSender {
+    /// Sole worker sender, detached before the final disconnect notification.
+    sender: Option<Sender<LocalBrowseResponse>>,
+    /// Frontend registration may change without restarting the worker.
+    waker: Arc<Mutex<Option<std::task::Waker>>>,
+}
+
+impl LocalBrowseResponseSender {
+    /// Queues one response before waking so the frontend cannot miss the payload.
+    /// A detached receiver ends the worker; its potentially large payload is not retried.
+    fn send(&self, response: LocalBrowseResponse) -> Result<(), ()> {
+        self.sender
+            .as_ref()
+            .expect("Local response sender is attached until worker exit")
+            .send(response)
+            .map_err(|_| ())?;
+        wake_local_browse(&self.waker);
+        Ok(())
+    }
+}
+
+impl Drop for LocalBrowseResponseSender {
+    fn drop(&mut self) {
+        // Also runs during unwinding: the receiver sees disconnection before
+        // its frontend wakes and clears any pending chooser or transfer state.
+        drop(self.sender.take());
+        wake_local_browse(&self.waker);
+    }
+}
+
 /// Sends bounded-rate progress without flooding the UI channel on fast storage.
 #[cfg(any(feature = "local-move", feature = "local-copy"))]
 fn local_transfer_progress_sender(
-    responses: &Sender<LocalBrowseResponse>,
+    responses: &LocalBrowseResponseSender,
     generation: u64,
 ) -> impl FnMut(crate::local_move::LocalTransferProgress) + '_ {
     let mut last_sent: Option<Instant> = None;
@@ -37382,7 +37459,12 @@ fn local_transfer_progress_sender(
 fn local_browse_worker(
     requests: Receiver<LocalBrowseRequest>,
     responses: Sender<LocalBrowseResponse>,
+    waker: Arc<Mutex<Option<std::task::Waker>>>,
 ) {
+    let responses = LocalBrowseResponseSender {
+        sender: Some(responses),
+        waker,
+    };
     while let Ok(request) = requests.recv() {
         let response = match request {
             LocalBrowseRequest::Browse {
@@ -47169,6 +47251,8 @@ mod tests {
     mod end_pause_tests;
     #[path = "local_activation.rs"]
     mod local_activation_tests;
+    #[path = "local_browse_wake.rs"]
+    mod local_browse_wake_tests;
     #[cfg(feature = "local-copy")]
     #[path = "local_copy.rs"]
     mod local_copy_tests;
@@ -64148,7 +64232,13 @@ mod tests {
         std::fs::write(&source, b"audio").expect("source fixture");
         let (request_sender, request_receiver) = unbounded();
         let (response_sender, response_receiver) = unbounded();
-        let worker = thread::spawn(move || local_browse_worker(request_receiver, response_sender));
+        let worker = thread::spawn(move || {
+            local_browse_worker(
+                request_receiver,
+                response_sender,
+                Arc::new(Mutex::new(None)),
+            );
+        });
 
         let plan = crate::local_move::validate_local_move(
             &source_directory,

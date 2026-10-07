@@ -133,6 +133,8 @@ for Copy or Move. In either destination picker, `Enter` opens a folder;
 transfer starts. Copy and Move run in a foreground dialog: navigation and
 dismissal stay blocked until completion, with byte or entry progress when
 available. Copy support is the standalone `local-copy` feature.
+In the terminal UI, folder listings and transfer progress wake the interface
+when ready instead of waiting for a periodic response check.
 
 Selecting media shows filename metadata immediately while tags and bounded
 `ffprobe` codec/container details load off the TUI thread. A fixed-size RAM

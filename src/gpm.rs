@@ -11,26 +11,20 @@
 use std::collections::VecDeque;
 use std::fs;
 use std::io::{self, Read, Write};
-use std::os::fd::RawFd;
 use std::os::unix::net::UnixStream as StandardUnixStream;
 use std::path::Path;
-use std::time::Duration;
 
 use crossterm::event::{
-    self, Event as CrosstermEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    Event as CrosstermEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use mio::net::UnixStream;
-use mio::unix::SourceFd;
-use mio::{Events, Interest, Poll, Token};
+use mio::{Interest, Registry, Token};
 
 const GPM_CONTROL_SOCKET: &str = "/dev/gpmctl";
 const GPM_CONNECT_BYTES: usize = 16;
 const GPM_EVENT_BYTES: usize = 28;
 const GPM_MAGIC: u32 = 0x4770_6d4c;
 const MAX_WHEEL_EVENTS_PER_PACKET: usize = 16;
-const STDIN_FD: RawFd = 0;
-const STDIN_TOKEN: Token = Token(0);
-const GPM_TOKEN: Token = Token(1);
 
 const GPM_MOVE: u32 = 1;
 const GPM_DRAG: u32 = 2;
@@ -52,17 +46,14 @@ const GPM_MOD_SHIFT_RIGHT: u8 = 1 << 5;
 const GPM_MOD_CONTROL_LEFT: u8 = 1 << 6;
 const GPM_MOD_CONTROL_RIGHT: u8 = 1 << 7;
 
-/// Readiness multiplexer for Crossterm input and one GPM control socket.
+/// Socket-only GPM mouse input registered with the terminal's shared reactor.
 ///
 /// Construction is deliberately best-effort through [`Self::try_current`].
-/// Once connected, `mio` waits on both standard input and `/dev/gpmctl`
-/// without a timer-driven busy loop.
+/// The caller owns readiness waiting and keyboard input. This adapter never
+/// reads standard input or accesses Crossterm's synchronous event reader.
 pub(crate) struct LinuxConsoleInput {
-    poll: Poll,
-    readiness: Events,
     client: GpmClient,
     pending_mouse: VecDeque<MouseEvent>,
-    terminal_ready: bool,
 }
 
 impl LinuxConsoleInput {
@@ -71,82 +62,51 @@ impl LinuxConsoleInput {
     /// Missing sockets, inactive daemons, permissions, PTYs, and unsupported
     /// descriptor layouts all return `None`; callers retain their normal
     /// terminal-keyboard input path and may retry on an explicit F8 press.
-    pub(crate) fn try_current() -> Option<Self> {
+    pub(crate) fn try_current(registry: &Registry, token: Token) -> Option<Self> {
         let virtual_console = current_virtual_console()?;
-        Self::connect(Path::new(GPM_CONTROL_SOCKET), virtual_console).ok()
+        Self::connect(
+            Path::new(GPM_CONTROL_SOCKET),
+            virtual_console,
+            registry,
+            token,
+        )
+        .ok()
     }
 
-    fn connect(socket: &Path, virtual_console: u32) -> io::Result<Self> {
+    /// Registers only the connected daemon socket; closing it releases registration.
+    fn connect(
+        socket: &Path,
+        virtual_console: u32,
+        registry: &Registry,
+        token: Token,
+    ) -> io::Result<Self> {
         let mut stream = StandardUnixStream::connect(socket)?;
         let pid = i32::try_from(std::process::id()).unwrap_or(i32::MAX);
         stream.write_all(&encode_connection(virtual_console, pid))?;
         stream.set_nonblocking(true)?;
 
         let mut client = GpmClient::new(UnixStream::from_std(stream));
-        let poll = Poll::new()?;
-        let mut stdin = SourceFd(&STDIN_FD);
-        poll.registry()
-            .register(&mut stdin, STDIN_TOKEN, Interest::READABLE)?;
-        poll.registry()
-            .register(client.stream_mut(), GPM_TOKEN, Interest::READABLE)?;
+        registry.register(client.stream_mut(), token, Interest::READABLE)?;
 
         Ok(Self {
-            poll,
-            readiness: Events::with_capacity(8),
             client,
             pending_mouse: VecDeque::new(),
-            terminal_ready: false,
         })
     }
 
-    /// Waits until either Crossterm or GPM has an input event.
-    pub(crate) fn poll(&mut self, timeout: Duration) -> io::Result<bool> {
-        if self.terminal_ready || !self.pending_mouse.is_empty() {
-            return Ok(true);
-        }
-
-        // Crossterm may already hold a decoded key or a SIGWINCH-generated
-        // resize that is not represented by standard-input readiness.
-        if event::poll(Duration::ZERO)? {
-            self.terminal_ready = true;
-            return Ok(true);
-        }
-
-        self.readiness.clear();
-        self.poll.poll(&mut self.readiness, Some(timeout))?;
-        let mut stdin_ready = false;
-        let mut gpm_ready = false;
-        for ready in &self.readiness {
-            match ready.token() {
-                STDIN_TOKEN => stdin_ready = true,
-                GPM_TOKEN => gpm_ready = true,
-                _ => {}
-            }
-        }
-
-        if gpm_ready {
-            self.client.drain_ready(&mut self.pending_mouse)?;
-        }
-        if stdin_ready {
-            self.terminal_ready = true;
-        } else if event::poll(Duration::ZERO)? {
-            // Catch a resize that arrived while `mio` was blocked.
-            self.terminal_ready = true;
-        }
-
-        Ok(self.terminal_ready || !self.pending_mouse.is_empty())
+    /// Drains mouse bytes after the caller observes this socket's readiness token.
+    ///
+    /// Reading stops at `WouldBlock`, retaining fragmented packets for later
+    /// readiness. On EOF or another socket failure, complete events already
+    /// decoded remain available through [`Self::read`] before the caller drops
+    /// this adapter and falls back to keyboard-only input.
+    pub(crate) fn drain_ready(&mut self) -> io::Result<()> {
+        self.client.drain_ready(&mut self.pending_mouse)
     }
 
-    /// Reads the input whose readiness was reported by [`Self::poll`].
-    pub(crate) fn read(&mut self) -> io::Result<CrosstermEvent> {
-        if self.terminal_ready {
-            self.terminal_ready = false;
-            return event::read();
-        }
-        self.pending_mouse
-            .pop_front()
-            .map(CrosstermEvent::Mouse)
-            .ok_or_else(|| io::Error::from(io::ErrorKind::WouldBlock))
+    /// Takes one buffered mouse event without waiting or reading any descriptor.
+    pub(crate) fn read(&mut self) -> Option<CrosstermEvent> {
+        self.pending_mouse.pop_front().map(CrosstermEvent::Mouse)
     }
 }
 
@@ -457,7 +417,162 @@ fn virtual_console_from_path(path: &Path) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mio::{Events, Poll, Token};
+    use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
+    /// Builds a daemon substitute without touching stdin or the real GPM socket.
+    fn socket_fixture(
+        token: Token,
+    ) -> (
+        Poll,
+        LinuxConsoleInput,
+        StandardUnixStream,
+        tempfile::TempDir,
+    ) {
+        let directory = tempfile::tempdir().expect("temporary GPM socket directory");
+        let path = directory.path().join("gpmctl");
+        let listener = UnixListener::bind(&path).expect("fixture GPM listener");
+        let poll = Poll::new().expect("shared input poll");
+        let input = LinuxConsoleInput::connect(&path, 7, poll.registry(), token)
+            .expect("connect registered GPM client");
+        let (mut peer, _) = listener.accept().expect("fixture GPM connection");
+        peer.set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("bounded handshake read");
+        let mut request = [0; GPM_CONNECT_BYTES];
+        peer.read_exact(&mut request)
+            .expect("GPM connect handshake");
+        assert_eq!(read_i32(&request, 12), 7);
+        assert_eq!(
+            read_i32(&request, 8),
+            i32::try_from(std::process::id()).unwrap()
+        );
+        (poll, input, peer, directory)
+    }
+
+    /// Waits only for the fixture socket's readiness, with a bounded test deadline.
+    fn await_socket(poll: &mut Poll, token: Token) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut events = Events::with_capacity(8);
+        loop {
+            let timeout = deadline.saturating_duration_since(Instant::now());
+            assert!(!timeout.is_zero(), "fixture GPM socket never became ready");
+            match poll.poll(&mut events, Some(timeout)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => panic!("fixture readiness failed: {error}"),
+            }
+            if events.iter().any(|event| event.token() == token) {
+                return;
+            }
+        }
+    }
+
+    /// The parent's registry/token receive readiness; buffered mouse events need no new wait.
+    #[test]
+    fn gpm_socket_uses_parent_registry_and_buffers_coalesced_packets() {
+        let token = Token(73);
+        let (mut poll, mut input, mut peer, _directory) = socket_fixture(token);
+        assert_eq!(input.read(), None);
+        let packets = [
+            encoded_event(fixture_event(GPM_DOWN, 4, 9)),
+            encoded_event(fixture_event(GPM_UP, 4, 9)),
+        ]
+        .concat();
+        peer.write_all(&packets).expect("coalesced GPM packets");
+        await_socket(&mut poll, token);
+        input.drain_ready().expect("drain registered socket");
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            assert_eq!(
+                input.read(),
+                Some(CrosstermEvent::Mouse(mouse_event(
+                    kind,
+                    3,
+                    8,
+                    KeyModifiers::NONE
+                )))
+            );
+        }
+        assert_eq!(input.read(), None);
+        input
+            .drain_ready()
+            .expect("an already drained socket is nonblocking");
+    }
+
+    /// Partial packet readiness does not become a synthetic mouse event or lose decoder state.
+    #[test]
+    fn gpm_socket_retains_fragmented_magic_prefixed_packet_until_complete() {
+        let token = Token(91);
+        let (mut poll, mut input, mut peer, _directory) = socket_fixture(token);
+        let packet = [
+            GPM_MAGIC.to_ne_bytes().as_slice(),
+            encoded_event(fixture_event(GPM_MOVE, 8, 3)).as_slice(),
+        ]
+        .concat();
+        for fragment in [&packet[..2], &packet[2..11]] {
+            peer.write_all(fragment).expect("partial GPM packet");
+            await_socket(&mut poll, token);
+            input.drain_ready().expect("buffer partial packet");
+            assert_eq!(input.read(), None);
+        }
+        peer.write_all(&packet[11..])
+            .expect("final GPM packet fragment");
+        await_socket(&mut poll, token);
+        input.drain_ready().expect("decode complete packet");
+        assert_eq!(
+            input.read(),
+            Some(CrosstermEvent::Mouse(mouse_event(
+                MouseEventKind::Moved,
+                7,
+                2,
+                KeyModifiers::NONE,
+            )))
+        );
+        assert_eq!(input.read(), None);
+    }
+
+    /// A daemon disconnect is recoverable while complete packets already read remain available.
+    #[test]
+    fn gpm_socket_disconnect_retains_final_mouse_packet_and_allows_reconnect() {
+        let token = Token(117);
+        let (mut poll, mut input, mut peer, directory) = socket_fixture(token);
+        peer.write_all(&encoded_event(fixture_event(GPM_DOWN, 2, 3)))
+            .expect("final packet");
+        drop(peer);
+        await_socket(&mut poll, token);
+        assert_eq!(
+            input.drain_ready().unwrap_err().kind(),
+            io::ErrorKind::ConnectionAborted
+        );
+        assert!(matches!(input.read(), Some(CrosstermEvent::Mouse(_))));
+        assert_eq!(input.read(), None);
+        drop(input);
+        // A separate daemon socket models the caller's explicit F8 reconnect.
+        let path = directory.path().join("restarted-gpmctl");
+        let listener = UnixListener::bind(&path).expect("restarted daemon listener");
+        let mut replacement = LinuxConsoleInput::connect(&path, 7, poll.registry(), token)
+            .expect("reuse parent registry and token after disconnect");
+        let (mut peer, _) = listener.accept().expect("replacement daemon client");
+        peer.write_all(&encoded_event(fixture_event(GPM_MOVE, 5, 6)))
+            .expect("replacement packet");
+        await_socket(&mut poll, token);
+        replacement
+            .drain_ready()
+            .expect("replacement socket remains usable");
+        assert_eq!(
+            replacement.read(),
+            Some(CrosstermEvent::Mouse(mouse_event(
+                MouseEventKind::Moved,
+                4,
+                5,
+                KeyModifiers::NONE,
+            )))
+        );
+    }
 
     fn encoded_event(event: GpmEvent) -> [u8; GPM_EVENT_BYTES] {
         let mut encoded = [0_u8; GPM_EVENT_BYTES];

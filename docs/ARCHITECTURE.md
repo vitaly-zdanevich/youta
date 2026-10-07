@@ -884,8 +884,20 @@ widgets, avoiding invisible or stale click targets. Every mouse action has a
 keyboard equivalent. Buttons can include their hotkey, and `?` opens the
 context-sensitive help layer.
 
-On a real Linux `/dev/ttyN`, the optional `gpm` feature registers both standard
-input and `/dev/gpmctl` with one readiness poll. Native-endian GPM packets are
+Terminal input uses Crossterm's `EventStream` with a shared `mio` wake handle,
+without an async runtime. The Local worker queues its results before waking
+the frontend; folder listings, Copy/Move destination listings, and transfer
+progress therefore do not shorten the idle interval to poll for replies.
+Notifications are coalesced and never consume the controller's response queue.
+Normal playback and animation deadlines remain, as do the separate artwork
+and waveform response checks. Before a foreground editor starts, Youta drops
+the input stream and waits for its outstanding task-waker leases to end, so
+no background terminal reader can consume the editor's keys. Input resumes
+after the editor exits. This handoff has an isolated real-PTY regression test.
+
+On a real Linux `/dev/ttyN`, the optional `gpm` feature registers `/dev/gpmctl`
+with the shared readiness poll, alongside the wake handle for Crossterm input
+and worker completions. Native-endian GPM packets are
 decoded in safe Rust and converted into the same mouse-event path as terminal
 emulator reporting. The client does not link `libgpm`, but physical input
 requires an installed and running GPM daemon. PTYs never open GPM. Socket

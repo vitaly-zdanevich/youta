@@ -468,6 +468,8 @@ confirms moving into the current directory.
 cancels either destination picker before transfer starts.
 During Copy or Move, the foreground dialog blocks navigation and dismissal
 until completion and displays byte or entry progress when available.
+Folder listings and transfer progress wake the terminal UI when ready,
+without waiting for a periodic response check.
 .TP
 .BR Shift+j ", " Shift+k
 Extend Local file/folder selection down or up for copy, move, or quality analysis,

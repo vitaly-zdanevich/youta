@@ -4,6 +4,10 @@
 //! writes to the terminal and does not create a second user interface.
 
 mod bug_report;
+mod input;
+mod input_stream;
+#[cfg(all(test, target_os = "linux", feature = "local-browser"))]
+mod input_tests;
 #[cfg(test)]
 mod performance;
 
@@ -13,8 +17,8 @@ use std::time::Duration;
 
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::style::{Attribute, Colored, ResetColor, SetAttribute};
@@ -47,8 +51,6 @@ use crate::config::{
     DEFAULT_THUMBNAIL_HEIGHT, MIN_THUMBNAIL_HEIGHT, SubscriptionsLayout, ThumbnailMode,
 };
 use crate::domain::{Chapter, MediaId, SourceKind};
-#[cfg(all(feature = "gpm", target_os = "linux"))]
-use crate::gpm::LinuxConsoleInput;
 use crate::links::{chapter_title_for_display, is_advertisement_chapter_title};
 use crate::playback::PlaybackStatus;
 #[cfg(feature = "qr")]
@@ -63,6 +65,7 @@ use crate::text_file_open::{
 #[cfg(feature = "images")]
 use crate::thumbnails::{ThumbnailCapability, ThumbnailManager, ThumbnailProtocol, ThumbnailState};
 use crate::waveform::Peak;
+use input::TerminalInput;
 
 pub use crate::view::*;
 
@@ -119,12 +122,8 @@ pub struct UiSettings {
     pub idle_tick: Duration,
 }
 
-/// Maximum event-loop sleep while one foreground Local listing is pending.
-///
-/// The tighter interval applies only for the short lifetime of a directory
-/// request. Idle browsing retains [`UiSettings::idle_tick`], so an open Local
-/// tab does not continuously poll or waste battery.
-const LOCAL_BROWSE_RESPONSE_POLL_INTERVAL: Duration = Duration::from_millis(25);
+/// Response budget for artwork/waveform workers without completion notifications.
+const LOCAL_ARTWORK_RESPONSE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 impl Default for UiSettings {
     fn default() -> Self {
@@ -1018,7 +1017,29 @@ pub fn run(controller: &mut impl UiController, settings: &UiSettings) -> io::Res
     let mut session = TerminalSession::enter()?;
     let (width, height) = current_terminal_window_pixels();
     controller.dispatch(UiAction::SetTerminalWindowPixels { width, height });
-    let mut input = TerminalInput::new();
+    let mut input = TerminalInput::new()?;
+    controller.set_local_browse_waker(Some(input.worker_waker()));
+    let result = run_with_input(
+        controller,
+        settings,
+        &mut session,
+        &mut input,
+        physical_linux_console,
+        openrc_managed,
+    );
+    controller.set_local_browse_waker(None);
+    result
+}
+
+/// Runs frames with a registered completion wake until shutdown or an I/O error.
+fn run_with_input(
+    controller: &mut impl UiController,
+    settings: &UiSettings,
+    session: &mut TerminalSession,
+    input: &mut TerminalInput,
+    physical_linux_console: bool,
+    openrc_managed: bool,
+) -> io::Result<()> {
     let mut thumbnail_renderer =
         create_thumbnail_renderer(settings, controller.view().show_images_in_tty);
     let mut hit_map = HitMap::default();
@@ -1156,7 +1177,7 @@ pub fn run(controller: &mut impl UiController, settings: &UiSettings) -> io::Res
             if let Some(renderer) = renderer.as_deref_mut() {
                 renderer.clear();
             }
-            let result = execute_text_file_open_plan(&mut session, plan);
+            let result = execute_text_file_open_plan(session, input, plan);
             controller.report_text_file_open_result(result);
         }
         controller.tick();
@@ -1203,86 +1224,6 @@ fn synchronize_tty_image_preference(
     renderer: &mut dyn ThumbnailRenderer,
 ) -> bool {
     renderer.set_tty_images_enabled(view.show_images_in_tty)
-}
-
-/// Input source that opportunistically adds GPM without changing PTY behavior.
-struct TerminalInput {
-    #[cfg(all(feature = "gpm", target_os = "linux"))]
-    linux_console: Option<LinuxConsoleInput>,
-}
-
-impl TerminalInput {
-    fn new() -> Self {
-        Self {
-            #[cfg(all(feature = "gpm", target_os = "linux"))]
-            linux_console: LinuxConsoleInput::try_current(),
-        }
-    }
-
-    fn poll(&mut self, timeout: Duration) -> io::Result<bool> {
-        #[cfg(all(feature = "gpm", target_os = "linux"))]
-        if let Some(input) = self.linux_console.as_mut() {
-            let Ok(ready) = input.poll(timeout) else {
-                // GPM is optional and may stop while Youta is running. Drop
-                // the failed socket and retain keyboard input. The next F8
-                // press explicitly retries it.
-                self.linux_console = None;
-                return event::poll(Duration::ZERO);
-            };
-            return Ok(ready);
-        }
-        event::poll(timeout)
-    }
-
-    fn read(&mut self) -> io::Result<Event> {
-        #[cfg(all(feature = "gpm", target_os = "linux"))]
-        if let Some(input) = self.linux_console.as_mut() {
-            return input.read();
-        }
-        event::read()
-    }
-
-    /// Reports whether this build includes the Linux GPM input adapter.
-    const fn gpm_supported() -> bool {
-        cfg!(all(feature = "gpm", target_os = "linux"))
-    }
-
-    /// Reports whether the live GPM control socket can currently supply input.
-    fn gpm_connected(&self) -> bool {
-        #[cfg(all(feature = "gpm", target_os = "linux"))]
-        {
-            return self.linux_console.is_some();
-        }
-        #[cfg(not(all(feature = "gpm", target_os = "linux")))]
-        false
-    }
-
-    /// Retries GPM only for an explicit F8 press on a physical console.
-    ///
-    /// Startup retains its existing opportunistic attempt. Restricting later
-    /// attempts to F8 avoids background filesystem or socket probes.
-    fn retry_gpm_on_f8_press(&mut self, f8_pressed: bool, physical_linux_console: bool) -> bool {
-        if !gpm_reconnect_needed(
-            f8_pressed,
-            ConsolePointerAvailability {
-                physical_linux_console,
-                gpm_supported: Self::gpm_supported(),
-                gpm_connected: self.gpm_connected(),
-                openrc_managed: false,
-            },
-        ) {
-            return false;
-        }
-        #[cfg(all(feature = "gpm", target_os = "linux"))]
-        {
-            return retry_optional_input_with(
-                &mut self.linux_console,
-                LinuxConsoleInput::try_current,
-            );
-        }
-        #[cfg(not(all(feature = "gpm", target_os = "linux")))]
-        false
-    }
 }
 
 /// Replaces a disconnected optional input through an injected factory.
@@ -1690,11 +1631,12 @@ fn is_apple_podcast_artwork(details: &DetailView) -> bool {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WaitOutcome {
     TerminalEvent,
+    WorkerReady,
     ThumbnailRedraw,
     Timeout,
 }
 
-/// Waits for terminal input while probing only an in-flight thumbnail worker.
+/// Waits for input or Local replies while probing an in-flight thumbnail worker.
 ///
 /// Cached thumbnails receive two quick probes, followed by progressively
 /// slower checks. Idle operation without thumbnail work still uses one full
@@ -1703,28 +1645,16 @@ enum WaitOutcome {
 fn wait_for_event_or_thumbnail(
     wait: Duration,
     mut thumbnail_renderer: Option<&mut (dyn ThumbnailRenderer + '_)>,
-    mut terminal_event_ready: impl FnMut(Duration) -> io::Result<bool>,
+    mut terminal_event_ready: impl FnMut(Duration) -> io::Result<WaitOutcome>,
 ) -> io::Result<WaitOutcome> {
     let Some(renderer) = thumbnail_renderer.as_mut() else {
-        return terminal_event_ready(wait).map(|ready| {
-            if ready {
-                WaitOutcome::TerminalEvent
-            } else {
-                WaitOutcome::Timeout
-            }
-        });
+        return terminal_event_ready(wait);
     };
     if renderer.needs_immediate_redraw() {
         return Ok(WaitOutcome::ThumbnailRedraw);
     }
     if !renderer.is_pending() {
-        return terminal_event_ready(wait).map(|ready| {
-            if ready {
-                WaitOutcome::TerminalEvent
-            } else {
-                WaitOutcome::Timeout
-            }
-        });
+        return terminal_event_ready(wait);
     }
     if renderer.poll() || !renderer.is_pending() {
         return Ok(WaitOutcome::ThumbnailRedraw);
@@ -1734,8 +1664,9 @@ fn wait_for_event_or_thumbnail(
     let mut waited = Duration::ZERO;
     while !remaining.is_zero() {
         let probe = thumbnail_probe_interval(waited).min(remaining);
-        if terminal_event_ready(probe)? {
-            return Ok(WaitOutcome::TerminalEvent);
+        let outcome = terminal_event_ready(probe)?;
+        if outcome != WaitOutcome::Timeout {
+            return Ok(outcome);
         }
         remaining = remaining.saturating_sub(probe);
         waited = waited.saturating_add(probe);
@@ -1775,32 +1706,28 @@ fn event_wait(view: &ViewModel, settings: &UiSettings) -> Duration {
     } else {
         playback_wait
     };
-    let wait = if view.local_browse_pending
-        || view.local_file_progress.is_some()
-        || view.local_artwork_pending
-        || matches!(view.waveform, WaveformView::Loading { .. })
-    {
-        playback_wait.min(LOCAL_BROWSE_RESPONSE_POLL_INTERVAL)
-    } else if view.search_activity.is_some()
-        || view
-            .bug_report_popup
-            .as_ref()
-            .is_some_and(|popup| matches!(popup.submission, GitHubIssueSubmissionView::Submitting))
-        || view.subscriptions.loading
-        || view.subscriptions.metadata_pending
-        || view.playback_activity_pending()
-        || view.playback_end_releasing
-        || (cfg!(feature = "invidious")
-            && view
-                .youtube_setup_popup
-                .as_ref()
-                .and_then(|setup| setup.invidious_instances.as_ref())
-                .is_some_and(|picker| picker.loading))
-    {
-        playback_wait.min(settings.playing_tick)
-    } else {
-        playback_wait
-    };
+    let wait =
+        if view.local_artwork_pending || matches!(view.waveform, WaveformView::Loading { .. }) {
+            playback_wait.min(LOCAL_ARTWORK_RESPONSE_POLL_INTERVAL)
+        } else if view.search_activity.is_some()
+            || view.bug_report_popup.as_ref().is_some_and(|popup| {
+                matches!(popup.submission, GitHubIssueSubmissionView::Submitting)
+            })
+            || view.subscriptions.loading
+            || view.subscriptions.metadata_pending
+            || view.playback_activity_pending()
+            || view.playback_end_releasing
+            || (cfg!(feature = "invidious")
+                && view
+                    .youtube_setup_popup
+                    .as_ref()
+                    .and_then(|setup| setup.invidious_instances.as_ref())
+                    .is_some_and(|picker| picker.loading))
+        {
+            playback_wait.min(settings.playing_tick)
+        } else {
+            playback_wait
+        };
     wait.max(Duration::from_millis(1))
 }
 
@@ -1894,6 +1821,7 @@ impl TerminalSession {
 #[cfg(feature = "local-browser")]
 fn execute_text_file_open_plan(
     session: &mut TerminalSession,
+    input: &mut TerminalInput,
     plan: TextFileOpenPlan,
 ) -> Result<TextFileOpenLifecycle, String> {
     use std::process::Command;
@@ -1906,11 +1834,14 @@ fn execute_text_file_open_plan(
         // must not grow a second copy of the spawn-and-reap dance.
         TextFileOpenLifecycle::Detached => spawn_detached_text_file_open(&plan).map(|()| lifecycle),
         TextFileOpenLifecycle::SuspendTuiAndWait => {
-            session
-                .suspend()
-                .map_err(|error| format!("cannot suspend the terminal UI: {error}"))?;
+            input.suspend();
+            if let Err(error) = session.suspend() {
+                input.resume();
+                return Err(format!("cannot suspend the terminal UI: {error}"));
+            }
             let editor_result = command.status();
             let resume_result = session.resume();
+            input.resume();
             if let Err(error) = resume_result {
                 return Err(format!("cannot restore the terminal UI: {error}"));
             }
@@ -17481,7 +17412,7 @@ for encoded, expected in json.load(sys.stdin):
     }
 
     #[test]
-    fn pending_local_folder_open_uses_the_interactive_response_budget() {
+    fn pending_local_folder_open_uses_completion_events_not_fast_polling() {
         let settings = UiSettings {
             idle_tick: Duration::from_secs(2),
             playing_tick: Duration::from_millis(250),
@@ -17492,18 +17423,15 @@ for encoded, expected in json.load(sys.stdin):
             ..ViewModel::default()
         };
 
-        assert_eq!(
-            event_wait(&view, &settings),
-            LOCAL_BROWSE_RESPONSE_POLL_INTERVAL
-        );
+        assert_eq!(event_wait(&view, &settings), settings.idle_tick);
 
         view.local_browse_pending = false;
         assert_eq!(event_wait(&view, &settings), Duration::from_secs(2));
     }
 
-    /// Foreground file transfer progress stays responsive even with paused playback.
+    /// Worker notifications deliver foreground progress without a response timer.
     #[test]
-    fn local_transfer_progress_uses_the_interactive_response_budget() {
+    fn local_transfer_progress_uses_completion_events_not_fast_polling() {
         let settings = UiSettings {
             idle_tick: Duration::from_secs(2),
             ..UiSettings::default()
@@ -17512,10 +17440,87 @@ for encoded, expected in json.load(sys.stdin):
             local_file_progress: Some(LocalFileProgressView::default()),
             ..ViewModel::default()
         };
-        assert_eq!(
-            event_wait(&view, &settings),
-            LOCAL_BROWSE_RESPONSE_POLL_INTERVAL
-        );
+        assert_eq!(event_wait(&view, &settings), settings.idle_tick);
+    }
+
+    /// Folder completions wake the chooser instead of shortening its idle deadline.
+    #[test]
+    fn pending_local_destination_navigation_uses_completion_events_not_fast_polling() {
+        let settings = UiSettings {
+            idle_tick: Duration::from_secs(2),
+            playing_tick: Duration::from_millis(250),
+            ..UiSettings::default()
+        };
+        for copy in [false, true] {
+            for paused in [false, true] {
+                let popup = if copy {
+                    LocalFilePopupView::Copy {
+                        source_names: vec!["song.flac".to_owned()],
+                        destination: "/music".to_owned(),
+                        directories: Vec::new(),
+                        selected: 0,
+                        pending: true,
+                        error: None,
+                    }
+                } else {
+                    LocalFilePopupView::Move {
+                        source_names: vec!["song.flac".to_owned()],
+                        destination: "/music".to_owned(),
+                        directories: Vec::new(),
+                        selected: 0,
+                        pending: true,
+                        error: None,
+                    }
+                };
+                let mut view = ViewModel {
+                    local_file_popup: Some(popup),
+                    ..ViewModel::default()
+                };
+                view.playback.paused = paused;
+                let resting_wait = if paused {
+                    settings.idle_tick
+                } else {
+                    settings.playing_tick
+                };
+                assert!(
+                    !view.local_browse_pending,
+                    "the chooser does not load Local-tab rows"
+                );
+                assert!(
+                    view.local_file_progress.is_none(),
+                    "choosing a folder is not a transfer"
+                );
+
+                // Initial opening, another child/parent, and a failed navigation
+                // use the same lifecycle without keeping a settled popup polling.
+                for failed in [false, true] {
+                    if let Some(
+                        LocalFilePopupView::Move { pending, error, .. }
+                        | LocalFilePopupView::Copy { pending, error, .. },
+                    ) = view.local_file_popup.as_mut()
+                    {
+                        *pending = true;
+                        *error = None;
+                    }
+                    assert_eq!(
+                        event_wait(&view, &settings),
+                        resting_wait,
+                        "copy={copy}, paused={paused}"
+                    );
+                    if let Some(
+                        LocalFilePopupView::Move { pending, error, .. }
+                        | LocalFilePopupView::Copy { pending, error, .. },
+                    ) = view.local_file_popup.as_mut()
+                    {
+                        *pending = false;
+                        *error = failed.then(|| "Cannot read destination".to_owned());
+                    }
+                    assert_eq!(event_wait(&view, &settings), resting_wait);
+                }
+                view.local_file_popup = None;
+                assert_eq!(event_wait(&view, &settings), resting_wait);
+            }
+        }
     }
 
     #[test]
@@ -17532,7 +17537,7 @@ for encoded, expected in json.load(sys.stdin):
 
         assert_eq!(
             event_wait(&view, &settings),
-            LOCAL_BROWSE_RESPONSE_POLL_INTERVAL
+            LOCAL_ARTWORK_RESPONSE_POLL_INTERVAL
         );
     }
 
@@ -17552,7 +17557,7 @@ for encoded, expected in json.load(sys.stdin):
 
         assert_eq!(
             event_wait(&view, &settings),
-            LOCAL_BROWSE_RESPONSE_POLL_INTERVAL
+            LOCAL_ARTWORK_RESPONSE_POLL_INTERVAL
         );
     }
 
@@ -17568,7 +17573,7 @@ for encoded, expected in json.load(sys.stdin):
         let outcome =
             wait_for_event_or_thumbnail(Duration::from_secs(2), Some(&mut thumbnails), |wait| {
                 waits.push(wait);
-                Ok(false)
+                Ok(WaitOutcome::Timeout)
             })
             .expect("wait for cached thumbnail");
 
@@ -17584,7 +17589,7 @@ for encoded, expected in json.load(sys.stdin):
         assert_eq!(
             wait_for_event_or_thumbnail(Duration::from_secs(2), Some(&mut idle), |wait| {
                 idle_waits.push(wait);
-                Ok(false)
+                Ok(WaitOutcome::Timeout)
             })
             .expect("idle terminal wait"),
             WaitOutcome::Timeout
@@ -17600,7 +17605,7 @@ for encoded, expected in json.load(sys.stdin):
         assert_eq!(
             wait_for_event_or_thumbnail(Duration::from_secs(1), Some(&mut loading), |wait| {
                 loading_waits.push(wait);
-                Ok(false)
+                Ok(WaitOutcome::Timeout)
             },)
             .expect("network thumbnail wait"),
             WaitOutcome::Timeout
@@ -17630,7 +17635,7 @@ for encoded, expected in json.load(sys.stdin):
         assert_eq!(
             wait_for_event_or_thumbnail(Duration::from_secs(1), Some(&mut loading), |wait| {
                 event_waits.push(wait);
-                Ok(true)
+                Ok(WaitOutcome::TerminalEvent)
             },)
             .expect("terminal event wait"),
             WaitOutcome::TerminalEvent
@@ -17648,6 +17653,27 @@ for encoded, expected in json.load(sys.stdin):
             .expect("immediate thumbnail followup"),
             WaitOutcome::ThumbnailRedraw
         );
+    }
+
+    /// A Local completion must also interrupt a wait for unrelated network artwork.
+    #[test]
+    fn local_completion_interrupts_thumbnail_wait() {
+        for pending in [false, true] {
+            let mut thumbnails = MockThumbnailRenderer {
+                pending,
+                ..MockThumbnailRenderer::default()
+            };
+            let mut calls = 0;
+            assert_eq!(
+                wait_for_event_or_thumbnail(Duration::from_secs(2), Some(&mut thumbnails), |_| {
+                    calls += 1;
+                    Ok(WaitOutcome::WorkerReady)
+                })
+                .unwrap(),
+                WaitOutcome::WorkerReady
+            );
+            assert_eq!(calls, 1);
+        }
     }
 
     #[test]

@@ -4762,6 +4762,11 @@ pub trait UiController {
     /// Returns the view for the next frame.
     fn view(&self) -> &ViewModel;
 
+    /// Registers a frontend wake-up for queued Local filesystem responses.
+    /// Installing a waker also wakes once so already-completed work is drained;
+    /// passing `None` detaches the frontend without changing queued responses.
+    fn set_local_browse_waker(&mut self, _waker: Option<std::task::Waker>) {}
+
     /// Reports visible Archive result slots, excluding the continuation/footer rows.
     /// Frontends without terminal geometry may retain the controller's default.
     fn set_archive_org_search_page_capacity(&mut self, _rows: usize) {}

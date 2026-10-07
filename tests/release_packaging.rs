@@ -284,7 +284,14 @@ fn default_release_features_keep_images_qr_and_sqlite_independent() {
     assert!(text_only.contains("dep:mio"));
     assert!(!yandex_free.contains("gpm"));
     assert!(yandex_free.contains("dep:mio"));
-    assert!(!tui.contains("dep:mio"));
+    // Terminal and Local-worker readiness share Mio even without GPM or mpv.
+    assert!(tui.contains("dep:mio"));
+    assert!(tui.contains("dep:futures-core"));
+    assert!(!tui.contains("gpm"));
+    let controller = feature_closure(&manifest, "controller");
+    for terminal_dependency in ["dep:mio", "dep:futures-core", "dep:crossterm"] {
+        assert!(!controller.contains(terminal_dependency));
+    }
     assert_eq!(feature_entries(&manifest, "backend-mpv"), ["dep:mio"]);
     assert_eq!(feature_entries(&manifest, "gpm"), ["tui", "dep:mio"]);
     assert!(gpm.contains("tui"));

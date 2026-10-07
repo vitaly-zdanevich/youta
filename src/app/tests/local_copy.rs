@@ -113,7 +113,9 @@ impl CopyFixture {
         assert!(matches!(&request, LocalBrowseRequest::Copy { .. }));
         let (sender, receiver) = unbounded();
         let (responses, results) = unbounded();
-        let worker = thread::spawn(move || local_browse_worker(receiver, responses));
+        let worker = thread::spawn(move || {
+            local_browse_worker(receiver, responses, Arc::new(Mutex::new(None)));
+        });
         sender.send(request).expect("send copy to worker");
         sender
             .send(LocalBrowseRequest::Shutdown)
