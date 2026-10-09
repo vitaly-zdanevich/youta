@@ -39848,11 +39848,12 @@ fn provider_worker(
         }
     }
 
-    // Close the public input before joining so callers never wait behind an
-    // active child while trying to enqueue work after shutdown.
-    drop(requests);
+    // Publish both stop flags before closing the public input: disconnection
+    // can wake callers immediately, so neither lane may still admit queued work.
     general_stopping.store(true, AtomicOrdering::Release);
     pagination_stopping.store(true, AtomicOrdering::Release);
+    // Close before joining so senders never wait behind an active child.
+    drop(requests);
     drop(pagination_sender.take());
     drop(pagination_pending.take());
     let _ = general_sender.send(GeneralProviderRequest {
@@ -88147,6 +88148,7 @@ mod tests {
         );
     }
 
+    /// Public disconnection must publish both stop flags before active work resumes.
     #[test]
     fn provider_supervisor_shutdown_skips_both_lanes_queued_work() {
         let calls = Arc::new(Mutex::new(Vec::new()));
