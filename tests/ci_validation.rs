@@ -105,6 +105,7 @@ fn production_code_badge_has_a_read_only_reproducible_gate() {
     assert!(badge.contains("timeout-minutes: 360"));
     assert!(badge.contains("scripts/production-loc-requirements.txt"));
     assert!(badge.contains("test_production_loc.py"));
+    assert!(badge.contains("test_pre_commit_badges.py"));
     assert!(badge.contains("scripts/production_loc.py --check"));
     assert!(!badge.contains("contents: write"));
     assert!(!badge.contains("--write"));

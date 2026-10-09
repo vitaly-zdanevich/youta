@@ -72,20 +72,51 @@ over deleting APIs or optional code based only on reference counts.
 
 ## Update and verify
 
+Enable automatic updates once in each clone, using Python 3.10 or newer:
+
+```sh
+python3 scripts/install_git_hooks.py
+```
+
+This installs a local [Git pre-commit hook](https://git-scm.com/docs/githooks#_pre_commit)
+and the pinned development parsers in a private environment under the Git
+directory. The hook regenerates and stages all three SVGs in the same commit.
+It counts the staged source and staged counter, preserving unstaged source
+edits and supporting partial staging and `git commit -a`. Counting a large
+checkout can take about a minute. An unstaged badge edit stops the commit before
+changing files; stage or save that edit first.
+
+For a partial commit, use `git add -- <paths>` (or `git add -p`), followed by a
+normal `git commit`. Avoid `git commit --only <paths>`: Git can leave the generated
+badges out of sync with the remaining index after that commit.
+
+Commits do not download dependencies. Run the setup command again when parser
+pins change or the environment is missing. Setup preserves existing hooks and
+refuses shared hook directories outside this repository; use manual regeneration
+below until this check is integrated with an existing hook. It does not change
+`core.hooksPath`.
+
+Hooks are local to a clone and can be bypassed with `git commit --no-verify`.
+They do not run for commits created on GitHub or for every Git history operation.
+CI remains the final check and rejects stale badges even when a hook was skipped.
+
+For manual regeneration and verification:
+
 From the repository root, using Python 3.10 or newer:
 
 ```sh
 python3 -m venv /tmp/youta-production-loc-venv
 /tmp/youta-production-loc-venv/bin/python -m pip install -r scripts/production-loc-requirements.txt
 /tmp/youta-production-loc-venv/bin/python -m unittest discover -s scripts/tests -p 'test_production_loc.py'
+/tmp/youta-production-loc-venv/bin/python -m unittest discover -s scripts/tests -p 'test_pre_commit_badges.py'
 /tmp/youta-production-loc-venv/bin/python scripts/production_loc.py --write
 /tmp/youta-production-loc-venv/bin/python scripts/production_loc.py --check
 ```
 
-The command prints production `total` / `files` plus a separate `tests` object
-with its own `total` / `files`. Commit the regenerated
-`docs/badges/production-code.svg` and `docs/badges/test-code.svg` with source or
-test changes. CI runs the same
+The command prints production `total` / `files` plus separate `tests` and
+`repository` objects with their own `total` / `files`. Commit the regenerated
+`docs/badges/production-code.svg`, `docs/badges/test-code.svg`, and
+`docs/badges/total-code.svg` with source or test changes. CI runs the same
 tests and `--check`, rejecting stale badges without making bot commits or
 requiring a badge-hosting service. The parser packages are development-only;
 they are not dependencies of Youta or its Gentoo packages.
