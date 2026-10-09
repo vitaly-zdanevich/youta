@@ -4945,6 +4945,17 @@ fn render_information_panel(
             UiAction::OpenCommonsUpload,
         );
     }
+    #[cfg(feature = "archive-upload")]
+    if show_text_selection && view.archive_upload_supported && view.archive_upload_available {
+        push_right_detail_button(
+            &mut lines,
+            &mut right_buttons,
+            inner.width,
+            button("I", "To archive.org", show_hotkeys),
+            theme.accent,
+            UiAction::OpenArchiveUpload,
+        );
+    }
     #[cfg(feature = "evernote")]
     if show_text_selection
         && view.evernote_available
@@ -4960,17 +4971,6 @@ fn render_information_panel(
             button("E", "To Evernote", show_hotkeys),
             theme.accent,
             UiAction::OpenEvernoteNote,
-        );
-    }
-    #[cfg(feature = "archive-upload")]
-    if show_text_selection && view.archive_upload_supported && view.archive_upload_available {
-        push_right_detail_button(
-            &mut lines,
-            &mut right_buttons,
-            inner.width,
-            button("I", "To archive.org", show_hotkeys),
-            theme.accent,
-            UiAction::OpenArchiveUpload,
         );
     }
     #[cfg(feature = "s3-upload")]
@@ -24532,9 +24532,10 @@ for encoded, expected in json.load(sys.stdin):
         }
     }
 
+    /// Archive stays after Commons and before Evernote when those actions are available.
     #[cfg(feature = "archive-upload")]
     #[test]
-    fn archive_upload_button_shows_shortcut_and_follows_existing_export_actions() {
+    fn archive_upload_button_shows_shortcut_and_precedes_evernote() {
         let mut view = ViewModel {
             archive_upload_available: true,
             details: Some(DetailView {
@@ -24581,7 +24582,8 @@ for encoded, expected in json.load(sys.stdin):
                 .iter()
                 .position(|(action, _)| action == &UiAction::OpenEvernoteNote)
                 .unwrap()
-                < archive
+                > archive,
+            "Evernote must follow the archive.org action"
         );
         let _ = archive;
         terminal

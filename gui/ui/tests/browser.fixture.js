@@ -1575,8 +1575,12 @@
 		const youtubeId = { source: 'you-tube', external_id: 'dQw4w9WgXcQ' };
 		snapshot({ screen: 'Search', rows: [], details: { ...details('Fixture YouTube video', youtubeId), source: 'YouTube' },
 			commons_upload_available: true, archive_upload_supported: true, archive_upload_available: true,
-			s3_upload_supported: true, s3_upload_available: true });
+			evernote_available: true, s3_upload_supported: true, s3_upload_available: true });
 		const commons = await until(() => button('[U] To Commons'), 'compact Commons action with uppercase shortcut');
+		const uploadLabels = [...commons.parentElement.querySelectorAll('button')]
+			.map((node) => node.textContent).filter((label) => /To Commons|To archive\.org|To Evernote|Upload to S3/.test(label));
+		assert(JSON.stringify(uploadLabels) === JSON.stringify(['[U] To Commons', '[I] To archive.org', '[E] To Evernote', 'Upload to S3']),
+			'Upload actions place Evernote after Commons and archive.org while retaining the S3 position');
 		assert(!button('Upload to Commons'), 'Commons no longer uses its old button label');
 		await action('OpenCommonsUpload', () => commons.click(), 'To Commons retains its existing review action');
 		// Forward uppercase U unchanged; the Rust keymap, not this fixture, selects the action.

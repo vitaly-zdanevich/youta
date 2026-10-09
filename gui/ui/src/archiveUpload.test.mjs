@@ -121,7 +121,7 @@ test('Archive upload progress cannot submit again and can cancel or open the res
 });
 
 
-test('Archive Details control follows Commons and Evernote and trusts the selected upload capability', async () => {
+test('Archive Details control follows Commons, precedes Evernote, and trusts the selected upload capability', async () => {
 	const details = await readFile(new URL('./components/Details.tsx', import.meta.url), 'utf8');
 	const guard = details.match(/\{([^\n]+) \? \(\s*<Action onClick=\{\(\) => void dispatch\('OpenArchiveUpload'\)\}>\[I\] To archive\.org<\/Action>/)?.[1];
 	assert.ok(guard, 'Archive action must show its compact label and shortcut with the existing capability guard');
@@ -136,10 +136,12 @@ test('Archive Details control follows Commons and Evernote and trusts the select
 	}
 	const commons = details.indexOf('>[U] To Commons</Action>');
 	assert.ok(commons >= 0, 'Commons shows its compact label and uppercase shortcut');
+	const archive = details.indexOf('>[I] To archive.org</Action>');
+	assert.ok(archive >= 0, 'Archive shows its compact label and uppercase shortcut');
 	const evernote = details.indexOf('>[E] To Evernote</Action>');
 	assert.ok(evernote >= 0, 'Evernote shows its compact label and uppercase shortcut');
-	assert.ok(commons < evernote);
-	assert.ok(evernote < details.indexOf('>[I] To archive.org</Action>'));
+	assert.ok(commons < archive, 'Commons precedes archive.org');
+	assert.ok(archive < evernote, 'Evernote follows archive.org');
 	assert.ok(!details.includes('Upload to archive.org'));
 });
 

@@ -1766,18 +1766,25 @@ fn the_window_exposes_evernote_review_with_its_uppercase_hotkey() {
 
 #[cfg(all(feature = "commons-upload", feature = "evernote"))]
 #[test]
-fn the_window_places_evernote_after_commons() {
+fn the_window_places_evernote_after_commons_and_archive_org() {
     let details = source_named("components/Details.tsx");
     let commons = details
         .find(">[U] To Commons</Action>")
         .expect("Commons action");
+    let archive = details
+        .find(">[I] To archive.org</Action>")
+        .expect("Archive.org action");
     let evernote = details
         .find(">[E] To Evernote</Action>")
         .expect("Evernote action");
 
     assert!(
-        commons < evernote,
-        "the Evernote action must follow the Commons action"
+        commons < archive,
+        "the Commons action must precede archive.org"
+    );
+    assert!(
+        archive < evernote,
+        "the Evernote action must follow the archive.org action"
     );
 }
 
