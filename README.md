@@ -175,6 +175,15 @@ Info also shows the connected IP, redirect chain, supplied `Server` and
 `Content-Encoding` headers, human-readable `Content-Length` when supplied,
 and identifiable CDN response-header hints. Content length is the declared
 transfer size (compressed size for an encoded response), not decoded page size.
+For an exact nginx, Apache 2.4 or Caddy version in `Server`, Info can also
+show its upstream release month/year and source. It checks official
+[nginx changelogs](https://nginx.org/en/CHANGES),
+[Apache release records](https://httpd.apache.org/security/vulnerabilities_24.html)
+or the [Caddy release API](https://docs.github.com/en/rest/releases/releases#get-a-release-by-tag-name),
+in parallel with IP registration and within the same network budget. These
+requests disclose only the product/version, not the visited website URL.
+Unsupported or unconfirmed dates are omitted. The upstream release date does
+not indicate installation time or distribution security backports.
 IP registration comes from IANA-discovered RDAP services: `Network country
 (registered)` describes the allocation, not the server's physical location;
 a CDN may hide the website's actual host. HTTPS certificate issuer, expiry,

@@ -23,6 +23,7 @@ use crate::domain::{ip_address_is_non_public, remote_url_has_non_public_host};
 mod analytics;
 mod metadata;
 mod network;
+mod server_release;
 pub(crate) mod site_files;
 mod tls;
 mod whois;
@@ -49,6 +50,7 @@ pub(crate) struct UrlInfoClient {
     bootstrap: Option<Vec<BootstrapService>>,
     whois: whois::WhoisClient,
     network: network::NetworkClient,
+    releases: server_release::ReleaseClient,
 }
 
 impl UrlInfoClient {
@@ -78,10 +80,14 @@ impl UrlInfoClient {
         let budget = Budget::new(cancelled);
         // The website worker owns the IP bootstrap cache. A mutex also permits
         // the sequential fallback without retaining a mutable scoped borrow.
-        let network = Mutex::new(std::mem::take(&mut self.network));
+        let caches = Mutex::new((
+            std::mem::take(&mut self.network),
+            std::mem::take(&mut self.releases),
+        ));
         let website = || {
-            let mut network = network.lock().map_err(|_| Failure::Transport)?;
-            fetch_website(transport, url, &budget, &mut network)
+            let mut caches = caches.lock().map_err(|_| Failure::Transport)?;
+            let (network, releases) = &mut *caches;
+            fetch_website(transport, url, &budget, network, releases)
         };
         let (page, registration) = if let Some(Host::Domain(host)) = url.host() {
             let host = host.trim_end_matches('.').to_ascii_lowercase();
@@ -107,7 +113,7 @@ impl UrlInfoClient {
         } else {
             (website(), None)
         };
-        self.network = network.into_inner().unwrap_or_default();
+        (self.network, self.releases) = caches.into_inner().unwrap_or_default();
         // Keep display order deterministic even when registration finishes first.
         match page {
             Ok((page, network_facts)) => {
@@ -259,15 +265,48 @@ fn fetch_website(
     url: &Url,
     budget: &Budget<'_>,
     network: &mut network::NetworkClient,
+    releases: &mut server_release::ReleaseClient,
 ) -> Result<(FetchedDocument, Vec<String>), Failure> {
     let page = fetch_document(transport, url, DocumentKind::Html, budget)?;
-    let facts = page
-        .response
-        .peer_ip
-        .filter(|ip| !ip_address_is_non_public(*ip))
-        .and_then(|ip| network.lookup(ip, transport, budget).ok())
-        .unwrap_or_default();
-    Ok((page, facts))
+    let releases = Mutex::new(releases);
+    let release_lookup = || {
+        releases
+            .lock()
+            .ok()?
+            .lookup(&page.response.server, transport, budget)
+            .ok()
+            .flatten()
+    };
+    let mut network_lookup = || {
+        page.response
+            .peer_ip
+            .filter(|ip| !ip_address_is_non_public(*ip))
+            .and_then(|ip| network.lookup(ip, transport, budget).ok())
+            .unwrap_or_default()
+    };
+    // The IP registry and software release source are independent once the page arrives.
+    let (network, release) = std::thread::scope(|scope| {
+        match std::thread::Builder::new()
+            .name("youta-server-release".into())
+            .spawn_scoped(scope, release_lookup)
+        {
+            Ok(worker) => (network_lookup(), worker.join().unwrap_or_default()),
+            Err(_) => (network_lookup(), release_lookup()),
+        }
+    });
+    let mut facts = Facts::default();
+    facts.extend(network);
+    if let Some(release) = release {
+        facts.add(
+            "Server version released (upstream)",
+            &format!(
+                "{} {} - {}",
+                release.product, release.version, release.released
+            ),
+        );
+        facts.add("Server release source", &release.source);
+    }
+    Ok((page, facts.finish()))
 }
 
 /// Fixed errors omit request URLs and third-party response/error bodies.
@@ -1097,6 +1136,80 @@ mod tests {
             assert_eq!(human_content_length(bytes), expected);
         }
         assert!(HttpResponse::default().content_length.is_none());
+    }
+
+    /// Independent post-response lookups overlap and enrich the same page without forwarding its URL.
+    #[test]
+    fn ip_registration_and_server_release_lookups_overlap() {
+        use std::sync::mpsc::{Receiver, Sender, channel};
+        struct Parallel {
+            network_started: Sender<()>,
+            release_started: Sender<()>,
+            network_wait: Mutex<Receiver<()>>,
+            release_wait: Mutex<Receiver<()>>,
+        }
+        impl HttpTransport for Parallel {
+            fn fetch(
+                &self,
+                url: &Url,
+                _: DocumentKind,
+                _: Duration,
+                _: &AtomicBool,
+            ) -> Result<HttpResponse, Failure> {
+                match url.as_str() {
+                    "https://8.8.8.8/private?q=secret" => Ok(HttpResponse {
+                        status: 200,
+                        content_type: "text/html".into(),
+                        body: b"<title>Preserved</title>".to_vec(),
+                        peer_ip: Some("8.8.8.8".parse().unwrap()),
+                        server: "nginx/1.24.0".into(),
+                        ..HttpResponse::default()
+                    }),
+                    "https://data.iana.org/rdap/ipv4.json" => {
+                        self.network_started.send(()).unwrap();
+                        self.release_wait
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(2))
+                            .unwrap();
+                        Err(Failure::Unavailable)
+                    }
+                    "https://nginx.org/en/CHANGES-1.24" => {
+                        self.release_started.send(()).unwrap();
+                        self.network_wait
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(2))
+                            .unwrap();
+                        Ok(HttpResponse {
+                            status: 200,
+                            content_type: "text/plain".into(),
+                            body: b"Changes with nginx 1.24.0 11 Apr 2023\n".to_vec(),
+                            ..HttpResponse::default()
+                        })
+                    }
+                    _ => panic!("unexpected service request"),
+                }
+            }
+        }
+        let (network_started, network_wait) = channel();
+        let (release_started, release_wait) = channel();
+        let transport = Parallel {
+            network_started,
+            release_started,
+            network_wait: Mutex::new(network_wait),
+            release_wait: Mutex::new(release_wait),
+        };
+        let facts = UrlInfoClient::default().lookup_with(
+            &Url::parse("https://8.8.8.8/private?q=secret").unwrap(),
+            &AtomicBool::new(false),
+            &transport,
+        );
+        assert!(facts.contains(&"Title: Preserved".into()));
+        assert!(
+            facts.contains(&"Server version released (upstream): nginx 1.24.0 - April 2023".into())
+        );
+        assert!(facts.contains(&"Server release source: https://nginx.org/en/CHANGES-1.24".into()));
     }
 
     /// Peer observations belong to the final page, never a second DNS lookup or registry socket.
