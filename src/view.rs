@@ -5101,16 +5101,19 @@ pub trait UiController {
     fn report_text_file_open_result(&mut self, _result: Result<TextFileOpenLifecycle, String>) {}
 
     /// Advertises a frontend that can exclusively hand its terminal to Bash.
+    ///
+    /// The global `:` editor submits through the shared custom-command transport;
+    /// also select [`CustomCommandMode::Terminal`] and consume its shell plans.
     #[cfg(feature = "cmd")]
     fn set_local_command_available(&mut self, _available: bool) {}
 
-    /// Takes one explicitly submitted foreground shell command.
+    /// Legacy Local-only transport; the application now uses `take_custom_command_plan`.
     #[cfg(feature = "cmd")]
     fn take_local_command_plan(&mut self) -> Option<crate::local_command::LocalCommandPlan> {
         None
     }
 
-    /// Refreshes the captured Local folder after its foreground shell returns.
+    /// Reports a legacy Local-only plan; shared plans use `report_custom_command_result`.
     #[cfg(feature = "cmd")]
     fn report_local_command_result(&mut self, _result: Result<(), String>) {}
 
@@ -5118,7 +5121,7 @@ pub trait UiController {
     #[cfg(feature = "cmd")]
     fn set_custom_command_mode(&mut self, _mode: CustomCommandMode) {}
 
-    /// Takes one explicitly invoked, target-bound custom command exactly once.
+    /// Takes one typed or button-invoked shell command exactly once.
     #[cfg(feature = "cmd")]
     fn take_custom_command_plan(&mut self) -> Option<crate::local_command::ShellCommandPlan> {
         None

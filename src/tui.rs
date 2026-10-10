@@ -8491,10 +8491,6 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
     if cfg!(feature = "local-trash") {
         local_actions.push("Delete");
     }
-    #[cfg(feature = "cmd")]
-    if view.local_command_available {
-        local_actions.push(": Bash command");
-    }
     if view.audio_quality_supported {
         local_actions.push("V audio quality");
     }
@@ -8572,6 +8568,13 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
     } else {
         selection_help.to_owned()
     };
+    let actions_help = "Actions";
+    #[cfg(feature = "cmd")]
+    let actions_help = if view.local_command_available {
+        "Actions     : Bash command (any tab)"
+    } else {
+        actions_help
+    };
     let help = [
         "Navigation",
         "  / search     Tab next tab     Shift+Tab previous tab     S subs",
@@ -8594,7 +8597,7 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
         "  {/} previous / next item in the queue or its source list",
         "  r repeat     A autoplay next item from same source list   w waveform",
         "  Details: Alt+←/→ history  Alt+↑/↓ (Linux TTY: Alt+u/d) scroll",
-        "Actions",
+        actions_help,
         "  Ctrl+n play next     a add to queue     u show queue     d download",
         "  Insert mark for download  d download marked items  Ctrl+D download queue",
         "  [x] marked for download     ↓ downloaded locally",

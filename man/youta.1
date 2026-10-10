@@ -435,7 +435,7 @@ closes. Confirm deletion with
 .B Enter
 or a second
 .BR Delete .
-.SS Local files and Radio
+.SS Commands, Local files and Radio
 .TP
 .B i
 Open or hide Info for the first visible URL in Local file comments or YouTube
@@ -458,39 +458,55 @@ The default-on
 Cargo feature and Gentoo USE flag can be disabled independently.
 .TP
 .B :
-Enter a Bash command for the selected Local file or folder in the seek-bar area.
+Enter a Bash command in the seek-bar area on any tab, whether playback is
+active or stopped. Ordinary commands such as pwd need no selection.
 The default-on
 .B cmd
 build feature requires Bash; the colon editor also requires a Unix terminal
 and is unavailable in the GUI and inside read-only archive folders.
+Commands cannot target extracted archive contents.
 .B Enter
-runs the command in the displayed directory with terminal input and output;
+runs the command in the foreground with terminal input and output;
 .B Esc
 cancels before execution.
+The working directory is the displayed Local directory; elsewhere it is a
+selected local file's parent, or Youta's process working directory for a remote
+item or no selection.
 .B Ctrl+C
-interrupts the command. After it finishes, any key returns to Youta and
-refreshes the directory. Commands run with your permissions and may modify
+interrupts the command. After it finishes, any key returns to Youta.
+Commands run with your permissions and may modify
 or delete files;
 they are not sandboxed. Bash startup files are not loaded.
 .IP
 Use an unquoted
 .B %
-argument for the full selected path, safely passed as one argument, or
+argument for the selected item's original URL or full local path, safely
+passed as one argument. The Local .. row supplies the full parent-directory
+path. Use
+.B %d
+for its downloaded or local path: reuse a completed download, or open the normal
+download/format chooser and wait for completion before executing.
+Failed or cancelled downloads never execute the command. For local entries,
+both macros supply the same full path. Macros require a selected item and never
+fall back to the playing item. Suffixes such as
 .B %.mp3
-to append a suffix. Quoted and escaped percent signs remain literal.
+and
+.B %d.flac
+append to the corresponding target. Quoted and escaped percent signs remain
+literal.
 For substitutions, arithmetic, grouping, and other complex Bash syntax, use
 .B \(dq$1\(dq
-instead of the percent shortcut: the selected path is Bash's first positional
-parameter. Changing positional parameters changes $1 but not the percent
-shortcut.
+instead of the percent shortcut: the selected original URL or local path is
+Bash's first positional parameter. Changing positional parameters changes $1
+but not the percent shortcut.
 .IP
 While entering a command,
 .B Tab
 completes command names from PATH and Bash builtins, or filenames relative to
-the displayed directory. Absolute paths and ~/ are also supported. The first
-Tab inserts a common prefix; repeated Tab cycles matches. Spaces and quotes
-are quoted automatically. Completion neither executes shell expansions nor
-loads programmable Bash completion scripts.
+the command's working directory. Absolute paths and ~/ are also supported.
+The first Tab inserts a common prefix; repeated Tab cycles matches. Spaces and
+quotes are quoted automatically. Completion neither executes shell expansions
+nor loads programmable Bash completion scripts.
 .B Up/Down
 recall previous commands and restore the unsent draft past the newest entry.
 .B Ctrl+R
@@ -807,7 +823,9 @@ accept #rgb or #rrggbb values.
 .PP
 An unquoted
 .B %
-passes the original selected provider URL as one argument.
+passes the original selected provider URL or full local path as one argument,
+using the same selection rules as the colon editor. Neither macro falls back
+to the playing item.
 .B %d
 passes a downloaded file path: reuse a completed download, or use the normal
 download/format chooser and wait for completion before executing.
@@ -889,7 +907,7 @@ Disabled command-button example, generated only if absent. Never loaded or
 executed; rename to commands to enable it.
 .TP
 .I cmd-log
-Plaintext Local command history: the latest 100 submitted commands,
+Plaintext terminal command history: the latest 100 submitted commands,
 one per line,
 up to 8192 bytes each. Requires the cmd feature. Delete while Youta is closed to
 clear it. Written with owner-only Unix permissions; included in configuration

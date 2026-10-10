@@ -6,7 +6,7 @@ use crate::local_command::CommandOutput;
 use crate::view::CustomCommandMode;
 
 /// Uses the existing supervised download fixture; no network or user commands run here.
-fn fixture(commands: &str) -> (AppController, tempfile::TempDir) {
+pub(super) fn fixture(commands: &str) -> (AppController, tempfile::TempDir) {
     let directory = crate::test_support::canonical_tempdir("custom command fixture");
     let config = Config::for_dir(directory.path().join("config"));
     config.ensure_directories().unwrap();
@@ -51,7 +51,10 @@ fn custom_commands_filter_providers_without_exposing_templates_or_descriptions()
     let path = directory.path().join("local file.flac");
     std::fs::write(&path, b"fixture").unwrap();
     controller.view.screen = Screen::History;
-    controller.view.rows.clear();
+    controller.view.rows = vec![RowView {
+        media_id: Some(local_media_id(&path)),
+        ..Default::default()
+    }];
     controller.view.details = Some(DetailView {
         media_id: Some(local_media_id(&path)),
         ..Default::default()
@@ -308,6 +311,153 @@ fn custom_commands_subscriptions_ignore_the_previous_generic_list_selection() {
         controller.take_custom_command_plan().unwrap().argument,
         "https://www.youtube.com/watch?v=abcdefghijk"
     );
+}
+
+/// A selected row remains usable before its optional Details metadata arrives.
+#[test]
+fn custom_commands_capture_selected_rows_without_details() {
+    let (mut controller, _directory) = fixture("[[commands]]\nname='Run'\ncommand='echo %'\n");
+    controller.view.details = None;
+    controller.dispatch(UiAction::RunCustomCommand(0));
+    assert_eq!(
+        controller.take_custom_command_plan().unwrap().argument,
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    );
+}
+
+/// A page without a selected media item must not inherit another page's Details target.
+#[test]
+fn custom_commands_ignore_stale_details_on_pages_without_selection() {
+    let (mut controller, _directory) = fixture("[[commands]]\nname='Run'\ncommand='echo %'\n");
+    controller.view.screen = Screen::Statistics;
+    controller.view.rows = vec![RowView::default()];
+    assert!(controller.custom_command_target().is_none());
+    controller.dispatch(UiAction::RunCustomCommand(0));
+    assert!(controller.take_custom_command_plan().is_none());
+}
+
+/// A selected channel owns its browser URL while finite-media downloads remain unavailable.
+#[test]
+fn custom_commands_channel_selection_does_not_reuse_the_previous_video() {
+    for template in ["echo %", "echo %d"] {
+        let (mut controller, _directory) =
+            fixture(&format!("[[commands]]\nname='Run'\ncommand='{template}'\n"));
+        controller.youtube_results = vec![SearchItem::Channel(ChannelSummary {
+            channel_id: "UCselected".to_owned(),
+            name: "Selected channel".to_owned(),
+            description: String::new(),
+            subscriber_count: None,
+            video_count: None,
+            created_at: None,
+            auto_generated: false,
+            thumbnails: Vec::new(),
+            webpage_url: None,
+        })];
+        controller.refresh_youtube_rows();
+        controller.dispatch(UiAction::RunCustomCommand(0));
+        if template == "echo %" {
+            assert_eq!(
+                controller.take_custom_command_plan().unwrap().argument,
+                "https://www.youtube.com/channel/UCselected"
+            );
+        } else {
+            assert!(controller.take_custom_command_plan().is_none());
+            assert!(controller.manual_downloads.queue.entries.is_empty());
+        }
+    }
+}
+
+/// Typed invocations keep their captured source while the usual format chooser owns the UI.
+#[test]
+fn captured_shell_commands_keep_the_source_and_normal_download_chooser() {
+    let (mut controller, directory) = fixture("[[commands]]\nname='Run'\ncommand='echo %'\n");
+    controller.config.downloads.mode = crate::config::DownloadMode::AskEachTime;
+    let download = controller.capture_command_download();
+    let plan = crate::local_command::ShellCommandPlan {
+        template: "echo % %d".to_owned(),
+        argument: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".into(),
+        downloaded_path: None,
+        directory: directory.path().to_owned(),
+    };
+    controller.view.screen = Screen::Statistics;
+    controller.view.rows.clear();
+    controller.view.details = None;
+    controller
+        .run_captured_shell_command("Command".to_owned(), plan, download, None)
+        .unwrap();
+    assert!(controller.view.download_choice_popup.is_some());
+    assert_eq!(
+        controller.manual_downloads.queue.entries[0]
+            .source
+            .media_id
+            .external_id,
+        "dQw4w9WgXcQ"
+    );
+    controller.dispatch(UiAction::DismissDownloadChoice);
+    controller.refresh_custom_command_buttons();
+    assert!(controller.take_custom_command_plan().is_none());
+}
+
+/// A command without macros does not require either media selection or a downloader.
+#[test]
+fn captured_shell_commands_allow_plain_commands_without_download_sources() {
+    let (mut controller, directory) = fixture("[[commands]]\nname='Run'\ncommand='echo %'\n");
+    controller.view.screen = Screen::Statistics;
+    controller.view.rows.clear();
+    controller.view.details = None;
+    let download = controller.capture_command_download();
+    assert!(download.source.is_err());
+    let plan = crate::local_command::ShellCommandPlan {
+        template: "pwd".to_owned(),
+        argument: Default::default(),
+        downloaded_path: None,
+        directory: directory.path().to_owned(),
+    };
+    controller
+        .run_captured_shell_command("Command".to_owned(), plan, download, None)
+        .unwrap();
+    assert_eq!(
+        controller.take_custom_command_plan().unwrap().template,
+        "pwd"
+    );
+    assert!(controller.manual_downloads.queue.entries.is_empty());
+}
+
+/// An existing validated file remains usable when the captured downloader is unavailable.
+#[test]
+fn captured_shell_commands_reuse_downloads_before_checking_source_errors() {
+    let (mut controller, directory) = fixture("[[commands]]\nname='Convert'\ncommand='echo %d'\n");
+    controller.dispatch(UiAction::RunCustomCommand(0));
+    let owner = controller.manual_downloads.active.unwrap();
+    let path = controller.config.downloads_dir().join("captured.opus");
+    std::fs::write(&path, b"finished media").unwrap();
+    controller.finish_manual_download_for(owner, Ok(path.clone()));
+    controller.refresh_custom_command_buttons();
+    assert!(controller.take_custom_command_plan().is_some());
+    controller.report_custom_command_result(Ok(CommandOutput {
+        output: String::new(),
+        success: true,
+    }));
+    controller.dispatch(UiAction::DismissCustomCommandOutput);
+    let mut download = controller.capture_command_download();
+    download.source = Err("Downloads are unavailable".to_owned());
+    let plan = crate::local_command::ShellCommandPlan {
+        template: "echo %d".to_owned(),
+        argument: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".into(),
+        downloaded_path: None,
+        directory: directory.path().to_owned(),
+    };
+    controller
+        .run_captured_shell_command("Command".to_owned(), plan, download, None)
+        .unwrap();
+    assert_eq!(
+        controller
+            .take_custom_command_plan()
+            .unwrap()
+            .downloaded_path,
+        Some(path)
+    );
+    assert_eq!(controller.manual_downloads.queue.entries.len(), 1);
 }
 
 /// Shared keyboard routing gives custom bindings priority only outside editors and popups.

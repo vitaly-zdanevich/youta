@@ -97,7 +97,7 @@ pub(super) fn render_command(
     if area.height > 1 {
         frame.render_widget(
             Paragraph::new(
-                "Enter run  Esc cancel  Tab complete  Up/Down history  Ctrl+R search  % selected path",
+                "% selected URL/path  %d downloaded/local  Enter run  Esc cancel  Tab complete  Up/Down history  Ctrl+R search",
             )
             .style(theme.muted),
             Rect::new(area.x, area.y + 1, area.width, 1),
@@ -258,6 +258,50 @@ pub(super) fn render_cursor(frame: &mut Frame<'_>, view: &ViewModel, enabled: bo
 mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
+
+    /// The compact prompt explains both selected-target macros on remote tabs too.
+    #[test]
+    fn command_hints_explain_selected_and_downloaded_targets() {
+        let mut terminal = Terminal::new(TestBackend::new(80, 2)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_command(
+                    frame,
+                    Rect::new(0, 0, 80, 2),
+                    &LocalCommandView::default(),
+                    &Theme::new(false),
+                );
+            })
+            .unwrap();
+        let hint = (0..80)
+            .map(|column| terminal.backend().buffer()[(column, 1)].symbol())
+            .collect::<String>();
+        assert!(hint.contains("% selected URL/path"));
+        assert!(hint.contains("%d downloaded/local"));
+        assert!(hint.contains("Enter run"));
+    }
+
+    /// Global command help remains in shared actions instead of the Local row.
+    #[test]
+    fn command_help_is_shared_with_remote_tabs() {
+        let mut terminal = Terminal::new(TestBackend::new(120, 60)).unwrap();
+        let view = ViewModel {
+            screen: Screen::Search,
+            local_command_available: true,
+            ..ViewModel::default()
+        };
+        terminal
+            .draw(|frame| render_help(frame, &view, &Theme::new(false)))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(text.contains("Actions     : Bash command (any tab)"));
+    }
 
     #[test]
     fn command_entry_uses_black_text_and_disables_seek_targets() {

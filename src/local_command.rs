@@ -1,6 +1,6 @@
-//! Explicit, foreground Bash commands for a selected Local entry.
+//! Explicit Bash commands with an optional selected local path or provider URL.
 //!
-//! Only the user-authored template is shell source. The selected path travels
+//! Only the user-authored template is shell source. A selected target travels
 //! as an OS-string positional argument, never as interpolated shell syntax.
 
 use std::ffi::OsString;
@@ -11,12 +11,13 @@ use std::process::Command;
 pub mod buttons;
 mod capture;
 
-/// A user-authored command with one captured local path or original provider URL.
+/// A user-authored command with an optional captured local path or original provider URL.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ShellCommandPlan {
-    /// Explicit shell source from the user's command configuration.
+    /// Explicit shell source from the user's prompt or command configuration.
     pub template: String,
     /// Selected target transported as one OS-string argument, never shell source.
+    /// Empty when the invocation has no selected target.
     pub argument: OsString,
     /// Completed media file for `%d`, absent until a requested download succeeds.
     pub downloaded_path: Option<PathBuf>,
@@ -157,21 +158,32 @@ impl ShellCommandPlan {
         Ok(command)
     }
 
+    /// Detects whether an unquoted `%` or `%d` macro requires a selected target.
+    ///
+    /// Quoted, escaped, commented, and embedded percent signs remain literal, so
+    /// ordinary commands can run without selecting a media item.
+    ///
+    /// # Errors
+    /// Returns the same grammar validation errors as command construction.
+    pub fn requires_selection(&self) -> Result<bool, String> {
+        expand_targets(&self.template).map(|expansion| expansion.requires_selection)
+    }
+
     /// Detects the unquoted `%d` macro without mistaking printf formats for downloads.
     ///
     /// # Errors
     /// Returns the same grammar validation errors as command construction.
     pub fn requires_download(&self) -> Result<bool, String> {
-        expand_targets(&self.template).map(|(_, download)| download)
+        expand_targets(&self.template).map(|expansion| expansion.requires_download)
     }
 
     /// Refuses to execute an unresolved download macro, even through direct API calls.
     fn expanded_source(&self) -> Result<String, String> {
-        let (source, download) = expand_targets(&self.template)?;
-        if download && self.downloaded_path.is_none() {
+        let expansion = expand_targets(&self.template)?;
+        if expansion.requires_download && self.downloaded_path.is_none() {
             return Err("The command requires a completed download for %d".to_owned());
         }
-        Ok(source)
+        Ok(expansion.source)
     }
 }
 
@@ -184,11 +196,21 @@ impl ShellCommandPlan {
 /// and callers can instead use the original selected path in quoted `"$1"`.
 /// A private readonly variable preserves macros after the user runs `set --`.
 fn expand_selected_path(template: &str) -> Result<String, String> {
-    expand_targets(template).map(|(source, _)| source)
+    expand_targets(template).map(|expansion| expansion.source)
+}
+
+/// Validated shell source and the selected-target requirements discovered by its lexer.
+struct TargetExpansion {
+    /// Shell source with recognized target macros replaced by readonly variables.
+    source: String,
+    /// At least one original or downloaded target macro was recognized.
+    requires_selection: bool,
+    /// A downloaded target macro needs a completed local file before execution.
+    requires_download: bool,
 }
 
 /// Lexes the two supported argument-start macros while preserving literal percent signs.
-fn expand_targets(template: &str) -> Result<(String, bool), String> {
+fn expand_targets(template: &str) -> Result<TargetExpansion, String> {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Quote {
         None,
@@ -270,7 +292,11 @@ fn expand_targets(template: &str) -> Result<(String, bool), String> {
         }
     }
     if !expanded {
-        return Ok((template.to_owned(), false));
+        return Ok(TargetExpansion {
+            source: template.to_owned(),
+            requires_selection: false,
+            requires_download: false,
+        });
     }
     if complex {
         return Err(
@@ -283,15 +309,73 @@ fn expand_targets(template: &str) -> Result<(String, bool), String> {
     } else {
         ""
     };
-    Ok((
-        format!("readonly __youta_selected_path=\"$1\"; {download_prefix}{result}"),
-        download,
-    ))
+    Ok(TargetExpansion {
+        source: format!("readonly __youta_selected_path=\"$1\"; {download_prefix}{result}"),
+        requires_selection: expanded,
+        requires_download: download,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only unquoted macros at argument starts require a captured media selection.
+    #[test]
+    fn selection_is_required_only_for_unquoted_argument_start_macros() {
+        for (template, selection, download) in [
+            ("pwd", false, false),
+            ("printf '%s' '%'", false, false),
+            ("printf '%s' \"%\"", false, false),
+            ("printf '%s' $'%'", false, false),
+            ("printf '%s' \\%", false, false),
+            ("printf '%s' 100%", false, false),
+            ("printf '%d' 7", false, false),
+            ("printf '%s' \"%d\"", false, false),
+            ("printf '%s' $'%d'", false, false),
+            ("printf '%s' \\%d", false, false),
+            ("printf '%s' embedded%d", false, false),
+            ("printf '%s' plain # % %d are comments", false, false),
+            ("printf '%s' $((5%2))", false, false),
+            ("printf '%s' ${name%pattern}", false, false),
+            ("printf '%s' %", true, false),
+            ("printf '%s' %.flac", true, false),
+            ("printf '%s' %d", true, true),
+            ("printf '%s' %d.flac", true, true),
+            ("printf '%s' % %d", true, true),
+        ] {
+            let plan = ShellCommandPlan {
+                template: template.to_owned(),
+                argument: OsString::new(),
+                downloaded_path: None,
+                directory: std::env::temp_dir(),
+            };
+            assert_eq!(plan.requires_selection().unwrap(), selection, "{template}");
+            assert_eq!(plan.requires_download().unwrap(), download, "{template}");
+        }
+    }
+
+    /// Selection detection and command construction reject the same unsafe macro grammar.
+    #[test]
+    fn selection_requirements_preserve_macro_grammar_validation() {
+        for template in [
+            "printf '%s' $(echo %) %",
+            "printf '%s' $((5%2)) %d",
+            "(printf '%s' %)",
+            "cat <<EOF %d",
+        ] {
+            let plan = ShellCommandPlan {
+                template: template.to_owned(),
+                argument: OsString::new(),
+                downloaded_path: None,
+                directory: std::env::temp_dir(),
+            };
+            let error = plan.requires_selection().unwrap_err();
+            assert_eq!(plan.requires_download().unwrap_err(), error);
+            assert_eq!(plan.command().unwrap_err(), error);
+            assert_eq!(plan.noninteractive_command().unwrap_err(), error);
+        }
+    }
 
     #[test]
     fn markers_preserve_shell_formats_quotes_escapes_and_multiple_arguments() {
@@ -357,10 +441,7 @@ mod tests {
                 downloaded_path: None,
                 directory: std::env::temp_dir(),
             };
-            assert_eq!(
-                expand_targets(template).unwrap(),
-                (template.to_owned(), false)
-            );
+            assert_eq!(expand_targets(template).unwrap().source, template);
             assert!(!plan.requires_download().unwrap(), "{template}");
             assert!(plan.command().is_ok(), "{template}");
             assert!(plan.noninteractive_command().is_ok(), "{template}");
@@ -370,10 +451,10 @@ mod tests {
     /// Original and downloaded targets receive distinct readonly variables and safe suffixes.
     #[test]
     fn download_markers_expand_independently_from_original_target_markers() {
-        let (source, download) = expand_targets("printf '%s' % %d %.flac %d.flac").unwrap();
-        assert!(download);
+        let expansion = expand_targets("printf '%s' % %d %.flac %d.flac").unwrap();
+        assert!(expansion.requires_download);
         assert_eq!(
-            source,
+            expansion.source,
             concat!(
                 "readonly __youta_selected_path=\"$1\"; ",
                 "readonly __youta_downloaded_path=\"$2\"; ",

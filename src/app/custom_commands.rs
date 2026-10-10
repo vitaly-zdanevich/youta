@@ -16,9 +16,20 @@ pub(super) struct CustomCommands {
     mode: CustomCommandMode,
     pub(super) pending: Option<ShellCommandPlan>,
     pub(super) running: bool,
+    /// Whether the accepted invocation owns a typed command's private history result.
+    pub(super) from_prompt: bool,
     waiting_download: Option<(u64, String, ShellCommandPlan)>,
     ready: Option<(String, ShellCommandPlan)>,
     local_selection: Option<(PathBuf, PathBuf)>,
+}
+
+/// Selection-bound download information kept private until an invocation needs `%d`.
+#[derive(Clone)]
+pub(super) struct CapturedCommandDownload {
+    /// Exact identity used to find a previously completed, validated download.
+    pub(super) identity: Option<MediaId>,
+    /// Deferred source errors do not prevent plain commands or reuse of completed files.
+    pub(super) source: Result<crate::download_queue::DownloadSource, String>,
 }
 
 impl AppController {
@@ -28,6 +39,7 @@ impl AppController {
         if mode == CustomCommandMode::Unavailable {
             self.custom_commands.waiting_download = None;
             self.custom_commands.ready = None;
+            self.custom_commands.from_prompt = false;
         }
         if mode != CustomCommandMode::Unavailable && !self.custom_commands.loaded {
             self.custom_commands.loaded = true;
@@ -40,7 +52,17 @@ impl AppController {
     }
 
     /// Resolves only selected identities; display abbreviations and signed streams are not inputs.
-    fn custom_command_target(&self) -> Option<(SourceKind, std::ffi::OsString, Option<PathBuf>)> {
+    pub(super) fn custom_command_target(
+        &self,
+    ) -> Option<(SourceKind, std::ffi::OsString, Option<PathBuf>)> {
+        if self.view.screen == Screen::Statistics {
+            return None;
+        }
+        if self.view.screen == Screen::Playlists
+            && !matches!(self.playlists_route, PlaylistsRoute::Entries { .. })
+        {
+            return None;
+        }
         if self.view.screen == Screen::Local {
             if self.view.local_browse_pending || self.local_archive_read_only() {
                 return None;
@@ -48,7 +70,7 @@ impl AppController {
             let path = self.selected_local_path()?;
             return Some((SourceKind::Local, path.clone().into_os_string(), Some(path)));
         }
-        let details = self.view.details.as_ref()?;
+        let details = self.view.details.as_ref();
         let selected_identity = if self.view.screen == Screen::Subscriptions {
             self.selected_playlist_identity().map(|(id, _)| id)
         } else {
@@ -59,12 +81,52 @@ impl AppController {
         };
         // A slow metadata response must not expose the preceding row's URL or path.
         if self.active_description_video.is_none()
-            && let (Some(selected), Some(shown)) = (&selected_identity, &details.media_id)
+            && let (Some(selected), Some(shown)) = (
+                &selected_identity,
+                details.and_then(|details| details.media_id.as_ref()),
+            )
             && selected != shown
         {
             return None;
         }
-        let identity = details.media_id.as_ref().or(selected_identity.as_ref());
+        // Optional Details metadata may lag, but another tab's retained Details
+        // never creates a selection on an empty or informational page.
+        if self.active_description_video.is_none()
+            && selected_identity.is_none()
+            && self.view.rows.get(self.view.selected).is_none()
+            && !(self.view.screen == Screen::Search
+                && (self.resolved_direct.is_some() || self.direct_item.is_some()))
+        {
+            return None;
+        }
+        if self.active_description_video.is_none()
+            && let Some(identity) = selected_identity.as_ref()
+            && identity.source == SourceKind::Local
+        {
+            let path = local_path_from_media_id(identity)?;
+            return Some((SourceKind::Local, path.clone().into_os_string(), Some(path)));
+        }
+        let selected = self
+            .active_description_video
+            .is_none()
+            .then(|| {
+                self.selected_queue_item()
+                    .map(|item| (item.media.id, item.media.webpage_url))
+                    .or_else(|_| {
+                        self.selected_playlist_snapshot()
+                            .map(|snapshot| (snapshot.id, snapshot.webpage_url))
+                    })
+                    .ok()
+            })
+            .flatten();
+        let linked_identity = self
+            .active_description_video
+            .as_ref()
+            .map(|linked| MediaId::new(SourceKind::YouTube, &linked.video_id));
+        let identity = linked_identity
+            .as_ref()
+            .or_else(|| selected.as_ref().map(|(identity, _)| identity))
+            .or(selected_identity.as_ref());
         if let Some(identity) = identity
             && identity.source == SourceKind::Local
         {
@@ -104,8 +166,16 @@ impl AppController {
                         HistoryReplayTarget::Local(_) => None,
                     },
                 )
+                .or_else(|| selected.as_ref().map(|(_, url)| url.to_string()))
                 .or_else(|| self.current_url())
-                .or_else(|| details.webpage_url.as_ref().map(ToString::to_string))
+                .or_else(|| {
+                    details
+                        .filter(|details| {
+                            selected_identity.is_some() && details.media_id == selected_identity
+                        })
+                        .and_then(|details| details.webpage_url.as_ref())
+                        .map(ToString::to_string)
+                })
         }?;
         let parsed = url::Url::parse(&url).ok()?;
         if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
@@ -193,13 +263,13 @@ impl AppController {
             self.view.status_line = "Cannot resolve the command working directory".to_owned();
             return;
         };
-        let mut plan = ShellCommandPlan {
+        let plan = ShellCommandPlan {
             template: button.command.clone(),
             argument,
             directory,
             downloaded_path: local.clone(),
         };
-        self.custom_commands.local_selection = if self.view.screen == Screen::Local {
+        let local_selection = if self.view.screen == Screen::Local {
             local.and_then(|path| {
                 self.local_listing
                     .as_ref()
@@ -208,99 +278,108 @@ impl AppController {
         } else {
             None
         };
-        let needs_download = match plan.requires_download() {
-            Ok(value) => value,
-            Err(error) => {
-                self.view.status_line = error;
-                return;
-            }
+        let download = self.capture_command_download();
+        if let Err(error) = self.run_captured_shell_command(name, plan, download, local_selection) {
+            self.view.status_line = error;
+        }
+    }
+
+    /// Captures download identity now; later edits, playback, and source changes cannot retarget it.
+    pub(super) fn capture_command_download(&self) -> CapturedCommandDownload {
+        let identity = if let Some(linked) = self.active_description_video.as_ref() {
+            Some(MediaId::new(SourceKind::YouTube, &linked.video_id))
+        } else if self.view.screen == Screen::Subscriptions {
+            self.selected_playlist_identity()
+                .map(|(identity, _)| identity)
+        } else {
+            self.view
+                .rows
+                .get(self.view.selected)
+                .and_then(|row| row.media_id.clone())
         };
-        if needs_download && plan.downloaded_path.is_none() {
-            // Existing validated files also work in builds without a downloader.
-            if let Some(identity) = self
-                .view
+        let source = if let Some(linked) = self.active_description_video.as_ref() {
+            self.view
                 .details
                 .as_ref()
-                .and_then(|details| details.media_id.as_ref())
-            {
-                plan.downloaded_path = self.custom_command_download_path(identity);
-            }
-            if plan.downloaded_path.is_some() {
-                self.start_custom_command(name, plan);
-                return;
-            }
-            let download_source = if self.active_description_video.is_some() {
-                self.view
-                    .details
-                    .as_ref()
-                    .and_then(|details| {
-                        let identity = details.media_id.as_ref()?;
-                        (identity.source == SourceKind::YouTube).then(|| {
-                            crate::download_queue::DownloadSource {
-                                media_id: identity.clone(),
-                                kind: MediaKind::Video,
-                                title: details.title.clone(),
-                                creator: (!details.channel_name.trim().is_empty())
-                                    .then(|| details.channel_name.trim().to_owned()),
-                                webpage_url: url::Url::parse(&youtube_video_url(
-                                    &identity.external_id,
-                                ))
+                .and_then(|details| {
+                    let identity = details.media_id.as_ref()?;
+                    (identity.source == SourceKind::YouTube
+                        && identity.external_id == linked.video_id)
+                        .then(|| crate::download_queue::DownloadSource {
+                            media_id: identity.clone(),
+                            kind: MediaKind::Video,
+                            title: details.title.clone(),
+                            creator: (!details.channel_name.trim().is_empty())
+                                .then(|| details.channel_name.trim().to_owned()),
+                            webpage_url: url::Url::parse(&youtube_video_url(&identity.external_id))
                                 .expect("canonical YouTube URL"),
-                                download_url: url::Url::parse(&youtube_video_url(
-                                    &identity.external_id,
-                                ))
-                                .expect("canonical YouTube URL"),
-                                duration_seconds: None,
-                            }
+                            download_url: url::Url::parse(&youtube_video_url(
+                                &identity.external_id,
+                            ))
+                            .expect("canonical YouTube URL"),
+                            duration_seconds: None,
                         })
-                    })
-                    .ok_or_else(|| "No downloadable linked item is selected".to_owned())
-            } else {
-                self.selected_manual_download_source()
-            };
-            let source = match download_source {
-                Ok(source) if source.media_id.source != SourceKind::Radio => source,
-                Ok(_) => {
-                    self.view.status_line =
-                        "%d requires finite media; record live radio first".to_owned();
-                    return;
-                }
-                Err(error) => {
-                    self.view.status_line = error;
-                    return;
-                }
-            };
-            let shown_identity = self
-                .view
-                .details
-                .as_ref()
-                .and_then(|details| details.media_id.as_ref())
-                .or_else(|| {
-                    self.view
-                        .rows
-                        .get(self.view.selected)
-                        .and_then(|row| row.media_id.as_ref())
-                });
-            if shown_identity != Some(&source.media_id) {
-                self.view.status_line =
+                })
+                .ok_or_else(|| "No downloadable linked item is selected".to_owned())
+        } else {
+            self.selected_manual_download_source()
+        };
+        let identity =
+            identity.or_else(|| source.as_ref().ok().map(|source| source.media_id.clone()));
+        let source = source.and_then(|source| {
+            if identity.as_ref() != Some(&source.media_id) {
+                return Err(
                     "Wait for the selected item details before downloading for a command"
-                        .to_owned();
-                return;
+                        .to_owned(),
+                );
             }
-            plan.downloaded_path = self.custom_command_download_path(&source.media_id);
+            Ok(source)
+        });
+        CapturedCommandDownload { identity, source }
+    }
+
+    /// Shares validated cache reuse, the ordinary format chooser, and one captured continuation.
+    pub(super) fn run_captured_shell_command(
+        &mut self,
+        name: String,
+        mut plan: ShellCommandPlan,
+        download: CapturedCommandDownload,
+        local_selection: Option<(PathBuf, PathBuf)>,
+    ) -> Result<(), String> {
+        if self.custom_commands.running
+            || self.custom_commands.waiting_download.is_some()
+            || self.custom_commands.ready.is_some()
+        {
+            return Err("Wait for the current command to finish".to_owned());
+        }
+        if self.custom_commands.mode == CustomCommandMode::Unavailable {
+            return Err("Shell commands are unavailable in this frontend".to_owned());
+        }
+        if plan.requires_download()? && plan.downloaded_path.is_none() {
+            // Reuse completed output even when no downloader is enabled in this build.
+            plan.downloaded_path = download
+                .identity
+                .as_ref()
+                .and_then(|identity| self.custom_command_download_path(identity));
             if plan.downloaded_path.is_none() {
-                match self.enqueue_custom_command_download(source) {
-                    Ok(id) => {
-                        self.custom_commands.waiting_download = Some((id, name, plan));
-                        self.view.status_line = "Downloading for custom command...".to_owned();
-                        self.poll_manual_download_queue();
-                    }
-                    Err(error) => self.view.status_line = error,
+                let source = download.source?;
+                if source.media_id.source == SourceKind::Radio {
+                    return Err("%d requires finite media; record live radio first".to_owned());
                 }
-                return;
+                plan.downloaded_path = self.custom_command_download_path(&source.media_id);
+                if plan.downloaded_path.is_none() {
+                    let id = self.enqueue_custom_command_download(source)?;
+                    self.custom_commands.local_selection = local_selection;
+                    self.custom_commands.waiting_download = Some((id, name, plan));
+                    self.view.status_line = "Downloading for custom command...".to_owned();
+                    self.poll_manual_download_queue();
+                    return Ok(());
+                }
             }
         }
+        self.custom_commands.local_selection = local_selection;
         self.start_custom_command(name, plan);
+        Ok(())
     }
 
     /// Transfers a validated captured plan once; repeated clicks cannot start another process.
@@ -350,6 +429,7 @@ impl AppController {
             self.custom_commands.ready = Some((name, plan));
         } else {
             self.custom_commands.local_selection = None;
+            self.custom_commands.from_prompt = false;
             self.view.status_line =
                 "Custom command not run: download failed or was cancelled".to_owned();
         }
@@ -380,5 +460,8 @@ impl AppController {
             "Custom command failed; see its output"
         }
         .to_owned();
+        if std::mem::take(&mut self.custom_commands.from_prompt) {
+            self.finish_prompt_command();
+        }
     }
 }

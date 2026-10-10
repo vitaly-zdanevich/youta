@@ -270,49 +270,88 @@ mod wire_tests {
     #[cfg(feature = "cmd")]
     use crate::view::{LocalCommandHistoryView, LocalCommandView, Screen};
 
-    /// Local exposes a command prompt instead of silently ignoring the colon key.
+    /// Colon opens the terminal command prompt in every tab, independent of playback.
     #[test]
     #[cfg(feature = "cmd")]
-    fn local_colon_opens_a_command_prompt() {
-        let view = ViewModel {
-            screen: crate::view::Screen::Local,
-            local_command_available: true,
-            ..ViewModel::default()
-        };
-        assert_eq!(
-            key_action(KeyPress::new(Key::Char(':')), &view, None, None),
-            Some(UiAction::BeginLocalCommand)
-        );
+    fn local_command_shortcut_is_global_and_requires_frontend_capability() {
+        for screen in Screen::ALL {
+            for (idle, paused) in [(true, true), (false, false), (false, true)] {
+                for available in [false, true] {
+                    let view = ViewModel {
+                        screen,
+                        local_command_available: available,
+                        playback: PlaybackStatus {
+                            idle,
+                            paused,
+                            ..PlaybackStatus::default()
+                        },
+                        ..ViewModel::default()
+                    };
+                    for shift in [false, true] {
+                        let key = KeyPress {
+                            shift,
+                            ..KeyPress::new(Key::Char(':'))
+                        };
+                        assert_eq!(
+                            key_action(key, &view, None, None),
+                            available.then_some(UiAction::BeginLocalCommand),
+                            "screen={screen:?}, idle={idle}, paused={paused}, available={available}, shift={shift}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
-    /// Only a terminal-enabled Local list can enter shell mode, even with Shift-produced ':'.
+    /// Global colon retains editor, modal, and explicit custom-binding priority.
     #[test]
     #[cfg(feature = "cmd")]
-    fn local_command_shortcut_requires_frontend_capability_and_respects_other_editors() {
-        for screen in [Screen::Local, Screen::Search] {
-            for available in [false, true] {
-                let mut view = ViewModel {
-                    screen,
-                    local_command_available: available,
-                    ..ViewModel::default()
-                };
-                for shift in [false, true] {
-                    let key = KeyPress {
-                        shift,
-                        ..KeyPress::new(Key::Char(':'))
-                    };
-                    assert_eq!(
-                        key_action(key, &view, None, None),
-                        (screen == Screen::Local && available)
-                            .then_some(UiAction::BeginLocalCommand)
-                    );
-                }
-                view.search_editing = true;
+    fn local_command_shortcut_respects_other_editors_modals_and_custom_bindings() {
+        for screen in Screen::ALL {
+            let mut view = ViewModel {
+                screen,
+                local_command_available: true,
+                ..ViewModel::default()
+            };
+            let key = KeyPress::new(Key::Char(':'));
+            for (ctrl, alt) in [(true, false), (false, true), (true, true)] {
                 assert_eq!(
-                    key_action(KeyPress::new(Key::Char(':')), &view, None, None),
-                    Some(UiAction::AppendSearch(':'))
+                    key_action(KeyPress { ctrl, alt, ..key }, &view, None, None),
+                    None
                 );
             }
+            view.custom_command_buttons = vec![crate::view::CustomCommandButtonView {
+                id: 7,
+                binding: Some(crate::local_command::buttons::Hotkey::parse(":").unwrap()),
+                ..crate::view::CustomCommandButtonView::default()
+            }];
+            assert_eq!(
+                key_action(key, &view, None, None),
+                Some(UiAction::RunCustomCommand(7))
+            );
+            view.search_editing = true;
+            assert_eq!(
+                key_action(key, &view, None, None),
+                Some(UiAction::AppendSearch(':'))
+            );
+            view.search_editing = false;
+            view.private_note_popup = Some(crate::view::PrivateNotePopupView::default());
+            assert_eq!(
+                key_action(key, &view, None, None),
+                Some(UiAction::AppendPrivateNoteCharacter(':'))
+            );
+            view.private_note_popup = None;
+            view.local_command = Some(LocalCommandView::default());
+            assert_eq!(
+                key_action(key, &view, None, None),
+                Some(UiAction::AppendLocalCommandCharacter(':'))
+            );
+            view.local_command = None;
+            view.help_open = true;
+            assert_eq!(key_action(key, &view, None, None), None);
+            view.help_open = false;
+            view.error_popup = Some(ErrorPopupView::default());
+            assert_eq!(key_action(key, &view, None, None), None);
         }
     }
 
@@ -1908,6 +1947,9 @@ fn subscription_items_active(view: &ViewModel) -> bool {
 ///
 /// Outside modal editors, Ctrl increases arrow seeking from five to twenty
 /// seconds. Alt retains priority for backward/forward navigation.
+/// With the `cmd` feature and terminal command capability, `:` opens the
+/// command prompt from any tab, regardless of playback. Editors, modals, and
+/// configured custom-command bindings keep priority over that shortcut.
 pub fn key_action(
     key: KeyPress,
     view: &ViewModel,
@@ -3208,9 +3250,7 @@ fn unfiltered_key_action(
         }
         Key::Char('/') => Some(UiAction::BeginSearch),
         #[cfg(feature = "cmd")]
-        Key::Char(':')
-            if !key.chorded() && view.screen == Screen::Local && view.local_command_available =>
-        {
+        Key::Char(':') if !key.chorded() && view.local_command_available => {
             Some(UiAction::BeginLocalCommand)
         }
         Key::Char('R') if view.screen == Screen::Web => Some(UiAction::RefreshWeb),

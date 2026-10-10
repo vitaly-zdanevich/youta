@@ -1,4 +1,4 @@
-//! Private Local shell input, bounded durable history, and frontend-owned execution.
+//! Global private shell input, bounded durable history, and frontend-owned execution.
 
 mod completion;
 
@@ -6,8 +6,9 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use super::custom_commands::CapturedCommandDownload;
 use super::*;
-use crate::local_command::LocalCommandPlan;
+use crate::local_command::ShellCommandPlan;
 use crate::view::{LocalCommandHistoryView, LocalCommandView};
 
 const COMMAND_LIMIT: usize = 8_192;
@@ -23,11 +24,18 @@ pub(super) struct LocalCommandState {
     loaded: bool,
     history_position: Option<usize>,
     history_draft: String,
-    selection: Option<LocalCommandPlan>,
-    pub(super) pending: Option<LocalCommandPlan>,
-    pub(super) running: bool,
+    selection: Option<CommandSelection>,
     history_save_failed: bool,
     completion: completion::State,
+}
+
+/// Freezes the selected target and download context before the user starts typing.
+#[derive(Clone)]
+struct CommandSelection {
+    plan: ShellCommandPlan,
+    has_target: bool,
+    download: CapturedCommandDownload,
+    local_selection: Option<(PathBuf, PathBuf)>,
 }
 
 /// Actions admitted while the private command editor owns the interface.
@@ -53,7 +61,7 @@ pub(super) fn command_action(action: &UiAction) -> bool {
 impl AppController {
     /// Applies only semantic shell-editor actions; no command executes in the controller.
     pub(super) fn dispatch_local_command(&mut self, action: UiAction) {
-        if self.local_command.running || self.view.error_popup.is_some() {
+        if self.custom_commands.running || self.view.error_popup.is_some() {
             return;
         }
         if !matches!(action, UiAction::CompleteLocalCommand) {
@@ -130,33 +138,45 @@ impl AppController {
         }
     }
 
-    /// Captures real filesystem identities once, never a shortened display path.
+    /// Captures only the selected item, never the playing item or a shortened path.
     fn begin_local_command(&mut self) {
         if !self.view.local_command_available
-            || self.view.screen != Screen::Local
             || self.view.local_command.is_some()
             || self.view.local_file_popup.is_some()
-            || self.view.local_browse_pending
+            || (self.view.screen == Screen::Local && self.view.local_browse_pending)
             || self.local_move_is_executing()
         {
             return;
         }
-        if self.local_archive_read_only() {
+        if self.view.screen == Screen::Local && self.local_archive_read_only() {
             self.view.status_line =
                 "Commands are unavailable inside read-only archive folders".to_owned();
             return;
         }
-        let Some(directory) = self
-            .local_listing
-            .as_ref()
-            .map(|listing| listing.path.clone())
-        else {
-            return;
-        };
-        let Some(path) = self.selected_local_path() else {
-            self.view.status_line =
-                "Select a local file or folder before entering a command".to_owned();
-            return;
+        let target = self.custom_command_target();
+        let local_path = target.as_ref().and_then(|(_, _, path)| path.clone());
+        let local_directory = (self.view.screen == Screen::Local)
+            .then(|| {
+                self.local_listing
+                    .as_ref()
+                    .map(|listing| listing.path.clone())
+            })
+            .flatten();
+        let directory = local_directory
+            .clone()
+            .or_else(|| {
+                local_path
+                    .as_deref()
+                    .and_then(Path::parent)
+                    .map(Path::to_owned)
+            })
+            .map_or_else(std::env::current_dir, Ok);
+        let directory = match directory {
+            Ok(directory) => directory,
+            Err(_) => {
+                self.view.status_line = "Cannot determine the command working directory".to_owned();
+                return;
+            }
         };
         if !self.local_command.loaded {
             self.local_command.loaded = true;
@@ -164,15 +184,20 @@ impl AppController {
                 Ok(history) => self.local_command.history = history,
                 Err(_) => {
                     self.view.status_line =
-                        "Local command history could not be read; starting with empty history"
-                            .to_owned()
+                        "Command history could not be read; starting with empty history".to_owned()
                 }
             }
         }
-        self.local_command.selection = Some(LocalCommandPlan {
-            template: String::new(),
-            path,
-            directory,
+        self.local_command.selection = Some(CommandSelection {
+            has_target: target.is_some(),
+            plan: ShellCommandPlan {
+                template: String::new(),
+                argument: target.map(|(_, argument, _)| argument).unwrap_or_default(),
+                downloaded_path: local_path.clone(),
+                directory,
+            },
+            download: self.capture_command_download(),
+            local_selection: local_directory.zip(local_path),
         });
         self.local_command.history_position = None;
         self.local_command.history_draft.clear();
@@ -214,7 +239,7 @@ impl AppController {
             &mut editor.command,
             &mut editor.cursor_byte,
             &completion::Context {
-                directory: &selection.directory,
+                directory: &selection.plan.directory,
                 search_path: search_path.as_deref(),
                 home: home.as_deref(),
             },
@@ -272,7 +297,7 @@ impl AppController {
         editor.cursor_byte = editor.command.len();
     }
 
-    /// Persists one submitted template before giving the frontend its exact path-bound plan.
+    /// Validates selected-item macros and shares the normal download/foreground execution flow.
     fn submit_local_command(&mut self) {
         let Some(editor) = self.view.local_command.as_ref() else {
             return;
@@ -288,52 +313,62 @@ impl AppController {
         if !valid_command(&template) {
             return;
         }
-        let Some(mut plan) = self.local_command.selection.clone() else {
+        let Some(mut selection) = self.local_command.selection.clone() else {
             return;
         };
-        plan.template = template.clone();
+        selection.plan.template = template.clone();
+        match selection.plan.requires_selection() {
+            Ok(true) if !selection.has_target => {
+                self.view.status_line =
+                    "Select an item before using % or %d in a command".to_owned();
+                return;
+            }
+            Err(error) => {
+                self.view.status_line = error;
+                return;
+            }
+            _ => {}
+        }
+        // Queue setup may fail synchronously and clear ownership before returning.
+        let previous_prompt = std::mem::replace(&mut self.custom_commands.from_prompt, true);
+        if let Err(error) = self.run_captured_shell_command(
+            "Command".to_owned(),
+            selection.plan,
+            selection.download,
+            selection.local_selection,
+        ) {
+            self.custom_commands.from_prompt = previous_prompt;
+            self.view.status_line = error;
+            return;
+        }
         self.local_command.history.push(template);
         if self.local_command.history.len() > HISTORY_LIMIT {
             self.local_command.history.remove(0);
         }
         self.local_command.history_save_failed =
             write_history(&history_path(&self.config), &self.local_command.history).is_err();
-        self.local_command.pending = Some(plan);
-        self.local_command.running = true;
         self.view.local_command = None;
-        self.view.status_line = "Running Local command...".to_owned();
+        self.local_command.selection = None;
     }
 
     /// Cancels unsent input without touching persistent command history.
     pub(super) fn dismiss_local_command(&mut self) {
-        if self.local_command.running {
+        if self.custom_commands.running {
             return;
         }
         self.view.local_command = None;
         self.local_command.selection = None;
-        self.local_command.pending = None;
         self.local_command.history_position = None;
         self.local_command.history_draft.clear();
     }
 
-    /// Reloads the captured directory because shell commands may have changed its entries.
-    pub(super) fn finish_local_command(&mut self, result: Result<(), String>) {
-        if !self.local_command.running {
-            return;
+    /// Retains history-write failures after the shared runner reports command completion.
+    pub(super) fn finish_prompt_command(&mut self) {
+        if self.local_command.history_save_failed {
+            self.view
+                .status_line
+                .push_str("; its history could not be saved");
         }
-        self.local_command.running = false;
-        self.local_command.pending = None;
-        if let Some(plan) = self.local_command.selection.take() {
-            self.browse_local_directory_with_reselection(plan.directory, Some(plan.path));
-        }
-        self.view.status_line = match result {
-            Ok(()) if self.local_command.history_save_failed => {
-                "Local command finished; its history could not be saved".to_owned()
-            }
-            Ok(()) => "Local command finished".to_owned(),
-            // Process output and command text stay in the terminal, never in diagnostics.
-            Err(_) => "Local command failed; its output was shown in the terminal".to_owned(),
-        };
         self.local_command.history_save_failed = false;
     }
 }
@@ -471,6 +506,7 @@ mod tests {
         controller.refresh_local_browser_rows();
         controller.select_local_path(Some(&selected));
         controller.set_local_command_available(true);
+        controller.set_custom_command_mode(crate::view::CustomCommandMode::Terminal);
         let (sender, requests) = unbounded();
         controller.local_browse_requests = Some(sender);
         (controller, directory, selected, requests)
@@ -491,14 +527,18 @@ mod tests {
         controller.dispatch(UiAction::ShowScreen(Screen::Search));
         assert_eq!(controller.view.screen, Screen::Local);
         controller.dispatch(UiAction::SubmitLocalCommand);
-        let plan = controller.take_local_command_plan().unwrap();
-        assert_eq!(plan.path, selected);
+        let plan = controller.take_custom_command_plan().unwrap();
+        assert_eq!(plan.argument, selected.as_os_str());
+        assert_eq!(plan.downloaded_path, Some(selected.clone()));
         assert_eq!(plan.directory, selected.parent().unwrap());
         assert_eq!(plan.template, "printf '%s\\n' %");
-        assert!(controller.take_local_command_plan().is_none());
+        assert!(controller.take_custom_command_plan().is_none());
         controller.dispatch(UiAction::Quit);
         assert!(!controller.view.quitting);
-        controller.report_local_command_result(Ok(()));
+        controller.report_custom_command_result(Ok(crate::local_command::CommandOutput {
+            output: String::new(),
+            success: true,
+        }));
         let LocalBrowseRequest::Browse {
             directory,
             preferred_child,
@@ -571,7 +611,7 @@ mod tests {
         controller.dispatch(UiAction::MoveLocalCommandHistory(1));
         controller.dispatch(UiAction::SubmitLocalCommand);
         assert_eq!(
-            controller.take_local_command_plan().unwrap().template,
+            controller.take_custom_command_plan().unwrap().template,
             "echo match18"
         );
     }
@@ -593,7 +633,7 @@ mod tests {
         controller.dispatch(UiAction::DeleteLocalCommandForward);
         assert_eq!(controller.view.local_command.as_ref().unwrap().command, "A");
         controller.dispatch(UiAction::DismissLocalCommand);
-        assert!(controller.take_local_command_plan().is_none());
+        assert!(controller.take_custom_command_plan().is_none());
         assert!(!history_path(&controller.config).exists());
     }
 
@@ -608,7 +648,7 @@ mod tests {
             controller.view.local_command.as_ref().unwrap().command,
             "cat track\\ with\\ space.flac"
         );
-        assert!(controller.take_local_command_plan().is_none());
+        assert!(controller.take_custom_command_plan().is_none());
         assert!(!history_path(&controller.config).exists());
         controller.dispatch(UiAction::OpenLocalCommandHistory);
         type_text(&mut controller, "cat tra");
@@ -651,20 +691,85 @@ mod tests {
     }
 
     #[test]
-    fn local_command_requires_a_terminal_and_an_exact_selection() {
+    fn command_prompt_requires_a_terminal_but_opens_on_every_tab_without_selection() {
         let (mut controller, _directory, _selected, _requests) = fixture();
         controller.set_local_command_available(false);
         controller.dispatch(UiAction::BeginLocalCommand);
         assert!(controller.view.local_command.is_none());
         controller.set_local_command_available(true);
-        controller.view.screen = Screen::Search;
-        controller.dispatch(UiAction::BeginLocalCommand);
-        assert!(controller.view.local_command.is_none());
-        controller.view.screen = Screen::Local;
         controller.local_listing = None;
+        controller.view.rows.clear();
+        controller.view.details = None;
+        for screen in Screen::ALL {
+            for (idle, paused) in [(true, false), (false, false), (false, true)] {
+                controller.view.screen = screen;
+                controller.view.playback.idle = idle;
+                controller.view.playback.paused = paused;
+                controller.dispatch(UiAction::BeginLocalCommand);
+                assert!(
+                    controller.view.local_command.is_some(),
+                    "{screen:?}, idle={idle}, paused={paused}"
+                );
+                controller.dispatch(UiAction::DismissLocalCommand);
+            }
+        }
+        assert!(controller.take_custom_command_plan().is_none());
+    }
+
+    /// The synthetic parent row is a real command target, not an empty selection.
+    #[test]
+    fn command_prompt_targets_parent_folder_without_changing_working_directory() {
+        let (mut controller, _directory, selected, _requests) = fixture();
+        controller.view.selected = 0;
         controller.dispatch(UiAction::BeginLocalCommand);
-        assert!(controller.view.local_command.is_none());
-        assert!(controller.take_local_command_plan().is_none());
+        type_text(&mut controller, "printf '%s\\n' % %d");
+        controller.dispatch(UiAction::SubmitLocalCommand);
+        let plan = controller.take_custom_command_plan().unwrap();
+        let current = selected.parent().unwrap();
+        let parent = current.parent().unwrap();
+        assert_eq!(plan.argument, parent.as_os_str());
+        assert_eq!(plan.downloaded_path.as_deref(), Some(parent));
+        assert_eq!(plan.directory, current);
+    }
+
+    /// Playing metadata never supplies a missing selection, while plain shell commands work.
+    #[test]
+    fn command_prompt_without_selection_rejects_macros_but_accepts_literal_percent() {
+        let (mut controller, _directory, _selected, requests) = fixture();
+        controller.view.screen = Screen::Search;
+        controller.view.rows.clear();
+        controller.view.details = None;
+        controller.view.playback.idle = false;
+        controller.view.now_playing = Some(NowPlayingView {
+            media_id: MediaId::new(SourceKind::YouTube, "playing-id"),
+            title: "Playing item is not selected".to_owned(),
+            subtitle: String::new(),
+        });
+        for template in ["echo %", "echo %d"] {
+            controller.dispatch(UiAction::BeginLocalCommand);
+            type_text(&mut controller, template);
+            controller.dispatch(UiAction::SubmitLocalCommand);
+            assert!(controller.view.local_command.is_some());
+            assert!(controller.view.status_line.contains("Select an item"));
+            assert!(controller.take_custom_command_plan().is_none());
+            assert!(!history_path(&controller.config).exists());
+            controller.dispatch(UiAction::DismissLocalCommand);
+        }
+        controller.dispatch(UiAction::BeginLocalCommand);
+        type_text(&mut controller, "printf '%s' '100%'");
+        controller.dispatch(UiAction::SubmitLocalCommand);
+        let plan = controller.take_custom_command_plan().unwrap();
+        assert!(plan.argument.is_empty());
+        assert_eq!(plan.directory, std::env::current_dir().unwrap());
+        controller.report_custom_command_result(Ok(crate::local_command::CommandOutput {
+            output: String::new(),
+            success: true,
+        }));
+        assert_eq!(controller.view.screen, Screen::Search);
+        assert!(
+            requests.try_recv().is_err(),
+            "remote commands must not refresh Local"
+        );
     }
 
     #[cfg(feature = "local-archives")]
@@ -689,11 +794,11 @@ mod tests {
         controller.dispatch(UiAction::BeginLocalCommand);
         type_text(&mut controller, "  ");
         controller.dispatch(UiAction::SubmitLocalCommand);
-        assert!(controller.take_local_command_plan().is_none());
+        assert!(controller.take_custom_command_plan().is_none());
         controller.dispatch(UiAction::OpenLocalCommandHistory);
         type_text(&mut controller, "no match");
         controller.dispatch(UiAction::SubmitLocalCommand);
-        assert!(controller.take_local_command_plan().is_none());
+        assert!(controller.take_custom_command_plan().is_none());
         assert!(controller.view.local_command.is_some());
         assert!(!history_path(&controller.config).exists());
     }
@@ -748,7 +853,7 @@ mod tests {
         controller.dispatch(UiAction::BeginLocalCommand);
         type_text(&mut controller, "echo prior %");
         controller.dispatch(UiAction::SubmitLocalCommand);
-        assert!(controller.take_local_command_plan().is_some());
+        assert!(controller.take_custom_command_plan().is_some());
         drop(controller);
         let mut controller =
             AppController::new(config, StateStore::open_in_memory().unwrap(), None, None);
@@ -771,7 +876,7 @@ mod tests {
             controller.view.local_command.as_ref().unwrap().command,
             "echo prior %"
         );
-        assert!(controller.take_local_command_plan().is_none());
+        assert!(controller.take_custom_command_plan().is_none());
     }
 
     #[cfg(unix)]

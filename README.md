@@ -163,36 +163,47 @@ query string) and the authoritative RDAP service discovered through
 Disable the default-on `url-info` Cargo feature or Gentoo USE flag to omit
 this capability from either frontend.
 
-With the default `cmd` feature, press `:` on a selected Local file or folder
-to enter a [Bash command](https://www.gnu.org/software/bash/manual/bash.html)
-in the seek-bar area. `Enter` runs it in the displayed directory, in the
-foreground; `Esc` cancels before execution. The TUI releases its terminal so
+With the default `cmd` feature, press `:` on any tab, whether playback is active
+or stopped, to enter a [Bash command](https://www.gnu.org/software/bash/manual/bash.html)
+in the seek-bar area. Ordinary commands such as `pwd` need no selection.
+`Enter` runs the command in the foreground; `Esc` cancels before execution.
+In Local, the working directory is the displayed directory. Elsewhere, a
+selected local file uses its parent directory; a remote item or no selection
+uses Youta's process working directory. The TUI releases its terminal so
 the command can read input and display output. `Ctrl+C` interrupts the command;
-after it finishes, press any key to return to Youta and refresh the directory.
+after it finishes, press any key to return to Youta.
 The `:` editor requires Bash and a Unix terminal; it is unavailable in the GUI
-and inside read-only archive folders.
+and inside read-only archive folders. Commands cannot target extracted archive
+contents.
 
-An unquoted `%` argument supplies the full selected path as one argument,
-including spaces or shell punctuation. For example:
+An unquoted `%` argument supplies the selected item's original URL or full local
+path as one argument, including spaces or shell punctuation. The Local `..` row
+supplies the full parent-directory path. `%d` supplies the selected downloaded
+or local path: Youta reuses a completed download, or opens the normal
+download/format chooser and waits for the download before running the command.
+Failed or cancelled downloads never run it. For local entries, `%` and `%d`
+both supply the same full path. These macros require a selected item and never
+fall back to the playing item. For example:
 
 ```sh
-ffmpeg -i % -c:a libmp3lame /tmp/output.mp3
+ffmpeg -i %d -c:a libmp3lame /tmp/output.mp3
 ```
 
-`%.mp3` appends a suffix to the selected path. Quoted or escaped percent signs
-remain literal, so `printf '%s\n' %` works. For complex Bash syntax such as
-substitutions, arithmetic, or grouping, use `"$1"` instead of `%`; the original
-selected path is supplied as Bash's first positional parameter. Changing
-positional parameters with `set --` changes `$1`, but not the `%` shortcut.
+Suffixes such as `%.mp3` and `%d.flac` append to the corresponding target.
+Quoted or escaped percent signs remain literal, so `printf '%s\n' %` works.
+For complex Bash syntax such as substitutions, arithmetic, or grouping, use
+`"$1"` instead of `%`; the selected original URL or local path is supplied as
+Bash's first positional parameter. Changing positional parameters with
+`set --` changes `$1`, but not the `%` shortcut.
 Commands run with your permissions and can modify or delete files; they are
 not sandboxed or limited to the selected entry. Bash startup files are not
 loaded.
 
 `Tab` completes command names from `PATH` and Bash builtins, or filenames
-relative to the displayed directory (also absolute paths and `~/`). It inserts
-the common prefix first; repeated `Tab` cycles through matches. Paths containing
-spaces and quotes are quoted automatically. Completion does not execute shell
-expansions or load programmable Bash completion scripts.
+relative to the command's working directory (also absolute paths and `~/`).
+It inserts the common prefix first; repeated `Tab` cycles through matches.
+Paths containing spaces and quotes are quoted automatically. Completion does
+not execute shell expansions or load programmable Bash completion scripts.
 `Up` / `Down` recall commands and restore the unfinished draft after the newest
 entry. `Ctrl+R` opens the ten newest matching commands; type a case-sensitive
 substring, choose with `Up` / `Down`, and press `Enter` to run it against the
@@ -222,9 +233,10 @@ it makes the button available for every eligible provider. Optional
 `font_color` and `background_color` accept `#rgb` or `#rrggbb` values.
 
 An unquoted `%` supplies the selected item's original URL, or its full path
-for Local items. `%d` supplies its downloaded file path: Youta reuses an
-existing completed download, or opens the normal download/format chooser and
-waits for the download before running the command. Failed or cancelled
+for local items, using the same selection rules as the `:` editor. Neither
+macro falls back to the playing item. `%d` supplies its downloaded file path:
+Youta reuses an existing completed download, or opens the normal download/format
+chooser and waits for the download before running the command. Failed or cancelled
 downloads never run the command. For Local items, `%` and `%d` both supply the
 same full path. Both macros pass one argument safely and support suffixes,
 such as `%d.flac`; the quoting rules above still apply. Commands are unavailable
@@ -1056,7 +1068,7 @@ leave it out of an explicit `--no-default-features` feature list:
 | `ascii-visualizer` | CAVA capture and fullscreen terminal/desktop spectrum renderers. |
 | `audio-quality` | Local spectral analysis and RustFFT. |
 | `cache` | Session RAM audio cache with a 90% system/container memory-pressure ceiling on Linux. |
-| `cmd` | TUI/GUI provider-filtered command buttons, plus terminal Local-tab Bash commands, completion, and history. |
+| `cmd` | TUI/GUI provider-filtered command buttons, plus terminal Bash commands on any tab, completion, and history. |
 | `url-info` | On-demand website title/description and public RDAP facts for Local comments and YouTube descriptions. |
 | `commons-upload` | Commons authentication, upload client, and review UI. |
 | `evernote` | Evernote client and audio-note UI. |
@@ -1432,7 +1444,7 @@ runtime/playback-checkpoint.toml
 cache/searches.toml      regenerable search snapshots
 cache/providers.toml     regenerable provider metadata
 subscriptions.opml       portable RSS, podcast, and compatible channel feeds
-cmd-log                  plaintext Local command history (cmd feature)
+cmd-log                  plaintext terminal command history (cmd feature)
 commands                 optional TOML command buttons (cmd feature)
 commands.sample          disabled command-button example; never executed
 ```

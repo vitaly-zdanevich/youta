@@ -35714,7 +35714,7 @@ impl UiController for AppController {
             }
         }
         #[cfg(feature = "cmd")]
-        if (self.view.local_command.is_some() || self.local_command.running)
+        if self.view.local_command.is_some()
             && !local_command::command_action(&action)
             && !matches!(
                 action,
@@ -37347,16 +37347,6 @@ impl UiController for AppController {
         if !available {
             self.dismiss_local_command();
         }
-    }
-
-    #[cfg(feature = "cmd")]
-    fn take_local_command_plan(&mut self) -> Option<crate::local_command::LocalCommandPlan> {
-        self.local_command.pending.take()
-    }
-
-    #[cfg(feature = "cmd")]
-    fn report_local_command_result(&mut self, result: Result<(), String>) {
-        self.finish_local_command(result);
     }
 
     #[cfg(feature = "cmd")]
@@ -47569,6 +47559,9 @@ mod tests {
     #[cfg(feature = "s3-upload")]
     #[path = "s3_upload.rs"]
     mod s3_upload_tests;
+    #[cfg(all(feature = "cmd", feature = "yt-dlp"))]
+    #[path = "typed_prompt_tests.rs"]
+    mod typed_prompt_tests;
     #[cfg(feature = "url-info")]
     #[path = "url_info.rs"]
     mod url_info_tests;
