@@ -4,7 +4,7 @@ resolver = "3"
 
 [package]
 name = "youta"
-version = "0.99.0"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.95"
 description = "A low-resource YouTube TUI audio player and local subscription manager that uses yt-dlp and saves and shows listening progress"
@@ -214,7 +214,7 @@ keyring = []
 # Shared networking and first-class sources.
 network = ["dep:ureq"]
 # Explicit website metadata and public RDAP lookups for Local comments.
-url-info = ["network", "dep:html5gum"]
+url-info = ["network", "dep:html5gum", "dep:rustls", "dep:webpki-roots", "dep:x509-cert"]
 # Explicit reviewed public transfers to Internet Archive, removable independently
 # of Archive browsing, Commons and Evernote. Private staging and credentials stay
 # behind this feature; no upload runs without a separate confirmation.
@@ -413,6 +413,9 @@ ratatui-image = { version = "=11.0.6", default-features = false, features = ["cr
 quick-xml = { version = "0.41.0", features = ["serialize"], optional = true }
 sha2 = { version = "0.10.9", optional = true }
 ureq = { version = "3.3.0", features = ["json"], optional = true }
+rustls = { version = "0.23.42", default-features = false, features = ["std", "ring", "tls12"], optional = true }
+webpki-roots = { version = "1", optional = true }
+x509-cert = { version = "0.2.5", default-features = false, features = ["std"], optional = true }
 zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"], optional = true }
 
 # Windows has no stable `std` route to a file's identity: the volume serial

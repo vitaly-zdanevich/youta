@@ -479,6 +479,14 @@ redirects and resolved addresses. Scripts/resources are not loaded.
 Website metadata and domain registration run concurrently, sharing one
 eight-second network budget and preserving partial results. Registration
 discovery still precedes its dependent registry request.
+Info shows the connected IP, redirects, supplied Server and Content-Encoding
+headers, human-readable Content-Length when supplied, and identifiable CDN
+header hints. Content length is the declared transfer size, compressed when
+the response uses compression, not the decoded page size. Network country (registered) is
+the IP allocation's country, not physical server geolocation; a CDN can hide
+the actual host. TLS version, certificate issuer, expiry and DNS names come
+from the same verified connection. Certificate domains are covered names,
+not proof of common ownership.
 Up to 64 recent results stay cached in RAM until exit, without expiry or a
 Refresh button. No browser or API key is required, including on a physical TTY.
 The default-on

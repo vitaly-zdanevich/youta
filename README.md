@@ -171,6 +171,15 @@ query string) and the authoritative RDAP service discovered through
 When no RDAP service is listed, Info discovers the registry's WHOIS server through
 IANA and queries the domain over TCP port 43. [WHOIS](https://www.rfc-editor.org/info/rfc3912/)
 needs no API key, but is unencrypted; the website path and query are never sent to it.
+Info also shows the connected IP, redirect chain, supplied `Server` and
+`Content-Encoding` headers, human-readable `Content-Length` when supplied,
+and identifiable CDN response-header hints. Content length is the declared
+transfer size (compressed size for an encoded response), not decoded page size.
+IP registration comes from IANA-discovered RDAP services: `Network country
+(registered)` describes the allocation, not the server's physical location;
+a CDN may hide the website's actual host. HTTPS certificate issuer, expiry,
+negotiated TLS version, and certificate DNS names come from the same verified
+connection. Certificate domains show coverage, not common ownership.
 Disable the default-on `url-info` Cargo feature or Gentoo USE flag to omit
 this capability from either frontend.
 

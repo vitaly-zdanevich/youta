@@ -478,6 +478,7 @@ mod tests {
                 location: None,
                 content_type: "text/html".into(),
                 body,
+                ..HttpResponse::default()
             })
         }
 

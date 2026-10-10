@@ -10,16 +10,19 @@
 
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use html5gum::{DefaultEmitter, Token, Tokenizer};
 use serde_json::Value;
 use ureq::unversioned::resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver};
-use ureq::unversioned::transport::{DefaultConnector, NextTimeout};
+use ureq::unversioned::transport::{Connector, NextTimeout, TcpConnector};
 use url::{Host, Url};
 
 use crate::domain::{ip_address_is_non_public, remote_url_has_non_public_host};
 
+mod network;
+mod tls;
 mod whois;
 
 const BOOTSTRAP_URL: &str = "https://data.iana.org/rdap/dns.json";
@@ -43,6 +46,7 @@ const MAX_BOOTSTRAP_SUFFIXES: usize = 4_096;
 pub(crate) struct UrlInfoClient {
     bootstrap: Option<Vec<BootstrapService>>,
     whois: whois::WhoisClient,
+    network: network::NetworkClient,
 }
 
 impl UrlInfoClient {
@@ -70,6 +74,13 @@ impl UrlInfoClient {
             return facts.finish();
         }
         let budget = Budget::new(cancelled);
+        // The website worker owns the IP bootstrap cache. A mutex also permits
+        // the sequential fallback without retaining a mutable scoped borrow.
+        let network = Mutex::new(std::mem::take(&mut self.network));
+        let website = || {
+            let mut network = network.lock().map_err(|_| Failure::Transport)?;
+            fetch_website(transport, url, &budget, &mut network)
+        };
         let (page, registration) = if let Some(Host::Domain(host)) = url.host() {
             let host = host.trim_end_matches('.').to_ascii_lowercase();
             std::thread::scope(|scope| {
@@ -77,9 +88,8 @@ impl UrlInfoClient {
                 // The website shares the deadline and atomic request allowance.
                 match std::thread::Builder::new()
                     .name("youta-url-website".into())
-                    .spawn_scoped(scope, || {
-                        fetch_document(transport, url, DocumentKind::Html, &budget)
-                    }) {
+                    .spawn_scoped(scope, website)
+                {
                     Ok(website) => {
                         let registration = self.registration(&host, transport, &budget);
                         let page = website.join().unwrap_or(Err(Failure::Transport));
@@ -87,20 +97,18 @@ impl UrlInfoClient {
                     }
                     Err(_) => {
                         // Thread limits must not make otherwise usable lookups fail.
-                        let page = fetch_document(transport, url, DocumentKind::Html, &budget);
+                        let page = website();
                         (page, Some(self.registration(&host, transport, &budget)))
                     }
                 }
             })
         } else {
-            (
-                fetch_document(transport, url, DocumentKind::Html, &budget),
-                None,
-            )
+            (website(), None)
         };
+        self.network = network.into_inner().unwrap_or_default();
         // Keep display order deterministic even when registration finishes first.
         match page {
-            Ok(page) => {
+            Ok((page, network_facts)) => {
                 facts.add(
                     "Website response",
                     &format!("HTTP {}", page.response.status),
@@ -112,6 +120,29 @@ impl UrlInfoClient {
                 if page.url != requested_url {
                     facts.add("Final URL", page.url.as_str());
                 }
+                if !page.redirects.is_empty() {
+                    let chain = page
+                        .redirects
+                        .iter()
+                        .chain(std::iter::once(&page.url))
+                        .map(Url::as_str)
+                        .collect::<Vec<_>>()
+                        .join(" -> ");
+                    facts.add("Redirect chain", &chain);
+                }
+                if let Some(ip) = page.response.peer_ip {
+                    facts.add("IP address", &ip.to_string());
+                }
+                facts.add("Server", &page.response.server);
+                facts.add("Compression", &page.response.compression);
+                if let Some(bytes) = page.response.content_length {
+                    facts.add("Content length", &human_content_length(bytes));
+                }
+                facts.add("CDN (reported)", &page.response.reported_cdns.join(", "));
+                if let Some(tls) = page.response.tls_info {
+                    facts.extend(tls.facts);
+                }
+                facts.extend(network_facts);
                 if (200..300).contains(&page.response.status) {
                     match html_facts(&page.response.body) {
                         Ok(values) => facts.extend(values),
@@ -214,6 +245,23 @@ impl UrlInfoClient {
         }
         Err(Failure::NotFound)
     }
+}
+
+/// Enriches the final website response using its connected peer, preserving the page on failure.
+fn fetch_website(
+    transport: &impl HttpTransport,
+    url: &Url,
+    budget: &Budget<'_>,
+    network: &mut network::NetworkClient,
+) -> Result<(FetchedDocument, Vec<String>), Failure> {
+    let page = fetch_document(transport, url, DocumentKind::Html, budget)?;
+    let facts = page
+        .response
+        .peer_ip
+        .filter(|ip| !ip_address_is_non_public(*ip))
+        .and_then(|ip| network.lookup(ip, transport, budget).ok())
+        .unwrap_or_default();
+    Ok((page, facts))
 }
 
 /// Fixed errors omit request URLs and third-party response/error bodies.
@@ -323,18 +371,25 @@ impl DocumentKind {
 }
 
 /// One bounded HTTP response; redirect and error bodies are deliberately not retained.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct HttpResponse {
     status: u16,
     location: Option<String>,
     content_type: String,
     body: Vec<u8>,
+    peer_ip: Option<std::net::IpAddr>,
+    reported_cdns: Vec<&'static str>,
+    tls_info: Option<tls::TlsInfo>,
+    server: String,
+    compression: String,
+    content_length: Option<u64>,
 }
 
 #[derive(Debug)]
 struct FetchedDocument {
     url: Url,
     response: HttpResponse,
+    redirects: Vec<Url>,
 }
 
 /// Injectable I/O boundary; callers independently enforce redirects and document budgets.
@@ -384,6 +439,7 @@ fn fetch_document(
 ) -> Result<FetchedDocument, Failure> {
     let mut current = url.clone();
     current.set_fragment(None);
+    let mut chain = Vec::new();
     for redirects in 0..=MAX_REDIRECTS {
         validate_public_url(&current)?;
         if matches!(kind, DocumentKind::Json) && current.scheme() != "https" {
@@ -406,6 +462,7 @@ fn fetch_document(
                 return Err(Failure::Redirect);
             }
             next.set_fragment(None);
+            chain.push(current);
             current = next;
             continue;
         }
@@ -418,6 +475,7 @@ fn fetch_document(
         return Ok(FetchedDocument {
             url: current,
             response,
+            redirects: chain,
         });
     }
     Err(Failure::Redirect)
@@ -480,7 +538,19 @@ impl HttpTransport for UreqTransport {
             #[cfg(test)]
             allow_loopback: test_loopback,
         };
-        let agent = ureq::Agent::with_parts(config, DefaultConnector::default(), resolver);
+        let peer = Arc::new(Mutex::new(None));
+        let tls = Arc::new(Mutex::new(None));
+        let connector = network::PeerConnector::with_connector(
+            Arc::clone(&peer),
+            TcpConnector::default().chain(tls::InfoTlsConnector::new(Arc::clone(&tls))),
+        );
+        #[cfg(test)]
+        let connector = {
+            let mut connector = connector;
+            connector.allow_loopback = test_loopback;
+            connector
+        };
+        let agent = ureq::Agent::with_parts(config, connector, resolver);
         let mut response = agent
             .get(url.as_str())
             .header(
@@ -496,6 +566,31 @@ impl HttpTransport for UreqTransport {
                 _ => Failure::Transport,
             })?;
         let status = response.status().as_u16();
+        let content_length = response
+            .headers()
+            .get("content-length")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse().ok());
+        let server = response
+            .headers()
+            .get("server")
+            .and_then(|value| value.to_str().ok())
+            .map(safe_text)
+            .unwrap_or_default();
+        let compression = response
+            .headers()
+            .get_all("content-encoding")
+            .iter()
+            .take(8)
+            .filter_map(|value| value.to_str().ok())
+            .flat_map(|value| value.split(','))
+            .map(str::trim)
+            .filter(|value| !value.eq_ignore_ascii_case("identity"))
+            .map(safe_text)
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let reported_cdns = network::reported_cdns(response.headers());
         let location = response
             .headers()
             .get("location")
@@ -549,8 +644,32 @@ impl HttpTransport for UreqTransport {
             location,
             content_type,
             body,
+            peer_ip: *peer.lock().map_err(|_| Failure::Transport)?,
+            tls_info: tls.lock().map_err(|_| Failure::Transport)?.take(),
+            reported_cdns,
+            server,
+            compression,
+            content_length,
         })
     }
+}
+
+/// Formats the declared transfer length without confusing it with decoded or measured bytes.
+fn human_content_length(bytes: u64) -> String {
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut scale = 1024_u64;
+    let mut unit = "KiB";
+    for next in ["MiB", "GiB", "TiB", "PiB", "EiB"] {
+        if bytes / scale < 1024 {
+            break;
+        }
+        scale *= 1024;
+        unit = next;
+    }
+    let tenths = (u128::from(bytes) * 10 + u128::from(scale) / 2) / u128::from(scale);
+    format!("{}.{} {unit}", tenths / 10, tenths % 10)
 }
 
 /// DNS filtering pins actual connections to public addresses; literal checks alone are insufficient.
@@ -1057,6 +1176,73 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
+    #[test]
+    fn content_lengths_use_binary_units_without_overflow_or_fabricated_values() {
+        for (bytes, expected) in [
+            (0, "0 B"),
+            (1023, "1023 B"),
+            (1024, "1.0 KiB"),
+            (1_048_576, "1.0 MiB"),
+            (u64::MAX, "16.0 EiB"),
+        ] {
+            assert_eq!(human_content_length(bytes), expected);
+        }
+        assert!(HttpResponse::default().content_length.is_none());
+    }
+
+    /// Peer observations belong to the final page, never a second DNS lookup or registry socket.
+    #[test]
+    fn website_connection_facts_include_only_supplied_headers_and_verified_peer() {
+        struct Observed;
+        impl HttpTransport for Observed {
+            fn fetch(
+                &self,
+                url: &Url,
+                _: DocumentKind,
+                _: Duration,
+                _: &AtomicBool,
+            ) -> Result<HttpResponse, Failure> {
+                if url.as_str() != "https://8.8.8.8/" {
+                    return Err(Failure::Unavailable);
+                }
+                Ok(HttpResponse {
+                    status: 200,
+                    content_type: "text/html".into(),
+                    body: b"<title>A page</title>".to_vec(),
+                    peer_ip: Some("8.8.8.8".parse().unwrap()),
+                    server: "nginx/1.26.3".into(),
+                    compression: "gzip".into(),
+                    content_length: Some(25_190),
+                    reported_cdns: vec!["Cloudflare"],
+                    tls_info: Some(tls::TlsInfo {
+                        facts: vec!["TLS version: 1.3".into()],
+                    }),
+                    ..HttpResponse::default()
+                })
+            }
+        }
+        let facts = UrlInfoClient::default().lookup_with(
+            &Url::parse("https://8.8.8.8/").unwrap(),
+            &AtomicBool::new(false),
+            &Observed,
+        );
+        for expected in [
+            "Title: A page",
+            "IP address: 8.8.8.8",
+            "Server: nginx/1.26.3",
+            "Compression: gzip",
+            "Content length: 24.6 KiB",
+            "CDN (reported): Cloudflare",
+            "TLS version: 1.3",
+        ] {
+            assert!(
+                facts.iter().any(|fact| fact == expected),
+                "missing {expected}: {facts:?}"
+            );
+        }
+        assert!(!facts.iter().any(|fact| fact.starts_with("Network country")));
+    }
+
     /// Scripted per-URL queues preserve redirect order without depending on branch scheduling.
     #[derive(Default)]
     struct MockTransport {
@@ -1078,6 +1264,7 @@ mod tests {
                     }
                     .to_owned(),
                     body: body.into(),
+                    ..HttpResponse::default()
                 }),
             ));
         }
@@ -1090,6 +1277,7 @@ mod tests {
                     location: Some(location.to_owned()),
                     content_type: String::new(),
                     body: Vec::new(),
+                    ..HttpResponse::default()
                 }),
             ));
         }
@@ -1300,6 +1488,7 @@ mod tests {
                     }
                     .into(),
                     body,
+                    ..HttpResponse::default()
                 })
             }
         }
@@ -1845,6 +2034,9 @@ mod tests {
             .join("\n");
         assert!(facts.contains("Website response: HTTP 200"));
         assert!(facts.contains("Final URL: https://artist.example/final"));
+        assert!(facts.contains(
+            "Redirect chain: http://artist.example/start -> https://artist.example/final"
+        ));
         assert!(!facts.contains("Transport:"));
         assert!(facts.contains("Title: Redirected title"));
         assert!(facts.contains("No supported registration service"));
@@ -2030,7 +2222,7 @@ mod tests {
                     request.push(byte[0]);
                 }
                 requests.push(String::from_utf8(request).unwrap());
-                stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nSet-Cookie: secret=must-not-replay\r\nContent-Length: 16\r\nConnection: close\r\n\r\n<title>x</title>").unwrap();
+                stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nServer: nginx/1.26.3\r\nContent-Encoding: identity\r\nSet-Cookie: secret=must-not-replay\r\nContent-Length: 16\r\nConnection: close\r\n\r\n<title>x</title>").unwrap();
             }
             requests
         });
@@ -2050,6 +2242,12 @@ mod tests {
                 .fetch(&url, DocumentKind::Html, Duration::from_secs(2), &cancelled)
                 .unwrap();
             assert_eq!(response.body, b"<title>x</title>");
+            assert_eq!(response.peer_ip, Some(address.ip()));
+            assert_eq!(response.server, "nginx/1.26.3");
+            assert_eq!(response.content_length, Some(16));
+            assert!(response.compression.is_empty());
+            assert!(response.reported_cdns.is_empty());
+            assert!(response.tls_info.is_none());
         }
         for request in server.join().unwrap() {
             let request = request.to_ascii_lowercase();
