@@ -48,6 +48,7 @@ impl UrlInfoClient {
     /// The caller must use a worker. One shared eight-second budget covers DNS,
     /// requests, redirects, and body reads. Cancellation is checked between reads.
     /// Errors are fixed explanations and never echo credentials or request queries.
+    /// The final URL is shown only when it differs from the fragment-free original.
     pub(crate) fn lookup(&mut self, url: &Url, cancelled: &AtomicBool) -> Vec<String> {
         self.lookup_with(url, cancelled, &UreqTransport::default())
     }
@@ -71,7 +72,13 @@ impl UrlInfoClient {
                     "Website response",
                     &format!("HTTP {}", page.response.status),
                 );
-                facts.add("Final URL", page.url.as_str());
+                // Fragments are not sent to the server, so their removal is
+                // not a changed destination worth repeating in the facts.
+                let mut requested_url = url.clone();
+                requested_url.set_fragment(None);
+                if page.url != requested_url {
+                    facts.add("Final URL", page.url.as_str());
+                }
                 if (200..300).contains(&page.response.status) {
                     match html_facts(&page.response.body) {
                         Ok(values) => facts.extend(values),
@@ -1137,6 +1144,82 @@ mod tests {
             .unwrap(),
             ["Description: \"A & B\" 'quoted'"]
         );
+    }
+
+    /// Unchanged destinations do not repeat the URL, including after round-trip redirects.
+    #[test]
+    fn unchanged_final_url_is_omitted_without_losing_website_or_registration_facts() {
+        for (original, requested) in [
+            ("https://artist.co.uk/music", "https://artist.co.uk/music"),
+            (
+                "https://ARTIST.CO.UK:443/music#section",
+                "https://artist.co.uk/music",
+            ),
+            (
+                "https://artist.co.uk/music?q=one%20two&lang=en#section",
+                "https://artist.co.uk/music?q=one%20two&lang=en",
+            ),
+        ] {
+            for round_trip in [false, true] {
+                let transport = MockTransport::default();
+                if round_trip {
+                    transport.redirect(requested, "/intermediate");
+                    transport.redirect("https://artist.co.uk/intermediate", requested);
+                }
+                transport.push(requested, 200, b"<title>Artist</title>".to_vec());
+                transport.push(BOOTSTRAP_URL, 200, bootstrap());
+                transport.push(
+                    "https://registry.example/rdap/domain/artist.co.uk",
+                    200,
+                    domain("artist.co.uk"),
+                );
+                let facts = UrlInfoClient::default().lookup_with(
+                    &Url::parse(original).unwrap(),
+                    &AtomicBool::new(false),
+                    &transport,
+                );
+                assert!(
+                    !facts.iter().any(|line| line.starts_with("Final URL:")),
+                    "unchanged destination should be hidden: {facts:?}"
+                );
+                assert!(facts.contains(&"Website response: HTTP 200".to_owned()));
+                assert!(facts.contains(&"Title: Artist".to_owned()));
+                assert!(facts.contains(
+                    &"RDAP source: https://registry.example/rdap/domain/artist.co.uk".to_owned()
+                ));
+                assert_eq!(
+                    transport.requests.borrow().len(),
+                    if round_trip { 5 } else { 3 }
+                );
+                assert!(transport.responses.borrow().is_empty());
+            }
+        }
+    }
+
+    /// A query-only redirect is meaningful even when the origin and path stay unchanged.
+    #[test]
+    fn query_only_redirect_keeps_the_final_url() {
+        let transport = MockTransport::default();
+        transport.redirect("https://artist.co.uk/music?q=old", "?q=new#section");
+        transport.push(
+            "https://artist.co.uk/music?q=new",
+            200,
+            b"<title>New results</title>".to_vec(),
+        );
+        transport.push(BOOTSTRAP_URL, 200, bootstrap());
+        transport.push(
+            "https://registry.example/rdap/domain/artist.co.uk",
+            200,
+            domain("artist.co.uk"),
+        );
+        let facts = UrlInfoClient::default().lookup_with(
+            &Url::parse("https://artist.co.uk/music?q=old#section").unwrap(),
+            &AtomicBool::new(false),
+            &transport,
+        );
+        assert!(facts.contains(&"Final URL: https://artist.co.uk/music?q=new".to_owned()));
+        assert!(facts.contains(&"Title: New results".to_owned()));
+        assert!(transport.responses.borrow().is_empty());
     }
 
     /// Explicit website queries survive redirects but never reach IANA or RDAP.
