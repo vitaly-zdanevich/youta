@@ -617,6 +617,7 @@ fn safe_text(value: &str) -> String {
 }
 
 /// Tokenizes only a bounded page prefix; scripts, styles, body text, and templates are not facts.
+/// Title and description use ASCII hyphens for em dashes unsupported by some TTY fonts.
 fn html_facts(html: &[u8]) -> Result<Vec<String>, Failure> {
     if html.len() > MAX_HTML_BYTES {
         return Err(Failure::TooLarge);
@@ -708,22 +709,18 @@ fn html_facts(html: &[u8]) -> Result<Vec<String>, Failure> {
         }
     }
     let title = safe_text(&title);
+    let title = if title.is_empty() {
+        fields.get("fallback-title").map_or("", String::as_str)
+    } else {
+        &title
+    };
+    let description = fields
+        .get("description")
+        .or_else(|| fields.get("fallback-description"))
+        .map_or("", String::as_str);
     let mut facts = Facts::default();
-    facts.add(
-        "Title",
-        if title.is_empty() {
-            fields.get("fallback-title").map_or("", String::as_str)
-        } else {
-            &title
-        },
-    );
-    facts.add(
-        "Description",
-        fields
-            .get("description")
-            .or_else(|| fields.get("fallback-description"))
-            .map_or("", String::as_str),
-    );
+    facts.add("Title", &title.replace('—', "-"));
+    facts.add("Description", &description.replace('—', "-"));
     for (key, label) in [
         ("author", "Author (website claim)"),
         ("site", "Site"),
@@ -1144,6 +1141,28 @@ mod tests {
             .unwrap(),
             ["Description: \"A & B\" 'quoted'"]
         );
+    }
+
+    /// Page prose uses ASCII dashes in TTYs, including entity-decoded Open Graph fallbacks.
+    #[test]
+    fn html_title_and_description_use_ascii_dashes() {
+        for html in [
+            "<title>Предание.ру — помощь &mdash; людям</title>\
+             <meta name='description' content='Музыка — книги &#8212; видео'>\
+             <meta property='og:site_name' content='Сайт — имя'>",
+            "<meta property='og:title' content='Предание.ру &mdash; помощь — людям'>\
+             <meta property='og:description' content='Музыка &#x2014; книги — видео'>\
+             <meta property='og:site_name' content='Сайт — имя'>",
+        ] {
+            assert_eq!(
+                html_facts(html.as_bytes()).unwrap(),
+                [
+                    "Title: Предание.ру - помощь - людям",
+                    "Description: Музыка - книги - видео",
+                    "Site: Сайт — имя",
+                ]
+            );
+        }
     }
 
     /// Unchanged destinations do not repeat the URL, including after round-trip redirects.
