@@ -147,6 +147,124 @@ mod wire_tests {
     use super::{Key, KeyPress, PopupGeometry, key_action};
     use crate::playback::PlaybackStatus;
 
+    /// Tilde toggles Repeat in normal browsing without taking Rename or modified chords.
+    #[test]
+    fn local_repeat_shortcut_preserves_rename_and_other_tabs() {
+        use crate::view::{Screen, SubscriptionRoute};
+
+        let mut view = ViewModel {
+            screen: Screen::Local,
+            ..ViewModel::default()
+        };
+        for shift in [false, true] {
+            let key = KeyPress {
+                shift,
+                ..KeyPress::new(Key::Char('~'))
+            };
+            for screen in Screen::ALL {
+                view.screen = screen;
+                assert_eq!(
+                    key_action(key, &view, None, None),
+                    Some(UiAction::ToggleRepeat),
+                    "tilde on {screen:?}"
+                );
+                for (ctrl, alt) in [(true, false), (false, true), (true, true)] {
+                    assert_eq!(
+                        key_action(KeyPress { ctrl, alt, ..key }, &view, None, None),
+                        None
+                    );
+                }
+            }
+        }
+        view.screen = Screen::Local;
+        assert_eq!(
+            key_action(KeyPress::new(Key::Char('A')), &view, None, None),
+            Some(UiAction::ToggleAutoplay)
+        );
+        assert_eq!(
+            key_action(KeyPress::new(Key::Char('r')), &view, None, None),
+            Some(if cfg!(feature = "local-rename") {
+                UiAction::BeginLocalRename
+            } else {
+                UiAction::ToggleRepeat
+            })
+        );
+        for (screen, expected) in [
+            (Screen::Local, None),
+            (Screen::Search, None),
+            (Screen::Radio, None),
+            (Screen::Downloaded, None),
+            (Screen::Web, Some(UiAction::RefreshWeb)),
+            (
+                Screen::Subscriptions,
+                Some(UiAction::RefreshSubscriptionVideos),
+            ),
+            (
+                Screen::YandexMusic,
+                Some(UiAction::DownloadTwentyYandexMusicRecommendations),
+            ),
+        ] {
+            view.screen = screen;
+            view.subscriptions.route = SubscriptionRoute::Items;
+            view.yandex_music_actions.twenty_recommendations_available = true;
+            assert_eq!(
+                key_action(KeyPress::new(Key::Char('R')), &view, None, None),
+                expected,
+                "uppercase R on {screen:?}"
+            );
+        }
+    }
+
+    /// Modal text entry and explicit custom commands keep priority over tilde Repeat.
+    #[test]
+    fn local_repeat_shortcut_respects_editors_and_custom_commands() {
+        use crate::view::{LocalFilePopupView, Screen};
+
+        let mut view = ViewModel {
+            screen: Screen::Local,
+            ..ViewModel::default()
+        };
+        let key = KeyPress::new(Key::Char('~'));
+        view.search_editing = true;
+        assert_eq!(
+            key_action(key, &view, None, None),
+            Some(UiAction::AppendSearch('~'))
+        );
+        view.search_editing = false;
+        view.help_open = true;
+        assert_eq!(key_action(key, &view, None, None), None);
+        view.help_open = false;
+        view.local_file_popup = Some(LocalFilePopupView::Rename {
+            value: "fixture.mp3".into(),
+            cursor_byte: 0,
+            error: None,
+        });
+        assert_eq!(
+            key_action(key, &view, None, None),
+            Some(UiAction::AppendLocalRenameCharacter('~'))
+        );
+        view.local_file_popup = None;
+        #[cfg(feature = "cmd")]
+        {
+            use crate::view::CustomCommandButtonView;
+
+            view.custom_command_buttons.push(CustomCommandButtonView {
+                id: 7,
+                binding: Some(crate::local_command::buttons::Hotkey::parse("~").unwrap()),
+                ..CustomCommandButtonView::default()
+            });
+            assert_eq!(
+                key_action(key, &view, None, None),
+                Some(UiAction::RunCustomCommand(7))
+            );
+            view.search_editing = true;
+            assert_eq!(
+                key_action(key, &view, None, None),
+                Some(UiAction::AppendSearch('~'))
+            );
+        }
+    }
+
     /// Bare F1 opens YT from ordinary browsing without stealing modified function keys.
     #[test]
     fn f1_opens_youtube_only_during_normal_browsing() {
@@ -3792,6 +3910,8 @@ fn unfiltered_key_action(
             Some(UiAction::ToggleYouTubeCreativeCommons)
         }
         Key::Char('A') => Some(UiAction::ToggleAutoplay),
+        // Tilde stays available where r is reserved for Rename or radio recording.
+        Key::Char('~') if !key.chorded() => Some(UiAction::ToggleRepeat),
         #[cfg(feature = "commons-upload")]
         Key::Char('U') if !key.chorded() && view.commons_upload_available => {
             Some(UiAction::OpenCommonsUpload)

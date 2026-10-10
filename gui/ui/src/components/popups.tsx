@@ -165,7 +165,7 @@ export function HelpPopup({
         ["[ · ]", "previous · next chapter"],
         ["{ · }", "previous · next item in the queue"],
         ["T", "chapter timestamps"],
-        ["r · A", "repeat · autoplay"],
+		['~ · A', 'repeat · autoplay'],
         ["w", "waveform"],
         ...(asciiVisualizerSupported
           ? ([['F10', 'fullscreen ASCII audio visualizer']] satisfies Array<[string, string]>)

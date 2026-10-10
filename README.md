@@ -523,8 +523,11 @@ followed by `[r] Repeat: off`. Both controls show their current state and accept
 mouse clicks or the displayed hotkeys. Podcast continuation follows the loaded
 episode order, stops at the last episode, and survives browsing another show.
 
-The shared `r` shortcut toggles Repeat outside contexts that assign it another
-action: in Radio it records, and in Local it opens Rename.
+The Local TUI footer shows `[A] Autoplay: off/on` followed by
+`[~] Repeat: off/on`; click either status or press its displayed key to toggle it.
+The `~` shortcut toggles Repeat during normal browsing in any tab. The existing
+`r` shortcut also toggles Repeat outside contexts that assign it another action:
+in Radio it records, and in Local it opens Rename.
 
 `u` opens that queue. It lists the entries in play order, marks the one
 playback is on, and starts the selected entry from where it sits, drops a
