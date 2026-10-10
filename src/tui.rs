@@ -8576,7 +8576,7 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
         actions_help
     };
     let help = [
-        "Navigation",
+        "Navigation     Details URLs: </> previous/next (no focus needed); i Info",
         "  / search     Tab next tab     Shift+Tab previous tab     S subs",
         "  Ctrl+Tab/Ctrl+Shift+Tab are aliases when the terminal distinguishes them.",
         history_navigation_help,
@@ -8593,7 +8593,7 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
         "  Linux /dev/ttyN: physical mouse input requires a running GPM daemon.",
         "Playback",
         "  Space pause     ←/→ 5 s     Ctrl+←/→ 20 s     0–9 seek by 10%",
-        "  ↑/↓ volume </> speed 10% [ prev chapter ] next chapter T chapter times",
+        "  ↑/↓ volume ,/. speed 10% [ prev chapter ] next chapter T chapter times",
         "  {/} previous / next item in the queue or its source list",
         "  r repeat     A autoplay next item from same source list   w waveform",
         "  Details: Alt+←/→ history  Alt+↑/↓ (Linux TTY: Alt+u/d) scroll",
@@ -19674,6 +19674,8 @@ for encoded, expected in json.load(sys.stdin):
         assert!(rendered.contains("Alt+↑/↓ (Linux TTY: Alt+u/d)"));
         assert!(rendered.contains("Backspace back"));
         assert!(rendered.contains("speed 10%"));
+        assert!(rendered.contains(",/. speed 10%"));
+        assert!(rendered.contains("Details URLs: </> previous/next (no focus needed); i Info"));
         assert!(rendered.contains("[ prev chapter"));
         assert!(rendered.contains("] next chapter"));
         assert!(rendered.contains("T chapter times"));
@@ -39951,6 +39953,7 @@ prose 07:25 remains clickable but is not a chapter";
             .collect::<String>();
         assert!(text.contains("Title: Fetched website"));
         assert!(text.contains("URL 13 of 20"));
+        assert!(text.contains("[<] [>] URL 13 of 20"));
         let start = buffer
             .content()
             .windows(6)
@@ -39990,6 +39993,32 @@ prose 07:25 remains clickable but is not a chapter";
             ),
             Some(UiAction::MoveUrlInfo(-1))
         );
+        for (character, delta) in [('<', -1), ('>', 1)] {
+            for modifiers in [KeyModifiers::NONE, KeyModifiers::SHIFT] {
+                assert_eq!(
+                    key_action(KeyEvent::new(KeyCode::Char(character), modifiers), &view),
+                    Some(UiAction::MoveUrlInfo(delta))
+                );
+            }
+            let (_, target) = hits
+                .detail_buttons
+                .iter()
+                .find(|(action, _)| *action == UiAction::MoveUrlInfo(delta))
+                .unwrap();
+            assert_eq!(
+                mouse_action(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: target.x,
+                        row: target.y,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    &hits,
+                    &view
+                ),
+                Some(UiAction::MoveUrlInfo(delta))
+            );
+        }
         view.external_opener_available = false;
         hits = HitMap::default();
         terminal

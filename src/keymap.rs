@@ -270,6 +270,148 @@ mod wire_tests {
     #[cfg(feature = "cmd")]
     use crate::view::{LocalCommandHistoryView, LocalCommandView, Screen};
 
+    /// Supplies a URL rail without relying on provider workers or networking.
+    fn url_navigation_view() -> ViewModel {
+        ViewModel {
+            details: Some(DetailView {
+                url_info: (0..3)
+                    .map(|index| crate::view::UrlInfoView {
+                        url: format!("https://example.com/{index}"),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// The displayed arrow shortcuts navigate URLs without taking focus or changing speed.
+    #[test]
+    fn url_navigation_angle_keys_ignore_focus_and_leave_comma_period_for_speed() {
+        let mut view = url_navigation_view();
+        for focused in [false, true] {
+            view.details_focused = focused;
+            for offset in 0..3 {
+                view.details.as_mut().unwrap().url_info_offset = offset;
+                for shift in [false, true] {
+                    for (character, action) in [
+                        ('<', UiAction::MoveUrlInfo(-1)),
+                        ('>', UiAction::MoveUrlInfo(1)),
+                        (',', UiAction::ChangeSpeed(-0.1)),
+                        ('.', UiAction::ChangeSpeed(0.1)),
+                    ] {
+                        assert_eq!(
+                            key_action(
+                                KeyPress {
+                                    shift,
+                                    ..KeyPress::new(Key::Char(character))
+                                },
+                                &view,
+                                None,
+                                None
+                            ),
+                            Some(action)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Hidden or absent URL navigation retains the existing speed aliases.
+    #[test]
+    fn url_navigation_angle_keys_keep_speed_without_a_visible_multi_url_panel() {
+        let mut hidden = url_navigation_view();
+        hidden.right_panel_mode = crate::view::RightPanelMode::Channel;
+        let mut single = url_navigation_view();
+        single.details.as_mut().unwrap().url_info.truncate(1);
+        let mut empty = url_navigation_view();
+        empty.details.as_mut().unwrap().url_info.clear();
+        for view in [&ViewModel::default(), &hidden, &single, &empty] {
+            for (character, speed) in [('<', -0.1), ('>', 0.1)] {
+                assert_eq!(
+                    key_action(KeyPress::new(Key::Char(character)), view, None, None),
+                    Some(UiAction::ChangeSpeed(speed))
+                );
+            }
+        }
+    }
+
+    /// Subscription layouts must not give hidden item descriptions keyboard ownership.
+    #[test]
+    fn url_navigation_angle_keys_follow_subscription_description_visibility() {
+        let mut view = url_navigation_view();
+        view.screen = crate::view::Screen::Subscriptions;
+        for (layout, route, expanded, visible) in [
+            (
+                crate::config::SubscriptionsLayout::Split,
+                crate::view::SubscriptionRoute::Sources,
+                false,
+                false,
+            ),
+            (
+                crate::config::SubscriptionsLayout::Split,
+                crate::view::SubscriptionRoute::Sources,
+                true,
+                true,
+            ),
+            (
+                crate::config::SubscriptionsLayout::DrillDown,
+                crate::view::SubscriptionRoute::Sources,
+                false,
+                false,
+            ),
+            (
+                crate::config::SubscriptionsLayout::DrillDown,
+                crate::view::SubscriptionRoute::Items,
+                false,
+                true,
+            ),
+        ] {
+            view.subscriptions.layout = layout;
+            view.subscriptions.route = route;
+            view.subscriptions.description_expanded = expanded;
+            assert_eq!(
+                key_action(KeyPress::new(Key::Char('>')), &view, None, None),
+                Some(if visible {
+                    UiAction::MoveUrlInfo(1)
+                } else {
+                    UiAction::ChangeSpeed(0.1)
+                })
+            );
+        }
+    }
+
+    /// Editing and overlays consume printable arrows before either navigation or speed.
+    #[test]
+    fn url_navigation_angle_keys_preserve_editor_and_overlay_priority() {
+        let mut view = url_navigation_view();
+        for character in ['<', '>'] {
+            let key = KeyPress::new(Key::Char(character));
+            view.search_editing = true;
+            assert_eq!(
+                key_action(key, &view, None, None),
+                Some(UiAction::AppendSearch(character))
+            );
+            view.search_editing = false;
+            view.private_note_popup = Some(crate::view::PrivateNotePopupView::default());
+            assert_eq!(
+                key_action(key, &view, None, None),
+                Some(UiAction::AppendPrivateNoteCharacter(character))
+            );
+            view.private_note_popup = None;
+            view.help_open = true;
+            assert_eq!(key_action(key, &view, None, None), None);
+            view.help_open = false;
+            view.details.as_mut().unwrap().thumbnail_expanded = true;
+            view.details.as_mut().unwrap().thumbnail_url =
+                Some(url::Url::parse("https://example.com/artwork.jpg").unwrap());
+            assert_eq!(key_action(key, &view, None, None), None);
+            view.details.as_mut().unwrap().thumbnail_expanded = false;
+        }
+    }
+
     /// Colon opens the terminal command prompt in every tab, independent of playback.
     #[test]
     #[cfg(feature = "cmd")]
@@ -3631,6 +3773,12 @@ fn unfiltered_key_action(
         }
         Key::Up => Some(UiAction::ChangeVolume(5)),
         Key::Down => Some(UiAction::ChangeVolume(-5)),
+        Key::Char('<') if !key.chorded() && details_accept_url_navigation(view) => {
+            Some(UiAction::MoveUrlInfo(-1))
+        }
+        Key::Char('>') if !key.chorded() && details_accept_url_navigation(view) => {
+            Some(UiAction::MoveUrlInfo(1))
+        }
         Key::Char('<') | Key::Char(',') => Some(UiAction::ChangeSpeed(-0.1)),
         Key::Char('>') | Key::Char('.') => Some(UiAction::ChangeSpeed(0.1)),
         Key::Char('[')
@@ -3671,6 +3819,27 @@ fn unfiltered_key_action(
         }
         _ => None,
     }
+}
+
+/// Gives the displayed URL arrows priority over speed, regardless of keyboard focus.
+///
+/// Subscriptions has its own Details visibility rules. Retained item metadata
+/// behind a channel or collapsed description must not capture navigation keys.
+/// Printable arrows remain available to editors and overlays earlier in the map.
+fn details_accept_url_navigation(view: &ViewModel) -> bool {
+    let details_visible = if view.screen == Screen::Subscriptions {
+        match view.subscriptions.layout {
+            SubscriptionsLayout::DrillDown => view.subscriptions.route == SubscriptionRoute::Items,
+            SubscriptionsLayout::Split => view.subscriptions.description_expanded,
+        }
+    } else {
+        view.right_panel_mode == RightPanelMode::Details
+    };
+    details_visible
+        && view
+            .details
+            .as_ref()
+            .is_some_and(|details| details.url_info.len() > 1 && !details.thumbnail_expanded)
 }
 
 /// Reports whether line-scrolling shortcuts can target the visible Details pane.

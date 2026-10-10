@@ -148,9 +148,14 @@ trust score or backlink count. Fetched text is muted and leaves the original
 comment/description unchanged. In the TUI, Info temporarily shows the facts in
 the scrollable Details body; **Hide** restores the description.
 
-Press `i` for the first visible URL's Info; `Alt+i` / `Alt+Shift+i` move to the
-next/previous URL without fetching it. The compact TUI URL rail also has
-clickable previous/next controls. Each unique HTTP(S) URL gets its own control;
+Press `i` for the first visible URL's Info. When Details has multiple URLs,
+press `<` / `>` or click the compact TUI URL rail's `[<]` / `[>]` controls to
+move to the previous/next URL without fetching it; Details does not need
+keyboard focus.
+`Alt+i` / `Alt+Shift+i` remain next/previous URL shortcuts. During normal
+browsing, `,` / `.` decrease/increase playback speed by 0.1; `<` / `>` also
+change speed when Details is not shown or has fewer than two URLs. Editors and
+popups retain their own key handling. Each unique HTTP(S) URL gets its own control;
 lookups are never automatic on selection. Results stay in RAM until exit, with
 up to 64 recent cached URLs and no expiry timer or Refresh button. Each explicit
 request has a shared eight-second network budget; partial results and errors

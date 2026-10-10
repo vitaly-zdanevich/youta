@@ -228,8 +228,14 @@ to navigate ordinary lists.
 .BR 0 " through " 9
 Seek to 0 through 90 percent of the playing item when seeking is available.
 .TP
-.BR , " or " < "; " . " or " >
+.BR , ", " .
 Decrease or increase playback speed by 0.1.
+.B <
+and
+.B >
+also change speed when Details is not shown or has fewer than two URLs.
+When Details has multiple URLs, they move to the previous or next URL instead,
+without requiring focus.
 .TP
 .BR [ ", " ]
 Go to the previous or next chapter of seekable, non-live media.
@@ -439,8 +445,19 @@ or a second
 .TP
 .B i
 Open or hide Info for the first visible URL in Local file comments or YouTube
-descriptions. Each HTTP(S) URL has an independent Info control. Alt+i moves to
-the next URL; Alt+Shift+i moves to the previous URL without fetching it.
+descriptions. Each HTTP(S) URL has an independent Info control. When Details
+has multiple URLs,
+press
+.B <
+or
+.B >
+or click the URL rail's
+.B [<]
+or
+.B [>]
+controls to move to the previous or next URL without fetching it.
+Details does not need keyboard focus. Alt+i and Alt+Shift+i remain shortcuts
+for the next and previous URL. Editors and popups retain their own key handling.
 Info fetches the HTML title/description and public RDAP registration facts:
 dates, registrar, registrant when public, nameservers and status. Redacted
 owner details remain unavailable. Registration dates are not website age or
