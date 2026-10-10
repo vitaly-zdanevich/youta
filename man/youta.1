@@ -464,18 +464,21 @@ or
 controls to move to the previous or next URL without fetching it.
 Details does not need keyboard focus. Alt+i and Alt+Shift+i remain shortcuts
 for the next and previous URL. Editors and popups retain their own key handling.
-Info fetches the HTML title/description and public RDAP registration facts:
+Info fetches the HTML title/description and public RDAP/WHOIS registration facts:
 dates, registrar, registrant when public, nameservers and status. Redacted
 owner details remain unavailable. Registration dates are not website age or
 a trust score. Muted facts temporarily occupy the scrollable terminal Details
 body; Hide restores the unchanged original description.
-Only explicit requests contact websites and IANA-discovered RDAP services.
+Only explicit requests contact websites and IANA-discovered registry services.
+When no RDAP service is listed, Info queries the registry's IANA-discovered WHOIS server
+over TCP port 43. WHOIS needs no API key but is unencrypted; website paths and
+queries are never sent to it.
 Website queries are sent to that website; browser cookies and credentials are
-not used. Private networks and nonstandard ports are rejected, including
+not used. Private networks and nonstandard website ports are rejected, including
 redirects and resolved addresses. Scripts/resources are not loaded.
 Website metadata and domain registration run concurrently, sharing one
 eight-second network budget and preserving partial results. Registration
-discovery still precedes its dependent RDAP request.
+discovery still precedes its dependent registry request.
 Up to 64 recent results stay cached in RAM until exit, without expiry or a
 Refresh button. No browser or API key is required, including on a physical TTY.
 The default-on

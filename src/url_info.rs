@@ -20,6 +20,8 @@ use url::{Host, Url};
 
 use crate::domain::{ip_address_is_non_public, remote_url_has_non_public_host};
 
+mod whois;
+
 const BOOTSTRAP_URL: &str = "https://data.iana.org/rdap/dns.json";
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(8);
 const MAX_HTML_BYTES: usize = 256 * 1024;
@@ -40,6 +42,7 @@ const MAX_BOOTSTRAP_SUFFIXES: usize = 4_096;
 #[derive(Default)]
 pub(crate) struct UrlInfoClient {
     bootstrap: Option<Vec<BootstrapService>>,
+    whois: whois::WhoisClient,
 }
 
 impl UrlInfoClient {
@@ -135,11 +138,24 @@ impl UrlInfoClient {
         facts.finish()
     }
 
+    /// Uses WHOIS only when IANA publishes no supported domain RDAP service.
+    fn registration(
+        &mut self,
+        host: &str,
+        transport: &impl HttpTransport,
+        budget: &Budget<'_>,
+    ) -> Result<Vec<String>, Failure> {
+        match self.rdap_registration(host, transport, budget) {
+            Err(Failure::Unavailable) => self.whois.lookup(host, transport, budget),
+            result => result,
+        }
+    }
+
     /// Tries a parent only after a registry 404, never guessing a registrable suffix.
     ///
     /// Only a validated parent needs a domain label: the original URL already
     /// identifies an exact hostname match, even when its website redirects elsewhere.
-    fn registration(
+    fn rdap_registration(
         &mut self,
         host: &str,
         transport: &impl HttpTransport,
@@ -330,6 +346,17 @@ trait HttpTransport: Sync {
         timeout: Duration,
         cancelled: &AtomicBool,
     ) -> Result<HttpResponse, Failure>;
+
+    /// Queries only the domain through the registry's IANA-discovered WHOIS server.
+    fn whois(
+        &self,
+        _server: &str,
+        _domain: &str,
+        _timeout: Duration,
+        _cancelled: &AtomicBool,
+    ) -> Result<Vec<u8>, Failure> {
+        Err(Failure::Unavailable)
+    }
 }
 
 /// Validates every destination before the transport can perform DNS or HTTP I/O.
@@ -404,6 +431,16 @@ struct UreqTransport {
 }
 
 impl HttpTransport for UreqTransport {
+    fn whois(
+        &self,
+        server: &str,
+        domain: &str,
+        timeout: Duration,
+        cancelled: &AtomicBool,
+    ) -> Result<Vec<u8>, Failure> {
+        whois::query(server, domain, timeout, cancelled)
+    }
+
     fn fetch(
         &self,
         url: &Url,
@@ -1794,6 +1831,11 @@ mod tests {
             b"<title>Redirected title</title>".to_vec(),
         );
         transport.push(BOOTSTRAP_URL, 200, bootstrap());
+        transport.push(
+            "https://www.iana.org/whois?q=example",
+            200,
+            b"<pre>domain: EXAMPLE</pre>".to_vec(),
+        );
         let facts = UrlInfoClient::default()
             .lookup_with(
                 &Url::parse("http://artist.example/start#private-fragment").unwrap(),

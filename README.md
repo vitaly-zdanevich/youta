@@ -162,12 +162,15 @@ lookups are never automatic on selection. Results stay in RAM until exit, with
 up to 64 recent cached URLs and no expiry timer or Refresh button. Each explicit
 request runs website metadata and domain registration concurrently, sharing
 one eight-second network budget; partial results and errors remain visible.
-Registration discovery still precedes its dependent RDAP request. Requests do not use
+Registration discovery still precedes its dependent registry request. Requests do not use
 browser cookies or credentials and reject private-network destinations, including
-redirects and DNS results. Only public ports 80/443 are supported; scripts and
+redirects and DNS results. Website requests support only public ports 80/443; scripts and
 page resources are not loaded. Opening Info contacts the website (including its
 query string) and the authoritative RDAP service discovered through
 [IANA's bootstrap registry](https://www.iana.org/assignments/rdap-dns).
+When no RDAP service is listed, Info discovers the registry's WHOIS server through
+IANA and queries the domain over TCP port 43. [WHOIS](https://www.rfc-editor.org/info/rfc3912/)
+needs no API key, but is unencrypted; the website path and query are never sent to it.
 Disable the default-on `url-info` Cargo feature or Gentoo USE flag to omit
 this capability from either frontend.
 
@@ -1085,7 +1088,7 @@ leave it out of an explicit `--no-default-features` feature list:
 | `audio-quality` | Local spectral analysis and RustFFT. |
 | `cache` | Session RAM audio cache with a 90% system/container memory-pressure ceiling on Linux. |
 | `cmd` | TUI/GUI provider-filtered command buttons, plus terminal Bash commands on any tab, completion, and history. |
-| `url-info` | On-demand website title/description and public RDAP facts for Local comments and YouTube descriptions. |
+| `url-info` | On-demand website metadata and public RDAP/WHOIS facts for Local comments and YouTube descriptions. |
 | `commons-upload` | Commons authentication, upload client, and review UI. |
 | `evernote` | Evernote client and audio-note UI. |
 | `gpm` | Linux virtual-console mouse input; opt in explicitly in either custom example. |
