@@ -13,7 +13,6 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use html5gum::{DefaultEmitter, Token, Tokenizer};
 use serde_json::Value;
 use ureq::unversioned::resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver};
 use ureq::unversioned::transport::{Connector, NextTimeout, TcpConnector};
@@ -21,6 +20,8 @@ use url::{Host, Url};
 
 use crate::domain::{ip_address_is_non_public, remote_url_has_non_public_host};
 
+mod analytics;
+mod metadata;
 mod network;
 mod tls;
 mod whois;
@@ -144,10 +145,14 @@ impl UrlInfoClient {
                 }
                 facts.extend(network_facts);
                 if (200..300).contains(&page.response.status) {
-                    match html_facts(&page.response.body) {
+                    match metadata::facts(&page.response.body, Some(&page.url)) {
                         Ok(values) => facts.extend(values),
                         Err(error) => facts.add("Website metadata", &error.message()),
                     }
+                    facts.add(
+                        "Analytics in HTML",
+                        &analytics::detect(&page.response.body).join(", "),
+                    );
                 }
             }
             Err(error) => facts.add("Website", &error.message()),
@@ -802,121 +807,10 @@ fn safe_text(value: &str) -> String {
     result
 }
 
-/// Tokenizes only a bounded page prefix; scripts, styles, body text, and templates are not facts.
-/// Title and description use ASCII hyphens for em dashes unsupported by some TTY fonts.
+/// Preserves the HTML-only test boundary while production resolves declarations against the final URL.
+#[cfg(test)]
 fn html_facts(html: &[u8]) -> Result<Vec<String>, Failure> {
-    if html.len() > MAX_HTML_BYTES {
-        return Err(Failure::TooLarge);
-    }
-    let mut fields = std::collections::BTreeMap::<&str, String>::new();
-    let mut title = String::new();
-    let mut in_title = false;
-    let mut hidden_depth = 0_usize;
-    let mut emitter = DefaultEmitter::default();
-    emitter.naively_switch_states(true);
-    for token in Tokenizer::new_with_emitter(html, emitter).take(MAX_HTML_TOKENS) {
-        let Ok(token) = token;
-        match token {
-            Token::StartTag(tag) => {
-                let name = tag.name.as_slice();
-                if matches!(name, b"template" | b"noscript") {
-                    hidden_depth = hidden_depth.saturating_add(1);
-                    continue;
-                }
-                if hidden_depth > 0 {
-                    continue;
-                }
-                if name == b"body" {
-                    break;
-                }
-                if name == b"title" {
-                    in_title = title.is_empty();
-                }
-                let attribute = |name: &[u8]| {
-                    tag.attributes
-                        .get(name)
-                        .and_then(|value| std::str::from_utf8(value.value.as_ref()).ok())
-                        .filter(|value| value.len() <= 8_192)
-                };
-                if name == b"html"
-                    && let Some(language) = attribute(b"lang")
-                {
-                    let language = safe_text(language);
-                    if !language.is_empty() {
-                        fields.entry("language").or_insert(language);
-                    }
-                }
-                if name != b"meta" {
-                    continue;
-                }
-                let key = attribute(b"name")
-                    .or_else(|| attribute(b"property"))
-                    .unwrap_or("")
-                    .trim()
-                    .to_ascii_lowercase();
-                let field = match key.as_str() {
-                    "description" => "description",
-                    "og:description" => "fallback-description",
-                    "og:title" => "fallback-title",
-                    "author" => "author",
-                    "og:site_name" => "site",
-                    "language" | "og:locale" => "language",
-                    _ => continue,
-                };
-                if let Some(value) = attribute(b"content") {
-                    let value = safe_text(value);
-                    if !value.is_empty() {
-                        fields.entry(field).or_insert(value);
-                    }
-                }
-            }
-            Token::EndTag(tag) => {
-                if matches!(tag.name.as_slice(), b"template" | b"noscript") {
-                    hidden_depth = hidden_depth.saturating_sub(1);
-                }
-                if tag.name.as_slice() == b"title" {
-                    in_title = false;
-                }
-                if tag.name.as_slice() == b"head" && hidden_depth == 0 {
-                    break;
-                }
-            }
-            Token::String(value) if in_title && hidden_depth == 0 => {
-                if title.len() < MAX_FIELD_BYTES {
-                    let text = String::from_utf8_lossy(value.value.as_ref());
-                    let mut end = text.len().min(MAX_FIELD_BYTES - title.len());
-                    while !text.is_char_boundary(end) {
-                        end -= 1;
-                    }
-                    title.push_str(&text[..end]);
-                }
-            }
-            _ => {}
-        }
-    }
-    let title = safe_text(&title);
-    let title = if title.is_empty() {
-        fields.get("fallback-title").map_or("", String::as_str)
-    } else {
-        &title
-    };
-    let description = fields
-        .get("description")
-        .or_else(|| fields.get("fallback-description"))
-        .map_or("", String::as_str);
-    let mut facts = Facts::default();
-    facts.add("Title", &title.replace('—', "-"));
-    facts.add("Description", &description.replace('—', "-"));
-    for (key, label) in [
-        ("author", "Author (website claim)"),
-        ("site", "Site"),
-        ("language", "Language"),
-    ] {
-        if let Some(value) = fields.get(key) {
-            facts.add(label, value);
-        }
-    }
-    Ok(facts.finish())
+    metadata::facts(html, None)
 }
 
 /// JSON recursion and aggregate node counts are independently bounded after byte-limited parsing.

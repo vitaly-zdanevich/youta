@@ -180,6 +180,15 @@ IP registration comes from IANA-discovered RDAP services: `Network country
 a CDN may hide the website's actual host. HTTPS certificate issuer, expiry,
 negotiated TLS version, and certificate DNS names come from the same verified
 connection. Certificate domains show coverage, not common ownership.
+Declared HTML/Open Graph/Schema.org metadata can also supply CMS/software,
+RSS/Atom feed URLs, publication/update dates, author/publisher, page type, and
+media artist, album, duration or track number. Missing fields are omitted;
+these are website claims, not independently verified facts. Only the current
+page's unambiguous structured-data object is used, not related recommendations.
+Info detects Google Analytics, Google Tag/Tag Manager and Yandex Metrica markers
+in the fetched HTML prefix. The analytics line is omitted when no marker is
+found; that does not prove a page is tracker-free. Scripts, feed URLs and
+JSON-LD contexts are never executed or fetched by metadata inspection.
 Disable the default-on `url-info` Cargo feature or Gentoo USE flag to omit
 this capability from either frontend.
 

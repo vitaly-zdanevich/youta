@@ -487,6 +487,14 @@ the IP allocation's country, not physical server geolocation; a CDN can hide
 the actual host. TLS version, certificate issuer, expiry and DNS names come
 from the same verified connection. Certificate domains are covered names,
 not proof of common ownership.
+Declared HTML, Open Graph and Schema.org metadata can supply software, feed
+URLs, published/updated dates, author/publisher, page type and media details.
+Missing fields are omitted. Claims are limited to the current page's
+unambiguous object; recommendations are not mixed into it.
+Recognizable Google Analytics, Google Tag/Tag Manager and Yandex Metrica HTML
+markers appear only when detected. Absence is not proof that tracking is
+absent: only a bounded HTML prefix is inspected, without executing scripts
+or fetching feeds or JSON-LD contexts.
 Up to 64 recent results stay cached in RAM until exit, without expiry or a
 Refresh button. No browser or API key is required, including on a physical TTY.
 The default-on
