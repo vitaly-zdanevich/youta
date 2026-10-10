@@ -37,7 +37,8 @@ with Rust 1.95 or newer:
 cargo run --release --locked
 ```
 
-Press `?` for contextual Help. Use `Tab` / `Shift+Tab` to switch sources,
+Press `?` for contextual Help. Use `F1` to jump to YT or
+`Tab` / `Shift+Tab` to switch sources,
 `j` / `k` to select an item, `Enter` to open or play it, and `Space` to pause.
 `/` searches the current source or edits the Web address; `p` or `F7` opens
 Preferences. The first YouTube search offers API-key or Invidious setup.
@@ -2298,7 +2299,9 @@ and link data is fetched again after a restart.
 
 `Tab` cycles forward through every enabled top-level screen, while `Shift+Tab`
 cycles backward; both wrap at the ends. `Ctrl+Tab` and `Ctrl+Shift+Tab` are
-aliases when the terminal reports those combinations distinctly. Uppercase
+aliases when the terminal reports those combinations distinctly. During normal
+browsing, `F1` switches directly to the **YT** tab without changing playback.
+Dialogs retain their own F1 actions, and editors keep their input handling. Uppercase
 `S` is the global **Subs** shortcut and always returns to the
 subscription-source root. Youta provides two layouts:
 

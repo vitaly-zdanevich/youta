@@ -8575,9 +8575,9 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
     #[cfg(not(feature = "qr"))]
     let private_note_help = "  n private note     t Details-only text selection";
     let history_navigation_help = if view.playback_history_enabled {
-        "  F2 offline     F3 log     Backspace back"
+        "  F1 YT     F2 offline     F3 log     Backspace back"
     } else {
-        "  F2 offline     Backspace back"
+        "  F1 YT     F2 offline     Backspace back"
     };
     #[cfg(feature = "ascii-visualizer")]
     let project_history_help =
@@ -44317,6 +44317,27 @@ prose 07:25 remains clickable but is not a chapter";
         let rendered = rendered_text(&terminal);
         assert!(rendered.contains("F3 log"));
         assert!(!rendered.contains("F3 history"));
+    }
+
+    /// The terminal advertises and forwards the YT shortcut even when Log is disabled.
+    #[test]
+    fn f1_youtube_shortcut_is_documented_and_forwarded_from_terminal() {
+        for playback_history_enabled in [false, true] {
+            let view = ViewModel {
+                screen: Screen::Local,
+                playback_history_enabled,
+                ..ViewModel::default()
+            };
+            let mut terminal = Terminal::new(TestBackend::new(180, 40)).unwrap();
+            terminal
+                .draw(|frame| render_help(frame, &view, &Theme::new(false)))
+                .unwrap();
+            assert!(rendered_text(&terminal).contains("F1 YT"));
+            assert_eq!(
+                key_action(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE), &view),
+                Some(UiAction::ShowScreen(Screen::Search))
+            );
+        }
     }
 
     #[test]

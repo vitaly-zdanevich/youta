@@ -58,6 +58,18 @@ const button = (tree, label) => nodes(tree).find((node) => node.type === 'button
 	&& (text(node) === label || node.props['aria-label'] === label));
 const aboutUrl = 'https://en.wikipedia.org/wiki/Invidious';
 
+test('navigation help advertises F1 for YT independently of playback history', () => {
+	for (const playbackHistoryEnabled of [false, true]) {
+		const tree = module.exports.HelpPopup({ playbackHistoryEnabled });
+		const cells = nodes(tree).filter((node) => ['dt', 'dd'].includes(node.type));
+		const shortcuts = playbackHistoryEnabled ? 'F1 · F2 · F3 · F4 · F5' : 'F1 · F2 · F4 · F5';
+		const index = cells.findIndex((node) => node.type === 'dt' && text(node) === shortcuts);
+		assert.notEqual(index, -1, 'F1 remains documented when Log is disabled');
+		assert.equal(text(cells[index + 1]), playbackHistoryEnabled
+			? 'YT · offline · log · lists · stats' : 'YT · offline · lists · stats');
+	}
+});
+
 test('the provider screen keeps its Wikipedia link visible with the directory closed or in any open state', () => {
 	for (const invidious_instances of [null, picker, { ...picker, loading: true },
 		{ ...picker, error: 'Directory temporarily unavailable' },

@@ -137,6 +137,19 @@
 			&& call.args.press.ctrl === Boolean(options.ctrlKey)), `forward ${keyName}`);
 		checks.push(`Keyboard ${keyName} uses the shared Rust keymap IPC`);
 	};
+	/** F1 remains a shared key so the core can preserve modal-specific guide actions. */
+	const forwardF1 = async (target, context) => {
+		const start = calls.length;
+		const event = new KeyboardEvent('keydown', { key: 'F1', bubbles: true, cancelable: true });
+		target.dispatchEvent(event);
+		await until(() => calls.slice(start).some((call) => call.command === 'key'), `F1 in ${context}`);
+		const forwarded = calls.slice(start).filter((call) => call.command === 'key');
+		assert(forwarded.length === 1 && JSON.stringify(forwarded[0].args.press)
+			=== JSON.stringify({ key: { F: 1 }, ctrl: false, alt: false, shift: false }),
+			`F1 in ${context} reaches the shared keymap exactly once`);
+		assert(event.defaultPrevented && !calls.slice(start).some((call) => call.command === 'dispatch'),
+			`F1 in ${context} suppresses browser help without overriding the core action`);
+	};
 	const mediaId = { source: 'archive-org', external_id: 'https://archive.org/download/fixture/first.mp3' };
 	const row = (title, id = mediaId) => ({ ...clone(defaults.RowView), title, media_id: id, source: 'archive.org' });
 	const details = (title, id = mediaId) => ({
@@ -506,6 +519,7 @@
 		assert(document.querySelectorAll('[role=dialog]').length === 1, 'Preferences is parked while the provider child editor is open');
 		assert(!dialog().querySelector('input, textarea'), 'Provider drafts are not copied into browser text controls');
 		assert(button('Save', dialog()) && !button('Save and retry', dialog()), 'Preferences provider changes save without retrying a search');
+		await forwardF1(button('YouTube API key', dialog()), 'the YouTube provider dialog');
 		const about = button(aboutUrl, dialog());
 		assert(about?.getAttribute('role') === 'link', 'The closed chooser still shows the complete Wikipedia URL as a link');
 		assert(getComputedStyle(about).textDecorationLine.includes('underline'), 'The Wikipedia URL is visibly underlined');
@@ -1023,12 +1037,16 @@
 		snapshot({ screen: 'History' });
 		await until(() => button('Log', tabs)?.getAttribute('aria-selected') === 'true', 'Log is selected for a History snapshot');
 		await key('F3', { F: 3 });
+		await forwardF1(document, 'ordinary browsing');
 		snapshot({ help_open: true });
 		await until(() => dialog()?.textContent.includes('The same map serves the terminal front-end'), 'Log navigation help');
-		const shortcut = [...dialog().querySelectorAll('dt')].find((node) => node.textContent === 'F2 · F3 · F4 · F5');
-		assert(shortcut?.nextElementSibling.textContent === 'offline · log · lists · stats', 'F3 help names the Log tab');
+		const shortcut = [...dialog().querySelectorAll('dt')].find((node) => node.textContent === 'F1 · F2 · F3 · F4 · F5');
+		assert(shortcut?.nextElementSibling.textContent === 'YT · offline · log · lists · stats', 'F1 and F3 help name the YT and Log tabs');
 		snapshot({ screen: previous.screen, playback_history_enabled: false });
 		await until(() => !button('Log', tabs) && !dialog()?.textContent.includes('F3'), 'disabled playback history hides Log and its F3 help');
+		const privateShortcut = [...dialog().querySelectorAll('dt')].find((node) => node.textContent === 'F1 · F2 · F4 · F5');
+		assert(privateShortcut?.nextElementSibling.textContent === 'YT · offline · lists · stats',
+			'Disabling Log preserves the F1 YT shortcut in help');
 		snapshot({ help_open: false, playback_history_enabled: true });
 		await until(() => !dialog() && button('Log', tabs), 'reenabling playback history restores Log');
 		snapshot(previous);

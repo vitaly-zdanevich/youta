@@ -141,12 +141,12 @@ export function HelpPopup({
         ["Enter", "open or play"],
         ["Backspace", "back"],
 		['Alt+Left / Alt+Right', 'back / forward'],
-        [
-          playbackHistoryEnabled ? "F2 · F3 · F4 · F5" : "F2 · F4 · F5",
-          playbackHistoryEnabled
-			? 'offline · log · lists · stats'
-			: 'offline · lists · stats',
-        ],
+		[
+			playbackHistoryEnabled ? 'F1 · F2 · F3 · F4 · F5' : 'F1 · F2 · F4 · F5',
+			playbackHistoryEnabled
+				? 'YT · offline · log · lists · stats'
+				: 'YT · offline · lists · stats',
+		],
 		['S · p · F9', 'subs · preferences · recent commits'],
 		['PageUp · PageDown', 'page through Subs'],
         ["R · h", "refresh subscription videos · show/hide Shorts"],

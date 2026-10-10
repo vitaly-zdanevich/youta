@@ -147,6 +147,77 @@ mod wire_tests {
     use super::{Key, KeyPress, PopupGeometry, key_action};
     use crate::playback::PlaybackStatus;
 
+    /// Bare F1 opens YT from ordinary browsing without stealing modified function keys.
+    #[test]
+    fn f1_opens_youtube_only_during_normal_browsing() {
+        use crate::view::{Screen, SiteFilePopupView, YouTubeSetupPopupView};
+
+        let key = KeyPress::new(Key::F(1));
+        let mut view = ViewModel::default();
+        for screen in Screen::ALL {
+            view.screen = screen;
+            assert_eq!(
+                key_action(key, &view, None, None),
+                Some(UiAction::ShowScreen(Screen::Search)),
+                "normal browsing on {screen:?}"
+            );
+        }
+        for modifiers in 1..8 {
+            let modified = KeyPress {
+                ctrl: modifiers & 1 != 0,
+                alt: modifiers & 2 != 0,
+                shift: modifiers & 4 != 0,
+                ..key
+            };
+            assert_eq!(key_action(modified, &view, None, None), None);
+        }
+        view.search_editing = true;
+        assert_eq!(key_action(key, &view, None, None), None);
+        view.search_editing = false;
+        view.help_open = true;
+        assert_eq!(key_action(key, &view, None, None), None);
+        view.help_open = false;
+        view.site_file_popup = Some(SiteFilePopupView::default());
+        assert_eq!(key_action(key, &view, None, None), None);
+        view.site_file_popup = None;
+        view.youtube_setup_popup = Some(YouTubeSetupPopupView::default());
+        view.external_opener_available = true;
+        assert_eq!(
+            key_action(key, &view, None, None),
+            Some(UiAction::OpenYouTubeApiKeyGuide)
+        );
+        view.external_opener_available = false;
+        assert_eq!(key_action(key, &view, None, None), None);
+    }
+
+    /// Explicit user-configured F1 bindings keep the same priority as other tab shortcuts.
+    #[cfg(feature = "cmd")]
+    #[test]
+    fn f1_custom_command_keeps_priority_outside_dialogs() {
+        use crate::view::{CustomCommandButtonView, YouTubeSetupPopupView};
+
+        let mut view = ViewModel::default();
+        view.custom_command_buttons.push(CustomCommandButtonView {
+            id: 7,
+            name: "Fixture".into(),
+            hotkey: Some("F1".into()),
+            binding: Some(crate::local_command::buttons::Hotkey::parse("F1").unwrap()),
+            font_color: None,
+            background_color: None,
+        });
+        let key = KeyPress::new(Key::F(1));
+        assert_eq!(
+            key_action(key, &view, None, None),
+            Some(UiAction::RunCustomCommand(7))
+        );
+        view.youtube_setup_popup = Some(YouTubeSetupPopupView::default());
+        view.external_opener_available = true;
+        assert_eq!(
+            key_action(key, &view, None, None),
+            Some(UiAction::OpenYouTubeApiKeyGuide)
+        );
+    }
+
     /// Site-file keys stay lazy and contextual, while the viewer owns navigation and Escape.
     #[test]
     fn site_file_shortcuts_and_viewer_navigation_are_modal() {
@@ -3584,6 +3655,8 @@ fn unfiltered_key_action(
                 .previous_available(view.playback_history_enabled),
         )),
         Key::Char('S') => Some(UiAction::ShowScreen(Screen::Subscriptions)),
+        // Editors, modal F1 guides, and configured shortcuts retain their earlier priority.
+        Key::F(1) if !key.modified() => Some(UiAction::ShowScreen(Screen::Search)),
         Key::F(2) => Some(UiAction::ShowScreen(Screen::Downloaded)),
         Key::F(3) if view.playback_history_enabled => Some(UiAction::ShowScreen(Screen::History)),
         Key::F(4) => Some(UiAction::ShowScreen(Screen::Playlists)),
