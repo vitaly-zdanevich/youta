@@ -541,12 +541,20 @@ Youta limits generated `mailto:` links to one recipient without message headers.
 External email actions are unavailable on a Linux virtual console without a
 desktop opener.
 
-Vertical YouTube videos use a distinct title color once the configured
+In the TUI, vertical YouTube videos (Shorts) use green titles once the configured
 provider reports a portrait aspect ratio. The official adapter uses player
 dimensions already returned by its batched video request, while Invidious
 enriches the selected row from its existing video-format response. Youta does
 not infer orientation from YouTube's often letterboxed thumbnail canvas or
 issue one metadata request per search result.
+
+Active livestream list titles and their `LIVE` labels are red; confirmed past
+livestream list titles are pink. Selection highlighting takes priority, and started
+videos retain their softer styling. Past-stream detection uses the official
+API's [broadcast end timestamp](https://developers.google.com/youtube/v3/docs/videos#liveStreamingDetails.actualEndTime)
+in existing batched requests, or Invidious's post-live DVR metadata in selected
+video details. Invidious does not reliably identify fully processed broadcast
+archives; unknown videos retain their normal title color.
 
 `mpv` is a playback engine, not a second UI. It is intentionally kept out of
 the terminal and never parses Youta's keystrokes. A future native backend can

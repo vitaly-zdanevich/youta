@@ -553,6 +553,11 @@ pub struct VideoSummary {
     pub published_text: Option<String>,
     /// Whether this is currently live.
     pub live: bool,
+    /// Whether provider metadata confirms a completed live broadcast.
+    ///
+    /// False also covers providers and older caches without broadcast history.
+    #[serde(default)]
+    pub was_live: bool,
     /// Provider-derived display orientation, when dimensions are available.
     #[serde(default)]
     pub orientation: VideoOrientation,
@@ -759,6 +764,11 @@ pub struct VideoDetails {
     pub ratings_allowed: Option<bool>,
     /// Whether this is currently live.
     pub live: bool,
+    /// Whether provider metadata confirms a completed live broadcast.
+    ///
+    /// False also covers providers and older caches without broadcast history.
+    #[serde(default)]
+    pub was_live: bool,
     /// Provider-derived display orientation, when dimensions are available.
     #[serde(default)]
     pub orientation: VideoOrientation,
@@ -1628,6 +1638,30 @@ mod tests {
                 .expect("empty automatic selection")
                 .is_none()
         );
+    }
+
+    /// Older JSON caches omit broadcast history; newer snapshots retain confirmed history.
+    #[test]
+    fn was_live_defaults_for_legacy_video_caches_and_round_trips_when_present() {
+        let mut legacy = serde_json::json!({
+            "video_id": "dQw4w9WgXcQ",
+            "title": "Legacy video",
+            "channel_name": "Channel",
+            "channel_id": "UC_fixture",
+            "description": "",
+            "live": false,
+            "keywords": [],
+            "thumbnails": [],
+        });
+        for expected in [false, true] {
+            if expected {
+                legacy["was_live"] = true.into();
+            }
+            let summary: VideoSummary = serde_json::from_value(legacy.clone()).unwrap();
+            let details: VideoDetails = serde_json::from_value(legacy.clone()).unwrap();
+            assert_eq!(serde_json::to_value(summary).unwrap()["was_live"], expected);
+            assert_eq!(serde_json::to_value(details).unwrap()["was_live"], expected);
+        }
     }
 
     #[cfg(all(feature = "youtube-official", feature = "invidious"))]

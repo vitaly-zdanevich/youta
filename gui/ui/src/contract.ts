@@ -71,6 +71,8 @@ export interface RowView {
   subtitle: string;
 	/** Confirmed YouTube broadcast; the canonical subtitle duration is LIVE. */
 	live: boolean;
+	/** Confirmed finished livestream, never inferred from duration; current live takes precedence. */
+	was_live: boolean;
   source: string;
   watched_percent: number;
   playback_started: boolean;

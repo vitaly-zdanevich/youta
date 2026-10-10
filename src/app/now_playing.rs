@@ -477,6 +477,7 @@ impl AppController {
                         published_at: item.media.published_at,
                         published_text: None,
                         live: item.media.kind == MediaKind::LiveStream,
+                        was_live: false,
                         orientation: VideoOrientation::Unknown,
                         thumbnails: Vec::new(),
                         webpage_url: url::Url::parse(&youtube_video_url(&id.external_id)).ok(),

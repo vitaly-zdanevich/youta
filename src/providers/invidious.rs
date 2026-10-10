@@ -379,6 +379,7 @@ impl InvidiousProvider {
             published_at: raw.published,
             published_text: nonempty(raw.published_text),
             live: raw.live_now,
+            was_live: false,
             orientation: VideoOrientation::Unknown,
             thumbnails: self.convert_thumbnails(raw.video_thumbnails),
             webpage_url,
@@ -494,6 +495,7 @@ impl InvidiousProvider {
             rating: raw.rating,
             ratings_allowed: raw.allow_ratings,
             live: raw.live_now,
+            was_live: raw.is_post_live_dvr && !raw.live_now && !raw.is_upcoming,
             orientation,
             keywords: raw.keywords,
             thumbnails: self.convert_thumbnails(raw.video_thumbnails),
@@ -1081,6 +1083,11 @@ struct RawVideoDetails {
     rating: Option<f64>,
     #[serde(default)]
     live_now: bool,
+    /// Confirmed ended stream while YouTube is still processing its archive.
+    #[serde(default)]
+    is_post_live_dvr: bool,
+    #[serde(default)]
+    is_upcoming: bool,
     #[serde(default)]
     license: Option<String>,
     #[serde(default)]
@@ -2003,6 +2010,35 @@ mod tests {
         );
         assert_eq!(details.keywords, ["music", "example"]);
         assert_eq!(details.orientation, VideoOrientation::Vertical);
+    }
+
+    /// Invidious only confirms ended broadcasts while its post-live DVR flag is set.
+    #[test]
+    fn was_live_requires_post_live_dvr_without_current_or_upcoming_broadcast() {
+        let provider = provider();
+        for (live, upcoming, post_live, expected) in [
+            (false, false, Some(true), true),
+            (false, false, Some(false), false),
+            (false, false, None, false),
+            (true, false, Some(true), false),
+            (false, true, Some(true), false),
+        ] {
+            let mut body: Value = serde_json::from_str(DETAILS_FIXTURE).unwrap();
+            body["title"] = "LIVE replay".into();
+            body["liveNow"] = live.into();
+            body["isUpcoming"] = upcoming.into();
+            if let Some(post_live) = post_live {
+                body["isPostLiveDvr"] = post_live.into();
+            }
+            let details = provider
+                .convert_video_details(serde_json::from_value(body).unwrap())
+                .unwrap();
+            assert_eq!(details.live, live);
+            assert_eq!(serde_json::to_value(details).unwrap()["was_live"], expected);
+        }
+        let raw = serde_json::from_str(CHANNEL_VIDEO_FIXTURE).unwrap();
+        let summary = provider.convert_video_summary(raw).unwrap();
+        assert_eq!(serde_json::to_value(summary).unwrap()["was_live"], false);
     }
 
     #[test]

@@ -7851,6 +7851,7 @@ mod tests {
             published_at: Some(100),
             published_text: None,
             live: false,
+            was_live: false,
             orientation: VideoOrientation::Unknown,
             thumbnails: Vec::new(),
             webpage_url: None,
@@ -7916,6 +7917,7 @@ mod tests {
             published_at: Some(100),
             published_text: None,
             live: false,
+            was_live: false,
             orientation: VideoOrientation::Unknown,
             thumbnails: vec![Thumbnail {
                 url: Url::from_file_path(thumbnail_path).expect("fixture Local thumbnail URL"),

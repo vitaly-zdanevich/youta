@@ -3675,6 +3675,14 @@ fn render_row_list(
             let youtube_video_title = uses_youtube_video_title_style(row);
             let mut title_style = if selected {
                 row_style
+            } else if youtube_video_title && row.live {
+                live_marker_style(row_style)
+            } else if youtube_video_title && row.was_live {
+                if playback_started {
+                    theme.past_live_video_started
+                } else {
+                    theme.past_live_video
+                }
             } else if youtube_video_title && playback_started {
                 if row.vertical {
                     theme.vertical_video_started
@@ -16603,6 +16611,10 @@ struct Theme {
     vertical_video: Style,
     /// Dimmed vertical-video title after playback is accepted by the backend.
     vertical_video_started: Style,
+    /// Former Shorts pink reserved for confirmed completed YouTube broadcasts.
+    past_live_video: Style,
+    /// Softer completed-broadcast color for an already-started item.
+    past_live_video_started: Style,
     muted: Style,
     cached: Style,
     progress: Style,
@@ -16612,13 +16624,15 @@ impl Theme {
     /// Builds a theme whose text styles are stable on the active terminal.
     ///
     /// A Linux virtual console has no dependable true-color or italic text,
-    /// so its vertical-video accent uses the closest named ANSI color. The
+    /// so its video accents use the closest named ANSI colors. The
     /// video-title renderer uses weight and named colors instead of italics.
     fn for_terminal(funny_mode: bool, physical_linux_console: bool) -> Self {
         let mut theme = Self::new(funny_mode);
         if physical_linux_console && !funny_mode {
-            theme.vertical_video = Style::default().fg(Color::LightMagenta);
-            theme.vertical_video_started = Style::default().fg(Color::Magenta);
+            theme.vertical_video = Style::default().fg(Color::LightGreen);
+            theme.vertical_video_started = Style::default().fg(Color::Green);
+            theme.past_live_video = Style::default().fg(Color::LightMagenta);
+            theme.past_live_video_started = Style::default().fg(Color::Magenta);
         }
         theme
     }
@@ -16637,8 +16651,10 @@ impl Theme {
                     .add_modifier(Modifier::BOLD),
                 accent: Style::default().fg(Color::LightMagenta),
                 active_chapter: Style::default().fg(Color::LightMagenta),
-                vertical_video: Style::default().fg(Color::LightCyan),
-                vertical_video_started: Style::default().fg(Color::Cyan),
+                vertical_video: Style::default().fg(Color::LightGreen),
+                vertical_video_started: Style::default().fg(Color::Green),
+                past_live_video: Style::default().fg(Color::LightMagenta),
+                past_live_video_started: Style::default().fg(Color::Magenta),
                 muted: Style::default().fg(Color::DarkGray),
                 cached: Style::default().fg(Color::DarkGray).bg(Color::Reset),
                 progress: Style::default().fg(Color::LightMagenta).bg(Color::Black),
@@ -16656,8 +16672,12 @@ impl Theme {
                 // ANSI magenta follows the terminal's configured palette and
                 // remains available without true-color support.
                 active_chapter: Style::default().fg(Color::Magenta),
-                vertical_video: Style::default().fg(Color::Rgb(255, 105, 180)),
+                vertical_video: Style::default().fg(Color::LightGreen),
                 vertical_video_started: Style::default()
+                    .fg(Color::LightGreen)
+                    .add_modifier(Modifier::DIM),
+                past_live_video: Style::default().fg(Color::Rgb(255, 105, 180)),
+                past_live_video_started: Style::default()
                     .fg(Color::Rgb(255, 105, 180))
                     .add_modifier(Modifier::DIM),
                 muted: Style::default().fg(Color::DarkGray),
@@ -18933,13 +18953,13 @@ for encoded, expected in json.load(sys.stdin):
         let buffer = terminal.backend().buffer();
         let playing_title = &buffer[(2, 1)];
         assert_eq!(playing_title.symbol(), "P");
-        assert_eq!(playing_title.fg, Color::Rgb(255, 105, 180));
+        assert_eq!(playing_title.fg, Color::LightGreen);
         assert!(!playing_title.modifier.contains(Modifier::BOLD));
         assert!(playing_title.modifier.contains(Modifier::DIM));
         assert!(!playing_title.modifier.contains(Modifier::ITALIC));
         let idle_title = &buffer[(0, 3)];
         assert_eq!(idle_title.symbol(), "V");
-        assert_eq!(idle_title.fg, Color::Rgb(255, 105, 180));
+        assert_eq!(idle_title.fg, Color::LightGreen);
         assert!(idle_title.modifier.contains(Modifier::BOLD));
         assert!(!idle_title.modifier.contains(Modifier::DIM));
         assert!(!idle_title.modifier.contains(Modifier::ITALIC));
@@ -19040,11 +19060,11 @@ for encoded, expected in json.load(sys.stdin):
         assert!(!regular_started.modifier.contains(Modifier::BOLD));
         assert!(!regular_started.modifier.contains(Modifier::ITALIC));
         assert_eq!(short_unplayed.symbol(), "S");
-        assert_eq!(short_unplayed.fg, Color::Rgb(255, 105, 180));
+        assert_eq!(short_unplayed.fg, Color::LightGreen);
         assert!(short_unplayed.modifier.contains(Modifier::BOLD));
         assert!(!short_unplayed.modifier.contains(Modifier::DIM));
         assert_eq!(short_started.symbol(), "S");
-        assert_eq!(short_started.fg, Color::Rgb(255, 105, 180));
+        assert_eq!(short_started.fg, Color::LightGreen);
         assert!(!short_started.modifier.contains(Modifier::BOLD));
         assert!(short_started.modifier.contains(Modifier::DIM));
         assert!(!short_started.modifier.contains(Modifier::ITALIC));
@@ -19062,6 +19082,101 @@ for encoded, expected in json.load(sys.stdin):
         assert!(buffer[(6, 13)].modifier.contains(Modifier::ITALIC));
     }
 
+    /// Confirmed broadcasts outrank portrait hints without sacrificing selected-row contrast.
+    #[test]
+    fn youtube_broadcast_titles_distinguish_active_and_past_streams() {
+        for (funny, console) in [(false, false), (false, true), (true, false)] {
+            let theme = Theme::for_terminal(funny, console);
+            let past_color = if console || funny {
+                Color::LightMagenta
+            } else {
+                Color::Rgb(255, 105, 180)
+            };
+            let started_color = if console || funny {
+                Color::Magenta
+            } else {
+                past_color
+            };
+            let mut view = ViewModel::default();
+            for (title, was_live, live, started) in [
+                ("Selected past stream", true, false, true),
+                ("Past stream", true, false, false),
+                ("Started past stream", true, false, true),
+                ("Active stream", true, true, true),
+            ] {
+                view.rows.push(RowView {
+                    media_id: Some(MediaId::new(SourceKind::YouTube, title)),
+                    title: title.to_owned(),
+                    subtitle: if live {
+                        "Creator · LIVE"
+                    } else {
+                        "Creator · 10:00"
+                    }
+                    .to_owned(),
+                    source: "YouTube".to_owned(),
+                    was_live,
+                    live,
+                    vertical: true,
+                    playback_started: started,
+                    ..RowView::default()
+                });
+            }
+            let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+            terminal
+                .draw(|frame| {
+                    render_body(
+                        frame,
+                        frame.area(),
+                        &view,
+                        true,
+                        DEFAULT_THUMBNAIL_HEIGHT,
+                        &theme,
+                        &mut HitMap::default(),
+                        None,
+                    );
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let selected = &buffer[(0, 1)];
+            assert_eq!(selected.symbol(), "S");
+            assert_eq!(selected.fg, Color::Black);
+            assert_eq!(
+                selected.bg,
+                if funny {
+                    Color::LightGreen
+                } else {
+                    Color::Cyan
+                }
+            );
+            assert!(!selected.modifier.contains(Modifier::DIM));
+            let past = &buffer[(0, 3)];
+            assert_eq!(past.symbol(), "P");
+            assert_eq!(past.fg, past_color);
+            assert!(past.modifier.contains(Modifier::BOLD));
+            let started = &buffer[(0, 5)];
+            assert_eq!(started.symbol(), "S");
+            assert_eq!(started.fg, started_color);
+            assert!(
+                !started
+                    .modifier
+                    .intersects(Modifier::BOLD | Modifier::ITALIC)
+            );
+            assert_eq!(started.modifier.contains(Modifier::DIM), !console && !funny);
+            let live = &buffer[(0, 7)];
+            assert_eq!(live.symbol(), "A");
+            assert_eq!(live.fg, Color::Red);
+            assert!(!live.modifier.contains(Modifier::DIM));
+            let marker_column = (0..100)
+                .find(|column| buffer[(*column, 8)].symbol() == "L")
+                .unwrap();
+            for column in marker_column..marker_column + 4 {
+                let cell = &buffer[(column, 8)];
+                assert_eq!(cell.fg, Color::Red);
+                assert!(cell.modifier.contains(Modifier::BOLD));
+            }
+        }
+    }
+
     #[test]
     fn active_chapter_colors_use_terminal_palette_pinks() {
         assert_eq!(
@@ -19076,13 +19191,13 @@ for encoded, expected in json.load(sys.stdin):
         );
         assert_eq!(
             Theme::for_terminal(false, true).vertical_video.fg,
-            Some(Color::LightMagenta),
+            Some(Color::LightGreen),
             "the physical Linux console must not receive a true-color text style"
         );
         assert_eq!(
             Theme::for_terminal(false, true).vertical_video_started.fg,
-            Some(Color::Magenta),
-            "a started Short needs a visibly darker Linux-console pink"
+            Some(Color::Green),
+            "a started Short needs a visibly darker Linux-console green"
         );
         assert!(
             !Theme::for_terminal(false, true)
@@ -19532,11 +19647,11 @@ for encoded, expected in json.load(sys.stdin):
         );
         let short_unplayed = &buffer[(0, 5)];
         assert_eq!(short_unplayed.symbol(), "U");
-        assert_eq!(short_unplayed.fg, Color::LightMagenta);
+        assert_eq!(short_unplayed.fg, Color::LightGreen);
         assert!(short_unplayed.modifier.contains(Modifier::BOLD));
         let short_started = &buffer[(0, 7)];
         assert_eq!(short_started.symbol(), "S");
-        assert_eq!(short_started.fg, Color::Magenta);
+        assert_eq!(short_started.fg, Color::Green);
         assert!(!short_started.modifier.contains(Modifier::BOLD));
         assert!(!short_started.modifier.contains(Modifier::DIM));
         assert!(

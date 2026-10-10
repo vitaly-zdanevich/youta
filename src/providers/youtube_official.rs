@@ -40,9 +40,9 @@ const CHANNEL_UPLOADS_FIELDS: &str = "items(id,contentDetails/relatedPlaylists/u
 /// Limits an uploads-playlist response to pagination data consumed here.
 const PLAYLIST_ITEMS_FIELDS: &str = "nextPageToken,items(contentDetails/videoId)";
 /// Limits video enrichment to the fields retained by search and upload rows.
-const VIDEO_SUMMARY_FIELDS: &str = "items(id,snippet(publishedAt,channelId,title,description,channelTitle,liveBroadcastContent,thumbnails),contentDetails/duration,statistics/viewCount,player(embedWidth,embedHeight))";
+const VIDEO_SUMMARY_FIELDS: &str = "items(id,snippet(publishedAt,channelId,title,description,channelTitle,liveBroadcastContent,thumbnails),contentDetails/duration,statistics/viewCount,player(embedWidth,embedHeight),liveStreamingDetails/actualEndTime)";
 /// Retains every field projected into an explicitly requested video Details view.
-const VIDEO_DETAILS_FIELDS: &str = "items(id,snippet(publishedAt,channelId,title,description,channelTitle,tags,liveBroadcastContent,thumbnails),contentDetails/duration,statistics(viewCount,likeCount,commentCount),status/license,player(embedWidth,embedHeight))";
+const VIDEO_DETAILS_FIELDS: &str = "items(id,snippet(publishedAt,channelId,title,description,channelTitle,tags,liveBroadcastContent,thumbnails),contentDetails/duration,statistics(viewCount,likeCount,commentCount),status/license,player(embedWidth,embedHeight),liveStreamingDetails/actualEndTime)";
 const MAX_API_KEY_BYTES: usize = 256;
 const MIN_API_KEY_BYTES: usize = 16;
 const MAX_PAGE_TOKEN_BYTES: usize = 2 * 1024;
@@ -68,8 +68,10 @@ enum VideoResourceProjection {
 impl VideoResourceProjection {
     fn parts(self) -> &'static str {
         match self {
-            Self::Summary => "snippet,contentDetails,statistics,player",
-            Self::FullDetails => "snippet,contentDetails,statistics,status,player",
+            Self::Summary => "snippet,contentDetails,statistics,player,liveStreamingDetails",
+            Self::FullDetails => {
+                "snippet,contentDetails,statistics,status,player,liveStreamingDetails"
+            }
         }
     }
 
@@ -1452,6 +1454,7 @@ fn video_summary_from_search(
             .and_then(parse_rfc3339_epoch),
         published_text: None,
         live: snippet.live_broadcast_content.as_deref() == Some("live"),
+        was_live: false,
         orientation: VideoOrientation::Unknown,
         thumbnails: convert_thumbnails(snippet.thumbnails),
         stream_url: None,
@@ -1471,6 +1474,7 @@ fn video_summary_from_resource(raw: RawVideoResource) -> Result<VideoSummary, Pr
         published_at: details.published_at,
         published_text: details.published_text,
         live: details.live,
+        was_live: details.was_live,
         orientation: details.orientation,
         thumbnails: details.thumbnails,
         webpage_url: details.webpage_url,
@@ -1559,6 +1563,17 @@ fn video_details_from_resource(raw: RawVideoResource) -> Result<VideoDetails, Pr
         .and_then(parse_iso8601_duration);
     let license = raw.status.license.as_deref().and_then(map_license);
     let orientation = raw.player.orientation();
+    // The API only supplies actualEndTime after a broadcast ends. Snippet
+    // "none" alone also describes ordinary uploads and cannot identify replays.
+    let was_live = !matches!(
+        raw.snippet.live_broadcast_content.as_deref(),
+        Some("live" | "upcoming")
+    ) && raw
+        .live_streaming_details
+        .actual_end_time
+        .as_deref()
+        .and_then(parse_rfc3339_epoch)
+        .is_some();
     Ok(VideoDetails {
         webpage_url: youtube_video_url(&raw.id),
         video_id: raw.id,
@@ -1580,6 +1595,7 @@ fn video_details_from_resource(raw: RawVideoResource) -> Result<VideoDetails, Pr
         rating: None,
         ratings_allowed: None,
         live: raw.snippet.live_broadcast_content.as_deref() == Some("live"),
+        was_live,
         orientation,
         keywords: raw.snippet.tags,
         thumbnails: convert_thumbnails(raw.snippet.thumbnails),
@@ -1973,6 +1989,16 @@ struct RawVideoResource {
     status: RawVideoStatus,
     #[serde(default)]
     player: RawVideoPlayer,
+    #[serde(default, rename = "liveStreamingDetails")]
+    live_streaming_details: RawLiveStreamingDetails,
+}
+
+/// Public completion evidence retained by both summary and details projections.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawLiveStreamingDetails {
+    #[serde(default)]
+    actual_end_time: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -2570,7 +2596,7 @@ mod tests {
         assert!(requests[1].starts_with("/videos?"));
         assert!(requests_contain_part(
             &requests,
-            "snippet%2CcontentDetails%2Cstatistics%2Cplayer"
+            "snippet%2CcontentDetails%2Cstatistics%2Cplayer%2CliveStreamingDetails"
         ));
         let resource_pairs = query_pairs(&requests[1]);
         assert_eq!(resource_pairs.get("id").map(String::as_str), Some(VIDEO_ID));
@@ -2581,7 +2607,7 @@ mod tests {
         assert_eq!(
             resource_pairs.get("fields").map(String::as_str),
             Some(
-                "items(id,snippet(publishedAt,channelId,title,description,channelTitle,liveBroadcastContent,thumbnails),contentDetails/duration,statistics/viewCount,player(embedWidth,embedHeight))"
+                "items(id,snippet(publishedAt,channelId,title,description,channelTitle,liveBroadcastContent,thumbnails),contentDetails/duration,statistics/viewCount,player(embedWidth,embedHeight),liveStreamingDetails/actualEndTime)"
             )
         );
         assert_eq!(
@@ -3043,7 +3069,7 @@ mod tests {
         assert_eq!(
             first_video_pairs.get("fields").map(String::as_str),
             Some(
-                "items(id,snippet(publishedAt,channelId,title,description,channelTitle,liveBroadcastContent,thumbnails),contentDetails/duration,statistics/viewCount,player(embedWidth,embedHeight))"
+                "items(id,snippet(publishedAt,channelId,title,description,channelTitle,liveBroadcastContent,thumbnails),contentDetails/duration,statistics/viewCount,player(embedWidth,embedHeight),liveStreamingDetails/actualEndTime)"
             )
         );
 
@@ -3630,7 +3656,7 @@ mod tests {
         assert_eq!(pairs.get("id").map(String::as_str), Some(VIDEO_ID));
         assert_eq!(
             pairs.get("part").map(String::as_str),
-            Some("snippet,contentDetails,statistics,status,player")
+            Some("snippet,contentDetails,statistics,status,player,liveStreamingDetails")
         );
         let fields = pairs
             .get("fields")
@@ -3642,6 +3668,82 @@ mod tests {
             );
         }
         assert!(requests[0].contains(&format!("key={TEST_KEY}")));
+    }
+
+    /// Completed broadcasts are identified by an actual end, never a title or duration.
+    #[test]
+    fn was_live_requires_a_completed_broadcast_in_details_and_summaries() {
+        for (status, end, expected) in [
+            ("none", Some("2024-01-02T04:05:06Z"), true),
+            ("none", None, false),
+            ("none", Some(""), false),
+            ("none", Some("not a timestamp"), false),
+            ("none", Some("2024-01-02T04:05:06"), false),
+            ("live", Some("2024-01-02T04:05:06Z"), false),
+            ("upcoming", Some("2024-01-02T04:05:06Z"), false),
+        ] {
+            let mut body: Value = serde_json::from_str(VIDEO_RESOURCE).unwrap();
+            let resource = &mut body["items"][0];
+            resource["snippet"]["liveBroadcastContent"] = status.into();
+            resource["snippet"]["title"] = "LIVE replay".into();
+            resource["liveStreamingDetails"] = serde_json::json!({
+                "scheduledStartTime": "2024-01-02T03:04:05Z",
+                "actualStartTime": "2024-01-02T03:04:05Z",
+                "actualEndTime": end,
+            });
+            let details =
+                video_details_from_resource(serde_json::from_value(resource.clone()).unwrap())
+                    .unwrap();
+            let summary =
+                video_summary_from_resource(serde_json::from_value(resource.clone()).unwrap())
+                    .unwrap();
+            assert_eq!(details.live, status == "live");
+            assert_eq!(summary.live, status == "live");
+            for normalized in [
+                serde_json::to_value(details).unwrap(),
+                serde_json::to_value(summary).unwrap(),
+            ] {
+                assert_eq!(normalized["was_live"], expected, "{status}: {end:?}");
+            }
+        }
+    }
+
+    /// Both existing video requests retain completion metadata without another lookup.
+    #[test]
+    fn was_live_metadata_is_requested_in_existing_summary_and_details_calls() {
+        let mut body: Value = serde_json::from_str(VIDEO_RESOURCE).unwrap();
+        body["items"][0]["liveStreamingDetails"] = serde_json::json!({
+            "actualEndTime": "2024-01-02T04:05:06Z",
+        });
+        let body = body.to_string();
+        let (provider, server) = provider_with_server(vec![
+            json_response("200 OK", SEARCH_VIDEO),
+            json_response("200 OK", &body),
+            json_response("200 OK", &body),
+        ]);
+        let page = provider
+            .search_at(
+                &SearchRequest::new("broadcast", SearchTarget::Videos),
+                1_704_067_200,
+            )
+            .unwrap();
+        let details = provider.video_details(VIDEO_ID).unwrap();
+        let requests = server.finish();
+        assert_eq!(requests.len(), 3);
+        for request in &requests[1..] {
+            let pairs = query_pairs(request);
+            assert!(
+                pairs["part"]
+                    .split(',')
+                    .any(|part| part == "liveStreamingDetails")
+            );
+            assert!(pairs["fields"].contains("liveStreamingDetails/actualEndTime"));
+        }
+        let [SearchItem::Video(summary)] = page.items.as_slice() else {
+            panic!("expected one video");
+        };
+        assert_eq!(serde_json::to_value(summary).unwrap()["was_live"], true);
+        assert_eq!(serde_json::to_value(details).unwrap()["was_live"], true);
     }
 
     #[test]
@@ -3844,6 +3946,7 @@ mod tests {
         assert_eq!(video.title, "Search title");
         assert_eq!(video.duration_seconds, None);
         assert_eq!(video.orientation, VideoOrientation::Unknown);
+        assert!(!video.was_live);
     }
 
     #[test]

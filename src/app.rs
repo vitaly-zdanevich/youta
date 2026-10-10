@@ -57,6 +57,7 @@ mod web_metadata;
 #[cfg(all(feature = "web-browser", feature = "local-metadata"))]
 mod web_probe;
 mod worker_notifications;
+mod youtube_broadcasts;
 mod youtube_hashtag;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -8025,6 +8026,7 @@ impl AppController {
             published_at: None,
             published_text: None,
             live: false,
+            was_live: false,
             orientation: VideoOrientation::Unknown,
             thumbnails: Vec::new(),
             webpage_url,
@@ -8053,6 +8055,7 @@ impl AppController {
             published_at: None,
             published_text: None,
             live: false,
+            was_live: false,
             orientation: VideoOrientation::Unknown,
             thumbnails: Vec::new(),
             webpage_url: url::Url::parse(&format!(
@@ -12597,7 +12600,7 @@ impl AppController {
                 }
                 self.finish_search_activity(SearchActivity::YouTube);
                 match result {
-                    Ok(page) => {
+                    Ok(mut page) => {
                         if page.page != request.page
                             || page.next_page.is_some_and(|next_page| {
                                 next_page <= request.page || next_page > 10_000
@@ -12609,6 +12612,7 @@ impl AppController {
                             );
                             return;
                         }
+                        self.merge_youtube_broadcast_summaries(&mut page.items);
                         let page_number = page.page;
                         if page_number == 1 {
                             self.youtube_results.clear();
@@ -13621,6 +13625,7 @@ impl AppController {
                                                 && !received_page_has_visible_item))
                                 });
                         let persist_snapshot = if stage_refresh {
+                            self.merge_youtube_broadcast_summaries(&mut page.items);
                             let pending = self
                                 .pending_subscription_refresh
                                 .as_mut()
@@ -14030,7 +14035,8 @@ impl AppController {
                     return;
                 }
                 match result {
-                    Ok(details) => {
+                    Ok(mut details) => {
+                        self.merge_youtube_broadcast_details(&mut details);
                         let previous_search_selection = if self.view.screen == Screen::Search
                             && self.local_results.is_empty()
                             && self.direct_item.is_none()
@@ -30509,7 +30515,8 @@ impl AppController {
     /// Touching the separate order deque maintains bounded LRU eviction across
     /// channels. Empty pages retain their continuation because private videos
     /// can otherwise hide a later playable page.
-    fn cache_subscription_video_page(&mut self, channel_id: &str, page: SearchPage) {
+    fn cache_subscription_video_page(&mut self, channel_id: &str, mut page: SearchPage) {
+        self.merge_youtube_broadcast_summaries(&mut page.items);
         self.prepare_subscription_cache_insert(channel_id);
         let cached = self
             .subscription_video_cache
@@ -42999,6 +43006,7 @@ fn row_from_search_item_with_progress_mode(
                 },
                 vertical: youtube_video_uses_shorts_style(video),
                 live: video.live,
+                was_live: video.was_live && !video.live,
                 hide_watched_marker: false,
                 compact: false,
                 radio_favorite: false,
@@ -43193,6 +43201,7 @@ fn search_item_from_youtube_music_track(track: YouTubeMusicTrack) -> SearchItem 
         published_at: None,
         published_text: None,
         live: false,
+        was_live: false,
         orientation: VideoOrientation::Unknown,
         thumbnails: vec![Thumbnail {
             url: track.thumbnail_url,
@@ -44191,6 +44200,7 @@ fn detail_from_media_item(
     }
 }
 
+/// Projects detail metadata while keeping current and past broadcasts mutually exclusive.
 fn summary_from_details(video: &VideoDetails) -> VideoSummary {
     VideoSummary {
         video_id: video.video_id.clone(),
@@ -44203,6 +44213,7 @@ fn summary_from_details(video: &VideoDetails) -> VideoSummary {
         published_at: video.published_at,
         published_text: video.published_text.clone(),
         live: video.live,
+        was_live: video.was_live && !video.live,
         orientation: video.orientation,
         thumbnails: video.thumbnails.clone(),
         webpage_url: video.webpage_url.clone(),
@@ -47657,6 +47668,8 @@ mod tests {
     #[cfg(feature = "web-browser")]
     #[path = "web_worker.rs"]
     mod web_worker_tests;
+    #[path = "youtube_broadcasts.rs"]
+    mod youtube_broadcast_tests;
     #[path = "youtube_shorts.rs"]
     mod youtube_shorts_tests;
 
@@ -50862,6 +50875,7 @@ mod tests {
             published_at: Some(1_729_003_672),
             published_text: None,
             live: false,
+            was_live: false,
             orientation: VideoOrientation::Unknown,
             thumbnails: Vec::new(),
             webpage_url: None,
@@ -50886,6 +50900,7 @@ mod tests {
             rating: None,
             ratings_allowed: Some(true),
             live: false,
+            was_live: false,
             keywords: Vec::new(),
             orientation: VideoOrientation::Unknown,
             thumbnails: Vec::new(),
@@ -55551,6 +55566,7 @@ mod tests {
             published_at: Some(1_729_003_672),
             published_text: None,
             live: false,
+            was_live: false,
             orientation: VideoOrientation::Unknown,
             thumbnails: Vec::new(),
             webpage_url: None,
@@ -55588,6 +55604,7 @@ mod tests {
             rating: None,
             ratings_allowed: Some(true),
             live: false,
+            was_live: false,
             keywords: Vec::new(),
             orientation: VideoOrientation::Unknown,
             thumbnails: Vec::new(),
@@ -75162,6 +75179,7 @@ mod tests {
             published_at: None,
             published_text: None,
             live: false,
+            was_live: false,
             orientation: VideoOrientation::Unknown,
             thumbnails: Vec::new(),
             webpage_url: Some(
@@ -77927,6 +77945,7 @@ mod tests {
             published_at: Some(1),
             published_text: None,
             live: false,
+            was_live: false,
             orientation: VideoOrientation::Unknown,
             thumbnails: Vec::new(),
             webpage_url: None,

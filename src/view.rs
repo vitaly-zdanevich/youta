@@ -605,6 +605,10 @@ pub struct RowView {
     pub vertical: bool,
     /// Whether provider metadata confirms that this media is currently live.
     pub live: bool,
+    /// Whether provider metadata confirms a finished livestream; false also means unknown.
+    /// Current live metadata takes precedence over this historical indication.
+    #[serde(default)]
+    pub was_live: bool,
     /// Hide played-state markers while retaining identity for playing-row emphasis.
     pub hide_watched_marker: bool,
     /// Omit generic source and marker padding on a source-specific screen.
