@@ -9,7 +9,7 @@
 //! registration JSON must fit completely within its separate response limit.
 
 use std::io::Read;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use html5gum::{DefaultEmitter, Token, Tokenizer};
@@ -46,7 +46,8 @@ impl UrlInfoClient {
     /// Returns bounded website and registration facts, retaining either partial result.
     ///
     /// The caller must use a worker. One shared eight-second budget covers DNS,
-    /// requests, redirects, and body reads. Cancellation is checked between reads.
+    /// concurrent website/registration requests, redirects, and body reads.
+    /// Cancellation is checked between reads; both branches finish before return.
     /// Errors are fixed explanations and never echo credentials or request queries.
     /// The final URL is shown only when it differs from the fragment-free original.
     pub(crate) fn lookup(&mut self, url: &Url, cancelled: &AtomicBool) -> Vec<String> {
@@ -65,8 +66,37 @@ impl UrlInfoClient {
             facts.add("URL info", &error.message());
             return facts.finish();
         }
-        let mut budget = Budget::new(cancelled);
-        match fetch_document(transport, url, DocumentKind::Html, &mut budget) {
+        let budget = Budget::new(cancelled);
+        let (page, registration) = if let Some(Host::Domain(host)) = url.host() {
+            let host = host.trim_end_matches('.').to_ascii_lowercase();
+            std::thread::scope(|scope| {
+                // Registration keeps sole ownership of the cached endpoint map.
+                // The website shares the deadline and atomic request allowance.
+                match std::thread::Builder::new()
+                    .name("youta-url-website".into())
+                    .spawn_scoped(scope, || {
+                        fetch_document(transport, url, DocumentKind::Html, &budget)
+                    }) {
+                    Ok(website) => {
+                        let registration = self.registration(&host, transport, &budget);
+                        let page = website.join().unwrap_or(Err(Failure::Transport));
+                        (page, Some(registration))
+                    }
+                    Err(_) => {
+                        // Thread limits must not make otherwise usable lookups fail.
+                        let page = fetch_document(transport, url, DocumentKind::Html, &budget);
+                        (page, Some(self.registration(&host, transport, &budget)))
+                    }
+                }
+            })
+        } else {
+            (
+                fetch_document(transport, url, DocumentKind::Html, &budget),
+                None,
+            )
+        };
+        // Keep display order deterministic even when registration finishes first.
+        match page {
             Ok(page) => {
                 facts.add(
                     "Website response",
@@ -91,15 +121,14 @@ impl UrlInfoClient {
         if cancelled.load(Ordering::Relaxed) {
             return facts.finish();
         }
-        let Some(Host::Domain(host)) = url.host() else {
+        let Some(registration) = registration else {
             facts.add(
                 "Registration",
                 "Domain registration is not applicable to an IP address",
             );
             return facts.finish();
         };
-        let host = host.trim_end_matches('.').to_ascii_lowercase();
-        match self.registration(&host, transport, &mut budget) {
+        match registration {
             Ok(values) => facts.extend(values),
             Err(error) => facts.add("Registration", &error.message()),
         }
@@ -114,7 +143,7 @@ impl UrlInfoClient {
         &mut self,
         host: &str,
         transport: &impl HttpTransport,
-        budget: &mut Budget<'_>,
+        budget: &Budget<'_>,
     ) -> Result<Vec<String>, Failure> {
         if !valid_domain(host) {
             return Err(Failure::Unavailable);
@@ -211,10 +240,10 @@ impl Failure {
     }
 }
 
-/// A finite operation-wide deadline and request count, including bootstrap and redirects.
+/// One deadline and atomic request allowance shared by concurrent lookup branches.
 struct Budget<'a> {
     deadline: Instant,
-    remaining_requests: usize,
+    remaining_requests: AtomicUsize,
     cancelled: &'a AtomicBool,
 }
 
@@ -222,7 +251,7 @@ impl<'a> Budget<'a> {
     fn new(cancelled: &'a AtomicBool) -> Self {
         Self {
             deadline: Instant::now() + LOOKUP_TIMEOUT,
-            remaining_requests: MAX_REQUESTS,
+            remaining_requests: AtomicUsize::new(MAX_REQUESTS),
             cancelled,
         }
     }
@@ -237,12 +266,13 @@ impl<'a> Budget<'a> {
             .ok_or(Failure::Timeout)
     }
 
-    fn request(&mut self) -> Result<Duration, Failure> {
+    fn request(&self) -> Result<Duration, Failure> {
         let remaining = self.remaining()?;
-        if self.remaining_requests == 0 {
-            return Err(Failure::Budget);
-        }
-        self.remaining_requests -= 1;
+        self.remaining_requests
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .map_err(|_| Failure::Budget)?;
         Ok(remaining)
     }
 }
@@ -292,7 +322,7 @@ struct FetchedDocument {
 }
 
 /// Injectable I/O boundary; callers independently enforce redirects and document budgets.
-trait HttpTransport {
+trait HttpTransport: Sync {
     fn fetch(
         &self,
         url: &Url,
@@ -323,7 +353,7 @@ fn fetch_document(
     transport: &impl HttpTransport,
     url: &Url,
     kind: DocumentKind,
-    budget: &mut Budget<'_>,
+    budget: &Budget<'_>,
 ) -> Result<FetchedDocument, Failure> {
     let mut current = url.clone();
     current.set_fragment(None);
@@ -987,19 +1017,19 @@ fn entity_facts(entities: Option<&Value>, depth: usize, remaining: &mut usize, f
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::cell::RefCell;
     use std::collections::VecDeque;
+    use std::sync::Mutex;
 
-    /// Scripted responses exercise the real redirect and registration policy without DNS.
+    /// Scripted per-URL queues preserve redirect order without depending on branch scheduling.
     #[derive(Default)]
     struct MockTransport {
-        responses: RefCell<VecDeque<(String, Result<HttpResponse, Failure>)>>,
-        requests: RefCell<Vec<String>>,
+        responses: Mutex<VecDeque<(String, Result<HttpResponse, Failure>)>>,
+        requests: Mutex<Vec<String>>,
     }
 
     impl MockTransport {
         fn push(&self, url: &str, status: u16, body: impl Into<Vec<u8>>) {
-            self.responses.borrow_mut().push_back((
+            self.responses.lock().unwrap().push_back((
                 url.to_owned(),
                 Ok(HttpResponse {
                     status,
@@ -1016,7 +1046,7 @@ mod tests {
         }
 
         fn redirect(&self, url: &str, location: &str) {
-            self.responses.borrow_mut().push_back((
+            self.responses.lock().unwrap().push_back((
                 url.to_owned(),
                 Ok(HttpResponse {
                     status: 302,
@@ -1041,14 +1071,13 @@ mod tests {
             _: Duration,
             _: &AtomicBool,
         ) -> Result<HttpResponse, Failure> {
-            self.requests.borrow_mut().push(url.to_string());
-            let (expected, response) = self
-                .responses
-                .borrow_mut()
-                .pop_front()
+            self.requests.lock().unwrap().push(url.to_string());
+            let mut responses = self.responses.lock().unwrap();
+            let index = responses
+                .iter()
+                .position(|(expected, _)| expected == url.as_str())
                 .expect("unexpected request");
-            assert_eq!(url.as_str(), expected);
-            response
+            responses.remove(index).expect("matched response").1
         }
     }
 
@@ -1105,7 +1134,7 @@ mod tests {
                 &AtomicBool::new(false),
                 &transport,
             );
-            assert!(transport.requests.borrow().is_empty());
+            assert!(transport.requests.lock().unwrap().is_empty());
             assert!(!facts.join("\n").contains("secret"));
         }
     }
@@ -1165,6 +1194,127 @@ mod tests {
         }
     }
 
+    /// Each request must observe the other before completing, not merely run in a new order.
+    #[test]
+    fn website_and_registration_requests_overlap_with_cold_and_warm_bootstrap() {
+        use std::sync::{Mutex, mpsc};
+
+        struct OverlapTransport {
+            html_started: mpsc::SyncSender<()>,
+            html_receiver: Mutex<mpsc::Receiver<()>>,
+            rdap_started: mpsc::SyncSender<()>,
+            rdap_receiver: Mutex<mpsc::Receiver<()>>,
+            html_overlapped: AtomicBool,
+            rdap_overlapped: AtomicBool,
+            html_failure: Option<Failure>,
+            rdap_failure: Option<Failure>,
+        }
+
+        impl HttpTransport for OverlapTransport {
+            fn fetch(
+                &self,
+                url: &Url,
+                kind: DocumentKind,
+                _: Duration,
+                _: &AtomicBool,
+            ) -> Result<HttpResponse, Failure> {
+                let body = if matches!(kind, DocumentKind::Html) {
+                    self.html_started.send(()).unwrap();
+                    self.html_overlapped.store(
+                        self.rdap_receiver
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(2))
+                            .is_ok(),
+                        Ordering::Relaxed,
+                    );
+                    if let Some(error) = self.html_failure {
+                        return Err(error);
+                    }
+                    b"<title>Concurrent page</title>".to_vec()
+                } else if url.as_str() == BOOTSTRAP_URL {
+                    bootstrap()
+                } else {
+                    self.rdap_started.send(()).unwrap();
+                    self.rdap_overlapped.store(
+                        self.html_receiver
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(2))
+                            .is_ok(),
+                        Ordering::Relaxed,
+                    );
+                    if let Some(error) = self.rdap_failure {
+                        return Err(error);
+                    }
+                    serde_json::to_vec(&json!({
+                        "objectClassName": "domain", "ldhName": "artist.co.uk",
+                        "events": [{"eventAction": "registration", "eventDate": "2000-01-01T00:00:00Z"}]
+                    }))
+                    .unwrap()
+                };
+                Ok(HttpResponse {
+                    status: 200,
+                    location: None,
+                    content_type: if matches!(kind, DocumentKind::Html) {
+                        "text/html"
+                    } else {
+                        "application/rdap+json"
+                    }
+                    .into(),
+                    body,
+                })
+            }
+        }
+
+        for (cached, html_failure, rdap_failure) in [false, true].into_iter().flat_map(|cached| {
+            [
+                (cached, None, None),
+                (cached, Some(Failure::Timeout), None),
+                (cached, None, Some(Failure::Timeout)),
+            ]
+        }) {
+            let (html_started, html_receiver) = mpsc::sync_channel(1);
+            let (rdap_started, rdap_receiver) = mpsc::sync_channel(1);
+            let transport = OverlapTransport {
+                html_started,
+                html_receiver: Mutex::new(html_receiver),
+                rdap_started,
+                rdap_receiver: Mutex::new(rdap_receiver),
+                html_overlapped: AtomicBool::new(false),
+                rdap_overlapped: AtomicBool::new(false),
+                html_failure,
+                rdap_failure,
+            };
+            let mut client = UrlInfoClient::default();
+            if cached {
+                client.bootstrap =
+                    Some(parse_bootstrap(&parse_json(&bootstrap()).unwrap()).unwrap());
+            }
+            let facts = client.lookup_with(
+                &Url::parse("https://artist.co.uk/").unwrap(),
+                &AtomicBool::new(false),
+                &transport,
+            );
+            assert!(transport.html_overlapped.load(Ordering::Relaxed));
+            assert!(transport.rdap_overlapped.load(Ordering::Relaxed));
+            let mut expected = if html_failure.is_some() {
+                vec!["Website: The URL information time limit was reached"]
+            } else {
+                vec!["Website response: HTTP 200", "Title: Concurrent page"]
+            };
+            if rdap_failure.is_some() {
+                expected.push("Registration: The URL information time limit was reached");
+            } else {
+                expected.extend([
+                    "Registered: 2000-01-01T00:00:00Z",
+                    "RDAP source: https://registry.example/rdap/domain/artist.co.uk",
+                ]);
+            }
+            assert_eq!(facts, expected);
+        }
+    }
+
     /// Unchanged destinations do not repeat the URL, including after round-trip redirects.
     #[test]
     fn unchanged_final_url_is_omitted_without_losing_website_or_registration_facts() {
@@ -1207,10 +1357,10 @@ mod tests {
                     &"RDAP source: https://registry.example/rdap/domain/artist.co.uk".to_owned()
                 ));
                 assert_eq!(
-                    transport.requests.borrow().len(),
+                    transport.requests.lock().unwrap().len(),
                     if round_trip { 5 } else { 3 }
                 );
-                assert!(transport.responses.borrow().is_empty());
+                assert!(transport.responses.lock().unwrap().is_empty());
             }
         }
     }
@@ -1238,7 +1388,7 @@ mod tests {
         );
         assert!(facts.contains(&"Final URL: https://artist.co.uk/music?q=new".to_owned()));
         assert!(facts.contains(&"Title: New results".to_owned()));
-        assert!(transport.responses.borrow().is_empty());
+        assert!(transport.responses.lock().unwrap().is_empty());
     }
 
     /// Explicit website queries survive redirects but never reach IANA or RDAP.
@@ -1270,14 +1420,19 @@ mod tests {
         assert!(!facts.contains("Registered domain:"));
         assert!(facts.contains("Final URL: https://artist.co.uk/results?q=one%20two&lang=en"));
         assert!(!facts.contains("private-fragment"));
-        let requests = transport.requests.borrow();
+        let requests = transport.requests.lock().unwrap();
         assert_eq!(requests.len(), 4);
+        let registration_requests = requests
+            .iter()
+            .filter(|request| Url::parse(request).unwrap().host_str() != Some("artist.co.uk"))
+            .collect::<Vec<_>>();
+        assert_eq!(registration_requests.len(), 2);
         assert!(
-            requests[2..]
+            registration_requests
                 .iter()
                 .all(|request| !request.contains('?') && !request.contains("one%20two"))
         );
-        assert!(transport.responses.borrow().is_empty());
+        assert!(transport.responses.lock().unwrap().is_empty());
     }
 
     /// Redirected pages keep registration attached to the original normalized hostname.
@@ -1338,7 +1493,7 @@ mod tests {
                     "{facts:?}"
                 );
             }
-            assert!(transport.responses.borrow().is_empty());
+            assert!(transport.responses.lock().unwrap().is_empty());
         }
     }
 
@@ -1484,11 +1639,12 @@ mod tests {
             domain("www.artist.co.uk"),
         );
         client.lookup_with(&url, &AtomicBool::new(false), &transport);
-        assert!(transport.responses.borrow().is_empty());
+        assert!(transport.responses.lock().unwrap().is_empty());
         assert_eq!(
             transport
                 .requests
-                .borrow()
+                .lock()
+                .unwrap()
                 .iter()
                 .filter(|url| *url == BOOTSTRAP_URL)
                 .count(),
@@ -1527,7 +1683,7 @@ mod tests {
             assert!(facts.contains("Registration:"));
             assert!(!facts.contains("Registered domain:"));
             assert!(!facts.contains("Transport:"));
-            assert_eq!(transport.requests.borrow().len(), 3);
+            assert_eq!(transport.requests.lock().unwrap().len(), 3);
         }
     }
 
@@ -1538,7 +1694,8 @@ mod tests {
         let url = Url::parse("https://artist.co.uk/").unwrap();
         transport
             .responses
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .push_back((url.to_string(), Err(Failure::Transport)));
         transport.push(BOOTSTRAP_URL, 200, bootstrap());
         transport.push(
@@ -1559,7 +1716,7 @@ mod tests {
                 "RDAP source: https://registry.example/rdap/domain/artist.co.uk",
             ]
         );
-        assert!(transport.responses.borrow().is_empty());
+        assert!(transport.responses.lock().unwrap().is_empty());
     }
 
     /// Redirect policy is enforced before any subsequent request, even with an injected transport.
@@ -1573,17 +1730,17 @@ mod tests {
             let transport = MockTransport::default();
             transport.redirect("https://artist.example/", target);
             let cancelled = AtomicBool::new(false);
-            let mut budget = Budget::new(&cancelled);
+            let budget = Budget::new(&cancelled);
             assert!(
                 fetch_document(
                     &transport,
                     &Url::parse("https://artist.example/").unwrap(),
                     DocumentKind::Html,
-                    &mut budget
+                    &budget
                 )
                 .is_err()
             );
-            assert_eq!(transport.requests.borrow().len(), 1);
+            assert_eq!(transport.requests.lock().unwrap().len(), 1);
         }
     }
 
@@ -1604,13 +1761,13 @@ mod tests {
                 &transport,
                 &Url::parse("https://artist.example/0").unwrap(),
                 DocumentKind::Html,
-                &mut budget
+                &budget
             )
             .unwrap_err(),
             Failure::Redirect
         );
-        assert_eq!(transport.requests.borrow().len(), MAX_REDIRECTS + 1);
-        budget.remaining_requests = 0;
+        assert_eq!(transport.requests.lock().unwrap().len(), MAX_REDIRECTS + 1);
+        budget.remaining_requests.store(0, Ordering::Relaxed);
         assert_eq!(budget.request().unwrap_err(), Failure::Budget);
         budget.deadline = Instant::now();
         assert_eq!(budget.remaining().unwrap_err(), Failure::Timeout);
@@ -1620,7 +1777,7 @@ mod tests {
             &AtomicBool::new(true),
             &unused,
         );
-        assert!(unused.requests.borrow().is_empty());
+        assert!(unused.requests.lock().unwrap().is_empty());
     }
 
     /// Website redirects expose only their validated final destination and actual HTTP status.
@@ -1685,8 +1842,8 @@ mod tests {
                 )
                 .join("\n");
             assert!(facts.contains("No matching registration record"));
-            assert_eq!(transport.requests.borrow().len(), attempts + 2);
-            assert!(transport.responses.borrow().is_empty());
+            assert_eq!(transport.requests.lock().unwrap().len(), attempts + 2);
+            assert!(transport.responses.lock().unwrap().is_empty());
         }
     }
 
@@ -1862,6 +2019,73 @@ mod tests {
             ] {
                 assert!(!request.contains(header));
             }
+        }
+    }
+
+    /// Concurrent branches share a single allowance without underflowing exhausted requests.
+    #[test]
+    fn concurrent_branches_share_one_request_budget() {
+        let cancelled = AtomicBool::new(false);
+        let budget = Budget::new(&cancelled);
+        let reserve = || {
+            (0..MAX_REQUESTS)
+                .map(|_| budget.request())
+                .collect::<Vec<_>>()
+        };
+        let reservations = std::thread::scope(|scope| {
+            let other = scope.spawn(reserve);
+            [reserve(), other.join().unwrap()]
+        });
+        assert_eq!(
+            reservations
+                .iter()
+                .flatten()
+                .filter(|request| request.is_ok())
+                .count(),
+            MAX_REQUESTS
+        );
+        assert_eq!(
+            reservations
+                .iter()
+                .flatten()
+                .filter(|request| **request == Err(Failure::Budget))
+                .count(),
+            MAX_REQUESTS
+        );
+        assert_eq!(budget.remaining_requests.load(Ordering::Relaxed), 0);
+    }
+
+    /// Both branches observe the same cancellation or deadline before issuing any request.
+    #[test]
+    fn stopped_shared_budgets_prevent_requests_from_both_branches() {
+        for is_cancelled in [true, false] {
+            let cancelled = AtomicBool::new(is_cancelled);
+            let mut budget = Budget::new(&cancelled);
+            let expected = if is_cancelled {
+                Failure::Cancelled
+            } else {
+                budget.deadline = Instant::now();
+                Failure::Timeout
+            };
+            let transport = MockTransport::default();
+            let website_url = Url::parse("https://artist.co.uk/").unwrap();
+            let registration_url = Url::parse(BOOTSTRAP_URL).unwrap();
+            std::thread::scope(|scope| {
+                let website = scope.spawn(|| {
+                    fetch_document(&transport, &website_url, DocumentKind::Html, &budget)
+                });
+                assert_eq!(
+                    fetch_document(&transport, &registration_url, DocumentKind::Json, &budget)
+                        .unwrap_err(),
+                    expected
+                );
+                assert_eq!(website.join().unwrap().unwrap_err(), expected);
+            });
+            assert!(transport.requests.lock().unwrap().is_empty());
+            assert_eq!(
+                budget.remaining_requests.load(Ordering::Relaxed),
+                MAX_REQUESTS
+            );
         }
     }
 }

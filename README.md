@@ -160,8 +160,9 @@ change speed when Details is not shown or has fewer than two URLs. Editors and
 popups retain their own key handling. Each unique HTTP(S) URL gets its own control;
 lookups are never automatic on selection. Results stay in RAM until exit, with
 up to 64 recent cached URLs and no expiry timer or Refresh button. Each explicit
-request has a shared eight-second network budget; partial results and errors
-remain visible. Requests do not use
+request runs website metadata and domain registration concurrently, sharing
+one eight-second network budget; partial results and errors remain visible.
+Registration discovery still precedes its dependent RDAP request. Requests do not use
 browser cookies or credentials and reject private-network destinations, including
 redirects and DNS results. Only public ports 80/443 are supported; scripts and
 page resources are not loaded. Opening Info contacts the website (including its
