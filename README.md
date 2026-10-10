@@ -148,10 +148,12 @@ trust score or backlink count. Fetched text is muted and leaves the original
 comment/description unchanged. In the TUI, Info temporarily shows the facts in
 the scrollable Details body; **Hide** restores the description.
 
-Press `i` for the first visible URL's Info. When Details has multiple URLs,
+The TUI keeps the selected URL, Info button, previous/next controls, and position
+counter on a single line. Press `i` for that URL's Info. When Details has multiple URLs,
 press `<` / `>` or click the compact TUI URL rail's `[<]` / `[>]` controls to
 move to the previous/next URL without fetching it; Details does not need
 keyboard focus.
+Only the selected URL's expanded facts are shown; switching URLs does not fetch them.
 `Alt+i` / `Alt+Shift+i` remain next/previous URL shortcuts. During normal
 browsing, `,` / `.` decrease/increase playback speed by 0.1; `<` / `>` also
 change speed when Details is not shown or has fewer than two URLs. Editors and

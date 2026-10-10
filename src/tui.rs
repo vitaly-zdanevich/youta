@@ -5840,7 +5840,11 @@ fn render_information_panel(
     let mut text_reserve = if details.thumbnail_expanded {
         0
     } else {
-        u16::from(has_details_body) + u16::from(!details.links.is_empty())
+        // URL controls need one row in addition to the body and the artwork's
+        // separator; otherwise a tall thumbnail can hide their disclosure.
+        u16::from(has_details_body || !details.url_info.is_empty())
+            + u16::from(!details.links.is_empty())
+            + 2 * u16::from(!details.url_info.is_empty())
     };
     let compact_metadata_height = u16::try_from(
         lines
@@ -6140,7 +6144,7 @@ fn render_information_panel(
     }
     if !details.links.is_empty() && remaining_height > 0 {
         let description_reserve = if !details.url_info.is_empty() {
-            remaining_height.min(6)
+            remaining_height.min(2)
         } else if has_details_body {
             remaining_height.min(1)
         } else {
@@ -6379,108 +6383,26 @@ fn render_information_panel(
     let url_start = details
         .url_info_offset
         .min(details.url_info.len().saturating_sub(1));
-    let url_rows = usize::from(remaining_height.saturating_sub(2).clamp(1, 3));
-    for (index, info) in details
-        .url_info
-        .iter()
-        .enumerate()
-        .skip(url_start)
-        .take(url_rows)
-    {
-        if remaining_height <= 1 {
-            break;
-        }
-        let label = if index == url_start {
-            if info.expanded {
-                "[i] Hide "
-            } else {
-                "[i] Info "
-            }
-        } else if info.expanded {
-            "[Hide] "
-        } else {
-            "[Info] "
-        };
-        let control_width = terminal_text_width(label).min(inner.width);
+    if !details.url_info.is_empty() && remaining_height > 1 {
         let row = Rect::new(inner.x, cursor_y, inner.width, 1);
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(label, theme.accent),
-                Span::styled(
-                    info.url.clone(),
-                    if view.external_opener_available {
-                        theme.accent.add_modifier(Modifier::UNDERLINED)
-                    } else {
-                        theme.muted
-                    },
-                ),
-            ])),
+        render_url_info_row(
+            frame,
             row,
+            details,
+            view.external_opener_available,
+            theme,
+            hit_map,
         );
-        hit_map.detail_buttons.push((
-            UiAction::ToggleUrlInfo(index),
-            Rect::new(row.x, row.y, control_width, 1),
-        ));
-        if view.external_opener_available && control_width < row.width {
-            hit_map.detail_buttons.push((
-                UiAction::OpenUrlInfo(index),
-                Rect::new(row.x + control_width, row.y, row.width - control_width, 1),
-            ));
-        }
         if show_text_selection {
             capture_selectable_details_row(frame, hit_map, row);
         }
         cursor_y = cursor_y.saturating_add(1);
         remaining_height = inner.bottom().saturating_sub(cursor_y);
     }
-    if details.url_info.len() > 1 && remaining_height > 1 {
-        let row = Rect::new(inner.x, cursor_y, inner.width, 1);
-        let previous = "[<] ";
-        let next = "[>] ";
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(
-                    previous,
-                    if url_start > 0 {
-                        theme.accent
-                    } else {
-                        theme.muted
-                    },
-                ),
-                Span::styled(
-                    next,
-                    if url_start + 1 < details.url_info.len() {
-                        theme.accent
-                    } else {
-                        theme.muted
-                    },
-                ),
-                Span::styled(
-                    format!("URL {} of {}", url_start + 1, details.url_info.len()),
-                    theme.muted,
-                ),
-            ])),
-            row,
-        );
-        if url_start > 0 {
-            hit_map.detail_buttons.push((
-                UiAction::MoveUrlInfo(-1),
-                Rect::new(row.x, row.y, 4.min(row.width), 1),
-            ));
-        }
-        if url_start + 1 < details.url_info.len() && row.width > 4 {
-            hit_map.detail_buttons.push((
-                UiAction::MoveUrlInfo(1),
-                Rect::new(row.x + 4, row.y, 4.min(row.width - 4), 1),
-            ));
-        }
-        cursor_y = cursor_y.saturating_add(1);
-        remaining_height = inner.bottom().saturating_sub(cursor_y);
-    }
     let expanded_url_info = details
         .url_info
-        .iter()
-        .find(|info| info.expanded)
+        .get(url_start)
+        .filter(|info| info.expanded)
         .map(|info| {
             if info.loading {
                 "Loading website and RDAP information...".to_owned()
@@ -6824,6 +6746,76 @@ fn render_information_panel(
     if show_text_selection {
         highlight_details_text_selection(frame, view, hit_map, theme);
     }
+}
+
+/// Renders only the selected URL, with disclosure, navigation, and clipped click targets.
+/// All controls occupy one non-wrapping line; hidden text never gains a hit target.
+fn render_url_info_row(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    details: &DetailView,
+    external_opener_available: bool,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+) {
+    let index = details
+        .url_info_offset
+        .min(details.url_info.len().saturating_sub(1));
+    let Some(info) = details.url_info.get(index) else {
+        return;
+    };
+    let mut spans = Vec::new();
+    let mut cursor = area.x;
+    let mut append = |text: String, style: Style, action: Option<UiAction>| {
+        let width = terminal_text_width(&text).min(area.right().saturating_sub(cursor));
+        if width == 0 || area.height == 0 {
+            return;
+        }
+        spans.push(Span::styled(text, style));
+        if let Some(action) = action {
+            hit_map
+                .detail_buttons
+                .push((action, Rect::new(cursor, area.y, width, 1)));
+        }
+        cursor = cursor.saturating_add(width);
+    };
+    append(
+        if info.expanded {
+            "[i] Hide "
+        } else {
+            "[i] Info "
+        }
+        .to_owned(),
+        theme.accent,
+        Some(UiAction::ToggleUrlInfo(index)),
+    );
+    if details.url_info.len() > 1 {
+        for (label, delta, enabled) in [
+            ("[<] ", -1, index > 0),
+            ("[>] ", 1, index + 1 < details.url_info.len()),
+        ] {
+            append(
+                label.to_owned(),
+                if enabled { theme.accent } else { theme.muted },
+                enabled.then_some(UiAction::MoveUrlInfo(delta)),
+            );
+        }
+        append(
+            format!("{}/{} ", index + 1, details.url_info.len()),
+            theme.muted,
+            None,
+        );
+    }
+    append(
+        info.url.clone(),
+        if external_opener_available {
+            theme.accent.add_modifier(Modifier::UNDERLINED)
+        } else {
+            theme.muted
+        },
+        external_opener_available.then_some(UiAction::OpenUrlInfo(index)),
+    );
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// Appends one expanded-Wikidata source token while preserving item links
@@ -40067,8 +40059,7 @@ prose 07:25 remains clickable but is not a chapter";
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
         assert!(text.contains("Title: Fetched website"));
-        assert!(text.contains("URL 13 of 20"));
-        assert!(text.contains("[<] [>] URL 13 of 20"));
+        assert!(text.contains("[i] Hide [<] [>] 13/20 https://example.com/12"));
         let start = buffer
             .content()
             .windows(6)
@@ -40086,8 +40077,25 @@ prose 07:25 remains clickable but is not a chapter";
                 .iter()
                 .filter(|(action, _)| matches!(action, UiAction::ToggleUrlInfo(_)))
                 .count(),
-            3
+            1
         );
+        let info_controls = hits
+            .detail_buttons
+            .iter()
+            .filter(|(action, _)| {
+                matches!(
+                    action,
+                    UiAction::ToggleUrlInfo(_)
+                        | UiAction::OpenUrlInfo(_)
+                        | UiAction::MoveUrlInfo(_)
+                )
+            })
+            .collect::<Vec<_>>();
+        let info_y = info_controls[0].1.y;
+        assert!(info_controls.iter().all(|(_, area)| area.y == info_y));
+        assert_eq!(start / 120, usize::from(info_y + 1));
+        assert!(!text.contains("https://example.com/13"));
+        assert!(!text.contains("https://example.com/14"));
         assert!(
             hits.detail_buttons
                 .iter()
@@ -40154,6 +40162,182 @@ prose 07:25 remains clickable but is not a chapter";
             view.details.as_ref().unwrap().description,
             "Original comment https://example.com/"
         );
+        view.details.as_mut().unwrap().url_info_offset = 13;
+        hits = HitMap::default();
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hits))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(text.contains("Original comment"));
+        assert!(
+            !text.contains("Title: Fetched website"),
+            "facts must belong to the selected URL"
+        );
+    }
+
+    /// Tall artwork must leave its separator, the URL row, and one facts row visible.
+    #[test]
+    fn url_info_row_survives_constrained_thumbnail_with_and_without_detail_links() {
+        let mut observed = Vec::new();
+        for with_links in [false, true] {
+            let view = ViewModel {
+                screen: Screen::Local,
+                external_opener_available: true,
+                details: Some(DetailView {
+                    title: "Artwork fixture".to_owned(),
+                    source: "Local".to_owned(),
+                    description: "Original comment".to_owned(),
+                    thumbnail_url: Some(
+                        url::Url::parse("https://example.com/artwork.jpg").unwrap(),
+                    ),
+                    links: if with_links {
+                        vec![DetailLinkView {
+                            label: "Related link".to_owned(),
+                            url: "https://example.org/related".to_owned(),
+                            ..DetailLinkView::default()
+                        }]
+                    } else {
+                        Vec::new()
+                    },
+                    url_info: vec![UrlInfoView {
+                        url: "https://example.com/page".to_owned(),
+                        expanded: true,
+                        lines: vec!["Title: Selected website".to_owned()],
+                        ..UrlInfoView::default()
+                    }],
+                    ..DetailView::default()
+                }),
+                ..ViewModel::default()
+            };
+            let mut terminal = Terminal::new(TestBackend::new(80, 18)).unwrap();
+            let mut hits = HitMap::default();
+            let mut thumbnails = MockThumbnailRenderer {
+                enabled: true,
+                rendered_artwork: true,
+                ..MockThumbnailRenderer::default()
+            };
+            terminal
+                .draw(|frame| {
+                    render_details_with_terminal_window(
+                        frame,
+                        frame.area(),
+                        &view,
+                        false,
+                        100,
+                        None,
+                        &Theme::new(false),
+                        &mut hits,
+                        Some(&mut thumbnails),
+                    );
+                })
+                .unwrap();
+            let text = rendered_text(&terminal);
+            observed.push((
+                with_links,
+                text.contains("THUMBNAIL IMAGE"),
+                hits.detail_buttons
+                    .iter()
+                    .any(|(action, _)| *action == UiAction::ToggleUrlInfo(0)),
+                text.contains("Title: Selected website"),
+                !with_links || text.contains("Related link"),
+            ));
+        }
+        assert_eq!(
+            observed,
+            [
+                (false, true, true, true, true),
+                (true, true, true, true, true)
+            ],
+            "with-links, artwork, URL control, facts, and optional link must remain visible"
+        );
+    }
+
+    /// One URL row stays bounded on narrow displays and at either navigation boundary.
+    #[test]
+    fn single_url_info_row_clips_hits_and_clamps_selection() {
+        for count in [0_usize, 1, 3] {
+            for offset in [0, 1, usize::MAX] {
+                for width in [0, 1, 8, 12, 17, 24, 80] {
+                    for opener in [false, true] {
+                        let details = DetailView {
+                            url_info: (0..count)
+                                .map(|index| UrlInfoView {
+                                    url: format!("https://example.com/{index}"),
+                                    ..UrlInfoView::default()
+                                })
+                                .collect(),
+                            url_info_offset: offset,
+                            ..DetailView::default()
+                        };
+                        let area = Rect::new(2, 1, width, 1);
+                        let mut terminal = Terminal::new(TestBackend::new(84, 4)).unwrap();
+                        let mut hits = HitMap::default();
+                        terminal
+                            .draw(|frame| {
+                                render_url_info_row(
+                                    frame,
+                                    area,
+                                    &details,
+                                    opener,
+                                    &Theme::new(false),
+                                    &mut hits,
+                                );
+                            })
+                            .unwrap();
+                        for (_, hit) in &hits.detail_buttons {
+                            assert!(hit.width > 0 && hit.height == 1);
+                            assert_eq!(hit.y, area.y);
+                            assert!(hit.x >= area.x && hit.right() <= area.right());
+                        }
+                        for adjacent in hits.detail_buttons.windows(2) {
+                            assert!(adjacent[0].1.right() <= adjacent[1].1.x);
+                        }
+                        let has = |action| {
+                            hits.detail_buttons
+                                .iter()
+                                .any(|(found, _)| *found == action)
+                        };
+                        let index = offset.min(count.saturating_sub(1));
+                        assert_eq!(has(UiAction::ToggleUrlInfo(index)), count > 0 && width > 0);
+                        assert_eq!(
+                            has(UiAction::MoveUrlInfo(-1)),
+                            count > 1 && index > 0 && width > 9
+                        );
+                        assert_eq!(
+                            has(UiAction::MoveUrlInfo(1)),
+                            count > 1 && index + 1 < count && width > 13
+                        );
+                        assert!(
+                            !hits
+                                .detail_buttons
+                                .iter()
+                                .any(|(action, _)| matches!(action,
+                                    UiAction::OpenUrlInfo(_) if !opener
+                                ))
+                        );
+                        let buffer = terminal.backend().buffer();
+                        for y in [0, 2, 3] {
+                            assert!((0..84).all(|x| buffer[(x, y)].symbol() == " "));
+                        }
+                        if width == 80 && count > 0 {
+                            assert_eq!(has(UiAction::OpenUrlInfo(index)), opener);
+                            let text = (0..84).map(|x| buffer[(x, 1)].symbol()).collect::<String>();
+                            assert!(text.contains(&format!("https://example.com/{index}")));
+                            assert_eq!(text.contains("[<] [>]"), count > 1);
+                            if count > 1 {
+                                assert!(text.contains(&format!("{}/{}", index + 1, count)));
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
