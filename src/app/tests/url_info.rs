@@ -2,6 +2,147 @@
 
 use super::*;
 
+/// Holds the sole worker open so scheduling/cancellation tests never touch the network.
+fn hold_site_file_worker(
+    controller: &mut AppController,
+    url: &str,
+) -> (
+    crossbeam_channel::Sender<Result<crate::url_info::site_files::SiteFile, String>>,
+    Arc<AtomicBool>,
+) {
+    let (sender, receiver) = bounded(1);
+    let cancelled = Arc::new(AtomicBool::new(false));
+    controller.url_info.site_file_worker = Some(super::super::url_info::SiteFileWorker {
+        url: url::Url::parse(url).unwrap(),
+        cancelled: Arc::clone(&cancelled),
+        receiver,
+    });
+    (sender, cancelled)
+}
+
+#[test]
+fn site_files_require_explicit_open_and_close_ignores_late_response() {
+    let mut controller = url_info_controller();
+    let origin = "https://example.com/page";
+    open_cached_url_info(&mut controller, origin, "Title: cached");
+    assert!(controller.view.site_file_popup.is_none());
+    assert!(controller.url_info.site_file_worker.is_none());
+    let (sender, cancelled) = hold_site_file_worker(&mut controller, "https://example.com/old.txt");
+    controller.dispatch(UiAction::OpenUrlRobots(0));
+    let popup = controller
+        .view
+        .site_file_popup
+        .as_ref()
+        .expect("explicit root file");
+    assert_eq!(popup.url, "https://example.com/robots.txt");
+    assert!(popup.loading);
+    assert!(cancelled.load(AtomicOrdering::Relaxed));
+    controller.dispatch(UiAction::DismissSiteFile);
+    sender.send(Err("late old completion".into())).unwrap();
+    controller.refresh_url_info();
+    assert!(controller.view.site_file_popup.is_none());
+    assert!(controller.url_info.site_file_worker.is_none());
+}
+
+#[test]
+fn site_file_child_back_restores_selection_and_scroll_without_fetching() {
+    let mut controller = url_info_controller();
+    let parent = crate::view::SiteFilePopupView {
+        title: "Sitemap".into(),
+        url: "https://example.com/sitemap.xml".into(),
+        sitemap: true,
+        sitemap_index: true,
+        selected: 1,
+        scroll_offset: 1,
+        entries: (0..3)
+            .map(|index| crate::view::SiteFileEntryView {
+                url: format!("https://example.com/child{index}.xml"),
+                metadata: vec![("Last modified".into(), "2026-10-10".into())],
+            })
+            .collect(),
+        ..crate::view::SiteFilePopupView::default()
+    };
+    controller.view.site_file_popup = Some(parent.clone());
+    let (_sender, cancelled) =
+        hold_site_file_worker(&mut controller, "https://example.com/held.xml");
+    controller.dispatch(UiAction::ActivateSiteFileEntry(1));
+    assert_eq!(
+        controller.view.site_file_popup.as_ref().unwrap().url,
+        "https://example.com/child1.xml"
+    );
+    assert!(
+        controller
+            .view
+            .site_file_popup
+            .as_ref()
+            .unwrap()
+            .can_go_back
+    );
+    assert!(cancelled.load(AtomicOrdering::Relaxed));
+    controller.dispatch(UiAction::BackSiteFile);
+    assert_eq!(controller.view.site_file_popup, Some(parent));
+    controller.dispatch(UiAction::DismissSiteFile);
+}
+
+#[test]
+fn site_file_completion_preserves_full_robots_and_structured_sitemap() {
+    use crate::url_info::site_files::{SiteFile, SiteFileContent, SitemapEntry};
+    let mut controller = url_info_controller();
+    for sitemap in [false, true] {
+        let url = if sitemap {
+            "https://example.com/sitemap.xml"
+        } else {
+            "https://example.com/robots.txt"
+        };
+        controller.view.site_file_popup = Some(crate::view::SiteFilePopupView {
+            url: url.into(),
+            sitemap,
+            loading: true,
+            ..crate::view::SiteFilePopupView::default()
+        });
+        let (sender, _) = hold_site_file_worker(&mut controller, url);
+        sender
+            .send(Ok(SiteFile {
+                url: url::Url::parse(url).unwrap(),
+                content: if sitemap {
+                    SiteFileContent::Sitemap {
+                        index: false,
+                        entries: vec![SitemapEntry {
+                            url: url::Url::parse("https://example.com/page").unwrap(),
+                            metadata: vec![("Last modified".into(), "2026-10-10".into())],
+                        }],
+                    }
+                } else {
+                    SiteFileContent::Robots("User-agent: *\nDisallow: /private\n".into())
+                },
+            }))
+            .unwrap();
+        controller.refresh_url_info();
+        let popup = controller.view.site_file_popup.as_ref().unwrap();
+        assert!(!popup.loading);
+        if sitemap {
+            assert_eq!(popup.entries[0].metadata[0].1, "2026-10-10");
+        } else {
+            assert_eq!(popup.text, "User-agent: *\nDisallow: /private\n");
+        }
+        assert!(controller.url_info.site_file_worker.is_none());
+    }
+    #[cfg(not(feature = "web-browser"))]
+    {
+        controller.dispatch(UiAction::ActivateSiteFileEntry(0));
+        assert_eq!(
+            controller
+                .view
+                .site_file_popup
+                .as_ref()
+                .unwrap()
+                .error
+                .as_deref(),
+            Some("This build does not include the Web tab.")
+        );
+    }
+}
+
 /// Uses a drive-qualified path on Windows without creating or probing a fixture file.
 fn url_info_fixture_path(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("youta-url-info-{name}.mp3"))

@@ -23036,6 +23036,10 @@ impl AppController {
         }
         #[cfg(feature = "web-browser")]
         if self.view.screen == Screen::Web {
+            #[cfg(feature = "url-info")]
+            if self.restore_site_file_from_web() {
+                return;
+            }
             self.open_web_parent();
             return;
         }
@@ -36187,6 +36191,61 @@ impl UiController for AppController {
                     .map(|info| info.url.clone())
                 {
                     self.open_external_url(&url);
+                }
+            }
+            UiAction::OpenUrlRobots(index) | UiAction::OpenUrlSitemap(index) => {
+                #[cfg(feature = "url-info")]
+                self.open_url_site_file(index, matches!(action, UiAction::OpenUrlSitemap(_)));
+                #[cfg(not(feature = "url-info"))]
+                let _ = index;
+            }
+            UiAction::DismissSiteFile => {
+                #[cfg(feature = "url-info")]
+                self.dismiss_site_file();
+            }
+            UiAction::BackSiteFile => {
+                #[cfg(feature = "url-info")]
+                self.back_site_file();
+            }
+            UiAction::MoveSiteFileSelection(delta) => {
+                #[cfg(feature = "url-info")]
+                self.move_site_file_selection(delta);
+                #[cfg(not(feature = "url-info"))]
+                let _ = delta;
+            }
+            UiAction::ActivateSiteFileEntry(index) => {
+                #[cfg(feature = "url-info")]
+                self.activate_site_file_entry(index);
+                #[cfg(not(feature = "url-info"))]
+                let _ = index;
+            }
+            UiAction::SetSiteFileScroll(offset) => {
+                if let Some(popup) = self.view.site_file_popup.as_mut() {
+                    if popup.scroll_offset != offset {
+                        popup.entry_line_offset = 0;
+                    }
+                    popup.scroll_offset = offset.min(if popup.sitemap {
+                        popup.entries.len().saturating_sub(1)
+                    } else {
+                        popup.text.chars().count()
+                    });
+                }
+            }
+            UiAction::SetSiteFileEntryScroll(offset) => {
+                if let Some(popup) = self.view.site_file_popup.as_mut()
+                    && let Some(entry) = popup.entries.get(popup.scroll_offset)
+                {
+                    let maximum =
+                        entry
+                            .metadata
+                            .iter()
+                            .fold(entry.url.len(), |length, (key, value)| {
+                                length
+                                    .saturating_add(key.len())
+                                    .saturating_add(value.len())
+                                    .saturating_add(3)
+                            });
+                    popup.entry_line_offset = offset.min(maximum);
                 }
             }
             UiAction::OpenWikidataValue(url) => {

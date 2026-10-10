@@ -1986,6 +1986,13 @@ struct HitMap {
     bug_report_buttons: Vec<(UiAction, Rect)>,
     /// Copy/cancel/close controls rendered inside the audio-quality popup.
     audio_quality_buttons: Vec<(UiAction, Rect)>,
+    /// Visible lazy site-file controls and selectable sitemap rows.
+    site_file_buttons: Vec<(UiAction, Rect)>,
+    site_file_entries: Vec<(usize, Rect)>,
+    /// Robots uses wrapped lines; sitemaps use entry offsets.
+    site_file_scroll: ScrollGeometry,
+    /// Secondary scrolling makes every line of a single oversized entry reachable.
+    site_file_entry_scroll: ScrollGeometry,
     /// Wrapped report viewport inside the audio-quality popup.
     audio_quality_text_area: Rect,
     /// Actual first wrapped audio-quality report line rendered.
@@ -2479,6 +2486,7 @@ fn render_frame(
     if view.error_popup.is_none()
         && view.bug_report_popup.is_none()
         && view.unsubscribe_popup.is_none()
+        && view.site_file_popup.is_none()
         && let Some(visualizer) = view.ascii_visualizer.as_ref()
     {
         if let Some(renderer) = thumbnail_renderer.as_mut() {
@@ -2500,6 +2508,7 @@ fn render_frame(
     hit_map.buttons.clear();
     render_tabs(frame, sections[0], view, &theme, hit_map);
     let thumbnail_is_obscured = view.help_open
+        || view.site_file_popup.is_some()
         || view.audio_quality_popup.is_some()
         || view.video_summary_popup.is_some()
         || view.project_history_popup.is_some()
@@ -2786,6 +2795,10 @@ fn render_frame(
     }
     hit_map.error_buttons.clear();
     hit_map.audio_quality_buttons.clear();
+    hit_map.site_file_buttons.clear();
+    hit_map.site_file_entries.clear();
+    hit_map.site_file_scroll = ScrollGeometry::default();
+    hit_map.site_file_entry_scroll = ScrollGeometry::default();
     hit_map.audio_quality_text_area = Rect::default();
     hit_map.audio_quality_scroll_offset = 0;
     hit_map.audio_quality_scroll_maximum = 0;
@@ -2839,6 +2852,9 @@ fn render_frame(
     }
     if let Some(popup) = view.audio_quality_popup.as_ref() {
         render_audio_quality_popup(frame, popup, &theme, hit_map);
+    }
+    if let Some(popup) = view.site_file_popup.as_ref() {
+        render_site_file_popup(frame, popup, &theme, hit_map);
     }
     hit_map.unsubscribe_buttons.clear();
     if let Some(popup) = view.unsubscribe_popup.as_ref() {
@@ -5837,6 +5853,14 @@ fn render_information_panel(
     let has_details_body = !details.description.is_empty()
         || !details.lastfm_artist_description.is_empty()
         || !details.local_audio_quality_description.is_empty();
+    let expanded_url = details
+        .url_info
+        .get(
+            details
+                .url_info_offset
+                .min(details.url_info.len().saturating_sub(1)),
+        )
+        .is_some_and(|info| info.expanded);
     let mut text_reserve = if details.thumbnail_expanded {
         0
     } else {
@@ -5845,6 +5869,7 @@ fn render_information_panel(
         u16::from(has_details_body || !details.url_info.is_empty())
             + u16::from(!details.links.is_empty())
             + 2 * u16::from(!details.url_info.is_empty())
+            + u16::from(expanded_url)
     };
     let compact_metadata_height = u16::try_from(
         lines
@@ -6144,7 +6169,7 @@ fn render_information_panel(
     }
     if !details.links.is_empty() && remaining_height > 0 {
         let description_reserve = if !details.url_info.is_empty() {
-            remaining_height.min(2)
+            remaining_height.min(2 + u16::from(expanded_url))
         } else if has_details_body {
             remaining_height.min(1)
         } else {
@@ -6396,6 +6421,22 @@ fn render_information_panel(
         if show_text_selection {
             capture_selectable_details_row(frame, hit_map, row);
         }
+        cursor_y = cursor_y.saturating_add(1);
+        remaining_height = inner.bottom().saturating_sub(cursor_y);
+    }
+    if details
+        .url_info
+        .get(url_start)
+        .is_some_and(|info| info.expanded)
+        && remaining_height > 1
+    {
+        render_site_file_buttons(
+            frame,
+            Rect::new(inner.x, cursor_y, inner.width, 1),
+            url_start,
+            theme,
+            hit_map,
+        );
         cursor_y = cursor_y.saturating_add(1);
         remaining_height = inner.bottom().saturating_sub(cursor_y);
     }
@@ -6816,6 +6857,29 @@ fn render_url_info_row(
         external_opener_available.then_some(UiAction::OpenUrlInfo(index)),
     );
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Offers root-origin files only inside the explicit URL disclosure.
+fn render_site_file_buttons(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    index: usize,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+) {
+    let mut x = area.x;
+    for (label, action) in [
+        ("[Alt+r] robots.txt", UiAction::OpenUrlRobots(index)),
+        ("[Alt+s] sitemap.xml", UiAction::OpenUrlSitemap(index)),
+    ] {
+        let width = terminal_text_width(label).min(area.right().saturating_sub(x));
+        if width > 0 && area.height > 0 {
+            let target = Rect::new(x, area.y, width, 1);
+            frame.render_widget(Paragraph::new(label).style(theme.accent), target);
+            hit_map.detail_buttons.push((action, target));
+        }
+        x = x.saturating_add(width).saturating_add(2);
+    }
 }
 
 /// Appends one expanded-Wikidata source token while preserving item links
@@ -9054,6 +9118,154 @@ fn github_issue_submission_notice(state: &GitHubIssueSubmissionView) -> Option<S
         GitHubIssueSubmissionView::Failed { message } => {
             Some(format!("GitHub issue submission failed:\n{message}"))
         }
+    }
+}
+
+/// Renders full robots text or a selectable, lazily navigated sitemap without interpreting markup.
+fn render_site_file_popup(
+    frame: &mut Frame<'_>,
+    popup: &crate::view::SiteFilePopupView,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+) {
+    let area = centered_rect(92, 88, frame.area());
+    frame.render_widget(Clear, area);
+    frame.render_widget(panel_block(&format!(" {} ", popup.title), theme), area);
+    let inner = area.inner(ratatui::layout::Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let sections = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+    frame.render_widget(
+        Paragraph::new(popup.url.as_str()).style(theme.muted),
+        sections[0],
+    );
+    let body = sections[1];
+    let page = usize::from(body.height).max(1);
+    let message = if popup.loading {
+        Some("Loading...")
+    } else if popup.sitemap && popup.entries.is_empty() && popup.error.is_none() {
+        Some("No sitemap entries.")
+    } else {
+        None
+    };
+    if let Some(message) = message {
+        frame.render_widget(Paragraph::new(message).style(theme.muted), body);
+    } else if popup.sitemap {
+        let maximum = popup.entries.len().saturating_sub(1);
+        let offset = popup.scroll_offset.min(maximum);
+        let mut y = body.y;
+        let mut visible = 0;
+        for (index, entry) in popup.entries.iter().enumerate().skip(offset) {
+            if y >= body.bottom() {
+                break;
+            }
+            let mut lines = wrap_text_lines(&entry.url, body.width);
+            for (label, value) in &entry.metadata {
+                lines.extend(wrap_text_lines(&format!("{label}: {value}"), body.width));
+            }
+            if index == offset {
+                let maximum = lines.len().saturating_sub(page);
+                let line_offset = popup.entry_line_offset.min(maximum);
+                hit_map.site_file_entry_scroll = ScrollGeometry {
+                    offset: line_offset,
+                    maximum,
+                    page_lines: page,
+                };
+                lines.drain(..line_offset);
+            }
+            let height = u16::try_from(lines.len())
+                .unwrap_or(u16::MAX)
+                .min(body.bottom().saturating_sub(y));
+            let target = Rect::new(body.x, y, body.width, height);
+            let style = if index == popup.selected {
+                theme.selected
+            } else {
+                theme.accent
+            };
+            frame.render_widget(
+                Paragraph::new(lines.into_iter().map(Line::from).collect::<Vec<_>>()).style(style),
+                target,
+            );
+            hit_map.site_file_entries.push((index, target));
+            visible += 1;
+            y = y.saturating_add(height).saturating_add(1);
+        }
+        hit_map.site_file_scroll = ScrollGeometry {
+            offset,
+            maximum,
+            page_lines: visible.max(1),
+        };
+        frame.render_widget(
+            Paragraph::new(format!(
+                "{} entries; Enter opens {}",
+                popup.entries.len(),
+                if popup.sitemap_index {
+                    "child sitemap"
+                } else {
+                    "page in Web"
+                }
+            ))
+            .style(theme.muted),
+            sections[2],
+        );
+    } else {
+        let lines = wrap_text_lines(&popup.text, body.width);
+        let maximum = lines.len().saturating_sub(page);
+        let offset = popup.scroll_offset.min(maximum);
+        frame.render_widget(
+            Paragraph::new(
+                lines
+                    .into_iter()
+                    .skip(offset)
+                    .take(page)
+                    .map(Line::from)
+                    .collect::<Vec<_>>(),
+            )
+            .style(theme.base),
+            body,
+        );
+        hit_map.site_file_scroll = ScrollGeometry {
+            offset,
+            maximum,
+            page_lines: page,
+        };
+    }
+    if let Some(error) = popup.error.as_deref() {
+        frame.render_widget(Paragraph::new(error).style(theme.muted), sections[2]);
+    } else if hit_map.site_file_entry_scroll.maximum > 0 {
+        frame.render_widget(
+            Paragraph::new(format!(
+                "PgUp/PgDn: entry lines {}/{}; arrows: entries",
+                hit_map.site_file_entry_scroll.offset + 1,
+                hit_map.site_file_entry_scroll.maximum + 1
+            ))
+            .style(theme.muted),
+            sections[2],
+        );
+    }
+    let mut x = sections[3].x;
+    let mut buttons = vec![("[Esc] Close", UiAction::DismissSiteFile)];
+    if popup.can_go_back {
+        buttons.push(("[Alt+Left] Back", UiAction::BackSiteFile));
+    }
+    for (label, action) in buttons {
+        let width = terminal_text_width(label).min(sections[3].right().saturating_sub(x));
+        if width > 0 && sections[3].height > 0 {
+            let target = Rect::new(x, sections[3].y, width, 1);
+            frame.render_widget(Paragraph::new(label).style(theme.accent), target);
+            hit_map.site_file_buttons.push((action, target));
+        }
+        x = x.saturating_add(width).saturating_add(3);
     }
 }
 
@@ -15429,6 +15641,8 @@ fn popup_geometry(hit_map: &HitMap) -> PopupGeometry {
             maximum: hit_map.video_comments_scroll_maximum,
             page_lines: hit_map.video_comments_page_lines,
         },
+        site_file: hit_map.site_file_scroll,
+        site_file_entry: hit_map.site_file_entry_scroll,
     }
 }
 
@@ -15564,6 +15778,53 @@ fn mouse_action_unfiltered(
                 .iter()
                 .find(|(_, area)| contains(*area, mouse.column, mouse.row))
                 .map(|(action, _)| action.clone()),
+            _ => None,
+        };
+    }
+    if let Some(popup) = view.site_file_popup.as_ref() {
+        return match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => hit_map
+                .site_file_buttons
+                .iter()
+                .find(|(_, area)| contains(*area, mouse.column, mouse.row))
+                .map(|(action, _)| action.clone())
+                .or_else(|| {
+                    (!popup.loading)
+                        .then(|| {
+                            hit_map
+                                .site_file_entries
+                                .iter()
+                                .find(|(_, area)| contains(*area, mouse.column, mouse.row))
+                                .map(|(index, _)| UiAction::ActivateSiteFileEntry(*index))
+                        })
+                        .flatten()
+                }),
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp if !popup.loading => {
+                let delta = if mouse.kind == MouseEventKind::ScrollDown {
+                    3
+                } else {
+                    -3
+                };
+                if popup.sitemap && hit_map.site_file_entry_scroll.maximum > 0 {
+                    Some(UiAction::SetSiteFileEntryScroll(
+                        hit_map
+                            .site_file_entry_scroll
+                            .offset
+                            .saturating_add_signed(delta as isize)
+                            .min(hit_map.site_file_entry_scroll.maximum),
+                    ))
+                } else if popup.sitemap {
+                    Some(UiAction::MoveSiteFileSelection(delta))
+                } else {
+                    Some(UiAction::SetSiteFileScroll(
+                        hit_map
+                            .site_file_scroll
+                            .offset
+                            .saturating_add_signed(delta as isize)
+                            .min(hit_map.site_file_scroll.maximum),
+                    ))
+                }
+            }
             _ => None,
         };
     }
@@ -40144,6 +40405,134 @@ prose 07:25 remains clickable but is not a chapter";
     }
 
     #[test]
+    fn oversized_sitemap_entry_scrolls_to_its_last_metadata_line() {
+        let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
+        let mut view = ViewModel {
+            site_file_popup: Some(crate::view::SiteFilePopupView {
+                title: "Sitemap".into(),
+                sitemap: true,
+                entries: vec![crate::view::SiteFileEntryView {
+                    url: "https://example.com/child.xml".into(),
+                    metadata: (0..40)
+                        .map(|index| (format!("Field {index}"), "complete value".into()))
+                        .collect(),
+                }],
+                ..crate::view::SiteFilePopupView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut hits = HitMap::default();
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hits))
+            .unwrap();
+        assert!(hits.site_file_entry_scroll.maximum > 0);
+        let page = hits.site_file_entry_scroll.page_lines;
+        assert_eq!(
+            crate::keymap::key_action(
+                crate::keymap::KeyPress::new(crate::keymap::Key::PageDown),
+                &view,
+                None,
+                Some(popup_geometry(&hits))
+            ),
+            Some(UiAction::SetSiteFileEntryScroll(page))
+        );
+        view.site_file_popup.as_mut().unwrap().entry_line_offset = usize::MAX;
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hits))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(text.contains("Field 39: complete value"));
+        assert_eq!(
+            hits.site_file_entry_scroll.offset,
+            hits.site_file_entry_scroll.maximum
+        );
+    }
+
+    #[test]
+    fn site_file_popup_keeps_metadata_and_modal_click_targets() {
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut view = ViewModel {
+            site_file_popup: Some(crate::view::SiteFilePopupView {
+                title: "Sitemap".into(),
+                url: "https://example.com/sitemap.xml".into(),
+                sitemap: true,
+                sitemap_index: true,
+                can_go_back: true,
+                entries: vec![crate::view::SiteFileEntryView {
+                    url: "https://example.com/child.xml".into(),
+                    metadata: vec![("Last modified".into(), "2026-10-10".into())],
+                }],
+                ..crate::view::SiteFilePopupView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut hits = HitMap::default();
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hits))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(text.contains("Last modified: 2026-10-10"));
+        let area = hits.site_file_entries[0].1;
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: area.x,
+                    row: area.y,
+                    modifiers: KeyModifiers::NONE
+                },
+                &hits,
+                &view
+            ),
+            Some(UiAction::ActivateSiteFileEntry(0))
+        );
+        assert!(
+            hits.site_file_buttons
+                .iter()
+                .any(|(action, _)| *action == UiAction::BackSiteFile)
+        );
+        view.site_file_popup = Some(crate::view::SiteFilePopupView {
+            title: "robots.txt".into(),
+            text: (0..100)
+                .map(|index| format!("Disallow: /{index}\n"))
+                .collect(),
+            scroll_offset: 99,
+            ..crate::view::SiteFilePopupView::default()
+        });
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hits))
+            .unwrap();
+        assert!(hits.site_file_entries.is_empty());
+        assert_eq!(hits.site_file_scroll.offset, hits.site_file_scroll.maximum);
+        assert!(hits.site_file_scroll.page_lines > 0);
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::ScrollDown,
+                    column: 0,
+                    row: 0,
+                    modifiers: KeyModifiers::NONE
+                },
+                &hits,
+                &view
+            ),
+            Some(UiAction::SetSiteFileScroll(hits.site_file_scroll.maximum))
+        );
+    }
+
+    #[test]
     fn url_info_controls_are_bounded_and_facts_are_muted_without_comment_link_actions() {
         let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
         let mut view = ViewModel {
@@ -40208,7 +40597,17 @@ prose 07:25 remains clickable but is not a chapter";
             .collect::<Vec<_>>();
         let info_y = info_controls[0].1.y;
         assert!(info_controls.iter().all(|(_, area)| area.y == info_y));
-        assert_eq!(start / 120, usize::from(info_y + 1));
+        assert_eq!(start / 120, usize::from(info_y + 2));
+        assert!(
+            hits.detail_buttons
+                .iter()
+                .any(|(action, _)| *action == UiAction::OpenUrlRobots(12))
+        );
+        assert!(
+            hits.detail_buttons
+                .iter()
+                .any(|(action, _)| *action == UiAction::OpenUrlSitemap(12))
+        );
         assert!(!text.contains("https://example.com/13"));
         assert!(!text.contains("https://example.com/14"));
         assert!(
@@ -40296,7 +40695,7 @@ prose 07:25 remains clickable but is not a chapter";
         );
     }
 
-    /// Tall artwork must leave its separator, the URL row, and one facts row visible.
+    /// Tall artwork leaves the URL row, expanded file controls, and one facts row visible.
     #[test]
     fn url_info_row_survives_constrained_thumbnail_with_and_without_detail_links() {
         let mut observed = Vec::new();
@@ -40361,15 +40760,22 @@ prose 07:25 remains clickable but is not a chapter";
                     .any(|(action, _)| *action == UiAction::ToggleUrlInfo(0)),
                 text.contains("Title: Selected website"),
                 !with_links || text.contains("Related link"),
+                hits.detail_buttons
+                    .iter()
+                    .any(|(action, _)| *action == UiAction::OpenUrlRobots(0))
+                    && hits
+                        .detail_buttons
+                        .iter()
+                        .any(|(action, _)| *action == UiAction::OpenUrlSitemap(0)),
             ));
         }
         assert_eq!(
             observed,
             [
-                (false, true, true, true, true),
-                (true, true, true, true, true)
+                (false, true, true, true, true, true),
+                (true, true, true, true, true, true)
             ],
-            "with-links, artwork, URL control, facts, and optional link must remain visible"
+            "with-links, artwork, URL control, facts, optional link, and file buttons must remain visible"
         );
     }
 

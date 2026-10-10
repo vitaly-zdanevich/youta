@@ -31,6 +31,12 @@ pub(super) struct WebWorker {
 }
 
 impl AppController {
+    /// Explicit Web child history takes precedence over a retained sitemap return point.
+    #[cfg(feature = "url-info")]
+    pub(super) fn web_has_back_history(&self) -> bool {
+        !self.web.back.is_empty()
+    }
+
     /// Revokes queued and in-flight directory ownership before restoring a typed source page.
     pub(super) fn cancel_web_navigation_for_now_playing(&mut self) {
         self.web.generation = self.web.generation.wrapping_add(1);
@@ -51,6 +57,8 @@ impl AppController {
         url: url::Url,
     ) -> Result<(), crate::web_browser::WebBrowserError> {
         validate_web_url(&url)?;
+        #[cfg(feature = "url-info")]
+        self.discard_site_file_web_return();
         self.show_screen(Screen::Web);
         self.web.back.clear();
         self.browse_web_url(url, 0);
@@ -68,6 +76,8 @@ impl AppController {
             });
         match result {
             Ok(url) => {
+                #[cfg(feature = "url-info")]
+                self.discard_site_file_web_return();
                 self.web.back.clear();
                 self.browse_web_url(url, 0);
             }
@@ -442,6 +452,91 @@ mod startup_tests {
         let config = Config::for_dir(directory.path());
         let store = StateStore::open(&config).expect("startup state");
         (directory, AppController::new(config, store, None, None))
+    }
+
+    /// Sitemap page browsing returns to the exact loaded list, without another sitemap request.
+    #[cfg(feature = "url-info")]
+    #[test]
+    fn sitemap_web_back_restores_viewer_selection_and_scroll() {
+        let (_directory, mut app) = controller();
+        let (release, held) = bounded::<()>(1);
+        let (_reply, response) = bounded(1);
+        app.web.worker = Some(WebWorker {
+            generation: 0,
+            response,
+            thread: thread::spawn(move || {
+                let _ = held.recv_timeout(Duration::from_secs(5));
+            }),
+        });
+        let before_screen = app.view.screen;
+        let popup = crate::view::SiteFilePopupView {
+            title: "Sitemap".into(),
+            url: "https://example.com/sitemap.xml".into(),
+            sitemap: true,
+            selected: 2,
+            scroll_offset: 1,
+            entries: (0..3)
+                .map(|index| crate::view::SiteFileEntryView {
+                    url: format!("https://example.com/page{index}"),
+                    metadata: Vec::new(),
+                })
+                .collect(),
+            ..crate::view::SiteFilePopupView::default()
+        };
+        app.view.site_file_popup = Some(popup.clone());
+        app.dispatch(UiAction::ActivateSiteFileEntry(2));
+        assert_eq!(app.view.screen, Screen::Web);
+        assert!(app.view.site_file_popup.is_none());
+        assert_eq!(
+            app.web.request.as_ref().unwrap().1.as_str(),
+            "https://example.com/page2"
+        );
+        app.go_back();
+        assert_eq!(app.view.screen, before_screen);
+        assert_eq!(app.view.site_file_popup, Some(popup));
+        assert!(app.web.request.is_none());
+        assert!(app.url_info.site_file_worker.is_none());
+        release.send(()).unwrap();
+    }
+
+    /// An independently opened address starts a new route, not a stale sitemap return.
+    #[cfg(feature = "url-info")]
+    #[test]
+    fn independent_web_address_discards_sitemap_return() {
+        for submitted in [false, true] {
+            let (_directory, mut app) = controller();
+            let (release, held) = bounded::<()>(1);
+            let (_reply, response) = bounded(1);
+            app.web.worker = Some(WebWorker {
+                generation: 0,
+                response,
+                thread: thread::spawn(move || {
+                    let _ = held.recv_timeout(Duration::from_secs(5));
+                }),
+            });
+            app.view.site_file_popup = Some(crate::view::SiteFilePopupView {
+                sitemap: true,
+                entries: vec![crate::view::SiteFileEntryView {
+                    url: "https://example.com/from-sitemap".into(),
+                    ..crate::view::SiteFileEntryView::default()
+                }],
+                ..crate::view::SiteFilePopupView::default()
+            });
+            app.dispatch(UiAction::ActivateSiteFileEntry(0));
+            let unrelated = "https://example.org/unrelated";
+            if submitted {
+                app.view.search_query = unrelated.into();
+                app.submit_web_url();
+            } else {
+                app.open_web_url(url::Url::parse(unrelated).unwrap())
+                    .unwrap();
+            }
+            assert!(!app.restore_site_file_from_web());
+            assert_eq!(app.view.screen, Screen::Web);
+            assert!(app.view.site_file_popup.is_none());
+            assert_eq!(app.web.request.as_ref().unwrap().1.as_str(), unrelated);
+            release.send(()).unwrap();
+        }
     }
 
     /// Startup queues the exact latest page through the existing worker, never playback.

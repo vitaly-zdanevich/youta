@@ -81,6 +81,8 @@ export type UnitUiAction =
 	| 'CopyBugReport'
 	| 'DismissBugReport'
 	| 'DismissCustomCommandOutput'
+	| 'DismissSiteFile'
+	| 'BackSiteFile'
 	| 'OpenBugReportResult'
 	| 'ActivateLocalMoveDestination'
 	| 'ActivateSelection'
@@ -313,6 +315,12 @@ export interface UiActionPayloads {
 	SetDetailsFocus: boolean;
 	SetDetailsScroll: number;
 	SetProjectHistoryScroll: number;
+	OpenUrlRobots: number;
+	OpenUrlSitemap: number;
+	MoveSiteFileSelection: number;
+	ActivateSiteFileEntry: number;
+	SetSiteFileScroll: number;
+	SetSiteFileEntryScroll: number;
 	SetSubscriptionsLayout: SubscriptionsLayout;
 	SetVideoCommentsScroll: number;
 	SetVideoSummaryScroll: number;

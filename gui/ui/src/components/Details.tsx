@@ -172,16 +172,19 @@ function Action({
 }
 
 /** Explicit URL controls own Enter/Space so they cannot activate playback too. */
-function UrlInfoButton({ children, index, toggle, expanded, disabled = false, title }: {
+function UrlInfoButton({ children, index, toggle, expanded, disabled = false, title, siteFile }: {
 	children: ReactNode;
 	index: number;
 	toggle: boolean;
 	expanded?: boolean;
 	disabled?: boolean;
 	title: string;
+	siteFile?: 'robots' | 'sitemap';
 }) {
 	const activate = () => {
-		if (!disabled) void dispatch(toggle ? { ToggleUrlInfo: index } : { OpenUrlInfo: index });
+		if (!disabled) void dispatch(siteFile === 'robots' ? { OpenUrlRobots: index }
+			: siteFile === 'sitemap' ? { OpenUrlSitemap: index }
+			: toggle ? { ToggleUrlInfo: index } : { OpenUrlInfo: index });
 	};
 	return <button type='button' disabled={disabled} aria-expanded={expanded} title={title}
 		onClick={(event) => {
@@ -218,6 +221,10 @@ function UrlInformation({ entries, externalOpenerAvailable }: {
 				</UrlInfoButton>
 			</div>
 			{entry.expanded ? <div className='mt-1'>
+				<div className='mb-1 flex gap-3'>
+					<UrlInfoButton index={index} toggle siteFile='robots' title='Read robots.txt in Youta (Alt+R)'>robots.txt</UrlInfoButton>
+					<UrlInfoButton index={index} toggle siteFile='sitemap' title='Browse sitemap.xml in Youta (Alt+S)'>sitemap.xml</UrlInfoButton>
+				</div>
 				{entry.loading ? <p role='status' className='m-0 text-ink-faint'>Loading...</p> : null}
 				{entry.lines.map((line, lineIndex) => <p key={lineIndex}
 					className='m-0 whitespace-pre-wrap break-words text-ink-faint'>{line}</p>)}

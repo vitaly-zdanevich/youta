@@ -23,6 +23,7 @@ use crate::domain::{ip_address_is_non_public, remote_url_has_non_public_host};
 mod analytics;
 mod metadata;
 mod network;
+pub(crate) mod site_files;
 mod tls;
 mod whois;
 
@@ -351,6 +352,7 @@ impl<'a> Budget<'a> {
 enum DocumentKind {
     Html,
     Json,
+    Text,
 }
 
 impl DocumentKind {
@@ -358,6 +360,7 @@ impl DocumentKind {
         match self {
             Self::Html => MAX_HTML_BYTES,
             Self::Json => MAX_JSON_BYTES,
+            Self::Text => site_files::MAX_FILE_BYTES,
         }
     }
     fn accepts(self, content_type: &str) -> bool {
@@ -371,6 +374,16 @@ impl DocumentKind {
                 content_type.eq_ignore_ascii_case("application/json")
                     || content_type.eq_ignore_ascii_case("application/rdap+json")
             }
+            Self::Text => [
+                "text/plain",
+                "text/xml",
+                "application/xml",
+                "application/gzip",
+                "application/x-gzip",
+                "application/octet-stream",
+            ]
+            .iter()
+            .any(|expected| content_type.eq_ignore_ascii_case(expected)),
         }
     }
 }
@@ -563,6 +576,7 @@ impl HttpTransport for UreqTransport {
                 match kind {
                     DocumentKind::Html => "text/html,application/xhtml+xml",
                     DocumentKind::Json => "application/rdap+json,application/json",
+                    DocumentKind::Text => "text/plain,application/xml,text/xml,application/gzip,application/octet-stream",
                 },
             )
             .call()
@@ -618,7 +632,7 @@ impl HttpTransport for UreqTransport {
             if !kind.accepts(&content_type) {
                 return Err(Failure::WrongType);
             }
-            if matches!(kind, DocumentKind::Json)
+            if !matches!(kind, DocumentKind::Html)
                 && response
                     .body()
                     .content_length()
@@ -640,6 +654,7 @@ impl HttpTransport for UreqTransport {
                     cancelled,
                 )?,
                 DocumentKind::Json => read_body(reader, MAX_JSON_BYTES, cancelled)?,
+                DocumentKind::Text => read_body(reader, site_files::MAX_FILE_BYTES, cancelled)?,
             }
         } else {
             Vec::new()

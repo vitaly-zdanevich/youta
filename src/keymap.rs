@@ -134,12 +134,95 @@ pub struct PopupGeometry {
     pub project_history: ScrollGeometry,
     /// Video-comments popup.
     pub video_comments: ScrollGeometry,
+    /// Explicit robots text or sitemap-list viewer.
+    #[serde(default)]
+    pub site_file: ScrollGeometry,
+    /// Wrapped lines of an oversized first visible sitemap entry; unused by native GUI scrolling.
+    #[serde(default)]
+    pub site_file_entry: ScrollGeometry,
 }
 
 #[cfg(test)]
 mod wire_tests {
     use super::{Key, KeyPress, PopupGeometry, key_action};
     use crate::playback::PlaybackStatus;
+
+    /// Site-file keys stay lazy and contextual, while the viewer owns navigation and Escape.
+    #[test]
+    fn site_file_shortcuts_and_viewer_navigation_are_modal() {
+        let mut view = ViewModel {
+            details: Some(crate::view::DetailView {
+                url_info: vec![crate::view::UrlInfoView {
+                    url: "https://example.com/page".into(),
+                    expanded: true,
+                    ..crate::view::UrlInfoView::default()
+                }],
+                ..crate::view::DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        for (key, action) in [
+            ('r', UiAction::OpenUrlRobots(0)),
+            ('s', UiAction::OpenUrlSitemap(0)),
+        ] {
+            let press = KeyPress {
+                alt: true,
+                ..KeyPress::new(Key::Char(key))
+            };
+            assert_eq!(key_action(press, &view, None, None), Some(action.clone()));
+            view.details.as_mut().unwrap().url_info[0].expanded = false;
+            assert_ne!(key_action(press, &view, None, None), Some(action));
+            view.details.as_mut().unwrap().url_info[0].expanded = true;
+        }
+        view.site_file_popup = Some(crate::view::SiteFilePopupView {
+            loading: true,
+            ..crate::view::SiteFilePopupView::default()
+        });
+        assert_eq!(
+            key_action(KeyPress::new(Key::Esc), &view, None, None),
+            Some(UiAction::DismissSiteFile)
+        );
+        assert_eq!(
+            key_action(KeyPress::new(Key::Char(' ')), &view, None, None),
+            None
+        );
+        view.site_file_popup = Some(crate::view::SiteFilePopupView {
+            sitemap: true,
+            sitemap_index: true,
+            can_go_back: true,
+            entries: vec![crate::view::SiteFileEntryView::default()],
+            ..crate::view::SiteFilePopupView::default()
+        });
+        assert_eq!(
+            key_action(KeyPress::new(Key::Enter), &view, None, None),
+            Some(UiAction::ActivateSiteFileEntry(0))
+        );
+        assert_eq!(
+            key_action(KeyPress::new(Key::Down), &view, None, None),
+            Some(UiAction::MoveSiteFileSelection(1))
+        );
+        assert_eq!(
+            key_action(
+                KeyPress {
+                    alt: true,
+                    ..KeyPress::new(Key::Left)
+                },
+                &view,
+                None,
+                None
+            ),
+            Some(UiAction::BackSiteFile)
+        );
+        view.site_file_popup.as_mut().unwrap().sitemap = false;
+        let mut geometry = PopupGeometry::default();
+        geometry.site_file.offset = 2;
+        geometry.site_file.maximum = 30;
+        geometry.site_file.page_lines = 7;
+        assert_eq!(
+            key_action(KeyPress::new(Key::PageDown), &view, None, Some(geometry)),
+            Some(UiAction::SetSiteFileScroll(9))
+        );
+    }
 
     /// The three-key chord is global, while the composer owns all later typing.
     #[test]
@@ -1068,6 +1151,13 @@ mod wire_tests {
         let json = serde_json::to_string(&geometry).expect("encode geometry");
         assert_eq!(
             serde_json::from_str::<PopupGeometry>(&json).expect("decode geometry"),
+            geometry
+        );
+        let mut legacy = serde_json::to_value(geometry).unwrap();
+        legacy.as_object_mut().unwrap().remove("site_file");
+        legacy.as_object_mut().unwrap().remove("site_file_entry");
+        assert_eq!(
+            serde_json::from_value::<PopupGeometry>(legacy).unwrap(),
             geometry
         );
     }
@@ -2160,6 +2250,16 @@ fn key_action_with_custom_command(
             _ => None,
         };
     }
+    if view.error_popup.is_none()
+        && let Some(popup) = view.site_file_popup.as_ref()
+    {
+        return site_file_key_action(
+            key,
+            popup,
+            popups.map(|geometry| geometry.site_file),
+            popups.map(|geometry| geometry.site_file_entry),
+        );
+    }
     #[cfg(feature = "ascii-visualizer")]
     if view.error_popup.is_none() && view.ascii_visualizer.is_some() {
         return match key.key {
@@ -2453,6 +2553,71 @@ fn video_summary_control_action(key: KeyPress, popup: &VideoSummaryPopupView) ->
         Key::Char('c' | 'C') if !popup.report.is_empty() => Some(UiAction::CopyVideoSummary),
         _ => None,
     }
+}
+
+/// Keeps file text scrolling and sitemap selection inside the modal viewer.
+fn site_file_key_action(
+    key: KeyPress,
+    popup: &SiteFilePopupView,
+    geometry: Option<ScrollGeometry>,
+    entry_geometry: Option<ScrollGeometry>,
+) -> Option<UiAction> {
+    if key.key == Key::Esc {
+        return Some(UiAction::DismissSiteFile);
+    }
+    if key.alt && key.key == Key::Left {
+        return popup.can_go_back.then_some(UiAction::BackSiteFile);
+    }
+    if key.chorded() || popup.loading {
+        return None;
+    }
+    let geometry = geometry.unwrap_or(ScrollGeometry {
+        offset: popup.scroll_offset,
+        maximum: usize::MAX,
+        page_lines: 20,
+    });
+    if popup.sitemap {
+        if let Some(entry) = entry_geometry.filter(|entry| entry.maximum > 0) {
+            let offset = match key.key {
+                Key::PageUp => Some(entry.offset.saturating_sub(entry.page_lines.max(1))),
+                Key::PageDown => Some(
+                    entry
+                        .offset
+                        .saturating_add(entry.page_lines.max(1))
+                        .min(entry.maximum),
+                ),
+                _ => None,
+            };
+            if let Some(offset) = offset {
+                return Some(UiAction::SetSiteFileEntryScroll(offset));
+            }
+        }
+        let page = i32::try_from(geometry.page_lines.max(1)).unwrap_or(i32::MAX);
+        return match key.key {
+            Key::Enter => (!popup.entries.is_empty())
+                .then_some(UiAction::ActivateSiteFileEntry(popup.selected)),
+            Key::Up | Key::Char('k') => Some(UiAction::MoveSiteFileSelection(-1)),
+            Key::Down | Key::Char('j') => Some(UiAction::MoveSiteFileSelection(1)),
+            Key::PageUp => Some(UiAction::MoveSiteFileSelection(-page)),
+            Key::PageDown => Some(UiAction::MoveSiteFileSelection(page)),
+            Key::Home => Some(UiAction::MoveSiteFileSelection(i32::MIN)),
+            Key::End => Some(UiAction::MoveSiteFileSelection(i32::MAX)),
+            _ => None,
+        };
+    }
+    let offset = match key.key {
+        Key::Up | Key::Char('k') => geometry.offset.saturating_sub(1),
+        Key::Down | Key::Char('j') => geometry.offset.saturating_add(1).min(geometry.maximum),
+        Key::PageUp => geometry.offset.saturating_sub(geometry.page_lines.max(1)),
+        Key::PageDown => geometry
+            .offset
+            .saturating_add(geometry.page_lines.max(1))
+            .min(geometry.maximum),
+        Key::Home => 0,
+        Key::End => geometry.maximum,
+        _ => return None,
+    };
+    Some(UiAction::SetSiteFileScroll(offset))
 }
 
 /// Maps modal project-history navigation to one resize-aware wrapped-line offset.
@@ -3327,6 +3492,16 @@ fn unfiltered_key_action(
             _ => None,
         };
     }
+    if key.alt
+        && !key.ctrl
+        && let Some(index) = expanded_url_info_index(view)
+    {
+        match key.key {
+            Key::Char('r') => return Some(UiAction::OpenUrlRobots(index)),
+            Key::Char('s') => return Some(UiAction::OpenUrlSitemap(index)),
+            _ => {}
+        }
+    }
     #[cfg(feature = "cmd")]
     {
         if let Some(id) = custom_command {
@@ -3827,6 +4002,31 @@ fn unfiltered_key_action(
 /// behind a channel or collapsed description must not capture navigation keys.
 /// Printable arrows remain available to editors and overlays earlier in the map.
 fn details_accept_url_navigation(view: &ViewModel) -> bool {
+    details_show_url_tools(view)
+        && view
+            .details
+            .as_ref()
+            .is_some_and(|details| details.url_info.len() > 1)
+}
+
+/// Returns the currently disclosed URL only while its Details controls are visible.
+fn expanded_url_info_index(view: &ViewModel) -> Option<usize> {
+    if !details_show_url_tools(view) {
+        return None;
+    }
+    let details = view.details.as_ref()?;
+    let index = details
+        .url_info_offset
+        .min(details.url_info.len().saturating_sub(1));
+    details
+        .url_info
+        .get(index)
+        .filter(|entry| entry.expanded)
+        .map(|_| index)
+}
+
+/// Shares the existing Details visibility rules between URL navigation and file tools.
+fn details_show_url_tools(view: &ViewModel) -> bool {
     let details_visible = if view.screen == Screen::Subscriptions {
         match view.subscriptions.layout {
             SubscriptionsLayout::DrillDown => view.subscriptions.route == SubscriptionRoute::Items,
@@ -3839,7 +4039,7 @@ fn details_accept_url_navigation(view: &ViewModel) -> bool {
         && view
             .details
             .as_ref()
-            .is_some_and(|details| details.url_info.len() > 1 && !details.thumbnail_expanded)
+            .is_some_and(|details| !details.thumbnail_expanded)
 }
 
 /// Reports whether line-scrolling shortcuts can target the visible Details pane.

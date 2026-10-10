@@ -1,4 +1,12 @@
 [
+	{ "OpenUrlRobots": 0 },
+	{ "OpenUrlSitemap": 0 },
+	"DismissSiteFile",
+	"BackSiteFile",
+	{ "MoveSiteFileSelection": 1 },
+	{ "ActivateSiteFileEntry": 0 },
+	{ "SetSiteFileScroll": 0 },
+	{ "SetSiteFileEntryScroll": 0 },
 	{ "RunCustomCommand": 0 },
 	"DismissCustomCommandOutput",
 	"OpenBugReport",

@@ -495,6 +495,16 @@ Recognizable Google Analytics, Google Tag/Tag Manager and Yandex Metrica HTML
 markers appear only when detected. Absence is not proof that tracking is
 absent: only a bounded HTML prefix is inspected, without executing scripts
 or fetching feeds or JSON-LD contexts.
+Expanded Info provides robots.txt (Alt+r) and sitemap.xml (Alt+s) controls.
+Each fetches only when opened. Robots text is shown in full; sitemaps become
+selectable lists with lastmod and other supplied metadata. Up/Down selects;
+Enter opens a child sitemap or a page in Youta's Web tab. Alt+Left restores
+the cached parent sitemap, or returns from Web to the same sitemap selection
+and scroll position. PageUp/PageDown and the wheel reveal long entries.
+Esc closes the viewer and cancels pending work. Files have a 1 MiB decoded
+limit, also enforced after gzip sitemap decompression. Oversized files show
+an error rather than a partial list. Selection never prefetches children or
+pages. Opening pages requires the web-browser build feature.
 Up to 64 recent results stay cached in RAM until exit, without expiry or a
 Refresh button. No browser or API key is required, including on a physical TTY.
 The default-on

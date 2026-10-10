@@ -13,6 +13,7 @@ import { Waveform } from "./components/Waveform";
 import { AsciiVisualizer } from './components/AsciiVisualizer';
 import { BugReportPopup } from './components/BugReportPopup';
 import { CustomCommandOutputPopup } from './components/CustomCommands';
+import { SiteFilePopup } from './components/SiteFilePopup';
 import { captureBugReportScreenshot, visibleWindowText } from './bugReport';
 import {
   AudioQualityPopup,
@@ -311,6 +312,7 @@ export function App() {
         <AudioQualityPopup popup={view.audio_quality_popup} />
       ) : null}
 		{view.custom_command_output ? <CustomCommandOutputPopup popup={view.custom_command_output} /> : null}
+		{view.site_file_popup ? <SiteFilePopup popup={view.site_file_popup} /> : null}
       {view.error_popup ? (
         <ErrorPopup
           popup={view.error_popup}

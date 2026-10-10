@@ -86,7 +86,7 @@ test('expanded website and RDAP facts use muted escaped text without rewriting c
 	const lines = ['Title: <img src=x onerror=alert(1)>', 'Description: music & sound', 'Registered: 2001-01-01'];
 	const tree = render([{ ...entries[0], expanded: true, lines }]);
 	assert.equal(text(nodes(tree).find((node) => 'data-description' in node.props)), comment);
-	assert.deepEqual(buttons(tree).map(text), [entries[0].url, 'Hide']);
+	assert.deepEqual(buttons(tree).map(text), [entries[0].url, 'Hide', 'robots.txt', 'sitemap.xml']);
 	assert.equal(buttons(tree)[1].props['aria-expanded'], true);
 	for (const line of lines) {
 		const node = nodes(section(tree)).find((node) => node.type === 'p' && text(node) === line);
@@ -150,5 +150,27 @@ test('YouTube descriptions expose the same on-demand URL information without cha
 test('providers with no URL metadata add no unused section', () => {
 	for (const kind of ['Local', 'Video', 'Podcast', 'Radio', 'YandexMusic', 'Channel', 'Generic']) {
 		assert.equal(section(render([], true, kind)), undefined, kind);
+	}
+});
+
+test('site-file buttons are lazy, require expanded Info, and never depend on a browser', () => {
+	for (const available of [false, true]) {
+		actions.length = 0;
+		const tree = render([{ ...entries[0], expanded: true }], available);
+		const controls = buttons(tree).slice(2);
+		assert.deepEqual(controls.map(text), ['robots.txt', 'sitemap.xml']);
+		assert.deepEqual(actions, [], 'rendering does not fetch a site file');
+		for (const [index, control] of controls.entries()) {
+			assert.equal(Boolean(control.props.disabled), false);
+			const expected = index === 0 ? { OpenUrlRobots: 0 } : { OpenUrlSitemap: 0 };
+			control.props.onClick({ stopPropagation() {} });
+			assert.deepEqual(actions.splice(0), [expected]);
+			for (const key of ['Enter', ' ']) {
+				const effects = [];
+				control.props.onKeyDown({ key, stopPropagation: () => effects.push('stop'), preventDefault: () => effects.push('prevent') });
+				assert.deepEqual(effects, ['prevent', 'stop']);
+				assert.deepEqual(actions.splice(0), [expected]);
+			}
+		}
 	}
 });

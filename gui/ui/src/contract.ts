@@ -233,6 +233,30 @@ export interface UrlInfoView {
 	lines: string[];
 }
 
+/** One validated sitemap destination and all bounded metadata declared for it. */
+export interface SiteFileEntryView {
+	url: string;
+	metadata: [string, string][];
+}
+
+/** Explicitly requested site text or sitemap rows; the core owns navigation and I/O. */
+export interface SiteFilePopupView {
+	title: string;
+	url: string;
+	loading: boolean;
+	text: string;
+	error: string | null;
+	sitemap: boolean;
+	sitemap_index: boolean;
+	entries: SiteFileEntryView[];
+	selected: number;
+	can_go_back: boolean;
+	/** Wrapped text line for robots, first visible entry for sitemaps. */
+	scroll_offset: number;
+	/** Terminal detail-line offset within one oversized sitemap entry. */
+	entry_line_offset: number;
+}
+
 /**
  * The Details panel.
  *
@@ -1085,6 +1109,7 @@ export interface ViewModel {
 	download_queue_popup: DownloadQueuePopupView | null;
   help_open: boolean;
   project_history_popup: ProjectHistoryPopupView | null;
+	site_file_popup: SiteFilePopupView | null;
   error_popup: ErrorPopupView | null;
 	bug_report_popup: BugReportPopupView | null;
   audio_quality_supported: boolean;
@@ -1247,4 +1272,6 @@ export interface PopupGeometry {
   video_summary: ScrollGeometry;
   project_history: ScrollGeometry;
   video_comments: ScrollGeometry;
+	site_file: ScrollGeometry;
+	site_file_entry: ScrollGeometry;
 }

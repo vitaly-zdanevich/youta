@@ -17,7 +17,7 @@ export function ScrollingText({
   onScroll,
   children,
 }: {
-  popup: "audio_quality" | "video_summary" | "project_history" | "video_comments";
+  popup: "audio_quality" | "video_summary" | "project_history" | "video_comments" | 'site_file';
   offset: number;
   onScroll: (offset: number) => void;
   children: ReactNode;

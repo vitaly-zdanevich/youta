@@ -144,6 +144,57 @@
 		description: 'Complete fixture description.\nSecond paragraph remains visible.',
 		webpage_url: 'https://archive.org/details/fixture',
 	});
+	/** Site-file controls keep XML/text inert and child navigation inside the core. */
+	async function checkSiteFiles() {
+		const previous = clone(view);
+		const entry = { url: 'https://example.com/music', expanded: true, loading: false, lines: [] };
+		snapshot({ screen: 'Local', external_opener_available: false,
+			details: { ...details('Site files', { source: 'local', external_id: '/tmp/music.mp3' }), url_info: [entry] } });
+		await until(() => button('robots.txt') && button('sitemap.xml'), 'expanded site-file buttons');
+		await action({ OpenUrlRobots: 0 }, () => button('robots.txt').click(), 'Robots loads only through an explicit indexed core action without a browser');
+		await action({ OpenUrlSitemap: 0 }, () => button('sitemap.xml').click(), 'Sitemap loads only through an explicit indexed core action');
+		const popup = { title: 'robots.txt', url: 'https://example.com/robots.txt', loading: false,
+			text: 'User-agent: *\n<script>literal</script>\n' + 'Disallow: /private\n'.repeat(100),
+			error: null, sitemap: false, sitemap_index: false, entries: [], selected: 0, can_go_back: false, scroll_offset: 0 };
+		snapshot({ site_file_popup: popup });
+		await until(() => dialog()?.textContent.includes(popup.text), 'complete robots content');
+		assert(!dialog().querySelector('script,iframe,a,img'), 'Site text never becomes executable markup or browser links');
+		await key('PageDown', 'PageDown');
+		const paging = calls.at(-1).args.popups.site_file;
+		assert(paging.maximum > 0 && paging.page_lines > 1, 'Robots reports its actual wrapped-line viewport for core paging');
+		const entries = Array.from({ length: 120 }, (_, index) => ({
+			url: `https://example.com/child-${index}.xml`, metadata: [['Last modified', '2025-01-01'], ['Priority', '0.8']],
+		}));
+		const sitemap = { ...popup, title: 'sitemap.xml', url: 'https://example.com/sitemap.xml', text: '',
+			sitemap: true, sitemap_index: true, entries };
+		snapshot({ site_file_popup: sitemap });
+		await until(() => dialog()?.querySelector('[data-site-file-entry="0"]'), 'sitemap rows');
+		assert(dialog().textContent.includes('Last modified: 2025-01-01') && dialog().textContent.includes('Priority: 0.8'),
+			'Sitemap entries display declared dates and additional metadata');
+		assert(dialog().querySelectorAll('[data-site-file-entry]').length < entries.length,
+			'Large sitemap lists render only a bounded virtual viewport');
+		await action({ ActivateSiteFileEntry: 0 }, () => dialog().querySelector('[data-site-file-entry="0"]').click(),
+			'Child sitemap clicks dispatch an index instead of opening an external browser');
+		snapshot({ site_file_popup: { ...sitemap, selected: 60, scroll_offset: 60 } });
+		const selected = await until(() => dialog()?.querySelector('[data-site-file-entry="60"][aria-current="true"]'), 'restored sitemap row');
+		const start = calls.length;
+		const enter = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true });
+		await action({ ActivateSiteFileEntry: 60 }, () => selected.dispatchEvent(enter), 'Focused sitemap Enter activates exactly that core row');
+		assert(enter.defaultPrevented && !calls.slice(start).some((call) => call.command === 'key'),
+			'Sitemap activation cannot bubble into playback or another selected row');
+		snapshot({ site_file_popup: { ...sitemap, selected: 60, scroll_offset: 60, error: 'Web browsing is not enabled in this build' } });
+		await until(() => dialog()?.querySelector('[role=alert]'), 'sitemap activation error');
+		assert(Boolean(dialog().querySelector('[data-site-file-entry="60"]')),
+			'An activation error retains loaded sitemap rows for visible keyboard navigation');
+		snapshot({ site_file_popup: { ...sitemap, url: entries[60].url, can_go_back: true, loading: true } });
+		await until(() => button('Alt+Left Back', dialog()) && dialog()?.querySelector('[role=status]'), 'loading child sitemap');
+		await action('BackSiteFile', () => button('Alt+Left Back', dialog()).click(), 'Back restores the core-owned sitemap parent');
+		await key('ArrowLeft', 'Left', { altKey: true });
+		await action('DismissSiteFile', () => button('Close', dialog()).click(), 'Site files can be cancelled while loading');
+		snapshot({ ...previous, site_file_popup: null });
+		await until(() => !dialog(), 'site-file fixture cleanup');
+	}
+
 	/** Configured actions work for provider and Local selections through the same private dialog. */
 	async function checkCustomCommands() {
 		const previous = clone(view);
@@ -1195,6 +1246,7 @@
 		await checkYouTubeSearchControls();
 		await checkEmailLinks();
 		await checkUrlInformation();
+		await checkSiteFiles();
 		await checkLiveDuration();
 		await checkLocalFullPath();
 		await checkLocalTrackMetadata();

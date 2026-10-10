@@ -189,6 +189,17 @@ Info detects Google Analytics, Google Tag/Tag Manager and Yandex Metrica markers
 in the fetched HTML prefix. The analytics line is omitted when no marker is
 found; that does not prove a page is tracker-free. Scripts, feed URLs and
 JSON-LD contexts are never executed or fetched by metadata inspection.
+Expanded Info offers `robots.txt` (`Alt+r`) and `sitemap.xml` (`Alt+s`) buttons.
+Each downloads only when opened. Robots text is shown in full; a
+[sitemap](https://www.sitemaps.org/protocol.html) is a selectable list with
+last-modified dates and other supplied metadata. Use Up/Down and Enter to open
+a child sitemap or browse a page in Youta's Web tab. `Alt+Left` returns to the
+same sitemap selection and scroll position; inside a child sitemap it restores
+the cached parent. PageUp/PageDown or the mouse wheel also reveal long entries.
+`Esc` closes the viewer and cancels a pending request. Files, including gzip
+sitemaps, have a 1 MiB decoded/decompressed limit; oversized files report an
+error instead of displaying an incomplete list. Child sitemaps and page links
+are never fetched just by selecting them. Page browsing needs `web-browser`.
 Disable the default-on `url-info` Cargo feature or Gentoo USE flag to omit
 this capability from either frontend.
 

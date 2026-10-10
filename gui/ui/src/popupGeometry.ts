@@ -29,6 +29,8 @@ const measured: Record<Scrollable, ScrollGeometry> = {
   video_summary: { ...EMPTY },
   project_history: { ...EMPTY },
   video_comments: { ...EMPTY },
+	site_file: { ...EMPTY },
+	site_file_entry: { ...EMPTY },
 };
 
 /**
@@ -54,6 +56,15 @@ export function reportGeometry(popup: Scrollable, element: HTMLElement | null, o
   };
 }
 
+/** Sitemap paging counts variable-height entries rather than wrapped text lines. */
+export function reportEntryGeometry(popup: Scrollable, offset: number, entries: number, visible: number) {
+	measured[popup] = {
+		offset,
+		maximum: Math.max(0, entries - 1),
+		page_lines: Math.max(1, visible),
+	};
+}
+
 /** Reads the current geometry for a key press. */
 export function popupGeometry(): PopupGeometry {
   return {
@@ -61,5 +72,7 @@ export function popupGeometry(): PopupGeometry {
     video_summary: measured.video_summary,
     project_history: measured.project_history,
     video_comments: measured.video_comments,
+		site_file: measured.site_file,
+		site_file_entry: measured.site_file_entry,
   };
 }

@@ -858,6 +858,44 @@ pub struct UrlInfoView {
     pub lines: Vec<String>,
 }
 
+/// One inert sitemap entry; URLs are opened only by an explicit user action.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct SiteFileEntryView {
+    /// Validated public page or child-sitemap URL.
+    pub url: String,
+    /// Bounded metadata supplied by the sitemap, without trust or freshness claims.
+    pub metadata: Vec<(String, String)>,
+}
+
+/// RAM-only, on-demand robots text or a navigable sitemap document.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct SiteFilePopupView {
+    /// Short document kind shown in the dialog title.
+    pub title: String,
+    /// Exact requested or final validated file URL.
+    pub url: String,
+    /// Whether an explicitly requested file is queued or loading.
+    pub loading: bool,
+    /// Complete sanitized robots text; never a truncated file prefix.
+    pub text: String,
+    /// A friendly failure, distinct from an empty successful file.
+    pub error: Option<String>,
+    /// Whether this dialog represents a sitemap rather than robots text.
+    pub sitemap: bool,
+    /// True for an index whose entries open child sitemaps internally.
+    pub sitemap_index: bool,
+    /// Bounded sitemap rows; rendering does not fetch these destinations.
+    pub entries: Vec<SiteFileEntryView>,
+    /// Selected sitemap entry, independent of the underlying media selection.
+    pub selected: usize,
+    /// Whether an already loaded parent document is available without another request.
+    pub can_go_back: bool,
+    /// Wrapped text offset for robots, or first visible entry for sitemap lists.
+    pub scroll_offset: usize,
+    /// First wrapped line within the first visible sitemap entry, for small terminal viewports.
+    pub entry_line_offset: usize,
+}
+
 /// Details for the selected media item.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct DetailView {
@@ -3372,6 +3410,8 @@ pub struct ViewModel {
     pub help_open: bool,
     /// Offline-first recent commit history and runtime provenance.
     pub project_history_popup: Option<ProjectHistoryPopupView>,
+    /// Explicitly requested robots text or sitemap navigation, independent of URL metadata.
+    pub site_file_popup: Option<SiteFilePopupView>,
     /// Whether this terminal attachment can launch a graphical external opener.
     pub external_opener_available: bool,
     /// Whether output is attached directly to a Linux virtual console.
@@ -3899,6 +3939,7 @@ impl Default for ViewModel {
             transient_footer_notice: None,
             help_open: false,
             project_history_popup: None,
+            site_file_popup: None,
             external_opener_available: true,
             physical_linux_console: false,
             error_popup: None,
@@ -4152,6 +4193,22 @@ pub enum UiAction {
     MoveUrlInfo(i32),
     /// Open the original URL associated with a metadata disclosure.
     OpenUrlInfo(usize),
+    /// Fetch the selected URL origin's robots.txt only on explicit input.
+    OpenUrlRobots(usize),
+    /// Fetch the selected URL origin's sitemap.xml only on explicit input.
+    OpenUrlSitemap(usize),
+    /// Close the site-file viewer and cancel pending work without waiting for I/O.
+    DismissSiteFile,
+    /// Restore a previously loaded parent sitemap without another request.
+    BackSiteFile,
+    /// Move the selected sitemap row without opening or fetching it.
+    MoveSiteFileSelection(i32),
+    /// Activate an exact sitemap row: child document internally, ordinary page in the Web tab.
+    ActivateSiteFileEntry(usize),
+    /// Set the renderer-clamped text or sitemap-list viewport offset.
+    SetSiteFileScroll(usize),
+    /// Scrolls metadata within an oversized sitemap entry without activating its URL.
+    SetSiteFileEntryScroll(usize),
     /// Open one validated Wikidata item, identifier, Commons page, or
     /// Wikipedia article.
     OpenWikidataValue(String),
