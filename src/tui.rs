@@ -5499,26 +5499,24 @@ fn render_information_panel(
             &right_buttons,
             &mut next_left_row,
             inner.width,
-            button("F12", "Podcast feed", show_hotkeys),
+            "Podcast feed".to_owned(),
             theme.accent,
             UiAction::ShareLocalPodcast,
         )
     });
-    // Keep the visible action on channel entities. The episode shortcut still
-    // opens feed review with the selected video's inclusive boundary.
+    // Keep feed review reachable from channels and episodes without a dedicated hotkey.
     #[cfg(feature = "lan-sharing")]
-    let youtube_podcast_button =
-        (view.youtube_podcast_feed_available() && details.media_id.is_none()).then(|| {
-            push_left_detail_button(
-                &mut lines,
-                &right_buttons,
-                &mut next_left_row,
-                inner.width,
-                button("F12", "Podcast feed", show_hotkeys),
-                theme.accent,
-                UiAction::ShareYouTubeChannelPodcast,
-            )
-        });
+    let youtube_podcast_button = view.youtube_podcast_feed_available().then(|| {
+        push_left_detail_button(
+            &mut lines,
+            &right_buttons,
+            &mut next_left_row,
+            inner.width,
+            "Podcast feed".to_owned(),
+            theme.accent,
+            UiAction::ShareYouTubeChannelPodcast,
+        )
+    });
     #[cfg(feature = "yt-dlp")]
     let channel_download_button = view.youtube_full_channel_download_available().then(|| {
         push_left_detail_button(
@@ -8560,7 +8558,6 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
     }
     if view.lan_share_supported {
         local_actions.push("F11 share");
-        local_actions.push("F12 feed");
     }
     if !local_actions.is_empty() {
         local_help.push_str("\n    ");
@@ -8574,11 +8571,19 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
         "  n private note     t Details-only text selection\n  Q selected YouTube video QR code";
     #[cfg(not(feature = "qr"))]
     let private_note_help = "  n private note     t Details-only text selection";
-    let history_navigation_help = if view.playback_history_enabled {
-        "  F1 YT     F2 offline     F3 log     Backspace back"
-    } else {
-        "  F1 YT     F2 offline     Backspace back"
-    };
+    let history_navigation_help = format!(
+        "  F1 YT{}{}     F12 offline     Backspace back",
+        if cfg!(feature = "local-browser") {
+            "     F2 Local"
+        } else {
+            ""
+        },
+        if view.playback_history_enabled {
+            "     F3 log"
+        } else {
+            ""
+        },
+    );
     #[cfg(feature = "ascii-visualizer")]
     let project_history_help =
         "  F9 recent commits and installation details     F10 ASCII visualizer";
@@ -8643,7 +8648,7 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
         "Navigation     Details URLs: </> previous/next (no focus needed); i Info",
         "  / search     Tab next tab     Shift+Tab previous tab     S subs",
         "  Ctrl+Tab/Ctrl+Shift+Tab are aliases when the terminal distinguishes them.",
-        history_navigation_help,
+        history_navigation_help.as_str(),
         preferences_help,
         project_history_help,
         search_kind_help(view),
@@ -18318,7 +18323,6 @@ for encoded, expected in json.load(sys.stdin):
             KeyCode::Char('H'),
             KeyCode::Char('Z'),
             KeyCode::F(11),
-            KeyCode::F(12),
         ] {
             assert_eq!(
                 key_action(KeyEvent::new(key, KeyModifiers::NONE), &view),
@@ -18326,6 +18330,10 @@ for encoded, expected in json.load(sys.stdin):
                 "Web must not offer local action {key:?}"
             );
         }
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE), &view),
+            Some(UiAction::ShowScreen(Screen::Downloaded))
+        );
         view.search_editing = true;
         view.search_query = "https://example.test/audio/".to_owned();
         view.search_cursor_byte = view.search_query.len();
@@ -29006,7 +29014,7 @@ for encoded, expected in json.load(sys.stdin):
         }
     }
 
-    /// Five paired rows plus Subscribe replace seven right rows plus Subscribe.
+    /// Pairing comments and summary saves two rows while retaining every optional action.
     #[cfg(all(
         feature = "commons-upload",
         feature = "evernote",
@@ -29086,12 +29094,12 @@ for encoded, expected in json.load(sys.stdin):
                 .unwrap();
             assert_eq!(
                 description.y,
-                hits.details_panel.y + 6,
-                "moving both actions must reclaim two of the previous eight control rows"
+                hits.details_panel.y + 6 + u16::from(cfg!(feature = "lan-sharing")),
+                "moving both actions saves two rows alongside the optional podcast button"
             );
             assert_eq!(
                 hits.detail_buttons.len(),
-                11,
+                11 + usize::from(cfg!(feature = "lan-sharing")),
                 "all controls must remain visible exactly once"
             );
             for (action, area) in &hits.detail_buttons {
@@ -29500,6 +29508,7 @@ for encoded, expected in json.load(sys.stdin):
             UiAction::OpenPlaylistPopup,
             UiAction::EditPrivateNote,
             UiAction::OpenVideoComments,
+            UiAction::ShareYouTubeChannelPodcast,
             UiAction::ToggleSubscription,
         ];
         let mut action_areas = expected_actions
@@ -29548,6 +29557,7 @@ for encoded, expected in json.load(sys.stdin):
             "[P] Playlist".to_owned(),
             "[n] Add private note".to_owned(),
             "[F6] Twenty comments".to_owned(),
+            "Podcast feed".to_owned(),
             "[s] Subscribe (locally)".to_owned(),
         ];
         for ((expected, expected_label), area) in expected_actions
@@ -32510,7 +32520,11 @@ for encoded, expected in json.load(sys.stdin):
         assert!(rendered.contains("Subscribe (locally)"));
         assert!(!rendered.contains("[s] Subscribe (locally)"));
         assert!(!rendered.contains("Auto-download"));
-        assert!(!rendered.contains("Podcast feed"));
+        assert_eq!(
+            rendered.contains("Podcast feed"),
+            cfg!(feature = "lan-sharing")
+        );
+        assert!(!rendered.contains("[F12]"));
         assert!(!rendered.contains("Select mode"));
         assert!(rendered.contains("open video"));
         assert!(!rendered.contains("[o] open video"));
@@ -32521,7 +32535,7 @@ for encoded, expected in json.load(sys.stdin):
                 .iter()
                 .filter(|(_, area)| area.x >= hit_map.details_panel.x)
                 .count(),
-            2
+            2 + usize::from(cfg!(feature = "lan-sharing"))
         );
         assert!(
             hit_map
@@ -41609,7 +41623,8 @@ prose 07:25 remains clickable but is not a chapter";
         assert!(!rendered.contains("Likes:"));
         assert!(!rendered.contains("Views:"));
         assert!(rendered.contains("[O] open channel https://www.youtube.com/channel/UCfixture"));
-        assert!(rendered.contains("[F12] Podcast feed"));
+        assert!(rendered.contains("Podcast feed"));
+        assert!(!rendered.contains("[F12] Podcast feed"));
         assert!(
             hit_map
                 .detail_buttons
@@ -41633,14 +41648,18 @@ prose 07:25 remains clickable but is not a chapter";
 
     #[cfg(feature = "lan-sharing")]
     #[test]
-    fn youtube_episode_hides_podcast_button_but_keeps_shortcut() {
-        for screen in [Screen::Search, Screen::Subscriptions] {
+    fn youtube_channel_and_episode_keep_podcast_button_without_hotkey() {
+        for (screen, video_id) in [
+            (Screen::Search, Some("dQw4w9WgXcQ")),
+            (Screen::Subscriptions, Some("dQw4w9WgXcQ")),
+            (Screen::Search, None),
+        ] {
             let mut view = ViewModel {
                 screen,
                 right_panel_mode: RightPanelMode::Details,
                 details: Some(DetailView {
-                    media_id: Some(MediaId::new(SourceKind::YouTube, "dQw4w9WgXcQ")),
-                    title: "Fixture video".to_owned(),
+                    media_id: video_id.map(|id| MediaId::new(SourceKind::YouTube, id)),
+                    title: "Fixture channel or video".to_owned(),
                     channel_id: "UCfixture".to_owned(),
                     ..DetailView::default()
                 }),
@@ -41672,17 +41691,19 @@ prose 07:25 remains clickable but is not a chapter";
                 })
                 .expect("draw selected subscription video");
 
-            assert!(!rendered_text(&terminal).contains("[F12] Podcast feed"));
+            let rendered = rendered_text(&terminal);
+            assert!(rendered.contains("Podcast feed"));
+            assert!(!rendered.contains("[F12] Podcast feed"));
             assert!(
-                !hit_map
+                hit_map
                     .detail_buttons
                     .iter()
                     .any(|(action, _)| *action == UiAction::ShareYouTubeChannelPodcast)
             );
             assert_eq!(
                 key_action(KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE), &view),
-                Some(UiAction::ShareYouTubeChannelPodcast),
-                "the episode shortcut must retain the inclusive feed boundary"
+                Some(UiAction::ShowScreen(Screen::Downloaded)),
+                "Offline navigation must not start a podcast feed"
             );
         }
     }
@@ -42263,7 +42284,8 @@ prose 07:25 remains clickable but is not a chapter";
             .expect("draw Local share buttons");
         let rendered = rendered_text(&terminal);
         assert!(rendered.contains("[F11] Share over LAN"));
-        assert!(rendered.contains("[F12] Podcast feed"));
+        assert!(rendered.contains("Podcast feed"));
+        assert!(!rendered.contains("[F12] Podcast feed"));
         for expected in [UiAction::ShareLocalFiles, UiAction::ShareLocalPodcast] {
             assert!(
                 hit_map
@@ -44340,6 +44362,37 @@ prose 07:25 remains clickable but is not a chapter";
         }
     }
 
+    /// Normal tab shortcuts remain available without history or podcast sharing support.
+    #[test]
+    fn f2_local_and_f12_offline_are_documented_and_forwarded() {
+        for playback_history_enabled in [false, true] {
+            let view = ViewModel {
+                screen: Screen::Search,
+                playback_history_enabled,
+                ..ViewModel::default()
+            };
+            let mut terminal = Terminal::new(TestBackend::new(180, 40)).unwrap();
+            terminal
+                .draw(|frame| render_help(frame, &view, &Theme::new(false)))
+                .unwrap();
+            let rendered = rendered_text(&terminal);
+            assert!(rendered.contains("F12 offline"));
+            assert_eq!(
+                rendered.contains("F2 Local"),
+                cfg!(feature = "local-browser")
+            );
+            assert!(!rendered.contains("F12 feed"));
+            assert_eq!(
+                key_action(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE), &view),
+                cfg!(feature = "local-browser").then_some(UiAction::ShowScreen(Screen::Local))
+            );
+            assert_eq!(
+                key_action(KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE), &view),
+                Some(UiAction::ShowScreen(Screen::Downloaded))
+            );
+        }
+    }
+
     #[test]
     fn disabled_playback_history_is_absent_from_top_tabs_and_help() {
         let backend = TestBackend::new(180, 40);
@@ -44393,7 +44446,11 @@ prose 07:25 remains clickable but is not a chapter";
             .expect("draw Help without History");
         let rendered = rendered_text(&terminal);
         assert!(!rendered.contains("F3 log"));
-        assert!(rendered.contains("F2 offline"));
+        assert!(rendered.contains("F12 offline"));
+        assert_eq!(
+            rendered.contains("F2 Local"),
+            cfg!(feature = "local-browser")
+        );
         assert!(rendered.contains("F4 lists"));
     }
 

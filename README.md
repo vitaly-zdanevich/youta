@@ -37,8 +37,8 @@ with Rust 1.95 or newer:
 cargo run --release --locked
 ```
 
-Press `?` for contextual Help. Use `F1` to jump to YT or
-`Tab` / `Shift+Tab` to switch sources,
+Press `?` for contextual Help. Use `F1` for YT, `F2` for Local and `F12` for Offline,
+or `Tab` / `Shift+Tab` to switch sources,
 `j` / `k` to select an item, `Enter` to open or play it, and `Space` to pause.
 `/` searches the current source or edits the Web address; `p` or `F7` opens
 Preferences. The first YouTube search offers API-key or Invidious setup.
@@ -2300,8 +2300,9 @@ and link data is fetched again after a restart.
 `Tab` cycles forward through every enabled top-level screen, while `Shift+Tab`
 cycles backward; both wrap at the ends. `Ctrl+Tab` and `Ctrl+Shift+Tab` are
 aliases when the terminal reports those combinations distinctly. During normal
-browsing, `F1` switches directly to the **YT** tab without changing playback.
-Dialogs retain their own F1 actions, and editors keep their input handling. Uppercase
+browsing, `F1` switches directly to **YT**, `F2` to **Local** (when built), and
+`F12` to **Offline**, without changing playback. Dialogs retain their own
+function-key actions, and editors keep their input handling. Uppercase
 `S` is the global **Subs** shortcut and always returns to the
 subscription-source root. Youta provides two layouts:
 
@@ -2557,7 +2558,8 @@ After cancellation with `[C]`, the stopped-download line disappears after
 
 The default-on `lan-sharing` feature adds two Local actions. `[F11] Share over
 LAN` serves the selected regular file or a bounded, recursive folder index.
-`[F12] Podcast feed` serves playable audio under the selection as RSS. When the
+The `Podcast feed` button, without a dedicated hotkey, serves playable audio
+under the selection as RSS. When the
 synthetic `..` row is selected, both actions share the directory currently on
 screen. A local podcast episode uses embedded artwork when available and then
 Youta's normal sidecar-artwork fallback. The feed itself uses the first retained
@@ -2619,10 +2621,10 @@ for subsequent requests, including concurrent requests from podcast apps.
 
 #### YouTube channel feeds and audio delivery
 
-`[F12] Podcast feed` is also available on a YouTube channel in Search and in
-the **Subs** tab. Its button is shown only for channel selections; the
-F12 shortcut also works on a selected episode to open the inclusive-boundary
-review described above. Feed creation uses channel and publication metadata,
+The `Podcast feed` button is also available on eligible YouTube channels and
+episodes in Search and the **Subs** tab, without a dedicated hotkey. On a selected
+episode it opens the inclusive-boundary review described above.
+Feed creation uses channel and publication metadata,
 downloads no media, gives every episode a stable Youta URL and artwork route, and uses the
 channel's square avatar as the podcast cover. The first retained episode image
 is the cover fallback when flat metadata has no channel artwork. When a podcast

@@ -144,9 +144,10 @@ export function HelpPopup({
 		[
 			playbackHistoryEnabled ? 'F1 · F2 · F3 · F4 · F5' : 'F1 · F2 · F4 · F5',
 			playbackHistoryEnabled
-				? 'YT · offline · log · lists · stats'
-				: 'YT · offline · lists · stats',
+				? 'YT · Local · log · lists · stats'
+				: 'YT · Local · lists · stats',
 		],
+		['F12', 'offline'],
 		['S · p · F9', 'subs · preferences · recent commits'],
 		['PageUp · PageDown', 'page through Subs'],
         ["R · h", "refresh subscription videos · show/hide Shorts"],
@@ -215,7 +216,7 @@ export function HelpPopup({
         ["Shift+J · Shift+K", "mark Local row and move down · up"],
 		['c / m (Local)', 'copy / move selected files or folders, when supported'],
 		...(lanShareSupported
-			? ([['F11 · F12', 'share Local selection · publish Local/YouTube podcast feed']] satisfies Array<[string, string]>)
+			? ([['F11', 'share Local selection']] satisfies Array<[string, string]>)
 			: []),
         ...(audioQualitySupported
           ? ([

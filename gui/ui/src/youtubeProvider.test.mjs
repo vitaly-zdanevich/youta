@@ -58,15 +58,22 @@ const button = (tree, label) => nodes(tree).find((node) => node.type === 'button
 	&& (text(node) === label || node.props['aria-label'] === label));
 const aboutUrl = 'https://en.wikipedia.org/wiki/Invidious';
 
-test('navigation help advertises F1 for YT independently of playback history', () => {
+test('navigation help advertises F1 YT, F2 Local and F12 Offline independently of playback history', () => {
 	for (const playbackHistoryEnabled of [false, true]) {
-		const tree = module.exports.HelpPopup({ playbackHistoryEnabled });
+		const tree = module.exports.HelpPopup({ playbackHistoryEnabled, lanShareSupported: true });
 		const cells = nodes(tree).filter((node) => ['dt', 'dd'].includes(node.type));
 		const shortcuts = playbackHistoryEnabled ? 'F1 · F2 · F3 · F4 · F5' : 'F1 · F2 · F4 · F5';
 		const index = cells.findIndex((node) => node.type === 'dt' && text(node) === shortcuts);
 		assert.notEqual(index, -1, 'F1 remains documented when Log is disabled');
 		assert.equal(text(cells[index + 1]), playbackHistoryEnabled
-			? 'YT · offline · log · lists · stats' : 'YT · offline · lists · stats');
+			? 'YT · Local · log · lists · stats' : 'YT · Local · lists · stats');
+		const offline = cells.findIndex((node) => node.type === 'dt' && text(node) === 'F12');
+		assert.notEqual(offline, -1);
+		assert.equal(text(cells[offline + 1]), 'offline');
+		const share = cells.findIndex((node) => node.type === 'dt' && text(node) === 'F11');
+		assert.notEqual(share, -1);
+		assert.equal(text(cells[share + 1]), 'share Local selection');
+		assert.ok(!text(tree).includes('podcast feed'), 'Podcast feed has no keyboard shortcut');
 	}
 });
 

@@ -67,20 +67,6 @@ test('full-channel download requires a subscribed YouTube channel entity', async
 	assert.doesNotMatch(guard, /\|\||view\.screen === 'Search'|\bkind ===/);
 });
 
-/** Channel metadata on an episode must not expose the channel podcast button. */
-test('YouTube podcast buttons are limited to channel entities, including search channels', async () => {
-	const details = await readFile(
-		new URL('./components/Details.tsx', import.meta.url),
-		'utf8',
-	);
-	const beforeButton = details.split("dispatch('ShareYouTubeChannelPodcast')")[0];
-	const guard = beforeButton.slice(beforeButton.lastIndexOf('{view.lan_share_supported &&'));
-	assert.match(guard, /details\.media_id === null/);
-	assert.match(guard, /details\.channel_id !== ''/);
-	assert.doesNotMatch(guard, /kind === 'Channel'/);
-	assert.doesNotMatch(guard, /kind === 'Video'/);
-});
-
 const require = createRequire(import.meta.url);
 const React = require('react');
 const ts = require('typescript');
@@ -127,6 +113,52 @@ function subscriptionButtons(screen, subscribed, mediaSource = 'you-tube', chann
 	return elements(detailsModule.exports.Details({ view, kind }))
 		.filter((node) => node.type === 'button' && ['Subscribe', 'Unsubscribe'].includes(node.props.children));
 }
+
+/** Feed controls keep the selected video boundary in the existing core action. */
+function podcastButtons({ screen = 'Search', kind = 'Video', mediaSource = 'you-tube',
+	channelId = 'UCfixture', sourceKind = 'you-tube', supported = true } = {}) {
+	const view = {
+		screen, lan_share_supported: supported, playlist_item: null,
+		subscriptions: { source_kind: sourceKind },
+		details: { title: 'Fixture episode', source: 'YouTube', channel_id: channelId,
+			media_id: mediaSource === null ? null : { source: mediaSource, external_id: 'fixture-video' },
+			playlist_names: [], links: [], dearrow_title: null,
+			channel_subscriber_count: null, channel_video_count: null, channel_total_view_count: null },
+	};
+	return elements(detailsModule.exports.Details({ view, kind }))
+		.filter((node) => node.type === 'button' && node.props.children === 'Podcast feed');
+}
+
+test('YouTube episodes and channel entities retain a visible Podcast feed action without a shortcut', () => {
+	for (const screen of ['Search', 'Subscriptions']) {
+		for (const mediaSource of ['you-tube', null]) {
+			actions.length = 0;
+			const buttons = podcastButtons({ screen, mediaSource });
+			assert.equal(buttons.length, 1, `${screen}, source=${mediaSource}`);
+			assert.deepEqual(actions, [], 'rendering cannot start feed preparation');
+			buttons[0].props.onClick();
+			assert.deepEqual(actions, ['ShareYouTubeChannelPodcast']);
+		}
+	}
+});
+
+test('YouTube podcast controls retain feature, route and channel identity gates', () => {
+	for (const patch of [
+		{ supported: false }, { channelId: '' }, { mediaSource: 'sound-cloud' },
+		{ screen: 'YouTubeMusic' }, { screen: 'History' }, { screen: 'Downloaded' },
+		{ screen: 'Subscriptions', sourceKind: 'rss' },
+	]) assert.deepEqual(podcastButtons(patch), [], JSON.stringify(patch));
+});
+
+test('Local Podcast feed remains available without its former F12 shortcut', () => {
+	actions.length = 0;
+	const patch = { screen: 'Local', kind: 'Local', mediaSource: 'local', channelId: '' };
+	const buttons = podcastButtons(patch);
+	assert.equal(buttons.length, 1);
+	buttons[0].props.onClick();
+	assert.deepEqual(actions, ['ShareLocalPodcast']);
+	assert.deepEqual(podcastButtons({ ...patch, supported: false }), []);
+});
 
 test('unsubscribed YouTube search videos expose Subscribe and dispatch its action', () => {
 	const buttons = subscriptionButtons('Search', false);

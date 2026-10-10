@@ -137,18 +137,18 @@
 			&& call.args.press.ctrl === Boolean(options.ctrlKey)), `forward ${keyName}`);
 		checks.push(`Keyboard ${keyName} uses the shared Rust keymap IPC`);
 	};
-	/** F1 remains a shared key so the core can preserve modal-specific guide actions. */
-	const forwardF1 = async (target, context) => {
+	/** Function keys stay shared so the core can preserve modal-specific actions. */
+	const forwardFunctionKey = async (number, target, context) => {
 		const start = calls.length;
-		const event = new KeyboardEvent('keydown', { key: 'F1', bubbles: true, cancelable: true });
+		const event = new KeyboardEvent('keydown', { key: `F${number}`, bubbles: true, cancelable: true });
 		target.dispatchEvent(event);
-		await until(() => calls.slice(start).some((call) => call.command === 'key'), `F1 in ${context}`);
+		await until(() => calls.slice(start).some((call) => call.command === 'key'), `F${number} in ${context}`);
 		const forwarded = calls.slice(start).filter((call) => call.command === 'key');
 		assert(forwarded.length === 1 && JSON.stringify(forwarded[0].args.press)
-			=== JSON.stringify({ key: { F: 1 }, ctrl: false, alt: false, shift: false }),
-			`F1 in ${context} reaches the shared keymap exactly once`);
+			=== JSON.stringify({ key: { F: number }, ctrl: false, alt: false, shift: false }),
+			`F${number} in ${context} reaches the shared keymap exactly once`);
 		assert(event.defaultPrevented && !calls.slice(start).some((call) => call.command === 'dispatch'),
-			`F1 in ${context} suppresses browser help without overriding the core action`);
+			`F${number} in ${context} suppresses browser defaults without overriding the core action`);
 	};
 	const mediaId = { source: 'archive-org', external_id: 'https://archive.org/download/fixture/first.mp3' };
 	const row = (title, id = mediaId) => ({ ...clone(defaults.RowView), title, media_id: id, source: 'archive.org' });
@@ -519,7 +519,7 @@
 		assert(document.querySelectorAll('[role=dialog]').length === 1, 'Preferences is parked while the provider child editor is open');
 		assert(!dialog().querySelector('input, textarea'), 'Provider drafts are not copied into browser text controls');
 		assert(button('Save', dialog()) && !button('Save and retry', dialog()), 'Preferences provider changes save without retrying a search');
-		await forwardF1(button('YouTube API key', dialog()), 'the YouTube provider dialog');
+		await forwardFunctionKey(1, button('YouTube API key', dialog()), 'the YouTube provider dialog');
 		const about = button(aboutUrl, dialog());
 		assert(about?.getAttribute('role') === 'link', 'The closed chooser still shows the complete Wikipedia URL as a link');
 		assert(getComputedStyle(about).textDecorationLine.includes('underline'), 'The Wikipedia URL is visibly underlined');
@@ -1027,6 +1027,31 @@
 		}
 		snapshot(previous);
 	}
+	/** Visible feed controls preserve the existing selected-episode review without a shortcut. */
+	async function checkPodcastFeedButtons() {
+		const previous = clone(view);
+		for (const screen of ['Search', 'Subscriptions', 'Local']) {
+			for (const mediaSource of screen === 'Local' ? ['local'] : ['you-tube', null]) {
+				const title = `Podcast fixture ${screen} ${mediaSource ?? 'channel'}`;
+				snapshot({ screen, lan_share_supported: true,
+					subscriptions: { ...clone(defaults.ViewModel.subscriptions), source_kind: 'you-tube',
+						layout: 'drill-down', route: 'Items', focus: 'Items' },
+					details: { ...clone(defaults.DetailView), title, channel_id: screen === 'Local' ? '' : 'UCfixture',
+						media_id: mediaSource === null ? null : { source: mediaSource, external_id: 'fixture-episode' } } });
+				await until(() => document.querySelector('[aria-label=Details] h2')?.textContent === title, title);
+				const feed = button('Podcast feed', document.querySelector('[aria-label=Details]'));
+				assert(Boolean(feed), `${title} retains a visible Podcast feed button`);
+				await action(screen === 'Local' ? 'ShareLocalPodcast' : 'ShareYouTubeChannelPodcast',
+					() => feed.click(), `${title} opens the shared feed review action`);
+				for (const number of [2, 12]) await forwardFunctionKey(number, feed, title);
+			}
+		}
+		snapshot({ lan_share_supported: false });
+		await until(() => !button('Podcast feed'), 'disabled LAN support hides the feed button');
+		snapshot(previous);
+		await until(() => document.querySelector('[aria-label=Sources] [aria-selected=true]')?.textContent.includes('archive.org'),
+			'restore Archive after feed controls');
+	}
 	/** A shorter display label never changes the persisted screen identity or history policy. */
 	async function checkLogTab() {
 		const previous = clone(view);
@@ -1037,15 +1062,18 @@
 		snapshot({ screen: 'History' });
 		await until(() => button('Log', tabs)?.getAttribute('aria-selected') === 'true', 'Log is selected for a History snapshot');
 		await key('F3', { F: 3 });
-		await forwardF1(document, 'ordinary browsing');
+		for (const number of [1, 2, 12]) await forwardFunctionKey(number, document, 'ordinary browsing');
 		snapshot({ help_open: true });
 		await until(() => dialog()?.textContent.includes('The same map serves the terminal front-end'), 'Log navigation help');
 		const shortcut = [...dialog().querySelectorAll('dt')].find((node) => node.textContent === 'F1 · F2 · F3 · F4 · F5');
-		assert(shortcut?.nextElementSibling.textContent === 'YT · offline · log · lists · stats', 'F1 and F3 help name the YT and Log tabs');
+		assert(shortcut?.nextElementSibling.textContent === 'YT · Local · log · lists · stats', 'F1, F2 and F3 help name the YT, Local and Log tabs');
+		const offline = [...dialog().querySelectorAll('dt')].find((node) => node.textContent === 'F12');
+		assert(offline?.nextElementSibling.textContent === 'offline', 'F12 help names Offline rather than podcast publishing');
+		assert(!dialog().textContent.includes('F11 · F12'), 'Help does not advertise a podcast feed hotkey');
 		snapshot({ screen: previous.screen, playback_history_enabled: false });
 		await until(() => !button('Log', tabs) && !dialog()?.textContent.includes('F3'), 'disabled playback history hides Log and its F3 help');
 		const privateShortcut = [...dialog().querySelectorAll('dt')].find((node) => node.textContent === 'F1 · F2 · F4 · F5');
-		assert(privateShortcut?.nextElementSibling.textContent === 'YT · offline · lists · stats',
+		assert(privateShortcut?.nextElementSibling.textContent === 'YT · Local · lists · stats',
 			'Disabling Log preserves the F1 YT shortcut in help');
 		snapshot({ help_open: false, playback_history_enabled: true });
 		await until(() => !dialog() && button('Log', tabs), 'reenabling playback history restores Log');
@@ -1273,6 +1301,7 @@
 		await checkLocalCopy();
 		await checkArchiveLocalUpload();
 		await checkEvernoteButton();
+		await checkPodcastFeedButtons();
 		await checkLogTab();
 		await checkArrowShortcuts();
 		await checkPreferencesFocus();

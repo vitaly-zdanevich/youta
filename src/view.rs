@@ -3799,7 +3799,8 @@ impl ViewModel {
     ///
     /// A selected video already owns its channel ID, so users inside a channel
     /// need not switch from Details to the separate Channel panel before using
-    /// the podcast-feed shortcut.
+    /// the podcast-feed button. Search channel rows have no media ID and also
+    /// expose this action directly in the normal Details panel.
     #[cfg(feature = "lan-sharing")]
     #[must_use]
     pub fn youtube_podcast_feed_available(&self) -> bool {
@@ -3810,6 +3811,7 @@ impl ViewModel {
             && self.details.as_ref().is_some_and(|details| {
                 !details.channel_id.is_empty()
                     && (self.right_panel_mode == RightPanelMode::Channel
+                        || details.media_id.is_none()
                         || details
                             .media_id
                             .as_ref()

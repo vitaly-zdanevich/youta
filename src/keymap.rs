@@ -218,6 +218,121 @@ mod wire_tests {
         );
     }
 
+    /// Tab navigation uses only bare function keys, independently of feed availability.
+    #[test]
+    fn f2_f12_open_local_and_offline_only_during_normal_browsing() {
+        use crate::view::{
+            DetailView, RightPanelMode, Screen, SiteFilePopupView, YouTubeSetupPopupView,
+        };
+
+        let mut view = ViewModel::default();
+        for screen in Screen::ALL {
+            view.screen = screen;
+            for (number, expected) in [
+                (
+                    2,
+                    cfg!(feature = "local-browser").then_some(UiAction::ShowScreen(Screen::Local)),
+                ),
+                (12, Some(UiAction::ShowScreen(Screen::Downloaded))),
+            ] {
+                let key = KeyPress::new(Key::F(number));
+                assert_eq!(
+                    key_action(key, &view, None, None),
+                    expected,
+                    "screen {screen:?}, F{number}"
+                );
+                for modifiers in 1..8 {
+                    assert_eq!(
+                        key_action(
+                            KeyPress {
+                                ctrl: modifiers & 1 != 0,
+                                alt: modifiers & 2 != 0,
+                                shift: modifiers & 4 != 0,
+                                ..key
+                            },
+                            &view,
+                            None,
+                            None
+                        ),
+                        None
+                    );
+                }
+            }
+        }
+        view.screen = Screen::Search;
+        view.right_panel_mode = RightPanelMode::Channel;
+        view.details = Some(DetailView {
+            channel_id: "UCfixture".into(),
+            ..DetailView::default()
+        });
+        assert_eq!(
+            key_action(KeyPress::new(Key::F(12)), &view, None, None),
+            Some(UiAction::ShowScreen(Screen::Downloaded))
+        );
+        assert_eq!(
+            key_action(
+                KeyPress {
+                    shift: true,
+                    ..KeyPress::new(Key::F(12))
+                },
+                &view,
+                None,
+                None
+            ),
+            None
+        );
+        for key in [KeyPress::new(Key::F(2)), KeyPress::new(Key::F(12))] {
+            view.search_editing = true;
+            assert_eq!(key_action(key, &view, None, None), None);
+            view.search_editing = false;
+            view.help_open = true;
+            assert_eq!(key_action(key, &view, None, None), None);
+            view.help_open = false;
+            view.site_file_popup = Some(SiteFilePopupView::default());
+            assert_eq!(key_action(key, &view, None, None), None);
+            view.site_file_popup = None;
+        }
+        view.youtube_setup_popup = Some(YouTubeSetupPopupView::default());
+        view.external_opener_available = true;
+        assert_eq!(
+            key_action(KeyPress::new(Key::F(2)), &view, None, None),
+            Some(UiAction::OpenGoogleCloudCredentials)
+        );
+        assert_eq!(
+            key_action(KeyPress::new(Key::F(12)), &view, None, None),
+            None
+        );
+    }
+
+    /// User-defined function-key commands still override built-ins only outside modal editors.
+    #[cfg(feature = "cmd")]
+    #[test]
+    fn f2_f12_custom_commands_keep_normal_priority() {
+        use crate::view::{CustomCommandButtonView, YouTubeSetupPopupView};
+
+        for number in [2, 12] {
+            let mut view = ViewModel::default();
+            view.custom_command_buttons.push(CustomCommandButtonView {
+                id: 7,
+                binding: Some(
+                    crate::local_command::buttons::Hotkey::parse(&format!("F{number}")).unwrap(),
+                ),
+                ..CustomCommandButtonView::default()
+            });
+            let key = KeyPress::new(Key::F(number));
+            assert_eq!(
+                key_action(key, &view, None, None),
+                Some(UiAction::RunCustomCommand(7))
+            );
+            view.youtube_setup_popup = Some(YouTubeSetupPopupView::default());
+            view.external_opener_available = true;
+            assert_eq!(
+                key_action(key, &view, None, None),
+                (number == 2).then_some(UiAction::OpenGoogleCloudCredentials)
+            );
+        }
+    }
+
     /// Site-file keys stay lazy and contextual, while the viewer owns navigation and Escape.
     #[test]
     fn site_file_shortcuts_and_viewer_navigation_are_modal() {
@@ -1872,7 +1987,7 @@ mod wire_tests {
         );
         assert_eq!(
             key_action(KeyPress::new(Key::F(12)), &local, None, None),
-            Some(UiAction::ShareLocalPodcast)
+            Some(UiAction::ShowScreen(crate::view::Screen::Downloaded))
         );
         assert_eq!(
             key_action(KeyPress::new(Key::F(11)), &ViewModel::default(), None, None),
@@ -1890,7 +2005,7 @@ mod wire_tests {
         };
         assert_eq!(
             key_action(KeyPress::new(Key::F(12)), &channel, None, None),
-            Some(UiAction::ShareYouTubeChannelPodcast)
+            Some(UiAction::ShowScreen(crate::view::Screen::Downloaded))
         );
 
         let subscription_video = ViewModel {
@@ -1915,8 +2030,8 @@ mod wire_tests {
         };
         assert_eq!(
             key_action(KeyPress::new(Key::F(12)), &subscription_video, None, None),
-            Some(UiAction::ShareYouTubeChannelPodcast),
-            "a selected YouTube subscription video must expose its podcast boundary"
+            Some(UiAction::ShowScreen(crate::view::Screen::Downloaded)),
+            "podcast feed availability never overrides Offline navigation"
         );
 
         let popup = ViewModel {
@@ -3630,12 +3745,6 @@ fn unfiltered_key_action(
         Key::F(10) if !view.playback.idle => Some(UiAction::ToggleAsciiVisualizer),
         #[cfg(feature = "lan-sharing")]
         Key::F(11) if view.screen == Screen::Local => Some(UiAction::ShareLocalFiles),
-        #[cfg(feature = "lan-sharing")]
-        Key::F(12) if view.screen == Screen::Local => Some(UiAction::ShareLocalPodcast),
-        #[cfg(feature = "lan-sharing")]
-        Key::F(12) if view.youtube_podcast_feed_available() => {
-            Some(UiAction::ShareYouTubeChannelPodcast)
-        }
         Key::Char('/') => Some(UiAction::BeginSearch),
         #[cfg(feature = "cmd")]
         Key::Char(':') if !key.chorded() && view.local_command_available => {
@@ -3657,10 +3766,13 @@ fn unfiltered_key_action(
         Key::Char('S') => Some(UiAction::ShowScreen(Screen::Subscriptions)),
         // Editors, modal F1 guides, and configured shortcuts retain their earlier priority.
         Key::F(1) if !key.modified() => Some(UiAction::ShowScreen(Screen::Search)),
-        Key::F(2) => Some(UiAction::ShowScreen(Screen::Downloaded)),
+        Key::F(2) if !key.modified() && cfg!(feature = "local-browser") => {
+            Some(UiAction::ShowScreen(Screen::Local))
+        }
         Key::F(3) if view.playback_history_enabled => Some(UiAction::ShowScreen(Screen::History)),
         Key::F(4) => Some(UiAction::ShowScreen(Screen::Playlists)),
         Key::F(5) => Some(UiAction::ShowScreen(Screen::Statistics)),
+        Key::F(12) if !key.modified() => Some(UiAction::ShowScreen(Screen::Downloaded)),
         Key::Char('v') if view.screen == Screen::YandexMusic => {
             Some(UiAction::CycleYandexMusicSearchKind)
         }
