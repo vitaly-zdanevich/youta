@@ -72,14 +72,6 @@ impl UrlInfoClient {
                     &format!("HTTP {}", page.response.status),
                 );
                 facts.add("Final URL", page.url.as_str());
-                facts.add(
-                    "Transport",
-                    if page.url.scheme() == "https" {
-                        "HTTPS (encrypted connection, not a trust rating)"
-                    } else {
-                        "HTTP (unencrypted connection)"
-                    },
-                );
                 if (200..300).contains(&page.response.status) {
                     match html_facts(&page.response.body) {
                         Ok(values) => facts.extend(values),
@@ -108,6 +100,9 @@ impl UrlInfoClient {
     }
 
     /// Tries a parent only after a registry 404, never guessing a registrable suffix.
+    ///
+    /// Only a validated parent needs a domain label: the original URL already
+    /// identifies an exact hostname match, even when its website redirects elsewhere.
     fn registration(
         &mut self,
         host: &str,
@@ -156,11 +151,12 @@ impl UrlInfoClient {
                 continue;
             }
             check_status(response.response.status)?;
+            let values = rdap_facts(&parse_json(&response.response.body)?, candidate)?;
             let mut facts = Facts::default();
-            facts.extend(rdap_facts(
-                &parse_json(&response.response.body)?,
-                candidate,
-            )?);
+            if candidate != host {
+                facts.add("Registered domain", candidate);
+            }
+            facts.extend(values);
             facts.add("RDAP source", response.url.as_str());
             return Ok(facts.finish());
         }
@@ -838,6 +834,7 @@ fn check_status(status: u16) -> Result<(), Failure> {
 }
 
 /// Projects a matching domain object without following its links or confusing contact roles.
+/// Missing fields stay absent; only the server's explicit redaction metadata adds a privacy note.
 fn rdap_facts(value: &Value, candidate: &str) -> Result<Vec<String>, Failure> {
     if value.get("objectClassName").and_then(Value::as_str) != Some("domain")
         || !value
@@ -848,7 +845,6 @@ fn rdap_facts(value: &Value, candidate: &str) -> Result<Vec<String>, Failure> {
         return Err(Failure::Mismatch);
     }
     let mut facts = Facts::default();
-    facts.add("Domain", candidate);
     if let Some(events) = value.get("events").and_then(Value::as_array) {
         for event in events.iter().take(32) {
             let label = match event.get("eventAction").and_then(Value::as_str) {
@@ -862,18 +858,8 @@ fn rdap_facts(value: &Value, candidate: &str) -> Result<Vec<String>, Failure> {
             }
         }
     }
-    let mut registrant = false;
     let mut remaining = 32;
-    entity_facts(
-        value.get("entities"),
-        0,
-        &mut remaining,
-        &mut registrant,
-        &mut facts,
-    );
-    if !registrant {
-        facts.add("Registrant", "not published (may be withheld or redacted)");
-    }
+    entity_facts(value.get("entities"), 0, &mut remaining, &mut facts);
     if value
         .get("redacted")
         .and_then(Value::as_array)
@@ -919,21 +905,11 @@ fn rdap_facts(value: &Value, candidate: &str) -> Result<Vec<String>, Failure> {
             },
         );
     }
-    facts.add(
-        "Registration note",
-        "Registry registration records are not site age or a trust rating",
-    );
     Ok(facts.finish())
 }
 
-/// Only registrar and registrant names/organizations are displayed, with finite nesting and counts.
-fn entity_facts(
-    entities: Option<&Value>,
-    depth: usize,
-    remaining: &mut usize,
-    registrant: &mut bool,
-    facts: &mut Facts,
-) {
+/// Displays published registrar/registrant names, organizations, and handles with finite traversal.
+fn entity_facts(entities: Option<&Value>, depth: usize, remaining: &mut usize, facts: &mut Facts) {
     if depth > 3 {
         return;
     }
@@ -997,16 +973,9 @@ fn entity_facts(
                     },
                     &values.join("; "),
                 );
-                *registrant |= is_registrant;
             }
         }
-        entity_facts(
-            entity.get("entities"),
-            depth + 1,
-            remaining,
-            registrant,
-            facts,
-        );
+        entity_facts(entity.get("entities"), depth + 1, remaining, facts);
     }
 }
 
@@ -1195,7 +1164,8 @@ mod tests {
             .lookup_with(&url, &AtomicBool::new(false), &transport)
             .join("\n");
         assert!(facts.contains("Title: Search results"));
-        assert!(facts.contains("Domain: artist.co.uk"));
+        assert!(!facts.contains("Domain:"));
+        assert!(!facts.contains("Registered domain:"));
         assert!(facts.contains("Final URL: https://artist.co.uk/results?q=one%20two&lang=en"));
         assert!(!facts.contains("private-fragment"));
         let requests = transport.requests.borrow();
@@ -1206,6 +1176,68 @@ mod tests {
                 .all(|request| !request.contains('?') && !request.contains("one%20two"))
         );
         assert!(transport.responses.borrow().is_empty());
+    }
+
+    /// Redirected pages keep registration attached to the original normalized hostname.
+    #[test]
+    fn lookup_only_labels_registered_parents_of_the_original_hostname() {
+        for (original, destination, parent) in [
+            (
+                "https://ARTIST.CO.UK./music",
+                "https://destination.example/final",
+                false,
+            ),
+            (
+                "https://www.artist.co.uk/music",
+                "https://artist.co.uk/final",
+                true,
+            ),
+        ] {
+            let transport = MockTransport::default();
+            let url = Url::parse(original).unwrap();
+            transport.redirect(url.as_str(), destination);
+            transport.push(
+                destination,
+                200,
+                b"<title>Redirected artist</title>".to_vec(),
+            );
+            transport.push(BOOTSTRAP_URL, 200, bootstrap());
+            if parent {
+                transport.push(
+                    "https://registry.example/rdap/domain/www.artist.co.uk",
+                    404,
+                    Vec::new(),
+                );
+            }
+            transport.push(
+                "https://registry.example/rdap/domain/artist.co.uk",
+                200,
+                serde_json::to_vec(&json!({
+                    "objectClassName": "domain", "ldhName": "ARTIST.CO.UK.",
+                    "events": [{"eventAction": "registration", "eventDate": "2000-01-01T00:00:00Z"}]
+                }))
+                .unwrap(),
+            );
+            let facts =
+                UrlInfoClient::default().lookup_with(&url, &AtomicBool::new(false), &transport);
+            assert!(facts.contains(&"Title: Redirected artist".to_owned()));
+            assert!(facts.contains(&format!("Final URL: {destination}")));
+            assert!(facts.contains(&"Registered: 2000-01-01T00:00:00Z".to_owned()));
+            assert!(facts.contains(
+                &"RDAP source: https://registry.example/rdap/domain/artist.co.uk".to_owned()
+            ));
+            assert_eq!(
+                facts.contains(&"Registered domain: artist.co.uk".to_owned()),
+                parent
+            );
+            for omitted in ["Transport:", "Domain:", "Registrant:", "Registration note:"] {
+                assert!(
+                    !facts.iter().any(|line| line.starts_with(omitted)),
+                    "{facts:?}"
+                );
+            }
+            assert!(transport.responses.borrow().is_empty());
+        }
     }
 
     /// All rendered text has finite size and cannot inject terminal controls or bidi overrides.
@@ -1280,8 +1312,43 @@ mod tests {
         )
         .unwrap()
         .join("\n");
-        assert!(absent.contains("Registrant: not published"));
-        assert!(!absent.contains("Registrant: redacted"));
+        assert!(
+            absent.is_empty(),
+            "absent metadata must not produce boilerplate: {absent}"
+        );
+    }
+
+    /// Missing contact fields stay silent while public identities and explicit redaction survive.
+    #[test]
+    fn rdap_contacts_omit_empty_placeholders_and_keep_published_details() {
+        for entities in [
+            Value::Null,
+            json!([]),
+            json!([{"roles": ["registrant"]}]),
+            json!([{"roles": ["registrant"], "vcardArray": ["vcard", [
+				["fn", {}, "text", "  "], ["org", {}, "text", ["", "\n"]],
+				["fn", {}, "text"], ["org", {}, "text", {}]
+			]], "handle": "\t"}]),
+        ] {
+            let value = json!({"objectClassName": "domain", "ldhName": "example.com", "entities": entities});
+            assert!(rdap_facts(&value, "example.com").unwrap().is_empty());
+        }
+        let value = json!({
+            "objectClassName": "domain", "ldhName": "example.com",
+            "entities": [{"roles": ["registrar"], "entities": [
+                {"roles": ["registrant"], "vcardArray": ["vcard", [["fn", {}, "text", "Public Name"]]]},
+                {"roles": ["registrant"], "handle": "PUBLIC-1"}
+            ]}],
+            "redacted": [{"name": {"type": "Registrant Email"}}]
+        });
+        assert_eq!(
+            rdap_facts(&value, "example.com").unwrap(),
+            [
+                "Registrant (public): Public Name",
+                "Registrant (public): handle PUBLIC-1",
+                "Registration privacy: The server explicitly marks some fields as redacted",
+            ]
+        );
     }
 
     /// Parent retries occur only after authoritative 404s and bootstrap data is session-cached.
@@ -1306,8 +1373,8 @@ mod tests {
             .lookup_with(&url, &AtomicBool::new(false), &transport)
             .join("\n");
         assert!(facts.contains("Title: Artist"));
-        assert!(facts.contains("Domain: artist.co.uk"));
-        assert!(facts.contains("not site age or a trust rating"));
+        assert!(facts.contains("Registered domain: artist.co.uk"));
+        assert!(!facts.contains("Registration note:"));
         transport.push(url.as_str(), 200, Vec::new());
         transport.push(
             "https://registry.example/rdap/domain/www.artist.co.uk",
@@ -1356,8 +1423,41 @@ mod tests {
                 .join("\n");
             assert!(facts.contains("Description: Page survives"));
             assert!(facts.contains("Registration:"));
+            assert!(!facts.contains("Registered domain:"));
+            assert!(!facts.contains("Transport:"));
             assert_eq!(transport.requests.borrow().len(), 3);
         }
+    }
+
+    /// Website failures retain useful registration facts without replacing omissions with notices.
+    #[test]
+    fn website_failure_preserves_registration_facts_without_boilerplate() {
+        let transport = MockTransport::default();
+        let url = Url::parse("https://artist.co.uk/").unwrap();
+        transport
+            .responses
+            .borrow_mut()
+            .push_back((url.to_string(), Err(Failure::Transport)));
+        transport.push(BOOTSTRAP_URL, 200, bootstrap());
+        transport.push(
+            "https://registry.example/rdap/domain/artist.co.uk",
+            200,
+            serde_json::to_vec(&json!({
+                "objectClassName": "domain", "ldhName": "artist.co.uk",
+                "events": [{"eventAction": "registration", "eventDate": "2000-01-01T00:00:00Z"}]
+            }))
+            .unwrap(),
+        );
+        let facts = UrlInfoClient::default().lookup_with(&url, &AtomicBool::new(false), &transport);
+        assert_eq!(
+            facts,
+            [
+                "Website: Could not connect to the public server",
+                "Registered: 2000-01-01T00:00:00Z",
+                "RDAP source: https://registry.example/rdap/domain/artist.co.uk",
+            ]
+        );
+        assert!(transport.responses.borrow().is_empty());
     }
 
     /// Redirect policy is enforced before any subsequent request, even with an injected transport.
@@ -1444,7 +1544,7 @@ mod tests {
             .join("\n");
         assert!(facts.contains("Website response: HTTP 200"));
         assert!(facts.contains("Final URL: https://artist.example/final"));
-        assert!(facts.contains("Transport: HTTPS"));
+        assert!(!facts.contains("Transport:"));
         assert!(facts.contains("Title: Redirected title"));
         assert!(facts.contains("No supported registration service"));
         assert!(!facts.contains("private-fragment"));
