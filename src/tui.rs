@@ -13453,12 +13453,20 @@ fn render_preferences_content(
     if inner.is_empty() {
         return;
     }
+    let history_help = "Off: no new log entries; searches are not saved or restored after restart.";
+    let history_help = if terminal_text_width(history_help) <= inner.width {
+        history_help
+    } else {
+        "Off: no new log entries;\nsearches are not saved or restored after restart."
+    };
+    let history_help = wrap_text_lines(history_help, inner.width);
+    let history_help_height = u16::try_from(history_help.len()).unwrap_or(u16::MAX);
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(2),
             Constraint::Length(3),
-            Constraint::Length(1),
+            Constraint::Length(1_u16.saturating_add(history_help_height)),
             Constraint::Length(2),
             Constraint::Length(2),
             // Download and playback source policies remain independent controls.
@@ -13522,7 +13530,7 @@ fn render_preferences_content(
     }
 
     let playback_history_label = format!(
-        "Save playback history: {}",
+        "Save log and searches: {}",
         if preferences.save_playback_history {
             "on"
         } else {
@@ -13544,6 +13552,17 @@ fn render_preferences_content(
             1,
         ),
     ));
+    frame.render_widget(
+        Paragraph::new(history_help.join("\n"))
+            .style(theme.muted)
+            .alignment(Alignment::Center),
+        Rect::new(
+            sections[2].x,
+            sections[2].y.saturating_add(1),
+            sections[2].width,
+            sections[2].height.saturating_sub(1),
+        ),
+    );
 
     let advertisement_label = format!(
         "[a] Skip sections named Реклама: {}",
@@ -25285,8 +25304,11 @@ for encoded, expected in json.load(sys.stdin):
         assert!(rendered.contains("Youta preferences"));
         assert!(rendered.contains("[d] Drill-down"));
         assert!(rendered.contains("[s] Split"));
-        assert!(rendered.contains("Save playback history: on"));
-        assert!(!rendered.contains("[h] Save playback history"));
+        assert!(rendered.contains("Save log and searches: on"));
+        assert!(!rendered.contains("[h] Save log and searches"));
+        assert!(rendered.contains(
+            "Off: no new log entries; searches are not saved or restored after restart."
+        ));
         assert!(rendered.contains("[S] SponsorBlock sponsored segments: on"));
         assert!(rendered.contains("[y] Prepare selected YouTube audio: on"));
         assert!(rendered.contains("[e] Download new episodes every hour: on"));
@@ -25456,7 +25478,7 @@ for encoded, expected in json.load(sys.stdin):
                     .to_owned()
             })
             .collect::<String>();
-        assert_eq!(visible_label, "Save playback history: on");
+        assert_eq!(visible_label, "Save log and searches: on");
         assert_eq!(
             mouse_action(
                 MouseEvent {
@@ -26058,7 +26080,9 @@ for encoded, expected in json.load(sys.stdin):
         for required in [
             "Subscriptions layout.",
             "Enter to save.",
-            "Save playback history: off",
+            "Save log and searches: off",
+            "Off: no new log entries;",
+            "searches are not saved or restored after restart.",
             #[cfg(any(feature = "youtube-official", feature = "invidious"))]
             "[Y] YouTube API / Invidious...",
             "[Enter] Save   [Esc] Cancel",

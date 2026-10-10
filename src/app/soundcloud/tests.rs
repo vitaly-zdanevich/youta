@@ -665,6 +665,63 @@ fn soundcloud_restored_query_respects_newer_navigation_or_input() {
     }
 }
 
+/// Disabling history revokes saved queries even before their dormant tab is opened.
+#[test]
+fn soundcloud_disabling_history_discards_dormant_restoration() {
+    for starts_hidden in [false, true] {
+        let (mut app, requests) = restored_soundcloud_controller_on_screen(
+            "private restored query",
+            if starts_hidden {
+                StoredScreen::Search
+            } else {
+                StoredScreen::SoundCloud
+            },
+        );
+        assert!(app.soundcloud.restored_query.is_some());
+        app.config.persistence.save_playback_history = false;
+        app.poll_soundcloud_worker();
+        assert!(app.soundcloud.restored_query.is_none());
+        assert!(app.soundcloud.worker.is_none());
+        assert!(app.soundcloud.pending.is_none());
+        assert!(app.view.search_activity.is_none());
+        assert!(requests.0.lock().unwrap().is_empty());
+        // Re-enabling storage cannot revive a restoration revoked while disabled.
+        app.config.persistence.save_playback_history = true;
+        app.show_screen(Screen::SoundCloud);
+        app.poll_soundcloud_worker();
+        assert!(app.soundcloud.worker.is_none());
+        assert!(app.view.rows.is_empty());
+        assert!(requests.0.lock().unwrap().is_empty());
+    }
+}
+
+/// An explicit private search remains usable and survives ordinary in-session tab changes.
+#[test]
+fn soundcloud_disabled_history_keeps_explicit_search_results() {
+    let (mut app, requests) =
+        restored_soundcloud_controller_on_screen("private restored query", StoredScreen::Search);
+    app.config.persistence.save_playback_history = false;
+    app.show_screen(Screen::SoundCloud);
+    app.view.search_query = "private live query".to_owned();
+    app.submit_soundcloud_search("private live query".to_owned());
+    finish_soundcloud_page(&mut app);
+    let rows = app.view.rows.clone();
+    assert!(!rows.is_empty());
+    app.show_screen(Screen::Search);
+    app.poll_soundcloud_worker();
+    app.show_screen(Screen::SoundCloud);
+    app.poll_soundcloud_worker();
+    assert_eq!(app.view.rows, rows);
+    assert!(app.soundcloud.restored_query.is_none());
+    let urls = requests.0.lock().unwrap();
+    assert_eq!(urls.len(), 1);
+    assert!(
+        urls[0]
+            .query_pairs()
+            .any(|(key, value)| key == "q" && value == "private live query")
+    );
+}
+
 #[test]
 fn soundcloud_manual_search_replaces_the_unstarted_saved_query() {
     let (mut app, requests) = restored_soundcloud_controller("minsk");

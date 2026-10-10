@@ -378,7 +378,7 @@ fn archive_playback_preference_values_match_the_window_union() {
     assert_eq!(declared, emitted);
 }
 
-/// The history control declares its reducer action and uses the shared click handler.
+/// The playback/search history control declares its shared policy and click action.
 #[test]
 fn window_filters_and_edits_playback_history_from_the_shared_view_policy() {
     let sources = window_sources();
@@ -399,7 +399,9 @@ fn window_filters_and_edits_playback_history_from_the_shared_view_policy() {
         assert!(app.contains(required), "App no longer contains {required}");
     }
     for required in [
-        "toggle('PlaybackHistory', 'Save playback history', popup.save_playback_history, 'TogglePlaybackHistorySaving')",
+        "toggle('PlaybackHistory', 'Save log and searches', popup.save_playback_history, 'TogglePlaybackHistorySaving')",
+        "Off: no new log entries; searches are not saved or restored after restart.",
+        "field === 'PlaybackHistory'",
         "controls.map(({ field, label, value, action, on }) =>",
         "onClick={() => void dispatch(action)}",
         "playbackHistoryEnabled ?",
@@ -409,7 +411,7 @@ fn window_filters_and_edits_playback_history_from_the_shared_view_policy() {
             "Preferences no longer contains {required}"
         );
     }
-    assert!(!popups.contains("[h] Save playback history"));
+    assert!(!popups.contains("[h] Save log and searches"));
 }
 
 /// Every declared field must exist in the JSON the reducer publishes.

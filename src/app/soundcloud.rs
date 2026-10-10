@@ -179,9 +179,17 @@ impl AppController {
     ///
     /// Hidden saved queries remain dormant. New input supersedes restoration, and
     /// frontends without a geometry hint retain the normal bounded page-size fallback.
+    /// Disabling history revokes deferred restoration even while its tab is hidden.
     pub(super) fn poll_soundcloud_worker(&mut self) {
         #[cfg(feature = "soundcloud")]
         {
+            if !self.config.persistence.save_playback_history
+                && self.soundcloud.restored_query.take().is_some()
+                && self.soundcloud.pending.is_none()
+                && self.soundcloud.worker.is_none()
+            {
+                self.finish_search_activity(SearchActivity::SoundCloud);
+            }
             if self.view.screen == Screen::SoundCloud
                 && let Some(query) = self.soundcloud.restored_query.take()
             {
@@ -367,7 +375,8 @@ impl AppController {
     pub(super) fn populate_soundcloud(&mut self) {
         #[cfg(feature = "soundcloud")]
         {
-            if self.soundcloud.restored_query.is_some()
+            if self.config.persistence.save_playback_history
+                && self.soundcloud.restored_query.is_some()
                 && self.soundcloud.items.is_empty()
                 && self.soundcloud.pending.is_none()
                 && self.soundcloud.worker.is_none()

@@ -1659,6 +1659,78 @@ impl Default for SessionState {
 }
 
 impl SessionState {
+    /// Removes online browsing history before persistence or restart restoration.
+    ///
+    /// Every provider's query, filter, selection, and nested location is cleared,
+    /// including providers absent from this build. Top-level tab and display
+    /// preferences survive, but a channel identity becomes the plain Search tab.
+    /// Local navigation and explicitly maintained playlists keep their active
+    /// selection; a remote media identity never survives on any screen. This
+    /// changes only the snapshot and performs no filesystem or provider work.
+    pub fn clear_online_browsing(&mut self) {
+        let online_screen = match &self.screen {
+            Screen::Search
+            | Screen::YouTubeMusic
+            | Screen::SoundCloud
+            | Screen::YandexMusic
+            | Screen::Bandcamp
+            | Screen::ApplePodcasts
+            | Screen::ArchiveOrg
+            | Screen::LibriVox
+            | Screen::Radio
+            | Screen::Web
+            | Screen::Subscriptions
+            | Screen::TrackerMusic
+            | Screen::Channel(_) => true,
+            Screen::Local
+            | Screen::Downloaded
+            | Screen::History
+            | Screen::Playlists
+            | Screen::Queue
+            | Screen::Statistics
+            | Screen::Playlist(_)
+            | Screen::Waveform => false,
+        };
+        if matches!(self.screen, Screen::Channel(_)) {
+            self.screen = Screen::Search;
+        }
+        self.back_stack.clear();
+        self.youtube_selected_row = None;
+        self.youtube_music_selected_row = None;
+        self.soundcloud_selected_row = None;
+        self.yandex_music_selected_row = None;
+        self.bandcamp_selected_row = None;
+        self.apple_podcasts_selected_row = None;
+        self.archive_org_selected_row = None;
+        self.librivox_selected_row = None;
+        self.radio_selected_row = None;
+        self.radio_selected_station_id = None;
+        self.radio_filter_text.clear();
+        self.search_text.clear();
+        self.youtube_music_search_text.clear();
+        self.soundcloud_search_text.clear();
+        self.yandex_music_search_text.clear();
+        self.bandcamp_search_text.clear();
+        self.apple_podcasts_search_text.clear();
+        self.archive_org_search_text.clear();
+        self.archive_org_search_scope = ArchiveOrgSearchScope::Text;
+        self.archive_org_location = None;
+        self.librivox_search_text.clear();
+        if online_screen {
+            self.selected_row = 0;
+            self.details_scroll = 0;
+            self.focus = PanelFocus::Left;
+        }
+        if online_screen
+            || self
+                .selected_media
+                .as_ref()
+                .is_some_and(|media| media.source != SourceKind::Local)
+        {
+            self.selected_media = None;
+        }
+    }
+
     /// Navigates to a screen while recording the previous screen.
     pub fn navigate_to(&mut self, screen: Screen) {
         if self.screen != screen {
@@ -1918,6 +1990,137 @@ mod tests {
         assert!(state.navigate_back());
         assert_eq!(state.screen, Screen::Search);
         assert!(!state.navigate_back());
+    }
+
+    /// Populates every persisted provider field, including features absent from this build.
+    fn private_online_session(screen: Screen) -> SessionState {
+        SessionState {
+            screen,
+            back_stack: vec![Screen::Local, Screen::Channel(id("private-channel"))],
+            focus: PanelFocus::Right,
+            selected_media: Some(id("private-media")),
+            selected_row: 17,
+            youtube_selected_row: Some(1),
+            youtube_music_selected_row: Some(2),
+            soundcloud_selected_row: Some(3),
+            yandex_music_selected_row: Some(4),
+            bandcamp_selected_row: Some(5),
+            apple_podcasts_selected_row: Some(6),
+            archive_org_selected_row: Some(7),
+            librivox_selected_row: Some(8),
+            radio_selected_row: Some(9),
+            radio_selected_station_id: Some("private-station".to_owned()),
+            radio_filter_text: "private-radio".to_owned(),
+            details_scroll: 23,
+            search_text: "private-search".to_owned(),
+            youtube_music_search_text: "private-youtube-music".to_owned(),
+            soundcloud_search_text: "private-soundcloud".to_owned(),
+            yandex_music_search_text: "private-yandex-music".to_owned(),
+            bandcamp_search_text: "private-bandcamp".to_owned(),
+            apple_podcasts_search_text: "private-apple-podcasts".to_owned(),
+            archive_org_search_text: "private-archive".to_owned(),
+            archive_org_search_scope: ArchiveOrgSearchScope::Creator,
+            archive_org_location: Some(ArchiveOrgSessionLocation {
+                query: "private-parent-query".to_owned(),
+                scope: ArchiveOrgSearchScope::Topic,
+                catalogue_selected: 11,
+                catalogue_identifier: Some("private-catalogue-item".to_owned()),
+                identifier: "private-open-item".to_owned(),
+                archive_filename: Some("private-files.zip".to_owned()),
+                filename: Some("private-files.zip/private-song.opus".to_owned()),
+            }),
+            librivox_search_text: "private-librivox".to_owned(),
+            local_path: Some("/music/albums".to_owned()),
+            waveform_visible: true,
+            chapter_timestamps_hidden: false,
+        }
+    }
+
+    /// Forgetting online browsing is independent of the active provider and compiled features.
+    #[test]
+    fn clear_online_browsing_clears_provider_state_and_retains_tab_preferences() {
+        for screen in [
+            Screen::Search,
+            Screen::YouTubeMusic,
+            Screen::SoundCloud,
+            Screen::YandexMusic,
+            Screen::Bandcamp,
+            Screen::ApplePodcasts,
+            Screen::ArchiveOrg,
+            Screen::LibriVox,
+            Screen::Radio,
+            Screen::Web,
+            Screen::Subscriptions,
+            Screen::TrackerMusic,
+            Screen::Channel(id("private-active-channel")),
+        ] {
+            let mut state = private_online_session(screen.clone());
+            state.clear_online_browsing();
+            let expected = SessionState {
+                screen: if matches!(screen, Screen::Channel(_)) {
+                    Screen::Search
+                } else {
+                    screen
+                },
+                local_path: Some("/music/albums".to_owned()),
+                waveform_visible: true,
+                chapter_timestamps_hidden: false,
+                ..SessionState::default()
+            };
+            assert_eq!(state, expected);
+            assert!(!serde_json::to_string(&state).unwrap().contains("private-"));
+            state.clear_online_browsing();
+            assert_eq!(
+                state, expected,
+                "clearing online browsing must be idempotent"
+            );
+        }
+    }
+
+    /// Local browsing and explicitly maintained playlists retain their independent selection.
+    #[test]
+    fn clear_online_browsing_preserves_local_and_user_managed_navigation() {
+        for screen in [
+            Screen::Local,
+            Screen::Downloaded,
+            Screen::Playlists,
+            Screen::Playlist("saved-playlist".to_owned()),
+            Screen::Queue,
+            Screen::Statistics,
+            Screen::History,
+            Screen::Waveform,
+        ] {
+            let local_media = MediaId::new(SourceKind::Local, "file:///music/albums/song.opus");
+            let mut state = private_online_session(screen.clone());
+            state.selected_media = Some(local_media.clone());
+            state.clear_online_browsing();
+            assert_eq!(
+                state,
+                SessionState {
+                    screen,
+                    focus: PanelFocus::Right,
+                    selected_media: Some(local_media),
+                    selected_row: 17,
+                    details_scroll: 23,
+                    local_path: Some("/music/albums".to_owned()),
+                    waveform_visible: true,
+                    chapter_timestamps_hidden: false,
+                    ..SessionState::default()
+                }
+            );
+        }
+    }
+
+    /// The last remote playback identity is browsing history even when Local is visible.
+    #[test]
+    fn clear_online_browsing_forgets_remote_media_on_local_screens() {
+        let mut state = private_online_session(Screen::Local);
+        state.clear_online_browsing();
+        assert!(state.selected_media.is_none());
+        assert_eq!(state.screen, Screen::Local);
+        assert_eq!(state.selected_row, 17);
+        assert_eq!(state.details_scroll, 23);
+        assert_eq!(state.local_path.as_deref(), Some("/music/albums"));
     }
 
     #[test]

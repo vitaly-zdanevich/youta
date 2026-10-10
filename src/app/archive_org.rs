@@ -505,7 +505,10 @@ impl AppController {
         self.cancel_stale_archive_now_playing_navigation();
         // Restored tabs wait until the frontend has had a frame to report its
         // result capacity. Frontends without a hint retain the default size.
-        if self.view.screen == Screen::ArchiveOrg && !self.archive_org.initialized {
+        if self.view.screen == Screen::ArchiveOrg
+            && !self.archive_org.initialized
+            && self.config.persistence.save_playback_history
+        {
             self.populate_archive_org();
         }
         let completed =
@@ -719,7 +722,9 @@ impl AppController {
         }
     }
 
-    /// Projects the catalogue or one item's tracks, preserving the human item URL.
+    /// Projects live catalogue state without implicitly loading private sessions.
+    ///
+    /// Explicit searches and item navigation still preserve the human item URL.
     pub(super) fn populate_archive_org(&mut self) {
         if self.view.screen != Screen::ArchiveOrg {
             return;
@@ -728,6 +733,16 @@ impl AppController {
             return;
         }
         if !self.archive_org.initialized {
+            if !self.config.persistence.save_playback_history {
+                // This dormant disk snapshot is not live navigation and must not
+                // reappear if history is enabled again later in the session.
+                self.archive_org.restart = None;
+                self.view.rows.clear();
+                self.view.details = None;
+                self.view.status_line =
+                    "Archive.org; press / to search or submit an empty query to browse".to_owned();
+                return;
+            }
             if self.begin_archive_session_restore() {
                 return;
             }
@@ -1809,6 +1824,122 @@ mod tests {
         details.tracks[1].waveform_url = None;
         app.update_archive_org_detail();
         assert!(!app.view.details.as_ref().unwrap().thumbnail_expanded);
+    }
+
+    /// Rejects any accidentally started request without touching the network.
+    struct PrivateCatalogueTransport;
+
+    impl crate::providers::archive_org::ArchiveOrgTransport for PrivateCatalogueTransport {
+        fn fetch(
+            &self,
+            _: &url::Url,
+            _: usize,
+        ) -> Result<Vec<u8>, crate::providers::ProviderError> {
+            Err(crate::providers::ProviderError::HttpStatus(503))
+        }
+    }
+
+    /// Startup and repeated ticks must leave private catalogues unrequested.
+    #[test]
+    fn private_archive_startup_and_navigation_wait_for_explicit_browse() {
+        let directory = crate::test_support::canonical_tempdir("private archive startup");
+        let mut config = Config::for_dir(directory.path().join("config"));
+        config.persistence.save_playback_history = false;
+        let store = StateStore::open_in_memory().unwrap();
+        store
+            .save_session(
+                &SessionState {
+                    screen: StoredScreen::ArchiveOrg,
+                    ..SessionState::default()
+                },
+                1,
+            )
+            .unwrap();
+        let mut controller = AppController::new(config, store, None, None);
+        controller.archive_org.client =
+            ArchiveOrgClient::with_transport(Arc::new(PrivateCatalogueTransport));
+        for _ in 0..3 {
+            controller.poll_archive_org_worker();
+            controller.populate_archive_org();
+            assert!(controller.view.rows.is_empty());
+            assert!(controller.archive_org.pending.is_none());
+            assert!(controller.archive_org.worker.is_none());
+            assert_eq!(controller.archive_org.generation, 0);
+            controller.show_screen(Screen::Search);
+            controller.show_screen(Screen::ArchiveOrg);
+        }
+        controller.config.persistence.save_playback_history = true;
+        controller.poll_archive_org_worker();
+        assert!(matches!(
+            controller.archive_org.pending.as_ref().map(|job| &job.kind),
+            Some(ArchiveRequest::Search(_))
+        ));
+    }
+
+    /// Explicit empty browsing and text searches retain their normal request owner.
+    #[test]
+    fn private_archive_explicit_browse_and_search_remain_available() {
+        let (_directory, mut controller) = lookup_controller();
+        controller.config.persistence.save_playback_history = false;
+        controller.archive_org.initialized = false;
+        controller.archive_org.client =
+            ArchiveOrgClient::with_transport(Arc::new(PrivateCatalogueTransport));
+        occupy_archive_worker(&mut controller);
+        controller.view.screen = Screen::ArchiveOrg;
+        for query in ["", "fixture"] {
+            controller.view.search_query = query.to_owned();
+            controller.dispatch(UiAction::SubmitSearch);
+            assert!(matches!(
+                &controller.archive_org.pending.as_ref().unwrap().kind,
+                ArchiveRequest::Search(request) if request.query == query && request.page == 1
+            ));
+            assert!(controller.archive_org.initialized);
+        }
+    }
+
+    /// Turning history off before visiting a saved tab must not activate its restore intent.
+    #[test]
+    fn private_archive_does_not_start_parked_session_restore() {
+        let (_directory, mut controller) = lookup_controller();
+        controller.archive_org = ArchiveOrgState::restored(&SessionState {
+            archive_org_location: Some(crate::domain::ArchiveOrgSessionLocation {
+                query: "saved private catalogue".to_owned(),
+                scope: ArchiveOrgSearchScope::Text,
+                catalogue_selected: 0,
+                catalogue_identifier: Some("fixture".to_owned()),
+                identifier: "fixture".to_owned(),
+                archive_filename: None,
+                filename: None,
+            }),
+            ..SessionState::default()
+        });
+        controller.archive_org.client =
+            ArchiveOrgClient::with_transport(Arc::new(PrivateCatalogueTransport));
+        controller.config.persistence.save_playback_history = false;
+        controller.show_screen(Screen::ArchiveOrg);
+        controller.poll_archive_org_worker();
+        assert!(controller.view.rows.is_empty());
+        assert!(controller.archive_org.pending.is_none());
+        assert!(controller.archive_org.restoring.is_none());
+        assert!(controller.archive_org.restart.is_none());
+        assert_eq!(controller.archive_org.generation, 0);
+    }
+
+    /// Disabling history does not throw away catalogue results already in memory.
+    #[test]
+    fn disabling_history_retains_live_archive_results() {
+        let (_directory, mut controller) = lookup_controller();
+        controller.archive_org.items = vec![item()];
+        controller.archive_org.client =
+            ArchiveOrgClient::with_transport(Arc::new(PrivateCatalogueTransport));
+        occupy_archive_worker(&mut controller);
+        controller.show_screen(Screen::ArchiveOrg);
+        let rows = controller.view.rows.clone();
+        controller.config.persistence.save_playback_history = false;
+        controller.show_screen(Screen::Search);
+        controller.show_screen(Screen::ArchiveOrg);
+        assert_eq!(controller.view.rows, rows);
+        assert_eq!(controller.archive_org.items.len(), 1);
     }
 
     pub(super) fn item() -> ArchiveOrgItem {

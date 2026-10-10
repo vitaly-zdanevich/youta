@@ -1750,7 +1750,7 @@ export function PreferencesPopup({ popup, archiveSupported }: {
 		add(field, label, value ? 'on' : 'off', action, supported, value);
 	add('SubscriptionsLayout', 'Subscriptions layout', popup.subscriptions_layout,
 		{ SetSubscriptionsLayout: popup.subscriptions_layout === 'drill-down' ? 'split' : 'drill-down' });
-	toggle('PlaybackHistory', 'Save playback history', popup.save_playback_history, 'TogglePlaybackHistorySaving');
+	toggle('PlaybackHistory', 'Save log and searches', popup.save_playback_history, 'TogglePlaybackHistorySaving');
 	toggle('AdvertisementChapters', 'Skip advertisement chapters', popup.skip_advertisement_chapters, 'ToggleSkipAdvertisementChapters');
 	toggle('SponsorBlock', 'Skip SponsorBlock sponsored segments', popup.sponsorblock_enabled, 'ToggleSponsorBlock', popup.sponsorblock_supported);
 	toggle('YouTubePrewarm', 'Prewarm the selected YouTube video', popup.youtube_prewarm, 'ToggleYouTubePrewarm');
@@ -1807,7 +1807,14 @@ export function PreferencesPopup({ popup, archiveSupported }: {
 									}
 								}}
 							>
-								{label ? <span className='text-ink-dim'>{label}</span> : null}
+								{label ? (
+									<span className='text-ink-dim'>
+										{label}
+										{field === 'PlaybackHistory' ? (
+											<span className='block text-[11px] leading-[16px] text-ink-faint'>Off: no new log entries; searches are not saved or restored after restart.</span>
+										) : null}
+									</span>
+								) : null}
 								{field === 'HourlyDownloads' || field === 'NaturalLocalSort' ? (
 									<input type='checkbox' data-youta-preferences='true'
 										aria-label={label} checked={on ?? false}

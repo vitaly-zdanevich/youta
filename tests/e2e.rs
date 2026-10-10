@@ -532,8 +532,9 @@ fn tui_subscriptions_openers_and_preferences_persist_end_to_end() {
     for expected in [
         "Sources",
         "Fixture channel",
-        "Save playback history: on",
-        "Save playback history: off",
+        "Save log and searches: on",
+        "Save log and searches: off",
+        "Off: no new log entries; searches are not saved or restored after restart.",
         "Split",
         "Prepare selected YouTube audio: off",
     ] {

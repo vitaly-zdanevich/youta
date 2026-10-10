@@ -878,6 +878,22 @@ The repository's
 .I config.example.toml
 documents available settings.
 .PP
+Preferences calls the playback/search persistence setting
+.BR "Save log and searches" .
+Set
+.B persistence.save_playback_history=false
+in config.toml, or
+.BR YOUTA_PERSISTENCE__SAVE_PLAYBACK_HISTORY=false ,
+to stop new log entries and hide Log. Searches are not saved or restored after
+restart. Previously saved online queries and search results are removed when
+the setting is turned off or Youta starts with it off. Online search tabs stay empty
+until an explicit search or browse action. Online browsing routes are omitted
+from saved sessions.
+Existing playback logs, media/artwork caches, and Git history are retained.
+Playback progress, listening statistics, other session state, and
+graceful-shutdown Git synchronization remain enabled. Re-enabling the setting
+reveals the retained playback history in Log again.
+.PP
 The first unconfigured YouTube search in the terminal offers provider setup.
 It saves API keys in
 .I secrets/credentials.toml

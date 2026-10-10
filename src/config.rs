@@ -1800,10 +1800,13 @@ pub struct PersistenceConfig {
     pub position_save_interval_seconds: u64,
     /// Completion threshold used by configurable UI and import code.
     pub played_threshold_percent: u8,
-    /// Whether to append a new History row after playback starts.
+    /// Whether to save log entries and online searches for restart restoration.
     ///
-    /// Disabling this does not delete existing History or stop progress,
-    /// statistics, session, cache, or graceful-shutdown Git persistence.
+    /// Disabling this hides Log, removes saved online queries/results, and
+    /// omits online browsing routes from saved sessions. Online search tabs remain
+    /// empty until an explicit search/browse action. Existing playback logs,
+    /// media/artwork caches, and Git history remain. Progress, statistics,
+    /// other session state, and graceful-shutdown Git persistence stay enabled.
     pub save_playback_history: bool,
     /// On graceful shutdown, commit and push the application directory when it
     /// belongs to a Git worktree.

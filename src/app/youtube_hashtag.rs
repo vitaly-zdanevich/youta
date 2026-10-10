@@ -365,7 +365,7 @@ impl AppController {
                 results: std::mem::take(&mut self.youtube_results),
                 next_page: self.next_youtube_page,
             };
-            let result = self.store.save_youtube_search(&saved, unix_time());
+            let result = self.save_youtube_search(&saved, unix_time());
             self.youtube_results = saved.results;
             result
         } else {

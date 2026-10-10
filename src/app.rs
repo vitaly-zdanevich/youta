@@ -45,6 +45,7 @@ mod queued_yandex_download;
 mod radio_evernote;
 #[cfg(feature = "s3-upload")]
 mod s3_upload;
+mod search_privacy;
 mod soundcloud;
 mod subscription_confirmation;
 #[cfg(feature = "url-info")]
@@ -6030,27 +6031,55 @@ impl AppController {
             .as_ref()
             .map(|_| local_waveform_request_sender);
 
-        let (saved, session_restore_error) = match store.session() {
+        let search_privacy_error = if config.persistence.save_playback_history {
+            None
+        } else {
+            search_privacy::clear_saved_online_searches(&store).err()
+        };
+        let (mut saved, session_restore_error) = match store.session() {
             Ok(saved) => (saved.unwrap_or_default(), None),
             Err(error) => (SessionState::default(), Some(error)),
         };
-        let (saved_search, search_restore_error) = match store.youtube_search() {
-            Ok(saved) => (saved, None),
-            Err(error) => (None, Some(error)),
+        // Never restore private browsing state, even when cleanup failed on disk.
+        if !config.persistence.save_playback_history {
+            saved.clear_online_browsing();
+        }
+        let (saved_search, search_restore_error) = if config.persistence.save_playback_history {
+            match store.youtube_search() {
+                Ok(saved) => (saved, None),
+                Err(error) => (None, Some(error)),
+            }
+        } else {
+            (None, None)
         };
-        let (saved_music_search, music_search_restore_error) = match store.youtube_music_search() {
-            Ok(saved) => (saved, None),
-            Err(error) => (None, Some(error)),
-        };
+        let (saved_music_search, music_search_restore_error) =
+            if config.persistence.save_playback_history {
+                match store.youtube_music_search() {
+                    Ok(saved) => (saved, None),
+                    Err(error) => (None, Some(error)),
+                }
+            } else {
+                (None, None)
+            };
         #[cfg(feature = "bandcamp")]
-        let (saved_bandcamp_search, bandcamp_search_restore_error) = match store.bandcamp_search() {
-            Ok(saved) => (saved, None),
-            Err(error) => (None, Some(error)),
-        };
-        let (saved_apple_search, apple_search_restore_error) = match store.apple_podcasts_search() {
-            Ok(saved) => (saved, None),
-            Err(error) => (None, Some(error)),
-        };
+        let (saved_bandcamp_search, bandcamp_search_restore_error) =
+            if config.persistence.save_playback_history {
+                match store.bandcamp_search() {
+                    Ok(saved) => (saved, None),
+                    Err(error) => (None, Some(error)),
+                }
+            } else {
+                (None, None)
+            };
+        let (saved_apple_search, apple_search_restore_error) =
+            if config.persistence.save_playback_history {
+                match store.apple_podcasts_search() {
+                    Ok(saved) => (saved, None),
+                    Err(error) => (None, Some(error)),
+                }
+            } else {
+                (None, None)
+            };
         let disabled_history_was_stored =
             !config.persistence.save_playback_history && saved.screen == StoredScreen::History;
         let mut view = ViewModel {
@@ -6966,7 +6995,11 @@ impl AppController {
         };
         // The terminal supplies Archive search capacity after its first frame;
         // defer only this restored route's initial request until the first tick.
-        if controller.view.screen != Screen::ArchiveOrg || !cfg!(feature = "archive-org") {
+        // Private sessions can render their empty catalogue immediately.
+        if controller.view.screen != Screen::ArchiveOrg
+            || !controller.config.persistence.save_playback_history
+            || !cfg!(feature = "archive-org")
+        {
             controller.populate_local_screen();
         }
         controller.restore_manual_downloads();
@@ -7033,6 +7066,9 @@ impl AppController {
         }
         if let Some(error) = session_restore_error {
             controller.show_error("Could not restore the previous session", &error);
+        }
+        if let Some(error) = search_privacy_error {
+            controller.show_error("Could not remove saved online searches", &error);
         }
         if let Some(error) = search_restore_error {
             controller.show_error("Could not restore the previous YouTube search", &error);
@@ -7128,7 +7164,9 @@ impl AppController {
         controller.refresh_selected_playlist_state();
         controller.refresh_video_summary_availability();
         #[cfg(feature = "yandex-music")]
-        if controller.view.screen == Screen::YandexMusic {
+        if controller.view.screen == Screen::YandexMusic
+            && controller.config.persistence.save_playback_history
+        {
             // My Wave uses the foreground provider lane. Queue it before
             // launching the independent bounded offline-reaction retry pass.
             controller.open_yandex_music_home();
@@ -7809,7 +7847,14 @@ impl AppController {
 
     fn submit_search(&mut self) {
         let query = self.view.search_query.trim().to_owned();
-        if query.is_empty() {
+        // Empty catalogue submissions deliberately browse the provider's defaults;
+        // private sessions must not need an implicit initial load to reach it.
+        if query.is_empty()
+            && !matches!(
+                self.view.screen,
+                Screen::ArchiveOrg | Screen::LibriVox | Screen::YandexMusic
+            )
+        {
             self.view.status_line = if self.view.screen == Screen::Web {
                 self.view.search_editing = true;
                 "Enter a complete http:// or https:// URL".to_owned()
@@ -7852,6 +7897,12 @@ impl AppController {
                 Err(error) => self.view.status_line = error.to_owned(),
             },
             SearchRoute::SoundCloud => self.submit_soundcloud_search(query),
+            SearchRoute::YandexMusic if query.is_empty() => {
+                #[cfg(feature = "yandex-music")]
+                self.open_yandex_music_home();
+                #[cfg(not(feature = "yandex-music"))]
+                self.submit_yandex_music_search(query);
+            }
             SearchRoute::YandexMusic => match parse_direct_source_input(&query) {
                 Ok(Some(direct)) if direct.source == SourceKind::YandexMusic => {
                     if let Some(album_id) = yandex_music_album_id_from_url(&direct.url) {
@@ -9849,7 +9900,7 @@ impl AppController {
         self.refresh_bandcamp_rows();
         self.update_bandcamp_detail();
         self.refresh_selected_playlist_state();
-        if let Err(error) = self.store.save_bandcamp_search(
+        if let Err(error) = self.save_bandcamp_search(
             &SavedBandcampSearch {
                 query,
                 page: 1,
@@ -12582,8 +12633,7 @@ impl AppController {
                             next_page: self.next_youtube_page,
                         };
                         self.youtube_search_request = Some(request);
-                        let save_result =
-                            self.store.save_youtube_search(&saved_search, unix_time());
+                        let save_result = self.save_youtube_search(&saved_search, unix_time());
                         self.youtube_results = saved_search.results;
                         if let Err(error) = save_result {
                             self.show_error("Could not save the YouTube search", &error);
@@ -12639,9 +12689,8 @@ impl AppController {
                             query: self.youtube_music_search_query.clone(),
                             results: self.youtube_music_results.clone(),
                         };
-                        if let Err(error) = self
-                            .store
-                            .save_youtube_music_search(&saved_search, unix_time())
+                        if let Err(error) =
+                            self.save_youtube_music_search(&saved_search, unix_time())
                             && self.view.screen == Screen::YouTubeMusic
                         {
                             self.show_error("Could not save the YouTube Music search", &error);
@@ -12976,8 +13025,7 @@ impl AppController {
                             results: self.bandcamp_results.clone(),
                             next_page: self.bandcamp_next_page,
                         };
-                        if let Err(error) =
-                            self.store.save_bandcamp_search(&saved_search, unix_time())
+                        if let Err(error) = self.save_bandcamp_search(&saved_search, unix_time())
                             && self.view.screen == Screen::Bandcamp
                         {
                             self.show_error("Could not save the Bandcamp search", &error);
@@ -13031,9 +13079,8 @@ impl AppController {
                             storefront: request.country,
                             results: self.apple_podcasts_results.clone(),
                         };
-                        if let Err(error) = self
-                            .store
-                            .save_apple_podcasts_search(&saved_search, unix_time())
+                        if let Err(error) =
+                            self.save_apple_podcasts_search(&saved_search, unix_time())
                         {
                             self.show_error("Could not save the Apple Podcasts search", &error);
                         }
@@ -14041,7 +14088,8 @@ impl AppController {
                                             && summary.orientation != details.orientation
                                 )
                             });
-                        if orientation_changed
+                        if self.config.persistence.save_playback_history
+                            && orientation_changed
                             && self.youtube_search_request.is_some()
                             && let Err(error) = self.store.update_saved_youtube_video_orientation(
                                 &details.video_id,
@@ -15626,10 +15674,11 @@ impl AppController {
             })
     }
 
-    /// Populates the current LibriVox route or starts its initial catalogue.
+    /// Projects live LibriVox state, loading defaults only when history is enabled.
     #[cfg(feature = "librivox")]
     fn populate_librivox(&mut self) {
-        if self.librivox_books.is_empty()
+        if self.config.persistence.save_playback_history
+            && self.librivox_books.is_empty()
             && self.active_librivox_book.is_none()
             && self.pending_librivox_request.is_none()
         {
@@ -15639,6 +15688,12 @@ impl AppController {
         self.refresh_librivox_rows();
         self.update_librivox_detail();
         self.view.status_line = match self.librivox_route {
+            LibrivoxRoute::Books
+                if self.librivox_books.is_empty()
+                    && !self.config.persistence.save_playback_history =>
+            {
+                "LibriVox; press / to search or submit an empty query to browse".to_owned()
+            }
             LibrivoxRoute::Books => format!(
                 "{} LibriVox book{}; press / to search",
                 self.librivox_books.len(),
@@ -27738,7 +27793,7 @@ impl AppController {
             self.request_selected_details();
         } else if screen == Screen::YandexMusic {
             #[cfg(feature = "yandex-music")]
-            if self.yandex_music_rows.is_empty() {
+            if self.config.persistence.save_playback_history && self.yandex_music_rows.is_empty() {
                 self.open_yandex_music_home();
             }
         } else if screen == Screen::ApplePodcasts {
@@ -27823,12 +27878,16 @@ impl AppController {
                     if self.yandex_music_rows.is_empty() {
                         self.view.rows.clear();
                         self.view.details = None;
-                        self.view.status_line =
-                            if self.config.providers.yandex_music_token.is_some() {
-                                "Loading My Wave recommendations...".to_owned()
-                            } else {
-                                "Yandex Music needs an OAuth access token".to_owned()
-                            };
+                        self.view.status_line = if !self.config.persistence.save_playback_history
+                            && self.view.search_activity != Some(SearchActivity::YandexMusic)
+                        {
+                            "Yandex Music; press / to search or submit an empty query for My Wave"
+                                .to_owned()
+                        } else if self.config.providers.yandex_music_token.is_some() {
+                            "Loading My Wave recommendations...".to_owned()
+                        } else {
+                            "Yandex Music needs an OAuth access token".to_owned()
+                        };
                     } else {
                         self.refresh_yandex_music_rows();
                         self.view.status_line = match self.yandex_music_route {
@@ -34907,6 +34966,16 @@ impl AppController {
         if !save_playback_history && self.view.screen == Screen::History {
             self.show_screen(Screen::Statistics);
         }
+        if !save_playback_history {
+            self.session_dirty = true;
+            if let Err(error) = search_privacy::clear_saved_online_searches(&self.store) {
+                if let Some(preferences) = self.view.preferences_popup.as_mut() {
+                    preferences.validation_error = Some(error.to_string());
+                }
+                self.show_error("Could not remove saved online searches", &error);
+                return;
+            }
+        }
         if self.config.providers.bandcamp_audio_format != bandcamp_audio_format
             && let Err(error) = self
                 .config
@@ -35471,7 +35540,7 @@ impl AppController {
         let persisted_archive_org_selected_row = self.archive_org_catalogue_selection();
         #[cfg(not(feature = "archive-org"))]
         let persisted_archive_org_selected_row = self.archive_org_selected;
-        let state = SessionState {
+        let mut state = SessionState {
             screen: stored_session_screen(self.view.screen, &self.playlists_route),
             focus: if self.view.details_focused {
                 PanelFocus::Right
@@ -35510,6 +35579,15 @@ impl AppController {
             chapter_timestamps_hidden: !self.view.show_chapter_timestamps,
             ..SessionState::default()
         };
+        if !self.config.persistence.save_playback_history {
+            state.clear_online_browsing();
+            // Retry cleanup at persistence barriers rather than syncing leftover searches.
+            if let Err(error) = search_privacy::clear_saved_online_searches(&self.store) {
+                self.show_session_save_error(&error);
+                self.session_dirty = true;
+                return false;
+            }
+        }
         match self.store.save_session(&state, unix_time()) {
             Ok(()) => {
                 self.session_dirty = false;
@@ -47550,6 +47628,9 @@ mod tests {
     #[cfg(feature = "tui")]
     #[path = "performance.rs"]
     mod performance_tests;
+    #[cfg(any(feature = "librivox", feature = "yandex-music"))]
+    #[path = "private_catalogue_startup.rs"]
+    mod private_catalogue_startup_tests;
     #[cfg(feature = "yandex-music")]
     #[path = "queued_yandex_download.rs"]
     mod queued_yandex_download_tests;
@@ -47559,6 +47640,8 @@ mod tests {
     #[cfg(feature = "s3-upload")]
     #[path = "s3_upload.rs"]
     mod s3_upload_tests;
+    #[path = "search_privacy.rs"]
+    mod search_privacy_tests;
     #[cfg(all(feature = "cmd", feature = "yt-dlp"))]
     #[path = "typed_prompt_tests.rs"]
     mod typed_prompt_tests;

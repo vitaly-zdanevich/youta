@@ -1455,11 +1455,16 @@ activity. Writes use canonical ordering and same-directory atomic replacement
 so diffs remain readable and an interrupted write does not replace the last
 complete document. Each kind of state has its own document, so saving playback
 progress does not rewrite history, notes, bookmarks, statistics, or playlists.
-`persistence.save_playback_history = false` prevents only new playback history
-entries and hides the Log tab. Existing history remains in the selected
-backend, and playback progress, listening statistics, sessions, caches, and
-graceful-shutdown Git synchronization continue normally. Setting it back to
-`true` exposes the retained history in Log again.
+`persistence.save_playback_history = false` prevents new playback history
+entries and hides the Log tab. It also omits online queries and browsing routes
+from saved sessions, so online search text and results do not reopen after a
+restart on any online tab. Previously saved online queries and search results
+are removed when the setting is turned off or Youta starts with it off. Online
+search tabs stay empty until you explicitly search or browse. Existing playback logs,
+media/artwork caches, and Git history are retained. Playback progress, listening
+statistics, other session state, and graceful-shutdown Git synchronization
+remain enabled. Setting it back to `true` exposes the retained playback history
+in Log again.
 At startup, a corrupt `runtime/` or `cache/` document is preserved beside its
 canonical path under a private hidden `.corrupt` name and replaced with an
 empty valid document. Existing quarantine files are never overwritten.
@@ -2297,7 +2302,7 @@ focus a setting and Space to change it, or use its displayed shortcut; press
 - exact `Реклама` chapter skipping and independent SponsorBlock skipping;
 - Nyan Cat seek bar and selected YouTube audio preparation;
 - Local folder-size measurement and YouTube video-thumbnail size;
-- playback history recording and hourly channel-download checks;
+- playback/search history saving and hourly channel-download checks;
 - manual video/audio download mode and archive.org original/MP3 selection;
 - archive.org playback: ask, prefer the original, or use an existing audio-only file;
 - the explicit video-summary backend.
@@ -2329,6 +2334,7 @@ youtube_thumbnail_size = 'automatic'
 nyan_cat_seekbar = false
 
 [persistence]
+# Save playback history and restore online searches/browsing after restart.
 save_playback_history = true
 
 [video_summary]
@@ -2348,11 +2354,14 @@ codex_executable = 'codex'
 work, hides cached folder sizes, and removes the Local size-sort control.
 `YOUTA_UI__NATURAL_LOCAL_SORT=true` enables numeric filename ordering in Local.
 `YOUTA_UI__YOUTUBE_THUMBNAIL_SIZE=high` selects the strict 480×360 YouTube
-video-thumbnail entry. `YOUTA_PERSISTENCE__SAVE_PLAYBACK_HISTORY=false` stops
-new playback history entries and hides the Log tab. It does not delete
-existing history or disable playback progress, listening statistics, session
-and cache persistence, or graceful-shutdown Git synchronization. Re-enabling
-it exposes the retained history in Log again. `YOUTA_VIDEO_SUMMARY__BACKEND=codex`
+video-thumbnail entry. `YOUTA_PERSISTENCE__SAVE_PLAYBACK_HISTORY=false` switches
+off **Save log and searches**: no new log entries; searches are not saved or
+restored after restart. Log is hidden, and previously saved online queries and
+search results are removed. Online search tabs stay empty until an explicit search or
+browse action. Existing playback logs, media/artwork caches, and Git history
+remain; playback progress, listening statistics, other session state, and
+graceful-shutdown Git synchronization remain enabled. Re-enabling it exposes
+the retained playback history in Log again. `YOUTA_VIDEO_SUMMARY__BACKEND=codex`
 enables the same explicit summary action without editing the TOML file;
 `YOUTA_VIDEO_SUMMARY__CODEX_EXECUTABLE=/path/to/codex` selects another CLI
 executable. The executable is not edited in Preferences, so that path override

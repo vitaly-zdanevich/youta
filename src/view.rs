@@ -1277,7 +1277,8 @@ pub struct PreferencesPopupView {
     pub youtube_provider_settings_supported: bool,
     /// Draft Subscriptions layout saved only when the user confirms.
     pub subscriptions_layout: SubscriptionsLayout,
-    /// Draft playback-history saving policy saved only on confirmation.
+    /// Draft log/search policy, including online search and browsing restoration.
+    /// Changes take effect only when the user confirms Preferences.
     pub save_playback_history: bool,
     /// Draft provider for explicit, on-demand video summaries.
     pub video_summary_backend: VideoSummaryBackend,

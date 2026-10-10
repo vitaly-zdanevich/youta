@@ -295,6 +295,24 @@ test('preferences preserve shared navigation order and distinguish focus from ac
 	assert.equal(checkbox.props['data-youta-preferences'], 'true', 'checkbox keys reach the shared preferences keymap');
 });
 
+test('log and search preferences always explain disabled restart behavior', () => {
+	for (const enabled of [true, false]) {
+		const popup = {
+			selected_field: 'SubscriptionsLayout', subscriptions_layout: 'drill-down',
+			save_playback_history: enabled,
+		};
+		const control = nodes(module.exports.PreferencesPopup({ popup, archiveSupported: false }))
+			.find((node) => node.props['data-preferences-field'] === 'PlaybackHistory');
+		assert.ok(text(control).includes('Save log and searches'));
+		assert.ok(text(control).includes('Off: no new log entries; searches are not saved or restored after restart.'));
+		const button = nodes(control).find((node) => node.type === 'button');
+		assert.equal(text(button), enabled ? 'on' : 'off');
+		actions.length = 0;
+		button.props.onClick();
+		assert.deepEqual(actions.pop(), ['TogglePlaybackHistorySaving']);
+	}
+});
+
 test('window mounts the shared download chooser and declares the exact snapshot contract', () => {
 	assert.match(contract, /export interface DownloadChoicePopupView/);
 	assert.match(contract, /download_choice_popup: DownloadChoicePopupView \| null/);

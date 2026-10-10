@@ -146,10 +146,11 @@ dos_rpg_mode = false
 # Close Youta before editing state/*.toml by hand.
 backend = 'files'
 
-# Save one new playback History entry after media starts, and expose the
-# History tab. Disabling this prevents only new History entries; it does not
-# delete existing History or disable playback progress, listening statistics,
-# session and cache persistence, or graceful-shutdown Git synchronization.
+# Save log and searches. Off: no new log entries; searches are not saved or
+# restored after restart. Previously saved online queries/results are removed.
+# Online search tabs stay empty until an explicit search/browse; Log is hidden.
+# Existing playback logs, media/artwork caches, and Git history are retained.
+# Progress, statistics, other session state, and Git sync remain enabled.
 # YOUTA_PERSISTENCE__SAVE_PLAYBACK_HISTORY has higher precedence.
 save_playback_history = true
 
