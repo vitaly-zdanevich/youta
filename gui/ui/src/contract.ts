@@ -346,6 +346,8 @@ export interface YtDlpForbiddenView {
 export interface ErrorPopupView {
   title: string;
   report: string;
+	/** Optional concise visible message; report remains the complete copyable diagnostics. */
+	summary: string | null;
   scroll_offset: number;
   gh_available: boolean;
   /** Whether this popup may offer either GitHub issue-creation path. */

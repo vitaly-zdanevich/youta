@@ -2918,12 +2918,17 @@ environment contents, and home-directory paths are redacted or omitted.
 Actionable runtime-state save conflicts instead show their concise error text,
 without a dependency list or backtrace.
 
+Playback timeouts show a compact message: "Playback timed out. Please try again."
+**Copy report** retains the redacted technical details, but these routine failures
+do not prompt for a GitHub issue or launch helper-version probes. Existing
+playback retries and specific HTTP 403 or decoder-setup guidance are unchanged.
+
 Helper-version processes are never launched at startup. Recoverable TUI
 reports lazily probe the configured `mpv` and `yt-dlp` concurrently; fatal CLI
 and TUI reports also probe `ffmpeg` and `ffprobe`. Every probe uses fixed
 version arguments and an independent 1.5-second deadline.
 
-The popup always offers separate `Copy` and `Copy + open issue` actions. When
+Reportable-error popups offer separate `Copy` and `Copy + open issue` actions. When
 `gh` is installed, it additionally offers `Submit GitHub issue`. Direct
 submission first asks for explicit confirmation that the complete diagnostic
 report will become public, disables dismissal while `gh issue create` is

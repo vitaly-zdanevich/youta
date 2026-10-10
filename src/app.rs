@@ -4527,6 +4527,7 @@ enum DeferredDiagnosticReport {
         title: String,
         report: String,
         reportable: bool,
+        summary: Option<String>,
     },
     /// Structured yt-dlp HTTP 403 content whose lookups start when displayed.
     #[cfg(feature = "yt-dlp")]
@@ -27207,7 +27208,12 @@ impl AppController {
                     self.show_yt_dlp_forbidden_report(report);
                     return;
                 }
-                self.show_error_message("Playback did not start", message);
+                self.show_playback_end_error(
+                    "Playback did not start",
+                    message,
+                    &end,
+                    tracker_module,
+                );
             }
             PlaybackEndReason::Eof => {
                 if let Some(duration) = self.view.playback.duration {
@@ -27338,7 +27344,7 @@ impl AppController {
                     self.show_yt_dlp_forbidden_report(report);
                     return;
                 }
-                self.show_error_message("Playback failed", message);
+                self.show_playback_end_error("Playback failed", message, &end, tracker_module);
             }
             PlaybackEndReason::Other(reason) => {
                 let message = format!(
@@ -31585,7 +31591,6 @@ impl AppController {
 
     /// Describes configured helpers without delaying an error popup to launch
     /// their version commands.
-    #[cfg(feature = "yt-dlp")]
     fn unprobed_diagnostic_helpers(&self) -> Vec<ExternalHelper> {
         let helpers = vec![
             ExternalHelper::new("mpv", Some(self.config.providers.mpv_executable.clone())),
@@ -31658,6 +31663,33 @@ impl AppController {
             DiagnosticReport::capture_message(&message, self.diagnostic_helpers()).render();
         self.show_diagnostic_report(title, report);
         self.view.status_line = format!("{title}: {message}");
+    }
+
+    /// Shows an expected media timeout concisely while retaining redacted diagnostics for copying.
+    ///
+    /// Only terminal media events use this path, after existing retries have finished.
+    /// Backend IPC/process failures, HTTP 403 guidance, and tracker setup errors keep
+    /// their original presentation. No helper version probes delay timeout feedback.
+    fn show_playback_end_error(
+        &mut self,
+        title: &str,
+        message: String,
+        end: &PlaybackEnd,
+        tracker_module: bool,
+    ) {
+        if playback_end_reports_timeout(end)
+            && !playback_end_reports_http_403(end)
+            && !(tracker_module && playback_end_reports_unsupported_format(end))
+        {
+            const SUMMARY: &str = "Playback timed out. Please try again.";
+            let report =
+                DiagnosticReport::capture_message(&message, self.unprobed_diagnostic_helpers())
+                    .render();
+            self.show_report_popup(title.to_owned(), report, false, Some(SUMMARY.to_owned()));
+            self.view.status_line = format!("{title}: {SUMMARY}");
+        } else {
+            self.show_error_message(title, message);
+        }
     }
 
     /// Shows a provider HTTP 500 without probing helpers or generating a
@@ -31740,6 +31772,7 @@ impl AppController {
         self.view.error_popup = Some(ErrorPopupView {
             title: "yt-dlp HTTP 403".to_owned(),
             report,
+            summary: None,
             scroll_offset: 0,
             gh_available: false,
             reportable: false,
@@ -31913,25 +31946,32 @@ impl AppController {
     /// This is also used by the process-level panic boundary after the normal
     /// terminal session has restored raw mode and the alternate screen.
     pub fn show_diagnostic_report(&mut self, title: impl Into<String>, report: impl Into<String>) {
-        self.show_report_popup(title.into(), report.into(), true);
+        self.show_report_popup(title.into(), report.into(), true, None);
     }
 
     /// Opens concise setup or service guidance without offering issue submission.
     fn show_actionable_message(&mut self, title: impl Into<String>, report: impl Into<String>) {
-        self.show_report_popup(title.into(), report.into(), false);
+        self.show_report_popup(title.into(), report.into(), false, None);
     }
 
     /// Opens or defers one report-like modal with an explicit action policy.
-    fn show_report_popup(&mut self, title: String, report: String, reportable: bool) {
+    fn show_report_popup(
+        &mut self,
+        title: String,
+        report: String,
+        reportable: bool,
+        summary: Option<String>,
+    ) {
         if self.diagnostic_popup_reserved_for_github_submission() {
             self.defer_diagnostic_report(DeferredDiagnosticReport::Standard {
                 title,
                 report,
                 reportable,
+                summary,
             });
             return;
         }
-        self.show_diagnostic_report_now(title, report, reportable);
+        self.show_diagnostic_report_now(title, report, reportable, summary);
     }
 
     /// Returns whether replacing the active diagnostic could hide a pending or
@@ -31950,12 +31990,19 @@ impl AppController {
     }
 
     /// Displays one ordinary diagnostic without applying modal deferral again.
-    fn show_diagnostic_report_now(&mut self, title: String, report: String, reportable: bool) {
+    fn show_diagnostic_report_now(
+        &mut self,
+        title: String,
+        report: String,
+        reportable: bool,
+        summary: Option<String>,
+    ) {
         self.github_issue_submission_confirmation_previous = None;
         self.diagnostic_report_generation = self.diagnostic_report_generation.wrapping_add(1);
         self.view.error_popup = Some(ErrorPopupView {
             title,
             report,
+            summary,
             scroll_offset: 0,
             gh_available: reportable && self.report_actions.gh_available(),
             reportable,
@@ -31976,8 +32023,9 @@ impl AppController {
                 title,
                 report,
                 reportable,
+                summary,
             } => {
-                self.show_diagnostic_report_now(title, report, reportable);
+                self.show_diagnostic_report_now(title, report, reportable, summary);
             }
             #[cfg(feature = "yt-dlp")]
             DeferredDiagnosticReport::YtDlpForbidden { report } => {
@@ -47394,6 +47442,21 @@ fn playback_end_message(end: &PlaybackEnd) -> String {
         .unwrap_or_else(|| "mpv reported a playback error without additional details".to_owned())
 }
 
+/// Detects a concrete media timeout even when the decoder reports only a generic format error.
+fn playback_end_reports_timeout(end: &PlaybackEnd) -> bool {
+    [
+        end.error.as_deref(),
+        end.file_error.as_deref(),
+        end.diagnostic.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|message| {
+        let message = message.to_ascii_lowercase();
+        message.contains("timed out") || message.contains("timeouterror")
+    })
+}
+
 fn playback_end_reports_http_403(end: &PlaybackEnd) -> bool {
     [
         end.error.as_deref(),
@@ -47639,6 +47702,8 @@ mod tests {
     #[cfg(feature = "tui")]
     #[path = "performance.rs"]
     mod performance_tests;
+    #[path = "playback_failure.rs"]
+    mod playback_failure_tests;
     #[cfg(any(feature = "librivox", feature = "yandex-music"))]
     #[path = "private_catalogue_startup.rs"]
     mod private_catalogue_startup_tests;

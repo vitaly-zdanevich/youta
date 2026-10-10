@@ -1279,6 +1279,21 @@ fn the_window_error_component_keeps_the_confirmed_submission_flow() {
     }
 }
 
+/// A concise visible summary never replaces the shared full-report copy action.
+#[test]
+fn the_window_error_component_prefers_summary_without_losing_report_copy() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("ui")
+        .join("src")
+        .join("components")
+        .join("popups.tsx");
+    let source = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+    assert!(source.contains("popup.summary ?? popup.report"));
+    assert!(source.contains("reportable || popup.summary !== null"));
+    assert!(source.contains("dispatch(\"CopyErrorReport\")"));
+}
+
 #[test]
 fn the_window_error_component_hides_issue_actions_for_setup_guidance() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

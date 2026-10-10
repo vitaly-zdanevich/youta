@@ -2232,14 +2232,17 @@ impl std::fmt::Debug for BugReportPopupView {
 ///
 /// For reportable failures, `report` contains the complete, copyable diagnostic
 /// report rather than a shortened user-facing message. Setup and service guidance
-/// instead store concise messages there. The controller owns `scroll_offset`
-/// so the position survives terminal redraws and resize events.
+/// instead store concise messages there. A routine playback timeout uses `summary`
+/// for display and retains the technical report for copying. The controller owns
+/// `scroll_offset` so the position survives terminal redraws and resize events.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct ErrorPopupView {
     /// Short error title displayed in the popup border.
     pub title: String,
     /// Complete diagnostic report or concise setup/service guidance.
     pub report: String,
+    /// Optional concise presentation; copying still uses the complete `report`.
+    pub summary: Option<String>,
     /// Zero-based wrapped-line offset at the top of the viewport.
     pub scroll_offset: usize,
     /// Whether direct GitHub CLI submission is available for this popup.

@@ -1385,7 +1385,7 @@ export function ErrorPopup({
         forbidden === null ? (
           <>
             <PopupButton onClick={() => void dispatch("CopyErrorReport")}>
-              {reportable ? "Copy report" : "Copy"}
+							{reportable || popup.summary !== null ? 'Copy report' : 'Copy'}
             </PopupButton>
             {requestable && popup.gh_available ? (
               <PopupButton
@@ -1439,7 +1439,7 @@ export function ErrorPopup({
             <GitHubIssueSubmissionNotice state={submission} externalOpener={externalOpener} />
           ) : null}
           <div className="min-h-0 flex-1 overflow-y-auto px-[18px] py-[10px] font-mono text-[11px] leading-[17px] whitespace-pre-wrap text-ink-dim">
-            {popup.report}
+						{popup.summary ?? popup.report}
           </div>
         </div>
       ) : (

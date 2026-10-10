@@ -8908,7 +8908,15 @@ fn render_error_popup_controls(
             buttons.push(("[c] Copy report".to_owned(), UiAction::CopyErrorReport));
             buttons
         } else if !error.reportable {
-            vec![("[c] Copy".to_owned(), UiAction::CopyErrorReport)]
+            vec![(
+                if error.summary.is_some() {
+                    "[c] Copy report"
+                } else {
+                    "[c] Copy"
+                }
+                .to_owned(),
+                UiAction::CopyErrorReport,
+            )]
         } else {
             match &error.github_issue_submission {
                 GitHubIssueSubmissionView::Idle => {
@@ -9413,6 +9421,7 @@ fn render_video_summary_popup(
     }
 }
 
+/// Renders concise operational messages without exposing their copy-only diagnostics.
 fn render_error_popup(
     frame: &mut Frame<'_>,
     error: &ErrorPopupView,
@@ -9420,7 +9429,23 @@ fn render_error_popup(
     theme: &Theme,
     hit_map: &mut HitMap,
 ) {
-    let area = centered_rect(92, 88, frame.area());
+    let specialized_body = error.yt_dlp_forbidden.as_ref().map(yt_dlp_forbidden_body);
+    let visible_body = specialized_body
+        .as_deref()
+        .or(error.summary.as_deref())
+        .unwrap_or(&error.report);
+    let mut area = centered_rect(92, 88, frame.area());
+    if specialized_body.is_none() && error.summary.is_some() {
+        // Match the body width below, including its scrollbar column. Keep
+        // room for the borders, action status, and copy/close controls.
+        let rows = wrap_diagnostic_report(
+            visible_body,
+            usize::from(area.width.saturating_sub(3).max(1)),
+        )
+        .len();
+        let height = u16::try_from(rows).unwrap_or(u16::MAX).saturating_add(4);
+        area = centered_sized_rect(area.width, height, frame.area());
+    }
     frame.render_widget(Clear, area);
     let title = if error.title.trim().is_empty() {
         " Youta error ".to_owned()
@@ -9486,8 +9511,6 @@ fn render_error_popup(
     } else {
         (report_area, Rect::default())
     };
-    let specialized_body = error.yt_dlp_forbidden.as_ref().map(yt_dlp_forbidden_body);
-    let visible_body = specialized_body.as_deref().unwrap_or(&error.report);
     let report_lines =
         wrap_diagnostic_report(visible_body, usize::from(report_text_area.width.max(1)));
     let visible_lines = usize::from(report_text_area.height);
@@ -9527,7 +9550,7 @@ fn render_error_popup(
     };
     let last_line = offset.saturating_add(visible_lines).min(report_lines.len());
     let report_position = format!("Lines {first_line}–{last_line} of {}", report_lines.len());
-    let position = if error.yt_dlp_forbidden.is_some() {
+    let position = if error.yt_dlp_forbidden.is_some() || error.summary.is_some() {
         error.action_status.clone().unwrap_or_default()
     } else if let Some(status) = &error.action_status {
         format!("{status} | {report_position}")
@@ -38530,6 +38553,7 @@ prose 07:25 remains clickable but is not a chapter";
             error_popup: Some(ErrorPopupView {
                 title: "Playback failed".to_owned(),
                 report: report_lines.join("\n"),
+                summary: None,
                 scroll_offset: 10,
                 gh_available: true,
                 reportable: true,
@@ -38574,6 +38598,97 @@ prose 07:25 remains clickable but is not a chapter";
         assert!(rendered.contains("[g] Submit GitHub issue"));
         assert!(rendered.contains("[Esc] Close"));
         assert_eq!(hit_map.error_buttons.len(), 4);
+    }
+
+    /// Routine timeout summaries stay compact while the complete payload remains copy-only.
+    #[test]
+    fn playback_timeout_popup_shows_compact_summary_and_copy_report_controls() {
+        const SUMMARY: &str = "Playback timed out. Please try again.";
+        const REPORT: &str =
+            "COPY_ONLY_DIAGNOSTIC_REPORT\nOperating system: fixture\nForced backtrace: fixture";
+        for scroll_offset in [0, usize::MAX] {
+            let view = ViewModel {
+                external_opener_available: true,
+                error_popup: Some(ErrorPopupView {
+                    title: "Playback failed".to_owned(),
+                    report: REPORT.to_owned(),
+                    summary: Some(SUMMARY.to_owned()),
+                    scroll_offset,
+                    action_status: Some("Copied with fixture".to_owned()),
+                    ..ErrorPopupView::default()
+                }),
+                ..ViewModel::default()
+            };
+            let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+            let mut hits = HitMap::default();
+            terminal
+                .draw(|frame| {
+                    render_error_popup(
+                        frame,
+                        view.error_popup.as_ref().unwrap(),
+                        true,
+                        &Theme::new(false),
+                        &mut hits,
+                    );
+                })
+                .unwrap();
+            let text = rendered_text(&terminal);
+            assert!(text.contains(SUMMARY));
+            assert!(text.contains("Copied with fixture"));
+            assert!(text.contains("[c] Copy report"));
+            assert!(text.contains("[Esc] Close"));
+            for hidden in [
+                "COPY_ONLY_DIAGNOSTIC_REPORT",
+                "Operating system:",
+                "Forced backtrace:",
+                "Lines ",
+                "GitHub issue",
+            ] {
+                assert!(!text.contains(hidden), "summary exposed {hidden}");
+            }
+            let buffer = terminal.backend().buffer();
+            let occupied_rows = (0..24)
+                .filter(|&y| (0..100).any(|x| buffer[(x, y)].symbol() != " "))
+                .count();
+            assert!(
+                occupied_rows <= 6,
+                "one-line summaries need a compact popup, got {occupied_rows} rows"
+            );
+            assert_eq!(
+                hits.error_buttons
+                    .iter()
+                    .map(|(action, _)| action)
+                    .collect::<Vec<_>>(),
+                [&UiAction::CopyErrorReport, &UiAction::DismissErrorPopup]
+            );
+            for (action, area) in &hits.error_buttons {
+                assert_eq!(
+                    mouse_action(
+                        MouseEvent {
+                            kind: MouseEventKind::Down(MouseButton::Left),
+                            column: area.x,
+                            row: area.y,
+                            modifiers: KeyModifiers::NONE,
+                        },
+                        &hits,
+                        &view
+                    ),
+                    Some(action.clone())
+                );
+            }
+            for (key, expected) in [
+                (KeyCode::Char('c'), Some(UiAction::CopyErrorReport)),
+                (KeyCode::Esc, Some(UiAction::DismissErrorPopup)),
+                (KeyCode::Char('g'), None),
+                (KeyCode::Char('i'), None),
+            ] {
+                assert_eq!(
+                    key_action(KeyEvent::new(key, KeyModifiers::NONE), &view),
+                    expected
+                );
+            }
+            assert_eq!(view.error_popup.as_ref().unwrap().report, REPORT);
+        }
     }
 
     #[test]
