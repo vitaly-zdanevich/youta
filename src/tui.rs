@@ -3698,12 +3698,12 @@ fn render_row_list(
             } else if youtube_video_title && row.live {
                 live_marker_style(row_style)
             } else if youtube_video_title && row.was_live {
-                if playback_started {
+                if playback_started && !playing {
                     theme.past_live_video_started
                 } else {
                     theme.past_live_video
                 }
-            } else if youtube_video_title && playback_started {
+            } else if youtube_video_title && playback_started && !playing {
                 if row.vertical {
                     theme.vertical_video_started
                 } else {
@@ -3720,7 +3720,11 @@ fn render_row_list(
                 row_style
             };
             if youtube_video_title && !selected {
-                if playback_started {
+                if playing {
+                    title_style = title_style
+                        .add_modifier(Modifier::BOLD)
+                        .remove_modifier(Modifier::DIM | Modifier::ITALIC);
+                } else if playback_started {
                     title_style = title_style
                         .remove_modifier(Modifier::BOLD)
                         .remove_modifier(Modifier::ITALIC);
@@ -3734,6 +3738,13 @@ fn render_row_list(
             {
                 title_style = title_style.add_modifier(Modifier::ITALIC);
             }
+            // Playing videos keep their category color on both lines and icons;
+            // selected rows retain the selection background and foreground.
+            let row_style = if youtube_video_title && playing && !selected {
+                title_style
+            } else {
+                row_style
+            };
             let show_watched_marker = has_playback_progress && !youtube_video_title;
             // YT search rows use only visible markers; mixed-source layouts keep their slots.
             let tight_youtube_prefix = !row.compact
@@ -3854,8 +3865,10 @@ fn render_row_list(
             if row.downloaded {
                 title_spans.push(Span::styled("↓ ", marked_style));
             }
-            // Align YT metadata with its title, including the two-cell ASCII pause marker.
-            let subtitle_indent = if tight_youtube_prefix {
+            // Video metadata uses the full line; first-line icons never indent it.
+            let subtitle_indent = if youtube_video_title {
+                0
+            } else if tight_youtube_prefix {
                 title_spans.iter().map(Span::width).sum::<usize>()
             } else if !row.compact && (show_source || playing) {
                 4
@@ -19306,8 +19319,8 @@ for encoded, expected in json.load(sys.stdin):
         let playing_title = &buffer[(2, 1)];
         assert_eq!(playing_title.symbol(), "P");
         assert_eq!(playing_title.fg, Color::LightGreen);
-        assert!(!playing_title.modifier.contains(Modifier::BOLD));
-        assert!(playing_title.modifier.contains(Modifier::DIM));
+        assert!(playing_title.modifier.contains(Modifier::BOLD));
+        assert!(!playing_title.modifier.contains(Modifier::DIM));
         assert!(!playing_title.modifier.contains(Modifier::ITALIC));
         let idle_title = &buffer[(0, 3)];
         assert_eq!(idle_title.symbol(), "V");
@@ -19323,6 +19336,100 @@ for encoded, expected in json.load(sys.stdin):
         assert!(!selected_title.modifier.contains(Modifier::DIM));
         assert!(!selected_title.modifier.contains(Modifier::ITALIC));
         assert_eq!(buffer[(0, 1)].symbol(), "▶");
+    }
+
+    /// Both lines of an unselected playing video share its category color or ordinary accent.
+    #[test]
+    fn playing_youtube_rows_color_both_lines_without_overriding_selection() {
+        let id = MediaId::new(SourceKind::YouTube, "playing-fixture");
+        for (funny, console) in [(false, false), (false, true), (true, false), (true, true)] {
+            let theme = Theme::for_terminal(funny, console);
+            for (vertical, live, was_live) in [
+                (false, false, false),
+                (true, false, false),
+                (false, true, false),
+                (false, false, true),
+            ] {
+                for paused in [false, true] {
+                    for selected in [0, 1] {
+                        let rows = [
+                            RowView {
+                                media_id: Some(id.clone()),
+                                title: "Current video".into(),
+                                subtitle: if live {
+                                    "Creator · LIVE"
+                                } else {
+                                    "Creator · 12:34"
+                                }
+                                .into(),
+                                source: "YouTube".into(),
+                                playback_started: true,
+                                watched_percent: 42,
+                                vertical,
+                                live,
+                                was_live,
+                                ..RowView::default()
+                            },
+                            RowView::default(),
+                        ];
+                        let mut terminal = Terminal::new(TestBackend::new(80, 4)).unwrap();
+                        terminal
+                            .draw(|frame| {
+                                render_row_list(
+                                    frame,
+                                    frame.area(),
+                                    "",
+                                    &rows,
+                                    RowSourceLabels::YouTubeSearch,
+                                    selected,
+                                    Some(&id),
+                                    paused,
+                                    None,
+                                    !console,
+                                    theme.heading,
+                                    &theme,
+                                );
+                                if console {
+                                    normalize_linux_console_buffer_for_color_output(
+                                        frame.buffer_mut(),
+                                        true,
+                                    );
+                                }
+                            })
+                            .unwrap();
+                        let buffer = terminal.backend().buffer();
+                        let mut expected = if selected == 0 {
+                            Color::Black
+                        } else if live {
+                            Color::Red
+                        } else if was_live {
+                            theme.past_live_video.fg.unwrap()
+                        } else if vertical {
+                            theme.vertical_video.fg.unwrap()
+                        } else {
+                            theme.accent.fg.unwrap()
+                        };
+                        if console {
+                            expected = linux_console_foreground(expected, true).0;
+                        }
+                        for (y, text) in [(0, "Current video"), (1, "Creator")] {
+                            let line = (0..80).map(|x| buffer[(x, y)].symbol()).collect::<String>();
+                            let start = line.find(text).unwrap();
+                            let x = terminal_text_width(&line[..start]);
+                            for column in x..x + terminal_text_width(text) {
+                                let cell = &buffer[(column, y)];
+                                assert_eq!(
+                                    cell.fg, expected,
+                                    "line={y}, paused={paused}, selected={selected}, vertical={vertical}, live={live}, was_live={was_live}"
+                                );
+                                assert!(!cell.modifier.contains(Modifier::DIM));
+                                assert!(!cell.modifier.contains(Modifier::ITALIC));
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -19967,7 +20074,7 @@ for encoded, expected in json.load(sys.stdin):
         assert!(!line(0).contains('%'));
         assert_eq!(
             line(1),
-            "    YouTube · Channel · 12:34 42%",
+            "YouTube · Channel · 12:34 42%",
             "YouTube progress follows its duration-last metadata"
         );
         assert_eq!(
@@ -19977,7 +20084,7 @@ for encoded, expected in json.load(sys.stdin):
         );
         assert_eq!(
             line(5),
-            "    YouTube · Channel · date unavailable 63%",
+            "YouTube · Channel · date unavailable 63%",
             "metadata without a duration receives progress at the end"
         );
         assert!(!line(7).contains('%'));
@@ -23883,11 +23990,8 @@ for encoded, expected in json.load(sys.stdin):
                 );
                 assert_eq!(
                     line(1).trim_end(),
-                    format!(
-                        "{}Artist",
-                        " ".repeat(usize::from(terminal_text_width(prefix)))
-                    ),
-                    "metadata must align with its title, including the two-cell pause marker"
+                    "Artist",
+                    "metadata must stay at the left edge independently of first-line markers"
                 );
             }
         }
@@ -23974,9 +24078,9 @@ for encoded, expected in json.load(sys.stdin):
                 format!(
                     "{}DoTravel · 81,100 subscribers · 2025 April 30 · 8:43 28%",
                     if screen == Screen::Search {
-                        "     "
+                        ""
                     } else {
-                        "    YouTube · "
+                        "YouTube · "
                     }
                 )
             );
@@ -42257,7 +42361,7 @@ prose 07:25 remains clickable but is not a chapter";
     }
 
     #[test]
-    fn youtube_live_rows_color_only_the_confirmed_duration_marker() {
+    fn youtube_live_rows_color_the_duration_marker_and_unselected_playing_metadata() {
         for source_labels in [
             RowSourceLabels::YouTubeSearch,
             RowSourceLabels::All,
@@ -42267,6 +42371,8 @@ prose 07:25 remains clickable but is not a chapter";
                 (0, false, false, true),
                 (1, false, false, true),
                 (1, true, false, true),
+                (0, true, false, true),
+                (1, true, false, false),
                 (0, false, true, true),
                 (0, false, false, false),
             ] {
@@ -42315,10 +42421,10 @@ prose 07:25 remains clickable but is not a chapter";
                 let metadata = line.find("LIVE channel · LIVE").expect("complete subtitle");
                 let channel_x = terminal_text_width(&line[..metadata]);
                 let marker_x = channel_x + terminal_text_width("LIVE channel · ");
-                assert_ne!(
-                    buffer[(channel_x, y)].fg,
-                    Color::Red,
-                    "channel name is not a live marker"
+                assert_eq!(
+                    buffer[(channel_x, y)].fg == Color::Red,
+                    playing && selected != 0 && live,
+                    "only unselected playing live rows color the whole metadata line"
                 );
                 for x in marker_x..marker_x + 4 {
                     assert_eq!(buffer[(x, y)].fg == Color::Red, live, "{line}");
