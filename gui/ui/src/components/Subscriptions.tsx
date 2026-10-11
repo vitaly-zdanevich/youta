@@ -5,7 +5,7 @@ import type { MediaId, RowView, SubscriptionPane, SubscriptionsView } from "../c
 import { dispatch } from "../ipc";
 import { SUBSCRIPTION_ROW_HEIGHT } from "../subscriptionPageRows";
 import { Artwork } from "./Artwork";
-import { RowSubtitle } from './RowSubtitle';
+import { RowSubtitle, rowSubtitleColorClass } from './RowSubtitle';
 
 /** Abbreviates a count the way the terminal heading does. */
 function formatCount(value: number): string {
@@ -271,7 +271,7 @@ function Pane({
 										{row.downloaded ? <span aria-label='Downloaded' title='Downloaded' className='ml-2 text-accent'>↓</span> : null}
                     </span>
                     {row.subtitle ? (
-                      <span className="block truncate text-[11px] text-ink-faint">
+						<span className={`block truncate text-[11px] ${rowSubtitleColorClass(row)}`}>
 						<RowSubtitle row={row} />
                       </span>
                     ) : null}

@@ -3752,6 +3752,9 @@ fn render_row_list(
             };
             let secondary_style = if selected || playing {
                 row_style
+            } else if youtube_video_title && !playback_started {
+                // One neutral ANSI step above watched metadata also works on Linux consoles.
+                theme.muted.fg(Color::Gray)
             } else {
                 theme.muted
             };
@@ -19417,6 +19420,149 @@ for encoded, expected in json.load(sys.stdin):
         assert_eq!(buffer[(4, 13)].symbol(), "◐");
         assert_eq!(buffer[(6, 13)].symbol(), "R");
         assert!(buffer[(6, 13)].modifier.contains(Modifier::ITALIC));
+    }
+
+    /// Unplayed video metadata is brighter without changing watched or active-row styles.
+    #[test]
+    fn youtube_unwatched_metadata_is_brighter_only_for_video_rows() {
+        let subtitle = "Creator · 12,345 subscribers · 2026 October 12 · 12:34";
+        for (funny, console) in [(false, false), (false, true), (true, false), (true, true)] {
+            let theme = Theme::for_terminal(funny, console);
+            for source_labels in [
+                RowSourceLabels::YouTubeSearch,
+                RowSourceLabels::All,
+                RowSourceLabels::Hidden,
+            ] {
+                for (source, identity, started, percent, color) in [
+                    ("YouTube", Some(SourceKind::YouTube), false, 0, Color::Gray),
+                    (
+                        "YouTube",
+                        Some(SourceKind::YouTube),
+                        true,
+                        0,
+                        Color::DarkGray,
+                    ),
+                    (
+                        "YouTube",
+                        Some(SourceKind::YouTube),
+                        false,
+                        42,
+                        Color::DarkGray,
+                    ),
+                    (
+                        "YouTube",
+                        Some(SourceKind::YouTube),
+                        true,
+                        100,
+                        Color::DarkGray,
+                    ),
+                    (
+                        "YouTube Music",
+                        Some(SourceKind::YouTube),
+                        false,
+                        0,
+                        Color::DarkGray,
+                    ),
+                    (
+                        "youtube",
+                        Some(SourceKind::YouTube),
+                        false,
+                        0,
+                        Color::DarkGray,
+                    ),
+                    (
+                        "YouTube channel",
+                        Some(SourceKind::YouTube),
+                        false,
+                        0,
+                        Color::DarkGray,
+                    ),
+                    ("Local", Some(SourceKind::Local), false, 0, Color::DarkGray),
+                    ("YouTube", None, false, 0, Color::DarkGray),
+                ] {
+                    let id = identity.map(|source| MediaId::new(source, "metadata-fixture"));
+                    for (selected, playing) in [(1, false), (0, false), (1, true)] {
+                        let rows = [
+                            RowView {
+                                media_id: id.clone(),
+                                title: "Fixture video".to_owned(),
+                                subtitle: subtitle.to_owned(),
+                                source: source.to_owned(),
+                                playback_started: started,
+                                watched_percent: percent,
+                                ..RowView::default()
+                            },
+                            RowView::default(),
+                        ];
+                        let playing_id = if playing { id.as_ref() } else { None };
+                        let mut expected = if selected == 0 {
+                            Color::Black
+                        } else if playing_id.is_some() {
+                            theme.accent.fg.unwrap()
+                        } else {
+                            color
+                        };
+                        if console {
+                            expected = linux_console_foreground(
+                                expected,
+                                selected == 0 || playing_id.is_some(),
+                            )
+                            .0;
+                        }
+                        let mut terminal = Terminal::new(TestBackend::new(100, 4)).unwrap();
+                        terminal
+                            .draw(|frame| {
+                                render_row_list(
+                                    frame,
+                                    frame.area(),
+                                    "",
+                                    &rows,
+                                    source_labels,
+                                    selected,
+                                    playing_id,
+                                    false,
+                                    None,
+                                    !console,
+                                    theme.heading,
+                                    &theme,
+                                );
+                                if console {
+                                    normalize_linux_console_buffer_for_color_output(
+                                        frame.buffer_mut(),
+                                        true,
+                                    );
+                                }
+                            })
+                            .unwrap();
+                        let buffer = terminal.backend().buffer();
+                        let line = (0..100)
+                            .map(|x| buffer[(x, 1)].symbol())
+                            .collect::<String>();
+                        let start = line.find(subtitle).expect("complete metadata line");
+                        let x = terminal_text_width(&line[..start]);
+                        for column in x..x + terminal_text_width(subtitle) {
+                            assert_eq!(
+                                buffer[(column, 1)].fg,
+                                expected,
+                                "{source}, started={started}, percent={percent}, selected={selected}, playing={playing}, console={console}"
+                            );
+                        }
+                        if selected == 0 {
+                            assert_eq!(
+                                buffer[(x, 1)].bg,
+                                if funny && console {
+                                    Color::Green
+                                } else if funny {
+                                    Color::LightGreen
+                                } else {
+                                    Color::Cyan
+                                }
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Confirmed broadcasts outrank portrait hints without sacrificing selected-row contrast.

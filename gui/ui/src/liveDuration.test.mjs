@@ -61,16 +61,67 @@ function text(element) {
 
 const redNodes = (tree) => nodes(tree).filter((node) => node.props.className?.split(/\s+/).includes('text-red-400'));
 
-/** Main results and subscription items must interpret the same controller-owned live flag. */
-function listTree(pane, subtitle, live) {
+/** Render both list types with the same controller-owned playback and broadcast flags. */
+function listTree(pane, subtitle, live, { row: overrides = {}, selected = 0, playing = false } = {}) {
 	const row = { title: 'LIVE', subtitle, live, source: 'YouTube',
-		media_id: { source: 'you-tube', external_id: 'fixture-live' }, watched_percent: 0 };
-	if (pane === 'main') return component('RowList').RowList({ rows: [row], selected: 0, playing: null });
-	return component('Subscriptions').Subscriptions({ playing: null, details: null, subscriptions: {
-		layout: 'drill-down', route: 'Items', focus: 'Items', sources: [], items: [row], selected_item: 0,
+		media_id: { source: 'you-tube', external_id: 'fixture-live' }, watched_percent: 0,
+		playback_started: false, ...overrides };
+	const rows = [row, { title: 'Other item', subtitle: '', media_id: null }];
+	const playingId = playing ? row.media_id : null;
+	if (pane === 'main') return component('RowList').RowList({ rows, selected, playing: playingId });
+	return component('Subscriptions').Subscriptions({ playing: playingId, details: null, subscriptions: {
+		layout: 'drill-down', route: 'Items', focus: 'Items', sources: [], items: rows, selected_item: selected,
 		source_kind: 'you-tube', source_title: '', source_created: '', source_subscriber_count: null,
 	} });
 }
+
+test('main and subscription metadata is brighter only for unwatched YouTube videos', () => {
+	const subtitle = 'Fixture channel · 81,100 subscribers · 2026 October 12 · 8:43';
+	for (const pane of ['main', 'subscriptions']) {
+		for (const [label, row, brighter] of [
+			['unwatched', {}, true],
+			['unwatched Short', { vertical: true }, true],
+			['unwatched former broadcast', { was_live: true }, true],
+			['accepted zero-percent start', { playback_started: true }, false],
+			['partly watched', { playback_started: true, watched_percent: 42 }, false],
+			['watched', { playback_started: true, watched_percent: 100 }, false],
+			['progress without started flag', { watched_percent: 42 }, false],
+			['YouTube Music', { source: 'YouTube Music' }, false],
+			['YouTube channel', { source: 'YouTube channel' }, false],
+			['restored generic source', { source: 'youtube' }, false],
+			['missing identity', { media_id: null }, false],
+			['different provider', { media_id: { source: 'rss', external_id: 'fixture' } }, false],
+		]) {
+			const tree = listTree(pane, subtitle, false, { row, selected: 1 });
+			const metadata = nodes(tree).find((node) => node.type === 'span' && text(node) === subtitle);
+			assert.ok(metadata, `${pane}: ${label}: complete metadata stays visible`);
+			assert.equal(metadata.props.className.split(/\s+/).includes('text-ink-dim'), brighter, `${pane}: ${label}`);
+			assert.equal(metadata.props.className.split(/\s+/).includes('text-ink-faint'), !brighter, `${pane}: ${label}`);
+		}
+	}
+});
+
+test('metadata brightness preserves selected and playing row indicators', () => {
+	const subtitle = 'Fixture channel · 8:43';
+	for (const pane of ['main', 'subscriptions']) {
+		for (const selected of [0, 1]) {
+			for (const playing of [false, true]) {
+				for (const playback_started of [false, true]) {
+					const tree = listTree(pane, subtitle, false, { selected, playing, row: { playback_started } });
+					const row = nodes(tree).find((node) => node.type === 'button' && node.props['aria-current'] !== undefined);
+					const title = nodes(row).find((node) => node.type === 'span' && text(node) === 'LIVE');
+					const metadata = nodes(row).find((node) => node.type === 'span' && text(node) === subtitle);
+					const context = `${pane}: selected=${selected === 0}, playing=${playing}, started=${playback_started}`;
+					assert.equal(row.props['aria-current'], selected === 0, context);
+					assert.equal(row.props.className.split(/\s+/).includes('bg-raised'), selected === 0, context);
+					assert.equal(title.props.className.split(/\s+/).includes('text-accent'), selected === 0, context);
+					assert.equal(text(row).includes('▶'), playing, context);
+					assert.equal(metadata.props.className.split(/\s+/).includes('text-ink-dim'), !playback_started, context);
+				}
+			}
+		}
+	}
+});
 
 test('main and subscription rows color only the canonical live duration field', () => {
 	for (const pane of ['main', 'subscriptions']) {

@@ -599,6 +599,10 @@ enriches the selected row from its existing video-format response. Youta does
 not infer orientation from YouTube's often letterboxed thumbnail canvas or
 issue one metadata request per search result.
 
+Unwatched YouTube videos have a brighter metadata line (channel, subscribers,
+date, and duration) than already-started videos. Selection and playback
+highlights are preserved.
+
 Active livestream list titles and their `LIVE` labels are red; confirmed past
 livestream list titles are pink. Selection highlighting takes priority, and started
 videos retain their softer styling. Past-stream detection uses the official
