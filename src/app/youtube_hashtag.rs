@@ -83,7 +83,7 @@ impl AppController {
     }
 
     /// Moves search pages and Details, retaining a subscription copy for playback.
-    fn take_youtube_hashtag_location(&mut self) -> HashtagLocation {
+    pub(super) fn take_youtube_hashtag_location(&mut self) -> HashtagLocation {
         let youtube_query = if self.view.screen == Screen::Search {
             self.view.search_query.clone()
         } else {
@@ -141,7 +141,7 @@ impl AppController {
     }
 
     /// Revokes both initial and refresh pages while their cached origin is parked.
-    fn cancel_hashtag_subscription_work(&mut self) {
+    pub(super) fn cancel_hashtag_subscription_work(&mut self) {
         self.subscription_generation = self.subscription_generation.wrapping_add(1);
         self.active_subscription_channel_id = None;
         self.pending_subscription_refresh = None;
@@ -163,6 +163,11 @@ impl AppController {
         let Some(location) = self.youtube_hashtag_history.pop_back() else {
             return false;
         };
+        self.restore_youtube_location(location)
+    }
+
+    /// Restores a parked `YouTube` adapter and exact Details state without another search.
+    pub(super) fn restore_youtube_location(&mut self, location: HashtagLocation) -> bool {
         if location.provider_generation != self.youtube_provider_generation {
             self.youtube_hashtag_history.clear();
             return false;

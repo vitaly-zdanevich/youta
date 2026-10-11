@@ -99,7 +99,7 @@ function elements(element) {
 }
 
 /** Minimal provider fixture keeps unrelated panels and optional capabilities inactive. */
-function subscriptionButtons(screen, subscribed, mediaSource = 'you-tube', channelId = 'UCfixture', kind = 'Video') {
+function channelDetailButtons(screen, subscribed, mediaSource = 'you-tube', channelId = 'UCfixture', kind = 'Video') {
 	const view = {
 		screen, playlist_item: null,
 		details: {
@@ -111,7 +111,13 @@ function subscriptionButtons(screen, subscribed, mediaSource = 'you-tube', chann
 		},
 	};
 	return elements(detailsModule.exports.Details({ view, kind }))
-		.filter((node) => node.type === 'button' && ['Subscribe', 'Unsubscribe'].includes(node.props.children));
+		.filter((node) => node.type === 'button');
+}
+
+/** Isolate subscribe controls while keeping the shared real-render fixture. */
+function subscriptionButtons(...args) {
+	return channelDetailButtons(...args)
+		.filter((node) => ['Subscribe', 'Unsubscribe'].includes(node.props.children));
 }
 
 /** Feed controls keep the selected video boundary in the existing core action. */
@@ -166,6 +172,46 @@ test('unsubscribed YouTube search videos expose Subscribe and dispatch its actio
 	actions.length = 0;
 	buttons[0].props.onClick();
 	assert.deepEqual(actions, ['ToggleSubscription']);
+});
+
+test('To channel immediately follows Subscribe and dispatches in-app channel browsing', () => {
+	actions.length = 0;
+	const buttons = channelDetailButtons('Search', false);
+	const labels = buttons.map((node) => node.props.children);
+	const subscribeIndex = labels.indexOf('Subscribe');
+	assert.ok(subscribeIndex >= 0);
+	assert.equal(labels[subscribeIndex + 1], 'To channel');
+	assert.deepEqual(actions, [], 'rendering must not navigate or subscribe');
+	buttons[subscribeIndex + 1].props.onClick();
+	assert.deepEqual(actions, ['BrowseYouTubeChannel']);
+});
+
+test('already subscribed YouTube videos retain To channel without a Subscribe button', () => {
+	actions.length = 0;
+	const buttons = channelDetailButtons('Search', true);
+	assert.ok(!buttons.some((node) => node.props.children === 'Subscribe'));
+	const browse = buttons.filter((node) => node.props.children === 'To channel');
+	assert.equal(browse.length, 1);
+	browse[0].props.onClick();
+	assert.deepEqual(actions, ['BrowseYouTubeChannel']);
+});
+
+test('To channel requires a YouTube search video with a channel identity', () => {
+	for (const [screen, source, channelId, kind] of [
+		['Search', 'you-tube', '', 'Video'],
+		['Search', 'sound-cloud', 'UCfixture', 'Video'],
+		['Search', 'archive-org', 'UCfixture', 'Video'],
+		['Search', null, 'UCfixture', 'Video'],
+		['Subscriptions', null, 'UCfixture', 'Channel'],
+		['Subscriptions', 'you-tube', 'UCfixture', 'Video'],
+		['YouTubeMusic', 'you-tube', 'UCfixture', 'Video'],
+		['History', 'you-tube', 'UCfixture', 'Video'],
+		['Downloaded', 'you-tube', 'UCfixture', 'Video'],
+	]) {
+		const buttons = channelDetailButtons(screen, false, source, channelId, kind);
+		assert.ok(!buttons.some((node) => node.props.children === 'To channel'),
+			`${screen}, source=${source}, channel=${channelId}`);
+	}
 });
 
 test('video subscription controls reject subscribed channels, other screens and other providers', () => {

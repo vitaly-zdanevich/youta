@@ -58,6 +58,7 @@ mod web_metadata;
 mod web_probe;
 mod worker_notifications;
 mod youtube_broadcasts;
+mod youtube_channel;
 mod youtube_hashtag;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -5279,7 +5280,7 @@ pub struct AppController {
     radio_artwork_cache: HashMap<String, Option<url::Url>>,
     tracker_results: Vec<TrackerItem>,
     subscription_tree: SubscriptionTree,
-    /// Current OPML leaves in stable folder order.
+    /// Current OPML leaves in stable folder order, or one transient browsed channel.
     subscription_entries: Vec<FlattenedSubscription>,
     /// Exact active OPML identity kept private from serialized front-end state.
     subscription_source_owner_id: Option<String>,
@@ -5641,6 +5642,8 @@ pub struct AppController {
     detail_navigation_forward: VecDeque<DetailNavigationSnapshot>,
     /// Cached origins displaced by internal `YouTube` hashtag searches.
     youtube_hashtag_history: VecDeque<youtube_hashtag::HashtagLocation>,
+    /// Temporary one-channel source pages with exact return locations.
+    youtube_channel_navigation: Vec<youtube_channel::ChannelLocation>,
     /// Linked video whose provider response owns the current Details panel.
     active_description_video: Option<ActiveDescriptionVideo>,
     last_position_save: Instant,
@@ -6984,6 +6987,7 @@ impl AppController {
             detail_navigation_back: VecDeque::new(),
             detail_navigation_forward: VecDeque::new(),
             youtube_hashtag_history: VecDeque::new(),
+            youtube_channel_navigation: Vec::new(),
             active_description_video: None,
             last_position_save: Instant::now(),
             last_session_save: Instant::now(),
@@ -22222,6 +22226,7 @@ impl AppController {
             self.view.status_line = "Nothing is playing".to_owned();
             return;
         };
+        self.abandon_youtube_channel_navigation();
         if self.view.screen == Screen::History {
             self.cancel_pending_history_replay();
         }
@@ -23023,6 +23028,9 @@ impl AppController {
     }
 
     fn go_back(&mut self) {
+        if self.go_back_youtube_channel() {
+            return;
+        }
         if self.restore_now_playing_location() {
             return;
         }
@@ -27682,6 +27690,7 @@ impl AppController {
             };
             return;
         }
+        self.abandon_youtube_channel_navigation();
         self.youtube_hashtag_history.clear();
         self.prepare_screen_transition(screen);
         self.view.screen = screen;
@@ -29437,7 +29446,11 @@ impl AppController {
                 return;
             }
         }
-        self.subscription_entries = self.subscription_tree.flattened_subscriptions();
+        self.subscription_entries = self
+            .youtube_channel_navigation
+            .last()
+            .map(|location| vec![location.channel.clone()])
+            .unwrap_or_else(|| self.subscription_tree.flattened_subscriptions());
         self.rebuild_subscription_source_rows();
         self.restore_cached_subscription_source_metadata();
         self.view.subscriptions.selected_source = self
@@ -29487,7 +29500,11 @@ impl AppController {
                     .subscription
                     .youtube_channel_id()
                     .and_then(|channel_id| self.channel_webpage_cache.get(&channel_id).cloned());
-                subscription_source_row(entry, webpage_url)
+                let mut row = subscription_source_row(entry, webpage_url);
+                if let Some(channel_id) = entry.subscription.youtube_channel_id() {
+                    row.subscribed = self.subscription_tree.contains_youtube_channel(&channel_id);
+                }
+                row
             })
             .collect();
     }
@@ -29640,8 +29657,11 @@ impl AppController {
             channel_name: source_title,
             channel_id: channel_id.clone(),
             channel_webpage_url,
-            channel_subscribed: true,
-            channel_auto_download: subscription.auto_download,
+            channel_subscribed: subscription.kind != SubscriptionKind::YouTube
+                || self.subscription_tree.contains_youtube_channel(&channel_id),
+            channel_auto_download: self
+                .subscription_tree
+                .youtube_channel_auto_download(&channel_id),
             channel_subscriber_count: cached_subscribers,
             description,
             #[cfg(feature = "rss")]
@@ -35046,7 +35066,14 @@ impl AppController {
             self.show_error("Could not save the Bandcamp audio preference", &error);
             return;
         }
-        self.view.subscriptions.layout = layout;
+        self.view.subscriptions.layout = if self.youtube_channel_navigation.is_empty() {
+            layout
+        } else {
+            if let Some(origin) = self.youtube_channel_navigation.first_mut() {
+                origin.subscriptions.layout = layout;
+            }
+            SubscriptionsLayout::DrillDown
+        };
         self.view.skip_advertisement_chapters = skip_advertisement_chapters;
         self.view.nyan_cat_seekbar = cfg!(feature = "nyan-cat") && nyan_cat_seekbar;
         #[cfg(feature = "sponsorblock")]
@@ -36555,6 +36582,7 @@ impl UiController for AppController {
             UiAction::ToggleRadioFavorite => self.toggle_selected_radio_favorite(),
             UiAction::ToggleRadioRecording => self.toggle_radio_recording(),
             UiAction::ShowChannel => self.show_selected_channel(),
+            UiAction::BrowseYouTubeChannel => self.browse_youtube_channel(),
             UiAction::OpenLocalParent => self.open_local_parent(),
             UiAction::GoBack => self.go_back(),
             UiAction::GoForward => self.go_forward(),

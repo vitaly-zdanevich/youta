@@ -5579,6 +5579,17 @@ fn render_information_panel(
             UiAction::ToggleSubscription,
         )
     });
+    let browse_channel_button = view.youtube_channel_browse_available().then(|| {
+        push_left_detail_button(
+            &mut lines,
+            &right_buttons,
+            &mut next_left_row,
+            inner.width,
+            button("c", "To channel", show_hotkeys),
+            theme.accent,
+            UiAction::BrowseYouTubeChannel,
+        )
+    });
     match kind {
         InformationPanelKind::Video => {
             let mut spans = Vec::new();
@@ -5835,6 +5846,7 @@ fn render_information_panel(
     detail_buttons.extend(channel_download_button);
     detail_buttons.extend(auto_download_button);
     detail_buttons.extend(subscription_button);
+    detail_buttons.extend(browse_channel_button);
     detail_buttons.extend(local_visibility_button);
     #[cfg(feature = "cmd")]
     detail_buttons.extend(custom_command_buttons);
@@ -8613,9 +8625,9 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
         "  F4 lists     F5 stats     p preferences"
     };
     let channel_actions_help = if view.channel_download_supported {
-        "  y copy link  c channel info  s (un)subscribe  X channel auto-download"
+        "  y copy link  c to channel  s (un)subscribe  X channel auto-download"
     } else {
-        "  y copy link     c channel info     s local subscribe/unsubscribe"
+        "  y copy link     c to channel     s local subscribe/unsubscribe"
     };
     let mut video_actions_help = "  o video page".to_owned();
     #[cfg(feature = "youtube-captions")]
@@ -29189,10 +29201,18 @@ for encoded, expected in json.load(sys.stdin):
             hit_map
                 .detail_buttons
                 .iter()
-                .filter(|(action, _)| *action != UiAction::ToggleSubscription)
+                .filter(|(action, _)| !matches!(
+                    action,
+                    UiAction::ToggleSubscription | UiAction::BrowseYouTubeChannel
+                ))
                 .map(|(_, area)| area.bottom())
                 .max(),
             "Subscribe must follow both action columns without an extra blank row"
+        );
+        assert_eq!(
+            area_for(&UiAction::BrowseYouTubeChannel).y,
+            area_for(&UiAction::ToggleSubscription).bottom(),
+            "To channel must immediately follow Subscribe"
         );
         for (action, area) in &hit_map.detail_buttons {
             assert_eq!(
@@ -32824,6 +32844,87 @@ for encoded, expected in json.load(sys.stdin):
                 .iter()
                 .any(|(action, _)| action == &UiAction::OpenInBrowser)
         );
+    }
+
+    /// Channel browsing stays reachable beside Subscribe and uses the same action by key and mouse.
+    #[test]
+    fn youtube_to_channel_follows_subscribe_and_remains_available_when_subscribed() {
+        for width in [80, 120, 180] {
+            for subscribed in [false, true] {
+                for show_hotkeys in [false, true] {
+                    let mut terminal = Terminal::new(TestBackend::new(width, 40)).unwrap();
+                    let view = ViewModel {
+                        screen: Screen::Search,
+                        details: Some(DetailView {
+                            title: "Video fixture".into(),
+                            source: "YouTube".into(),
+                            media_id: Some(crate::domain::MediaId::new(
+                                crate::domain::SourceKind::YouTube,
+                                "fixture-video",
+                            )),
+                            channel_id: "UCfixture".into(),
+                            channel_subscribed: subscribed,
+                            ..DetailView::default()
+                        }),
+                        ..ViewModel::default()
+                    };
+                    let mut hit_map = HitMap::default();
+                    terminal
+                        .draw(|frame| {
+                            render(
+                                frame,
+                                &view,
+                                &UiSettings {
+                                    show_hotkeys,
+                                    ..UiSettings::default()
+                                },
+                                &mut hit_map,
+                            );
+                        })
+                        .unwrap();
+                    let rendered = terminal
+                        .backend()
+                        .buffer()
+                        .content()
+                        .iter()
+                        .map(ratatui::buffer::Cell::symbol)
+                        .collect::<String>();
+                    assert!(rendered.contains("To channel"));
+                    assert_eq!(rendered.contains("[c] To channel"), show_hotkeys);
+                    let (_, channel_area) = hit_map
+                        .detail_buttons
+                        .iter()
+                        .find(|(action, _)| *action == UiAction::BrowseYouTubeChannel)
+                        .expect("channel button");
+                    if !subscribed {
+                        let (_, subscribe_area) = hit_map
+                            .detail_buttons
+                            .iter()
+                            .find(|(action, _)| *action == UiAction::ToggleSubscription)
+                            .unwrap();
+                        assert!(channel_area.y > subscribe_area.y);
+                        assert_eq!(channel_area.x, subscribe_area.x);
+                    }
+                    assert_eq!(
+                        mouse_action(
+                            MouseEvent {
+                                kind: MouseEventKind::Down(MouseButton::Left),
+                                column: channel_area.x,
+                                row: channel_area.y,
+                                modifiers: KeyModifiers::NONE,
+                            },
+                            &hit_map,
+                            &view
+                        ),
+                        Some(UiAction::BrowseYouTubeChannel)
+                    );
+                    assert_eq!(
+                        key_action(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE), &view),
+                        Some(UiAction::BrowseYouTubeChannel)
+                    );
+                }
+            }
+        }
     }
 
     #[cfg(feature = "commons-upload")]

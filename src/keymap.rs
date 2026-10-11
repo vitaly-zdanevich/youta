@@ -147,6 +147,46 @@ mod wire_tests {
     use super::{Key, KeyPress, PopupGeometry, key_action};
     use crate::playback::PlaybackStatus;
 
+    /// The shared channel key browses `YouTube` search uploaders without stealing text input.
+    #[test]
+    fn youtube_to_channel_key_preserves_other_contexts_and_search_input() {
+        use crate::view::Screen;
+
+        let mut view = ViewModel {
+            details: Some(DetailView {
+                media_id: Some(crate::domain::MediaId::new(
+                    crate::domain::SourceKind::YouTube,
+                    "video",
+                )),
+                channel_id: "UCfixture".into(),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let key = KeyPress::new(Key::Char('c'));
+        assert_eq!(
+            key_action(key, &view, None, None),
+            Some(UiAction::BrowseYouTubeChannel)
+        );
+        view.search_editing = true;
+        assert_eq!(
+            key_action(key, &view, None, None),
+            Some(UiAction::AppendSearch('c'))
+        );
+        view.search_editing = false;
+        view.screen = Screen::Subscriptions;
+        assert_eq!(
+            key_action(key, &view, None, None),
+            Some(UiAction::ShowChannel)
+        );
+        view.screen = Screen::Search;
+        view.details.as_mut().unwrap().channel_id.clear();
+        assert_eq!(
+            key_action(key, &view, None, None),
+            Some(UiAction::ShowChannel)
+        );
+    }
+
     /// Tilde toggles Repeat in normal browsing without taking Rename or modified chords.
     #[test]
     fn local_repeat_shortcut_preserves_rename_and_other_tabs() {
@@ -4356,6 +4396,9 @@ fn unfiltered_key_action(
         Key::Char('}') => Some(UiAction::PlayQueueNeighbour(1)),
         Key::Char('r') => Some(UiAction::ToggleRepeat),
         Key::Char('w') if !key.modified() => Some(UiAction::ToggleWaveform),
+        Key::Char('c') if view.youtube_channel_browse_available() => {
+            Some(UiAction::BrowseYouTubeChannel)
+        }
         Key::Char('c') => Some(UiAction::ShowChannel),
         Key::Char('s') if view.youtube_channel_subscription_available() => {
             Some(UiAction::ToggleSubscription)

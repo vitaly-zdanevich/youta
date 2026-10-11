@@ -229,6 +229,7 @@ export type UnitUiAction =
 	| 'ToggleSkipAdvertisementChapters'
 	| 'ToggleSponsorBlock'
 	| 'ToggleSubscription'
+	| 'BrowseYouTubeChannel'
 	| 'ToggleSubscriptionDescription'
 	| 'ToggleSubscriptionShorts'
 	| 'ToggleThumbnailExpansion'

@@ -3776,6 +3776,19 @@ impl ViewModel {
             })
     }
 
+    /// Whether a `YouTube` search video's channel can be browsed without subscribing.
+    #[must_use]
+    pub fn youtube_channel_browse_available(&self) -> bool {
+        self.screen == Screen::Search
+            && self.details.as_ref().is_some_and(|details| {
+                !details.channel_id.is_empty()
+                    && details
+                        .media_id
+                        .as_ref()
+                        .is_some_and(|id| id.source == SourceKind::YouTube)
+            })
+    }
+
     /// Allows channel subscription changes and Subscribe on `YouTube` search videos.
     ///
     /// Search videos expose their uploader's channel without requiring a panel
@@ -4317,6 +4330,8 @@ pub enum UiAction {
     ToggleRadioRecording,
     /// Show information about the playing channel.
     ShowChannel,
+    /// Opens the selected `YouTube` video's channel as a browsable source without subscribing.
+    BrowseYouTubeChannel,
     /// Open the parent of the currently displayed Local directory.
     OpenLocalParent,
     /// Return to the previous internal Details page or seek position.
@@ -5424,6 +5439,35 @@ mod tests {
         assert!(!view.youtube_channel_subscription_available());
         view.details = None;
         assert!(!view.youtube_channel_subscription_available());
+    }
+
+    /// Browsing a video's channel does not depend on subscription or external-browser support.
+    #[test]
+    fn youtube_channel_browse_requires_a_video_channel_in_search() {
+        let mut view = ViewModel {
+            screen: Screen::Search,
+            details: Some(DetailView {
+                media_id: Some(MediaId::new(SourceKind::YouTube, "fixture-video")),
+                channel_id: "UCfixture".into(),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        assert!(view.youtube_channel_browse_available());
+        view.details.as_mut().unwrap().channel_subscribed = true;
+        assert!(view.youtube_channel_browse_available());
+        view.screen = Screen::Local;
+        assert!(!view.youtube_channel_browse_available());
+        view.screen = Screen::Search;
+        view.details.as_mut().unwrap().media_id = Some(MediaId::new(SourceKind::Local, "file"));
+        assert!(!view.youtube_channel_browse_available());
+        view.details.as_mut().unwrap().media_id = None;
+        assert!(!view.youtube_channel_browse_available());
+        view.details.as_mut().unwrap().media_id = Some(MediaId::new(SourceKind::YouTube, "video"));
+        view.details.as_mut().unwrap().channel_id.clear();
+        assert!(!view.youtube_channel_browse_available());
+        view.details = None;
+        assert!(!view.youtube_channel_browse_available());
     }
 
     #[test]
