@@ -13,6 +13,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "network")]
+use ureq::unversioned::transport::{Buffers, ConnectionDetails, Connector, NextTimeout, Transport};
+#[cfg(feature = "network")]
 use url::Url;
 
 use super::ProviderError;
@@ -324,7 +326,16 @@ fn validate_client_options(
 
 #[cfg(feature = "network")]
 fn update_agent(timeout: Duration) -> ureq::Agent {
-    ureq::Agent::config_builder()
+    update_agent_with_connector(
+        timeout,
+        ureq::unversioned::transport::DefaultConnector::default(),
+    )
+}
+
+/// Keeps update-client configuration identical for real and injected transports.
+#[cfg(feature = "network")]
+fn update_agent_with_connector<C: Connector<()>>(timeout: Duration, connector: C) -> ureq::Agent {
+    let config = ureq::Agent::config_builder()
         .timeout_global(Some(timeout))
         .user_agent(concat!(
             "youta/",
@@ -333,8 +344,94 @@ fn update_agent(timeout: Duration) -> ureq::Agent {
             env!("CARGO_PKG_REPOSITORY"),
             ")"
         ))
-        .build()
-        .into()
+        .build();
+    ureq::Agent::with_parts(
+        config,
+        connector.chain(InterruptedReadConnector),
+        ureq::unversioned::resolver::DefaultResolver::default(),
+    )
+}
+
+/// Adds interrupted-read handling without replacing ureq's TLS or proxy setup.
+#[cfg(feature = "network")]
+#[derive(Debug)]
+struct InterruptedReadConnector;
+
+#[cfg(feature = "network")]
+impl<T: Transport> Connector<T> for InterruptedReadConnector {
+    type Out = InterruptedReadTransport<T>;
+
+    fn connect(
+        &self,
+        _: &ConnectionDetails<'_>,
+        chained: Option<T>,
+    ) -> Result<Option<Self::Out>, ureq::Error> {
+        Ok(chained.map(InterruptedReadTransport))
+    }
+}
+
+/// Retries only interrupted input operations on the same connection and deadline.
+///
+/// ureq 3.3 propagates EINTR while receiving response headers. Retrying the HTTP
+/// request instead could discard partial headers or duplicate a request. Writes
+/// are deliberately not retried here: a failed write may already have sent bytes.
+#[cfg(feature = "network")]
+#[derive(Debug)]
+struct InterruptedReadTransport<T>(T);
+
+#[cfg(feature = "network")]
+impl<T: Transport> InterruptedReadTransport<T> {
+    /// An injectable elapsed clock makes deadline exhaustion deterministic in tests.
+    fn await_input_with_elapsed(
+        &mut self,
+        timeout: NextTimeout,
+        mut elapsed: impl FnMut() -> Duration,
+    ) -> Result<bool, ureq::Error> {
+        loop {
+            let after = if timeout.after.is_not_happening() {
+                timeout.after
+            } else {
+                timeout
+                    .after
+                    .checked_sub(elapsed())
+                    .filter(|remaining| !remaining.is_zero())
+                    .ok_or(ureq::Error::Timeout(timeout.reason))?
+                    .into()
+            };
+            let next = NextTimeout {
+                after,
+                reason: timeout.reason,
+            };
+            match self.0.await_input(next) {
+                Err(ureq::Error::Io(error)) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                result => return result,
+            }
+        }
+    }
+}
+
+#[cfg(feature = "network")]
+impl<T: Transport> Transport for InterruptedReadTransport<T> {
+    fn buffers(&mut self) -> &mut dyn Buffers {
+        self.0.buffers()
+    }
+
+    fn transmit_output(&mut self, amount: usize, timeout: NextTimeout) -> Result<(), ureq::Error> {
+        self.0.transmit_output(amount, timeout)
+    }
+
+    fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, ureq::Error> {
+        let started = std::time::Instant::now();
+        self.await_input_with_elapsed(timeout, || started.elapsed())
+    }
+
+    fn is_open(&mut self) -> bool {
+        self.0.is_open()
+    }
+
+    fn is_tls(&self) -> bool {
+        self.0.is_tls()
+    }
 }
 
 #[cfg(feature = "network")]
@@ -582,11 +679,12 @@ fn map_ureq_error(error: ureq::Error) -> ProviderError {
 mod tests {
     #[cfg(feature = "network")]
     use std::{
+        collections::VecDeque,
         io::{BufRead, BufReader, Read, Write},
         net::{Shutdown, TcpListener, TcpStream},
         sync::{
-            Arc,
-            atomic::{AtomicBool, Ordering},
+            Arc, Mutex,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         thread::{self, JoinHandle},
         time::Duration,
@@ -596,6 +694,11 @@ mod tests {
     use serde_json::json;
     #[cfg(feature = "network")]
     use url::Url;
+
+    #[cfg(feature = "network")]
+    use ureq::unversioned::transport::{
+        Buffers, ConnectionDetails, Connector, LazyBuffers, NextTimeout, Transport,
+    };
 
     #[cfg(feature = "network")]
     use super::{GentooYtDlpPackageClient, GitHubYtDlpReleaseClient};
@@ -721,6 +824,265 @@ mod tests {
             "oversized fixture returned {error:?}"
         );
         large_server.finish();
+    }
+
+    /// Interrupting response headers must not replace JSON validation with a transport error.
+    #[cfg(feature = "network")]
+    #[test]
+    fn github_client_retries_interrupted_reads_without_replaying_request() {
+        for (body, limit, oversized) in [("not json", 4096, false), ("abcdefghijklmnopq", 16, true)]
+        {
+            let header = json_response_without_length(200, "").into_bytes();
+            let transport = ScriptedTransport::new(
+                [
+                    Err(std::io::ErrorKind::Interrupted),
+                    Ok(header[..12].to_vec()),
+                    Err(std::io::ErrorKind::Interrupted),
+                    Ok(header[12..].to_vec()),
+                    Err(std::io::ErrorKind::Interrupted),
+                    Ok(body.as_bytes().to_vec()),
+                ]
+                .into(),
+            );
+            let transmitted = Arc::clone(&transport.transmitted);
+            let connector = ScriptedConnector(Mutex::new(Some(transport)));
+            let client = GitHubYtDlpReleaseClient {
+                api_base_url: Url::parse("http://127.0.0.1/").unwrap(),
+                agent: super::update_agent_with_connector(Duration::from_secs(2), connector),
+                max_json_bytes: limit,
+            };
+
+            let error = client
+                .latest_release()
+                .expect_err("invalid response fixture");
+            if oversized {
+                assert!(
+                    matches!(error, ProviderError::ResponseTooLarge { limit: 16 }),
+                    "{error:?}"
+                );
+            } else {
+                assert!(
+                    matches!(error, ProviderError::InvalidResponse(_)),
+                    "{error:?}"
+                );
+            }
+            assert_eq!(
+                transmitted.load(Ordering::Relaxed),
+                1,
+                "request was replayed"
+            );
+        }
+    }
+
+    /// The same interrupted transport also preserves successful, complete JSON payloads.
+    #[cfg(feature = "network")]
+    #[test]
+    fn github_and_gentoo_clients_keep_response_bytes_across_interruptions() {
+        let github = r#"{"tag_name":"2026.08.19","published_at":"2026-08-19T23:48:43Z"}"#;
+        let gentoo = gentoo_fixture(&json!([
+            {"version": "2026.08.19", "keywords": ["amd64"]}
+        ]));
+        for (body, source) in [
+            (github, super::JsonSource::GitHub),
+            (gentoo.as_str(), super::JsonSource::Gentoo),
+        ] {
+            let response = json_response(200, body).into_bytes();
+            let split = response.len() - body.len() + body.len() / 2;
+            let transport = ScriptedTransport::new(
+                [
+                    Err(std::io::ErrorKind::Interrupted),
+                    Ok(response[..split].to_vec()),
+                    Err(std::io::ErrorKind::Interrupted),
+                    Ok(response[split..].to_vec()),
+                ]
+                .into(),
+            );
+            let transmitted = Arc::clone(&transport.transmitted);
+            let agent = super::update_agent_with_connector(
+                Duration::from_secs(2),
+                ScriptedConnector(Mutex::new(Some(transport))),
+            );
+            let result: serde_json::Value = super::get_bounded_json(
+                &agent,
+                &Url::parse("http://127.0.0.1/fixture").unwrap(),
+                4096,
+                source,
+            )
+            .expect("read complete JSON after interruption");
+            assert_eq!(
+                result,
+                serde_json::from_str::<serde_json::Value>(body).unwrap()
+            );
+            assert_eq!(transmitted.load(Ordering::Relaxed), 1);
+        }
+    }
+
+    /// Retrying interrupted input spends the original budget rather than restarting it.
+    #[cfg(feature = "network")]
+    #[test]
+    fn interrupted_reads_do_not_extend_the_deadline() {
+        let inner = ScriptedTransport::new(
+            [
+                Err(std::io::ErrorKind::Interrupted),
+                Err(std::io::ErrorKind::Interrupted),
+                Ok(b"too late".to_vec()),
+            ]
+            .into(),
+        );
+        let mut transport = super::InterruptedReadTransport(inner);
+        let mut elapsed = [0, 6, 10].into_iter();
+        let error = transport
+            .await_input_with_elapsed(
+                NextTimeout {
+                    after: Duration::from_millis(10).into(),
+                    reason: ureq::Timeout::Global,
+                },
+                || Duration::from_millis(elapsed.next().expect("bounded retry count")),
+            )
+            .expect_err("deadline should expire before third read");
+        assert!(matches!(error, ureq::Error::Timeout(ureq::Timeout::Global)));
+        assert_eq!(
+            transport.0.read_timeouts,
+            [
+                Duration::from_millis(10).into(),
+                Duration::from_millis(4).into()
+            ]
+        );
+        assert_eq!(transport.0.reads.len(), 1);
+    }
+
+    /// ureq's unlimited sentinel must not become an enormous platform socket timeout.
+    #[cfg(feature = "network")]
+    #[test]
+    fn interrupted_reads_preserve_unlimited_timeout_sentinel() {
+        let inner = ScriptedTransport::new(
+            [Err(std::io::ErrorKind::Interrupted), Ok(b"ready".to_vec())].into(),
+        );
+        let mut transport = super::InterruptedReadTransport(inner);
+        let unlimited = ureq::unversioned::transport::time::Duration::NotHappening;
+        assert!(
+            transport
+                .await_input_with_elapsed(
+                    NextTimeout {
+                        after: unlimited,
+                        reason: ureq::Timeout::Global
+                    },
+                    || Duration::from_secs(1),
+                )
+                .expect("unlimited input should finish after interruption")
+        );
+        assert_eq!(transport.0.read_timeouts, [unlimited, unlimited]);
+    }
+
+    /// Genuine failures and ambiguous writes must not be retried or hidden by the wrapper.
+    #[cfg(feature = "network")]
+    #[test]
+    fn interrupted_read_wrapper_preserves_errors_writes_and_tls_state() {
+        let timeout = NextTimeout {
+            after: Duration::from_secs(1).into(),
+            reason: ureq::Timeout::Global,
+        };
+        for kind in [
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::ConnectionReset,
+        ] {
+            let inner = ScriptedTransport::new([Err(kind), Ok(b"unread".to_vec())].into());
+            let mut transport = super::InterruptedReadTransport(inner);
+            assert!(
+                matches!(transport.await_input(timeout), Err(ureq::Error::Io(error)) if error.kind() == kind)
+            );
+            assert_eq!(transport.0.reads.len(), 1);
+            assert_eq!(transport.0.read_timeouts.len(), 1);
+        }
+        let mut inner = ScriptedTransport::new(VecDeque::new());
+        inner.tls = true;
+        inner.write_error = Some(std::io::ErrorKind::Interrupted);
+        let mut transport = super::InterruptedReadTransport(inner);
+        assert!(transport.is_tls());
+        assert!(transport.is_open());
+        assert!(
+            matches!(transport.transmit_output(1, timeout), Err(ureq::Error::Io(error)) if error.kind() == std::io::ErrorKind::Interrupted)
+        );
+        assert_eq!(transport.0.transmitted.load(Ordering::Relaxed), 1);
+    }
+
+    /// A one-connection transport injects interruptions without signals or scheduling races.
+    #[cfg(feature = "network")]
+    #[derive(Debug)]
+    struct ScriptedConnector(Mutex<Option<ScriptedTransport>>);
+
+    #[cfg(feature = "network")]
+    impl Connector<()> for ScriptedConnector {
+        type Out = ScriptedTransport;
+
+        fn connect(
+            &self,
+            _: &ConnectionDetails<'_>,
+            _: Option<()>,
+        ) -> Result<Option<Self::Out>, ureq::Error> {
+            Ok(self.0.lock().unwrap().take())
+        }
+    }
+
+    /// Each step is one successful short read or one zero-progress I/O failure.
+    #[cfg(feature = "network")]
+    #[derive(Debug)]
+    struct ScriptedTransport {
+        buffers: LazyBuffers,
+        reads: VecDeque<Result<Vec<u8>, std::io::ErrorKind>>,
+        transmitted: Arc<AtomicUsize>,
+        read_timeouts: Vec<ureq::unversioned::transport::time::Duration>,
+        write_error: Option<std::io::ErrorKind>,
+        tls: bool,
+    }
+
+    #[cfg(feature = "network")]
+    impl ScriptedTransport {
+        fn new(reads: VecDeque<Result<Vec<u8>, std::io::ErrorKind>>) -> Self {
+            Self {
+                buffers: LazyBuffers::new(4096, 4096),
+                reads,
+                transmitted: Arc::new(AtomicUsize::new(0)),
+                read_timeouts: Vec::new(),
+                write_error: None,
+                tls: false,
+            }
+        }
+    }
+
+    #[cfg(feature = "network")]
+    impl Transport for ScriptedTransport {
+        fn buffers(&mut self) -> &mut dyn Buffers {
+            &mut self.buffers
+        }
+
+        fn transmit_output(&mut self, _: usize, _: NextTimeout) -> Result<(), ureq::Error> {
+            self.transmitted.fetch_add(1, Ordering::Relaxed);
+            if let Some(kind) = self.write_error {
+                return Err(std::io::Error::from(kind).into());
+            }
+            Ok(())
+        }
+
+        fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, ureq::Error> {
+            self.read_timeouts.push(timeout.after);
+            let bytes = self
+                .reads
+                .pop_front()
+                .unwrap_or_else(|| Ok(Vec::new()))
+                .map_err(std::io::Error::from)?;
+            self.buffers.input_append_buf()[..bytes.len()].copy_from_slice(&bytes);
+            self.buffers.input_appended(bytes.len());
+            Ok(!bytes.is_empty())
+        }
+
+        fn is_open(&mut self) -> bool {
+            true
+        }
+
+        fn is_tls(&self) -> bool {
+            self.tls
+        }
     }
 
     /// An incomplete request must not consume the next canned HTTP response.
