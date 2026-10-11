@@ -39,6 +39,34 @@ fn native_ram_cache_ci_checks_the_supported_mpv_version() {
     assert!(cache_job[version_check..regression].contains("0.38"));
 }
 
+/// Public station outages remain visible without replacing offline playback gates.
+#[test]
+fn radio_correctness_gate_is_offline_and_health_is_separate() {
+    let ci = workflow("ci.yml");
+    let playback = job(&ci, "radio-playback");
+    assert!(playback.contains("runs-on: ubuntu-26.04"));
+    assert!(playback.contains("timeout-minutes: 360"));
+    assert!(playback.contains("YOUTA_RUN_RADIO_FIXTURE_TEST: '1'"));
+    assert!(playback.contains("--test radio_playback"));
+    assert!(playback.contains("--features radio,backend-mpv"));
+    assert!(playback.contains("dpkg --compare-versions"));
+    assert!(playback.contains("test_radio_health.py"));
+    assert!(!playback.contains("continue-on-error:"));
+    assert!(!playback.lines().any(|line| line.starts_with("    if:")));
+    assert!(!ci.contains("  live-radio:\n"));
+
+    let health = workflow("radio-health.yml");
+    assert!(health.contains("name: Radio station health"));
+    assert!(health.contains("  push:\n    branches:\n      - '**'\n"));
+    assert!(health.contains("  pull_request:\n"));
+    assert!(health.contains("  workflow_dispatch:\n"));
+    assert!(!health.contains("workflow_call:"));
+    assert!(health.contains("timeout-minutes: 360"));
+    assert!(health.contains("python3 scripts/radio_health.py --allow-network"));
+    assert!(!health.contains("continue-on-error:"));
+    assert!(!health.contains("|| true"));
+}
+
 /// Release publication must wait for the same complete suite used by branches.
 #[test]
 fn release_publication_requires_shared_ci_and_tag_validation() {
@@ -83,6 +111,7 @@ fn shared_ci_retains_branch_triggers_and_declares_boolean_release_mode() {
         "windows-compile",
         "freebsd-compile",
         "e2e",
+        "radio-playback",
         "coverage",
     ] {
         let gate = job(&ci, name);
@@ -166,7 +195,6 @@ fn live_service_gates_respect_release_mode() {
         "live-apple-podcasts",
         "live-librivox",
         "live-wikidata",
-        "live-radio",
     ] {
         let probe = job(&ci, name);
         assert!(

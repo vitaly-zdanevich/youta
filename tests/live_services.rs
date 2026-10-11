@@ -1,4 +1,4 @@
-//! Required live checks for remote metadata services.
+//! Opt-in live checks for remote metadata services.
 //!
 //! Each test is ignored by an ordinary local `cargo test` invocation and is
 //! enabled explicitly by a CI job or an opt-in local command. This keeps
@@ -130,6 +130,9 @@ fn yandex_music_live_test_token() -> String {
 
 #[cfg(all(feature = "backend-mpv", feature = "radio"))]
 const RADIO_TEST_OPT_IN: &str = "YOUTA_RUN_LIVE_RADIO_TEST";
+#[cfg(all(feature = "backend-mpv", feature = "radio"))]
+#[path = "support/radio_probe.rs"]
+mod radio_probe;
 #[cfg(all(feature = "backend-mpv", feature = "bbc-radio"))]
 const BBC_RADIO_TEST_OPT_IN: &str = "YOUTA_RUN_LIVE_BBC_RADIO_TEST";
 
@@ -143,7 +146,8 @@ fn probe_live_audio_codec(station_id: &str, stream: &str) -> String {
     use std::process::Command;
 
     let executable = std::env::var_os("YOUTA_TEST_FFPROBE").unwrap_or_else(|| "ffprobe".into());
-    let output = Command::new(executable)
+    let mut command = Command::new(executable);
+    command
         .args([
             "-v",
             "error",
@@ -160,9 +164,9 @@ fn probe_live_audio_codec(station_id: &str, stream: &str) -> String {
             "-of",
             "default=noprint_wrappers=1:nokey=1",
         ])
-        .arg(stream)
-        .output()
-        .unwrap_or_else(|error| panic!("start ffprobe for {station_id}: {error}"));
+        .arg(stream);
+    let output =
+        radio_probe::run(command).unwrap_or_else(|error| panic!("probe {station_id}: {error}"));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
@@ -803,27 +807,24 @@ fn yandex_music_mixed_search_keeps_spoken_word_results() {
     );
 }
 
-/// Decodes public regional, playlist, and curated-codec streams, then parses station metadata.
+/// Requires explicit permission before a radio test contacts a public service.
 #[cfg(all(feature = "backend-mpv", feature = "radio"))]
-#[test]
-#[ignore = "requires public radio streams, metadata endpoints, mpv, and ffprobe"]
-fn radio_stream_and_passive_metadata_are_usable() {
-    use std::time::{Duration, Instant};
-
-    use youta::playback::mpv::MpvBackend;
-    use youta::playback::{
-        AudioOutputDriver, AudiophilePlaybackOptions, PlaybackBackend, PlaybackInput,
-        PlaybackProfile, ProcessPlaybackConfig,
-    };
-    use youta::providers::radio::{RadioNowPlayingClient, station_by_id};
-
+fn require_radio_live_opt_in() {
     assert_eq!(
         std::env::var(RADIO_TEST_OPT_IN).as_deref(),
         Ok("1"),
         "set {RADIO_TEST_OPT_IN}=1 when invoking this live test"
     );
+}
 
-    let station = station_by_id("somafm-groove-salad").expect("HTTPS M3U live-radio fixture");
+/// Gives each station an independent backend and private IPC directory.
+#[cfg(all(feature = "backend-mpv", feature = "radio"))]
+fn spawn_radio_live_backend() -> (tempfile::TempDir, youta::playback::mpv::MpvBackend) {
+    use youta::playback::mpv::MpvBackend;
+    use youta::playback::{
+        AudioOutputDriver, AudiophilePlaybackOptions, PlaybackProfile, ProcessPlaybackConfig,
+    };
+
     let temporary = tempfile::tempdir().expect("temporary Radio playback directory");
     let config = ProcessPlaybackConfig {
         mpv_executable: std::env::var_os("YOUTA_TEST_MPV").map_or_else(|| "mpv".into(), Into::into),
@@ -835,7 +836,23 @@ fn radio_stream_and_passive_metadata_are_usable() {
         profile: PlaybackProfile::Balanced,
         audiophile: AudiophilePlaybackOptions::default(),
     };
-    let mut backend = MpvBackend::spawn(&config).expect("start Youta's mpv backend");
+    let backend = MpvBackend::spawn(&config).expect("start Youta's mpv backend");
+    (temporary, backend)
+}
+
+/// Resolves `SomaFM`'s playlist, decodes its stream, and receives an ICY title.
+#[cfg(all(feature = "backend-mpv", feature = "radio"))]
+#[test]
+#[ignore = "requires SomaFM's public playlist and radio stream, plus mpv"]
+fn radio_somafm_playlist_audio_and_icy_metadata_are_usable() {
+    use std::time::{Duration, Instant};
+
+    use youta::playback::{PlaybackBackend, PlaybackInput};
+    use youta::providers::radio::station_by_id;
+
+    require_radio_live_opt_in();
+    let station = station_by_id("somafm-groove-salad").expect("HTTPS M3U live-radio fixture");
+    let (_temporary, mut backend) = spawn_radio_live_backend();
     backend
         .play(&PlaybackInput::new(station.stream))
         .expect("open the public HTTPS radio stream through Youta");
@@ -875,97 +892,188 @@ fn radio_stream_and_passive_metadata_are_usable() {
         }
         std::thread::sleep(Duration::from_millis(250));
     }
+    let shutdown = backend.shutdown();
     assert!(
         active && position >= Duration::from_secs(2) && stream_title.is_some(),
         "public M3U Radio audio or ICY metadata did not become active; last position: \
          {position:?}; stream title: {stream_title:?}; backend diagnostic: {}",
         backend_diagnostic.as_deref().unwrap_or("none")
     );
+    shutdown.expect("stop SomaFM playback cleanly");
+}
 
+/// Checks the official Palitra endpoint independently of other stations.
+#[cfg(all(feature = "backend-mpv", feature = "radio"))]
+#[test]
+#[ignore = "requires Radio Palitra's public stream and ffprobe"]
+fn radio_palitra_stream_declares_mp3() {
+    use youta::providers::radio::station_by_id;
+
+    require_radio_live_opt_in();
     let palitra = station_by_id("radio-palitra").expect("Radio Palitra live fixture");
     assert_eq!(
         probe_live_audio_codec("radio-palitra", palitra.stream),
         "mp3",
         "Radio Palitra's official stream no longer serves MP3 audio"
     );
+}
 
-    for (station_id, expected_codec) in [
-        ("kalx-berkeley-flac", "flac"),
-        ("radio-calico-flac", "flac"),
-        ("intense-radio-flac", "flac"),
-        ("openbroadcast-flac", "flac"),
-        ("radio-bergeijk-flac", "flac"),
-        ("pure-classix-radio-flac", "flac"),
-        ("radio-campus-grenoble-flac", "flac"),
-        ("sector-radio-progressive-flac", "flac"),
-        ("rlocale-radio-flac", "flac"),
-        ("1zwolle-flac", "flac"),
-        ("radiosega", "opus"),
-    ] {
-        let station = station_by_id(station_id).expect("public curated-codec radio fixture");
-        assert_eq!(
-            probe_live_audio_codec(station_id, station.stream),
-            expected_codec,
-            "{station_id} no longer serves its declared {expected_codec} audio"
-        );
-        let fixture_title = format!("Youta live codec smoke: {station_id}");
-        let mut input = PlaybackInput::new(station.stream);
-        input.title = Some(fixture_title.clone());
-        backend
-            .play(&input)
-            .unwrap_or_else(|error| panic!("open {station_id} through Youta: {error}"));
-        let deadline = Instant::now() + Duration::from_secs(30);
-        let mut audio_active = false;
-        let mut audio_baseline = None;
-        let mut audio_advance = Duration::ZERO;
-        let mut audio_diagnostic = None;
-        while Instant::now() < deadline {
-            match backend.status() {
-                Ok(status) => {
-                    let is_audio_fixture = status.title.as_deref() == Some(fixture_title.as_str());
-                    audio_active |= is_audio_fixture && !status.idle;
-                    if is_audio_fixture && !status.idle {
-                        if let Some(baseline) = audio_baseline {
-                            if status.position < baseline {
-                                audio_baseline = Some(status.position);
-                                audio_advance = Duration::ZERO;
-                            } else {
-                                audio_advance =
-                                    audio_advance.max(status.position.saturating_sub(baseline));
-                            }
-                        } else {
+/// Confirms one declared codec and actual Youta playback with its own timeout.
+#[cfg(all(feature = "backend-mpv", feature = "radio"))]
+fn check_curated_radio_audio(station_id: &str, expected_codec: &str) {
+    use std::time::{Duration, Instant};
+
+    use youta::playback::{PlaybackBackend, PlaybackInput};
+    use youta::providers::radio::station_by_id;
+
+    require_radio_live_opt_in();
+    let station = station_by_id(station_id).expect("public curated-codec radio fixture");
+    assert_eq!(
+        probe_live_audio_codec(station_id, station.stream),
+        expected_codec,
+        "{station_id} no longer serves its declared {expected_codec} audio"
+    );
+    let (_temporary, mut backend) = spawn_radio_live_backend();
+    let fixture_title = format!("Youta live codec smoke: {station_id}");
+    let mut input = PlaybackInput::new(station.stream);
+    input.title = Some(fixture_title.clone());
+    backend
+        .play(&input)
+        .unwrap_or_else(|error| panic!("open {station_id} through Youta: {error}"));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut audio_active = false;
+    let mut audio_baseline = None;
+    let mut audio_advance = Duration::ZERO;
+    let mut audio_diagnostic = None;
+    while Instant::now() < deadline {
+        match backend.status() {
+            Ok(status) => {
+                let is_audio_fixture = status.title.as_deref() == Some(fixture_title.as_str());
+                audio_active |= is_audio_fixture && !status.idle;
+                if is_audio_fixture && !status.idle {
+                    if let Some(baseline) = audio_baseline {
+                        if status.position < baseline {
                             audio_baseline = Some(status.position);
+                            audio_advance = Duration::ZERO;
+                        } else {
+                            audio_advance =
+                                audio_advance.max(status.position.saturating_sub(baseline));
                         }
+                    } else {
+                        audio_baseline = Some(status.position);
                     }
                 }
-                Err(error) => {
-                    audio_diagnostic = Some(error.to_string());
-                    break;
-                }
             }
-            match backend.poll_event() {
-                Ok(Some(event @ youta::playback::PlaybackEvent::Ended(_)))
-                | Ok(Some(event @ youta::playback::PlaybackEvent::ProcessExited { .. })) => {
-                    audio_diagnostic = Some(format!("{event:?}"));
-                }
-                Ok(_) => {}
-                Err(error) => audio_diagnostic = Some(error.to_string()),
-            }
-            if audio_active && audio_advance >= Duration::from_secs(1) {
+            Err(error) => {
+                audio_diagnostic = Some(error.to_string());
                 break;
             }
-            std::thread::sleep(Duration::from_millis(250));
         }
-        assert!(
-            audio_active && audio_advance >= Duration::from_secs(1),
-            "{station_id} {expected_codec} audio did not advance after its first current-title \
-             timestamp; baseline: {audio_baseline:?}; advance: {audio_advance:?}; backend \
-             diagnostic: {}",
-            audio_diagnostic.as_deref().unwrap_or("none")
-        );
+        match backend.poll_event() {
+            Ok(Some(event @ youta::playback::PlaybackEvent::Ended(_)))
+            | Ok(Some(event @ youta::playback::PlaybackEvent::ProcessExited { .. })) => {
+                audio_diagnostic = Some(format!("{event:?}"));
+            }
+            Ok(_) => {}
+            Err(error) => audio_diagnostic = Some(error.to_string()),
+        }
+        if audio_active && audio_advance >= Duration::from_secs(1) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
     }
-    backend.shutdown().expect("stop Radio playback cleanly");
+    let shutdown = backend.shutdown();
+    assert!(
+        audio_active && audio_advance >= Duration::from_secs(1),
+        "{station_id} {expected_codec} audio did not advance after its first current-title \
+         timestamp; baseline: {audio_baseline:?}; advance: {audio_advance:?}; backend \
+         diagnostic: {}",
+        audio_diagnostic.as_deref().unwrap_or("none")
+    );
+    shutdown.expect("stop Radio playback cleanly");
+}
 
+/// Keeps each public station separately selectable and retryable by exact test name.
+#[cfg(all(feature = "backend-mpv", feature = "radio"))]
+macro_rules! curated_radio_live_test {
+    ($name:ident, $station:literal, $codec:literal) => {
+        #[doc = concat!("Probes ", $station, " for ", $codec, " and decodes it through Youta.")]
+        #[test]
+        #[ignore = "requires this station's public stream, mpv, and ffprobe"]
+        fn $name() {
+            check_curated_radio_audio($station, $codec);
+        }
+    };
+}
+
+#[cfg(all(feature = "backend-mpv", feature = "radio"))]
+curated_radio_live_test!(
+    radio_kalx_berkeley_flac_audio_is_usable,
+    "kalx-berkeley-flac",
+    "flac"
+);
+#[cfg(all(feature = "backend-mpv", feature = "radio"))]
+curated_radio_live_test!(
+    radio_calico_flac_audio_is_usable,
+    "radio-calico-flac",
+    "flac"
+);
+#[cfg(all(feature = "backend-mpv", feature = "radio"))]
+curated_radio_live_test!(
+    radio_intense_flac_audio_is_usable,
+    "intense-radio-flac",
+    "flac"
+);
+#[cfg(all(feature = "backend-mpv", feature = "radio"))]
+curated_radio_live_test!(
+    radio_openbroadcast_flac_audio_is_usable,
+    "openbroadcast-flac",
+    "flac"
+);
+#[cfg(all(feature = "backend-mpv", feature = "radio"))]
+curated_radio_live_test!(
+    radio_bergeijk_flac_audio_is_usable,
+    "radio-bergeijk-flac",
+    "flac"
+);
+#[cfg(all(feature = "backend-mpv", feature = "radio"))]
+curated_radio_live_test!(
+    radio_pure_classix_flac_audio_is_usable,
+    "pure-classix-radio-flac",
+    "flac"
+);
+#[cfg(all(feature = "backend-mpv", feature = "radio"))]
+curated_radio_live_test!(
+    radio_campus_grenoble_flac_audio_is_usable,
+    "radio-campus-grenoble-flac",
+    "flac"
+);
+#[cfg(all(feature = "backend-mpv", feature = "radio"))]
+curated_radio_live_test!(
+    radio_sector_progressive_flac_audio_is_usable,
+    "sector-radio-progressive-flac",
+    "flac"
+);
+#[cfg(all(feature = "backend-mpv", feature = "radio"))]
+curated_radio_live_test!(
+    radio_rlocale_flac_audio_is_usable,
+    "rlocale-radio-flac",
+    "flac"
+);
+#[cfg(all(feature = "backend-mpv", feature = "radio"))]
+curated_radio_live_test!(radio_1zwolle_flac_audio_is_usable, "1zwolle-flac", "flac");
+#[cfg(all(feature = "backend-mpv", feature = "radio"))]
+curated_radio_live_test!(radio_sega_opus_audio_is_usable, "radiosega", "opus");
+
+/// Parses 4duk's optional JSON independently of unrelated stream availability.
+#[cfg(all(feature = "backend-mpv", feature = "radio"))]
+#[test]
+#[ignore = "requires 4duk's public now-playing JSON endpoint"]
+fn radio_four_duk_now_playing_is_usable() {
+    use std::time::Duration;
+    use youta::providers::radio::{RadioNowPlayingClient, station_by_id};
+
+    require_radio_live_opt_in();
     let four_duk = station_by_id("4duk-radio").expect("4duk metadata fixture");
     let endpoint = four_duk
         .now_playing
@@ -978,7 +1086,17 @@ fn radio_stream_and_passive_metadata_are_usable() {
         metadata.title.is_some() || metadata.artist.is_some(),
         "4duk returned no current title or artist"
     );
+}
 
+/// Parses Sector metadata independently of the station's FLAC stream check.
+#[cfg(all(feature = "backend-mpv", feature = "radio"))]
+#[test]
+#[ignore = "requires Sector's public now-playing metadata endpoint"]
+fn radio_sector_now_playing_is_usable() {
+    use std::time::Duration;
+    use youta::providers::radio::{RadioNowPlayingClient, station_by_id};
+
+    require_radio_live_opt_in();
     let sector = station_by_id("sector-radio-progressive-flac").expect("Sector metadata fixture");
     let endpoint = sector
         .now_playing

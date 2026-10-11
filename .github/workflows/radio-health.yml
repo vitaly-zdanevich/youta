@@ -1,0 +1,58 @@
+name: Radio station health
+
+on:
+  push:
+    branches:
+      - '**'
+    tags-ignore:
+      - 'v*'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: radio-health-${{ github.workflow }}-${{ github.sha }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: '1'
+  RUST_VERSION: 1.95.0
+
+jobs:
+  live-radio:
+    # Outages fail this visible diagnostic, not the deterministic CI/release gates.
+    name: Public radio availability and formats
+    runs-on: ubuntu-26.04
+    timeout-minutes: 360
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@v6
+
+      - name: Install the minimum Rust toolchain
+        run: |
+          rustup toolchain install "${RUST_VERSION}" --profile minimal
+          rustup default "${RUST_VERSION}"
+
+      - name: Restore Cargo registry cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Install native audio helpers
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ffmpeg mpv
+          mpv --version
+          dpkg --compare-versions \
+            "$(dpkg-query --show --showformat='${Version}' mpv)" \
+            ge \
+            0.38
+
+      - name: Check every station with independent bounded retries
+        run: python3 scripts/radio_health.py --allow-network

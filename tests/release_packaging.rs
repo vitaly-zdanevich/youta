@@ -1749,66 +1749,20 @@ fn desktop_and_core_versions_remain_in_sync() {
     );
 }
 
+/// Radio health keeps the NPR/BBC probes and retries individual exact tests.
 #[test]
 fn live_radio_workflow_retries_each_provider_independently() {
-    let ci = read_repository_file(".github/workflows/ci.yml");
-    let live_radio = ci
-        .split_once("  live-radio:\n")
-        .expect("CI workflow retains the live Radio job")
-        .1
-        .split_once("\n  coverage:\n")
-        .expect("live Radio job remains before Coverage")
-        .0;
-    let tests = [
-        (
-            "Decode curated public streams and parse passive metadata",
-            "radio_stream_and_passive_metadata_are_usable",
-        ),
-        (
-            "Decode a generated NPR stream and parse its current programme",
-            "generated_npr_station_stream_and_program_are_usable",
-        ),
-        (
-            "Resolve and decode BBC Sounds radio",
-            "bbc_sounds_resolution_and_audio_are_usable",
-        ),
-    ];
-
-    for (step_name, test_name) in tests {
-        let marker = format!("      - name: {step_name}\n");
-        let step = live_radio
-            .split_once(&marker)
-            .unwrap_or_else(|| panic!("live Radio workflow omits `{step_name}`"))
-            .1
-            .split("\n      - name: ")
-            .next()
-            .expect("workflow step has content");
-        assert!(
-            step.contains("for attempt in 1 2; do"),
-            "`{step_name}` has no independent retry loop"
-        );
-        assert!(
-            step.contains("sleep 10"),
-            "`{step_name}` has no bounded pause before its retry"
-        );
-        assert!(
-            step.contains(&format!("--exact {test_name} \\")),
-            "`{step_name}` does not execute `{test_name}`"
-        );
-        assert_eq!(
-            step.matches("--exact ").count(),
-            1,
-            "`{step_name}` contains more than one exact test invocation"
-        );
-        assert_eq!(
-            tests
-                .iter()
-                .filter(|(_, candidate)| step.contains(candidate))
-                .count(),
-            1,
-            "`{step_name}` chains another live Radio test inside its retry boundary"
-        );
-    }
+    let health = read_repository_file(".github/workflows/radio-health.yml");
+    let runner = read_repository_file("scripts/radio_health.py");
+    assert!(health.contains("python3 scripts/radio_health.py --allow-network"));
+    assert!(runner.contains("'radio,bbc-radio,backend-mpv'"));
+    assert!(runner.contains("'generated_npr_station_stream_and_program_are_usable'"));
+    assert!(runner.contains("'bbc_sounds_resolution_and_audio_are_usable'"));
+    assert!(runner.contains("'--ignored', '--exact', name, '--nocapture'"));
+    assert!(runner.contains("RETRY_DELAYS = (2, 5)"));
+    assert!(runner.contains("return exit_status(results)"));
+    assert!(!health.contains("continue-on-error:"));
+    assert!(!health.contains("|| true"));
 }
 
 #[test]
@@ -1837,8 +1791,8 @@ fn live_wikidata_workflow_retries_each_probe_independently() {
         .split_once("  live-wikidata:\n")
         .expect("CI workflow retains the live Wikidata job")
         .1
-        .split_once("\n  live-radio:\n")
-        .expect("live Wikidata job remains before live Radio")
+        .split_once("\n  radio-playback:\n")
+        .expect("live Wikidata job remains before offline Radio playback")
         .0;
     let tests = [
         (

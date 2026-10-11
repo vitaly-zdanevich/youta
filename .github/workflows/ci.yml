@@ -25,8 +25,8 @@ permissions:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.sha }}
-  # Every branch revision must finish the complete suite, including live
-  # service checks, even when another revision is pushed soon afterwards.
+  # Every branch revision must finish its checks even when another revision
+  # is pushed soon afterwards. Public radio health runs separately.
   cancel-in-progress: false
 
 env:
@@ -1173,11 +1173,9 @@ jobs:
             sleep 10
           done
 
-  live-radio:
-    if: ${{ !inputs.release-validation }}
-    name: Live public radio playback
-    # The live test supplies per-file titles through the indexed `loadfile`
-    # JSON-IPC signature introduced by mpv 0.38.
+  radio-playback:
+    name: Offline radio playback regression
+    # Match Youta's indexed loadfile command without relying on public streams.
     runs-on: ubuntu-26.04
     timeout-minutes: 360
     steps:
@@ -1207,74 +1205,15 @@ jobs:
             ge \
             0.38
 
-      - name: Decode curated public streams and parse passive metadata
-        env:
-          YOUTA_RUN_LIVE_RADIO_TEST: '1'
-        run: |
-          for attempt in 1 2; do
-            if cargo test \
-                --locked \
-                --test live_services \
-                --no-default-features \
-                --features radio,backend-mpv \
-                -- \
-                --ignored \
-                --exact radio_stream_and_passive_metadata_are_usable \
-                --nocapture
-            then
-              exit 0
-            fi
-            if [ "${attempt}" -eq 2 ]; then
-              exit 1
-            fi
-            sleep 10
-          done
+      - name: Test independent bounded health-check retries offline
+        run: python3 -m unittest discover -s scripts/tests -p 'test_radio_health.py'
 
-      - name: Decode a generated NPR stream and parse its current programme
+      - name: Decode local FLAC and Opus streams and observe ICY metadata
         env:
-          YOUTA_RUN_LIVE_RADIO_TEST: '1'
-        run: |
-          for attempt in 1 2; do
-            if cargo test \
-                --locked \
-                --test live_services \
-                --no-default-features \
-                --features radio,backend-mpv \
-                -- \
-                --ignored \
-                --exact generated_npr_station_stream_and_program_are_usable \
-                --nocapture
-            then
-              exit 0
-            fi
-            if [ "${attempt}" -eq 2 ]; then
-              exit 1
-            fi
-            sleep 10
-          done
-
-      - name: Resolve and decode BBC Sounds radio
-        env:
-          YOUTA_RUN_LIVE_BBC_RADIO_TEST: '1'
-        run: |
-          for attempt in 1 2; do
-            if cargo test \
-                --locked \
-                --test live_services \
-                --no-default-features \
-                --features bbc-radio,backend-mpv \
-                -- \
-                --ignored \
-                --exact bbc_sounds_resolution_and_audio_are_usable \
-                --nocapture
-            then
-              exit 0
-            fi
-            if [ "${attempt}" -eq 2 ]; then
-              exit 1
-            fi
-            sleep 10
-          done
+          YOUTA_RUN_RADIO_FIXTURE_TEST: '1'
+        run: >-
+          cargo test --locked --no-default-features --features radio,backend-mpv
+          --test radio_playback -- --ignored --nocapture
 
   coverage:
     name: Coverage

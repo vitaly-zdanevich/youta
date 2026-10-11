@@ -3302,17 +3302,28 @@ mutating durable account state:
 YOUTA_RUN_LIVE_YANDEX_MUSIC_TEST=1 cargo test --locked --test live_services --no-default-features --features yandex-music -- --ignored --exact yandex_music_account_recommendations_search_and_media_metadata_are_usable --nocapture
 ```
 
-Run the Radio smokes locally to resolve and decode real HTTP(S) M3U, PLS, MP3,
-and FLAC streams through Youta's `mpv` backend, independently confirm declared
-FLAC codecs with `ffprobe`, observe real ICY metadata, and parse bounded public
-now-playing responses from curated and NPR providers. The
-separate BBC smoke follows Youta's production Sounds-page and Media Selector
-path, then decodes the returned regional manifest:
+The required Radio playback check generates FLAC, Ogg Opus and ICY fixtures
+locally and decodes them through Youta's real `mpv` backend over loopback HTTP.
+It needs `mpv` 0.38 or newer and `ffmpeg`, but no public network:
 
 ```sh
-YOUTA_RUN_LIVE_RADIO_TEST=1 cargo test --locked --test live_services --no-default-features --features radio,backend-mpv -- --ignored --exact radio_stream_and_passive_metadata_are_usable --nocapture
-YOUTA_RUN_LIVE_RADIO_TEST=1 cargo test --locked --test live_services --no-default-features --features radio,backend-mpv -- --ignored --exact generated_npr_station_stream_and_program_are_usable --nocapture
-YOUTA_RUN_LIVE_BBC_RADIO_TEST=1 cargo test --locked --test live_services --no-default-features --features bbc-radio,backend-mpv -- --ignored --exact bbc_sounds_resolution_and_audio_are_usable --nocapture
+YOUTA_RUN_RADIO_FIXTURE_TEST=1 cargo test --locked --test radio_playback --no-default-features --features radio,backend-mpv -- --ignored --nocapture
+```
+
+The separate [Radio station health workflow](.github/workflows/radio-health.yml)
+runs on branch pushes and pull requests. It probes public streams and their
+declared codecs, ICY metadata, curated/NPR now-playing responses, and BBC Sounds
+resolution and playback. Each check gets at most three attempts, with 2- and
+5-second waits and a 90-second limit per attempt. A failing station does not
+skip the remaining checks; exhausted failures keep this workflow red, with a
+per-check summary, without failing the deterministic CI/release gates.
+
+Run all health checks on a POSIX system with `mpv`, `ffmpeg` and `ffprobe`, or
+select one for diagnosis:
+
+```sh
+python3 scripts/radio_health.py --allow-network
+python3 scripts/radio_health.py --allow-network --check radio_sector_progressive_flac_audio_is_usable
 ```
 
 ### Gentoo packages
