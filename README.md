@@ -497,7 +497,7 @@ what it can start directly. The same-source position is tracked even while
 autoplay is off, so a manual skip can use it; the toggle decides only whether
 end-of-file continues on its own.
 
-`[r] Repeat: off/on` follows Autoplay in both **Subs** layouts, including
+`[~] Repeat: off/on` follows Autoplay in both **Subs** layouts, including
 RSS episode lists. It repeats the **currently playing item** from the beginning
 each time it ends, taking precedence over queued items and Autoplay until
 disabled. Repeat is session-only and starts off each time Youta opens. Manual
@@ -516,11 +516,11 @@ retain their existing continuation behavior.
 For example, a YouTube channel's item footer is:
 
 ```text
-[R] Refresh  [h] Shorts: off  [A] Autoplay: off  [r] Repeat: off
+[R] Refresh  [h] Shorts: off  [A] Autoplay: off  [~] Repeat: off
 ```
 
 The archive.org, MOD, and Podcasts footers also offer `[A] Autoplay: off`
-followed by `[r] Repeat: off`. Both controls show their current state and accept
+followed by `[~] Repeat: off`. Both controls show their current state and accept
 mouse clicks or the displayed hotkeys. Podcast continuation follows the loaded
 episode order, stops at the last episode, and survives browsing another show.
 
@@ -1747,7 +1747,7 @@ These are distinct integration modes:
   Public-page search has its own capacity-one latest-only worker and cannot
   hold the general YouTube provider lane.
 - The **YT** list footer offers `[h] Shorts: on/off`, `[A] Autoplay: on/off`,
-  and `[r] Repeat: on/off`. Shorts visibility uses the same saved preference
+  and `[~] Repeat: on/off`. Shorts visibility uses the same saved preference
   as YouTube subscriptions; toggling restores cached results without another
   network request. It hides only provider-confirmed vertical videos, keeps
   channels and explicitly opened video URLs available, and does not affect
@@ -2320,7 +2320,7 @@ subscription-source root. Youta provides two layouts:
   For YouTube, `[h] Shorts: on/off` follows the refresh action and controls
   whether provider-confirmed vertical videos remain in the list. Shorts are
   shown by default and retain their existing distinct title color. The
-  `[A] Autoplay: on/off` control follows Shorts, then `[r] Repeat: off/on`.
+  `[A] Autoplay: on/off` control follows Shorts, then `[~] Repeat: off/on`.
   RSS episode footers also offer Autoplay followed by Repeat.
 - `split` keeps sources on the left and the selected source's videos or
   episodes on the right. Moving across sources uses only cached rows and makes

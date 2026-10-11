@@ -3509,6 +3509,7 @@ fn render_body(
 }
 
 /// Shares playback toggles, YT Shorts visibility, and parent navigation below catalogue lists.
+/// Every catalogue advertises the global tilde shortcut for Repeat.
 fn render_catalog_playback_controls(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -3547,12 +3548,7 @@ fn render_catalog_playback_controls(
                 UiAction::ToggleAutoplay,
             ),
             (
-                // Local reserves lowercase r for Rename, even with the shared footer.
-                if view.screen == Screen::Local {
-                    "~"
-                } else {
-                    "r"
-                },
+                "~",
                 if view.repeating {
                     "Repeat: on"
                 } else {
@@ -4267,7 +4263,7 @@ fn render_subscription_item_buttons(
     );
     let repeat = (
         button(
-            "r",
+            "~",
             if repeating {
                 "Repeat: on"
             } else {
@@ -24287,7 +24283,7 @@ for encoded, expected in json.load(sys.stdin):
         assert!(rendered.contains("Fixture RSS show · RSS/Atom"));
         assert!(rendered.contains("Fixture RSS episode"));
         assert!(rendered.contains("[R] Refresh episodes"));
-        assert!(rendered.contains("[A] Autoplay: off  [r] Repeat: off"));
+        assert!(rendered.contains("[A] Autoplay: off  [~] Repeat: off"));
         assert!(!rendered.contains("Shorts"));
         assert!(
             hit_map
@@ -24557,11 +24553,12 @@ for encoded, expected in json.load(sys.stdin):
                         .expect("draw Repeat toggle");
                     let rendered = rendered_text(&terminal);
                     let state = if repeating { "on" } else { "off" };
-                    let label = button("r", &format!("Repeat: {state}"), show_hotkeys);
+                    let label = button("~", &format!("Repeat: {state}"), show_hotkeys);
                     let autoplay = button("A", "Autoplay: off", show_hotkeys);
                     assert!(rendered.contains(&format!("{autoplay}  {label}")));
+                    assert!(!rendered.contains("[r] Repeat"));
                     if !show_hotkeys {
-                        assert!(!rendered.contains("[r] Repeat"));
+                        assert!(!rendered.contains("[~] Repeat"));
                     }
                     let target = hit_map
                         .detail_buttons
@@ -24592,10 +24589,15 @@ for encoded, expected in json.load(sys.stdin):
                         ),
                         Some(UiAction::ToggleRepeat)
                     );
-                    assert_eq!(
-                        key_action(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE), &view),
-                        Some(UiAction::ToggleRepeat)
-                    );
+                    for key in ['~', 'r'] {
+                        assert_eq!(
+                            key_action(
+                                KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE),
+                                &view
+                            ),
+                            Some(UiAction::ToggleRepeat)
+                        );
+                    }
                 }
             }
         }
@@ -31005,9 +31007,8 @@ for encoded, expected in json.load(sys.stdin):
                             },
                             show_hotkeys,
                         );
-                        let repeat_key = if screen == Screen::Local { '~' } else { 'r' };
                         let repeat_label = button(
-                            &repeat_key.to_string(),
+                            "~",
                             if repeating {
                                 "Repeat: on"
                             } else {
@@ -31029,7 +31030,7 @@ for encoded, expected in json.load(sys.stdin):
                         let mut previous: Option<Rect> = None;
                         for (key, label, expected) in [
                             ('A', autoplay_label, UiAction::ToggleAutoplay),
-                            (repeat_key, repeat_label, UiAction::ToggleRepeat),
+                            ('~', repeat_label, UiAction::ToggleRepeat),
                         ] {
                             let targets = hit_map
                                 .detail_buttons
@@ -31177,7 +31178,7 @@ for encoded, expected in json.load(sys.stdin):
                         UiAction::ToggleSubscriptionShorts,
                     ),
                     ('A', format!("Autoplay: {state}"), UiAction::ToggleAutoplay),
-                    ('r', format!("Repeat: {state}"), UiAction::ToggleRepeat),
+                    ('~', format!("Repeat: {state}"), UiAction::ToggleRepeat),
                 ];
                 let expected = labels
                     .iter()
