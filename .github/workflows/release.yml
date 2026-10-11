@@ -161,6 +161,36 @@ jobs:
           path: dist/youta-${{ env.PACKAGE_VERSION }}-${{ matrix.artifact_os }}-${{ matrix.architecture }}.sha256
           if-no-files-found: error
 
+      - name: Upload the unstripped debug executable
+        uses: actions/upload-artifact@v7
+        with:
+          archive: false
+          path: dist/youta-${{ env.PACKAGE_VERSION }}-${{ matrix.artifact_os }}-${{ matrix.architecture }}-debug
+          if-no-files-found: error
+
+      - name: Upload the debug executable checksum
+        uses: actions/upload-artifact@v7
+        with:
+          archive: false
+          path: dist/youta-${{ env.PACKAGE_VERSION }}-${{ matrix.artifact_os }}-${{ matrix.architecture }}-debug.sha256
+          if-no-files-found: error
+
+      - name: Upload the macOS debug symbols
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v7
+        with:
+          archive: false
+          path: dist/youta-${{ env.PACKAGE_VERSION }}-${{ matrix.artifact_os }}-${{ matrix.architecture }}-debug.dSYM.tar.xz
+          if-no-files-found: error
+
+      - name: Upload the macOS debug symbols checksum
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v7
+        with:
+          archive: false
+          path: dist/youta-${{ env.PACKAGE_VERSION }}-${{ matrix.artifact_os }}-${{ matrix.architecture }}-debug.dSYM.tar.xz.sha256
+          if-no-files-found: error
+
       - name: Upload the text-only executable
         uses: actions/upload-artifact@v7
         with:
@@ -662,6 +692,12 @@ jobs:
               executable="youta-${version}-${platform}${suffix}"
               expected+=("${executable}" "${executable}.sha256")
             done
+            debug_executable="youta-${version}-${platform}-debug"
+            expected+=("${debug_executable}" "${debug_executable}.sha256")
+            if [[ ${platform} == macos-* ]]; then
+              debug_symbols="${debug_executable}.dSYM.tar.xz"
+              expected+=("${debug_symbols}" "${debug_symbols}.sha256")
+            fi
           done
           linux_platforms=(linux-amd64 linux-i686 linux-arm64)
           no_gpm_suffixes=(-no-gpm -text-no-gpm -no-qr-no-gpm -text-no-qr-no-gpm)
@@ -706,7 +742,7 @@ jobs:
 
           # Checksums stay inside the workflow: GitHub calculates and displays
           # a Digest for every asset attached to the Release page.
-          readonly expected_download_count=96
+          readonly expected_download_count=110
           ((${#expected[@]} == expected_download_count)) || {
             echo "Internal release contract generated ${#expected[@]} downloads; expected ${expected_download_count}." >&2
             exit 1
@@ -744,7 +780,7 @@ jobs:
           RELEASE_TAG: ${{ github.ref_name }}
           GH_REPO: ${{ github.repository }}
         run: |
-          readonly expected_release_asset_count=48
+          readonly expected_release_asset_count=55
           mapfile -d '' assets < <(
             find dist -maxdepth 1 -type f ! -name '*.sha256' -print0 |
               sort -z

@@ -1098,6 +1098,124 @@ fn release_script_builds_gpm_and_linux_no_gpm_non_sqlite_executables() {
     assert!(readme.contains("neither `app` nor `app-core` adds it transitively"));
 }
 
+/// Runs the real publication gate against an independently assembled asset fixture.
+/// The publish job runs on Linux and uses GNU find/checksums and modern Bash.
+#[cfg(target_os = "linux")]
+#[test]
+fn release_asset_gate_requires_debug_binaries_symbols_and_matching_checksums() {
+    let release = read_repository_file(".github/workflows/release.yml");
+    let step = release
+        .split_once("      - name: Validate the complete release asset set\n")
+        .expect("asset validation step")
+        .1;
+    let script = step
+        .split_once("        run: |\n")
+        .expect("asset validation script")
+        .1
+        .lines()
+        .take_while(|line| line.starts_with("          ") || line.is_empty())
+        .map(|line| line.strip_prefix("          ").unwrap_or(line))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let fixture = tempfile::tempdir().expect("asset fixture");
+    let dist = fixture.path().join("dist");
+    fs::create_dir(&dist).unwrap();
+    let mut names = Vec::new();
+    for platform in [
+        "linux-amd64",
+        "linux-i686",
+        "linux-arm64",
+        "macos-amd64",
+        "macos-arm64",
+    ] {
+        for suffix in ["", "-text", "-no-qr", "-text-no-qr", "-debug"] {
+            names.push(format!("youta-1.2.3-{platform}{suffix}"));
+        }
+        if platform.starts_with("linux-") {
+            for suffix in [
+                "-no-gpm",
+                "-text-no-gpm",
+                "-no-qr-no-gpm",
+                "-text-no-qr-no-gpm",
+            ] {
+                names.push(format!("youta-1.2.3-{platform}{suffix}"));
+            }
+        } else {
+            names.push(format!("youta-1.2.3-{platform}-debug.dSYM.tar.xz"));
+        }
+    }
+    for platform in [
+        "linux-amd64",
+        "linux-i686",
+        "linux-arm64",
+        "macos-amd64",
+        "macos-arm64",
+        "windows-amd64",
+    ] {
+        let extension = if platform.starts_with("windows-") {
+            ".exe"
+        } else {
+            ""
+        };
+        names.push(format!("youta-gui-1.2.3-{platform}{extension}"));
+    }
+    for (platform, extensions) in [
+        ("linux-amd64", "deb rpm AppImage"),
+        ("linux-arm64", "deb rpm AppImage"),
+        ("macos-amd64", "dmg"),
+        ("macos-arm64", "dmg"),
+        ("windows-amd64", "exe"),
+    ] {
+        for extension in extensions.split_whitespace() {
+            names.push(format!("youta-desktop-1.2.3-{platform}.{extension}"));
+        }
+    }
+    names.push("youta-1.2.3-vendor.tar.xz".into());
+    assert_eq!(names.len(), 55);
+    for name in &names {
+        fs::write(dist.join(name), b"release fixture\n").unwrap();
+    }
+    let checksums = Command::new("bash")
+        .args([
+            "-c",
+            "for asset in *; do sha256sum \"$asset\" > \"$asset.sha256\" || exit; done",
+        ])
+        .current_dir(&dist)
+        .output()
+        .unwrap();
+    assert!(checksums.status.success(), "{checksums:?}");
+    let validate = || {
+        Command::new("bash")
+            .args(["-c", &script])
+            .env("RELEASE_TAG", "v1.2.3")
+            .current_dir(fixture.path())
+            .output()
+            .unwrap()
+    };
+    let complete = validate();
+    assert!(complete.status.success(), "{complete:?}");
+    for name in [
+        "youta-1.2.3-linux-amd64-debug",
+        "youta-1.2.3-macos-arm64-debug.dSYM.tar.xz",
+    ] {
+        fs::remove_file(dist.join(name)).unwrap();
+        assert!(
+            !validate().status.success(),
+            "missing {name} must fail publication"
+        );
+        fs::write(dist.join(name), b"release fixture\n").unwrap();
+    }
+    fs::write(
+        dist.join("youta-1.2.3-macos-arm64-debug.dSYM.tar.xz"),
+        b"corrupt symbols\n",
+    )
+    .unwrap();
+    assert!(
+        !validate().status.success(),
+        "mismatched debug-symbol checksum must fail publication"
+    );
+}
+
 #[test]
 fn workflows_validate_and_publish_the_documented_platform_contract() {
     let release = read_repository_file(".github/workflows/release.yml");
@@ -1119,6 +1237,7 @@ fn workflows_validate_and_publish_the_documented_platform_contract() {
     assert!(release.contains("dist images-no-qr-no-gpm"));
     assert!(release.contains("dist text-no-qr-no-gpm"));
     for suffix in [
+        "-debug",
         "-no-gpm",
         "-text-no-gpm",
         "-no-qr-no-gpm",
@@ -1129,7 +1248,7 @@ fn workflows_validate_and_publish_the_documented_platform_contract() {
         );
         assert!(
             release.contains(&upload_path),
-            "release workflow omits no-GPM upload `{upload_path}`"
+            "release workflow omits executable upload `{upload_path}`"
         );
     }
     assert!(release.contains("fetch-depth: 10"));
@@ -1141,12 +1260,16 @@ fn workflows_validate_and_publish_the_documented_platform_contract() {
         "suffixes=('' -text -no-qr -text-no-qr)",
         "linux_platforms=(linux-amd64 linux-i686 linux-arm64)",
         "no_gpm_suffixes=(-no-gpm -text-no-gpm -no-qr-no-gpm -text-no-qr-no-gpm)",
-        // Build jobs still transfer one internal checksum beside each of the 48
+        // Build jobs still transfer one internal checksum beside each of the 55
         // deliverables so publication can verify every byte. GitHub Releases
-        // publish only those 48 deliverables because GitHub exposes their
+        // publish only those 55 deliverables because GitHub exposes their
         // computed hashes in the Digest column.
-        "readonly expected_download_count=96",
-        "readonly expected_release_asset_count=48",
+        "readonly expected_download_count=110",
+        "readonly expected_release_asset_count=55",
+        "debug_executable=\"youta-${version}-${platform}-debug\"",
+        "expected+=(\"${debug_executable}\" \"${debug_executable}.sha256\")",
+        "debug_symbols=\"${debug_executable}.dSYM.tar.xz\"",
+        "expected+=(\"${debug_symbols}\" \"${debug_symbols}.sha256\")",
         "executable=\"youta-${version}-${platform}${suffix}\"",
         "desktop_executables=(linux-amd64 linux-i686 linux-arm64 macos-amd64 macos-arm64 windows-amd64)",
         "gui_executable=\"youta-gui-${version}-${platform}${extension}\"",
@@ -1462,8 +1585,8 @@ fn the_desktop_window_ships_one_bundle_contract_across_every_file_that_states_it
         release.contains("desktop_executables=(linux-amd64 linux-i686 linux-arm64"),
         "the desktop executable contract must include Linux i686"
     );
-    assert!(release.contains("readonly expected_download_count=96"));
-    assert!(release.contains("readonly expected_release_asset_count=48"));
+    assert!(release.contains("readonly expected_download_count=110"));
+    assert!(release.contains("readonly expected_release_asset_count=55"));
     assert!(release.contains("scripts/package-desktop.sh dist-desktop"));
     assert!(
         release

@@ -3003,9 +3003,11 @@ the manual browser-review path. The complete report travels through a helper's
 standard input or the terminal's OSC 52 clipboard protocol; the fallback
 browser URL contains only a short bounded title and paste instruction.
 
-The normal `release` profile keeps panic unwinding and line-table symbols so a
-panic can restore terminal state and produce useful frames. The optional
-`release-small` profile strips symbols and aborts on panic to minimize the
+The local Cargo `release` profile keeps panic unwinding and line-table symbols
+so a panic can restore terminal state and produce useful frames. Packaged
+release downloads strip symbols; use the matching `-debug` TUI download for
+source-line diagnostics (plus its dSYM on macOS). Both keep panic unwinding.
+The optional `release-small` profile strips symbols and aborts on panic to minimize the
 binary; that explicit size tradeoff weakens panic diagnostics and cannot
 guarantee terminal cleanup after a panic.
 
@@ -3131,14 +3133,28 @@ downloaded Linux or macOS file needs `chmod +x ./youta-*` before it is run. The
 release also publishes one Cargo vendor archive for offline/external build systems. It
 contains the locked Rust dependency graph and the already-built GUI page, so a
 source package can compile both front ends without npm network access. It is
-source input and is the deliberate archive exception. No published executable
+source input rather than an executable. No published executable
 enables SQLite; human-readable TOML remains the standard persistence backend.
+
+Normal TUI and GUI downloads are stripped to reduce download and installed
+sizes. Each TUI platform/architecture also gets one optimized, unstripped
+`youta-VERSION-OS-ARCH-debug` executable with the default features, including
+images and QR support (and GPM on Linux). Reduced-feature variants do not get
+separate debug builds. Linux debug executables contain source-line information.
+Each macOS debug executable has a matching
+`youta-VERSION-macos-ARCH-debug.dSYM.tar.xz` archive; extract it beside the debug
+executable and keep both from the same release and architecture. These builds
+retain function names and line tables, not full local-variable/type debugging
+data; see [Cargo's debug levels](https://doc.rust-lang.org/cargo/reference/profiles.html#debug).
+Stripping does not disable panic unwinding or terminal cleanup.
 
 The desktop window is published as a standalone GUI executable for Linux
 amd64, i686 and arm64, macOS amd64 and arm64, and Windows amd64. Native bundle
 forms remain `.deb`, `.rpm` and AppImage for Linux amd64 and arm64, `.dmg` for
 macOS amd64 and arm64, and NSIS for Windows amd64. The macOS executable can be
-launched from a terminal; Finder users should use the `.dmg`.
+launched from a terminal; Finder users should use the `.dmg`. GUI binaries are
+stripped during compilation, before bundling and signing; there is no separate
+GUI debug download.
 `scripts/package-desktop.sh` builds whichever native forms its host can make,
 while `scripts/package-desktop-executable.sh` produces the standalone Linux
 i686 program without pretending to cross-compile an installer. The workflow
@@ -3386,20 +3402,16 @@ GPM mouse-daemon integration is opt-in with `USE="gpm"` in both packages. The
 binary ebuild selects an unsuffixed GPM-enabled executable only when that flag
 is enabled; otherwise it uses the corresponding `-no-gpm` release executable.
 
-Starting with `youta-bin-0.53.3-r1`, the binary package allows normal Portage
-stripping instead of unconditionally preserving upstream debug information:
-
-| Portage setting | Installed result |
-| --- | --- |
-| Normal stripping | Smaller executable, without debug information. |
-| `FEATURES="splitdebug"` | Smaller executable with separate debugging information. |
-| `FEATURES="nostrip"` | Original executable with its debug information retained. |
-
-There is no separate `debug` USE flag. In the measured Linux amd64 0.53.3
-artifact, stripping reduced the executable from 104.7 MB to 22.1 MB. This
-changes installed size, not the downloaded upstream artifact or its published
-checksum. Panic unwinding remains enabled; stripping is not the same as the
-`release-small` profile's abort-on-panic tradeoff.
+Starting with Youta 1.8.3, normal prebuilt release executables are already
+stripped. Portage's `FEATURES="splitdebug"` or `FEATURES="nostrip"` cannot
+restore their removed debugging information. Use the upstream `-debug` TUI
+download for troubleshooting, or the source ebuild with `FEATURES="splitdebug"`.
+There is no separate `debug` USE flag. Older unstripped binary releases allowed
+Portage to preserve or separate their debug information; the measured Linux
+amd64 0.53.3 artifact shrank from 104.7 MB to 22.1 MB when stripped. New releases
+apply stripping before upload, reducing the normal download too. Panic
+unwinding remains enabled; stripping is not the same as the `release-small`
+profile's abort-on-panic tradeoff.
 
 ### Building release artifacts
 
@@ -3429,6 +3441,15 @@ npm --prefix gui/ui ci
 npm --prefix gui/ui run build
 scripts/package-vendor.sh
 ```
+
+The `images` invocation builds once and emits both the normal and `-debug`
+executables. TUI packaging requires a target-compatible `strip`; set
+`YOUTA_RELEASE_STRIP` to its executable path for cross-builds that the host tool
+cannot handle. Native Linux amd64 tools also support i686. macOS debug
+packaging additionally uses `dsymutil` and `tar` with xz compression, collecting
+the dSYM before another feature build can replace the debug object files.
+Checksums are calculated after stripping or archiving. Packaging overrides
+apply only to those commands, leaving local Cargo profile defaults unchanged.
 
 ### Playback and podcast integration tests
 

@@ -53,6 +53,10 @@ mkdir -p "${output_argument}"
 output_directory=$(CDPATH= cd -- "${output_argument}" && pwd)
 
 export YOUTA_BUILD_ORIGIN=github-release
+# Match native desktop releases without changing local release diagnostics or
+# panic unwinding: Cargo strips the executable as part of linking.
+export CARGO_PROFILE_RELEASE_STRIP=symbols
+export CARGO_PROFILE_RELEASE_DEBUG=0
 npm --prefix gui/ui ci
 npm --prefix gui/ui run build
 

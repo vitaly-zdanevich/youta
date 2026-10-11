@@ -102,6 +102,11 @@ command -v npm > /dev/null 2>&1 || {
 }
 
 export YOUTA_BUILD_ORIGIN=github-release
+# Strip while linking so installers contain the compact executable before
+# Tauri signs it. These packaging-only overrides preserve local diagnostics
+# and the release profile's panic unwinding.
+export CARGO_PROFILE_RELEASE_STRIP=symbols
+export CARGO_PROFILE_RELEASE_DEBUG=0
 
 # The window's page is compiled into the binary, so it is built first and its
 # exit status is checked: a TypeScript failure that only shows in the log would
