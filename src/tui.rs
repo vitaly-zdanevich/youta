@@ -3202,7 +3202,8 @@ fn search_panel_title(view: &ViewModel) -> String {
                 .last()
                 .unwrap_or_default()
         };
-        query.insert(cursor, '▏');
+        // ASCII keeps the search caret legible with basic Linux console fonts.
+        query.insert(cursor, '|');
         match view.screen {
             Screen::Radio => format!(" Filter: {query} "),
             Screen::Web => format!(" Open URL: {query} "),
@@ -18350,7 +18351,7 @@ for encoded, expected in json.load(sys.stdin):
         view.search_cursor_byte = view.search_query.len();
         assert_eq!(
             search_panel_title(&view),
-            " Open URL: https://example.test/audio/▏ "
+            " Open URL: https://example.test/audio/| "
         );
         assert_eq!(
             key_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &view),
@@ -18511,7 +18512,7 @@ for encoded, expected in json.load(sys.stdin):
         view.search_editing = true;
         assert_eq!(
             search_panel_title(&view),
-            " Filter: fixture query▏ ",
+            " Filter: fixture query| ",
             "Radio's live editor must describe itself as a filter"
         );
         view.search_editing = false;
@@ -18569,7 +18570,7 @@ for encoded, expected in json.load(sys.stdin):
             view.search_cursor_byte = view.search_query.len();
             assert_eq!(
                 search_panel_title(&view),
-                format!(" {title} search: fixture query▏ ")
+                format!(" {title} search: fixture query| ")
             );
             view.search_editing = false;
         }
@@ -18965,6 +18966,7 @@ for encoded, expected in json.load(sys.stdin):
         assert_eq!(album_row, wikidata_row.saturating_add(2));
     }
 
+    /// Search keeps its ASCII insertion marker separate from playback seeking.
     #[test]
     fn youtube_search_editor_renders_and_moves_its_cursor_without_seeking() {
         let mut view = ViewModel {
@@ -18979,7 +18981,7 @@ for encoded, expected in json.load(sys.stdin):
             },
             ..ViewModel::default()
         };
-        assert_eq!(search_panel_title(&view), " Search: alpha ▏omega ");
+        assert_eq!(search_panel_title(&view), " Search: alpha |omega ");
         assert_eq!(
             key_action(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), &view),
             Some(UiAction::MoveSearchCursor(-1))
@@ -18992,9 +18994,49 @@ for encoded, expected in json.load(sys.stdin):
         view.search_query = "A👩‍💻B".to_owned();
         view.search_cursor_byte = "A👩".len();
         assert!(
-            search_panel_title(&view).contains("A▏👩‍💻B"),
+            search_panel_title(&view).contains("A|👩‍💻B"),
             "a synthetic non-boundary cursor must clamp before the complete UTF-8 scalar"
         );
+    }
+
+    /// The search marker is font-independent and never modifies or splits the query.
+    #[test]
+    fn search_cursor_uses_an_ascii_bar_in_terminals_and_linux_consoles() {
+        for physical_linux_console in [false, true] {
+            for (query, cursor, marked) in [
+                ("", 0, "|"),
+                ("#music", 0, "|#music"),
+                ("a|b", 2, "a||b"),
+                ("café", 4, "caf|é"),
+                ("Ae\u{301}Z", 2, "A|e\u{301}Z"),
+                ("A👩‍💻B", "A👩".len(), "A|👩‍💻B"),
+                ("#music", usize::MAX, "#music|"),
+            ] {
+                let mut view = ViewModel {
+                    screen: Screen::Search,
+                    search_editing: true,
+                    search_query: query.to_owned(),
+                    search_cursor_byte: cursor,
+                    physical_linux_console,
+                    ..ViewModel::default()
+                };
+                assert_eq!(search_panel_title(&view), format!(" Search: {marked} "));
+                let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+                let mut hits = HitMap::default();
+                terminal
+                    .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hits))
+                    .unwrap();
+                let rendered = rendered_text(&terminal);
+                // Buffer text includes blank continuation cells for wide graphemes.
+                assert!(rendered.contains("Search: ") && rendered.contains('|'));
+                assert!(!rendered.contains('▏'));
+                assert_eq!(view.search_query, query);
+
+                view.search_editing = false;
+                view.search_query = "#music".to_owned();
+                assert_eq!(search_panel_title(&view), " #music ");
+            }
+        }
     }
 
     #[test]

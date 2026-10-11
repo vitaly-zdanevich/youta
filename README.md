@@ -44,6 +44,8 @@ or `Tab` / `Shift+Tab` to switch sources,
 `/` searches the current source or edits the Web address; `p` or `F7` opens
 Preferences. The first YouTube search offers API-key or Invidious setup.
 YouTube Music search needs neither; Local, Web, and Radio need no account.
+The TUI search and filter field uses ASCII `|` to mark the insertion point,
+including on Linux consoles.
 
 For installation alternatives, optional helpers, credentials, and smaller
 builds, see [Build and run](#build-and-run). For the desktop front-end, see
