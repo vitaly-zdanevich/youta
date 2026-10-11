@@ -28,6 +28,8 @@ const MAX_GENRES: usize = 128;
 const MAX_KEYWORDS: usize = 128;
 const MAX_SECTIONS: usize = 4_096;
 const MAX_READERS: usize = 128;
+/// At most two retries, with all waits charged to the original request timeout.
+const HTTP_RETRY_DELAYS: [Duration; 2] = [Duration::from_millis(500), Duration::from_secs(1)];
 
 /// One bounded LibriVox catalogue request.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -260,17 +262,69 @@ impl LibrivoxTransport for UreqLibrivoxTransport {
         accept: &'static str,
         max_bytes: usize,
     ) -> Result<Vec<u8>, ProviderError> {
+        let started = std::time::Instant::now();
+        self.fetch_with_timing(
+            url,
+            accept,
+            max_bytes,
+            || started.elapsed(),
+            std::thread::sleep,
+        )
+    }
+}
+
+impl UreqLibrivoxTransport {
+    /// Retries only temporary HTTP failures of this validated, read-only GET.
+    ///
+    /// Retries and body reads share the original timeout. A server-supplied
+    /// Retry-After suppresses automatic retries instead of guessing when to retry.
+    /// Transport, parsing, and body-size failures are never replayed. Injected
+    /// elapsed time and waiting keep the retry regressions deterministic.
+    fn fetch_with_timing(
+        &self,
+        url: &Url,
+        accept: &'static str,
+        max_bytes: usize,
+        mut elapsed: impl FnMut() -> Duration,
+        mut wait: impl FnMut(Duration),
+    ) -> Result<Vec<u8>, ProviderError> {
         validate_librivox_fetch_url(url)?;
-        let mut response = self
+        let timeout = self
             .agent
-            .get(url.as_str())
-            .header("Accept", accept)
-            .call()
-            .map_err(map_ureq_error)?;
-        let status = response.status().as_u16();
-        if !(200..300).contains(&status) {
-            return Err(ProviderError::HttpStatus(status));
-        }
+            .config()
+            .timeouts()
+            .global
+            .unwrap_or(DEFAULT_REQUEST_TIMEOUT);
+        let mut delays = HTTP_RETRY_DELAYS.into_iter();
+        let mut response = loop {
+            let remaining = remaining_request_timeout(timeout, elapsed())?;
+            let response = self
+                .agent
+                .get(url.as_str())
+                .header("Accept", accept)
+                .config()
+                .http_status_as_error(false)
+                .timeout_global(Some(remaining))
+                .build()
+                .call()
+                .map_err(map_ureq_error)?;
+            let remaining = remaining_request_timeout(timeout, elapsed())?;
+            let status = response.status().as_u16();
+            if (200..300).contains(&status) {
+                break response;
+            }
+            if !matches!(status, 500 | 502 | 503 | 504)
+                || response.headers().contains_key("retry-after")
+            {
+                return Err(ProviderError::HttpStatus(status));
+            }
+            let Some(delay) = delays.next().filter(|delay| *delay < remaining) else {
+                return Err(ProviderError::HttpStatus(status));
+            };
+            // Do not read an unbounded error page or retain its connection while waiting.
+            drop(response);
+            wait(delay);
+        };
         if response
             .body()
             .content_length()
@@ -292,8 +346,20 @@ impl LibrivoxTransport for UreqLibrivoxTransport {
         if bytes.len() > max_bytes {
             return Err(ProviderError::ResponseTooLarge { limit: max_bytes });
         }
+        remaining_request_timeout(timeout, elapsed())?;
         Ok(bytes)
     }
+}
+
+/// Uses elapsed subtraction so even a caller-supplied Duration::MAX cannot overflow.
+fn remaining_request_timeout(
+    timeout: Duration,
+    elapsed: Duration,
+) -> Result<Duration, ProviderError> {
+    timeout
+        .checked_sub(elapsed)
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| map_ureq_error(ureq::Error::Timeout(ureq::Timeout::Global)))
 }
 
 /// Blocking, bounded client for the credential-free LibriVox catalogue.
@@ -333,6 +399,10 @@ impl LibrivoxClient {
     }
 
     /// Creates a client with explicit network and response limits.
+    ///
+    /// Each GET may retry HTTP 500, 502, 503, or 504 at most twice. Attempts,
+    /// backoff waits, and body reads share `timeout`; Retry-After responses are
+    /// returned without automatic retries.
     ///
     /// # Errors
     ///
@@ -1534,6 +1604,10 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> String {
     }
     value[..boundary].to_owned()
 }
+
+#[cfg(test)]
+#[path = "librivox/retry_tests.rs"]
+mod retry_tests;
 
 #[cfg(test)]
 mod tests {
