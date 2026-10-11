@@ -722,6 +722,30 @@ mod wire_tests {
         }
     }
 
+    /// Podcasts expose the shared Info shortcut without requiring a browser or Details focus.
+    #[test]
+    fn podcast_url_info_shortcut_uses_the_selected_link() {
+        let mut view = url_navigation_view();
+        view.screen = crate::view::Screen::ApplePodcasts;
+        view.external_opener_available = false;
+        for focused in [false, true] {
+            view.details_focused = focused;
+            for offset in 0..3 {
+                view.details.as_mut().unwrap().url_info_offset = offset;
+                assert_eq!(
+                    key_action(KeyPress::new(Key::Char('i')), &view, None, None),
+                    Some(UiAction::ToggleUrlInfo(offset))
+                );
+            }
+        }
+        view.search_editing = true;
+        assert_ne!(
+            key_action(KeyPress::new(Key::Char('i')), &view, None, None),
+            Some(UiAction::ToggleUrlInfo(2)),
+            "editing the query must not open URL Info"
+        );
+    }
+
     /// The displayed arrow shortcuts navigate URLs without taking focus or changing speed.
     #[test]
     fn url_navigation_angle_keys_ignore_focus_and_leave_comma_period_for_speed() {

@@ -55,12 +55,12 @@ const entries = [
 	{ url: 'https://example.org/a?one=1&two=2', expanded: false, loading: false, lines: [] },
 	{ url: 'https://other.example/music', expanded: false, loading: false, lines: [] },
 ];
-const render = (url_info = entries, external_opener_available = true, kind = 'Local') => Details({ kind, view: {
-	screen: kind === 'Video' ? 'Search' : 'Local', playlist_item: null, details_focused: false,
+const render = (url_info = entries, external_opener_available = true, kind = 'Local', selection = {}) => Details({ kind, view: {
+	screen: selection.screen ?? (kind === 'Video' ? 'Search' : 'Local'), playlist_item: null, details_focused: false,
 	external_opener_available, yandex_music_actions: {},
-	details: { title: 'Recording', source: kind === 'Video' ? 'YouTube' : 'Local',
-		media_id: kind === 'Video' ? { source: 'you-tube', external_id: 'video-id' } : null, channel_id: '', channel_name: '',
-		playlist_names: [], dearrow_title: null, description: comment, timecodes: [], video_links: [],
+	details: { title: 'Recording', source: selection.source ?? (kind === 'Video' ? 'YouTube' : 'Local'),
+		media_id: selection.media_id ?? (kind === 'Video' ? { source: 'you-tube', external_id: 'video-id' } : null), channel_id: '', channel_name: '',
+		playlist_names: [], dearrow_title: null, description: selection.description ?? comment, timecodes: [], video_links: [],
 		wikidata_entities: [], links: [], url_info, url_info_offset: 1 },
 } });
 const section = (tree) => nodes(tree).find((node) => node.props['aria-label'] === 'URL information');
@@ -146,6 +146,37 @@ test('YouTube descriptions expose the same on-demand URL information without cha
 	controls[1].props.onClick({ stopPropagation() {} });
 	assert.deepEqual(actions, [{ ToggleUrlInfo: 0 }]);
 });
+
+/** Podcast URLs retain the same controls on their dedicated and aggregate screens. */
+for (const [kind, screen, source, media_id] of [
+	['Podcast', 'ApplePodcasts', 'Apple Podcasts', { source: 'apple-podcasts', external_id: '1000444555666' }],
+	['Generic', 'History', 'RSS podcast', { source: 'rss', external_id: `rss-v1-${'a'.repeat(64)}` }],
+	['Generic', 'Playlists', 'Apple Podcasts', { source: 'apple-podcasts', external_id: '1000444555666' }],
+]) {
+	test(`${source} descriptions expose lazy URL Info on ${screen}`, () => {
+		const description = 'Episode notes: <a href="https://example.org/a?one=1&two=2">Привет</a>';
+		const selection = { screen, source, media_id, description };
+		actions.length = 0;
+		const tree = render(entries, false, kind, selection);
+		const controls = buttons(tree);
+		assert.deepEqual(controls.map(text), [entries[0].url, 'Info', entries[1].url, 'Info']);
+		assert.equal(controls[0].props.disabled, true, 'Info remains usable without an external opener');
+		assert.equal(Boolean(controls[1].props.disabled), false);
+		assert.deepEqual(actions, [], 'rendering podcast details must not request URL information');
+		assert.equal(text(nodes(tree).find((node) => 'data-description' in node.props)), description);
+		controls[1].props.onClick({ stopPropagation() {} });
+		assert.deepEqual(actions, [{ ToggleUrlInfo: 0 }]);
+
+		const lines = ['Title: Podcast episode notes'];
+		const expanded = render([{ ...entries[0], expanded: true, lines }], false, kind, selection);
+		assert.equal(text(nodes(expanded).find((node) => 'data-description' in node.props)), description);
+		assert.ok(text(section(expanded)).includes(lines[0]));
+		assert.equal(buttons(expanded)[1].props['aria-expanded'], true);
+		assert.deepEqual(actions, [{ ToggleUrlInfo: 0 }], 'rendering cached facts must not request them again');
+		buttons(expanded)[1].props.onClick({ stopPropagation() {} });
+		assert.deepEqual(actions, [{ ToggleUrlInfo: 0 }, { ToggleUrlInfo: 0 }]);
+	});
+}
 
 test('providers with no URL metadata add no unused section', () => {
 	for (const kind of ['Local', 'Video', 'Podcast', 'Radio', 'YandexMusic', 'Channel', 'Generic']) {

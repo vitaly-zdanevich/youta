@@ -134,11 +134,14 @@ fn comment_urls(comment: &str) -> Vec<UrlInfoView> {
 }
 
 impl AppController {
-    /// Reads existing `YouTube` descriptions or Local tags without probing files or URLs.
+    /// Reads existing `YouTube`/podcast descriptions or Local tags without probing files or URLs.
     fn selected_url_info_source(&self) -> Option<(MediaId, &str)> {
         let details = self.view.details.as_ref()?;
         let id = details.media_id.as_ref()?;
-        if id.source == SourceKind::YouTube {
+        if matches!(
+            id.source,
+            SourceKind::YouTube | SourceKind::ApplePodcasts | SourceKind::Rss
+        ) {
             return (details.description.len() <= MAX_SOURCE_BYTES)
                 .then(|| (id.clone(), details.description.as_str()));
         }

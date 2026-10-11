@@ -415,42 +415,125 @@ fn url_info_completed_results_are_cached_by_url_but_never_auto_expanded() {
 }
 
 #[test]
-fn url_info_youtube_description_is_explicit_and_rejects_late_selection_results() {
+fn url_info_online_description_is_explicit_and_rejects_late_selection_results() {
+    for (source, screen) in [
+        (SourceKind::YouTube, Screen::Search),
+        (SourceKind::ApplePodcasts, Screen::ApplePodcasts),
+        (SourceKind::Rss, Screen::Subscriptions),
+    ] {
+        let (mut controller, _) = controller_with_mock_statuses([]);
+        let first_id = MediaId::new(source.clone(), "first-item");
+        let second_id = MediaId::new(source, "second-item");
+        let description = "Description: https://example.com/page Original text.";
+        controller.view.screen = screen;
+        controller.view.selected = 0;
+        controller.view.rows = vec![RowView {
+            media_id: Some(first_id.clone()),
+            ..RowView::default()
+        }];
+        controller.view.details = Some(DetailView {
+            media_id: Some(first_id),
+            description: description.into(),
+            ..DetailView::default()
+        });
+        controller.refresh_url_info();
+        let info = &controller.view.details.as_ref().unwrap().url_info[0];
+        assert_eq!(info.url, "https://example.com/page");
+        assert!(!info.expanded);
+        assert!(controller.url_info.worker.is_none());
+        open_cached_url_info(&mut controller, "https://example.com/page", "Title: Cached");
+        let (sender, cancelled) =
+            inject_url_info_worker(&mut controller, "https://example.com/page");
+        controller.view.rows[0].media_id = Some(second_id.clone());
+        controller.view.details.as_mut().unwrap().media_id = Some(second_id);
+        sender
+            .send((
+                Default::default(),
+                vec!["Title: Stale description result".into()],
+            ))
+            .unwrap();
+        controller.refresh_url_info();
+        assert!(cancelled.load(AtomicOrdering::Relaxed));
+        assert!(controller.url_info.worker.is_none());
+        let details = controller.view.details.as_ref().unwrap();
+        assert_eq!(details.description, description);
+        assert!(!details.url_info[0].expanded);
+        assert!(details.url_info[0].lines.is_empty());
+    }
+}
+
+/// Podcast catalogue and episode builders expose existing links without fetching them.
+#[cfg(feature = "apple-podcasts")]
+#[test]
+fn url_info_apple_show_and_episode_details_keep_lazy_links_and_cached_results() {
     let (mut controller, _) = controller_with_mock_statuses([]);
-    let first_id = MediaId::new(SourceKind::YouTube, "first-video");
-    let second_id = MediaId::new(SourceKind::YouTube, "second-video");
-    let description = "Description: https://example.com/page Original text.";
-    controller.view.screen = Screen::Search;
-    controller.view.selected = 0;
-    controller.view.rows = vec![RowView {
-        media_id: Some(first_id.clone()),
-        ..RowView::default()
-    }];
-    controller.view.details = Some(DetailView {
-        media_id: Some(first_id),
-        description: description.into(),
-        ..DetailView::default()
-    });
+    controller.view.screen = Screen::ApplePodcasts;
+    let show = apple_podcast_show_fixture(1_001, "URL Info show");
+    let feed_url = show.feed_url.as_ref().unwrap().to_string();
+    controller.apple_podcasts_results = vec![show.clone()];
+    controller.update_apple_podcasts_detail();
     controller.refresh_url_info();
-    let info = &controller.view.details.as_ref().unwrap().url_info[0];
-    assert_eq!(info.url, "https://example.com/page");
-    assert!(!info.expanded);
+    let details = controller.view.details.as_ref().unwrap();
+    assert_eq!(details.url_info.len(), 1);
+    assert_eq!(details.url_info[0].url, feed_url);
+    assert!(!details.url_info[0].expanded);
     assert!(controller.url_info.worker.is_none());
-    open_cached_url_info(&mut controller, "https://example.com/page", "Title: Cached");
-    let (sender, cancelled) = inject_url_info_worker(&mut controller, "https://example.com/page");
-    controller.view.rows[0].media_id = Some(second_id.clone());
-    controller.view.details.as_mut().unwrap().media_id = Some(second_id);
-    sender
-        .send((
-            Default::default(),
-            vec!["Title: Stale YouTube result".into()],
-        ))
-        .unwrap();
+
+    let description = "<p>Show notes: <a href=\"https://example.com/notes\">Notes</a></p>\nMore: https://example.org/about";
+    let mut episode = apple_podcast_episode_fixture(1_001, 2_002, "URL Info episode", None);
+    episode.description = Some(description.into());
+    controller.active_apple_podcast_show = Some(show);
+    controller.apple_podcast_episodes = vec![episode];
+    controller.update_apple_podcast_episode_detail();
     controller.refresh_url_info();
-    assert!(cancelled.load(AtomicOrdering::Relaxed));
-    assert!(controller.url_info.worker.is_none());
     let details = controller.view.details.as_ref().unwrap();
     assert_eq!(details.description, description);
+    assert_eq!(details.url_info.len(), 2);
+    assert_eq!(details.url_info[0].url, "https://example.com/notes");
+    assert_eq!(details.url_info[1].url, "https://example.org/about");
+    assert!(details.url_info.iter().all(|info| !info.expanded));
+    assert!(controller.url_info.worker.is_none());
+
+    open_cached_url_info(
+        &mut controller,
+        "https://example.com/notes",
+        "Title: Show notes",
+    );
+    controller.update_apple_podcast_episode_detail();
+    controller.refresh_url_info();
+    let details = controller.view.details.as_ref().unwrap();
+    assert_eq!(details.description, description);
+    assert!(details.url_info[0].expanded);
+    assert_eq!(details.url_info[0].lines, ["Title: Show notes"]);
+    assert!(controller.url_info.worker.is_none());
+}
+
+/// RSS descriptions keep their publisher text and share the on-demand URL cache.
+#[cfg(feature = "rss")]
+#[test]
+fn url_info_rss_episode_details_keep_publisher_links() {
+    let (mut controller, _) = controller_with_mock_statuses([]);
+    let feed_url = url::Url::parse("https://podcasts.example/feed.xml").unwrap();
+    let mut feed = fixture_rss_feed(&feed_url, &["url-info"]);
+    let description = "<p><a href=\"https://example.com/notes\">Notes</a></p>";
+    feed.episodes[0].description = Some(description.into());
+    let episode = podcast_episode_summary(&feed, &feed.episodes[0], &feed_url);
+    controller.view.screen = Screen::Subscriptions;
+    controller.view.details = Some(detail_from_podcast_episode(&episode));
+    controller.refresh_url_info();
+    let details = controller.view.details.as_ref().unwrap();
+    assert!(details.description.ends_with(description));
+    assert_eq!(details.url_info.len(), 1);
+    assert_eq!(details.url_info[0].url, "https://example.com/notes");
     assert!(!details.url_info[0].expanded);
-    assert!(details.url_info[0].lines.is_empty());
+    assert!(controller.url_info.worker.is_none());
+    open_cached_url_info(
+        &mut controller,
+        "https://example.com/notes",
+        "Title: RSS notes",
+    );
+    assert_eq!(
+        controller.view.details.as_ref().unwrap().url_info[0].lines,
+        ["Title: RSS notes"]
+    );
 }

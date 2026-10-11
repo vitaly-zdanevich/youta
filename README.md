@@ -142,7 +142,8 @@ available. Copy support is the standalone `local-copy` feature.
 In the terminal UI, folder listings and transfer progress wake the interface
 when ready instead of waiting for a periodic response check.
 
-URLs in Local file comments and YouTube descriptions have an **Info** control.
+URLs in Local file comments, YouTube descriptions, and Apple Podcasts or RSS
+podcast descriptions have an **Info** control.
 It fetches the website's HTML title/description and public
 [RDAP registration data](https://lookup.icann.org/en/faq) only when opened:
 registration/change/expiry dates, registrar, public registrant details, domain
@@ -1137,7 +1138,7 @@ leave it out of an explicit `--no-default-features` feature list:
 | `audio-quality` | Local spectral analysis and RustFFT. |
 | `cache` | Session RAM audio cache with a 90% system/container memory-pressure ceiling on Linux. |
 | `cmd` | TUI/GUI provider-filtered command buttons, plus terminal Bash commands on any tab, completion, and history. |
-| `url-info` | On-demand website metadata and public RDAP/WHOIS facts for Local comments and YouTube descriptions. |
+| `url-info` | On-demand website metadata and public RDAP/WHOIS facts for Local comments, YouTube descriptions, and Apple Podcasts or RSS podcast descriptions. |
 | `commons-upload` | Commons authentication, upload client, and review UI. |
 | `evernote` | Evernote client and audio-note UI. |
 | `gpm` | Linux virtual-console mouse input; opt in explicitly in either custom example. |
