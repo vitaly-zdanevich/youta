@@ -1576,16 +1576,27 @@ fn subscription_continuation_has_a_static_indicator_without_animating_refresh() 
     }
 }
 
-/// Navigation shortcuts use the labels displayed by the corresponding tabs.
+/// Navigation shortcuts name their tabs, including when Log is disabled.
 #[test]
 fn the_window_help_uses_current_navigation_labels() {
     let source = window_source("components/popups.tsx");
-    for label in [
-        "offline · log · lists · stats",
-        "offline · lists · stats",
-        "subs · preferences · recent commits",
+    let navigation = source
+        .split_once("\"Navigation\",")
+        .expect("window Help has a Navigation section")
+        .1
+        .split_once("\"Playback\",")
+        .expect("window Help separates Navigation from Playback")
+        .0;
+    let navigation = navigation.split_whitespace().collect::<Vec<_>>().join(" ");
+    for binding in [
+        "[ playbackHistoryEnabled ? 'F1 · F2 · F3 · F4 · F5' : 'F1 · F2 · F4 · F5', playbackHistoryEnabled ? 'YT · Local · log · lists · stats' : 'YT · Local · lists · stats', ]",
+        "['F12', 'offline']",
+        "['S · p · F9', 'subs · preferences · recent commits']",
     ] {
-        assert!(source.contains(label), "window Help must name {label}");
+        assert!(
+            navigation.contains(binding),
+            "window Help must pair navigation shortcuts with their current labels: {binding}"
+        );
     }
 }
 
