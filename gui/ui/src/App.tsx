@@ -253,6 +253,7 @@ export function App() {
 			channelDownloadSupported={view.channel_download_supported}
 			evernoteSupported={view.evernote_supported}
 			lanShareSupported={view.lan_share_supported}
+			podcastsSupported={sources.some((source) => source.id === 'ApplePodcasts')}
           playbackHistoryEnabled={view.playback_history_enabled}
           videoSummarySupported={view.video_summary_supported}
           youtubeCaptionsSupported={view.youtube_captions_supported ?? false}

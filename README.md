@@ -37,7 +37,8 @@ with Rust 1.95 or newer:
 cargo run --release --locked
 ```
 
-Press `?` for contextual Help. Use `F1` for YT, `F2` for Local and `F12` for Offline,
+Press `?` for contextual Help. Use `F1` for YT, `F2` for Local, `F11` for Podcasts
+and `F12` for Offline,
 or `Tab` / `Shift+Tab` to switch sources,
 `j` / `k` to select an item, `Enter` to open or play it, and `Space` to pause.
 `/` searches the current source or edits the Web address; `p` or `F7` opens
@@ -2303,8 +2304,9 @@ and link data is fetched again after a restart.
 `Tab` cycles forward through every enabled top-level screen, while `Shift+Tab`
 cycles backward; both wrap at the ends. `Ctrl+Tab` and `Ctrl+Shift+Tab` are
 aliases when the terminal reports those combinations distinctly. During normal
-browsing, `F1` switches directly to **YT**, `F2` to **Local** (when built), and
-`F12` to **Offline**, without changing playback. Dialogs retain their own
+browsing, `F1` switches directly to **YT**, `F2` to **Local** (when built),
+`F11` to **Podcasts** (when built), and `F12` to **Offline**, without changing
+playback. Dialogs retain their own
 function-key actions, and editors keep their input handling. Uppercase
 `S` is the global **Subs** shortcut and always returns to the
 subscription-source root. Youta provides two layouts:
@@ -2559,8 +2561,9 @@ After cancellation with `[C]`, the stopped-download line disappears after
 
 #### Sharing local files and folders
 
-The default-on `lan-sharing` feature adds two Local actions. `[F11] Share over
+The default-on `lan-sharing` feature adds two Local actions. `[Shift+F1] Share over
 LAN` serves the selected regular file or a bounded, recursive folder index.
+Linux console keymaps that report `Shift+F1` as `F13` are also supported.
 The `Podcast feed` button, without a dedicated hotkey, serves playable audio
 under the selection as RSS. When the
 synthetic `..` row is selected, both actions share the directory currently on

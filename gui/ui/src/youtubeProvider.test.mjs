@@ -58,6 +58,19 @@ const button = (tree, label) => nodes(tree).find((node) => node.type === 'button
 	&& (text(node) === label || node.props['aria-label'] === label));
 const aboutUrl = 'https://en.wikipedia.org/wiki/Invidious';
 
+/** Podcast navigation is present only when that source exists in the native build. */
+test('navigation help advertises F11 Podcasts only for supported builds', () => {
+	for (const playbackHistoryEnabled of [false, true]) {
+		for (const podcastsSupported of [false, true]) {
+			const tree = module.exports.HelpPopup({ playbackHistoryEnabled, podcastsSupported });
+			const cells = nodes(tree).filter((node) => ['dt', 'dd'].includes(node.type));
+			const podcasts = cells.findIndex((node) => node.type === 'dt' && text(node) === 'F11');
+			assert.equal(podcasts !== -1, podcastsSupported);
+			if (podcastsSupported) assert.equal(text(cells[podcasts + 1]), 'Podcasts');
+		}
+	}
+});
+
 test('navigation help advertises F1 YT, F2 Local and F12 Offline independently of playback history', () => {
 	for (const playbackHistoryEnabled of [false, true]) {
 		const tree = module.exports.HelpPopup({ playbackHistoryEnabled, lanShareSupported: true });
@@ -70,11 +83,20 @@ test('navigation help advertises F1 YT, F2 Local and F12 Offline independently o
 		const offline = cells.findIndex((node) => node.type === 'dt' && text(node) === 'F12');
 		assert.notEqual(offline, -1);
 		assert.equal(text(cells[offline + 1]), 'offline');
-		const share = cells.findIndex((node) => node.type === 'dt' && text(node) === 'F11');
+		const share = cells.findIndex((node) => node.type === 'dt' && text(node) === 'Shift+F1');
 		assert.notEqual(share, -1);
 		assert.equal(text(cells[share + 1]), 'share Local selection');
 		assert.ok(!text(tree).includes('podcast feed'), 'Podcast feed has no keyboard shortcut');
 	}
+});
+
+/** The window derives Podcast support from native sources instead of adding a separate flag. */
+test('window Help derives Podcast support from its native source catalogue', async () => {
+	const app = await readFile(new URL('./App.tsx', import.meta.url), 'utf8');
+	assert.ok(app.includes("podcastsSupported={sources.some((source) => source.id === 'ApplePodcasts')}"));
+	const tree = module.exports.HelpPopup({ podcastsSupported: true, lanShareSupported: false });
+	assert.ok(!text(tree).includes('share Local selection'));
+	assert.ok(text(tree).includes('F11Podcasts'));
 });
 
 test('the provider screen keeps its Wikipedia link visible with the directory closed or in any open state', () => {

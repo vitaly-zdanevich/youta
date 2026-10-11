@@ -338,7 +338,7 @@ mod wire_tests {
 
     /// Tab navigation uses only bare function keys, independently of feed availability.
     #[test]
-    fn f2_f12_open_local_and_offline_only_during_normal_browsing() {
+    fn f2_f11_f12_open_tabs_only_during_normal_browsing() {
         use crate::view::{
             DetailView, RightPanelMode, Screen, SiteFilePopupView, YouTubeSetupPopupView,
         };
@@ -350,6 +350,11 @@ mod wire_tests {
                 (
                     2,
                     cfg!(feature = "local-browser").then_some(UiAction::ShowScreen(Screen::Local)),
+                ),
+                (
+                    11,
+                    cfg!(feature = "apple-podcasts")
+                        .then_some(UiAction::ShowScreen(Screen::ApplePodcasts)),
                 ),
                 (12, Some(UiAction::ShowScreen(Screen::Downloaded))),
             ] {
@@ -399,7 +404,11 @@ mod wire_tests {
             ),
             None
         );
-        for key in [KeyPress::new(Key::F(2)), KeyPress::new(Key::F(12))] {
+        for key in [
+            KeyPress::new(Key::F(2)),
+            KeyPress::new(Key::F(11)),
+            KeyPress::new(Key::F(12)),
+        ] {
             view.search_editing = true;
             assert_eq!(key_action(key, &view, None, None), None);
             view.search_editing = false;
@@ -425,10 +434,10 @@ mod wire_tests {
     /// User-defined function-key commands still override built-ins only outside modal editors.
     #[cfg(feature = "cmd")]
     #[test]
-    fn f2_f12_custom_commands_keep_normal_priority() {
+    fn f2_f11_f12_custom_commands_keep_normal_priority() {
         use crate::view::{CustomCommandButtonView, YouTubeSetupPopupView};
 
-        for number in [2, 12] {
+        for number in [2, 11, 12] {
             let mut view = ViewModel::default();
             view.custom_command_buttons.push(CustomCommandButtonView {
                 id: 7,
@@ -2099,9 +2108,32 @@ mod wire_tests {
             screen: crate::view::Screen::Local,
             ..ViewModel::default()
         };
+        let share_keys = [
+            KeyPress {
+                shift: true,
+                ..KeyPress::new(Key::F(1))
+            },
+            KeyPress::new(Key::F(13)),
+        ];
+        for key in share_keys {
+            assert_eq!(
+                key_action(key, &local, None, None),
+                Some(UiAction::ShareLocalFiles)
+            );
+            assert_eq!(key_action(key, &ViewModel::default(), None, None), None);
+            for modified in [
+                KeyPress { ctrl: true, ..key },
+                KeyPress { alt: true, ..key },
+            ] {
+                assert_eq!(key_action(modified, &local, None, None), None);
+            }
+            let mut editor = local.clone();
+            editor.search_editing = true;
+            assert_eq!(key_action(key, &editor, None, None), None);
+        }
         assert_eq!(
-            key_action(KeyPress::new(Key::F(11)), &local, None, None),
-            Some(UiAction::ShareLocalFiles)
+            key_action(KeyPress::new(Key::F(1)), &local, None, None),
+            Some(UiAction::ShowScreen(Screen::Search))
         );
         assert_eq!(
             key_action(KeyPress::new(Key::F(12)), &local, None, None),
@@ -2109,7 +2141,7 @@ mod wire_tests {
         );
         assert_eq!(
             key_action(KeyPress::new(Key::F(11)), &ViewModel::default(), None, None),
-            None
+            cfg!(feature = "apple-podcasts").then_some(UiAction::ShowScreen(Screen::ApplePodcasts))
         );
 
         let channel = ViewModel {
@@ -2175,6 +2207,41 @@ mod wire_tests {
             None,
             "the modal must own keys until it closes"
         );
+        for key in share_keys.into_iter().chain([KeyPress::new(Key::F(11))]) {
+            assert_eq!(key_action(key, &popup, None, None), None);
+        }
+    }
+
+    /// Both physical-console and modifier-preserving sharing keys respect custom commands.
+    #[cfg(all(feature = "lan-sharing", feature = "cmd"))]
+    #[test]
+    fn local_lan_share_shortcuts_keep_custom_command_priority() {
+        use crate::view::CustomCommandButtonView;
+
+        for (binding, key) in [
+            (
+                "Shift+F1",
+                KeyPress {
+                    shift: true,
+                    ..KeyPress::new(Key::F(1))
+                },
+            ),
+            ("F13", KeyPress::new(Key::F(13))),
+        ] {
+            let view = ViewModel {
+                screen: Screen::Local,
+                custom_command_buttons: vec![CustomCommandButtonView {
+                    id: 7,
+                    binding: Some(crate::local_command::buttons::Hotkey::parse(binding).unwrap()),
+                    ..CustomCommandButtonView::default()
+                }],
+                ..ViewModel::default()
+            };
+            assert_eq!(
+                key_action(key, &view, None, None),
+                Some(UiAction::RunCustomCommand(7))
+            );
+        }
     }
 
     #[cfg(feature = "lan-sharing")]
@@ -3862,7 +3929,14 @@ fn unfiltered_key_action(
         #[cfg(feature = "ascii-visualizer")]
         Key::F(10) if !view.playback.idle => Some(UiAction::ToggleAsciiVisualizer),
         #[cfg(feature = "lan-sharing")]
-        Key::F(11) if view.screen == Screen::Local => Some(UiAction::ShareLocalFiles),
+        Key::F(1) if view.screen == Screen::Local && key.shift && !key.chorded() => {
+            Some(UiAction::ShareLocalFiles)
+        }
+        // Linux console keymaps commonly encode Shift+F1 as unmodified F13.
+        #[cfg(feature = "lan-sharing")]
+        Key::F(13) if view.screen == Screen::Local && !key.modified() => {
+            Some(UiAction::ShareLocalFiles)
+        }
         Key::Char('/') => Some(UiAction::BeginSearch),
         #[cfg(feature = "cmd")]
         Key::Char(':') if !key.chorded() && view.local_command_available => {
@@ -3890,6 +3964,9 @@ fn unfiltered_key_action(
         Key::F(3) if view.playback_history_enabled => Some(UiAction::ShowScreen(Screen::History)),
         Key::F(4) => Some(UiAction::ShowScreen(Screen::Playlists)),
         Key::F(5) => Some(UiAction::ShowScreen(Screen::Statistics)),
+        Key::F(11) if !key.modified() && cfg!(feature = "apple-podcasts") => {
+            Some(UiAction::ShowScreen(Screen::ApplePodcasts))
+        }
         Key::F(12) if !key.modified() => Some(UiAction::ShowScreen(Screen::Downloaded)),
         Key::Char('v') if view.screen == Screen::YandexMusic => {
             Some(UiAction::CycleYandexMusicSearchKind)

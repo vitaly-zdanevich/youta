@@ -5494,7 +5494,7 @@ fn render_information_panel(
             &right_buttons,
             &mut next_left_row,
             inner.width,
-            button("F11", "Share over LAN", show_hotkeys),
+            button("Shift+F1", "Share over LAN", show_hotkeys),
             theme.accent,
             UiAction::ShareLocalFiles,
         )
@@ -8564,7 +8564,7 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
         local_actions.push("V audio quality");
     }
     if view.lan_share_supported {
-        local_actions.push("F11 share");
+        local_actions.push("Shift+F1 share");
     }
     if !local_actions.is_empty() {
         local_help.push_str("\n    ");
@@ -8579,7 +8579,7 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
     #[cfg(not(feature = "qr"))]
     let private_note_help = "  n private note     t Details-only text selection";
     let history_navigation_help = format!(
-        "  F1 YT{}{}     F12 offline     Backspace back",
+        "  F1 YT{}{}{}  F12 offline  Backspace back",
         if cfg!(feature = "local-browser") {
             "     F2 Local"
         } else {
@@ -8587,6 +8587,11 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
         },
         if view.playback_history_enabled {
             "     F3 log"
+        } else {
+            ""
+        },
+        if cfg!(feature = "apple-podcasts") {
+            "  F11 Podcasts"
         } else {
             ""
         },
@@ -18329,7 +18334,6 @@ for encoded, expected in json.load(sys.stdin):
             KeyCode::Char('m'),
             KeyCode::Char('H'),
             KeyCode::Char('Z'),
-            KeyCode::F(11),
         ] {
             assert_eq!(
                 key_action(KeyEvent::new(key, KeyModifiers::NONE), &view),
@@ -18337,6 +18341,10 @@ for encoded, expected in json.load(sys.stdin):
                 "Web must not offer local action {key:?}"
             );
         }
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::F(11), KeyModifiers::NONE), &view),
+            cfg!(feature = "apple-podcasts").then_some(UiAction::ShowScreen(Screen::ApplePodcasts))
+        );
         assert_eq!(
             key_action(KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE), &view),
             Some(UiAction::ShowScreen(Screen::Downloaded))
@@ -42361,7 +42369,13 @@ prose 07:25 remains clickable but is not a chapter";
             .draw(|frame| render(frame, &local, &UiSettings::default(), &mut hit_map))
             .expect("draw Local share buttons");
         let rendered = rendered_text(&terminal);
-        assert!(rendered.contains("[F11] Share over LAN"));
+        assert!(rendered.contains("[Shift+F1] Share over LAN"));
+        for key in [
+            KeyEvent::new(KeyCode::F(1), KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::F(13), KeyModifiers::NONE),
+        ] {
+            assert_eq!(key_action(key, &local), Some(UiAction::ShareLocalFiles));
+        }
         assert!(rendered.contains("Podcast feed"));
         assert!(!rendered.contains("[F12] Podcast feed"));
         for expected in [UiAction::ShareLocalFiles, UiAction::ShareLocalPodcast] {
@@ -44442,7 +44456,7 @@ prose 07:25 remains clickable but is not a chapter";
 
     /// Normal tab shortcuts remain available without history or podcast sharing support.
     #[test]
-    fn f2_local_and_f12_offline_are_documented_and_forwarded() {
+    fn f2_local_f11_podcasts_and_f12_offline_are_documented_and_forwarded() {
         for playback_history_enabled in [false, true] {
             let view = ViewModel {
                 screen: Screen::Search,
@@ -44459,10 +44473,19 @@ prose 07:25 remains clickable but is not a chapter";
                 rendered.contains("F2 Local"),
                 cfg!(feature = "local-browser")
             );
+            assert_eq!(
+                rendered.contains("F11 Podcasts"),
+                cfg!(feature = "apple-podcasts")
+            );
             assert!(!rendered.contains("F12 feed"));
             assert_eq!(
                 key_action(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE), &view),
                 cfg!(feature = "local-browser").then_some(UiAction::ShowScreen(Screen::Local))
+            );
+            assert_eq!(
+                key_action(KeyEvent::new(KeyCode::F(11), KeyModifiers::NONE), &view),
+                cfg!(feature = "apple-podcasts")
+                    .then_some(UiAction::ShowScreen(Screen::ApplePodcasts))
             );
             assert_eq!(
                 key_action(KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE), &view),

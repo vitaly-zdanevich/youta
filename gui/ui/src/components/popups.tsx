@@ -115,6 +115,7 @@ export function HelpPopup({
 	channelDownloadSupported,
 	evernoteSupported,
 	lanShareSupported,
+	podcastsSupported,
   playbackHistoryEnabled,
   videoSummarySupported,
   youtubeCaptionsSupported,
@@ -127,6 +128,7 @@ export function HelpPopup({
 	channelDownloadSupported: boolean;
 	evernoteSupported: boolean;
 	lanShareSupported: boolean;
+	podcastsSupported: boolean;
   playbackHistoryEnabled: boolean;
   videoSummarySupported: boolean;
   youtubeCaptionsSupported: boolean;
@@ -147,6 +149,9 @@ export function HelpPopup({
 				? 'YT · Local · log · lists · stats'
 				: 'YT · Local · lists · stats',
 		],
+		...(podcastsSupported
+			? ([['F11', 'Podcasts']] satisfies Array<[string, string]>)
+			: []),
 		['F12', 'offline'],
 		['S · p · F9', 'subs · preferences · recent commits'],
 		['PageUp · PageDown', 'page through Subs'],
@@ -216,7 +221,7 @@ export function HelpPopup({
         ["Shift+J · Shift+K", "mark Local row and move down · up"],
 		['c / m (Local)', 'copy / move selected files or folders, when supported'],
 		...(lanShareSupported
-			? ([['F11', 'share Local selection']] satisfies Array<[string, string]>)
+			? ([['Shift+F1', 'share Local selection']] satisfies Array<[string, string]>)
 			: []),
         ...(audioQualitySupported
           ? ([

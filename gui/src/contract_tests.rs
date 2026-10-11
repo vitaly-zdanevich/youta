@@ -1591,6 +1591,7 @@ fn the_window_help_uses_current_navigation_labels() {
     for binding in [
         "[ playbackHistoryEnabled ? 'F1 · F2 · F3 · F4 · F5' : 'F1 · F2 · F4 · F5', playbackHistoryEnabled ? 'YT · Local · log · lists · stats' : 'YT · Local · lists · stats', ]",
         "['F12', 'offline']",
+        "podcastsSupported ? ([['F11', 'Podcasts']] satisfies Array<[string, string]>) : []",
         "['S · p · F9', 'subs · preferences · recent commits']",
     ] {
         assert!(
@@ -1598,6 +1599,7 @@ fn the_window_help_uses_current_navigation_labels() {
             "window Help must pair navigation shortcuts with their current labels: {binding}"
         );
     }
+    assert!(source.contains("['Shift+F1', 'share Local selection']"));
 }
 
 #[test]

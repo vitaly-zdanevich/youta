@@ -67,6 +67,7 @@
 		{ id: 'Search', label: 'YouTube', details_kind: 'Video', search_verb: 'Search' },
 		{ id: 'YouTubeMusic', label: 'YT Music', details_kind: 'Video', search_verb: 'Search' },
 		{ id: 'SoundCloud', label: 'SoundCloud', details_kind: 'Generic', search_verb: 'Search' },
+		{ id: 'ApplePodcasts', label: 'Podcasts', details_kind: 'Podcast', search_verb: 'Search' },
 		{ id: 'ArchiveOrg', label: 'archive.org', details_kind: 'Generic', search_verb: 'Search' },
 		{ id: 'LibriVox', label: 'LibriVox', details_kind: 'Podcast', search_verb: 'Search' },
 		{ id: 'Local', label: 'Local', details_kind: 'Local', search_verb: null },
@@ -138,17 +139,18 @@
 		checks.push(`Keyboard ${keyName} uses the shared Rust keymap IPC`);
 	};
 	/** Function keys stay shared so the core can preserve modal-specific actions. */
-	const forwardFunctionKey = async (number, target, context) => {
+	const forwardFunctionKey = async (number, target, context, shift = false) => {
 		const start = calls.length;
-		const event = new KeyboardEvent('keydown', { key: `F${number}`, bubbles: true, cancelable: true });
+		const label = `${shift ? 'Shift+' : ''}F${number}`;
+		const event = new KeyboardEvent('keydown', { key: `F${number}`, shiftKey: shift, bubbles: true, cancelable: true });
 		target.dispatchEvent(event);
-		await until(() => calls.slice(start).some((call) => call.command === 'key'), `F${number} in ${context}`);
+		await until(() => calls.slice(start).some((call) => call.command === 'key'), `${label} in ${context}`);
 		const forwarded = calls.slice(start).filter((call) => call.command === 'key');
 		assert(forwarded.length === 1 && JSON.stringify(forwarded[0].args.press)
-			=== JSON.stringify({ key: { F: number }, ctrl: false, alt: false, shift: false }),
-			`F${number} in ${context} reaches the shared keymap exactly once`);
+			=== JSON.stringify({ key: { F: number }, ctrl: false, alt: false, shift }),
+			`${label} in ${context} reaches the shared keymap exactly once`);
 		assert(event.defaultPrevented && !calls.slice(start).some((call) => call.command === 'dispatch'),
-			`F${number} in ${context} suppresses browser defaults without overriding the core action`);
+			`${label} in ${context} suppresses browser defaults without overriding the core action`);
 	};
 	const mediaId = { source: 'archive-org', external_id: 'https://archive.org/download/fixture/first.mp3' };
 	const row = (title, id = mediaId) => ({ ...clone(defaults.RowView), title, media_id: id, source: 'archive.org' });
@@ -1062,11 +1064,16 @@
 		snapshot({ screen: 'History' });
 		await until(() => button('Log', tabs)?.getAttribute('aria-selected') === 'true', 'Log is selected for a History snapshot');
 		await key('F3', { F: 3 });
-		for (const number of [1, 2, 12]) await forwardFunctionKey(number, document, 'ordinary browsing');
-		snapshot({ help_open: true });
+		for (const number of [1, 2, 11, 12]) await forwardFunctionKey(number, document, 'ordinary browsing');
+		await forwardFunctionKey(1, document, 'ordinary browsing', true);
+		snapshot({ help_open: true, lan_share_supported: true });
 		await until(() => dialog()?.textContent.includes('The same map serves the terminal front-end'), 'Log navigation help');
 		const shortcut = [...dialog().querySelectorAll('dt')].find((node) => node.textContent === 'F1 · F2 · F3 · F4 · F5');
 		assert(shortcut?.nextElementSibling.textContent === 'YT · Local · log · lists · stats', 'F1, F2 and F3 help name the YT, Local and Log tabs');
+		const podcasts = [...dialog().querySelectorAll('dt')].find((node) => node.textContent === 'F11');
+		assert(podcasts?.nextElementSibling.textContent === 'Podcasts', 'F11 help names the built Podcasts source');
+		const sharing = [...dialog().querySelectorAll('dt')].find((node) => node.textContent === 'Shift+F1');
+		assert(sharing?.nextElementSibling.textContent === 'share Local selection', 'Shift+F1 help keeps Local sharing separate from F11 Podcasts');
 		const offline = [...dialog().querySelectorAll('dt')].find((node) => node.textContent === 'F12');
 		assert(offline?.nextElementSibling.textContent === 'offline', 'F12 help names Offline rather than podcast publishing');
 		assert(!dialog().textContent.includes('F11 · F12'), 'Help does not advertise a podcast feed hotkey');
@@ -1075,6 +1082,8 @@
 		const privateShortcut = [...dialog().querySelectorAll('dt')].find((node) => node.textContent === 'F1 · F2 · F4 · F5');
 		assert(privateShortcut?.nextElementSibling.textContent === 'YT · Local · lists · stats',
 			'Disabling Log preserves the F1 YT shortcut in help');
+		const privatePodcasts = [...dialog().querySelectorAll('dt')].find((node) => node.textContent === 'F11');
+		assert(privatePodcasts?.nextElementSibling.textContent === 'Podcasts', 'Disabling Log preserves F11 Podcasts help');
 		snapshot({ help_open: false, playback_history_enabled: true });
 		await until(() => !dialog() && button('Log', tabs), 'reenabling playback history restores Log');
 		snapshot(previous);
