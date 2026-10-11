@@ -2481,6 +2481,11 @@ fn write_text_response(
     Ok(())
 }
 
+/// Streams a local file or range and explicitly closes its response's send side.
+///
+/// Successful HEAD, empty, and rejected-range responses need the same graceful
+/// EOF as a body response. Do not rely on socket-handle drop: the request reader
+/// can retain a clone, and implicit Winsock close can reset the peer's read.
 fn write_file_response(
     stream: &mut HttpStream,
     content_type: &str,
@@ -2498,7 +2503,7 @@ fn write_file_response(
                     stream,
                     "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{length}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                 )?;
-                return Ok(());
+                return stream.finish_response();
             }
         },
         None => None,
@@ -2521,7 +2526,7 @@ fn write_file_response(
     }
     write!(stream, "Connection: close\r\n\r\n")?;
     if head || content_length == 0 {
-        return Ok(());
+        return stream.finish_response();
     }
     let mut file = File::open(path)?;
     file.seek(SeekFrom::Start(start))?;
@@ -2536,7 +2541,7 @@ fn write_file_response(
         write_media_bytes(stream, &buffer[..read], stop)?;
         remaining = remaining.saturating_sub(read as u64);
     }
-    Ok(())
+    stream.finish_response()
 }
 
 /// Maximum time without a successful media write before releasing its worker.
@@ -3800,6 +3805,72 @@ mod tests {
                     "Youta is busy; retry shortly"
                 }
             );
+        }
+    }
+
+    /// Completed file responses must signal EOF even while another socket handle lives.
+    #[test]
+    fn local_file_responses_signal_eof_before_connection_handles_are_dropped() {
+        let directory = canonical_tempdir("lan-file-response-eof");
+        let audio = directory.path().join("episode.opus");
+        for (content, range, status, expected_length, expected_body) in [
+            ("0123456789", "", "200 OK", 10, "0123456789"),
+            (
+                "0123456789",
+                "Range: bytes=2-5\r\n",
+                "206 Partial Content",
+                4,
+                "2345",
+            ),
+            (
+                "0123456789",
+                "Range: bytes=99-100\r\n",
+                "416 Range Not Satisfiable",
+                0,
+                "",
+            ),
+            ("", "", "200 OK", 0, ""),
+        ] {
+            fs::write(&audio, content).unwrap();
+            let state = ServerState::new(
+                prepare_file_share(&audio).unwrap(),
+                "http://127.0.0.1".to_owned(),
+            )
+            .unwrap();
+            for method in ["HEAD", "GET"] {
+                let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+                let mut client = TcpStream::connect_timeout(
+                    &listener.local_addr().unwrap(),
+                    Duration::from_secs(2),
+                )
+                .unwrap();
+                client
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                client
+                    .set_write_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let (socket, _) = listener.accept().unwrap();
+                let retained_handle = socket.try_clone().unwrap();
+                client
+                    .write_all(
+                        format!("{method} /media/0/episode.opus HTTP/1.1\r\nHost: fixture\r\n{range}\r\n")
+                            .as_bytes(),
+                    )
+                    .unwrap();
+                handle_connection(socket, &state, &AtomicBool::new(false)).unwrap();
+                let mut response = String::new();
+                let result = client.take(4096).read_to_string(&mut response);
+                drop(retained_handle);
+                result.expect("completed file response must explicitly signal EOF");
+                let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+                assert!(
+                    headers.starts_with(&format!("HTTP/1.1 {status}")),
+                    "{headers}"
+                );
+                assert!(headers.contains(&format!("Content-Length: {expected_length}\r\n")));
+                assert_eq!(body, if method == "HEAD" { "" } else { expected_body });
+            }
         }
     }
 
