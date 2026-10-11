@@ -48,8 +48,8 @@ jobs:
     with:
       release-validation: true
 
-  binaries:
-    name: ${{ matrix.operating_system }} ${{ matrix.architecture }}
+  tui:
+    name: TUI ${{ matrix.operating_system }} ${{ matrix.architecture }}
     needs: validate
     strategy:
       fail-fast: false
@@ -632,7 +632,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     needs:
       - validate
-      - binaries
+      - tui
       - desktop
       - desktop-i686
       - vendor

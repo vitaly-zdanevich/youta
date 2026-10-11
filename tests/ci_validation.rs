@@ -79,7 +79,7 @@ fn release_publication_requires_shared_ci_and_tag_validation() {
     assert!(!validate.contains("continue-on-error:"));
     assert!(!validate.contains("secrets: inherit"));
     assert!(job(&release, "validate-tag").contains("Require a matching version tag"));
-    for name in ["binaries", "desktop", "desktop-i686", "vendor"] {
+    for name in ["tui", "desktop", "desktop-i686", "vendor"] {
         assert!(job(&release, name).contains("needs: validate"), "{name}");
     }
     assert!(job(&release, "publish").contains("      - validate\n"));
@@ -87,6 +87,20 @@ fn release_publication_requires_shared_ci_and_tag_validation() {
     for duplicated in ["cargo fmt", "cargo clippy", "cargo doc", "cargo test"] {
         assert!(!validate.contains(duplicated), "{duplicated}");
     }
+}
+
+/// Matrix labels identify the terminal frontend without changing its artifacts.
+#[test]
+fn release_tui_matrix_is_named_and_required_for_publication() {
+    let release = workflow("release.yml");
+    let tui = job(&release, "tui");
+    assert!(tui.contains("name: TUI ${{ matrix.operating_system }} ${{ matrix.architecture }}"));
+    assert!(job(&release, "publish").contains("      - tui\n"));
+    assert!(!release.contains("  binaries:\n"));
+    assert!(!job(&release, "publish").contains("      - binaries\n"));
+    assert!(tui.contains(
+        "path: dist/youta-${{ env.PACKAGE_VERSION }}-${{ matrix.artifact_os }}-${{ matrix.architecture }}\n"
+    ));
 }
 
 /// Tag deduplication must retain all branch pushes and normal pull requests.
