@@ -18,7 +18,7 @@
 
 ![Youta logo](gui/icons/icon.png)
 
-![Youta subscriptions screen](screenshot.webp)
+![Youta photo](photo.jpg)
 
 Youta is a low-resource audio player and subscription manager written in Rust,
 with terminal and desktop front-ends. It saves and shows listening progress.
