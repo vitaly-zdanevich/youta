@@ -29382,6 +29382,23 @@ for encoded, expected in json.load(sys.stdin):
             }),
             ..ViewModel::default()
         };
+        let expected_actions = [
+            UiAction::OpenCommonsUpload,
+            UiAction::OpenArchiveUpload,
+            UiAction::OpenEvernoteNote,
+            UiAction::OpenChannelInBrowser,
+            UiAction::OpenInBrowser,
+            UiAction::ToggleTodoPlaylist,
+            UiAction::OpenPlaylistPopup,
+            UiAction::EditPrivateNote,
+            UiAction::OpenVideoComments,
+            UiAction::GenerateVideoSummary,
+            #[cfg(feature = "lan-sharing")]
+            UiAction::ShareYouTubeChannelPodcast,
+            UiAction::ToggleSubscription,
+            UiAction::BrowseYouTubeChannel,
+        ];
+        let podcast_rows = u16::from(cfg!(feature = "lan-sharing"));
         for show_hotkeys in [true, false] {
             let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
             let mut hits = HitMap::default();
@@ -29402,6 +29419,18 @@ for encoded, expected in json.load(sys.stdin):
             for (action, key, label, row) in [
                 (UiAction::OpenVideoComments, "F6", "Twenty comments", 3),
                 (UiAction::GenerateVideoSummary, "G", "Summarize", 4),
+                (
+                    UiAction::ToggleSubscription,
+                    "s",
+                    "Subscribe (locally)",
+                    5 + podcast_rows,
+                ),
+                (
+                    UiAction::BrowseYouTubeChannel,
+                    "c",
+                    "To channel",
+                    6 + podcast_rows,
+                ),
             ] {
                 let (_, area) = hits
                     .detail_buttons
@@ -29424,14 +29453,24 @@ for encoded, expected in json.load(sys.stdin):
                 .unwrap();
             assert_eq!(
                 description.y,
-                hits.details_panel.y + 6 + u16::from(cfg!(feature = "lan-sharing")),
-                "moving both actions saves two rows alongside the optional podcast button"
+                hits.details_panel.y + 7 + podcast_rows,
+                "paired comments and summary retain room for Subscribe, To channel, and the optional podcast button"
             );
             assert_eq!(
                 hits.detail_buttons.len(),
-                11 + usize::from(cfg!(feature = "lan-sharing")),
+                expected_actions.len(),
                 "all controls must remain visible exactly once"
             );
+            for expected in &expected_actions {
+                assert_eq!(
+                    hits.detail_buttons
+                        .iter()
+                        .filter(|(action, _)| action == expected)
+                        .count(),
+                    1,
+                    "detail action {expected:?} must appear exactly once"
+                );
+            }
             for (action, area) in &hits.detail_buttons {
                 assert_eq!(area.intersection(hits.details_panel), *area);
                 assert!(hits.detail_buttons.iter().all(
@@ -29840,6 +29879,7 @@ for encoded, expected in json.load(sys.stdin):
             UiAction::OpenVideoComments,
             UiAction::ShareYouTubeChannelPodcast,
             UiAction::ToggleSubscription,
+            UiAction::BrowseYouTubeChannel,
         ];
         let mut action_areas = expected_actions
             .iter()
@@ -29889,6 +29929,7 @@ for encoded, expected in json.load(sys.stdin):
             "[F6] Twenty comments".to_owned(),
             "Podcast feed".to_owned(),
             "[s] Subscribe (locally)".to_owned(),
+            "[c] To channel".to_owned(),
         ];
         for ((expected, expected_label), area) in expected_actions
             .iter()
