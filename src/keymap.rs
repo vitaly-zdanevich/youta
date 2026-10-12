@@ -405,6 +405,15 @@ mod wire_tests {
                     "screen {screen:?}, F{number}"
                 );
                 for modifiers in 1..8 {
+                    let modified_action = if number == 2
+                        && modifiers == 4
+                        && cfg!(feature = "lan-sharing")
+                        && screen == Screen::Local
+                    {
+                        Some(UiAction::ShareLocalPodcast)
+                    } else {
+                        None
+                    };
                     assert_eq!(
                         key_action(
                             KeyPress {
@@ -417,7 +426,7 @@ mod wire_tests {
                             None,
                             None
                         ),
-                        None
+                        modified_action
                     );
                 }
             }
@@ -2165,6 +2174,230 @@ mod wire_tests {
         );
     }
 
+    /// Feed shortcuts follow the visible Local and YouTube actions without taking tab keys.
+    #[cfg(feature = "lan-sharing")]
+    #[test]
+    fn podcast_feed_shortcuts_share_local_and_eligible_youtube_contexts() {
+        use crate::subscriptions::SubscriptionKind;
+        use crate::view::{RightPanelMode, Screen, SubscriptionsView};
+
+        let feed_keys = [
+            KeyPress {
+                shift: true,
+                ..KeyPress::new(Key::F(2))
+            },
+            KeyPress::new(Key::F(14)),
+        ];
+        let local = ViewModel {
+            screen: Screen::Local,
+            ..ViewModel::default()
+        };
+        for key in feed_keys {
+            assert_eq!(
+                key_action(key, &local, None, None),
+                Some(UiAction::ShareLocalPodcast)
+            );
+        }
+        for screen in [Screen::Search, Screen::Subscriptions] {
+            for mode in [RightPanelMode::Details, RightPanelMode::Channel] {
+                for media_id in [
+                    None,
+                    Some(crate::domain::MediaId::new(
+                        crate::domain::SourceKind::YouTube,
+                        "fixture-video",
+                    )),
+                ] {
+                    let view = ViewModel {
+                        screen,
+                        right_panel_mode: mode,
+                        details: Some(DetailView {
+                            channel_id: "UCfixture".into(),
+                            media_id,
+                            ..DetailView::default()
+                        }),
+                        subscriptions: SubscriptionsView {
+                            source_kind: SubscriptionKind::YouTube,
+                            ..SubscriptionsView::default()
+                        },
+                        ..ViewModel::default()
+                    };
+                    assert!(view.youtube_podcast_feed_available());
+                    for key in feed_keys {
+                        assert_eq!(
+                            key_action(key, &view, None, None),
+                            Some(UiAction::ShareYouTubeChannelPodcast),
+                            "{screen:?}, {mode:?}"
+                        );
+                        for modified in [
+                            KeyPress { ctrl: true, ..key },
+                            KeyPress { alt: true, ..key },
+                        ] {
+                            assert_eq!(key_action(modified, &view, None, None), None);
+                            assert_eq!(key_action(modified, &local, None, None), None);
+                        }
+                        let mut unavailable = view.clone();
+                        unavailable.details.as_mut().unwrap().channel_id.clear();
+                        assert_eq!(key_action(key, &unavailable, None, None), None);
+                        for other_screen in
+                            [Screen::Downloaded, Screen::History, Screen::YouTubeMusic]
+                        {
+                            unavailable = view.clone();
+                            unavailable.screen = other_screen;
+                            assert_eq!(key_action(key, &unavailable, None, None), None);
+                        }
+                        unavailable = view.clone();
+                        unavailable.screen = Screen::Subscriptions;
+                        unavailable.subscriptions.source_kind = SubscriptionKind::Rss;
+                        assert_eq!(key_action(key, &unavailable, None, None), None);
+                    }
+                    assert_eq!(
+                        key_action(KeyPress::new(Key::F(2)), &view, None, None),
+                        cfg!(feature = "local-browser")
+                            .then_some(UiAction::ShowScreen(Screen::Local))
+                    );
+                    assert_eq!(
+                        key_action(KeyPress::new(Key::F(11)), &view, None, None),
+                        cfg!(feature = "apple-podcasts")
+                            .then_some(UiAction::ShowScreen(Screen::ApplePodcasts))
+                    );
+                    assert_eq!(
+                        key_action(KeyPress::new(Key::F(12)), &view, None, None),
+                        Some(UiAction::ShowScreen(Screen::Downloaded))
+                    );
+                }
+            }
+        }
+        for key in feed_keys {
+            assert_eq!(key_action(key, &ViewModel::default(), None, None), None);
+        }
+        assert_eq!(
+            key_action(
+                KeyPress {
+                    shift: true,
+                    ..KeyPress::new(Key::F(14))
+                },
+                &local,
+                None,
+                None
+            ),
+            None,
+            "the Linux-console alias accepts only an unmodified F14"
+        );
+    }
+
+    /// Search, Help, selection, and popup owners retain the feed keys until dismissed.
+    #[cfg(feature = "lan-sharing")]
+    #[test]
+    fn podcast_feed_shortcuts_keep_editors_and_modals_in_control() {
+        use crate::view::{PrivateNotePopupView, Screen, SiteFilePopupView};
+
+        for screen in [Screen::Local, Screen::Search] {
+            let mut view = ViewModel {
+                screen,
+                details: Some(DetailView {
+                    channel_id: "UCfixture".into(),
+                    ..DetailView::default()
+                }),
+                ..ViewModel::default()
+            };
+            for key in [
+                KeyPress {
+                    shift: true,
+                    ..KeyPress::new(Key::F(2))
+                },
+                KeyPress::new(Key::F(14)),
+            ] {
+                view.search_editing = true;
+                assert_eq!(key_action(key, &view, None, None), None);
+                view.search_editing = false;
+                view.help_open = true;
+                assert_eq!(key_action(key, &view, None, None), None);
+                view.help_open = false;
+                view.text_selection_mode = true;
+                assert_eq!(key_action(key, &view, None, None), None);
+                view.text_selection_mode = false;
+                view.private_note_popup = Some(PrivateNotePopupView::default());
+                assert_eq!(key_action(key, &view, None, None), None);
+                view.private_note_popup = None;
+                view.site_file_popup = Some(SiteFilePopupView::default());
+                assert_eq!(key_action(key, &view, None, None), None);
+                view.site_file_popup = None;
+            }
+        }
+    }
+
+    /// A build without LAN sharing must leave both feed-key encodings unassigned.
+    #[cfg(not(feature = "lan-sharing"))]
+    #[test]
+    fn podcast_feed_shortcuts_are_disabled_without_lan_sharing() {
+        use crate::view::Screen;
+
+        for screen in [Screen::Local, Screen::Search, Screen::Subscriptions] {
+            let view = ViewModel {
+                screen,
+                details: Some(DetailView {
+                    channel_id: "UCfixture".into(),
+                    ..DetailView::default()
+                }),
+                ..ViewModel::default()
+            };
+            for key in [
+                KeyPress {
+                    shift: true,
+                    ..KeyPress::new(Key::F(2))
+                },
+                KeyPress::new(Key::F(14)),
+            ] {
+                assert_eq!(key_action(key, &view, None, None), None);
+            }
+        }
+    }
+
+    /// Configured commands override either feed encoding only during ordinary browsing.
+    #[cfg(all(feature = "lan-sharing", feature = "cmd"))]
+    #[test]
+    fn podcast_feed_shortcuts_keep_custom_command_priority() {
+        use crate::view::CustomCommandButtonView;
+
+        for screen in [Screen::Local, Screen::Search] {
+            for (binding, key) in [
+                (
+                    "Shift+F2",
+                    KeyPress {
+                        shift: true,
+                        ..KeyPress::new(Key::F(2))
+                    },
+                ),
+                ("F14", KeyPress::new(Key::F(14))),
+            ] {
+                let mut view = ViewModel {
+                    screen,
+                    details: Some(DetailView {
+                        channel_id: "UCfixture".into(),
+                        ..DetailView::default()
+                    }),
+                    custom_command_buttons: vec![CustomCommandButtonView {
+                        id: 7,
+                        binding: Some(
+                            crate::local_command::buttons::Hotkey::parse(binding).unwrap(),
+                        ),
+                        ..CustomCommandButtonView::default()
+                    }],
+                    ..ViewModel::default()
+                };
+                assert_eq!(
+                    key_action(key, &view, None, None),
+                    Some(UiAction::RunCustomCommand(7))
+                );
+                view.search_editing = true;
+                assert_eq!(key_action(key, &view, None, None), None);
+                view.search_editing = false;
+                view.help_open = true;
+                assert_eq!(key_action(key, &view, None, None), None);
+            }
+        }
+    }
+
     /// LAN shortcuts remain available without the optional command or podcast features.
     #[cfg(feature = "lan-sharing")]
     #[test]
@@ -2274,7 +2507,14 @@ mod wire_tests {
             None,
             "the modal must own keys until it closes"
         );
-        for key in share_keys.into_iter().chain([KeyPress::new(Key::F(11))]) {
+        for key in share_keys.into_iter().chain([
+            KeyPress::new(Key::F(11)),
+            KeyPress {
+                shift: true,
+                ..KeyPress::new(Key::F(2))
+            },
+            KeyPress::new(Key::F(14)),
+        ]) {
             assert_eq!(key_action(key, &popup, None, None), None);
         }
     }
@@ -2315,6 +2555,7 @@ mod wire_tests {
     #[test]
     fn podcast_feed_options_popup_owns_review_and_preparation_keys() {
         let options = ViewModel {
+            screen: crate::view::Screen::Local,
             podcast_feed_options_popup: Some(crate::view::PodcastFeedOptionsPopupView {
                 source: "Local folder: album".to_owned(),
                 selected_item: "02-selected.opus".to_owned(),
@@ -2345,6 +2586,15 @@ mod wire_tests {
             key_action(KeyPress::new(Key::Esc), &options, None, None),
             Some(UiAction::DismissPodcastFeed)
         );
+        for key in [
+            KeyPress {
+                shift: true,
+                ..KeyPress::new(Key::F(2))
+            },
+            KeyPress::new(Key::F(14)),
+        ] {
+            assert_eq!(key_action(key, &options, None, None), None);
+        }
 
         let mut preparing = options;
         preparing
@@ -2361,6 +2611,15 @@ mod wire_tests {
             key_action(KeyPress::new(Key::Esc), &preparing, None, None),
             Some(UiAction::DismissPodcastFeed)
         );
+        for key in [
+            KeyPress {
+                shift: true,
+                ..KeyPress::new(Key::F(2))
+            },
+            KeyPress::new(Key::F(14)),
+        ] {
+            assert_eq!(key_action(key, &preparing, None, None), None);
+        }
     }
 
     #[test]
@@ -2620,6 +2879,8 @@ fn subscription_items_active(view: &ViewModel) -> bool {
 /// With the `cmd` feature and terminal command capability, `:` opens the
 /// command prompt from any tab, regardless of playback. Editors, modals, and
 /// configured custom-command bindings keep priority over that shortcut.
+/// With `lan-sharing`, `Shift+F2` (or the Linux-console `F14` encoding) creates
+/// a podcast feed for the Local selection or an eligible `YouTube` channel.
 pub fn key_action(
     key: KeyPress,
     view: &ViewModel,
@@ -4004,6 +4265,11 @@ fn unfiltered_key_action(
         Key::F(13) if view.screen == Screen::Local && !key.modified() => {
             Some(UiAction::ShareLocalFiles)
         }
+        #[cfg(feature = "lan-sharing")]
+        Key::F(2) if key.shift && !key.chorded() => podcast_feed_action(view),
+        // Linux console keymaps encode Shift+F2 as an unmodified F14.
+        #[cfg(feature = "lan-sharing")]
+        Key::F(14) if !key.modified() => podcast_feed_action(view),
         Key::Char('/') => Some(UiAction::BeginSearch),
         #[cfg(feature = "cmd")]
         Key::Char(':') if !key.chorded() && view.local_command_available => {
@@ -4445,6 +4711,17 @@ fn unfiltered_key_action(
             Some(UiAction::SeekPercent(percentage))
         }
         _ => None,
+    }
+}
+
+/// Matches the feed shortcut to the existing Local or eligible YouTube button action.
+#[cfg(feature = "lan-sharing")]
+fn podcast_feed_action(view: &ViewModel) -> Option<UiAction> {
+    if view.screen == Screen::Local {
+        Some(UiAction::ShareLocalPodcast)
+    } else {
+        view.youtube_podcast_feed_available()
+            .then_some(UiAction::ShareYouTubeChannelPodcast)
     }
 }
 

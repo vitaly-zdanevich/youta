@@ -450,17 +450,21 @@ export function Details({ view, kind }: { view: ViewModel; kind: InformationPane
 		{view.lan_share_supported && kind === 'Local' ? (
 			<>
 				<Action onClick={() => void dispatch('ShareLocalFiles')}>Share over LAN</Action>
-				<Action onClick={() => void dispatch('ShareLocalPodcast')}>Podcast feed</Action>
+				<Action onClick={() => void dispatch('ShareLocalPodcast')}>
+					<kbd className='font-mono text-ink-faint'>[Shift+F2]</kbd>{' '}Podcast feed
+				</Action>
 			</>
 		) : null}
-		{/* Channels and selected YouTube videos share the same core feed review;
-		    videos keep their optional episode boundary without a separate hotkey. */}
+		{/* Channels and selected YouTube videos share the same feed shortcut and
+		    core review; videos retain their optional episode boundary. */}
 		{view.lan_share_supported &&
 		(details.media_id === null || isYouTube) &&
 		details.channel_id !== '' &&
 		(view.screen === 'Search' ||
 			(view.screen === 'Subscriptions' && view.subscriptions.source_kind === YOUTUBE)) ? (
-			<Action onClick={() => void dispatch('ShareYouTubeChannelPodcast')}>Podcast feed</Action>
+			<Action onClick={() => void dispatch('ShareYouTubeChannelPodcast')}>
+				<kbd className='font-mono text-ink-faint'>[Shift+F2]</kbd>{' '}Podcast feed
+			</Action>
 		) : null}
 		{view.channel_download_supported &&
 		// Videos carry channel metadata too; only channel entities have no media ID.

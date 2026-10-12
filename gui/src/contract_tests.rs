@@ -1600,6 +1600,7 @@ fn the_window_help_uses_current_navigation_labels() {
         );
     }
     assert!(source.contains("['Shift+F1', 'share Local selection']"));
+    assert!(source.contains("['Shift+F2', 'podcast feed for Local selection or YouTube channel']"));
 }
 
 #[test]

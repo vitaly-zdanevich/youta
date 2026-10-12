@@ -98,6 +98,14 @@ function elements(element) {
 	return [element, ...React.Children.toArray(element.props.children).flatMap(elements)];
 }
 
+/** Flatten shortcut markup and labels as users read the rendered action. */
+function buttonText(element) {
+	if (typeof element === 'string' || typeof element === 'number') return String(element);
+	if (!React.isValidElement(element)) return '';
+	if (typeof element.type === 'function') return buttonText(element.type(element.props));
+	return React.Children.toArray(element.props.children).map(buttonText).join('');
+}
+
 /** Minimal provider fixture keeps unrelated panels and optional capabilities inactive. */
 function channelDetailButtons(screen, subscribed, mediaSource = 'you-tube', channelId = 'UCfixture', kind = 'Video') {
 	const view = {
@@ -132,15 +140,17 @@ function podcastButtons({ screen = 'Search', kind = 'Video', mediaSource = 'you-
 			channel_subscriber_count: null, channel_video_count: null, channel_total_view_count: null },
 	};
 	return elements(detailsModule.exports.Details({ view, kind }))
-		.filter((node) => node.type === 'button' && node.props.children === 'Podcast feed');
+		.filter((node) => node.type === 'button' && buttonText(node).endsWith('Podcast feed'));
 }
 
-test('YouTube episodes and channel entities retain a visible Podcast feed action without a shortcut', () => {
+test('YouTube episodes and channels show Shift+F2 beside the Podcast feed action', () => {
 	for (const screen of ['Search', 'Subscriptions']) {
 		for (const mediaSource of ['you-tube', null]) {
 			actions.length = 0;
 			const buttons = podcastButtons({ screen, mediaSource });
 			assert.equal(buttons.length, 1, `${screen}, source=${mediaSource}`);
+			assert.match(buttonText(buttons[0]), /^\[Shift\+F2\]\s*Podcast feed$/);
+			assert.equal(elements(buttons[0]).filter((node) => node.type === 'kbd').length, 1);
 			assert.deepEqual(actions, [], 'rendering cannot start feed preparation');
 			buttons[0].props.onClick();
 			assert.deepEqual(actions, ['ShareYouTubeChannelPodcast']);
@@ -156,11 +166,13 @@ test('YouTube podcast controls retain feature, route and channel identity gates'
 	]) assert.deepEqual(podcastButtons(patch), [], JSON.stringify(patch));
 });
 
-test('Local Podcast feed remains available without its former F12 shortcut', () => {
+test('Local Podcast feed shows Shift+F2 and keeps the Local action', () => {
 	actions.length = 0;
 	const patch = { screen: 'Local', kind: 'Local', mediaSource: 'local', channelId: '' };
 	const buttons = podcastButtons(patch);
 	assert.equal(buttons.length, 1);
+	assert.match(buttonText(buttons[0]), /^\[Shift\+F2\]\s*Podcast feed$/);
+	assert.equal(elements(buttons[0]).filter((node) => node.type === 'kbd').length, 1);
 	buttons[0].props.onClick();
 	assert.deepEqual(actions, ['ShareLocalPodcast']);
 	assert.deepEqual(podcastButtons({ ...patch, supported: false }), []);

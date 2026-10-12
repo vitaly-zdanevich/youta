@@ -86,7 +86,9 @@ test('navigation help advertises F1 YT, F2 Local and F12 Offline independently o
 		const share = cells.findIndex((node) => node.type === 'dt' && text(node) === 'Shift+F1');
 		assert.notEqual(share, -1);
 		assert.equal(text(cells[share + 1]), 'share Local selection');
-		assert.ok(!text(tree).includes('podcast feed'), 'Podcast feed has no keyboard shortcut');
+		const feed = cells.findIndex((node) => node.type === 'dt' && text(node) === 'Shift+F2');
+		assert.notEqual(feed, -1);
+		assert.equal(text(cells[feed + 1]), 'podcast feed for Local selection or YouTube channel');
 	}
 });
 
@@ -96,6 +98,7 @@ test('window Help derives Podcast support from its native source catalogue', asy
 	assert.ok(app.includes("podcastsSupported={sources.some((source) => source.id === 'ApplePodcasts')}"));
 	const tree = module.exports.HelpPopup({ podcastsSupported: true, lanShareSupported: false });
 	assert.ok(!text(tree).includes('share Local selection'));
+	assert.ok(!text(tree).includes('Shift+F2'));
 	assert.ok(text(tree).includes('F11Podcasts'));
 });
 

@@ -5520,12 +5520,12 @@ fn render_information_panel(
             &right_buttons,
             &mut next_left_row,
             inner.width,
-            "Podcast feed".to_owned(),
+            button("Shift+F2", "Podcast feed", show_hotkeys),
             theme.accent,
             UiAction::ShareLocalPodcast,
         )
     });
-    // Keep feed review reachable from channels and episodes without a dedicated hotkey.
+    // The shared shortcut keeps feed review reachable from channels and episodes.
     #[cfg(feature = "lan-sharing")]
     let youtube_podcast_button = view.youtube_podcast_feed_available().then(|| {
         push_left_detail_button(
@@ -5533,7 +5533,7 @@ fn render_information_panel(
             &right_buttons,
             &mut next_left_row,
             inner.width,
-            "Podcast feed".to_owned(),
+            button("Shift+F2", "Podcast feed", show_hotkeys),
             theme.accent,
             UiAction::ShareYouTubeChannelPodcast,
         )
@@ -8563,11 +8563,14 @@ fn search_kind_help(view: &ViewModel) -> &'static str {
 fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
     let area = centered_rect(76, 92, frame.area());
     frame.render_widget(Clear, area);
-    let mut local_help =
-        "  Local: Esc parent     PageUp/Down page   H all files   Z size".to_owned();
-    // This row has room for Copy; extending the full action row would wrap compact help.
+    let mut local_help = "  Local: Esc parent     PageUp/Down page H all Z size".to_owned();
+    // Budget Copy and the feed shortcut here: the full action row cannot grow
+    // without clipping shared controls farther down the compact Help popup.
     if cfg!(feature = "local-copy") {
-        local_help.push_str("  c copy");
+        local_help.push_str(" c copy");
+    }
+    if view.lan_share_supported {
+        local_help.push_str(" Shift+F2 feed");
     }
     let mut local_actions = Vec::new();
     if cfg!(feature = "local-rename") {
@@ -30037,7 +30040,7 @@ for encoded, expected in json.load(sys.stdin):
             "[P] Playlist".to_owned(),
             "[n] Add private note".to_owned(),
             "[F6] Twenty comments".to_owned(),
-            "Podcast feed".to_owned(),
+            "[Shift+F2] Podcast feed".to_owned(),
             "[s] Subscribe (locally)".to_owned(),
             "[c] To channel".to_owned(),
         ];
@@ -42279,7 +42282,7 @@ prose 07:25 remains clickable but is not a chapter";
 
     #[cfg(feature = "lan-sharing")]
     #[test]
-    fn youtube_channel_and_episode_keep_podcast_button_without_hotkey() {
+    fn youtube_channel_and_episode_show_the_podcast_feed_hotkey() {
         for (screen, video_id) in [
             (Screen::Search, Some("dQw4w9WgXcQ")),
             (Screen::Subscriptions, Some("dQw4w9WgXcQ")),
@@ -42323,7 +42326,7 @@ prose 07:25 remains clickable but is not a chapter";
                 .expect("draw selected subscription video");
 
             let rendered = rendered_text(&terminal);
-            assert!(rendered.contains("Podcast feed"));
+            assert!(rendered.contains("[Shift+F2] Podcast feed"));
             assert!(!rendered.contains("[F12] Podcast feed"));
             assert!(
                 hit_map
@@ -42923,7 +42926,7 @@ prose 07:25 remains clickable but is not a chapter";
         ] {
             assert_eq!(key_action(key, &local), Some(UiAction::ShareLocalFiles));
         }
-        assert!(rendered.contains("Podcast feed"));
+        assert!(rendered.contains("[Shift+F2] Podcast feed"));
         assert!(!rendered.contains("[F12] Podcast feed"));
         for expected in [UiAction::ShareLocalFiles, UiAction::ShareLocalPodcast] {
             assert!(

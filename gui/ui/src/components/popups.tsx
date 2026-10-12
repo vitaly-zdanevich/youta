@@ -220,8 +220,11 @@ export function HelpPopup({
           : []),
         ["Shift+J · Shift+K", "mark Local row and move down · up"],
 		['c / m (Local)', 'copy / move selected files or folders, when supported'],
-		...(lanShareSupported
-			? ([['Shift+F1', 'share Local selection']] satisfies Array<[string, string]>)
+        ...(lanShareSupported
+			? ([
+				['Shift+F1', 'share Local selection'],
+				['Shift+F2', 'podcast feed for Local selection or YouTube channel'],
+			] satisfies Array<[string, string]>)
 			: []),
         ...(audioQualitySupported
           ? ([

@@ -1029,7 +1029,7 @@
 		}
 		snapshot(previous);
 	}
-	/** Visible feed controls preserve the existing selected-episode review without a shortcut. */
+	/** Feed controls expose their shared shortcut and preserve selected-episode review. */
 	async function checkPodcastFeedButtons() {
 		const previous = clone(view);
 		for (const screen of ['Search', 'Subscriptions', 'Local']) {
@@ -1041,15 +1041,17 @@
 					details: { ...clone(defaults.DetailView), title, channel_id: screen === 'Local' ? '' : 'UCfixture',
 						media_id: mediaSource === null ? null : { source: mediaSource, external_id: 'fixture-episode' } } });
 				await until(() => document.querySelector('[aria-label=Details] h2')?.textContent === title, title);
-				const feed = button('Podcast feed', document.querySelector('[aria-label=Details]'));
-				assert(Boolean(feed), `${title} retains a visible Podcast feed button`);
+				const feed = button('[Shift+F2] Podcast feed', document.querySelector('[aria-label=Details]'));
+				assert(feed?.querySelector('kbd')?.textContent === '[Shift+F2]', `${title} shows the Podcast feed shortcut`);
 				await action(screen === 'Local' ? 'ShareLocalPodcast' : 'ShareYouTubeChannelPodcast',
 					() => feed.click(), `${title} opens the shared feed review action`);
 				for (const number of [2, 12]) await forwardFunctionKey(number, feed, title);
+				await forwardFunctionKey(2, feed, title, true);
+				await forwardFunctionKey(14, feed, title);
 			}
 		}
 		snapshot({ lan_share_supported: false });
-		await until(() => !button('Podcast feed'), 'disabled LAN support hides the feed button');
+		await until(() => !button('[Shift+F2] Podcast feed'), 'disabled LAN support hides the feed button');
 		snapshot(previous);
 		await until(() => document.querySelector('[aria-label=Sources] [aria-selected=true]')?.textContent.includes('archive.org'),
 			'restore Archive after feed controls');
@@ -1074,9 +1076,11 @@
 		assert(podcasts?.nextElementSibling.textContent === 'Podcasts', 'F11 help names the built Podcasts source');
 		const sharing = [...dialog().querySelectorAll('dt')].find((node) => node.textContent === 'Shift+F1');
 		assert(sharing?.nextElementSibling.textContent === 'share Local selection', 'Shift+F1 help keeps Local sharing separate from F11 Podcasts');
+		const feed = [...dialog().querySelectorAll('dt')].find((node) => node.textContent === 'Shift+F2');
+		assert(feed?.nextElementSibling.textContent === 'podcast feed for Local selection or YouTube channel', 'Shift+F2 help documents Local and YouTube feed sharing');
 		const offline = [...dialog().querySelectorAll('dt')].find((node) => node.textContent === 'F12');
 		assert(offline?.nextElementSibling.textContent === 'offline', 'F12 help names Offline rather than podcast publishing');
-		assert(!dialog().textContent.includes('F11 · F12'), 'Help does not advertise a podcast feed hotkey');
+		assert(!dialog().textContent.includes('F11 · F12'), 'Help retains separate Podcasts and Offline navigation keys');
 		snapshot({ screen: previous.screen, playback_history_enabled: false });
 		await until(() => !button('Log', tabs) && !dialog()?.textContent.includes('F3'), 'disabled playback history hides Log and its F3 help');
 		const privateShortcut = [...dialog().querySelectorAll('dt')].find((node) => node.textContent === 'F1 · F2 · F4 · F5');
