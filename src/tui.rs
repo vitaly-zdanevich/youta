@@ -13351,20 +13351,22 @@ struct WrappedPrivateNote {
 ///
 /// Explicit line breaks preserve empty lines. The visible insertion marker is
 /// included in the measured output so cursor following matches what the user
-/// sees at the right edge of a line.
+/// sees at the right edge of a line. An ASCII pipe keeps the caret readable with
+/// Linux-console fonts that do not include Unicode partial-block glyphs.
 fn wrap_private_note(body: &str, requested_cursor: usize, width: u16) -> WrappedPrivateNote {
-    wrap_editor_text(body, requested_cursor, width, true)
+    wrap_editor_text(body, requested_cursor, width, true, "|")
 }
 
-/// Shares grapheme wrapping with unfocused fields that should hide their cursor.
+/// Shares grapheme wrapping while preserving each editor's visible cursor glyph.
+///
+/// Unfocused fields hide the marker without changing their insertion-row tracking.
 fn wrap_editor_text(
     body: &str,
     requested_cursor: usize,
     width: u16,
     show_cursor: bool,
+    cursor_marker: &str,
 ) -> WrappedPrivateNote {
-    const CURSOR_MARKER: &str = "▏";
-
     let width = usize::from(width.max(1));
     let requested_cursor = requested_cursor.min(body.len());
     let cursor = if requested_cursor == body.len() {
@@ -13400,7 +13402,7 @@ fn wrap_editor_text(
                          line_width: &mut usize,
                          cursor_row: &mut usize| {
         if show_cursor {
-            push_grapheme(CURSOR_MARKER, lines, line, line_width);
+            push_grapheme(cursor_marker, lines, line, line_width);
         }
         *cursor_row = lines.len();
     };
@@ -23007,12 +23009,59 @@ for encoded, expected in json.load(sys.stdin):
         );
     }
 
+    /// The insertion marker must use a glyph available in Linux-console fonts.
+    #[test]
+    fn private_note_cursor_uses_ascii_pipe_in_terminal_and_physical_console() {
+        for physical_linux_console in [false, true] {
+            let mut terminal =
+                Terminal::new(TestBackend::new(110, 32)).expect("private-note cursor terminal");
+            let view = ViewModel {
+                physical_linux_console,
+                private_note_popup: Some(PrivateNotePopupView {
+                    body: "beforeafter".to_owned(),
+                    cursor_byte: "before".len(),
+                    ..PrivateNotePopupView::default()
+                }),
+                ..ViewModel::default()
+            };
+
+            terminal
+                .draw(|frame| {
+                    render(frame, &view, &UiSettings::default(), &mut HitMap::default());
+                })
+                .expect("render ASCII note cursor");
+
+            let rendered = rendered_text(&terminal);
+            assert!(
+                rendered.contains("before|after"),
+                "note insertion marker must be ASCII on console={physical_linux_console}"
+            );
+            assert!(!rendered.contains('▏'));
+        }
+    }
+
+    /// Switching cursor glyphs must retain grapheme boundaries and edge wrapping.
+    #[test]
+    fn private_note_cursor_uses_ascii_pipe_at_wrapped_grapheme_boundaries() {
+        for (body, cursor, width, expected, expected_row) in [
+            ("", 0, 1, vec!["|"], 0),
+            ("ab", 1, 3, vec!["a|b"], 0),
+            ("ab", 2, 2, vec!["ab", "|"], 1),
+            ("e\u{301}x", 1, 2, vec!["|e\u{301}", "x"], 0),
+            ("a\n", 2, 2, vec!["a", "|"], 1),
+        ] {
+            let wrapped = wrap_private_note(body, cursor, width);
+            assert_eq!(wrapped.lines, expected, "body={body:?}, cursor={cursor}");
+            assert_eq!(wrapped.cursor_row, expected_row);
+        }
+    }
+
     #[test]
     fn private_note_wrapping_preserves_unicode_graphemes_and_empty_lines() {
         let body = "界e\u{301}👩‍💻\n\n尾";
         let wrapped = wrap_private_note(body, body.len(), 2);
 
-        assert_eq!(wrapped.lines, vec!["界", "e\u{301}", "👩‍💻", "", "尾", "▏"]);
+        assert_eq!(wrapped.lines, vec!["界", "e\u{301}", "👩‍💻", "", "尾", "|"]);
         assert_eq!(wrapped.cursor_row, wrapped.lines.len() - 1);
         assert!(
             wrapped
@@ -23069,7 +23118,7 @@ for encoded, expected in json.load(sys.stdin):
         );
         let rendered = rendered_text(&terminal);
         assert!(
-            rendered.contains('尾') && rendered.contains('▏'),
+            rendered.contains('尾') && rendered.contains('|'),
             "the final Unicode content and insertion marker must remain visible"
         );
     }

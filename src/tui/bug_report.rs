@@ -157,7 +157,7 @@ pub(super) fn render_popup(
                 text_area,
             );
         } else {
-            let wrapped = wrap_editor_text(value, cursor, text_area.width, selected);
+            let wrapped = wrap_editor_text(value, cursor, text_area.width, selected, "▏");
             let visible = usize::from(text_area.height);
             let maximum = wrapped.lines.len().saturating_sub(visible);
             let mut offset = popup.body_scroll_offset.min(maximum);
