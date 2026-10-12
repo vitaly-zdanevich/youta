@@ -180,6 +180,20 @@ test('live rows never present a percent-complete value or progress bar', () => {
 	}
 });
 
+test('selected YouTube channels expose QR without requiring a video identity', () => {
+	for (const [source, channel_id, supported] of [
+		['YouTube channel', 'UC_x5XG1OV2P6uZZ5FSM9Ttw', true],
+		['YouTube channel', '', false], ['Local', 'UC_x5XG1OV2P6uZZ5FSM9Ttw', false],
+	]) {
+		const tree = component('Details').Details({ kind: 'Channel', view: {
+			screen: 'Subscriptions', playlist_item: null, right_panel_mode: 'Channel',
+			details: { source, channel_id, title: 'Selected channel', channel_name: '',
+				media_id: null, playlist_names: [], links: [], dearrow_title: null },
+		} });
+		assert.equal(nodes(tree).some((node) => node.type === 'button' && text(node) === 'QR'), supported);
+	}
+});
+
 test('LIVE footer prefers stable elapsed time over synthetic backend timestamps', () => {
 	const tree = component('Player').Player({
 		playback: { idle: false, live: true, position: 8641222,

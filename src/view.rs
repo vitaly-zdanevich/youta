@@ -2470,15 +2470,15 @@ pub struct VideoCommentsPopupView {
     pub scroll_offset: usize,
 }
 
-/// Offline QR representation of one exact selected YouTube video.
+/// Offline QR representation of one exact selected YouTube video or channel.
 #[cfg(feature = "qr")]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct VideoQrPopupView {
-    /// Stable provider video identifier that owns this popup.
+    /// Stable provider video or channel identifier that owns this popup.
     pub video_id: String,
-    /// Human-readable selected video title retained for controller ownership checks.
+    /// Human-readable selected item title retained for controller ownership checks.
     pub video_title: String,
-    /// Full canonical YouTube watch URL encoded into [`Self::matrix`].
+    /// Full canonical YouTube watch or channel URL encoded into [`Self::matrix`].
     pub url: String,
     /// Provider-independent QR modules generated once when the popup opens.
     pub matrix: QrMatrix,
@@ -3793,6 +3793,39 @@ impl ViewModel {
                     cfg!(feature = "soundcloud") && self.screen == Screen::SoundCloud
                 }
                 _ => false,
+            })
+    }
+
+    /// Whether the visible channel has a safe canonical YouTube QR target.
+    #[cfg(feature = "qr")]
+    #[must_use]
+    pub fn youtube_channel_qr_available(&self) -> bool {
+        self.right_panel_mode == RightPanelMode::Channel
+            && self.details.as_ref().is_some_and(|details| {
+                matches!(details.source.as_str(), "YouTube" | "YouTube channel")
+                    && details
+                        .media_id
+                        .as_ref()
+                        .is_none_or(|media| media.source == SourceKind::YouTube)
+                    && details.channel_id.starts_with("UC")
+                    && (3..=128).contains(&details.channel_id.len())
+                    && details
+                        .channel_id
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            })
+    }
+
+    /// Offers offline QR for selected YouTube videos and visible channel details.
+    #[cfg(feature = "qr")]
+    #[must_use]
+    pub fn youtube_qr_available(&self) -> bool {
+        self.youtube_channel_qr_available()
+            || self.details.as_ref().is_some_and(|details| {
+                details
+                    .media_id
+                    .as_ref()
+                    .is_some_and(|media| media.source == SourceKind::YouTube)
             })
     }
 

@@ -382,6 +382,10 @@ export function Details({ view, kind }: { view: ViewModel; kind: InformationPane
 
   const facts = factsFor(kind, details);
   const isYouTube = details.media_id?.source === YOUTUBE;
+	const isYouTubeChannel = kind === 'Channel'
+		&& (details.source === 'YouTube' || details.source === 'YouTube channel')
+		&& (!details.media_id || isYouTube)
+		&& details.channel_id.length <= 128 && /^UC[A-Za-z0-9_-]+$/.test(details.channel_id);
 	const isArchiveOrg = details.media_id?.source === 'archive-org';
 	const isSoundCloud = details.media_id?.source === 'sound-cloud';
   const openable =
@@ -535,7 +539,7 @@ export function Details({ view, kind }: { view: ViewModel; kind: InformationPane
         {kind === "Video" && view.video_summary_available && isYouTube ? (
           <Action onClick={() => void dispatch("GenerateVideoSummary")}>Summarize</Action>
         ) : null}
-        {kind === "Video" && isYouTube ? (
+        {(kind === 'Video' && isYouTube) || isYouTubeChannel ? (
           <Action onClick={() => void dispatch("OpenVideoQr")}>QR</Action>
         ) : null}
         {openable ? (

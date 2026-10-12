@@ -2303,7 +2303,8 @@ subscribed channels. Unsubscribe opens a confirmation naming the channel;
 Typing an exact `@channel_name` (or its YouTube handle URL) in YT search opens
 the same channel view directly, using the configured provider rather than
 approximate text search. `/` returns to the previous search and starts editing
-it. Neither path adds a subscription.
+it. Neither path adds a subscription. Press `Q` on a selected YouTube video or
+channel to show its canonical URL as an offline QR code; `Q` or `Esc` closes it.
 
 OAuth-based synchronization remains roadmap work. In Details, uppercase
 `[O] open channel` opens the selected YouTube channel's webpage, while lowercase

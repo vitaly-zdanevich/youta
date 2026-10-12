@@ -4302,14 +4302,7 @@ fn unfiltered_key_action(
         Key::Char('q') => Some(UiAction::Quit),
         Key::Char('d' | 'D') if key.ctrl && !key.alt => Some(UiAction::OpenDownloadQueue),
         #[cfg(feature = "qr")]
-        Key::Char('Q')
-            if !key.chorded()
-                && view.details.as_ref().is_some_and(|details| {
-                    details.media_id.as_ref().is_some_and(|media_id| {
-                        media_id.source == crate::domain::SourceKind::YouTube
-                    })
-                }) =>
-        {
+        Key::Char('Q') if !key.chorded() && view.youtube_qr_available() => {
             Some(UiAction::OpenVideoQr)
         }
         Key::Char('?') => Some(UiAction::ToggleHelp),

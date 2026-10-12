@@ -511,6 +511,17 @@
 		assert(!subscriptionMarker.closest('button').textContent.includes('%')
 			&& !subscriptionMarker.closest('button').querySelector('i, [title$="% played"]'),
 			'LIVE subscription rows do not imply finite completion');
+		// Channel QR remains a reducer-owned action; this browser fixture supplies
+		// only the selected channel snapshot, not a fake QR implementation.
+		snapshot({ youtube_channel_browsing: true, right_panel_mode: 'Channel',
+			subscriptions: { ...view.subscriptions, route: 'Sources', focus: 'Sources' },
+			details: { ...details('Selected channel', null), source: 'YouTube channel', channel_id: 'UCfixture' } });
+		await until(() => document.querySelector('[aria-label=Details]')?.textContent.includes('Selected channel'), 'selected channel details');
+		assert(button('YouTube', document.querySelector('nav')).getAttribute('aria-selected') === 'true',
+			'A temporary channel keeps the YouTube tab selected');
+		await action('OpenVideoQr', () => button('QR', document.querySelector('[aria-label=Details]')).click(),
+			'A channel without a video identity exposes the shared QR action');
+		await key('Q', { Char: 'Q' }, { shiftKey: true });
 		snapshot(previous);
 		await until(() => !document.querySelector('[data-subscriptions-screen]'), 'restore the prior screen after live fixtures');
 	}

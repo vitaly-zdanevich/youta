@@ -11415,7 +11415,7 @@ impl AppController {
         self.view.video_comments_popup = None;
     }
 
-    /// Generates an offline QR code for the exact selected YouTube video.
+    /// Generates an offline QR code for the selected YouTube video or visible channel.
     ///
     /// The canonical full watch URL is derived from the validated provider ID
     /// instead of a provider-supplied alias, so scanning does not require a
@@ -11427,6 +11427,33 @@ impl AppController {
             self.view.status_line = "No YouTube video is selected".to_owned();
             return;
         };
+        if self.view.youtube_channel_qr_available() {
+            let channel_id = details.channel_id.clone();
+            let title = if details.channel_name.is_empty() {
+                &details.title
+            } else {
+                &details.channel_name
+            };
+            let title = title.clone();
+            let url = canonical_youtube_channel_url(&channel_id)
+                .expect("QR eligibility validates the channel path")
+                .to_string();
+            match QrMatrix::encode(&url) {
+                Ok(matrix) => {
+                    self.view.video_qr_popup = Some(VideoQrPopupView {
+                        video_id: channel_id,
+                        video_title: title,
+                        url,
+                        matrix,
+                    })
+                }
+                Err(error) => {
+                    self.view.status_line =
+                        format!("Cannot create YouTube channel QR code: {error}")
+                }
+            }
+            return;
+        }
         let Some(media_id) = details
             .media_id
             .as_ref()
@@ -56130,6 +56157,70 @@ mod tests {
         assert!(!popup.url.contains("youtu.be"));
         assert!(!popup.url.contains("m.youtube.com"));
         assert!(popup.matrix.width() > 0);
+    }
+
+    #[cfg(feature = "qr")]
+    #[test]
+    fn youtube_channel_qr_uses_selected_channel_without_changing_playback_or_subscription() {
+        let (_temporary, mut controller, _requests) = controller_with_youtube_video_comments();
+        let channel_id = "UC_x5XG1OV2P6uZZ5FSM9Ttw";
+        controller.view.right_panel_mode = RightPanelMode::Channel;
+        controller.view.details = Some(DetailView {
+            channel_id: channel_id.into(),
+            channel_name: "Google Developers".into(),
+            source: "YouTube channel".into(),
+            title: "Google Developers".into(),
+            ..DetailView::default()
+        });
+        let selected = controller.view.selected;
+        let playing = controller.current_media.clone();
+        let subscriptions = controller.subscription_tree.clone();
+        controller.dispatch(UiAction::OpenVideoQr);
+        let popup = controller
+            .view
+            .video_qr_popup
+            .as_ref()
+            .expect("selected channel QR");
+        assert_eq!(popup.video_id, channel_id);
+        assert_eq!(popup.video_title, "Google Developers");
+        assert_eq!(
+            popup.url,
+            format!("https://www.youtube.com/channel/{channel_id}")
+        );
+        assert!(popup.matrix.width() > 0);
+        assert_eq!(controller.view.selected, selected);
+        assert_eq!(controller.current_media, playing);
+        assert_eq!(controller.subscription_tree, subscriptions);
+        controller.dispatch(UiAction::DismissVideoQr);
+        assert!(controller.view.video_qr_popup.is_none());
+        assert_eq!(
+            controller.view.details.as_ref().unwrap().channel_id,
+            channel_id
+        );
+    }
+
+    #[cfg(feature = "qr")]
+    #[test]
+    fn youtube_channel_qr_rejects_malformed_and_non_youtube_channel_details() {
+        let (_temporary, mut controller, _requests) = controller_with_youtube_video_comments();
+        controller.view.right_panel_mode = RightPanelMode::Channel;
+        for channel_id in ["", "invalid/channel"] {
+            controller.view.details = Some(DetailView {
+                channel_id: channel_id.into(),
+                source: "YouTube channel".into(),
+                ..DetailView::default()
+            });
+            controller.dispatch(UiAction::OpenVideoQr);
+            assert!(controller.view.video_qr_popup.is_none());
+        }
+        controller.view.details = Some(DetailView {
+            media_id: Some(MediaId::new(SourceKind::Local, "/tmp/fixture.mp3")),
+            channel_id: "UC_x5XG1OV2P6uZZ5FSM9Ttw".into(),
+            source: "Local".into(),
+            ..DetailView::default()
+        });
+        controller.dispatch(UiAction::OpenVideoQr);
+        assert!(controller.view.video_qr_popup.is_none());
     }
 
     #[cfg(feature = "qr")]

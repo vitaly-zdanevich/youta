@@ -1541,7 +1541,7 @@ export function VideoCommentsPopup({ popup, externalOpenerAvailable }: {
   );
 }
 
-/** The offline QR code for one selected video. */
+/** The offline QR code for one selected YouTube video or channel. */
 export function VideoQrPopup({ popup }: { popup: VideoQrPopupView }) {
   const { width, modules } = popup.matrix;
   // The quiet zone is mandatory and excluded from the matrix, so it is added

@@ -2013,7 +2013,7 @@ struct HitMap {
     video_summary_page_lines: usize,
     /// Buttons rendered inside the public-comments popup.
     video_comments_buttons: Vec<(UiAction, Rect)>,
-    /// Close control rendered inside the selected-video QR popup.
+    /// Close control rendered inside the selected YouTube item QR popup.
     #[cfg(feature = "qr")]
     video_qr_buttons: Vec<(UiAction, Rect)>,
     /// Close and stop controls rendered inside the LAN-share QR popup.
@@ -8601,7 +8601,7 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
     }
     #[cfg(feature = "qr")]
     let private_note_help =
-        "  n private note     t Details-only text selection\n  Q selected YouTube video QR code";
+        "  n private note t Details-only text selection Q YouTube video/channel QR";
     #[cfg(not(feature = "qr"))]
     let private_note_help = "  n private note     t Details-only text selection";
     let history_navigation_help = format!(
@@ -10246,7 +10246,7 @@ fn render_video_qr_popup(
 
     let area = centered_sized_rect(required_width, required_height, frame.area());
     frame.render_widget(Clear, area);
-    frame.render_widget(panel_block(" YouTube video QR ", theme), area);
+    frame.render_widget(panel_block(" YouTube QR ", theme), area);
     let inner = area.inner(ratatui::layout::Margin {
         horizontal: 1,
         vertical: 1,
@@ -10308,7 +10308,7 @@ fn render_video_qr_size_fallback(
     let height = frame.area().height.min(8);
     let area = centered_sized_rect(width, height, frame.area());
     frame.render_widget(Clear, area);
-    frame.render_widget(panel_block(" YouTube video QR ", theme), area);
+    frame.render_widget(panel_block(" YouTube QR ", theme), area);
     let inner = area.inner(ratatui::layout::Margin {
         horizontal: 1,
         vertical: 1,
@@ -18493,7 +18493,7 @@ for encoded, expected in json.load(sys.stdin):
             assert!(rendered.contains("E Evernote audio"));
             if height >= 40 {
                 #[cfg(feature = "qr")]
-                assert!(rendered.contains("Q selected YouTube video QR code"));
+                assert!(rendered.contains("Q YouTube video/channel QR"));
             }
         }
     }
@@ -20535,9 +20535,9 @@ for encoded, expected in json.load(sys.stdin):
         #[cfg(feature = "commons-upload")]
         assert!(rendered.contains("U Commons audio"));
         #[cfg(feature = "qr")]
-        assert!(rendered.contains("Q selected YouTube video QR code"));
+        assert!(rendered.contains("Q YouTube video/channel QR"));
         #[cfg(not(feature = "qr"))]
-        assert!(!rendered.contains("Q selected YouTube video QR code"));
+        assert!(!rendered.contains("Q YouTube video/channel QR"));
         assert_eq!(
             rendered.contains("G summarize with Codex"),
             ViewModel::default().video_summary_supported
@@ -42739,7 +42739,7 @@ prose 07:25 remains clickable but is not a chapter";
 
     #[cfg(feature = "qr")]
     #[test]
-    fn youtube_qr_shortcut_is_help_only_and_scoped_to_selected_video() {
+    fn youtube_qr_shortcut_is_help_only_and_scoped_to_selected_video_or_channel() {
         let youtube = ViewModel {
             details: Some(DetailView {
                 media_id: Some(MediaId::new(SourceKind::YouTube, "dQw4w9WgXcQ")),
@@ -42763,6 +42763,22 @@ prose 07:25 remains clickable but is not a chapter";
             ),
             Some(UiAction::Quit),
             "the new shortcut must not replace lowercase q quit"
+        );
+        let channel = ViewModel {
+            right_panel_mode: RightPanelMode::Channel,
+            details: Some(DetailView {
+                source: "YouTube channel".into(),
+                channel_id: "UC_x5XG1OV2P6uZZ5FSM9Ttw".into(),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        assert_eq!(
+            key_action(
+                KeyEvent::new(KeyCode::Char('Q'), KeyModifiers::SHIFT),
+                &channel
+            ),
+            Some(UiAction::OpenVideoQr)
         );
         for unsupported in [
             ViewModel::default(),
@@ -42838,7 +42854,7 @@ prose 07:25 remains clickable but is not a chapter";
             .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
             .expect("draw QR popup");
         let rendered = rendered_text(&terminal);
-        assert!(rendered.contains("YouTube video QR"));
+        assert!(rendered.contains("YouTube QR"));
         assert!(rendered.contains("[Esc] Close"));
         assert!(rendered.contains('█') || rendered.contains('▀') || rendered.contains('▄'));
 
@@ -43166,7 +43182,7 @@ prose 07:25 remains clickable but is not a chapter";
         terminal
             .draw(|frame| render(frame, &help, &UiSettings::default(), &mut hit_map))
             .expect("draw help without QR support");
-        assert!(!rendered_text(&terminal).contains("YouTube video QR code"));
+        assert!(!rendered_text(&terminal).contains("Q YouTube video/channel QR"));
     }
 
     #[test]
