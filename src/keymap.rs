@@ -465,14 +465,10 @@ mod wire_tests {
                     "screen {screen:?}, F{number}"
                 );
                 for modifiers in 1..8 {
-                    let modified_action = if number == 2
-                        && modifiers == 4
-                        && cfg!(feature = "lan-sharing")
-                        && screen == Screen::Local
-                    {
-                        Some(UiAction::ShareLocalPodcast)
-                    } else {
-                        None
+                    let modified_action = match (number, modifiers, screen) {
+                        #[cfg(feature = "lan-sharing")]
+                        (2, 4, Screen::Local) => Some(UiAction::ShareLocalPodcast),
+                        _ => None,
                     };
                     assert_eq!(
                         key_action(
