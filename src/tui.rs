@@ -3109,7 +3109,7 @@ fn render_tabs(
         }
         spans.push(Span::styled(
             label,
-            if screen == view.screen {
+            if screen == view.displayed_screen() {
                 theme.selected
             } else {
                 theme.base
@@ -3128,7 +3128,10 @@ fn active_tab_window(
     available_width: u16,
     divider_width: u16,
 ) -> std::ops::Range<usize> {
-    let Some(active_index) = screens.iter().position(|screen| *screen == view.screen) else {
+    let Some(active_index) = screens
+        .iter()
+        .position(|screen| *screen == view.displayed_screen())
+    else {
         return 0..screens.len();
     };
     let widths = screens
@@ -4196,7 +4199,7 @@ fn render_subscription_source_list(
         heading_style,
         theme,
     );
-    if !sections[1].is_empty() {
+    if !sections[1].is_empty() && !view.youtube_channel_browsing {
         let label = button("a", "Add RSS feed", show_hotkeys);
         let width = terminal_text_width(&label).min(sections[1].width);
         if width > 0 {
@@ -44756,6 +44759,48 @@ prose 07:25 remains clickable but is not a chapter";
             Some(UiAction::ShowScreen(Screen::TrackerMusic)),
             "button targets must retain priority over the now-playing target"
         );
+    }
+
+    #[test]
+    fn transient_channel_tabs_keep_youtube_selected_and_clickable() {
+        for width in [4, 180] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+            let view = ViewModel {
+                screen: Screen::Subscriptions,
+                youtube_channel_browsing: true,
+                ..ViewModel::default()
+            };
+            let mut hit_map = HitMap::default();
+            let theme = Theme::new(false);
+            terminal
+                .draw(|frame| {
+                    render_tabs(frame, frame.area(), &view, &theme, &mut hit_map);
+                })
+                .unwrap();
+            let area = hit_map
+                .tabs
+                .iter()
+                .find(|(screen, _)| *screen == Screen::Search)
+                .expect("YouTube remains visible even in a narrow terminal")
+                .1;
+            assert_eq!(
+                terminal.backend().buffer()[(area.x, area.y)].fg,
+                theme.selected.fg.unwrap()
+            );
+            assert_eq!(
+                mouse_action(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: area.x,
+                        row: area.y,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    &hit_map,
+                    &view
+                ),
+                Some(UiAction::ShowScreen(Screen::Search))
+            );
+        }
     }
 
     #[test]

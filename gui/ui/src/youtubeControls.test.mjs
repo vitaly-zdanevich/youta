@@ -55,6 +55,23 @@ test('the Search Shorts control stays scoped to the YouTube tab', () => {
 	}
 });
 
+/** Channel navigation exposes the query editor, not controls for its parked search. */
+test('temporary channel search bars retain BeginSearch without duplicating pane controls', () => {
+	for (const route of ['Sources', 'Items']) {
+		actions.length = 0;
+		const tree = render({
+			screen: 'Subscriptions', youtube_channel_browsing: true,
+			subscriptions: { route, show_youtube_shorts: true },
+		});
+		assert.equal(shortsButton(tree), undefined);
+		assert.deepEqual(nodes(tree).filter((node) => node.type === 'button'), [], 'parked search controls stay hidden');
+		const editor = nodes(tree).find((node) => node.props.onMouseDown);
+		assert.ok(editor);
+		editor.props.onMouseDown({ preventDefault: () => {} });
+		assert.deepEqual(actions, ['BeginSearch']);
+	}
+});
+
 test('query editing disables the Shorts button and preserves h as query text', () => {
 	actions.length = 0;
 	const tree = render({ search_editing: true, search_query: 'h', search_cursor_byte: 1 });

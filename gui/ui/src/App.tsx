@@ -170,6 +170,10 @@ export function App() {
     ? sources
     : sources.filter((source) => source.id !== "History");
   const onSubscriptions = view.screen === "Subscriptions";
+	// The channel adapter retains its Subs semantics, but a temporary visit
+	// belongs to YouTube and must not imply a saved subscription.
+	const transientChannel = onSubscriptions && view.youtube_channel_browsing;
+	const displayedScreen = transientChannel ? 'Search' : view.screen;
   // While a subscription *source* is being chosen, the panel is describing a
   // channel or a feed rather than a media item, and those expose an entirely
   // different set of facts — subscribers and join date instead of views and
@@ -180,7 +184,7 @@ export function App() {
     (view.subscriptions.layout === "drill-down"
       ? view.subscriptions.route === "Sources"
       : !view.subscriptions.description_expanded);
-  const active = visibleSources.find((source) => source.id === view.screen);
+  const active = visibleSources.find((source) => source.id === displayedScreen);
   const kind: InformationPanelKind = showingChannel
     ? "Channel"
     : (active?.details_kind ?? "Generic");
@@ -189,7 +193,7 @@ export function App() {
   return (
     <>
       <div className="grid h-full grid-rows-[auto_auto_minmax(0,1fr)_auto_auto_auto_auto]">
-        <Tabs sources={visibleSources} active={view.screen}
+        <Tabs sources={visibleSources} active={displayedScreen}
 					playing={view.playback.idle ? null : view.playing_screen} paused={view.playback.paused} />
 
         {/* Only where the reducer accepts a query; the catalogue says which
@@ -205,6 +209,7 @@ export function App() {
 		<div ref={body} data-subscriptions-screen className="grid min-h-0">
             <Subscriptions
               subscriptions={view.subscriptions}
+              transientChannel={transientChannel}
               playing={view.playing_media_id}
               details={details}
             />

@@ -502,7 +502,7 @@ export function Details({ view, kind }: { view: ViewModel; kind: InformationPane
 			</Action>
 		) : null}
 		{/* Browse without changing subscription state; Enter opens the channel's videos. */}
-		{view.screen === 'Search' && isYouTube && details.channel_id !== '' ? (
+		{(view.screen === 'Search' || (view.screen === 'Subscriptions' && view.youtube_channel_browsing)) && isYouTube && details.channel_id !== '' ? (
 			<Action onClick={() => void dispatch('BrowseYouTubeChannel')}>To channel</Action>
 		) : null}
         {view.playlist_item !== null ? (

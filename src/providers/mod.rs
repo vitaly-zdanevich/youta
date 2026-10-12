@@ -78,6 +78,81 @@ pub const DEFAULT_MAX_JSON_BYTES: usize = 2 * 1024 * 1024;
 /// Default end-to-end timeout for a provider request.
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Normalizes a raw `YouTube` handle without decoding a URL path more than once.
+///
+/// The optional leading `@` is removed after strict percent-escape validation
+/// and decoding. Unicode names retain their spelling; malformed UTF-8, control
+/// characters, whitespace, route delimiters, and remaining `%` escapes are
+/// rejected. The existing `url` decoder keeps official-only builds independent
+/// of an optional percent-encoding dependency.
+///
+/// # Errors
+///
+/// Returns [`ProviderError::InvalidRequest`] for empty, malformed, or oversized handles.
+pub fn normalize_youtube_channel_handle(raw: &str) -> Result<String, ProviderError> {
+    let invalid = || {
+        ProviderError::InvalidRequest(
+            "YouTube handle is malformed or exceeds its size limit".into(),
+        )
+    };
+    if raw.is_empty() || raw.len() > 512 {
+        return Err(invalid());
+    }
+    let bytes = raw.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if bytes
+                .get(index + 1..index + 3)
+                .is_none_or(|pair| !pair.iter().all(u8::is_ascii_hexdigit))
+            {
+                return Err(invalid());
+            }
+            index += 3;
+        } else {
+            index += 1;
+        }
+    }
+    // Form decoding must not turn a literal plus into whitespace or split the handle.
+    let encoded = format!("handle={}", raw.replace('+', "%2B").replace('&', "%26"));
+    let (_, decoded) = url::form_urlencoded::parse(encoded.as_bytes())
+        .next()
+        .expect("fixed form key");
+    let handle = decoded.strip_prefix('@').unwrap_or(decoded.as_ref());
+    if handle.is_empty()
+        || handle.len() > 128
+        || matches!(handle, "." | "..")
+        || handle.chars().any(|character| {
+            character.is_control()
+                || character.is_whitespace()
+                || character == '\u{fffd}'
+                || matches!(character, '/' | '\\' | '?' | '#' | '%' | '@' | ':')
+                || (character.is_ascii()
+                    && !character.is_ascii_alphanumeric()
+                    && !matches!(character, '-' | '_' | '.'))
+        })
+    {
+        return Err(invalid());
+    }
+    Ok(handle.to_owned())
+}
+
+/// Handle resolution accepts stable `UC` identities rather than arbitrary API route aliases.
+#[cfg(any(feature = "youtube-official", feature = "invidious"))]
+fn validate_resolved_youtube_channel_id(channel_id: &str) -> Result<(), ProviderError> {
+    if channel_id.len() != 24
+        || !channel_id.starts_with("UC")
+        || !channel_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(ProviderError::InvalidResponse(
+            "handle resolution did not return a stable YouTube channel ID".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Features implemented by a provider.
 #[allow(
     clippy::struct_excessive_bools,
@@ -948,6 +1023,21 @@ pub trait Provider: Send + Sync {
             })
     }
 
+    /// Resolves a whole `YouTube` handle to full metadata for its stable channel identity.
+    ///
+    /// Callers pass the raw handle, optionally including its leading `@`. URL-path
+    /// escapes are decoded exactly once by implementations; a search containing a
+    /// mention is not a handle lookup. Existing providers default to unsupported.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderError::Unsupported`] by default. Implementations may reject
+    /// malformed handles, unavailable or ambiguous channels, transport failures,
+    /// unsuccessful status codes, and malformed bounded metadata.
+    fn resolve_channel_handle(&self, _handle: &str) -> Result<ChannelDetails, ProviderError> {
+        Err(ProviderError::Unsupported)
+    }
+
     /// Performs one blocking video-details fetch.
     ///
     /// # Errors
@@ -1425,6 +1515,46 @@ mod tests {
             MinimalProvider.full_channel_details("channel"),
             Err(ProviderError::Unsupported)
         ));
+    }
+
+    /// The new lookup leaves existing providers and mocks source-compatible.
+    #[test]
+    fn channel_handle_resolution_is_unsupported_by_default() {
+        assert!(matches!(
+            MinimalProvider.resolve_channel_handle("@fixture"),
+            Err(ProviderError::Unsupported)
+        ));
+    }
+
+    /// Encoded Unicode names retain their spelling and nested escapes cannot alter routing.
+    #[test]
+    fn youtube_channel_handle_normalization_decodes_once_and_bounds_unicode() {
+        for (input, expected) in [
+            ("@GoogleDevelopers", "GoogleDevelopers"),
+            ("GoogleDevelopers", "GoogleDevelopers"),
+            ("@%D1%82%D0%B5%D1%81%D1%82", "тест"),
+            ("@тест", "тест"),
+            ("%40GoogleDevelopers", "GoogleDevelopers"),
+            ("@under_score-name.123", "under_score-name.123"),
+        ] {
+            assert_eq!(normalize_youtube_channel_handle(input).unwrap(), expected);
+        }
+        for input in [
+            "@%252F",
+            "@%FF",
+            "@%",
+            "@name+other",
+            "@name&other",
+            "@name\n",
+            "@name/other",
+        ] {
+            assert!(matches!(
+                normalize_youtube_channel_handle(input),
+                Err(ProviderError::InvalidRequest(_))
+            ));
+        }
+        assert!(normalize_youtube_channel_handle(&format!("@{}", "a".repeat(129))).is_err());
+        assert!(normalize_youtube_channel_handle(&format!("@{}", "%61".repeat(171))).is_err());
     }
 
     #[test]

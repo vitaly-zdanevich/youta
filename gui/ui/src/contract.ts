@@ -1056,6 +1056,8 @@ export interface ArchiveCredentialsEditorView {
 /** The published snapshot. */
 export interface ViewModel {
   screen: string;
+	/** Parked transient channel navigation; only internal Subs panes project onto YouTube. */
+	youtube_channel_browsing: boolean;
   playback_history_enabled: boolean;
   search_editing: boolean;
 	/** Active provider/directory request, including the session-only Web browser. */

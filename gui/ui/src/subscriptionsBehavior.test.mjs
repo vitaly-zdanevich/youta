@@ -71,6 +71,82 @@ const require = createRequire(import.meta.url);
 const React = require('react');
 const ts = require('typescript');
 const actions = [];
+
+/** Render App's route composition with inert effects and named component boundaries. */
+async function channelRouteTree(screen, browsing) {
+	const appSource = await readFile(new URL('./App.tsx', import.meta.url), 'utf8');
+	const compiled = ts.transpileModule(appSource, {
+		compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX },
+	}).outputText;
+	const view = {
+		screen, youtube_channel_browsing: browsing, playback_history_enabled: true,
+		playback: { idle: true }, subscriptions: { layout: 'drill-down', route: 'Sources' },
+	};
+	const appModule = { exports: {} };
+	const appRequire = (name) => {
+		if (name === 'react') return { ...React, useEffect: () => {}, useRef: (current) => ({ current }), useCallback: (fn) => fn };
+		if (name === './useYouta') return { useYouta: () => ({ view, sources: [
+			{ id: 'Search', label: 'YouTube', search_verb: 'Search', details_kind: 'Video' },
+			{ id: 'Subscriptions', label: 'Subs', search_verb: null, details_kind: 'Video' },
+		], output: null, failure: null }) };
+		if (name.startsWith('./')) return new Proxy({}, { get: (_, key) => key });
+		return require(name);
+	};
+	new Function('require', 'module', 'exports', compiled)(appRequire, appModule, appModule.exports);
+	return appModule.exports.App();
+}
+
+test('transient channel uses the YouTube tab and search bar while retaining shared channel panes', async () => {
+	const tree = elements(await channelRouteTree('Subscriptions', true));
+	assert.equal(tree.find((node) => node.type === 'Tabs').props.active, 'Search');
+	assert.equal(tree.find((node) => node.type === 'SearchBar').props.label, 'YouTube');
+	assert.equal(tree.find((node) => node.type === 'SearchBar').props.view.screen, 'Subscriptions', 'the query editor retains its adapter-scoped control guards');
+	assert.equal(tree.find((node) => node.type === 'Subscriptions').props.transientChannel, true);
+	assert.equal(tree.find((node) => node.type === 'Subscriptions').props.details.props.kind, 'Channel');
+	assert.ok(tree.some((node) => node.props['data-subscriptions-screen'] === true));
+});
+
+test('real Subs and hashtag search keep their own tab and list projection', async () => {
+	for (const [screen, browsing] of [['Subscriptions', false], ['Search', true]]) {
+		const tree = elements(await channelRouteTree(screen, browsing));
+		assert.equal(tree.find((node) => node.type === 'Tabs').props.active, screen);
+		assert.equal(tree.some((node) => node.type === 'Subscriptions'), screen === 'Subscriptions');
+		assert.equal(tree.some((node) => node.type === 'SearchBar'), screen === 'Search');
+	}
+});
+
+test('transient channel panes hide RSS management without changing source selection or Enter', () => {
+	const compiled = ts.transpileModule(source, {
+		compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX },
+	}).outputText;
+	const subscriptionsModule = { exports: {} };
+	const subscriptionsRequire = (name) => {
+		if (name === 'react') return { ...React, useEffect: () => {}, useRef: (current) => ({ current }) };
+		if (name === '@tanstack/react-virtual') return { useVirtualizer: () => ({
+			getTotalSize: () => 60, getVirtualItems: () => [{ index: 0, key: 0, start: 0, size: 60 }],
+		}) };
+		if (name === '../ipc') return { dispatch: (action) => actions.push(action) };
+		if (name === '../subscriptionPageRows') return { SUBSCRIPTION_ROW_HEIGHT: 60 };
+		if (name === './Artwork') return { Artwork: () => null };
+		if (name === './RowSubtitle') return { RowSubtitle: () => null, rowSubtitleColorClass: () => '' };
+		if (name === '../format') return { formatCount: String };
+		return require(name);
+	};
+	new Function('require', 'module', 'exports', compiled)(subscriptionsRequire, subscriptionsModule, subscriptionsModule.exports);
+	for (const transientChannel of [false, true]) {
+		actions.length = 0;
+		const tree = elements(subscriptionsModule.exports.Subscriptions({
+			transientChannel, playing: null, details: null,
+			subscriptions: { layout: 'drill-down', route: 'Sources', focus: 'Sources', selected_source: 0,
+				source_kind: 'you-tube', sources: [{ title: 'Fixture channel', subtitle: '', media_id: null }], items: [] },
+		}));
+		assert.equal(tree.some((node) => node.type === 'button' && buttonText(node) === 'Add RSS feed...'), !transientChannel);
+		const row = tree.find((node) => node.type === 'button' && node.props.onDoubleClick);
+		row.props.onClick({ ctrlKey: false });
+		row.props.onDoubleClick();
+		assert.deepEqual(actions, [{ SelectSubscriptionSource: 0 }, 'ActivateSelection']);
+	}
+});
 const detailsSource = await readFile(new URL('./components/Details.tsx', import.meta.url), 'utf8');
 const compiledDetails = ts.transpileModule(detailsSource, {
 	compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX },

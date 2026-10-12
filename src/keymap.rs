@@ -4338,14 +4338,15 @@ fn unfiltered_key_action(
         Key::Char('R') if view.screen == Screen::Web => Some(UiAction::RefreshWeb),
         Key::Char('p') | Key::F(7) => Some(UiAction::OpenPreferences),
         Key::Tab if reverse_tab(key) => Some(UiAction::ShowScreen(
-            view.screen
+            view.displayed_screen()
                 .previous_available(view.playback_history_enabled),
         )),
         Key::Tab => Some(UiAction::ShowScreen(
-            view.screen.next_available(view.playback_history_enabled),
+            view.displayed_screen()
+                .next_available(view.playback_history_enabled),
         )),
         Key::BackTab => Some(UiAction::ShowScreen(
-            view.screen
+            view.displayed_screen()
                 .previous_available(view.playback_history_enabled),
         )),
         Key::Char('S') => Some(UiAction::ShowScreen(Screen::Subscriptions)),
@@ -4532,6 +4533,7 @@ fn unfiltered_key_action(
         }
         Key::Char('a')
             if view.screen == Screen::Subscriptions
+                && !view.youtube_channel_browsing
                 && view.subscriptions.route == SubscriptionRoute::Sources
                 && !key.chorded() =>
         {

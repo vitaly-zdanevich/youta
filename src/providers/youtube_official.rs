@@ -23,7 +23,8 @@ use super::{
     MAX_VIDEO_COMMENT_ID_BYTES, MAX_VIDEO_COMMENTS, Provider, ProviderCapabilities, ProviderError,
     SearchDate, SearchDuration, SearchFeature, SearchItem, SearchPage, SearchRequest, SearchSort,
     SearchTarget, Thumbnail, VideoComment, VideoDetails, VideoOrientation, VideoSummary,
-    normalize_video_comment_text, parse_rfc3339_epoch, provider_agent, validate_base_url,
+    normalize_video_comment_text, normalize_youtube_channel_handle, parse_rfc3339_epoch,
+    provider_agent, validate_base_url, validate_resolved_youtube_channel_id,
     validate_video_comment_author, validate_youtube_video_id,
 };
 
@@ -1003,6 +1004,36 @@ impl Provider for YouTubeOfficialProvider {
 
     fn full_channel_details(&self, channel_id: &str) -> Result<ChannelDetails, ProviderError> {
         full_channel_details_from_resource(self.fetch_exact_channel_resource(channel_id)?)
+    }
+
+    /// Uses the documented one-unit `channels.list` handle filter instead of search.
+    fn resolve_channel_handle(&self, handle: &str) -> Result<ChannelDetails, ProviderError> {
+        let handle = normalize_youtube_channel_handle(handle)?;
+        let mut url = self.endpoint("channels")?;
+        url.query_pairs_mut()
+            .append_pair("part", "snippet,statistics")
+            .append_pair("forHandle", &handle)
+            .append_pair("maxResults", "1");
+        // Serde can echo wrong-type string values, including server-echoed credentials.
+        let response: RawChannelListResponse =
+            self.request_json(&url).map_err(|error| match error {
+                ProviderError::InvalidResponse(_) => ProviderError::InvalidResponse(
+                    "YouTube handle response contains malformed channel metadata".into(),
+                ),
+                other => other,
+            })?;
+        if response.items.len() != 1 {
+            return Err(ProviderError::InvalidResponse(
+                "YouTube handle did not resolve to exactly one channel".into(),
+            ));
+        }
+        let resource = response
+            .items
+            .into_iter()
+            .next()
+            .expect("one resource checked above");
+        validate_resolved_youtube_channel_id(&resource.id)?;
+        full_channel_details_from_resource(resource)
     }
 
     fn video_details(&self, video_id: &str) -> Result<VideoDetails, ProviderError> {
@@ -2800,6 +2831,120 @@ mod tests {
                 .subscriber_count,
             None
         );
+    }
+
+    /// Handle resolution uses one exact channel lookup, including full selected metadata.
+    #[test]
+    fn channel_handle_resolution_uses_for_handle_and_full_metadata() {
+        for handle in [
+            "@GoogleDevelopers",
+            "GoogleDevelopers",
+            "@%D1%82%D0%B5%D1%81%D1%82",
+        ] {
+            let server = MockServer::spawn(vec![json_response("200 OK", CHANNEL_RESOURCE)]);
+            let provider = YouTubeOfficialProvider::with_base_url(
+                TEST_KEY,
+                server.base_url.join("prefix/").unwrap(),
+                Duration::from_secs(2),
+                DEFAULT_MAX_JSON_BYTES,
+            )
+            .unwrap();
+            let details = provider
+                .resolve_channel_handle(handle)
+                .expect("resolve exact handle");
+            let requests = server.finish();
+            assert_eq!(details.summary.channel_id, CHANNEL_ID);
+            assert_eq!(details.summary.video_count, Some(42));
+            assert_eq!(details.total_view_count, Some(1_094_367_204));
+            assert_eq!(details.country.as_deref(), Some("UA"));
+            assert_eq!(requests.len(), 1);
+            assert!(requests[0].starts_with("/prefix/channels?"));
+            let query = query_pairs(&requests[0]);
+            assert_eq!(
+                query.get("forHandle").map(String::as_str),
+                Some(if handle.contains('%') {
+                    "тест"
+                } else {
+                    "GoogleDevelopers"
+                })
+            );
+            assert_eq!(
+                query.get("part").map(String::as_str),
+                Some("snippet,statistics")
+            );
+            assert!(!query.contains_key("id"));
+            assert!(!query.contains_key("q"));
+        }
+    }
+
+    /// No malformed or doubly encoded input can silently become another channel request.
+    #[test]
+    fn channel_handle_resolution_rejects_malformed_input_without_http() {
+        let (provider, server) = provider_with_server(Vec::new());
+        for handle in [
+            "",
+            "@",
+            "@@name",
+            "name with spaces",
+            "@name/other",
+            "@name?key=value",
+            "@name#fragment",
+            "@%",
+            "@%GG",
+            "@%FF",
+            "@%252F",
+            "@%2F",
+            "@%40name",
+            "@..",
+        ] {
+            assert!(
+                matches!(
+                    provider.resolve_channel_handle(handle),
+                    Err(ProviderError::InvalidRequest(_))
+                ),
+                "{handle}"
+            );
+        }
+        assert!(server.finish().is_empty());
+    }
+
+    /// Empty, ambiguous, malformed, and non-channel resources cannot open an arbitrary channel.
+    #[test]
+    fn channel_handle_resolution_rejects_missing_ambiguous_and_invalid_resources() {
+        let fixture: Value = serde_json::from_str(CHANNEL_RESOURCE).unwrap();
+        let resource = fixture["items"][0].clone();
+        let mut invalid = resource.clone();
+        invalid["id"] = Value::String("dQw4w9WgXcQ".into());
+        for body in [
+            serde_json::json!({"items": []}),
+            serde_json::json!({"items": [resource.clone(), resource]}),
+            serde_json::json!({"items": [invalid]}),
+            serde_json::json!({"items": [{}]}),
+        ] {
+            let (provider, server) =
+                provider_with_server(vec![json_response("200 OK", &body.to_string())]);
+            assert!(matches!(
+                provider.resolve_channel_handle("@missing"),
+                Err(ProviderError::InvalidResponse(_))
+            ));
+            assert_eq!(server.finish().len(), 1);
+        }
+    }
+
+    /// Wrong-type metadata cannot expose a key echoed inside a successful HTTP response.
+    #[test]
+    fn channel_handle_resolution_redacts_api_key_echoed_in_malformed_json() {
+        let mut body: Value = serde_json::from_str(CHANNEL_RESOURCE).unwrap();
+        body["items"][0]["statistics"]["hiddenSubscriberCount"] = Value::String(TEST_KEY.into());
+        let (provider, server) =
+            provider_with_server(vec![json_response("200 OK", &body.to_string())]);
+        let error = provider
+            .resolve_channel_handle("@fixture")
+            .expect_err("wrong-type channel metadata");
+        assert_eq!(server.finish().len(), 1);
+        assert!(matches!(error, ProviderError::InvalidResponse(_)));
+        assert!(!error.to_string().contains(TEST_KEY));
+        assert!(error.to_string().contains("malformed channel metadata"));
     }
 
     #[test]

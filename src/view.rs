@@ -3261,6 +3261,11 @@ pub struct AsciiVisualizerView {
 pub struct ViewModel {
     /// Active screen.
     pub screen: Screen,
+    /// A process-local YouTube channel owns parked navigation, including hashtag detours.
+    ///
+    /// Channel lists reuse the Subs adapter internally; only their top-level
+    /// presentation belongs to YouTube. This flag is never saved to the session.
+    pub youtube_channel_browsing: bool,
     /// Whether playback History is available as a top-level screen.
     pub playback_history_enabled: bool,
     /// Whether text typed by the user edits the search query.
@@ -3612,6 +3617,16 @@ pub struct ViewModel {
 }
 
 impl ViewModel {
+    /// Projects transient channel panes onto YouTube without changing their adapter.
+    #[must_use]
+    pub fn displayed_screen(&self) -> Screen {
+        if self.screen == Screen::Subscriptions && self.youtube_channel_browsing {
+            Screen::Search
+        } else {
+            self.screen
+        }
+    }
+
     /// Whether rendered cells can be captured without exposing a private editor.
     #[must_use]
     pub fn bug_report_screenshot_allowed(&self) -> bool {
@@ -3784,7 +3799,7 @@ impl ViewModel {
     /// Whether a `YouTube` search video's channel can be browsed without subscribing.
     #[must_use]
     pub fn youtube_channel_browse_available(&self) -> bool {
-        self.screen == Screen::Search
+        self.displayed_screen() == Screen::Search
             && self.details.as_ref().is_some_and(|details| {
                 !details.channel_id.is_empty()
                     && details
@@ -3899,6 +3914,7 @@ impl Default for ViewModel {
     fn default() -> Self {
         Self {
             screen: Screen::Search,
+            youtube_channel_browsing: false,
             playback_history_enabled: true,
             search_editing: false,
             search_query: String::new(),

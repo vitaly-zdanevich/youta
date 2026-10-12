@@ -1071,7 +1071,7 @@ impl AppController {
     /// Finishes a proven source selection without changing the playing queue or backend.
     pub(super) fn finish_now_playing_selection(&mut self, item: &QueueItem) {
         if self.current_media.as_ref() == Some(&item.media.id) {
-            self.view.playing_screen = Some(self.view.screen);
+            self.view.playing_screen = Some(self.view.displayed_screen());
         }
         self.view.right_panel_mode = RightPanelMode::Details;
         self.view.details_focused = true;

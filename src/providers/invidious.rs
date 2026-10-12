@@ -24,8 +24,9 @@ use super::{
     MAX_VIDEO_COMMENT_ID_BYTES, MAX_VIDEO_COMMENTS, Provider, ProviderCapabilities, ProviderError,
     SearchDate, SearchDuration, SearchFeature, SearchItem, SearchPage, SearchRequest, SearchSort,
     SearchTarget, Thumbnail, VideoComment, VideoDetails, VideoOrientation, VideoSummary,
-    get_bounded_json, normalize_video_comment_text, provider_agent, resolve_http_url,
-    validate_base_url, validate_video_comment_author, validate_youtube_video_id,
+    get_bounded_json, normalize_video_comment_text, normalize_youtube_channel_handle,
+    provider_agent, resolve_http_url, validate_base_url, validate_resolved_youtube_channel_id,
+    validate_video_comment_author, validate_youtube_video_id,
 };
 
 const MAX_CONFIGURED_JSON_BYTES: usize = 64 * 1024 * 1024;
@@ -721,6 +722,47 @@ impl Provider for InvidiousProvider {
         self.convert_full_channel_details(raw, channel_id)
     }
 
+    /// Resolves a canonical handle URL before loading the exact channel's full metadata.
+    fn resolve_channel_handle(&self, handle: &str) -> Result<ChannelDetails, ProviderError> {
+        let handle = normalize_youtube_channel_handle(handle)?;
+        let mut source = Url::parse("https://www.youtube.com/").expect("fixed YouTube base URL");
+        source
+            .path_segments_mut()
+            .expect("HTTP URL has path segments")
+            .pop_if_empty()
+            .push(&format!("@{handle}"));
+        let mut url = self.endpoint("api/v1/resolveurl")?;
+        url.query_pairs_mut().append_pair("url", source.as_str());
+        let resolved: RawResolvedChannelUrl = self.request_json(&url)?;
+        if resolved.page_type != "WEB_PAGE_TYPE_CHANNEL"
+            || resolved.video_id.is_some()
+            || resolved.playlist_id.is_some()
+            || resolved.post_id.is_some()
+        {
+            return Err(ProviderError::InvalidResponse(
+                "handle did not resolve to a channel page".into(),
+            ));
+        }
+        let channel_id = resolved
+            .ucid
+            .as_deref()
+            .or(resolved.browse_id.as_deref())
+            .ok_or_else(|| {
+                ProviderError::InvalidResponse("handle resolution has no channel identity".into())
+            })?;
+        validate_resolved_youtube_channel_id(channel_id)?;
+        if resolved
+            .browse_id
+            .as_deref()
+            .is_some_and(|id| id != channel_id)
+        {
+            return Err(ProviderError::InvalidResponse(
+                "handle resolution has ambiguous channel identities".into(),
+            ));
+        }
+        self.full_channel_details(channel_id)
+    }
+
     fn video_details(&self, video_id: &str) -> Result<VideoDetails, ProviderError> {
         let url = self.build_video_url(video_id)?;
         let raw: RawVideoDetails = self.request_json(&url)?;
@@ -901,6 +943,18 @@ fn optional_video_channel_id(author_id: Option<String>) -> String {
     author_id
         .filter(|id| valid_youtube_channel_route_id(id))
         .unwrap_or_default()
+}
+
+/// The documented resolveurl response identifies the page family and possible resource IDs.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawResolvedChannelUrl {
+    page_type: String,
+    browse_id: Option<String>,
+    ucid: Option<String>,
+    video_id: Option<String>,
+    playlist_id: Option<String>,
+    post_id: Option<String>,
 }
 
 fn validate_resource_id(value: &str, field: &str) -> Result<(), ProviderError> {
@@ -1842,6 +1896,112 @@ mod tests {
             ),
             Err(ProviderError::InvalidResponse(message)) if message.contains("does not match")
         ));
+    }
+
+    /// Canonical handle resolution preserves a configured API path prefix and full metadata.
+    #[test]
+    fn channel_handle_resolution_resolves_canonical_url_then_loads_full_channel() {
+        for handle in [
+            "@GoogleDevelopers",
+            "GoogleDevelopers",
+            "@%D1%82%D0%B5%D1%81%D1%82",
+        ] {
+            let response = r#"{"pageType":"WEB_PAGE_TYPE_CHANNEL","browseId":"UC_x5XG1OV2P6uZZ5FSM9Ttw","ucid":"UC_x5XG1OV2P6uZZ5FSM9Ttw"}"#;
+            let server = MockServer::spawn(vec![
+                json_response("200 OK", response),
+                json_response("200 OK", CHANNEL_DETAILS_FIXTURE),
+            ]);
+            let provider = InvidiousProvider::with_options(
+                server.base_url.join("prefix/").unwrap(),
+                Duration::from_secs(2),
+                DEFAULT_MAX_JSON_BYTES,
+            )
+            .unwrap();
+            let details = provider
+                .resolve_channel_handle(handle)
+                .expect("resolve handle and channel");
+            let requests = server.finish();
+            assert_eq!(details.summary.channel_id, "UC_x5XG1OV2P6uZZ5FSM9Ttw");
+            assert_eq!(details.total_view_count, Some(1_094_367_204));
+            assert_eq!(requests.len(), 2);
+            let request = Url::parse(&format!("http://mock.test{}", requests[0])).unwrap();
+            assert_eq!(request.path(), "/prefix/api/v1/resolveurl");
+            let resolved = request
+                .query_pairs()
+                .find(|(key, _)| key == "url")
+                .unwrap()
+                .1;
+            let source = Url::parse(&resolved).unwrap();
+            assert_eq!(source.host_str(), Some("www.youtube.com"));
+            assert_eq!(source.scheme(), "https");
+            assert_eq!(
+                source.path(),
+                if handle.contains('%') {
+                    "/@%D1%82%D0%B5%D1%81%D1%82"
+                } else {
+                    "/@GoogleDevelopers"
+                }
+            );
+            assert!(source.query().is_none());
+            assert_eq!(
+                requests[1],
+                "/prefix/api/v1/channels/UC_x5XG1OV2P6uZZ5FSM9Ttw"
+            );
+        }
+    }
+
+    /// Input validation happens before either resolution or channel metadata HTTP work.
+    #[test]
+    fn channel_handle_resolution_rejects_malformed_input_without_http() {
+        let server = MockServer::spawn(Vec::new());
+        let provider = InvidiousProvider::new(server.base_url.clone()).unwrap();
+        for handle in [
+            "",
+            "@",
+            "@@name",
+            "@name/other",
+            "@name?x=1",
+            "@%",
+            "@%GG",
+            "@%FF",
+            "@%252F",
+            "@%2F",
+            "@%40name",
+            "@..",
+            "@name with spaces",
+        ] {
+            assert!(
+                matches!(
+                    provider.resolve_channel_handle(handle),
+                    Err(ProviderError::InvalidRequest(_))
+                ),
+                "{handle}"
+            );
+        }
+        assert!(server.finish().is_empty());
+    }
+
+    /// Resolution must identify precisely one channel, never a video, playlist, or mixed result.
+    #[test]
+    fn channel_handle_resolution_rejects_missing_ambiguous_and_nonchannel_results() {
+        for response in [
+            r#"{}"#,
+            r#"{"pageType":"WEB_PAGE_TYPE_CHANNEL"}"#,
+            r#"{"pageType":"WEB_PAGE_TYPE_CHANNEL","ucid":"invalid"}"#,
+            r#"{"pageType":"WEB_PAGE_TYPE_CHANNEL","ucid":"UC_x5XG1OV2P6uZZ5FSM9Ttw","browseId":"UCabcdefghijkabcdefghijk"}"#,
+            r#"{"pageType":"WEB_PAGE_TYPE_WATCH","videoId":"dQw4w9WgXcQ"}"#,
+            r#"{"pageType":"WEB_PAGE_TYPE_CHANNEL","ucid":"UC_x5XG1OV2P6uZZ5FSM9Ttw","videoId":"dQw4w9WgXcQ"}"#,
+            r#"{"pageType":"WEB_PAGE_TYPE_CHANNEL","ucid":"UC_x5XG1OV2P6uZZ5FSM9Ttw","playlistId":"PLfixture"}"#,
+            r#"[]"#,
+        ] {
+            let server = MockServer::spawn(vec![json_response("200 OK", response)]);
+            let provider = InvidiousProvider::new(server.base_url.clone()).unwrap();
+            assert!(matches!(
+                provider.resolve_channel_handle("@missing"),
+                Err(ProviderError::InvalidResponse(_))
+            ));
+            assert_eq!(server.finish().len(), 1);
+        }
     }
 
     #[test]

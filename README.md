@@ -2293,12 +2293,18 @@ YouTube subscriptions are currently local-only channel subscriptions. Choosing
 YouTube video search result adds that channel to Youta's OPML-backed source
 list; it does not subscribe the signed-in YouTube account. Unsubscribe and its
 `s` shortcut remain channel-only. In YT video Details, `[c] To channel` follows
-Subscribe and opens a Subs-style page with that single channel on the left and
-its description on the right, without subscribing. Press `Enter` to browse its
-videos. `Alt+Left` or `Backspace` returns from the videos to the channel, then
+Subscribe and opens a Subs-style page in the YT tab with that single channel on
+the left and its description on the right, without subscribing. Press `Enter`
+to browse its videos. `Alt+Left` or `Backspace` returns to the channel, then
 to the original search and selection. The button remains available for already
 subscribed channels. Unsubscribe opens a confirmation naming the channel;
 `Enter` confirms and `Esc` cancels. Downloaded files are kept.
+
+Typing an exact `@channel_name` (or its YouTube handle URL) in YT search opens
+the same channel view directly, using the configured provider rather than
+approximate text search. `/` returns to the previous search and starts editing
+it. Neither path adds a subscription.
+
 OAuth-based synchronization remains roadmap work. In Details, uppercase
 `[O] open channel` opens the selected YouTube channel's webpage, while lowercase
 `[o] open video` opens the selected video's webpage. Each control shows its full

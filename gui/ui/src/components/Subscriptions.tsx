@@ -335,10 +335,13 @@ function PaneButton({
  */
 export function Subscriptions({
   subscriptions,
+  transientChannel = false,
   playing,
   details,
 }: {
   subscriptions: SubscriptionsView;
+  /** Temporary YouTube visits share these panes but cannot add unrelated RSS sources. */
+  transientChannel?: boolean;
   playing: MediaId | null;
   details: ReactNode;
 }) {
@@ -362,7 +365,7 @@ export function Subscriptions({
         <Pane
           pane="Sources"
           sourceOwner={0}
-          heading="Subscriptions"
+          heading={transientChannel ? 'Channel' : 'Subscriptions'}
           rows={subscriptions.sources}
           selected={subscriptions.selected_source}
           focused={subscriptions.focus === "Sources"}
@@ -373,9 +376,9 @@ export function Subscriptions({
           {/* Adding a feed opens a terminal-only editor: the URL may itself be a
               credential, so the window can ask for it to be opened but never
               draws it. */}
-          <PaneButton onClick={() => void dispatch("OpenRssSubscriptionPopup")}>
+          {!transientChannel ? <PaneButton onClick={() => void dispatch("OpenRssSubscriptionPopup")}>
             Add RSS feed...
-          </PaneButton>
+          </PaneButton> : null}
         </Pane>
       ) : null}
 

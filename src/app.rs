@@ -2451,6 +2451,12 @@ enum ProviderRequest {
         generation: u64,
         request: SearchRequest,
     },
+    /// Resolves a direct handle with the provider captured when this work is routed.
+    ResolveYouTubeChannel {
+        generation: u64,
+        provider_generation: u64,
+        handle: String,
+    },
     #[cfg(feature = "youtube-music")]
     YouTubeMusicSearch {
         generation: u64,
@@ -2878,6 +2884,12 @@ enum ProviderResponse {
         generation: u64,
         request: SearchRequest,
         result: Result<SearchPage, String>,
+    },
+    /// Complete metadata for a direct handle; never an approximate search match.
+    ResolvedYouTubeChannel {
+        generation: u64,
+        provider_generation: u64,
+        result: Result<ChannelDetails, String>,
     },
     #[cfg(feature = "youtube-music")]
     YouTubeMusicSearch {
@@ -5651,6 +5663,8 @@ pub struct AppController {
     youtube_hashtag_history: VecDeque<youtube_hashtag::HashtagLocation>,
     /// Temporary one-channel source pages with exact return locations.
     youtube_channel_navigation: Vec<youtube_channel::ChannelLocation>,
+    /// Latest direct handle lookup, owned by search and provider generations.
+    pending_youtube_channel_handle: Option<(u64, u64)>,
     /// Linked video whose provider response owns the current Details panel.
     active_description_video: Option<ActiveDescriptionVideo>,
     last_position_save: Instant,
@@ -6998,6 +7012,7 @@ impl AppController {
             detail_navigation_forward: VecDeque::new(),
             youtube_hashtag_history: VecDeque::new(),
             youtube_channel_navigation: Vec::new(),
+            pending_youtube_channel_handle: None,
             active_description_video: None,
             last_position_save: Instant::now(),
             last_session_save: Instant::now(),
@@ -7233,6 +7248,7 @@ impl AppController {
     /// Invalidates responses from an older input route and stops its animation.
     fn supersede_search_generation(&mut self) {
         self.search_generation = self.search_generation.wrapping_add(1);
+        self.pending_youtube_channel_handle = None;
         self.clear_search_activity();
         #[cfg(feature = "tracker-music")]
         if self.pending_tracker_preparation.take().is_some() {
@@ -7665,6 +7681,7 @@ impl AppController {
         }
         self.youtube_channel_statistics_mode = channel_statistics_mode;
         self.youtube_provider_generation = self.youtube_provider_generation.wrapping_add(1);
+        self.pending_youtube_channel_handle = None;
         self.channel_subscriber_cache.clear();
         self.channel_webpage_cache.clear();
         self.pending_channel_subscribers.clear();
@@ -7738,12 +7755,18 @@ impl AppController {
             self.load_selected_subscription_videos();
         } else {
             self.view.status_line = format!("Using {provider_name}; retrying YouTube search...");
-            self.submit_youtube_search(1);
+            self.submit_search();
         }
     }
 
     /// Starts editing the active search, Web address, or local Radio filter.
     fn begin_search_input(&mut self) {
+        self.cancel_youtube_channel_lookup();
+        // A query starts a new YouTube route, not an editor inside the shared
+        // Subs adapter. Cancelling leaves the restored search visible.
+        if self.view.screen == Screen::Subscriptions && self.view.youtube_channel_browsing {
+            self.show_screen(Screen::Search);
+        }
         #[cfg(feature = "librivox")]
         self.cancel_librivox_now_playing_navigation();
         #[cfg(feature = "radio")]
@@ -7865,6 +7888,24 @@ impl AppController {
 
     fn submit_search(&mut self) {
         let query = self.view.search_query.trim().to_owned();
+        if self.pending_youtube_channel_handle.is_some() {
+            // A new submission replaces the lookup, even while it shares the
+            // YouTube search spinner. Keep the newly submitted editor text.
+            self.supersede_search_generation();
+        }
+        // Direct UI dispatch can submit without BeginSearch. Preserve the
+        // submitted text while restoring the ordinary search adapter first.
+        if self.view.screen == Screen::Subscriptions && self.view.youtube_channel_browsing {
+            self.show_screen(Screen::Search);
+            self.view.search_query.clone_from(&query);
+            self.view.search_cursor_byte = query.len();
+        } else if self.view.screen == Screen::Search && self.view.youtube_channel_browsing {
+            // An explicit query leaves a channel's hashtag detour. Keep the
+            // current results for handle lookup/Back, but retire unreachable
+            // channel parents and restore the genuine Subs adapter.
+            self.abandon_youtube_channel_navigation();
+            self.youtube_hashtag_history.clear();
+        }
         // Empty catalogue submissions deliberately browse the provider's defaults;
         // private sessions must not need an implicit initial load to reach it.
         if query.is_empty()
@@ -7884,6 +7925,12 @@ impl AppController {
         self.view.details_focused = false;
         self.view.details_scroll = 0;
 
+        if self.view.screen == Screen::Search
+            && let Some(handle) = youtube_channel::parse_handle_input(&query)
+        {
+            self.submit_youtube_channel_handle(handle);
+            return;
+        }
         match search_route(self.view.screen) {
             SearchRoute::Web => {
                 #[cfg(feature = "web-browser")]
@@ -12603,6 +12650,13 @@ impl AppController {
 
     fn handle_provider_response(&mut self, response: ProviderResponse) {
         match response {
+            ProviderResponse::ResolvedYouTubeChannel {
+                generation,
+                provider_generation,
+                result,
+            } => {
+                self.accept_youtube_channel_handle(generation, provider_generation, result);
+            }
             #[cfg(feature = "lan-sharing")]
             ProviderResponse::YouTubePublicationDates(dates) => {
                 self.youtube_publication_date_cache.remember(dates);
@@ -22242,6 +22296,7 @@ impl AppController {
             self.view.status_line = "Nothing is playing".to_owned();
             return;
         };
+        self.cancel_youtube_channel_lookup();
         self.abandon_youtube_channel_navigation();
         if self.view.screen == Screen::History {
             self.cancel_pending_history_replay();
@@ -23044,6 +23099,10 @@ impl AppController {
     }
 
     fn go_back(&mut self) {
+        if self.cancel_youtube_channel_lookup() {
+            self.view.status_line = "Cancelled YouTube channel lookup".into();
+            return;
+        }
         if self.go_back_youtube_channel() {
             return;
         }
@@ -27769,6 +27828,7 @@ impl AppController {
     /// Radio filtering is live, so leaving its editor keeps the visible query
     /// instead of restoring the snapshot captured when `/` was pressed.
     fn show_screen(&mut self, screen: Screen) {
+        self.cancel_youtube_channel_lookup();
         if screen == Screen::History && !self.config.persistence.save_playback_history {
             self.view.status_line = if std::env::var_os(SAVE_PLAYBACK_HISTORY_ENV).is_some() {
                 format!(
@@ -35628,7 +35688,9 @@ impl AppController {
             self.session_dirty = true;
             return false;
         }
-        if self.view.screen == Screen::Search {
+        // A pending handle names a destination, not the search results that
+        // remain visible; autosave must not replace their parked query.
+        if self.view.screen == Screen::Search && self.pending_youtube_channel_handle.is_none() {
             self.youtube_search_query
                 .clone_from(&self.view.search_query);
             self.youtube_selected = self.view.selected;
@@ -35718,14 +35780,19 @@ impl AppController {
         #[cfg(not(feature = "archive-org"))]
         let persisted_archive_org_selected_row = self.archive_org_selected;
         let mut state = SessionState {
-            screen: stored_session_screen(self.view.screen, &self.playlists_route),
-            focus: if self.view.details_focused {
+            screen: stored_session_screen(self.view.displayed_screen(), &self.playlists_route),
+            focus: if self.view.details_focused && self.view.screen == self.view.displayed_screen()
+            {
                 PanelFocus::Right
             } else {
                 PanelFocus::Left
             },
             selected_media: self.current_media.clone(),
-            selected_row: self.view.selected,
+            selected_row: if self.view.screen != self.view.displayed_screen() {
+                self.youtube_selected
+            } else {
+                self.view.selected
+            },
             youtube_selected_row: Some(self.youtube_selected),
             youtube_music_selected_row: Some(self.youtube_music_selected),
             soundcloud_selected_row: Some(self.soundcloud.selected),
@@ -35740,7 +35807,13 @@ impl AppController {
             radio_selected_row: Some(persisted_radio_selected_row),
             radio_selected_station_id,
             radio_filter_text: self.radio_filter_query.clone(),
-            details_scroll: u64::try_from(self.view.details_scroll).unwrap_or(u64::MAX),
+            details_scroll: if self.view.screen != self.view.displayed_screen() {
+                // A process-local channel is not restored on restart; its
+                // scroll offset does not belong to the saved search results.
+                0
+            } else {
+                u64::try_from(self.view.details_scroll).unwrap_or(u64::MAX)
+            },
             search_text: self.youtube_search_query.clone(),
             youtube_music_search_text: self.youtube_music_search_query.clone(),
             soundcloud_search_text: self.soundcloud.query.clone(),
@@ -39869,6 +39942,7 @@ fn provider_request_uses_youtube_provider(request: &ProviderRequest) -> bool {
     matches!(
         request,
         ProviderRequest::Search { .. }
+            | ProviderRequest::ResolveYouTubeChannel { .. }
             | ProviderRequest::ChannelVideos { .. }
             | ProviderRequest::Details { .. }
             | ProviderRequest::VideoComments { .. }
@@ -40448,6 +40522,30 @@ fn general_provider_worker(
                     .send(ProviderResponse::Search {
                         generation,
                         request,
+                        result,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            ProviderRequest::ResolveYouTubeChannel {
+                generation,
+                provider_generation,
+                handle,
+            } => {
+                let result = routed_youtube_provider.as_ref().map_or_else(
+                    || Err("YouTube provider is not configured".to_owned()),
+                    |provider| {
+                        provider
+                            .resolve_channel_handle(&handle)
+                            .map_err(|error| error.to_string())
+                    },
+                );
+                if responses
+                    .send(ProviderResponse::ResolvedYouTubeChannel {
+                        generation,
+                        provider_generation,
                         result,
                     })
                     .is_err()
