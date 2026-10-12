@@ -1084,6 +1084,8 @@ export interface ViewModel {
   waveform_visible: boolean;
   waveform_playback_matches: boolean;
   playback: PlaybackStatus;
+  /** Stable YouTube LIVE time, independent of the rolling rewind cache. */
+  live_elapsed_seconds: number | null;
   ascii_visualizer_supported?: boolean;
   ascii_visualizer?: AsciiVisualizerView | null;
   playback_starting: boolean;
@@ -1196,6 +1198,7 @@ export interface YouTubeProviderEditorView {
 /** The high-frequency group carried on its own channel. */
 export interface PlaybackTick {
   playback: PlaybackStatus;
+  live_elapsed_seconds: number | null;
   ascii_visualizer?: AsciiVisualizerView | null;
   radio_now_playing: string | null;
   playback_starting: boolean;

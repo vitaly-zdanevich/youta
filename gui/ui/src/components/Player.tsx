@@ -88,6 +88,7 @@ function ChapterTimeline({
 /** The transport bar. */
 export function Player({
   playback,
+  liveElapsedSeconds,
   chapters,
   showChapterTimestamps,
   nyanCatSeekbar,
@@ -100,6 +101,7 @@ export function Player({
   output,
 }: {
   playback: PlaybackStatus;
+  liveElapsedSeconds?: number | null;
   chapters: Chapter[];
   showChapterTimestamps: boolean;
   nyanCatSeekbar: boolean;
@@ -117,8 +119,6 @@ export function Player({
   const progress = duration > 0 ? Math.min(100, (position / duration) * 100) : 0;
 	// A live station's rewind buffer is not a finite track duration.
 	const radio = playback.live && track?.media_id.source === 'radio';
-	// Seekable broadcasts retain their distance from the live edge and buffer length.
-	const liveSeekable = playback.live && !radio && seekable;
 
   // A snapshot arriving mid-drag must not yank the scrubber out from under the
   // pointer, so the control is uncontrolled while the pointer is down.
@@ -191,7 +191,8 @@ export function Player({
 			<span className='font-mono tabular-nums'>
 				{radio ? 'radio' : playback.live ? <>
 					<span className='font-semibold text-red-400'>LIVE</span>
-					{liveSeekable ? ` −${formatSeconds(duration - position)}` : null}
+					{/* Live time follows the normalized playback position, including rewind. */}
+					{` ${formatSeconds(liveElapsedSeconds ?? position)}`}
 				</> : formatSeconds(position)}
 			</span>
             {/* Clicking the title jumps the list to whatever is playing, which
@@ -219,8 +220,7 @@ export function Player({
                     : `${track.title} — ${track.subtitle}`)}
             </button>
             <span className="font-mono tabular-nums">
-				{radio ? null : liveSeekable ? `${formatSeconds(duration)} buffer`
-					: playback.live ? null : duration > 0 ? formatSeconds(duration) : '--:--'}
+				{playback.live ? null : duration > 0 ? formatSeconds(duration) : '--:--'}
             </span>
           </div>
 

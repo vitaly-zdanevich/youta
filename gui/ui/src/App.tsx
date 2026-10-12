@@ -222,6 +222,7 @@ export function App() {
 
         <Player
           playback={view.playback}
+          liveElapsedSeconds={view.live_elapsed_seconds}
           chapters={view.playback_chapters}
           showChapterTimestamps={view.show_chapter_timestamps}
           nyanCatSeekbar={view.nyan_cat_seekbar}

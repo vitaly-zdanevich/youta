@@ -106,7 +106,7 @@ export function RowList({
               <span
                 className="w-[42px] justify-self-end"
                 title={
-                  row.hide_watched_marker
+                  row.hide_watched_marker || row.live
                     ? undefined
                     : row.watched_percent > 0
                       ? `${row.watched_percent}% played`
@@ -115,7 +115,7 @@ export function RowList({
                         : undefined
                 }
               >
-                {!row.hide_watched_marker && (row.playback_started || row.watched_percent > 0) ? (
+                {!row.hide_watched_marker && !row.live && (row.playback_started || row.watched_percent > 0) ? (
                   <span className="block h-[3px] rounded-[3px] bg-line-strong">
                     <i
                       className="block h-full rounded-[3px] bg-accent"

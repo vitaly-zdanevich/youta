@@ -4,7 +4,7 @@ resolver = "3"
 
 [package]
 name = "youta"
-version = "1.9.0"
+version = "1.10.0"
 edition = "2024"
 rust-version = "1.95"
 description = "A low-resource YouTube TUI audio player and local subscription manager that uses yt-dlp and saves and shows listening progress"
@@ -295,7 +295,7 @@ vimeo = ["yt-dlp"]
 rutube = ["yt-dlp"]
 youtube-official = ["network"]
 youtube-music = ["yt-dlp"]
-yt-dlp = ["dep:chrono", "dep:fs2", "dep:rustix", "dep:tempfile", "dep:sha2"]
+yt-dlp = ["dep:chrono", "dep:fs2", "dep:getrandom", "dep:rustix", "dep:tempfile", "dep:sha2"]
 sponsorblock = ["network"]
 dearrow = ["network"]
 wikidata = ["network"]

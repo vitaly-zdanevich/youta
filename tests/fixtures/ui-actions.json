@@ -307,6 +307,7 @@
 	{"RemoveQueuePopupRow":1},
 	{"RetryQueuedDownload":1},
 	{"SeekPercent":1.25},
+	"SeekLiveStart",
 	{"SeekRelative":1},
 	{"SelectArchiveCredentialField":false},
 	{"SelectArchiveCredentialField":true},

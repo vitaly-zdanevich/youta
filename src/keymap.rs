@@ -147,6 +147,66 @@ mod wire_tests {
     use super::{Key, KeyPress, PopupGeometry, key_action};
     use crate::playback::PlaybackStatus;
 
+    /// Zero opens the true broadcast beginning independently of the local playback cache.
+    #[test]
+    fn youtube_live_zero_requests_broadcast_beginning_without_rewind_cache() {
+        for range in [
+            None,
+            Some(crate::playback::BufferedRange {
+                start: std::time::Duration::from_secs(100),
+                end: std::time::Duration::from_secs(140),
+            }),
+        ] {
+            let mut view = crate::view::ViewModel {
+                playback: PlaybackStatus {
+                    idle: false,
+                    live: true,
+                    live_seekable_range: range,
+                    ..PlaybackStatus::default()
+                },
+                playing_media_id: Some(crate::domain::MediaId::new(
+                    crate::domain::SourceKind::YouTube,
+                    "fixture-live",
+                )),
+                ..crate::view::ViewModel::default()
+            };
+            let key = KeyPress::new(Key::Char('0'));
+            assert_eq!(
+                key_action(key, &view, None, None),
+                Some(UiAction::SeekLiveStart)
+            );
+            view.search_editing = true;
+            assert_eq!(
+                key_action(key, &view, None, None),
+                Some(UiAction::AppendSearch('0'))
+            );
+            view.search_editing = false;
+            view.help_open = true;
+            assert_eq!(key_action(key, &view, None, None), None);
+            view.help_open = false;
+            view.private_note_popup = Some(crate::view::PrivateNotePopupView::default());
+            assert_eq!(
+                key_action(key, &view, None, None),
+                Some(UiAction::AppendPrivateNoteCharacter('0'))
+            );
+            view.private_note_popup = None;
+            view.playing_media_id.as_mut().unwrap().source = crate::domain::SourceKind::Radio;
+            assert_eq!(
+                key_action(key, &view, None, None),
+                range.map(|_| UiAction::SeekPercent(0.0))
+            );
+            view.playing_media_id.as_mut().unwrap().source = crate::domain::SourceKind::YouTube;
+            view.playback.idle = true;
+            assert_eq!(key_action(key, &view, None, None), None);
+            view.playback.idle = false;
+            view.playback.live = false;
+            assert_eq!(
+                key_action(key, &view, None, None),
+                Some(UiAction::SeekPercent(0.0))
+            );
+        }
+    }
+
     /// The shared channel key browses `YouTube` search uploaders without stealing text input.
     #[test]
     fn youtube_to_channel_key_preserves_other_contexts_and_search_input() {
@@ -4706,6 +4766,17 @@ fn unfiltered_key_action(
         Key::Char('O') => Some(UiAction::OpenChannelInBrowser),
         Key::Char('y') => Some(UiAction::CopyLink),
         Key::Char('u') if !key.modified() => Some(UiAction::OpenQueuePopup),
+        Key::Char('0')
+            if !key.modified()
+                && !view.playback.idle
+                && view.playback.live
+                && view
+                    .playing_media_id
+                    .as_ref()
+                    .is_some_and(|media| media.source == crate::domain::SourceKind::YouTube) =>
+        {
+            Some(UiAction::SeekLiveStart)
+        }
         Key::Char(digit @ '0'..='9') if view.playback.seeking_available() => {
             let percentage = f64::from(digit.to_digit(10).unwrap_or_default()) * 10.0;
             Some(UiAction::SeekPercent(percentage))

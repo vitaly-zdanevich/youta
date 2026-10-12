@@ -35,6 +35,9 @@ pub mod cache_export;
 pub mod ytdlp;
 
 #[cfg(feature = "yt-dlp")]
+pub mod live_from_start;
+
+#[cfg(feature = "yt-dlp")]
 pub mod youtube_prewarm;
 
 #[cfg(all(feature = "yt-dlp", feature = "network"))]

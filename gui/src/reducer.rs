@@ -72,6 +72,7 @@ pub const PLAYBACK_EVENT: &str = "youta://playback";
 #[derive(Clone, Debug, PartialEq, Serialize)]
 struct PlaybackTick {
     playback: youta::playback::PlaybackStatus,
+    live_elapsed_seconds: Option<u64>,
     radio_now_playing: Option<String>,
     playback_starting: bool,
     playback_start_animation_frame: usize,
@@ -88,6 +89,7 @@ impl PlaybackTick {
     fn of(view: &ViewModel) -> Self {
         Self {
             playback: view.playback.clone(),
+            live_elapsed_seconds: view.live_elapsed_seconds,
             radio_now_playing: view.radio_now_playing.clone(),
             playback_starting: view.playback_starting,
             playback_start_animation_frame: view.playback_start_animation_frame,
@@ -103,6 +105,7 @@ impl PlaybackTick {
     /// Writes this group onto a snapshot.
     fn apply_to(&self, view: &mut ViewModel) {
         view.playback = self.playback.clone();
+        view.live_elapsed_seconds = self.live_elapsed_seconds;
         view.radio_now_playing = self.radio_now_playing.clone();
         view.playback_starting = self.playback_starting;
         view.playback_start_animation_frame = self.playback_start_animation_frame;
@@ -1113,6 +1116,7 @@ mod tests {
         }];
         let mut after = before.clone();
         after.playback.position = Duration::from_secs(41);
+        after.live_elapsed_seconds = Some(41);
 
         let tick = PlaybackTick::of(&after);
         let mut probe = before.clone();

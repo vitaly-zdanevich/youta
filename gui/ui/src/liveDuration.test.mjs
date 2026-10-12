@@ -146,28 +146,61 @@ test('LIVE in a title or channel never becomes an inferred broadcast indicator',
 	}
 });
 
-test('Details colors only a confirmed LIVE Length fact', () => {
-	for (const [live, length, expected] of [[true, 'LIVE', ['LIVE']], [false, 'LIVE', []],
+test('Details omits the redundant live length while preserving finite length and counts', () => {
+	for (const [live, length, expected] of [[true, 'LIVE', []], [false, 'LIVE', []],
 		[false, '0:00', []], [false, '3:21', []], [true, '3:21', []]]) {
 		const tree = component('Details').Details({ kind: 'Video', view: {
 			screen: 'Search', playlist_item: null, details: {
-				live, length, title: 'LIVE', channel_name: 'LIVE', source: 'LIVE', likes: 'LIVE',
+				live, length, title: 'LIVE', channel_name: 'LIVE', source: 'LIVE', likes: '7',
+				views: '12', comments: '4',
 				channel_id: '', media_id: { source: 'you-tube', external_id: 'fixture-live' },
 				playlist_names: [], links: [], dearrow_title: null,
 			},
 		} });
 		assert.deepEqual(redNodes(tree).map(text), expected, `length=${length}, live=${live}`);
-		assert.ok(nodes(tree).some((node) => node.type === 'dd' && text(node) === length));
+		const lengthLabel = nodes(tree).find((node) => node.type === 'dt' && text(node) === 'Length');
+		assert.equal(Boolean(lengthLabel), !live, `length=${length}, live=${live}`);
+		for (const value of ['12', '7', '4']) {
+			assert.ok(nodes(tree).some((node) => node.type === 'dd' && text(node) === value));
+		}
 	}
 });
 
-test('the player shows red LIVE with DVR context while preserving radio and seeking', () => {
+test('live rows never present a percent-complete value or progress bar', () => {
+	for (const live of [true, false]) {
+		for (const pane of ['main', 'subscriptions']) {
+			const tree = listTree(pane, live ? 'Creator · LIVE' : 'Creator · 4:05', live, {
+				row: { watched_percent: 38, playback_started: true },
+			});
+			const percentage = nodes(tree).find((node) => node.props.title === '38% played');
+			const bar = nodes(tree).find((node) => node.type === 'i' && node.props.style?.width === '38%');
+			assert.equal(Boolean(percentage), !live && pane === 'main');
+			assert.equal(Boolean(bar), !live && pane === 'main');
+		}
+	}
+});
+
+test('LIVE footer prefers stable elapsed time over synthetic backend timestamps', () => {
+	const tree = component('Player').Player({
+		playback: { idle: false, live: true, position: 8641222,
+			duration: 8641235, live_seekable_range: null, paused: false,
+			buffering: false, buffered_ranges: [], speed: 1, volume: 50, title: null, chapter: null },
+		liveElapsedSeconds: 23,
+		chapters: [], track: { media_id: { source: 'you-tube', external_id: 'fixture-live' }, title: 'Live', subtitle: '' },
+	});
+	assert.ok(text(tree).includes('LIVE 0:23'));
+	assert.ok(!text(tree).includes('2400:20'));
+});
+
+test('the player shows red LIVE with current playback time while preserving radio and seeking', () => {
 	for (const [source, live, buffered, position, labels] of [
-		['you-tube', true, false, 0, ['LIVE', '']],
-		['you-tube', true, true, 120, ['LIVE −1:00', '3:00 buffer']],
-		['you-tube', true, true, 240, ['LIVE −0:00', '3:00 buffer']],
+		['you-tube', true, false, 0, ['LIVE 0:00', '']],
+		['you-tube', true, false, 23, ['LIVE 0:23', '']],
+		['you-tube', true, true, 120, ['LIVE 2:00', '']],
+		['you-tube', true, true, 240, ['LIVE 4:00', '']],
 		['you-tube', false, false, 0, ['0:00', '--:--']],
 		['you-tube', false, true, 0, ['0:00', '3:00']],
+		['you-tube', false, true, 120, ['2:00', '3:00']],
 		['radio', true, false, 0, ['radio', '']],
 		['radio', true, true, 120, ['radio', '']],
 	]) {
@@ -187,5 +220,9 @@ test('the player shows red LIVE with DVR context while preserving radio and seek
 		assert.equal(text(title), 'LIVE', 'the playing title stays separate from the indicator');
 		assert.equal(nodes(tree).find((node) => node.props['aria-label'] === 'Playback position').props.disabled,
 			!buffered, 'label changes preserve the existing seekability rule');
+		for (const label of ['Back 5 seconds', 'Forward 5 seconds']) {
+			assert.equal(nodes(tree).find((node) => node.props['aria-label'] === label).props.disabled,
+				!buffered, `${label} still uses the available seekable cache`);
+		}
 	}
 });

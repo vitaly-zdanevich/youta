@@ -219,6 +219,7 @@ export type UnitUiAction =
 	| 'ToggleNaturalLocalSort'
 	| 'ToggleNyanCatSeekbar'
 	| 'TogglePause'
+	| 'SeekLiveStart'
 	| 'TogglePlaybackHistorySaving'
 	| 'TogglePodcastFeedIgnoreBefore'
 	| 'TogglePodcastFeedSkipShorts'

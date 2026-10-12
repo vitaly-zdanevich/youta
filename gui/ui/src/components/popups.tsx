@@ -164,7 +164,7 @@ export function HelpPopup({
         ["Space", "pause"],
 		['Left / Right', 'seek backward / forward 5 seconds'],
 		['Ctrl+Left / Ctrl+Right', 'seek backward / forward 20 seconds'],
-        ["0–9", "seek by ten percent"],
+        ['0-9', 'seek by ten percent; 0 requests the actual YouTube LIVE beginning'],
         ["↑ · ↓", "volume"],
         ["< · >", "speed"],
         ["[ · ]", "previous · next chapter"],

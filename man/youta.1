@@ -238,6 +238,14 @@ to navigate ordinary lists.
 .TP
 .BR 0 " through " 9
 Seek to 0 through 90 percent of the playing item when seeking is available.
+For YouTube LIVE,
+.B 0
+instead requests the broadcast's original beginning using a supervised,
+audio-only yt-dlp stream. Existing audio continues during preparation.
+Unavailable beginnings produce an error, never a rolling-cache or live-edge
+fallback. This requires the yt-dlp build feature; broadcasts older than the
+extractor's 120-hour from-start limit are rejected.
+YouTube LIVE displays only its current playback time, not the buffer duration.
 .TP
 .BR , ", " .
 Decrease or increase playback speed by 0.1.

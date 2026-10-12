@@ -443,6 +443,17 @@ seeking is available. Both front-ends share these shortcuts. `Alt+Left` /
 `Alt+Right` remain back / forward navigation, and editors and modal views
 retain their own key handling.
 
+YouTube LIVE shows only its current playback time, not a buffer duration or
+distance from the live edge. Press `0` during a broadcast to request its actual
+beginning through a supervised audio-only `yt-dlp` stream. Existing audio keeps
+playing while that request is prepared. If the original beginning is no longer
+available, Youta reports it instead of jumping to the oldest locally cached
+audio or silently returning to the live edge. This requires the `yt-dlp` build
+feature. [YouTube DVR availability and rewind limits](https://support.google.com/youtube/answer/9296823)
+still apply; broadcasts older than the extractor's 120-hour from-start limit
+are rejected. For other media, `0` through `9` seek to 0 through 90 percent
+when seeking is available.
+
 While a requested track is being resolved or waiting for playback to start,
 an ASCII spinner appears at the bottom-left of the TUI's last line. It shares
 the existing status row without reducing the space available for results.

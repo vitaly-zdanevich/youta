@@ -76,7 +76,7 @@ function factsFor(kind: InformationPanelKind, details: DetailView): Array<[strin
   switch (kind) {
     case "Video":
       rows.push(
-        ["Length", fact(details.length)],
+        ["Length", details.live ? null : fact(details.length)],
         ["Views", fact(details.views)],
         ["Likes", fact(details.likes)],
         ["Comments", fact(details.comments)],
@@ -432,8 +432,7 @@ export function Details({ view, kind }: { view: ViewModel; kind: InformationPane
           {facts.map(([label, value]) => (
             <div key={label} className="contents">
               <dt className="text-ink-faint">{label}</dt>
-							<dd className={details.live && label === 'Length' && value === 'LIVE'
-								? 'm-0 font-semibold text-red-400' : 'm-0'}>
+							<dd className='m-0'>
 								<FactValue details={details} label={label} value={value} />
 							</dd>
             </div>

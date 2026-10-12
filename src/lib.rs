@@ -127,7 +127,7 @@ pub mod thumbnails;
 pub mod app;
 #[cfg(feature = "ascii-visualizer")]
 pub mod ascii_visualizer;
-#[cfg(feature = "controller")]
+#[cfg(any(feature = "controller", feature = "yt-dlp"))]
 pub mod worker_wake;
 
 #[cfg(feature = "tui")]

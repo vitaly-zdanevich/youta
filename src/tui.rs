@@ -3752,7 +3752,7 @@ fn render_row_list(
                 && matches!(source_labels, RowSourceLabels::YouTubeSearch)
                 && matches!(row.source.as_str(), "YouTube" | "YouTube channel");
             let marker = if row.subscribed { "◆" } else { " " };
-            let progress = if !has_playback_progress || row.watched_percent == 0 {
+            let progress = if !has_playback_progress || row.live || row.watched_percent == 0 {
                 String::new()
             } else {
                 format!(" {}%", row.watched_percent)
@@ -5614,18 +5614,17 @@ fn render_information_panel(
                 ("Comments", details.comments.as_str()),
             ] {
                 let value = value.trim();
-                if value.is_empty() || value.eq_ignore_ascii_case("unknown") {
+                if value.is_empty()
+                    || value.eq_ignore_ascii_case("unknown")
+                    || (name == "Length" && details.live)
+                {
                     continue;
                 }
                 if !spans.is_empty() {
                     spans.push(Span::raw("  "));
                 }
                 spans.push(Span::styled(format!("{name}: "), theme.muted));
-                spans.push(if name == "Length" && details.live && value == "LIVE" {
-                    Span::styled(value.to_owned(), live_marker_style(Style::default()))
-                } else {
-                    Span::raw(value.to_owned())
-                });
+                spans.push(Span::raw(value.to_owned()));
             }
             if !spans.is_empty() {
                 lines.push(Line::from(spans));
@@ -7908,21 +7907,16 @@ fn render_seek_bar(
             view.playback.volume
         )
     } else if view.playback.live {
-        if live_seekable {
-            format!(
-                "{recording_prefix}LIVE −{} / {} buffer  {}x  vol {}%{state_suffix}{title_spacing}",
-                format_duration(duration.saturating_sub(view.playback.position)),
-                format_duration(duration),
-                trim_speed(view.playback.speed),
-                view.playback.volume,
-            )
-        } else {
-            format!(
-                "{recording_prefix}LIVE  {}x  vol {}%{state_suffix}{title_spacing}",
-                trim_speed(view.playback.speed),
-                view.playback.volume,
-            )
-        }
+        // A rolling rewind buffer is not the broadcast's total duration.
+        format!(
+            "{recording_prefix}LIVE {}  {}x  vol {}%{state_suffix}{title_spacing}",
+            format_duration(
+                view.live_elapsed_seconds
+                    .map_or(view.playback.position, Duration::from_secs)
+            ),
+            trim_speed(view.playback.speed),
+            view.playback.volume,
+        )
     } else {
         format!(
             "{} / {}  {}x  vol {}%{}{state_suffix}{title_spacing}",
@@ -8702,7 +8696,7 @@ fn render_help(frame: &mut Frame<'_>, view: &ViewModel, theme: &Theme) {
         "  F8 pointer: arrows move, Enter clicks, Esc/F8 exits.",
         "  Linux /dev/ttyN: physical mouse input requires a running GPM daemon.",
         "Playback",
-        "  Space pause     ←/→ 5 s     Ctrl+←/→ 20 s     0–9 seek by 10%",
+        "  Space pause  ←/→ 5 s  Ctrl+←/→ 20 s  0-9 seek 10%; LIVE: 0 to start",
         "  ↑/↓ volume ,/. speed 10% [ prev chapter ] next chapter T chapter times",
         "  {/} previous / next item in the queue or its source list",
         "  ~ repeat     A autoplay next item from same source list   w waveform",
@@ -37436,6 +37430,7 @@ for encoded, expected in json.load(sys.stdin):
         let backend = TestBackend::new(100, 2);
         let mut terminal = Terminal::new(backend).expect("terminal");
         let view = ViewModel {
+            live_elapsed_seconds: Some(23),
             playback: PlaybackStatus {
                 idle: false,
                 live: true,
@@ -37560,6 +37555,50 @@ for encoded, expected in json.load(sys.stdin):
         );
     }
 
+    /// LIVE presents current playback time, not a negative lag or finite buffer duration.
+    #[test]
+    fn youtube_live_status_shows_elapsed_time_and_preserves_seekability() {
+        for height in [1, 2] {
+            for seekable in [false, true] {
+                let mut terminal = Terminal::new(TestBackend::new(100, height)).unwrap();
+                let view = ViewModel {
+                    playing_media_id: Some(MediaId::new(SourceKind::YouTube, "live-fixture")),
+                    playback: PlaybackStatus {
+                        idle: false,
+                        live: true,
+                        position: Duration::from_secs(23),
+                        duration: seekable.then_some(Duration::from_secs(36)),
+                        live_seekable_range: seekable.then_some(crate::playback::BufferedRange {
+                            start: Duration::from_secs(1_000),
+                            end: Duration::from_secs(1_036),
+                        }),
+                        ..PlaybackStatus::default()
+                    },
+                    ..ViewModel::default()
+                };
+                let mut hit_map = HitMap::default();
+                terminal
+                    .draw(|frame| {
+                        render_seek_bar(
+                            frame,
+                            frame.area(),
+                            &view,
+                            &UiSettings::default(),
+                            &Theme::new(false),
+                            &mut hit_map,
+                        );
+                    })
+                    .unwrap();
+                let rendered = rendered_text(&terminal);
+                assert!(rendered.contains("LIVE 0:23"), "{rendered}");
+                assert!(!rendered.contains(" / "), "{rendered}");
+                assert!(!rendered.contains(" buffer"), "{rendered}");
+                assert!(!rendered.contains("−"), "{rendered}");
+                assert_eq!(!hit_map.seek_bar.is_empty(), seekable);
+            }
+        }
+    }
+
     #[test]
     fn live_cached_range_restores_a_bounded_clickable_seek_bar() {
         let backend = TestBackend::new(160, 2);
@@ -37602,7 +37641,10 @@ for encoded, expected in json.load(sys.stdin):
             .expect("draw cached live seek bar");
 
         let rendered = rendered_text(&terminal);
-        assert!(rendered.contains("LIVE −0:13 / 3:55 buffer"));
+        assert!(rendered.contains("LIVE 3:42"));
+        assert!(!rendered.contains(" buffer"));
+        assert!(!rendered.contains("−0:13"));
+        assert!(!rendered.contains(" / 3:55"));
         assert!(rendered.contains("Fixture live station"));
         assert!(!rendered.contains("2400:20"));
         assert_eq!(hit_map.seek_bar, Rect::new(0, 0, 160, 1));
@@ -42591,7 +42633,7 @@ prose 07:25 remains clickable but is not a chapter";
     }
 
     #[test]
-    fn youtube_live_details_color_the_length_without_changing_public_counts() {
+    fn youtube_live_details_omit_length_without_changing_public_counts() {
         for live in [true, false] {
             let mut terminal = Terminal::new(TestBackend::new(160, 18)).expect("terminal");
             let view = ViewModel {
@@ -42600,7 +42642,7 @@ prose 07:25 remains clickable but is not a chapter";
                     source: "YouTube".to_owned(),
                     title: "LIVE title".to_owned(),
                     live,
-                    length: "LIVE".to_owned(),
+                    length: if live { "LIVE" } else { "4:05" }.to_owned(),
                     views: "12".to_owned(),
                     likes: "3".to_owned(),
                     comments: "4".to_owned(),
@@ -42614,25 +42656,54 @@ prose 07:25 remains clickable but is not a chapter";
                 })
                 .expect("draw live details");
 
-            let buffer = terminal.backend().buffer();
-            let (y, line, start) = (0..18)
-                .find_map(|y| {
-                    let line = (0..160)
-                        .map(|x| buffer[(x, y)].symbol())
-                        .collect::<String>();
-                    let start = line.find("Length: LIVE  Views: 12  Likes: 3  Comments: 4")?;
-                    Some((y, line, start))
-                })
-                .expect("live length and original public counts");
-            let x = terminal_text_width(&line[..start]) + 8;
-            for x in x..x + 4 {
-                assert_eq!(buffer[(x, y)].fg == Color::Red, live);
+            let rendered = rendered_text(&terminal);
+            assert!(rendered.contains("Views: 12  Likes: 3  Comments: 4"));
+            assert_eq!(rendered.contains("Length:"), !live);
+            if !live {
+                assert!(rendered.contains("Length: 4:05"));
             }
-            assert_ne!(
-                buffer[(x + 14, y)].fg,
-                Color::Red,
-                "view count stays unchanged"
-            );
+        }
+    }
+
+    #[test]
+    fn live_rows_omit_percentages_but_finite_rows_keep_them() {
+        for screen in [Screen::Search, Screen::Subscriptions] {
+            for compact in [false, true] {
+                for live in [false, true] {
+                    let row = RowView {
+                        media_id: Some(MediaId::new(SourceKind::YouTube, "dQw4w9WgXcQ")),
+                        source: "YouTube".to_owned(),
+                        title: "Progress fixture".to_owned(),
+                        subtitle: format!("Creator · {}", if live { "LIVE" } else { "4:05" }),
+                        compact,
+                        live,
+                        playback_started: true,
+                        watched_percent: 38,
+                        ..RowView::default()
+                    };
+                    let mut view = ViewModel {
+                        screen,
+                        rows: vec![row.clone()],
+                        ..ViewModel::default()
+                    };
+                    view.subscriptions.items = vec![row];
+                    view.subscriptions.route = SubscriptionRoute::Items;
+                    view.subscriptions.layout = SubscriptionsLayout::DrillDown;
+                    let mut terminal = Terminal::new(TestBackend::new(160, 18)).unwrap();
+                    terminal
+                        .draw(|frame| {
+                            render(frame, &view, &UiSettings::default(), &mut HitMap::default());
+                        })
+                        .unwrap();
+                    let rendered = rendered_text(&terminal);
+                    assert!(rendered.contains("Progress fixture"));
+                    assert_eq!(
+                        rendered.contains("38%"),
+                        !live,
+                        "{screen:?}, compact={compact}"
+                    );
+                }
+            }
         }
     }
 

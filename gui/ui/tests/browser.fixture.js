@@ -103,6 +103,7 @@
 		view.playback = { ...view.playback, ...clone(patch) };
 		emit('youta://playback', {
 			playback: view.playback, radio_now_playing: null, playback_starting: false,
+			live_elapsed_seconds: view.live_elapsed_seconds,
 			playback_start_animation_frame: 0, search_animation_frame: 0,
 			local_fingerprint_animation_frame: 0, youtube_caption_line: null,
 		});
@@ -432,24 +433,27 @@
 		snapshot(previous);
 	}
 
-	/** The live duration is red in results, subscriptions, Details and the transport. */
+	/** LIVE marks rows and stable elapsed playback without a finite length or completion percent. */
 	async function checkLiveDuration() {
 		const previous = clone(view);
 		const id = { source: 'you-tube', external_id: 'fixture-live' };
-		const liveRow = { ...row('LIVE', id), source: 'YouTube', subtitle: 'LIVE · LIVE', live: true };
-		const ordinary = { ...row('Ordinary video', id), subtitle: 'LIVE · 0:00', live: false };
-		snapshot({ screen: 'Search', rows: [liveRow, ordinary],
+		const liveRow = { ...row('LIVE', id), source: 'YouTube', subtitle: 'LIVE · LIVE', live: true,
+			watched_percent: 38, playback_started: true };
+		const ordinary = { ...row('Ordinary video', id), subtitle: 'LIVE · 0:00', live: false,
+			watched_percent: 38, playback_started: true };
+		snapshot({ screen: 'Search', rows: [liveRow, ordinary], live_elapsed_seconds: 0,
 			details: { ...details('LIVE', id), source: 'YouTube', channel_name: 'LIVE', length: 'LIVE', live: true },
 			now_playing: { media_id: id, title: 'LIVE', subtitle: '' },
 			playback: { ...view.playback, idle: false, live: true, duration: null,
 				position: { secs: 0, nanos: 0 }, live_seekable_range: null } });
 		const resultMarker = await until(() => document.querySelector('[aria-label=Results] .text-red-400'), 'red LIVE in search results');
-		const lengthMarker = await until(() => document.querySelector('[aria-label=Details] dd.text-red-400'), 'red LIVE Length in Details');
 		const playerMarker = await until(() => document.querySelector('footer .text-red-400'), 'red LIVE in the player');
+		assert(![...document.querySelectorAll('[aria-label=Details] dt')].some((node) => node.textContent === 'Length'),
+			'LIVE Details omits the redundant finite Length row');
 		const probe = document.createElement('span');
 		probe.style.color = 'var(--color-red-400)';
 		document.body.append(probe);
-		for (const marker of [resultMarker, lengthMarker, playerMarker]) {
+		for (const marker of [resultMarker, playerMarker]) {
 			assert(marker.textContent === 'LIVE' && getComputedStyle(marker).color === getComputedStyle(probe).color,
 				'The canonical LIVE indicator uses the built red color');
 			assert(getComputedStyle(marker).color !== getComputedStyle(marker.parentElement).color,
@@ -459,17 +463,33 @@
 		assert(document.querySelectorAll('[aria-label=Results] .text-red-400').length === 1,
 			'A channel named LIVE and unknown ordinary duration stay uncolored');
 		assert(resultMarker.parentElement.textContent === 'LIVE · LIVE', 'The complete channel and live duration remain visible');
+		const liveButton = resultMarker.closest('button');
+		assert(!liveButton.textContent.includes('%') && !liveButton.querySelector('i, [title$="% played"]'),
+			'LIVE results omit completion percentages and watched-progress bars');
+		assert(document.querySelector('[aria-label=Results] [title="38% played"] i')?.style.width === '38%',
+			'Finite results retain their watched-progress bar and percentage');
 		assert(!document.querySelector('footer').textContent.includes('--:--'), 'Live playback omits an unknown finite duration');
+		assert(playerMarker.parentElement.textContent === 'LIVE 0:00', 'Unseekable playback begins at positive LIVE 0:00');
 		assert(document.querySelector('[aria-label="Playback position"]').disabled, 'An unseekable live stream keeps seeking disabled');
-		snapshot({ playback: { ...view.playback, position: { secs: 240, nanos: 0 }, duration: { secs: 300, nanos: 0 },
-			live_seekable_range: { start: { secs: 0, nanos: 0 }, end: { secs: 300, nanos: 0 } } } });
-		await until(() => document.querySelector('footer').textContent.includes('LIVE −1:00'), 'live edge offset in DVR playback');
-		assert(document.querySelector('footer').textContent.includes('5:00 buffer'), 'Seekable live playback retains the available buffer duration');
+		snapshot({ live_elapsed_seconds: 23, playback: { ...view.playback,
+			position: { secs: 8641222, nanos: 0 }, duration: { secs: 8641235, nanos: 0 } } });
+		await until(() => document.querySelector('footer .text-red-400')?.parentElement.textContent === 'LIVE 0:23',
+			'stable elapsed time despite synthetic backend timestamps');
+		assert(document.querySelector('[aria-label="Playback position"]').disabled,
+			'A synthetic duration does not make an unbuffered broadcast seekable');
+		snapshot({ live_elapsed_seconds: 240, playback: { ...view.playback,
+			live_seekable_range: { start: { secs: 8640935, nanos: 0 }, end: { secs: 8641235, nanos: 0 } } } });
+		await until(() => document.querySelector('footer .text-red-400')?.parentElement.textContent === 'LIVE 4:00',
+			'positive elapsed time in DVR playback');
+		assert(!document.querySelector('footer').textContent.includes('buffer')
+			&& !document.querySelector('footer').textContent.includes('−1:00'), 'LIVE omits buffer duration and negative edge lag');
 		assert(!document.querySelector('[aria-label="Playback position"]').disabled, 'The live DVR buffer remains seekable');
+		await action({ SeekRelative: -5 }, () => button('Back 5 seconds').click(), 'The available LIVE cache still supports backward seeking');
+		await action({ SeekRelative: 5 }, () => button('Forward 5 seconds').click(), 'The available LIVE cache still supports forward seeking');
 		const dvrMarker = document.querySelector('footer .text-red-400');
 		assert(dvrMarker.textContent === 'LIVE'
 			&& getComputedStyle(dvrMarker).color !== getComputedStyle(dvrMarker.parentElement).color,
-			'Only LIVE is red; its DVR offset retains the muted status color');
+			'Only LIVE is red; its elapsed time retains the muted status color');
 		snapshot({ queue_popup: { current: 0, selected: 0, repeat_one: false, items: [
 			{ media_id: id, title: 'LIVE', subtitle: 'LIVE', length: 'LIVE' },
 			{ media_id: { ...id, external_id: 'ordinary' }, title: 'LIVE', subtitle: 'LIVE', length: '0:00' },
@@ -488,6 +508,9 @@
 		assert(subscriptionMarker.textContent === 'LIVE'
 			&& document.querySelectorAll('[data-subscription-pane] .text-red-400').length === 1,
 			'Subscriptions shares the confirmed live duration styling without coloring the channel');
+		assert(!subscriptionMarker.closest('button').textContent.includes('%')
+			&& !subscriptionMarker.closest('button').querySelector('i, [title$="% played"]'),
+			'LIVE subscription rows do not imply finite completion');
 		snapshot(previous);
 		await until(() => !document.querySelector('[data-subscriptions-screen]'), 'restore the prior screen after live fixtures');
 	}

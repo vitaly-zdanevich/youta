@@ -3358,6 +3358,11 @@ pub struct ViewModel {
     pub waveform_playback_matches: bool,
     /// Current player state.
     pub playback: PlaybackStatus,
+    /// Stable YouTube LIVE elapsed time, independent of the rolling rewind cache.
+    ///
+    /// Ordinary live playback starts at its first active backend timestamp;
+    /// original-broadcast playback instead retains the broadcast's zero origin.
+    pub live_elapsed_seconds: Option<u64>,
     /// Whether this build contains fullscreen ASCII audio visualization.
     #[cfg(feature = "ascii-visualizer")]
     pub ascii_visualizer_supported: bool,
@@ -3934,6 +3939,7 @@ impl Default for ViewModel {
             waveform: WaveformView::Unavailable,
             waveform_playback_matches: false,
             playback: PlaybackStatus::default(),
+            live_elapsed_seconds: None,
             radio_now_playing: None,
             radio_recording: None,
             playback_chapters: Vec::new(),
@@ -4269,6 +4275,8 @@ pub enum UiAction {
     SeekRelative(i64),
     /// Seek to a percentage from `0.0` to `100.0`.
     SeekPercent(f64),
+    /// Prepare an active `YouTube` broadcast from its original start, beyond the local cache.
+    SeekLiveStart,
     /// Seek within, or start, the media owning a description timecode.
     ActivateTimecode {
         /// Media identity captured when the timecode was rendered.

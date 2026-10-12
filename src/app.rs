@@ -28,6 +28,8 @@ mod download_choice;
 mod email_links;
 mod end_pause;
 mod invidious_instances;
+#[cfg(feature = "yt-dlp")]
+mod live_start;
 #[cfg(feature = "cmd")]
 mod local_command;
 #[cfg(feature = "local-copy")]
@@ -5622,6 +5624,11 @@ pub struct AppController {
     #[cfg(feature = "sponsorblock")]
     skipped_sponsorblock_segment: Option<(MediaId, u64)>,
     current_media: Option<MediaId>,
+    /// Stable raw backend timestamp owning the current YouTube LIVE elapsed clock.
+    youtube_live_time_origin: Option<Duration>,
+    /// Async original-broadcast preparation and the current transient transport.
+    #[cfg(feature = "yt-dlp")]
+    live_start: live_start::LiveStartState,
     /// Playback progress loaded once per item and updated without rescanning
     /// the complete human-readable progress document every checkpoint.
     current_playback_progress: Option<PlaybackProgress>,
@@ -6975,6 +6982,9 @@ impl AppController {
             #[cfg(feature = "sponsorblock")]
             skipped_sponsorblock_segment: None,
             current_media: saved.selected_media,
+            youtube_live_time_origin: None,
+            #[cfg(feature = "yt-dlp")]
+            live_start: live_start::LiveStartState::new(worker_notifier.clone()),
             current_playback_progress: None,
             current_autoplay_origin: None,
             queued_autoplay_resume_origin: None,
@@ -7291,6 +7301,8 @@ impl AppController {
         let preparing = history_pending || self.soundcloud_playback_pending();
         #[cfg(not(feature = "soundcloud"))]
         let preparing = history_pending;
+        #[cfg(feature = "yt-dlp")]
+        let preparing = preparing || self.live_start.preparing();
         let was_pending = self.view.playback_activity_pending();
         self.view.playback_preparing = preparing
             && !self.view.quitting
@@ -19364,6 +19376,8 @@ impl AppController {
     /// does on its own. A missing, replaced, or exhausted list is a stated
     /// refusal rather than a wrap-around.
     fn play_queue_neighbour(&mut self, step: i32) {
+        #[cfg(feature = "yt-dlp")]
+        self.cancel_live_start_preparation();
         let Some(current) = self.playback_queue.current_index else {
             self.view.status_line = "The queue holds nothing to move through".to_owned();
             return;
@@ -21364,6 +21378,8 @@ impl AppController {
     }
 
     fn activate_selection(&mut self) {
+        #[cfg(feature = "yt-dlp")]
+        self.cancel_live_start_preparation();
         if self.view.screen == Screen::SoundCloud {
             self.activate_soundcloud_selection();
             return;
@@ -26408,6 +26424,12 @@ impl AppController {
         origin: Option<AutoplayOrigin>,
         resolved_input: Option<PlaybackInput>,
     ) {
+        #[cfg(feature = "yt-dlp")]
+        let live_start_input = self.live_start.accepting_input;
+        #[cfg(not(feature = "yt-dlp"))]
+        let live_start_input = false;
+        #[cfg(feature = "yt-dlp")]
+        self.cancel_live_start_preparation();
         // A newer source intent supersedes outstanding resolution before any
         // source-specific early return can leave an older worker in charge.
         #[cfg(feature = "yandex-music")]
@@ -26602,7 +26624,9 @@ impl AppController {
         input.title = Some(item.media.title.clone());
         input.keep_open = canonical_input.keep_open;
         input.cache_identity = canonical_input.cache_identity.clone();
-        let mut load_kind = if media_id.source == SourceKind::YouTube {
+        let mut load_kind = if live_start_input {
+            PlaybackLoadKind::Regular
+        } else if media_id.source == SourceKind::YouTube {
             PlaybackLoadKind::YouTubeCanonical
         } else {
             PlaybackLoadKind::Regular
@@ -26618,12 +26642,21 @@ impl AppController {
             input.bypass_ytdl = true;
             load_kind = PlaybackLoadKind::YouTubeDirect;
         }
-        if media_id.source == SourceKind::YouTube && input.location != canonical_input.location {
+        if !live_start_input
+            && media_id.source == SourceKind::YouTube
+            && input.location != canonical_input.location
+        {
             input.cache_fallback_url = Some(canonical_input.location.clone());
+        }
+        if live_start_input {
+            input.cache_identity = None;
+            input.cache_fallback_url = None;
         }
         #[cfg(all(feature = "archive-org", feature = "yt-dlp", feature = "backend-mpv"))]
         self.cache_original_playback_input(&item, &mut input);
         let had_active_media = self.current_media.is_some();
+        #[cfg(feature = "yt-dlp")]
+        self.retire_active_live_start();
         let first_result = self
             .player
             .as_mut()
@@ -26643,6 +26676,10 @@ impl AppController {
         };
         match play_result {
             Ok(()) => {
+                let youtube_live = live_stream && media_id.source == SourceKind::YouTube;
+                self.youtube_live_time_origin =
+                    (youtube_live && live_start_input).then_some(Duration::ZERO);
+                self.view.live_elapsed_seconds = youtube_live.then_some(0);
                 #[cfg(feature = "waveform")]
                 {
                     self.current_local_waveform_playback =
@@ -26742,6 +26779,13 @@ impl AppController {
                 #[cfg(all(feature = "archive-org", feature = "yt-dlp", feature = "backend-mpv"))]
                 {
                     self.archive_playback_cache = None;
+                }
+                #[cfg(feature = "yt-dlp")]
+                if live_start_input {
+                    self.fail_live_start_playback(
+                        "The playback backend could not open initial audio",
+                    );
+                    return;
                 }
                 self.show_error("Playback failed", &error);
             }
@@ -26884,13 +26928,36 @@ impl AppController {
     /// Some live transports expose large synthetic `time-pos` and `duration`
     /// values. For a [`MediaKind::LiveStream`], only mpv's exact cached seek
     /// range becomes a rolling user timeline; the transport duration itself
-    /// remains hidden.
-    fn normalize_playback_status(&self, status: &mut PlaybackStatus) {
+    /// remains hidden. YouTube elapsed time is derived before that projection,
+    /// using a stable origin rather than the sliding cache's start timestamp.
+    fn normalize_playback_status(&mut self, status: &mut PlaybackStatus) {
         let live_stream = self.current_media.as_ref().is_some_and(|media_id| {
             self.playback_queue.current().is_some_and(|item| {
                 &item.media.id == media_id && item.media.kind == MediaKind::LiveStream
             })
         });
+        let youtube_live = live_stream
+            && self
+                .current_media
+                .as_ref()
+                .is_some_and(|media_id| media_id.source == SourceKind::YouTube);
+        if youtube_live {
+            // Loading snapshots can contain zero placeholders or stale transport
+            // timestamps. Only an active positive timestamp establishes the
+            // session origin; accepted from-start inputs already own origin zero.
+            if !status.idle && self.playback_phase == PlaybackPhase::Playing {
+                if self.youtube_live_time_origin.is_none() && !status.position.is_zero() {
+                    self.youtube_live_time_origin = Some(status.position);
+                }
+                self.view.live_elapsed_seconds = Some(
+                    self.youtube_live_time_origin
+                        .map_or(0, |origin| status.position.saturating_sub(origin).as_secs()),
+                );
+            }
+        } else {
+            self.youtube_live_time_origin = None;
+            self.view.live_elapsed_seconds = None;
+        }
         status.live = live_stream;
         status.live_seekable_range = None;
         if live_stream {
@@ -27186,6 +27253,16 @@ impl AppController {
     }
 
     fn handle_playback_end(&mut self, end: PlaybackEnd, elapsed: Duration) {
+        #[cfg(feature = "yt-dlp")]
+        if let Some(error) = self.take_live_start_error() {
+            self.fail_live_start_playback(&error);
+            return;
+        }
+        #[cfg(feature = "yt-dlp")]
+        if self.live_start.active.is_some() && end.reason == PlaybackEndReason::Error {
+            self.fail_live_start_playback("The broadcast's original audio stream failed");
+            return;
+        }
         #[cfg(feature = "radio")]
         self.discard_active_radio_recording();
         if self.retry_youtube_load(&end) {
@@ -27445,6 +27522,9 @@ impl AppController {
             Ok(()) => {
                 self.playback_load_kind = next_kind;
                 self.playback_phase = PlaybackPhase::Loading;
+                self.youtube_live_time_origin = None;
+                self.view.live_elapsed_seconds =
+                    (item.media.kind == MediaKind::LiveStream).then_some(0);
                 self.begin_playback_start_activity();
                 self.ignore_replaced_stop = true;
                 self.last_tick = Instant::now();
@@ -27492,6 +27572,8 @@ impl AppController {
     }
 
     fn reset_playback_state(&mut self) {
+        #[cfg(feature = "yt-dlp")]
+        self.cancel_live_start();
         self.clear_now_playing_context();
         #[cfg(feature = "soundcloud")]
         self.reset_soundcloud_preview();
@@ -27510,6 +27592,8 @@ impl AppController {
         self.pending_history = None;
         self.ignore_replaced_stop = false;
         self.current_media = None;
+        self.youtube_live_time_origin = None;
+        self.view.live_elapsed_seconds = None;
         self.current_playback_progress = None;
         self.current_autoplay_origin = None;
         self.seek_back.clear();
@@ -27532,6 +27616,11 @@ impl AppController {
     where
         E: std::error::Error + 'static,
     {
+        #[cfg(feature = "yt-dlp")]
+        if self.live_start.active.is_some() {
+            self.fail_live_start_playback("The from-start playback backend failed");
+            return;
+        }
         #[cfg(feature = "radio")]
         self.disable_and_discard_active_radio_recording();
         self.prepare_to_clear_playback(elapsed);
@@ -32066,6 +32155,8 @@ impl AppController {
         title: impl Into<String>,
         report: impl Into<String>,
     ) {
+        #[cfg(feature = "yt-dlp")]
+        self.shutdown_live_start();
         #[cfg(feature = "ascii-visualizer")]
         self.dismiss_ascii_visualizer();
         #[cfg(feature = "audio-quality")]
@@ -35717,6 +35808,8 @@ impl AppController {
         // Prevent Drop from repeating partial teardown if a destructor or
         // worker join panics while this method is already running.
         self.shutdown_persistence_succeeded = Some(false);
+        #[cfg(feature = "yt-dlp")]
+        self.shutdown_live_start();
         #[cfg(all(feature = "yt-dlp", feature = "backend-mpv"))]
         drop(self.pending_cached_download.take());
         #[cfg(all(feature = "archive-org", feature = "yt-dlp", feature = "backend-mpv"))]
@@ -36408,6 +36501,16 @@ impl UiController for AppController {
             UiAction::TogglePause => self.player_command(PlayerCommand::TogglePause),
             UiAction::SeekRelative(seconds) => self.seek_relative(seconds),
             UiAction::SeekPercent(percent) => self.seek_percent(percent),
+            UiAction::SeekLiveStart => {
+                #[cfg(feature = "yt-dlp")]
+                self.request_live_start();
+                #[cfg(not(feature = "yt-dlp"))]
+                {
+                    self.view.status_line =
+                        "Broadcast beginning is unavailable: this build omits yt-dlp support"
+                            .into();
+                }
+            }
             UiAction::ChangeVolume(delta) => {
                 let volume = i16::from(self.view.playback.volume)
                     .saturating_add(i16::from(delta))
@@ -37743,6 +37846,8 @@ impl UiController for AppController {
         self.poll_archive_upload();
         #[cfg(feature = "s3-upload")]
         self.poll_s3_upload();
+        #[cfg(feature = "yt-dlp")]
+        self.poll_live_start();
         self.update_player();
         #[cfg(feature = "ascii-visualizer")]
         self.refresh_ascii_visualizer();
@@ -47765,6 +47870,9 @@ mod tests {
     mod download_choice_tests;
     #[path = "end_pause.rs"]
     mod end_pause_tests;
+    #[cfg(feature = "yt-dlp")]
+    #[path = "live_start.rs"]
+    mod live_start_tests;
     #[path = "local_activation.rs"]
     mod local_activation_tests;
     #[path = "local_browse_wake.rs"]
