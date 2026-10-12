@@ -4974,7 +4974,7 @@ fn render_information_panel(
                 if archive_org_details {
                     "Comments"
                 } else {
-                    "Twenty comments"
+                    "Few comments"
                 },
                 show_hotkeys,
             ),
@@ -5426,7 +5426,7 @@ fn render_information_panel(
                 &right_buttons,
                 &mut next_left_row,
                 inner.width,
-                button("F6", "Twenty comments", show_hotkeys),
+                button("F6", "Few comments", show_hotkeys),
                 theme.accent,
                 UiAction::OpenVideoComments,
             )
@@ -29715,7 +29715,7 @@ for encoded, expected in json.load(sys.stdin):
                 })
                 .unwrap();
             for (action, key, label, row) in [
-                (UiAction::OpenVideoComments, "F6", "Twenty comments", 3),
+                (UiAction::OpenVideoComments, "F6", "Few comments", 3),
                 (UiAction::GenerateVideoSummary, "G", "Summarize", 4),
                 (
                     UiAction::ToggleSubscription,
@@ -29878,7 +29878,7 @@ for encoded, expected in json.load(sys.stdin):
                 video_comments_available: true,
                 external_opener_available: false,
                 details: Some(DetailView {
-                    media_id: Some(MediaId::new(source, "fixture")),
+                    media_id: Some(MediaId::new(source.clone(), "fixture")),
                     source: "YouTube".into(),
                     ..DetailView::default()
                 }),
@@ -29906,6 +29906,16 @@ for encoded, expected in json.load(sys.stdin):
                 .find(|(action, _)| *action == UiAction::OpenVideoComments);
             if let Some(left) = expected_left {
                 let (_, area) = target.expect("available public comments");
+                let label = if source == SourceKind::ArchiveOrg {
+                    "[F6] Comments"
+                } else {
+                    "[F6] Few comments"
+                };
+                let rendered_label = (area.x..area.right())
+                    .map(|x| terminal.backend().buffer()[(x, area.y)].symbol())
+                    .collect::<String>();
+                assert_eq!(rendered_label, label, "{screen:?}");
+                assert_eq!(area.width, terminal_text_width(label), "{screen:?}");
                 assert_eq!(area.x == hits.details_panel.x, left, "{screen:?}");
                 if !left {
                     assert_eq!(area.right(), hits.details_panel.right());
@@ -30224,7 +30234,7 @@ for encoded, expected in json.load(sys.stdin):
             "[l] Add to todo".to_owned(),
             "[P] Playlist".to_owned(),
             "[n] Add note".to_owned(),
-            "[F6] Twenty comments".to_owned(),
+            "[F6] Few comments".to_owned(),
             "[Shift+F2] Podcast".to_owned(),
             "[s] Subscribe (locally)".to_owned(),
             "[c] To channel".to_owned(),
@@ -30399,7 +30409,7 @@ for encoded, expected in json.load(sys.stdin):
             "[l] Add to todo",
             "[P] Playlist",
             "[n] Add note",
-            "[F6] Twenty comments",
+            "[F6] Few comments",
             "[G] Summarize",
         ] {
             assert!(rendered.contains(label), "missing rendered label {label:?}");
@@ -42900,7 +42910,7 @@ prose 07:25 remains clickable but is not a chapter";
                 .expect("draw comments fixture");
             let rendered = rendered_text(&terminal);
             assert!(!rendered.contains("Comments: 0"));
-            assert_eq!(rendered.contains("[F6] Twenty comments"), expected);
+            assert_eq!(rendered.contains("[F6] Few comments"), expected);
             assert_eq!(
                 hit_map
                     .detail_buttons
@@ -43461,17 +43471,17 @@ prose 07:25 remains clickable but is not a chapter";
                 );
             })
             .expect("draw supported YouTube comments control");
-        assert!(rendered_text(&youtube_terminal).contains("[F6] Twenty comments"));
+        assert!(rendered_text(&youtube_terminal).contains("[F6] Few comments"));
         let comments_target = youtube_hit_map
             .detail_buttons
             .iter()
             .find_map(|(action, target)| {
                 (action == &UiAction::OpenVideoComments).then_some(*target)
             })
-            .expect("Twenty comments hit target");
+            .expect("Few comments hit target");
         assert_eq!(
             comments_target.width,
-            terminal_text_width("[F6] Twenty comments"),
+            terminal_text_width("[F6] Few comments"),
         );
         assert_eq!(
             mouse_action(
@@ -43505,7 +43515,7 @@ prose 07:25 remains clickable but is not a chapter";
         local_terminal
             .draw(|frame| render(frame, &local, &UiSettings::default(), &mut local_hit_map))
             .expect("draw unsupported Local comments control");
-        assert!(!rendered_text(&local_terminal).contains("[F6] Twenty comments"));
+        assert!(!rendered_text(&local_terminal).contains("[F6] Few comments"));
         assert!(
             local_hit_map
                 .detail_buttons
@@ -43530,7 +43540,7 @@ prose 07:25 remains clickable but is not a chapter";
                 );
             })
             .expect("draw unsupported YouTube comments control");
-        assert!(!rendered_text(&unsupported_terminal).contains("[F6] Twenty comments"));
+        assert!(!rendered_text(&unsupported_terminal).contains("[F6] Few comments"));
         assert!(
             unsupported_hit_map
                 .detail_buttons
