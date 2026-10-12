@@ -121,6 +121,51 @@ pub fn validate_web_url(url: &Url) -> Result<(), WebBrowserError> {
     Ok(())
 }
 
+/// Parses a Web editor address, defaulting omitted schemes to HTTPS.
+///
+/// Explicit schemes retain their usual validation, including rejection of
+/// credentials and non-HTTP protocols. Domain, localhost, and bracketed IPv6
+/// ports are distinguished from schemes such as `javascript:`. This applies
+/// only to typed addresses, never to redirects or discovered relative links.
+///
+/// # Errors
+///
+/// Returns [`WebBrowserError::InvalidUrl`] for unsupported or unsafe addresses.
+#[cfg(feature = "controller")]
+pub(crate) fn parse_web_address(input: &str) -> Result<Url, WebBrowserError> {
+    let input = input.trim();
+    if input.is_empty()
+        || input.len() > MAX_URL_BYTES
+        || input.chars().any(char::is_control)
+        || (input.starts_with('/') && !input.starts_with("//"))
+        || input.starts_with("./")
+        || input.starts_with("../")
+    {
+        return Err(WebBrowserError::InvalidUrl);
+    }
+    let authority = input.split(['/', '?', '#']).next().unwrap_or_default();
+    let host_with_port = authority.rsplit_once(':').is_some_and(|(host, port)| {
+        (host.contains('.')
+            || host.eq_ignore_ascii_case("localhost")
+            || (host.starts_with('[') && host.ends_with(']')))
+            && !port.is_empty()
+            && port.bytes().all(|byte| byte.is_ascii_digit())
+    });
+    let parsed = if input.starts_with("//") {
+        Url::parse(&format!("https:{input}"))
+    } else if host_with_port {
+        Url::parse(&format!("https://{input}"))
+    } else {
+        match Url::parse(input) {
+            Err(url::ParseError::RelativeUrlWithoutBase) => Url::parse(&format!("https://{input}")),
+            result => result,
+        }
+    };
+    let url = parsed.map_err(|_| WebBrowserError::InvalidUrl)?;
+    validate_web_url(&url)?;
+    Ok(url)
+}
+
 /// Loads one Web listing without importing browser or provider credentials.
 #[derive(Clone, Debug)]
 pub struct WebBrowserClient {
@@ -555,6 +600,27 @@ mod tests {
 
     fn page() -> Url {
         Url::parse("http://192.168.100.2:8000/books/").unwrap()
+    }
+
+    /// Scheme insertion and URL encoding must stay inside the existing byte bound.
+    #[cfg(feature = "controller")]
+    #[test]
+    fn web_address_default_scheme_revalidates_normalized_size_and_relative_paths() {
+        let prefix = "example.org/";
+        let valid = format!("{prefix}{}", "a".repeat(MAX_URL_BYTES - prefix.len() - 8));
+        let url = parse_web_address(&valid).expect("normalized URL at the byte limit");
+        assert_eq!(url.as_str().len(), MAX_URL_BYTES);
+        assert!(parse_web_address(&format!("{valid}a")).is_err());
+        assert!(parse_web_address(&"a".repeat(MAX_URL_BYTES + 1)).is_err());
+        for input in ["./music/", "../music/", "javascript:1234", "ftp:8000"] {
+            assert!(parse_web_address(input).is_err(), "{input}");
+        }
+        assert_eq!(
+            parse_web_address("bücher.example/a%20b.opus?title=one%20two")
+                .unwrap()
+                .as_str(),
+            "https://xn--bcher-kva.example/a%20b.opus?title=one%20two"
+        );
     }
 
     #[test]

@@ -382,7 +382,9 @@ The Web tab, immediately after Local, browses HTTP/HTTPS directory listings
 and direct media links. It opens the URL editor on first entry; `/` edits the
 address, `Enter` opens a folder or plays selected media, `Esc` or `Backspace`
 goes back, and `R` refreshes. `j` / `k` and `PageUp` / `PageDown` navigate the
-compact list. `[A] Autoplay` uses the existing preference (off by default) to
+compact list. Addresses entered without a scheme, such as `example.com`, use
+`https://` automatically; explicit `http://` addresses remain unchanged.
+`[A] Autoplay` uses the existing preference (off by default) to
 continue through the directory's media in sequence. Playback is audio only,
 including linked video containers.
 

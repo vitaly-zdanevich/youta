@@ -7916,7 +7916,7 @@ impl AppController {
         {
             self.view.status_line = if self.view.screen == Screen::Web {
                 self.view.search_editing = true;
-                "Enter a complete http:// or https:// URL".to_owned()
+                "Enter a Web address (HTTPS by default)".to_owned()
             } else {
                 "Enter a search query".to_owned()
             };

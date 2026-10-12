@@ -2,7 +2,8 @@
 
 use super::*;
 use crate::web_browser::{
-    WebBrowserClient, WebDirectoryListing, WebEntry, WebEntryKind, validate_web_url,
+    WebBrowserClient, WebDirectoryListing, WebEntry, WebEntryKind, parse_web_address,
+    validate_web_url,
 };
 use sha2::{Digest, Sha256};
 
@@ -65,15 +66,9 @@ impl AppController {
         Ok(())
     }
 
-    /// Validates an explicit address before scheduling any network work.
+    /// Defaults typed addresses to HTTPS and validates before any network work.
     pub(super) fn submit_web_url(&mut self) {
-        let result = url::Url::parse(self.view.search_query.trim())
-            .map_err(|_| "Enter a complete http:// or https:// URL".to_owned())
-            .and_then(|url| {
-                validate_web_url(&url)
-                    .map(|()| url)
-                    .map_err(|error| error.to_string())
-            });
+        let result = parse_web_address(&self.view.search_query).map_err(|error| error.to_string());
         match result {
             Ok(url) => {
                 #[cfg(feature = "url-info")]
@@ -398,6 +393,82 @@ pub(super) fn queue_item_from_web(entry: &WebEntry) -> Option<QueueItem> {
 #[cfg(test)]
 mod startup_tests {
     use super::*;
+
+    /// Both frontends submit through this reducer; omitted schemes default to HTTPS.
+    #[test]
+    fn submitted_web_addresses_default_to_https_without_changing_explicit_http() {
+        let (_directory, mut app) = controller();
+        app.show_screen(Screen::Web);
+        let (release, held) = bounded::<()>(1);
+        let (_reply, response) = bounded(1);
+        app.web.worker = Some(WebWorker {
+            generation: 0,
+            response,
+            thread: thread::spawn(move || {
+                let _ = held.recv_timeout(Duration::from_secs(5));
+            }),
+        });
+        for (input, expected) in [
+            ("example.com", "https://example.com/"),
+            (
+                "  example.com/music/?page=2#track  ",
+                "https://example.com/music/?page=2",
+            ),
+            ("example.com:8443/music/", "https://example.com:8443/music/"),
+            ("localhost:8443/music/", "https://localhost:8443/music/"),
+            ("127.0.0.1:8443/music/", "https://127.0.0.1:8443/music/"),
+            ("[::1]:8443/music/", "https://[::1]:8443/music/"),
+            ("[::1]/music/", "https://[::1]/music/"),
+            ("//example.com/music/", "https://example.com/music/"),
+            ("https://example.com/music/", "https://example.com/music/"),
+            (
+                "http://localhost:8000/music/",
+                "http://localhost:8000/music/",
+            ),
+            ("HTTP://example.com/music/", "http://example.com/music/"),
+        ] {
+            app.view.search_query = input.to_owned();
+            app.dispatch(UiAction::SubmitSearch);
+            assert_eq!(app.web.query, expected, "{input}");
+            assert_eq!(app.view.search_query, expected, "{input}");
+            assert_eq!(app.view.search_cursor_byte, expected.len(), "{input}");
+            assert_eq!(app.web.request.as_ref().unwrap().1.as_str(), expected);
+            assert!(app.web.pending);
+            assert!(!app.view.search_editing);
+            assert!(app.current_media.is_none());
+        }
+        release.send(()).unwrap();
+        app.web.worker.take().unwrap().thread.join().unwrap();
+    }
+
+    /// Adding the default scheme must not bypass credential or scheme validation.
+    #[test]
+    fn submitted_web_addresses_reject_unsafe_or_invalid_input_without_network_work() {
+        let (_directory, mut app) = controller();
+        app.show_screen(Screen::Web);
+        for input in [
+            "",
+            "file:///etc/passwd",
+            "ftp://example.com/music/",
+            "javascript:alert(1)",
+            "data:text/html,hello",
+            "https://user:secret@example.com/",
+            "user:secret@example.com/",
+            "user@example.com/",
+            "//user:secret@example.com/",
+            "example.com:invalid/music/",
+            "example.com:65536/music/",
+            "/music/",
+            "example.com\n/music/",
+        ] {
+            app.view.search_query = input.to_owned();
+            app.dispatch(UiAction::SubmitSearch);
+            assert!(app.view.search_editing, "{input}");
+            assert!(app.web.worker.is_none(), "{input}");
+            assert!(app.web.request.is_none(), "{input}");
+            assert!(!app.web.pending, "{input}");
+        }
+    }
 
     #[test]
     fn published_web_result_does_not_wait_for_thread_exit() {
