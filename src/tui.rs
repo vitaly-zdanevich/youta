@@ -4609,7 +4609,7 @@ fn detail_button_layout_width(button_placement: &DetailButtonPlacement, show_hot
     let stable_label = match &button_placement.action {
         UiAction::ToggleRadioFavorite => Some(button("f", "Unfavorite", show_hotkeys)),
         UiAction::ToggleTodoPlaylist => Some(button("l", "Remove from todo", show_hotkeys)),
-        UiAction::EditPrivateNote => Some(button("n", "Edit private note", show_hotkeys)),
+        UiAction::EditPrivateNote => Some(button("n", "Edit note", show_hotkeys)),
         UiAction::ToggleSubscription => Some(button("s", "Unsubscribe (locally)", show_hotkeys)),
         UiAction::ToggleRadioRecording => Some(button("r", "Stop recording", show_hotkeys)),
         UiAction::FingerprintLocalAudio => Some(button("f", "Fingerprinting |", show_hotkeys)),
@@ -5397,9 +5397,9 @@ fn render_information_panel(
         let label = button(
             "n",
             if details.has_private_note {
-                "Edit private note"
+                "Edit note"
             } else {
-                "Add private note"
+                "Add note"
             },
             show_hotkeys,
         );
@@ -23218,7 +23218,7 @@ for encoded, expected in json.load(sys.stdin):
         terminal
             .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
             .expect("render add note");
-        assert!(rendered_text(&terminal).contains("[n] Add private note"));
+        assert!(rendered_text(&terminal).contains("[n] Add note"));
         assert!(
             hit_map
                 .detail_buttons
@@ -23230,7 +23230,27 @@ for encoded, expected in json.load(sys.stdin):
         terminal
             .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
             .expect("render edit note");
-        assert!(rendered_text(&terminal).contains("[n] Edit private note"));
+        assert!(rendered_text(&terminal).contains("[n] Edit note"));
+    }
+
+    /// The action rail reserves only the longer of the two compact note labels.
+    #[test]
+    fn private_note_button_rail_width_matches_short_add_and_edit_labels() {
+        for show_hotkeys in [false, true] {
+            for label in ["Add note", "Edit note"] {
+                let placement = DetailButtonPlacement {
+                    line_index: 0,
+                    column: 0,
+                    label: button("n", label, show_hotkeys),
+                    style: Style::default(),
+                    action: UiAction::EditPrivateNote,
+                };
+                assert_eq!(
+                    detail_button_layout_width(&placement, show_hotkeys),
+                    terminal_text_width(&button("n", "Edit note", show_hotkeys))
+                );
+            }
+        }
     }
 
     /// Folder notes remain actionable without manufacturing a playable media identity.
@@ -23261,9 +23281,9 @@ for encoded, expected in json.load(sys.stdin):
                     .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
                     .unwrap();
                 let label = if has_private_note {
-                    "[n] Edit private note"
+                    "[n] Edit note"
                 } else {
-                    "[n] Add private note"
+                    "[n] Add note"
                 };
                 assert!(rendered_text(&terminal).contains(label));
                 assert!(view.details.as_ref().unwrap().media_id.is_none());
@@ -30203,7 +30223,7 @@ for encoded, expected in json.load(sys.stdin):
             "[o] open video".to_owned(),
             "[l] Add to todo".to_owned(),
             "[P] Playlist".to_owned(),
-            "[n] Add private note".to_owned(),
+            "[n] Add note".to_owned(),
             "[F6] Twenty comments".to_owned(),
             "[Shift+F2] Podcast".to_owned(),
             "[s] Subscribe (locally)".to_owned(),
@@ -30378,7 +30398,7 @@ for encoded, expected in json.load(sys.stdin):
         for label in [
             "[l] Add to todo",
             "[P] Playlist",
-            "[n] Add private note",
+            "[n] Add note",
             "[F6] Twenty comments",
             "[G] Summarize",
         ] {
@@ -32193,13 +32213,14 @@ for encoded, expected in json.load(sys.stdin):
     fn archive_waveform_layout_preserves_small_sources_and_fits_narrow_or_short_panes() {
         for (width, height, dimensions, expected_width, link_below, comments) in [
             (148, 60, Some((320, 80)), 58, false, true),
-            (148, 60, Some((800, 200)), 125, true, true),
+            // The compact note/comment rail reserves 13 cells plus its two-cell gutter.
+            (148, 60, Some((800, 200)), 133, true, true),
             (148, 60, Some((1200, 200)), 148, true, true),
             (80, 30, Some((800, 200)), 80, true, true),
             (40, 20, Some((800, 200)), 40, true, true),
-            (148, 12, Some((800, 200)), 125, true, true),
+            (148, 12, Some((800, 200)), 133, true, true),
             (148, 8, Some((800, 200)), 58, false, true),
-            (148, 60, None, 125, true, true),
+            (148, 60, None, 133, true, true),
             // The compact note and original URL initially share the same row.
             (148, 60, Some((1200, 200)), 148, true, false),
         ] {
@@ -32959,7 +32980,7 @@ for encoded, expected in json.load(sys.stdin):
         assert!(!rendered.contains("Views:"));
         assert!(rendered.contains("[l] Add to todo"));
         assert!(rendered.contains("[P] Playlist"));
-        assert!(rendered.contains("[n] Add private note"));
+        assert!(rendered.contains("[n] Add note"));
         assert!(rendered.contains("THUMBNAIL IMAGE"));
         assert!(hit_map.thumbnail_area.is_some());
         assert_eq!(thumbnails.synchronized.len(), 1);

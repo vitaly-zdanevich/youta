@@ -1594,7 +1594,7 @@ and [gPodder synchronization manual](https://gpodder.github.io/docs/user-manual.
 
 ## Private notes
 
-Press `n`, or activate the **Add private note** / **Edit private note** row in
+Press `n`, or activate the **Add note** / **Edit note** row in
 Details, to open the focused multiline editor. The row is highlighted when the
 exact selection already has a note and remains a selectable mouse action.
 Youta keeps one private note per exact target:
