@@ -20752,8 +20752,8 @@ for encoded, expected in json.load(sys.stdin):
         };
         assert_eq!(
             key_action(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT), &channel),
-            None,
-            "the shortcut must not change volume while the description is hidden"
+            Some(UiAction::ScrollDetails(DetailsScroll::Lines(-1))),
+            "Channel details and expanded Wikidata also scroll"
         );
     }
 
@@ -20779,14 +20779,20 @@ for encoded, expected in json.load(sys.stdin):
             Some(UiAction::ScrollDetails(DetailsScroll::Lines(1)))
         );
 
-        for unavailable in [
-            ViewModel::default(),
-            ViewModel {
-                details: Some(DetailView::default()),
-                right_panel_mode: RightPanelMode::Channel,
-                ..ViewModel::default()
-            },
-        ] {
+        let channel = ViewModel {
+            right_panel_mode: RightPanelMode::Channel,
+            ..details
+        };
+        for (key, delta) in [('u', -1), ('d', 1)] {
+            assert_eq!(
+                key_action(
+                    KeyEvent::new(KeyCode::Char(key), KeyModifiers::ALT),
+                    &channel
+                ),
+                Some(UiAction::ScrollDetails(DetailsScroll::Lines(delta)))
+            );
+        }
+        for unavailable in [ViewModel::default()] {
             assert_eq!(
                 key_action(
                     KeyEvent::new(KeyCode::Char('u'), KeyModifiers::ALT),
@@ -20803,6 +20809,75 @@ for encoded, expected in json.load(sys.stdin):
                 "the Linux-TTY scroll fallback must not become Download"
             );
         }
+    }
+
+    #[test]
+    fn channel_wikidata_tty_scroll_keys_move_visible_text_and_clamp_at_both_ends() {
+        let mut view = ViewModel {
+            right_panel_mode: RightPanelMode::Channel,
+            details: Some(DetailView {
+                source: "YouTube channel".into(),
+                channel_id: "UC_x5XG1OV2P6uZZ5FSM9Ttw".into(),
+                expanded_wikidata_item: Some("Q42".into()),
+                wikidata_entities: vec![DetailWikidataEntityView {
+                    item_id: "Q42".into(),
+                    text: (0..60)
+                        .map(|line| format!("WIKIDATA_LINE_{line:02}"))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    value_links: Vec::new(),
+                    media_controls: Vec::new(),
+                    image_url: None,
+                }],
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        let mut hit_map = HitMap::default();
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+            .unwrap();
+        let original = rendered_text(&terminal);
+        let maximum = hit_map.details_scroll_maximum;
+        assert!(maximum > 1);
+        for _ in 0..maximum + 2 {
+            let expected = view.details_scroll.saturating_add(1).min(maximum);
+            assert_eq!(
+                key_action_with_page_rows(
+                    KeyEvent::new(KeyCode::Char('d'), KeyModifiers::ALT),
+                    &view,
+                    None,
+                    Some(&hit_map)
+                ),
+                Some(UiAction::SetDetailsScroll(expected))
+            );
+            view.details_scroll = expected;
+            terminal
+                .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+                .unwrap();
+        }
+        assert!(rendered_text(&terminal).contains("WIKIDATA_LINE_59"));
+        assert_ne!(rendered_text(&terminal), original);
+        for _ in 0..maximum + 2 {
+            let expected = view.details_scroll.saturating_sub(1);
+            assert_eq!(
+                key_action_with_page_rows(
+                    KeyEvent::new(KeyCode::Char('u'), KeyModifiers::ALT),
+                    &view,
+                    None,
+                    Some(&hit_map)
+                ),
+                Some(UiAction::SetDetailsScroll(expected))
+            );
+            view.details_scroll = expected;
+            terminal
+                .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+                .unwrap();
+        }
+        assert_eq!(rendered_text(&terminal), original);
+        assert_eq!(view.selected, 0);
+        assert!(view.playback.idle);
     }
 
     #[test]

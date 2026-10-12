@@ -4837,7 +4837,8 @@ fn details_show_url_tools(view: &ViewModel) -> bool {
             .is_some_and(|details| !details.thumbnail_expanded)
 }
 
-/// Reports whether line-scrolling shortcuts can target the visible Details pane.
+/// Reports whether line-scrolling shortcuts can target Details or Channel text,
+/// including an expanded Wikidata entity in either information panel.
 ///
 /// The default Linux virtual-console keymap binds `Alt+Up` to its
 /// `KeyboardSignal` action and emits `Alt+Down` like plain `Down`, so neither
@@ -4846,7 +4847,7 @@ fn details_show_url_tools(view: &ViewModel) -> bool {
 /// virtual-console-safe aliases. Both paths use this predicate so a failed
 /// `Alt+d` scroll never falls through to the unrelated Download action.
 fn details_accept_line_scroll(view: &ViewModel) -> bool {
-    view.details.is_some() && view.right_panel_mode == RightPanelMode::Details
+    view.details.is_some()
 }
 
 /// Resolves the Wikidata disclosure owned by the global `W` shortcut.
