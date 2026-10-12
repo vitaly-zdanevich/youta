@@ -275,7 +275,9 @@ impl AppController {
             webpage_url: Some(entry.url.clone()),
             description: if entry.kind == WebEntryKind::Directory {
                 "Press Enter to open this folder.".to_owned()
-            } else { "Audio only. With Autoplay enabled, playback continues through this folder in the displayed order.".to_owned() },
+            } else {
+                String::new()
+            },
             ..DetailView::default()
         });
         #[cfg(feature = "local-metadata")]

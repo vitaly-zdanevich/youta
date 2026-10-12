@@ -151,8 +151,7 @@ impl AppController {
             return;
         };
         let cached = self.web.metadata.cache.get(&entry.url);
-        let description =
-            web_metadata_description(&entry.name, cached.map(|cached| &cached.result.metadata));
+        let description = web_metadata_description(cached.map(|cached| &cached.result.metadata));
         let Some(details) = self.view.details.as_mut() else {
             return;
         };
@@ -294,9 +293,9 @@ fn cache_web_embedded_artwork(
     url::Url::from_file_path(path).ok()
 }
 
-/// Uses Local's field labels and units, with no made-up values for unavailable fields.
-fn web_metadata_description(filename: &str, metadata: Option<&WebMediaMetadata>) -> String {
-    let mut lines = vec![format!("File: {filename}")];
+/// Uses Local's metadata labels and units without repeating the selected filename.
+fn web_metadata_description(metadata: Option<&WebMediaMetadata>) -> String {
+    let mut lines = Vec::new();
     if let Some(metadata) = metadata {
         for (label, value) in [
             ("Artists", &metadata.artist),
@@ -334,8 +333,6 @@ fn web_metadata_description(filename: &str, metadata: Option<&WebMediaMetadata>)
     } else {
         lines.push("Loading metadata...".to_owned());
     }
-    lines.push(String::new());
-    lines.push("Audio only. With Autoplay enabled, playback continues through this folder in the displayed order.".to_owned());
     lines.join("\n")
 }
 

@@ -68,6 +68,27 @@ fn web_listing_has_compact_parent_folders_and_media() {
     assert!(!controller.view.search_editing);
 }
 
+/// Media details stay focused on the selected file, not general playback behavior.
+#[test]
+fn web_playable_details_omit_redundant_playback_instructions() {
+    let (mut controller, _) = controller_with_mock_statuses([]);
+    controller.show_screen(Screen::Web);
+    accept_listing(&mut controller);
+    controller.select_row(1);
+    assert_eq!(
+        controller.view.details.as_ref().unwrap().description,
+        "Press Enter to open this folder."
+    );
+    for row in [2, 3] {
+        controller.select_row(row);
+        let description = &controller.view.details.as_ref().unwrap().description;
+        assert!(!description.contains("Audio only."));
+        assert!(!description.contains("With Autoplay enabled"));
+        #[cfg(not(feature = "local-metadata"))]
+        assert!(description.is_empty());
+    }
+}
+
 #[test]
 fn web_stale_and_background_responses_do_not_replace_another_tab() {
     let (mut controller, _) = controller_with_mock_statuses([]);

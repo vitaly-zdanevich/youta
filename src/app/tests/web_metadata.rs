@@ -89,6 +89,7 @@ fn web_metadata_uses_local_labels_without_local_actions_or_reordering_files() {
         );
     }
     assert!(!details.description.contains("Full path:"));
+    assert!(!details.description.contains("File: "));
     assert_eq!(details.webpage_url.as_ref(), Some(&entry.url));
     assert!(!details.local_renamable && !details.local_movable && !details.local_trashable);
     assert!(!details.local_audio_quality_available && !details.local_fingerprint_available);
@@ -110,6 +111,23 @@ fn web_metadata_missing_fields_keep_filename_and_do_not_invent_zero_size() {
     assert!(!details.description.contains("Artists:"));
     assert!(!details.description.contains("Loading metadata"));
     assert!(controller.selected_queue_item().is_ok());
+}
+
+/// Descriptions do not repeat the visible filename or general playback instructions.
+#[test]
+fn web_metadata_descriptions_omit_redundant_playback_instructions() {
+    let mut controller = metadata_controller();
+    controller.select_row(2);
+    assert_eq!(
+        controller.view.details.as_ref().unwrap().description,
+        "Loading metadata..."
+    );
+    let url = controller.selected_web_entry().unwrap().url.clone();
+    controller.cache_web_metadata(url, WebMediaMetadata::default(), None);
+    controller.update_web_detail();
+    assert_eq!(controller.view.details.as_ref().unwrap().description, "");
+    assert_eq!(controller.view.details.as_ref().unwrap().title, "01.opus");
+    assert_eq!(controller.view.rows[2].title, "01.opus");
 }
 
 #[test]
