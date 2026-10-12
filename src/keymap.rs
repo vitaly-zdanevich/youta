@@ -2165,9 +2165,12 @@ mod wire_tests {
         );
     }
 
+    /// LAN shortcuts remain available without the optional command or podcast features.
     #[cfg(feature = "lan-sharing")]
     #[test]
     fn local_lan_share_shortcuts_and_popup_are_scoped() {
+        use crate::view::Screen;
+
         let local = ViewModel {
             screen: crate::view::Screen::Local,
             ..ViewModel::default()
