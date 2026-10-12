@@ -3693,9 +3693,10 @@ fn render_row_list(
             let has_playback_progress = row.media_id.is_some() && !row.hide_watched_marker;
             let playback_started = row.playback_started || row.watched_percent > 0;
             let youtube_video_title = uses_youtube_video_title_style(row);
+            let youtube_live_video = youtube_video_title && row.live;
             let mut title_style = if selected {
                 row_style
-            } else if youtube_video_title && row.live {
+            } else if youtube_live_video {
                 live_marker_style(row_style)
             } else if youtube_video_title && row.was_live {
                 if playback_started && !playing {
@@ -3738,9 +3739,9 @@ fn render_row_list(
             {
                 title_style = title_style.add_modifier(Modifier::ITALIC);
             }
-            // Playing videos keep their category color on both lines and icons;
+            // Live and playing videos keep their category color on both lines and icons;
             // selected rows retain the selection background and foreground.
-            let row_style = if youtube_video_title && playing && !selected {
+            let row_style = if youtube_video_title && (playing || row.live) && !selected {
                 title_style
             } else {
                 row_style
@@ -3756,12 +3757,12 @@ fn render_row_list(
             } else {
                 format!(" {}%", row.watched_percent)
             };
-            let source_style = if selected || playing {
+            let source_style = if selected || playing || youtube_live_video {
                 row_style
             } else {
                 source_style(&row.source, theme)
             };
-            let secondary_style = if selected || playing {
+            let secondary_style = if selected || playing || youtube_live_video {
                 row_style
             } else if youtube_video_title && !playback_started {
                 // One neutral ANSI step above watched metadata also works on Linux consoles.
@@ -19677,6 +19678,115 @@ for encoded, expected in json.load(sys.stdin):
                                     Color::Cyan
                                 }
                             );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Live video metadata, including dates, shares the title color without requiring playback.
+    #[test]
+    fn youtube_live_rows_color_both_lines_including_publication_dates() {
+        let id = MediaId::new(SourceKind::YouTube, "live-date-fixture");
+        let title = "Active broadcast";
+        let subtitle = "Creator · 12,345 subscribers · 2026 October 12 (today) · LIVE";
+        for (funny, console) in [(false, false), (false, true), (true, false), (true, true)] {
+            let theme = Theme::for_terminal(funny, console);
+            for source_labels in [
+                RowSourceLabels::YouTubeSearch,
+                RowSourceLabels::All,
+                RowSourceLabels::Hidden,
+            ] {
+                for (playing, started, compact) in [
+                    (false, false, false),
+                    (false, true, false),
+                    (true, true, false),
+                    (false, false, true),
+                    (false, true, true),
+                    (true, true, true),
+                ] {
+                    for selected in [0, 1] {
+                        let rows = [
+                            RowView {
+                                media_id: Some(id.clone()),
+                                title: title.to_owned(),
+                                subtitle: subtitle.to_owned(),
+                                source: "YouTube".to_owned(),
+                                live: true,
+                                was_live: true,
+                                vertical: true,
+                                playback_started: started,
+                                compact,
+                                ..RowView::default()
+                            },
+                            RowView {
+                                compact,
+                                ..RowView::default()
+                            },
+                        ];
+                        let mut terminal = Terminal::new(TestBackend::new(100, 4)).unwrap();
+                        terminal
+                            .draw(|frame| {
+                                render_row_list(
+                                    frame,
+                                    frame.area(),
+                                    "",
+                                    &rows,
+                                    source_labels,
+                                    selected,
+                                    playing.then_some(&id),
+                                    false,
+                                    None,
+                                    !console,
+                                    theme.heading,
+                                    &theme,
+                                );
+                                if console {
+                                    normalize_linux_console_buffer_for_color_output(
+                                        frame.buffer_mut(),
+                                        true,
+                                    );
+                                }
+                            })
+                            .unwrap();
+                        let buffer = terminal.backend().buffer();
+                        let metadata = if !compact && matches!(source_labels, RowSourceLabels::All)
+                        {
+                            format!("YouTube · {subtitle}")
+                        } else {
+                            subtitle.to_owned()
+                        };
+                        let metadata_y = u16::from(!compact);
+                        for (y, text) in [(0, title), (metadata_y, metadata.as_str())] {
+                            let line = (0..100)
+                                .map(|x| buffer[(x, y)].symbol())
+                                .collect::<String>();
+                            let start = line.find(text).expect("complete live row text");
+                            let x = terminal_text_width(&line[..start]);
+                            for column in x..x + terminal_text_width(text) {
+                                let live_marker =
+                                    text == metadata && column >= x + terminal_text_width(text) - 4;
+                                let color = if selected == 0 && !live_marker {
+                                    Color::Black
+                                } else {
+                                    Color::Red
+                                };
+                                let expected = if console {
+                                    linux_console_foreground(
+                                        color,
+                                        selected == 0 || playing || !started || live_marker,
+                                    )
+                                    .0
+                                } else {
+                                    color
+                                };
+                                assert_eq!(
+                                    buffer[(column, y)].fg,
+                                    expected,
+                                    "date and all live metadata: line={y}, selected={selected}, playing={playing}, started={started}, compact={compact}, funny={funny}, console={console}"
+                                );
+                            }
                         }
                     }
                 }
@@ -42402,7 +42512,7 @@ prose 07:25 remains clickable but is not a chapter";
     }
 
     #[test]
-    fn youtube_live_rows_color_the_duration_marker_and_unselected_playing_metadata() {
+    fn youtube_live_rows_color_the_duration_marker_and_unselected_metadata() {
         for source_labels in [
             RowSourceLabels::YouTubeSearch,
             RowSourceLabels::All,
@@ -42464,8 +42574,8 @@ prose 07:25 remains clickable but is not a chapter";
                 let marker_x = channel_x + terminal_text_width("LIVE channel · ");
                 assert_eq!(
                     buffer[(channel_x, y)].fg == Color::Red,
-                    playing && selected != 0 && live,
-                    "only unselected playing live rows color the whole metadata line"
+                    selected != 0 && live,
+                    "all unselected live rows color the whole metadata line"
                 );
                 for x in marker_x..marker_x + 4 {
                     assert_eq!(buffer[(x, y)].fg == Color::Red, live, "{line}");
