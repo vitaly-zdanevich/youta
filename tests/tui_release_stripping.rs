@@ -314,6 +314,58 @@ fn smaller_variants_emit_one_stripped_executable_and_checksum() {
     }
 }
 
+/// Release variants keep every default capability except their documented omissions.
+#[test]
+fn release_variants_keep_default_features_including_global_commands() {
+    let manifest: toml::Table =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
+            .unwrap()
+            .parse()
+            .unwrap();
+    let defaults = manifest["features"]["default"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|feature| feature.as_str().unwrap().to_owned())
+        .collect::<std::collections::BTreeSet<_>>();
+    for variant in [
+        "images",
+        "text",
+        "images-no-qr",
+        "text-no-qr",
+        "images-no-gpm",
+        "text-no-gpm",
+        "images-no-qr-no-gpm",
+        "text-no-qr-no-gpm",
+    ] {
+        let fixture = ReleaseFixture::new();
+        let target = "x86_64-unknown-linux-gnu";
+        assert_success(&fixture.command(target, target, variant).output().unwrap());
+        let invocation = fixture.read("cargo.log");
+        let (_, features) = invocation.split_once("--features ").unwrap();
+        let actual = features
+            .trim()
+            .split(',')
+            .map(str::to_owned)
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut expected = defaults.clone();
+        if variant.starts_with("text") {
+            expected.remove("images");
+        }
+        if variant.contains("no-qr") {
+            expected.remove("qr");
+            expected.remove("lan-sharing");
+        }
+        if variant.contains("no-gpm") {
+            expected.remove("gpm");
+        }
+        assert_eq!(
+            actual, expected,
+            "{variant} must retain default-on commands and other unrelated capabilities"
+        );
+    }
+}
+
 /// A strip error cannot be reported as successful packaging or receive checksums.
 #[test]
 fn strip_failure_stops_packaging_without_touching_the_cargo_executable() {

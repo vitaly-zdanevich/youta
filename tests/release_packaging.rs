@@ -824,11 +824,11 @@ fn yandex_music_feature_and_credentials_remain_optional_and_documented() {
     let readme = read_repository_file("README.md");
     assert!(readme.contains("private client API"));
     assert!(readme.contains(
-        "--features app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,commons-upload"
+        "--features app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload"
     ));
     assert!(
         readme.contains(
-            "--features app-core,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,commons-upload"
+            "--features app-core,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload"
         )
     );
     assert!(readme.contains("Audiobook search is best-effort"));
@@ -1030,14 +1030,14 @@ fn release_script_builds_gpm_and_linux_no_gpm_non_sqlite_executables() {
 
     assert!(!script.contains("--features bundled-sqlite"));
     for feature_set in [
-        "cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,commons-upload,evernote,gpm,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info,web-browser,youtube-captions",
-        "cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,commons-upload,evernote,gpm,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info,web-browser,youtube-captions",
-        "cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,commons-upload,evernote,gpm,images,local-archives,nyan-cat,sponsorblock,summary,url-info,web-browser,youtube-captions",
-        "cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,commons-upload,evernote,gpm,local-archives,nyan-cat,sponsorblock,summary,url-info,web-browser,youtube-captions",
-        "cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,commons-upload,evernote,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info,web-browser,youtube-captions",
-        "cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,commons-upload,evernote,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info,web-browser,youtube-captions",
-        "cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,commons-upload,evernote,images,local-archives,nyan-cat,sponsorblock,summary,url-info,web-browser,youtube-captions",
-        "cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,commons-upload,evernote,local-archives,nyan-cat,sponsorblock,summary,url-info,web-browser,youtube-captions",
+        "cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,gpm,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info,web-browser,youtube-captions",
+        "cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,gpm,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info,web-browser,youtube-captions",
+        "cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,gpm,images,local-archives,nyan-cat,sponsorblock,summary,url-info,web-browser,youtube-captions",
+        "cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,gpm,local-archives,nyan-cat,sponsorblock,summary,url-info,web-browser,youtube-captions",
+        "cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info,web-browser,youtube-captions",
+        "cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info,web-browser,youtube-captions",
+        "cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,images,local-archives,nyan-cat,sponsorblock,summary,url-info,web-browser,youtube-captions",
+        "cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,local-archives,nyan-cat,sponsorblock,summary,url-info,web-browser,youtube-captions",
     ] {
         assert!(
             script
@@ -1359,14 +1359,14 @@ fn workflows_validate_and_publish_the_documented_platform_contract() {
     assert!(ci.contains("sudo apt-get install --yes gcc-multilib libc6-dev-i386"));
     assert!(ci.contains("cargo build --locked --release --target i686-unknown-linux-gnu"));
     for feature_set in [
-        "app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,commons-upload,evernote,gpm,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info",
-        "app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,commons-upload,evernote,gpm,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info",
-        "app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,commons-upload,evernote,gpm,images,local-archives,nyan-cat,sponsorblock,summary,url-info",
-        "app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,commons-upload,evernote,gpm,local-archives,nyan-cat,sponsorblock,summary,url-info",
-        "app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,commons-upload,evernote,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info",
-        "app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,commons-upload,evernote,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info",
-        "app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,commons-upload,evernote,images,local-archives,nyan-cat,sponsorblock,summary,url-info",
-        "app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,commons-upload,evernote,local-archives,nyan-cat,sponsorblock,summary,url-info",
+        "app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,gpm,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info",
+        "app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,gpm,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info",
+        "app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,gpm,images,local-archives,nyan-cat,sponsorblock,summary,url-info",
+        "app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,gpm,local-archives,nyan-cat,sponsorblock,summary,url-info",
+        "app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info",
+        "app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info",
+        "app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,images,local-archives,nyan-cat,sponsorblock,summary,url-info",
+        "app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,local-archives,nyan-cat,sponsorblock,summary,url-info",
     ] {
         assert!(
             ci.contains(&format!(
@@ -1972,7 +1972,7 @@ fn live_wikidata_workflow_retries_each_probe_independently() {
         );
     }
 }
-/// Every explicit 32-bit release variant keeps the default-on Archive provider.
+/// Every explicit 32-bit release variant keeps the default Archive and command features.
 #[test]
 fn i686_release_variants_include_archive_org() {
     let workflow = std::fs::read_to_string(
@@ -1997,6 +1997,10 @@ fn i686_release_variants_include_archive_org() {
         assert!(
             features.contains(&"archive-org"),
             "release variant omits the default Archive provider: {variant}"
+        );
+        assert!(
+            features.contains(&"cmd"),
+            "release variant omits the default command prompt: {variant}"
         );
     }
 }

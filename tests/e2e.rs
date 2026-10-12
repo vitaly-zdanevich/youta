@@ -434,6 +434,78 @@ fn tui_missing_provider_opens_setup_with_storage_location() {
     );
 }
 
+/// An idle, empty YouTube tab accepts the global command shortcut on a Linux TTY.
+#[cfg(all(target_os = "linux", feature = "tui", feature = "cmd"))]
+#[test]
+fn tui_colon_opens_command_prompt_on_idle_youtube_without_selection() {
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    let temporary = tempdir().expect("temporary directory");
+    let config_directory = temporary.path().join("configuration");
+    let helpers = temporary.path().join("helpers");
+    let transcript = temporary.path().join("typescript.txt");
+    let launcher = temporary.path().join("launch-youta");
+    fs::create_dir(&helpers).expect("helper directory");
+    fs::write(
+        &launcher,
+        "#!/bin/sh\n/bin/stty cols 140 rows 42\nexport TERM=linux\n\
+		exec \"$YOUTA_TEST_BINARY\" --config-dir \"$YOUTA_TEST_CONFIG_DIR\" tui\n",
+    )
+    .expect("launcher fixture");
+    fs::set_permissions(&launcher, fs::Permissions::from_mode(0o700))
+        .expect("launcher permissions");
+
+    let mut child = Command::new("/usr/bin/timeout")
+        .args([
+            "--signal=TERM",
+            "--kill-after=2",
+            "20",
+            "/usr/bin/script",
+            "--quiet",
+            "--return",
+            "--flush",
+            "--echo",
+            "never",
+            "--output-limit",
+            "2MiB",
+            "--log-out",
+        ])
+        .arg(&transcript)
+        .arg("--command")
+        .arg(&launcher)
+        .env_clear()
+        .env("PATH", &helpers)
+        .env("YOUTA_TEST_BINARY", assert_cmd::cargo_bin!("youta"))
+        .env("YOUTA_TEST_CONFIG_DIR", &config_directory)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("launch idle YouTube in a pseudo-terminal");
+    wait_for_text_file(&transcript, "Video search", "terminal transcript");
+    let input = child.stdin.as_mut().expect("pseudo-terminal input");
+    input.write_all(b":").expect("open global command prompt");
+    input.flush().expect("flush command shortcut");
+    wait_for_text_file(&transcript, "% selected URL/path", "terminal transcript");
+    input.write_all(b"\x1b").expect("cancel command prompt");
+    input.flush().expect("flush command cancellation");
+    // A standalone-Escape gap prevents the terminal from decoding quit as Alt+q.
+    std::thread::sleep(Duration::from_millis(100));
+    input.write_all(b"q").expect("quit");
+    input.flush().expect("flush quit");
+    child.stdin.take();
+
+    let output = child.wait_with_output().expect("wait for pseudo-terminal");
+    assert!(
+        output.status.success(),
+        "idle YouTube command PTY failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[cfg(all(target_os = "linux", feature = "tui"))]
 #[test]
 fn tui_subscriptions_openers_and_preferences_persist_end_to_end() {

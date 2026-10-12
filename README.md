@@ -1107,7 +1107,7 @@ dependencies, or the optional Linux virtual-console mouse client with:
 
 ```sh
 cargo build --release --locked --no-default-features \
-	--features app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,commons-upload,evernote,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info,web-browser,youtube-captions
+	--features app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info,web-browser,youtube-captions
 ```
 
 The `app` profile includes the experimental YandexMusic adapter but does not
@@ -1118,7 +1118,7 @@ with:
 
 ```sh
 cargo build --release --locked --no-default-features \
-	--features app-core,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,commons-upload,evernote,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info,web-browser,youtube-captions
+	--features app-core,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info,web-browser,youtube-captions
 ```
 
 Omit `images` from that command for the Yandex-free text-only variant. Omit
