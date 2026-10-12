@@ -24,11 +24,11 @@ test('Archive.org item pages are available in the generic panel', () => {
 });
 
 /** Exercise the actual JSX guard with mock provider capabilities and tab state. */
-function commentsButtonVisible(view, kind, source) {
+function commentsButtonVisible(view, kind, source, comments = '') {
 	const guard = details.match(/\{([^\n]+) \? \(\s*<Action onClick=\{\(\) => void dispatch\("OpenVideoComments"\)\}>Comments<\/Action>/)?.[1];
 	assert.ok(guard, 'Comments button must have a provider-aware visibility guard');
-	return new Function('view', 'kind', 'isYouTube', 'isArchiveOrg', 'isSoundCloud', `return (${guard});`)(
-		view, kind, source === 'youtube', source === 'archive-org', source === 'sound-cloud',
+	return new Function('view', 'kind', 'details', 'isYouTube', 'isArchiveOrg', 'isSoundCloud', `return (${guard});`)(
+		view, kind, { comments }, source === 'youtube', source === 'archive-org', source === 'sound-cloud',
 	);
 }
 
@@ -60,6 +60,20 @@ test('YouTube comments still require its backend and Video layout', () => {
 test('SoundCloud comments do not borrow YouTube capability or appear on History', () => {
 	for (const screen of ['SoundCloud', 'History', 'Downloaded', 'Playlists', 'Search']) {
 		assert.equal(commentsButtonVisible({ screen, video_comments_available: false }, 'Generic', 'sound-cloud'), screen === 'SoundCloud');
+	}
+});
+
+/** Known zeros hide comments; omitted counts remain eligible for an on-demand request. */
+test('known zero comments hide every provider action without treating unknown counts as zero', () => {
+	for (const [screen, kind, source] of [
+		['Search', 'Video', 'youtube'], ['ArchiveOrg', 'Generic', 'archive-org'],
+		['SoundCloud', 'Generic', 'sound-cloud'],
+	]) {
+		const view = { screen, video_comments_available: true };
+		for (const comments of ['0', ' 0 ']) {
+			assert.equal(commentsButtonVisible(view, kind, source, comments), false);
+		}
+		assert.equal(commentsButtonVisible(view, kind, source, ''), true);
 	}
 });
 

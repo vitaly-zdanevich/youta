@@ -194,6 +194,19 @@ test('selected YouTube channels expose QR without requiring a video identity', (
 	}
 });
 
+test('zero comments omit the count and action; unknown counts do not imply zero', () => {
+	for (const comments of ['0', ' 0 ', '', 'unknown', '4']) {
+		const tree = component('Details').Details({ kind: 'Video', view: {
+			screen: 'Search', playlist_item: null, video_comments_available: true,
+			details: { comments, title: 'Fixture', channel_name: '', source: 'YouTube',
+				channel_id: '', media_id: { source: 'you-tube', external_id: 'fixture-video' },
+				playlist_names: [], links: [], dearrow_title: null },
+		} });
+		assert.equal(nodes(tree).some((node) => node.type === 'button' && text(node) === 'Comments'), comments.trim() !== '0');
+		assert.equal(nodes(tree).some((node) => node.type === 'dt' && text(node) === 'Comments'), comments.trim() === '4');
+	}
+});
+
 test('LIVE footer prefers stable elapsed time over synthetic backend timestamps', () => {
 	const tree = component('Player').Player({
 		playback: { idle: false, live: true, position: 8641222,

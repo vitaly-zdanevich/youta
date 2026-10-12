@@ -5620,6 +5620,7 @@ fn render_information_panel(
                 if value.is_empty()
                     || value.eq_ignore_ascii_case("unknown")
                     || (name == "Length" && details.live)
+                    || (name == "Comments" && value == "0")
                 {
                     continue;
                 }
@@ -5728,7 +5729,7 @@ fn render_information_panel(
                         },
                     ),
                 ] {
-                    if !value.is_empty() {
+                    if !value.is_empty() && !(label == "Comments" && value.trim() == "0") {
                         lines.push(Line::from(vec![
                             Span::styled(format!("{label}: "), theme.muted),
                             Span::raw(value),
@@ -5776,7 +5777,10 @@ fn render_information_panel(
                 ] {
                     let source = value;
                     let value = source.trim();
-                    if value.is_empty() || value.eq_ignore_ascii_case("unknown") {
+                    if value.is_empty()
+                        || value.eq_ignore_ascii_case("unknown")
+                        || (name == "Comments" && value == "0")
+                    {
                         continue;
                     }
                     let start = source.len() - source.trim_start().len();
@@ -42780,6 +42784,43 @@ prose 07:25 remains clickable but is not a chapter";
             if !live {
                 assert!(rendered.contains("Length: 4:05"));
             }
+        }
+    }
+
+    #[test]
+    fn youtube_zero_comments_hide_fact_action_and_hotkey_but_unknown_counts_remain_available() {
+        for comments in ["0", " 0 ", "", "unknown", "4"] {
+            let view = ViewModel {
+                video_comments_available: true,
+                details: Some(DetailView {
+                    media_id: Some(MediaId::new(SourceKind::YouTube, "dQw4w9WgXcQ")),
+                    source: "YouTube".to_owned(),
+                    title: "Comments fixture".to_owned(),
+                    comments: comments.to_owned(),
+                    ..DetailView::default()
+                }),
+                ..ViewModel::default()
+            };
+            let expected = comments.trim() != "0";
+            let mut terminal = Terminal::new(TestBackend::new(160, 25)).expect("terminal");
+            let mut hit_map = HitMap::default();
+            terminal
+                .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+                .expect("draw comments fixture");
+            let rendered = rendered_text(&terminal);
+            assert!(!rendered.contains("Comments: 0"));
+            assert_eq!(rendered.contains("[F6] Twenty comments"), expected);
+            assert_eq!(
+                hit_map
+                    .detail_buttons
+                    .iter()
+                    .any(|(action, _)| *action == UiAction::OpenVideoComments),
+                expected
+            );
+            assert_eq!(
+                key_action(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE), &view),
+                expected.then_some(UiAction::OpenVideoComments)
+            );
         }
     }
 

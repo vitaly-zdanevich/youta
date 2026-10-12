@@ -3778,11 +3778,13 @@ impl ViewModel {
         action.requires_external_opener()
     }
 
-    /// Whether the selection belongs to an implemented public-comments adapter.
+    /// Whether the selection supports public comments and is not known to have none.
+    /// Unknown counts remain eligible for an explicit on-demand request.
     #[must_use]
     pub fn public_comments_available(&self) -> bool {
         self.details
             .as_ref()
+            .filter(|details| details.comments.trim() != "0")
             .and_then(|details| details.media_id.as_ref())
             .is_some_and(|media_id| match media_id.source {
                 SourceKind::YouTube => self.video_comments_available,

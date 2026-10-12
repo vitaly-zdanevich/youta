@@ -143,7 +143,8 @@ function factsFor(kind: InformationPanelKind, details: DetailView): Array<[strin
   if (details.playlist_names.length > 0) {
     rows.push(["Playlists", details.playlist_names.join(", ")]);
   }
-  return rows.filter((row): row is [string, string] => row[1] !== null);
+  return rows.filter((row): row is [string, string] => row[1] !== null
+		&& !(row[0] === 'Comments' && row[1].trim() === '0'));
 }
 
 /** One Details action, mirroring a terminal hotkey. */
@@ -533,7 +534,7 @@ export function Details({ view, kind }: { view: ViewModel; kind: InformationPane
             Favorite
           </Action>
         ) : null}
-        {(view.video_comments_available && kind === 'Video' && isYouTube) || (isArchiveOrg && view.screen === 'ArchiveOrg') || (isSoundCloud && view.screen === 'SoundCloud') ? (
+        {details.comments?.trim() !== '0' && ((view.video_comments_available && kind === 'Video' && isYouTube) || (isArchiveOrg && view.screen === 'ArchiveOrg') || (isSoundCloud && view.screen === 'SoundCloud')) ? (
           <Action onClick={() => void dispatch("OpenVideoComments")}>Comments</Action>
         ) : null}
         {kind === "Video" && view.video_summary_available && isYouTube ? (
