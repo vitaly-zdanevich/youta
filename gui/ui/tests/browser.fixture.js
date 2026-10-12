@@ -1075,7 +1075,9 @@
 					details: { ...clone(defaults.DetailView), title, channel_id: screen === 'Local' ? '' : 'UCfixture',
 						media_id: mediaSource === null ? null : { source: mediaSource, external_id: 'fixture-episode' } } });
 				await until(() => document.querySelector('[aria-label=Details] h2')?.textContent === title, title);
-				const feed = button('[Shift+F2] Podcast feed', document.querySelector('[aria-label=Details]'));
+				const feed = button('[Shift+F2] Podcast', document.querySelector('[aria-label=Details]'));
+				assert(!button('[Shift+F2] Podcast feed', document.querySelector('[aria-label=Details]')),
+					`${title} omits the longer Podcast feed button label`);
 				assert(feed?.querySelector('kbd')?.textContent === '[Shift+F2]', `${title} shows the Podcast feed shortcut`);
 				await action(screen === 'Local' ? 'ShareLocalPodcast' : 'ShareYouTubeChannelPodcast',
 					() => feed.click(), `${title} opens the shared feed review action`);
@@ -1085,7 +1087,7 @@
 			}
 		}
 		snapshot({ lan_share_supported: false });
-		await until(() => !button('[Shift+F2] Podcast feed'), 'disabled LAN support hides the feed button');
+		await until(() => !button('[Shift+F2] Podcast'), 'disabled LAN support hides the feed button');
 		snapshot(previous);
 		await until(() => document.querySelector('[aria-label=Sources] [aria-selected=true]')?.textContent.includes('archive.org'),
 			'restore Archive after feed controls');

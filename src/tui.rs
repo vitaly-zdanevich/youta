@@ -5523,7 +5523,7 @@ fn render_information_panel(
             &right_buttons,
             &mut next_left_row,
             inner.width,
-            button("Shift+F2", "Podcast feed", show_hotkeys),
+            button("Shift+F2", "Podcast", show_hotkeys),
             theme.accent,
             UiAction::ShareLocalPodcast,
         )
@@ -5536,7 +5536,7 @@ fn render_information_panel(
             &right_buttons,
             &mut next_left_row,
             inner.width,
-            button("Shift+F2", "Podcast feed", show_hotkeys),
+            button("Shift+F2", "Podcast", show_hotkeys),
             theme.accent,
             UiAction::ShareYouTubeChannelPodcast,
         )
@@ -30156,7 +30156,7 @@ for encoded, expected in json.load(sys.stdin):
             "[P] Playlist".to_owned(),
             "[n] Add private note".to_owned(),
             "[F6] Twenty comments".to_owned(),
-            "[Shift+F2] Podcast feed".to_owned(),
+            "[Shift+F2] Podcast".to_owned(),
             "[s] Subscribe (locally)".to_owned(),
             "[c] To channel".to_owned(),
         ];
@@ -33189,10 +33189,28 @@ for encoded, expected in json.load(sys.stdin):
         assert!(rendered.contains("Subscribe (locally)"));
         assert!(!rendered.contains("[s] Subscribe (locally)"));
         assert!(!rendered.contains("Auto-download"));
-        assert_eq!(
-            rendered.contains("Podcast feed"),
-            cfg!(feature = "lan-sharing")
-        );
+        // Match button labels exactly so the Podcasts tab cannot satisfy this check.
+        let podcast_button_visible = hit_map.detail_buttons.iter().any(|(_, area)| {
+            let label = (area.left()..area.right())
+                .map(|x| terminal.backend().buffer()[(x, area.y)].symbol())
+                .collect::<String>();
+            label == "Podcast"
+        });
+        assert_eq!(podcast_button_visible, cfg!(feature = "lan-sharing"));
+        assert!(!rendered.contains("Podcast feed"));
+        assert!(!rendered.contains("[Shift+F2] Podcast"));
+        #[cfg(feature = "lan-sharing")]
+        {
+            let (_, area) = hit_map
+                .detail_buttons
+                .iter()
+                .find(|(action, _)| *action == UiAction::ShareYouTubeChannelPodcast)
+                .expect("podcast sharing button without hotkey");
+            let label = (area.left()..area.right())
+                .map(|x| terminal.backend().buffer()[(x, area.y)].symbol())
+                .collect::<String>();
+            assert_eq!(label, "Podcast");
+        }
         assert!(!rendered.contains("[F12]"));
         assert!(!rendered.contains("Select mode"));
         assert!(rendered.contains("open video"));
@@ -42421,8 +42439,9 @@ prose 07:25 remains clickable but is not a chapter";
         assert!(!rendered.contains("Likes:"));
         assert!(!rendered.contains("Views:"));
         assert!(rendered.contains("[O] open channel https://www.youtube.com/channel/UCfixture"));
-        assert!(rendered.contains("Podcast feed"));
-        assert!(!rendered.contains("[F12] Podcast feed"));
+        assert!(rendered.contains("[Shift+F2] Podcast"));
+        assert!(!rendered.contains("Podcast feed"));
+        assert!(!rendered.contains("[F12] Podcast"));
         assert!(
             hit_map
                 .detail_buttons
@@ -42444,6 +42463,7 @@ prose 07:25 remains clickable but is not a chapter";
         );
     }
 
+    /// Compact sharing labels preserve the podcast shortcut and mouse action.
     #[cfg(feature = "lan-sharing")]
     #[test]
     fn youtube_channel_and_episode_show_the_podcast_feed_hotkey() {
@@ -42490,8 +42510,9 @@ prose 07:25 remains clickable but is not a chapter";
                 .expect("draw selected subscription video");
 
             let rendered = rendered_text(&terminal);
-            assert!(rendered.contains("[Shift+F2] Podcast feed"));
-            assert!(!rendered.contains("[F12] Podcast feed"));
+            assert!(rendered.contains("[Shift+F2] Podcast"));
+            assert!(!rendered.contains("Podcast feed"));
+            assert!(!rendered.contains("[F12] Podcast"));
             assert!(
                 hit_map
                     .detail_buttons
@@ -43172,8 +43193,9 @@ prose 07:25 remains clickable but is not a chapter";
         ] {
             assert_eq!(key_action(key, &local), Some(UiAction::ShareLocalFiles));
         }
-        assert!(rendered.contains("[Shift+F2] Podcast feed"));
-        assert!(!rendered.contains("[F12] Podcast feed"));
+        assert!(rendered.contains("[Shift+F2] Podcast"));
+        assert!(!rendered.contains("Podcast feed"));
+        assert!(!rendered.contains("[F12] Podcast"));
         for expected in [UiAction::ShareLocalFiles, UiAction::ShareLocalPodcast] {
             assert!(
                 hit_map

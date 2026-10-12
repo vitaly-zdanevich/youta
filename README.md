@@ -2593,7 +2593,7 @@ After cancellation with `[C]`, the stopped-download line disappears after
 The default-on `lan-sharing` feature adds two Local actions. `[Shift+F1] Share over
 LAN` serves the selected regular file or a bounded, recursive folder index.
 Linux console keymaps that report `Shift+F1` as `F13` are also supported.
-`[Shift+F2] Podcast feed` serves playable audio under the selection as RSS.
+`[Shift+F2] Podcast` serves playable audio under the selection as RSS.
 Linux console keymaps that report `Shift+F2` as `F14` are also supported. When the
 synthetic `..` row is selected, both actions share the directory currently on
 screen. A local podcast episode uses embedded artwork when available and then
@@ -2656,7 +2656,7 @@ for subsequent requests, including concurrent requests from podcast apps.
 
 #### YouTube channel feeds and audio delivery
 
-`[Shift+F2] Podcast feed` is also available on eligible YouTube channels and
+`[Shift+F2] Podcast` is also available on eligible YouTube channels and
 episodes in Search and the **Subs** tab. On a selected
 episode it opens the inclusive-boundary review described above.
 Feed creation uses channel and publication metadata,

@@ -455,7 +455,7 @@ export function Details({ view, kind }: { view: ViewModel; kind: InformationPane
 			<>
 				<Action onClick={() => void dispatch('ShareLocalFiles')}>Share over LAN</Action>
 				<Action onClick={() => void dispatch('ShareLocalPodcast')}>
-					<kbd className='font-mono text-ink-faint'>[Shift+F2]</kbd>{' '}Podcast feed
+					<kbd className='font-mono text-ink-faint'>[Shift+F2]</kbd>{' '}Podcast
 				</Action>
 			</>
 		) : null}
@@ -467,7 +467,7 @@ export function Details({ view, kind }: { view: ViewModel; kind: InformationPane
 		(view.screen === 'Search' ||
 			(view.screen === 'Subscriptions' && view.subscriptions.source_kind === YOUTUBE)) ? (
 			<Action onClick={() => void dispatch('ShareYouTubeChannelPodcast')}>
-				<kbd className='font-mono text-ink-faint'>[Shift+F2]</kbd>{' '}Podcast feed
+				<kbd className='font-mono text-ink-faint'>[Shift+F2]</kbd>{' '}Podcast
 			</Action>
 		) : null}
 		{view.channel_download_supported &&

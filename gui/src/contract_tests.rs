@@ -998,13 +998,21 @@ fn the_window_can_share_local_files_and_podcast_feeds() {
         "dispatch('ShareLocalPodcast')",
         "dispatch('ShareYouTubeChannelPodcast')",
         "Share over LAN",
-        "Podcast feed",
+        "Podcast",
     ] {
         assert!(
             details.contains(required),
             "Details no longer contains {required}"
         );
     }
+    assert_eq!(
+        details
+            .lines()
+            .filter(|line| line.trim_end().ends_with("[Shift+F2]</kbd>{' '}Podcast"))
+            .count(),
+        2
+    );
+    assert!(!details.contains("[Shift+F2]</kbd>{' '}Podcast feed"));
     for required in [
         "dispatch('ConfirmPodcastFeed')",
         "dispatch('DismissPodcastFeed')",

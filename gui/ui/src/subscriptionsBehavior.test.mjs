@@ -216,16 +216,16 @@ function podcastButtons({ screen = 'Search', kind = 'Video', mediaSource = 'you-
 			channel_subscriber_count: null, channel_video_count: null, channel_total_view_count: null },
 	};
 	return elements(detailsModule.exports.Details({ view, kind }))
-		.filter((node) => node.type === 'button' && buttonText(node).endsWith('Podcast feed'));
+		.filter((node) => node.type === 'button' && buttonText(node).endsWith('Podcast'));
 }
 
-test('YouTube episodes and channels show Shift+F2 beside the Podcast feed action', () => {
+test('YouTube episodes and channels show the compact Podcast label with Shift+F2', () => {
 	for (const screen of ['Search', 'Subscriptions']) {
 		for (const mediaSource of ['you-tube', null]) {
 			actions.length = 0;
 			const buttons = podcastButtons({ screen, mediaSource });
 			assert.equal(buttons.length, 1, `${screen}, source=${mediaSource}`);
-			assert.match(buttonText(buttons[0]), /^\[Shift\+F2\]\s*Podcast feed$/);
+			assert.match(buttonText(buttons[0]), /^\[Shift\+F2\]\s*Podcast$/);
 			assert.equal(elements(buttons[0]).filter((node) => node.type === 'kbd').length, 1);
 			assert.deepEqual(actions, [], 'rendering cannot start feed preparation');
 			buttons[0].props.onClick();
@@ -242,12 +242,12 @@ test('YouTube podcast controls retain feature, route and channel identity gates'
 	]) assert.deepEqual(podcastButtons(patch), [], JSON.stringify(patch));
 });
 
-test('Local Podcast feed shows Shift+F2 and keeps the Local action', () => {
+test('Local shows the compact Podcast label with Shift+F2 and keeps its action', () => {
 	actions.length = 0;
 	const patch = { screen: 'Local', kind: 'Local', mediaSource: 'local', channelId: '' };
 	const buttons = podcastButtons(patch);
 	assert.equal(buttons.length, 1);
-	assert.match(buttonText(buttons[0]), /^\[Shift\+F2\]\s*Podcast feed$/);
+	assert.match(buttonText(buttons[0]), /^\[Shift\+F2\]\s*Podcast$/);
 	assert.equal(elements(buttons[0]).filter((node) => node.type === 'kbd').length, 1);
 	buttons[0].props.onClick();
 	assert.deepEqual(actions, ['ShareLocalPodcast']);
