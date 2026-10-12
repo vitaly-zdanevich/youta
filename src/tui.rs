@@ -4186,7 +4186,7 @@ fn render_subscription_source_list(
     let rendered = render_row_list(
         frame,
         sections[0],
-        "Sources",
+        "",
         &view.subscriptions.sources,
         RowSourceLabels::All,
         view.subscriptions.selected_source,
@@ -7625,7 +7625,11 @@ fn render_channel(
         show_hotkeys,
         theme,
         hit_map,
-        " Channel ",
+        if view.screen == Screen::Subscriptions {
+            ""
+        } else {
+            " Channel "
+        },
         "No channel is selected.",
         InformationPanelKind::Channel,
         false,
@@ -24445,6 +24449,42 @@ for encoded, expected in json.load(sys.stdin):
     }
 
     #[test]
+    fn subscriptions_omit_generic_headings_and_reclaim_the_first_content_row() {
+        for layout in [SubscriptionsLayout::DrillDown, SubscriptionsLayout::Split] {
+            let mut view = ViewModel {
+                screen: Screen::Subscriptions,
+                right_panel_mode: RightPanelMode::Channel,
+                details: Some(DetailView {
+                    source: "YouTube channel".into(),
+                    channel_id: "UC_x5XG1OV2P6uZZ5FSM9Ttw".into(),
+                    channel_name: "CHANNEL_FIXTURE".into(),
+                    title: "CHANNEL_FIXTURE".into(),
+                    description: "CHANNEL_DESCRIPTION".into(),
+                    channel_subscriber_count: Some(123),
+                    ..DetailView::default()
+                }),
+                ..ViewModel::default()
+            };
+            view.subscriptions.layout = layout;
+            view.subscriptions.sources = vec![subscription_row("CHANNEL_FIXTURE", false)];
+            view.subscriptions.source_title = "CHANNEL_FIXTURE".into();
+            let mut terminal = Terminal::new(TestBackend::new(180, 24)).unwrap();
+            let mut hit_map = HitMap::default();
+            terminal
+                .draw(|frame| {
+                    render(frame, &view, &UiSettings::default(), &mut hit_map);
+                })
+                .unwrap();
+            let rendered = rendered_text(&terminal);
+            assert!(!rendered.contains("Sources"));
+            assert!(!rendered.contains(" Channel "));
+            assert!(rendered.contains("CHANNEL_FIXTURE"));
+            assert_eq!(hit_map.subscription_source_rows.y, 2);
+            assert!(rendered.contains("[a] Add RSS feed"));
+        }
+    }
+
+    #[test]
     fn subscriptions_render_both_drill_down_and_split_navigation_models() {
         let backend = TestBackend::new(180, 34);
         let mut terminal = Terminal::new(backend).expect("terminal");
@@ -24480,7 +24520,7 @@ for encoded, expected in json.load(sys.stdin):
             .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
             .expect("draw drill-down sources");
         let rendered = rendered_text(&terminal);
-        assert!(rendered.contains("Sources"));
+        assert!(!rendered.contains("Sources"));
         assert!(!rendered.contains("Subscription sources"));
         assert!(rendered.contains("Fixture channel"));
         assert_eq!(
@@ -24650,7 +24690,7 @@ for encoded, expected in json.load(sys.stdin):
             .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
             .expect("draw split lists");
         let rendered = rendered_text(&terminal);
-        assert!(rendered.contains("Sources"));
+        assert!(!rendered.contains("Sources"));
         assert!(!rendered.contains("Subscription sources"));
         assert!(rendered.contains("[a] Add RSS feed"));
         assert!(rendered.contains("Fixture channel · YouTube · 13,045 subscribers"));
