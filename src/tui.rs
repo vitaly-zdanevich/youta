@@ -3468,10 +3468,10 @@ fn render_body(
         list_area,
         search_title.trim(),
         &view.rows,
-        if view.screen == Screen::Search {
-            RowSourceLabels::YouTubeSearch
-        } else {
-            RowSourceLabels::All
+        match view.screen {
+            Screen::Search => RowSourceLabels::YouTubeSearch,
+            Screen::YouTubeMusic => RowSourceLabels::YouTubeMusicSearch,
+            _ => RowSourceLabels::All,
         },
         view.selected,
         view.playing_media_id.as_ref(),
@@ -3628,6 +3628,8 @@ enum RowSourceLabels {
     All,
     /// The YT tab identifies `YouTube`, but foreign sources and channel kinds remain useful.
     YouTubeSearch,
+    /// YT Music keeps its source label while omitting empty marker padding.
+    YouTubeMusicSearch,
 }
 
 impl RowSourceLabels {
@@ -3750,10 +3752,14 @@ fn render_row_list(
                 row_style
             };
             let show_watched_marker = has_playback_progress && !youtube_video_title;
-            // YT search rows use only visible markers; mixed-source layouts keep their slots.
+            // Dedicated YouTube searches use visible markers; mixed-source lists keep slots.
+            let tight_youtube_music_prefix = !row.compact
+                && matches!(source_labels, RowSourceLabels::YouTubeMusicSearch)
+                && row.source == "YouTube Music";
             let tight_youtube_prefix = !row.compact
-                && matches!(source_labels, RowSourceLabels::YouTubeSearch)
-                && matches!(row.source.as_str(), "YouTube" | "YouTube channel");
+                && ((matches!(source_labels, RowSourceLabels::YouTubeSearch)
+                    && matches!(row.source.as_str(), "YouTube" | "YouTube channel"))
+                    || tight_youtube_music_prefix);
             let marker = if row.subscribed { "◆" } else { " " };
             let progress = if !has_playback_progress || row.live || row.watched_percent == 0 {
                 String::new()
@@ -3869,8 +3875,8 @@ fn render_row_list(
             if row.downloaded {
                 title_spans.push(Span::styled("↓ ", marked_style));
             }
-            // Video metadata uses the full line; first-line icons never indent it.
-            let subtitle_indent = if youtube_video_title {
+            // Dedicated music and video metadata use the full line regardless of title icons.
+            let subtitle_indent = if youtube_video_title || tight_youtube_music_prefix {
                 0
             } else if tight_youtube_prefix {
                 title_spans.iter().map(Span::width).sum::<usize>()
@@ -24261,6 +24267,107 @@ for encoded, expected in json.load(sys.stdin):
                     line(1).trim_end(),
                     "Artist",
                     "metadata must stay at the left edge independently of first-line markers"
+                );
+            }
+        }
+    }
+
+    /// YT Music gives titles and metadata every cell not occupied by a visible marker.
+    #[test]
+    fn youtube_music_search_rows_reserve_space_only_for_visible_markers() {
+        let media_id = MediaId::new(SourceKind::YouTube, "music-fixture");
+        let title = "ABCDEFGHIJKLMNOPQRSTUVWXYZ".repeat(4);
+        for (playing, paused, started, percent, subscribed, marked, downloaded, prefix) in [
+            (false, false, false, 0, false, false, false, "● "),
+            (false, false, true, 0, false, false, false, "◐ "),
+            (false, false, true, 28, false, false, false, "◐ "),
+            (false, false, true, 100, false, false, false, "○ "),
+            (true, false, true, 28, false, false, false, "▶ ◐ "),
+            (true, true, true, 28, false, false, false, "|| ◐ "),
+            (false, false, false, 0, true, false, false, "◆ ● "),
+            (false, false, false, 0, false, true, false, "● [x] "),
+            (false, false, false, 0, false, false, true, "● ↓ "),
+            (true, true, true, 28, true, true, true, "|| ◆ ◐ [x] ↓ "),
+        ] {
+            for selected in 0..=1 {
+                let mut terminal = Terminal::new(TestBackend::new(120, 12)).expect("terminal");
+                let view = ViewModel {
+                    screen: Screen::YouTubeMusic,
+                    selected,
+                    playing_media_id: playing.then_some(media_id.clone()),
+                    playback: crate::playback::PlaybackStatus {
+                        paused,
+                        ..crate::playback::PlaybackStatus::default()
+                    },
+                    rows: vec![
+                        RowView {
+                            media_id: Some(media_id.clone()),
+                            title: title.clone(),
+                            subtitle: "Artist · 3:32".to_owned(),
+                            source: "YouTube Music".to_owned(),
+                            playback_started: started,
+                            watched_percent: percent,
+                            subscribed,
+                            download_marked: marked,
+                            downloaded,
+                            ..RowView::default()
+                        },
+                        RowView::default(),
+                    ],
+                    ..ViewModel::default()
+                };
+                let mut hits = HitMap::default();
+                terminal
+                    .draw(|frame| {
+                        render_body(
+                            frame,
+                            frame.area(),
+                            &view,
+                            true,
+                            0,
+                            &Theme::new(false),
+                            &mut hits,
+                            None,
+                        )
+                    })
+                    .expect("draw YT Music marker spacing");
+                let buffer = terminal.backend().buffer();
+                let line = |offset| {
+                    (hits.rows.x..hits.rows.right())
+                        .map(|x| buffer[(x, hits.rows.y + offset)].symbol())
+                        .collect::<String>()
+                };
+                assert_eq!(
+                    line(0),
+                    format!("{prefix}{title}")
+                        .chars()
+                        .take(usize::from(hits.rows.width))
+                        .collect::<String>(),
+                    "only visible markers may take title space: {prefix:?}, selected={selected}"
+                );
+                let progress = if percent > 0 {
+                    format!(" {percent}%")
+                } else {
+                    String::new()
+                };
+                assert_eq!(
+                    line(1).trim_end(),
+                    format!("YouTube Music · Artist · 3:32{progress}"),
+                    "metadata must stay at the left edge independently of first-line markers"
+                );
+                assert_eq!(hits.rows_row_height, 2);
+                assert_eq!(
+                    mouse_action(
+                        MouseEvent {
+                            kind: MouseEventKind::Down(MouseButton::Left),
+                            column: hits.rows.x,
+                            row: hits.rows.y + 3,
+                            modifiers: KeyModifiers::NONE,
+                        },
+                        &hits,
+                        &view
+                    ),
+                    Some(UiAction::SelectRow(1))
                 );
             }
         }
