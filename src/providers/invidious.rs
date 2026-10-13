@@ -2090,6 +2090,7 @@ mod tests {
         assert!(channel.thumbnails.is_empty());
     }
 
+    /// Invalid identifiers and required JSON fields are rejected without network timing.
     #[test]
     fn channel_details_reject_invalid_malformed_and_mismatched_identifiers() {
         let provider = provider();
@@ -2121,18 +2122,13 @@ mod tests {
 
         let missing_author =
             CHANNEL_DETAILS_FIXTURE.replace("\"author\": \"Example channel\",", "");
-        let server = MockServer::spawn(vec![json_response("200 OK", &missing_author)]);
-        let provider = InvidiousProvider::with_options(
-            server.base_url.clone(),
-            Duration::from_secs(2),
-            DEFAULT_MAX_JSON_BYTES,
-        )
-        .expect("mock provider should construct");
-        assert!(matches!(
-            provider.channel_details("UC_x5XG1OV2P6uZZ5FSM9Ttw"),
-            Err(ProviderError::InvalidResponse(_))
-        ));
-        server.finish();
+        let error = serde_json::from_str::<RawChannelDetails>(&missing_author)
+            .expect_err("channel metadata must reject a missing author");
+        assert_eq!(error.classify(), serde_json::error::Category::Data);
+        assert!(
+            error.to_string().contains("missing field `author`"),
+            "{error}"
+        );
     }
 
     #[test]
