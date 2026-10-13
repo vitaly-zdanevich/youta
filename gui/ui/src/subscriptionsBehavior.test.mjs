@@ -147,6 +147,55 @@ test('transient channel panes hide RSS management without changing source select
 		assert.deepEqual(actions, [{ SelectSubscriptionSource: 0 }, 'ActivateSelection']);
 	}
 });
+
+/** Read the real item heading without invoking the virtualized pane's effects. */
+function subscriptionItemHeading(patch = {}, transientChannel = false) {
+	const compiled = ts.transpileModule(source, {
+		compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX },
+	}).outputText;
+	const subscriptionsModule = { exports: {} };
+	const subscriptionsRequire = (name) => {
+		if (name === '@tanstack/react-virtual' || name.startsWith('.')) return {};
+		return require(name);
+	};
+	new Function('require', 'module', 'exports', compiled)(subscriptionsRequire, subscriptionsModule, subscriptionsModule.exports);
+	const tree = subscriptionsModule.exports.Subscriptions({
+		transientChannel, playing: null, details: null,
+		subscriptions: {
+			layout: 'drill-down', route: 'Items', focus: 'Items', sources: [], items: [],
+			source_kind: 'you-tube', source_title: 'Fixture channel',
+			source_subscriber_count: 13_045, source_created: '2020 January 2',
+			...patch,
+		},
+	});
+	return React.Children.toArray(tree.props.children)
+		.find((node) => React.isValidElement(node) && node.props.pane === 'Items').props.heading;
+}
+
+test('transient YouTube channel headings omit the provider and retain public channel facts', () => {
+	for (const layout of ['drill-down', 'split']) {
+		assert.equal(subscriptionItemHeading({ layout }, true),
+			'Fixture channel · 13K subscribers · created 2020 January 2');
+		assert.equal(subscriptionItemHeading({ layout, source_subscriber_count: null }, true),
+			'Fixture channel · created 2020 January 2');
+		assert.equal(subscriptionItemHeading({ layout, source_subscriber_count: null, source_created: '' }, true),
+			'Fixture channel');
+	}
+});
+
+test('subscription headings retain provider labels and missing-title fallbacks', () => {
+	assert.equal(subscriptionItemHeading(),
+		'Fixture channel · YouTube · 13K subscribers · created 2020 January 2');
+	for (const transientChannel of [false, true]) {
+		assert.equal(subscriptionItemHeading({ source_title: '' }, transientChannel),
+			'YouTube · 13K subscribers · created 2020 January 2');
+		assert.equal(subscriptionItemHeading({ source_kind: 'rss' }, transientChannel),
+			'Fixture channel · RSS/Atom');
+		assert.equal(subscriptionItemHeading({ source_kind: 'other' }, transientChannel),
+			'Fixture channel · Subscription');
+	}
+});
+
 const detailsSource = await readFile(new URL('./components/Details.tsx', import.meta.url), 'utf8');
 const compiledDetails = ts.transpileModule(detailsSource, {
 	compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX },

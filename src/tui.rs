@@ -3977,7 +3977,7 @@ fn render_subscriptions_body(
             ) = render_row_list(
                 frame,
                 list_sections[0],
-                &subscription_items_heading(subscriptions),
+                &subscription_items_heading(subscriptions, view.youtube_channel_browsing),
                 &subscriptions.items,
                 RowSourceLabels::Hidden,
                 subscriptions.selected_item,
@@ -4127,7 +4127,8 @@ fn render_subscriptions_body(
                     .constraints([Constraint::Min(1), Constraint::Length(1)])
                     .split(panes[1]);
                 hit_map.subscription_item_row_height = row_list_height(&subscriptions.items);
-                let heading = subscription_items_heading(subscriptions);
+                let heading =
+                    subscription_items_heading(subscriptions, view.youtube_channel_browsing);
                 (
                     hit_map.subscription_item_rows,
                     hit_map.subscription_item_first_index,
@@ -4213,8 +4214,12 @@ fn render_subscription_source_list(
     rendered
 }
 
-/// Builds the source-aware item heading for both subscription layouts.
-fn subscription_items_heading(subscriptions: &SubscriptionsView) -> String {
+/// Builds the item heading for both layouts, omitting the redundant provider
+/// during named YouTube channel visits but preserving it in mixed-source Subs.
+fn subscription_items_heading(
+    subscriptions: &SubscriptionsView,
+    youtube_channel_browsing: bool,
+) -> String {
     let provider = match subscriptions.source_kind {
         SubscriptionKind::YouTube => "YouTube",
         SubscriptionKind::Rss => "RSS/Atom",
@@ -4222,6 +4227,8 @@ fn subscription_items_heading(subscriptions: &SubscriptionsView) -> String {
     };
     let mut heading = if subscriptions.source_title.is_empty() {
         provider.to_owned()
+    } else if youtube_channel_browsing && subscriptions.source_kind == SubscriptionKind::YouTube {
+        subscriptions.source_title.clone()
     } else {
         format!("{} · {provider}", subscriptions.source_title)
     };
@@ -24554,6 +24561,49 @@ for encoded, expected in json.load(sys.stdin):
             assert!(rendered.contains("CHANNEL_FIXTURE"));
             assert_eq!(hit_map.subscription_source_rows.y, 2);
             assert!(rendered.contains("[a] Add RSS feed"));
+        }
+    }
+
+    #[test]
+    fn youtube_channel_item_heading_omits_redundant_provider_in_both_layouts() {
+        for layout in [SubscriptionsLayout::DrillDown, SubscriptionsLayout::Split] {
+            for count in [Some(13_045), None] {
+                for title in ["Fixture channel", ""] {
+                    let mut view = ViewModel {
+                        screen: Screen::Subscriptions,
+                        youtube_channel_browsing: true,
+                        ..ViewModel::default()
+                    };
+                    view.subscriptions.layout = layout;
+                    view.subscriptions.route = SubscriptionRoute::Items;
+                    view.subscriptions.focus = SubscriptionPane::Items;
+                    view.subscriptions.source_kind = SubscriptionKind::YouTube;
+                    view.subscriptions.source_title = title.to_owned();
+                    view.subscriptions.source_subscriber_count = count;
+                    view.subscriptions.source_created = "2010 April 13".to_owned();
+                    view.subscriptions.items = vec![subscription_row("Fixture video", true)];
+                    let mut terminal = Terminal::new(TestBackend::new(180, 24)).unwrap();
+                    let mut hit_map = HitMap::default();
+                    terminal
+                        .draw(|frame| {
+                            render(frame, &view, &UiSettings::default(), &mut hit_map);
+                        })
+                        .unwrap();
+
+                    let title = if title.is_empty() { "YouTube" } else { title };
+                    let expected = if count.is_some() {
+                        format!("{title} · 13,045 subscribers · created 2010 April 13")
+                    } else {
+                        format!("{title} · created 2010 April 13")
+                    };
+                    let rendered = rendered_text(&terminal);
+                    assert!(
+                        rendered.contains(&expected),
+                        "YT channel heading must preserve its facts without repeating the provider: {expected}"
+                    );
+                    assert!(!rendered.contains("Fixture channel · YouTube"));
+                }
+            }
         }
     }
 

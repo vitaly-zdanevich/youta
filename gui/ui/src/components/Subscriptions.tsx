@@ -28,24 +28,26 @@ function itemNoun(subscriptions: SubscriptionsView): string {
  *
  * The wording is restated here rather than shared because it is a label, not a
  * rule: getting it wrong shows the wrong words, not the wrong data.
+ * A named temporary channel omits the provider already identified by its tab.
  */
-function itemsHeading(subscriptions: SubscriptionsView): string {
-  const provider =
-    subscriptions.source_kind === "rss"
-      ? "RSS/Atom"
-      : subscriptions.source_kind === "you-tube"
-        ? "YouTube"
-        : "Subscription";
-  let heading = subscriptions.source_title
-    ? `${subscriptions.source_title} · ${provider}`
-    : provider;
-  if (subscriptions.source_kind === "you-tube" && subscriptions.source_subscriber_count !== null) {
-    heading += ` · ${formatCount(subscriptions.source_subscriber_count)} subscribers`;
-  }
-  if (subscriptions.source_kind === "you-tube" && subscriptions.source_created !== "") {
-    heading += ` · created ${subscriptions.source_created}`;
-  }
-  return heading;
+function itemsHeading(subscriptions: SubscriptionsView, transientChannel: boolean): string {
+	const provider =
+		subscriptions.source_kind === 'rss'
+			? 'RSS/Atom'
+			: subscriptions.source_kind === 'you-tube'
+				? 'YouTube'
+				: 'Subscription';
+	let heading = subscriptions.source_title || provider;
+	if (subscriptions.source_title && (!transientChannel || subscriptions.source_kind !== 'you-tube')) {
+		heading += ` · ${provider}`;
+	}
+	if (subscriptions.source_kind === 'you-tube' && subscriptions.source_subscriber_count !== null) {
+		heading += ` · ${formatCount(subscriptions.source_subscriber_count)} subscribers`;
+	}
+	if (subscriptions.source_kind === 'you-tube' && subscriptions.source_created !== '') {
+		heading += ` · created ${subscriptions.source_created}`;
+	}
+	return heading;
 }
 
 /** Whether a row is the authoritative playing item. */
@@ -386,7 +388,7 @@ export function Subscriptions({
         <Pane
           pane="Items"
           sourceOwner={subscriptions.source_generation}
-          heading={itemsHeading(subscriptions)}
+					heading={itemsHeading(subscriptions, transientChannel)}
           rows={subscriptions.items}
           selected={subscriptions.selected_item}
           focused={subscriptions.focus === "Items"}
