@@ -3306,12 +3306,11 @@ fn live_marker_style(style: Style) -> Style {
         .remove_modifier(Modifier::DIM)
 }
 
-/// Highlights only the reducer's trailing live-duration field, never creator text.
-fn row_subtitle_spans(row: &RowView, style: Style) -> Vec<Span<'_>> {
-    let live_prefix = row
-        .subtitle
-        .strip_suffix("LIVE")
-        .filter(|prefix| row.live && (prefix.is_empty() || prefix.ends_with(" · ")));
+/// Highlights the trailing live-duration field unless selected playback needs black text.
+fn row_subtitle_spans(row: &RowView, style: Style, highlight_live_marker: bool) -> Vec<Span<'_>> {
+    let live_prefix = row.subtitle.strip_suffix("LIVE").filter(|prefix| {
+        highlight_live_marker && row.live && (prefix.is_empty() || prefix.ends_with(" · "))
+    });
     if let Some(prefix) = live_prefix {
         vec![
             Span::styled(prefix, style),
@@ -3650,6 +3649,7 @@ impl RowSourceLabels {
     clippy::too_many_arguments,
     reason = "the renderer keeps list data and presentation state explicit"
 )]
+/// Renders shared item rows, preserving black selected-playback text without VT bold intensity.
 fn render_row_list(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -3685,12 +3685,19 @@ fn render_row_list(
         .map(|(index, row)| {
             let selected = index == selected_index;
             let playing = playing_index == Some(index);
+            let selected_playing = selected && playing;
             let playing_symbol = if playback_paused {
                 PLAYBACK_PAUSED_SYMBOL
             } else {
                 PLAYBACK_PLAYING_SYMBOL
             };
-            let row_style = if selected {
+            let row_style = if selected_playing {
+                // Linux consoles render bold black as gray; keep this state truly black.
+                theme
+                    .selected
+                    .fg(Color::Black)
+                    .remove_modifier(Modifier::BOLD)
+            } else if selected {
                 theme.selected.fg(Color::Black)
             } else if playing {
                 theme.accent.add_modifier(Modifier::BOLD)
@@ -3803,7 +3810,11 @@ fn render_row_list(
                     media_id.source == SourceKind::Radio && media_id.external_id == station_id
                 })
             });
-            let recording_style = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
+            let recording_style = if selected_playing {
+                row_style
+            } else {
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+            };
             let mut title_spans = if row.compact {
                 let mut spans = Vec::with_capacity(3);
                 if playing {
@@ -3890,7 +3901,7 @@ fn render_row_list(
             title_spans.push(Span::styled(&row.title, title_style));
             if row_height == 1 && !row.subtitle.is_empty() {
                 title_spans.push(Span::styled(" · ", secondary_style));
-                title_spans.extend(row_subtitle_spans(row, secondary_style));
+                title_spans.extend(row_subtitle_spans(row, secondary_style, !selected_playing));
             }
             if row_height == 1 && !progress.is_empty() {
                 title_spans.push(Span::styled(progress.clone(), secondary_style));
@@ -3921,7 +3932,11 @@ fn render_row_list(
                     subtitle_spans
                         .push(Span::styled(&row.subtitle[duration_end..], secondary_style));
                 } else {
-                    subtitle_spans.extend(row_subtitle_spans(row, secondary_style));
+                    subtitle_spans.extend(row_subtitle_spans(
+                        row,
+                        secondary_style,
+                        !selected_playing,
+                    ));
                     if !progress.is_empty() {
                         subtitle_spans.push(Span::styled(progress, secondary_style));
                     }
@@ -19364,6 +19379,189 @@ for encoded, expected in json.load(sys.stdin):
         assert_eq!(buffer[(0, 1)].symbol(), "▶");
     }
 
+    /// Selected playing rows keep actual black text, including markers, on Linux consoles.
+    #[test]
+    fn selected_playing_rows_keep_black_text_across_sources_and_terminals() {
+        for (source, label, vertical, live, was_live) in [
+            (SourceKind::YouTube, "YouTube", false, false, false),
+            (SourceKind::YouTube, "YouTube", true, false, false),
+            (SourceKind::YouTube, "YouTube", false, true, false),
+            (SourceKind::YouTube, "YouTube", false, false, true),
+            (SourceKind::YouTube, "YouTube Music", false, false, false),
+            (SourceKind::SoundCloud, "SoundCloud", false, false, false),
+            (SourceKind::YandexMusic, "Yandex Music", false, false, false),
+            (SourceKind::Bandcamp, "Bandcamp", false, false, false),
+            (SourceKind::Rss, "Podcast", false, false, false),
+            (SourceKind::ArchiveOrg, "archive.org", false, false, false),
+            (SourceKind::LibriVox, "LibriVox", false, false, false),
+            (SourceKind::Radio, "Radio", false, false, false),
+            (SourceKind::ModArchive, "MOD", false, false, false),
+            (SourceKind::Local, "Local", false, false, false),
+            (SourceKind::GenericYtDlp, "Web", false, false, false),
+        ] {
+            let id = MediaId::new(source, "selected-playing-fixture");
+            for funny in [false, true] {
+                for console in [false, true] {
+                    let theme = Theme::for_terminal(funny, console);
+                    for compact in [false, true] {
+                        for paused in [false, true] {
+                            let rows = [RowView {
+                                media_id: Some(id.clone()),
+                                title: "Current item".to_owned(),
+                                subtitle: format!(
+                                    "Creator · 2026 October 13 · {}",
+                                    if live { "LIVE" } else { "12:34" }
+                                ),
+                                source: label.to_owned(),
+                                playback_started: true,
+                                watched_percent: 42,
+                                subscribed: true,
+                                downloaded: true,
+                                download_marked: true,
+                                local_marked: true,
+                                radio_favorite: true,
+                                vertical,
+                                live,
+                                was_live,
+                                compact,
+                                ..RowView::default()
+                            }];
+                            let mut terminal = Terminal::new(TestBackend::new(100, 2)).unwrap();
+                            terminal
+                                .draw(|frame| {
+                                    render_row_list(
+                                        frame,
+                                        frame.area(),
+                                        "",
+                                        &rows,
+                                        RowSourceLabels::All,
+                                        0,
+                                        Some(&id),
+                                        paused,
+                                        (id.source == SourceKind::Radio)
+                                            .then_some(id.external_id.as_str()),
+                                        !console,
+                                        theme.heading,
+                                        &theme,
+                                    );
+                                    if console {
+                                        normalize_linux_console_buffer_for_color_output(
+                                            frame.buffer_mut(),
+                                            true,
+                                        );
+                                    }
+                                })
+                                .unwrap();
+                            let buffer = terminal.backend().buffer();
+                            let expected_background = if console {
+                                linux_console_background(theme.selected.bg.unwrap())
+                            } else {
+                                theme.selected.bg.unwrap()
+                            };
+                            for y in 0..row_list_height(&rows) {
+                                for x in 0..100 {
+                                    let cell = &buffer[(x, y)];
+                                    assert_eq!(cell.bg, expected_background);
+                                    assert_eq!(
+                                        cell.fg,
+                                        Color::Black,
+                                        "source={label}, compact={compact}, paused={paused}, funny={funny}, console={console}, live={live}, cell=({x},{y})"
+                                    );
+                                    assert!(!cell.modifier.contains(Modifier::BOLD));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Black-without-bold contrast changes only the selected playing combination.
+    #[test]
+    fn black_playing_selection_preserves_other_row_states() {
+        let id = MediaId::new(SourceKind::SoundCloud, "contrast-fixture");
+        for funny in [false, true] {
+            for console in [false, true] {
+                let theme = Theme::for_terminal(funny, console);
+                for compact in [false, true] {
+                    for (selected, playing) in [(0, true), (0, false), (1, true), (1, false)] {
+                        let rows = [
+                            RowView {
+                                media_id: Some(id.clone()),
+                                title: "Contrast fixture".to_owned(),
+                                subtitle: "Creator · 12:34".to_owned(),
+                                source: "SoundCloud".to_owned(),
+                                compact,
+                                ..RowView::default()
+                            },
+                            RowView {
+                                compact,
+                                ..RowView::default()
+                            },
+                        ];
+                        let mut terminal = Terminal::new(TestBackend::new(100, 4)).unwrap();
+                        terminal
+                            .draw(|frame| {
+                                render_row_list(
+                                    frame,
+                                    frame.area(),
+                                    "",
+                                    &rows,
+                                    RowSourceLabels::All,
+                                    selected,
+                                    playing.then_some(&id),
+                                    false,
+                                    None,
+                                    false,
+                                    theme.heading,
+                                    &theme,
+                                );
+                                if console {
+                                    normalize_linux_console_buffer_for_color_output(
+                                        frame.buffer_mut(),
+                                        true,
+                                    );
+                                }
+                            })
+                            .unwrap();
+                        let line = (0..100)
+                            .map(|x| terminal.backend().buffer()[(x, 0)].symbol())
+                            .collect::<String>();
+                        let title_start = line.find("Contrast fixture").unwrap();
+                        let cell = &terminal.backend().buffer()
+                            [(terminal_text_width(&line[..title_start]), 0)];
+                        let expected = if selected == 0 {
+                            theme.selected
+                        } else if playing {
+                            theme.accent.add_modifier(Modifier::BOLD)
+                        } else {
+                            theme.base
+                        };
+                        let bold = selected == 0 && !playing || selected != 0 && playing;
+                        let foreground = expected.fg.unwrap_or(Color::Reset);
+                        let (foreground, bright) = if console {
+                            linux_console_foreground(foreground, bold)
+                        } else {
+                            (foreground, bold)
+                        };
+                        assert_eq!(cell.fg, foreground);
+                        assert_eq!(cell.modifier.contains(Modifier::BOLD), bright);
+                        let background = expected.bg.unwrap_or(Color::Reset);
+                        assert_eq!(
+                            cell.bg,
+                            if console {
+                                linux_console_background(background)
+                            } else {
+                                background
+                            }
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// Both lines of an unselected playing video share its category color or ordinary accent.
     #[test]
     fn playing_youtube_rows_color_both_lines_without_overriding_selection() {
@@ -19436,7 +19634,7 @@ for encoded, expected in json.load(sys.stdin):
                             theme.accent.fg.unwrap()
                         };
                         if console {
-                            expected = linux_console_foreground(expected, true).0;
+                            expected = linux_console_foreground(expected, selected != 0).0;
                         }
                         for (y, text) in [(0, "Current video"), (1, "Creator")] {
                             let line = (0..80).map(|x| buffer[(x, y)].symbol()).collect::<String>();
@@ -19792,7 +19990,8 @@ for encoded, expected in json.load(sys.stdin):
                             for column in x..x + terminal_text_width(text) {
                                 let live_marker =
                                     text == metadata && column >= x + terminal_text_width(text) - 4;
-                                let color = if selected == 0 && !live_marker {
+                                let selected_playing = selected == 0 && playing;
+                                let color = if selected == 0 && (!live_marker || playing) {
                                     Color::Black
                                 } else {
                                     Color::Red
@@ -19800,7 +19999,11 @@ for encoded, expected in json.load(sys.stdin):
                                 let expected = if console {
                                     linux_console_foreground(
                                         color,
-                                        selected == 0 || playing || !started || live_marker,
+                                        !selected_playing
+                                            && (selected == 0
+                                                || playing
+                                                || !started
+                                                || live_marker),
                                     )
                                     .0
                                 } else {
@@ -43031,8 +43234,9 @@ prose 07:25 remains clickable but is not a chapter";
                     "all unselected live rows color the whole metadata line"
                 );
                 for x in marker_x..marker_x + 4 {
-                    assert_eq!(buffer[(x, y)].fg == Color::Red, live, "{line}");
-                    if live {
+                    let red_marker = live && !(selected == 0 && playing);
+                    assert_eq!(buffer[(x, y)].fg == Color::Red, red_marker, "{line}");
+                    if red_marker {
                         assert!(buffer[(x, y)].modifier.contains(Modifier::BOLD));
                     }
                 }
