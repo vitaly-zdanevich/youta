@@ -1868,8 +1868,13 @@ mod tests {
             controller.show_screen(Screen::Search);
             controller.show_screen(Screen::ArchiveOrg);
         }
+        // Inspect the queued owner before its immediate mock response can be
+        // consumed by this same poll; private startup checks remain unblocked.
+        occupy_archive_worker(&mut controller);
         controller.config.persistence.save_playback_history = true;
         controller.poll_archive_org_worker();
+        assert!(controller.archive_org.initialized);
+        assert_eq!(controller.archive_org.generation, 1);
         assert!(matches!(
             controller.archive_org.pending.as_ref().map(|job| &job.kind),
             Some(ArchiveRequest::Search(_))
