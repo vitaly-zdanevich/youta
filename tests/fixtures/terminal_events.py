@@ -24,12 +24,58 @@ def resize(fd, columns, rows):
 	fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack('HHHH', rows, columns, 0, 0))
 
 
+class TerminalOutput:
+	'''Retain bounded PTY output and answer the child's cursor-position queries.'''
+
+	def __init__(self, master, child):
+		'''Keep one transcript across distinct event and editor handoff markers.'''
+		self.master = master
+		self.child = child
+		self.transcript = b''
+		self.query_tail = b''
+
+	def wait_for(self, marker):
+		'''Drain ready output before interpreting process exit as a missing marker.'''
+		deadline = time.monotonic() + 5
+		while marker not in self.transcript:
+			remaining = max(0, deadline - time.monotonic())
+			if select.select([self.master], [], [], min(0.05, remaining))[0]:
+				try:
+					chunk = os.read(self.master, 65536)
+					if not chunk:
+						self.missing(marker, 'PTY closed (EOF)')
+				except OSError as error:
+					if error.errno != errno.EIO:
+						raise
+					self.missing(marker, 'PTY closed (EIO)')
+				self.transcript = (self.transcript + chunk)[-65536:]
+				queries = self.query_tail + chunk
+				for _ in range(queries.count(b'\x1b[6n')):
+					os.write(self.master, b'\x1b[1;1R')
+				self.query_tail = queries[-3:]
+				if marker in self.transcript:
+					return
+			elif self.child.poll() is not None:
+				# The child may have flushed and exited after the first readiness check.
+				# Once exit is confirmed, a final nonblocking check sees all its output.
+				if select.select([self.master], [], [], 0)[0]:
+					continue
+				self.missing(marker, 'child exited')
+			if time.monotonic() >= deadline:
+				self.missing(marker, 'timed out')
+
+	def missing(self, marker, reason):
+		'''Distinguish watchdog, terminal closure, and process-exit failures.'''
+		status = self.child.poll()
+		raise AssertionError(
+			f'Missing {marker!r} ({reason}; child status={status!r}): {self.transcript[-8000:]!r}'
+		)
+
+
 def main():
 	'''Verify notifications, decoded input, and repeated editor/TUI ownership.'''
 	master, slave = os.openpty()
 	child = None
-	transcript = b''
-	query_tail = b''
 	try:
 		resize(slave, 80, 24)
 		environment = dict(os.environ, TERM='xterm-256color', YOUTA_INPUT_TEST_SOCKET=sys.argv[2])
@@ -39,25 +85,8 @@ def main():
 		os.close(slave)
 		slave = None
 
-		def wait_for(marker):
-			'''Drain bounded terminal output until one distinct fixture marker.'''
-			nonlocal transcript, query_tail
-			deadline = time.monotonic() + 5
-			while marker not in transcript:
-				if child.poll() is not None or time.monotonic() >= deadline:
-					raise AssertionError(f'Missing {marker!r}: {transcript[-8000:]!r}')
-				if not select.select([master], [], [], 0.05)[0]:
-					continue
-				try:
-					chunk = os.read(master, 65536)
-					transcript = (transcript + chunk)[-65536:]
-					queries = query_tail + chunk
-					for _ in range(queries.count(b'\x1b[6n')):
-						os.write(master, b'\x1b[1;1R')
-					query_tail = queries[-3:]
-				except OSError as error:
-					if error.errno != errno.EIO:
-						raise
+		output = TerminalOutput(master, child)
+		wait_for = output.wait_for
 
 		wait_for(b'WORKER_WAIT_READY')
 		with socket.socket(socket.AF_UNIX) as worker:
@@ -73,7 +102,7 @@ def main():
 			wait_for(f'EDITOR_RETURNED_{cycle}'.encode())
 			os.write(master, b'q')
 		wait_for(b'INPUT_TEST_DONE')
-		assert child.wait(timeout=5) == 0, transcript[-8000:]
+		assert child.wait(timeout=5) == 0, output.transcript[-8000:]
 	finally:
 		if child is not None:
 			try:
@@ -86,4 +115,5 @@ def main():
 			os.close(slave)
 
 
-main()
+if __name__ == '__main__':
+	main()

@@ -36,6 +36,27 @@ fn terminal_completion_events_and_editor_handoff() {
     );
 }
 
+/// Covers PTY exit/output ordering without relying on process scheduling.
+#[test]
+fn terminal_driver_drains_completion_after_child_exit() {
+    let output = Command::new("python3")
+        .args([
+            "-B",
+            "-c",
+            include_str!("../../tests/fixtures/test_terminal_events.py"),
+            "--fixture-source",
+            include_str!("../../tests/fixtures/terminal_events.py"),
+        ])
+        .output()
+        .expect("Python 3 PTY driver regressions");
+    assert!(
+        output.status.success(),
+        "PTY driver regressions failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// Signals the test driver without waiting for a render or animation deadline.
 fn marker(text: &str) {
     print!("\r\n{text}\r\n");
