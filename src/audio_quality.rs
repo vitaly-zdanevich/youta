@@ -2541,28 +2541,55 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(2));
     }
 
+    /// Replaces the input after the helper starts but before it can finish.
     #[cfg(unix)]
     #[test]
     fn replacing_the_file_while_ffmpeg_runs_discards_the_report() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let audio = directory.path().join("audio.flac");
         fs::write(&audio, b"original").expect("fixture");
-        let helper = directory.path().join("delayed ffmpeg");
-        executable_script(&helper, "#!/bin/sh\nsleep 0.2\nhead -c 98304 /dev/zero\n");
+        let helper = directory.path().join("gated ffmpeg");
+        let started = helper.with_extension("started");
+        let release = helper.with_extension("release");
+        executable_script(
+            &helper,
+            "#!/bin/sh\n: > \"$0.started\"\nwhile [ ! -f \"$0.release\" ]; do sleep 0.01; done\nhead -c 98304 /dev/zero\n",
+        );
         let request = AudioQualityRequest::from_path(audio.clone()).expect("request");
         let analyzer = FfmpegAudioQualityAnalyzer::new(helper);
-        let worker =
-            thread::spawn(move || analyzer.analyze(&request, &AudioQualityCancellation::new()));
+        let cancellation = AudioQualityCancellation::new();
+        let worker_cancellation = cancellation.clone();
+        let worker = thread::spawn(move || analyzer.analyze(&request, &worker_cancellation));
 
-        thread::sleep(Duration::from_millis(60));
-        let replacement = directory.path().join("replacement.flac");
-        fs::write(&replacement, b"replaced").expect("replacement");
-        fs::rename(replacement, &audio).expect("publish replacement");
+        // A duration alone cannot order the two threads on a busy CI runner.
+        // Hold the helper until the replacement is published, and cancel it
+        // before joining if startup or any fixture operation fails.
+        let coordination = (|| -> io::Result<()> {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !started.exists() {
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "mock FFmpeg did not signal startup",
+                    ));
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            let replacement = directory.path().join("replacement.flac");
+            fs::write(&replacement, b"replaced")?;
+            fs::rename(replacement, &audio)?;
+            fs::write(&release, b"")
+        })();
+        if coordination.is_err() {
+            cancellation.cancel();
+        }
+        let result = worker.join().expect("analysis worker");
+        coordination.expect("coordinate replacement with mock FFmpeg");
 
-        assert!(matches!(
-            worker.join().expect("analysis worker"),
-            Err(AudioQualityError::FileChanged)
-        ));
+        assert!(
+            matches!(&result, Err(AudioQualityError::FileChanged)),
+            "replaced audio must discard the report, got {result:?}"
+        );
     }
 
     #[test]
