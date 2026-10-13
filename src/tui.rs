@@ -3390,6 +3390,7 @@ fn main_list_pane_areas(mut pane: Rect, screen: Screen) -> (Rect, Rect) {
     let controls_height = pane.height.min(match screen {
         Screen::Web => 2,
         Screen::Search
+        | Screen::YouTubeMusic
         | Screen::ArchiveOrg
         | Screen::SoundCloud
         | Screen::ApplePodcasts
@@ -3454,6 +3455,7 @@ fn render_body(
     } else if matches!(
         view.screen,
         Screen::Search
+            | Screen::YouTubeMusic
             | Screen::ArchiveOrg
             | Screen::SoundCloud
             | Screen::ApplePodcasts
@@ -31776,6 +31778,7 @@ for encoded, expected in json.load(sys.stdin):
     fn catalog_playback_footers_show_autoplay_repeat_and_working_controls() {
         for (screen, width) in [
             Screen::Search,
+            Screen::YouTubeMusic,
             Screen::ArchiveOrg,
             Screen::SoundCloud,
             Screen::ApplePodcasts,
@@ -31893,19 +31896,29 @@ for encoded, expected in json.load(sys.stdin):
         }
     }
 
-    /// Local paging and row clicks exclude the fixed footer even at the end of a folder.
+    /// Catalogue paging and row clicks exclude the footer even at the final result.
     #[test]
-    fn local_playback_footer_stays_below_rows_and_outside_page_capacity() {
-        for width in [160, 79] {
+    fn catalog_playback_footers_stay_below_rows_and_outside_page_capacity() {
+        for (screen, width) in [Screen::Local, Screen::YouTubeMusic]
+            .into_iter()
+            .flat_map(|screen| [160, 79].map(|width| (screen, width)))
+        {
             for row_count in [0_usize, 1, 100] {
                 let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
                 let view = ViewModel {
-                    screen: Screen::Local,
+                    screen,
                     selected: row_count.saturating_sub(1),
                     rows: (0..row_count)
                         .map(|index| RowView {
                             title: format!("Track {index}"),
-                            compact: true,
+                            subtitle: "Artist · 3:32".to_owned(),
+                            source: if screen == Screen::YouTubeMusic {
+                                "YouTube Music"
+                            } else {
+                                "Local audio"
+                            }
+                            .to_owned(),
+                            compact: screen == Screen::Local,
                             ..RowView::default()
                         })
                         .collect(),
@@ -31921,11 +31934,19 @@ for encoded, expected in json.load(sys.stdin):
                     .detail_buttons
                     .iter()
                     .find_map(|(action, area)| (action == &UiAction::ToggleRepeat).then_some(*area))
-                    .expect("Local Repeat footer must be visible even in an empty folder");
+                    .expect("Repeat footer must be visible even with no results");
                 let body = main_frame_sections(terminal.backend().buffer().area, &view)[1];
                 let pane = main_body_panes(body)[0];
                 assert_eq!(footer.bottom(), pane.bottom());
                 assert_eq!(footer.y, hits.rows.bottom());
+                assert_eq!(
+                    hits.rows_row_height,
+                    if screen == Screen::Local && row_count > 0 {
+                        1
+                    } else {
+                        2
+                    }
+                );
                 let capacity = visible_main_list_page_rows(&hits, &view).unwrap();
                 assert_eq!(
                     capacity,
@@ -31938,23 +31959,29 @@ for encoded, expected in json.load(sys.stdin):
                         Some(capacity),
                         None,
                     ),
-                    Some(UiAction::MoveSelection(i32::try_from(capacity).unwrap()))
+                    (screen == Screen::Local)
+                        .then(|| UiAction::MoveSelection(i32::try_from(capacity).unwrap()))
                 );
                 if row_count > capacity {
                     assert!(rendered_text(&terminal).contains("Track 99"));
-                    assert_eq!(
-                        mouse_action(
-                            MouseEvent {
-                                kind: MouseEventKind::Down(MouseButton::Left),
-                                column: hits.rows.x,
-                                row: hits.rows.bottom() - 1,
-                                modifiers: KeyModifiers::NONE,
-                            },
-                            &hits,
-                            &view,
-                        ),
-                        Some(UiAction::SelectRow(99))
-                    );
+                    let last_row_top =
+                        hits.rows.y + u16::try_from(capacity - 1).unwrap() * hits.rows_row_height;
+                    for row in last_row_top..last_row_top + hits.rows_row_height {
+                        assert!(row < footer.y);
+                        assert_eq!(
+                            mouse_action(
+                                MouseEvent {
+                                    kind: MouseEventKind::Down(MouseButton::Left),
+                                    column: hits.rows.x,
+                                    row,
+                                    modifiers: KeyModifiers::NONE,
+                                },
+                                &hits,
+                                &view,
+                            ),
+                            Some(UiAction::SelectRow(99))
+                        );
+                    }
                 }
             }
         }
@@ -32077,6 +32104,7 @@ for encoded, expected in json.load(sys.stdin):
     fn catalog_playback_footers_stay_bounded_in_small_terminals() {
         for (screen, (width, height)) in [
             Screen::Search,
+            Screen::YouTubeMusic,
             Screen::ArchiveOrg,
             Screen::SoundCloud,
             Screen::ApplePodcasts,
