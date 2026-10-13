@@ -601,8 +601,8 @@ fn tui_subscriptions_openers_and_preferences_persist_end_to_end() {
     // so unchanged cells inside a title can be omitted from its byte stream.
     // Assert a preference unique to this popup instead of requiring its title
     // to appear as one contiguous substring.
+    // Subscriptions omit their generic heading; verify the actual channel row.
     for expected in [
-        "Sources",
         "Fixture channel",
         "Save log and searches: on",
         "Save log and searches: off",
@@ -643,7 +643,7 @@ fn tui_subscriptions_openers_and_preferences_persist_end_to_end() {
         &locked_transcript,
         &opened_links,
         Some("drill-down"),
-        "Sources",
+        "Fixture channel",
         &[
             (b"p", 300),
             (b"s", 200),
