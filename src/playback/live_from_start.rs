@@ -739,12 +739,86 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpStream;
     use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::ExitStatus;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use serde_json::{Value, json};
     use url::Url;
 
     use super::*;
+
+    /// Probe argument that exits before any mock metadata or audio behavior runs.
+    const MOCK_READY_ARGUMENT: &str = "__youta_live_fixture_ready__";
+
+    /// Checks fixture readiness, retrying only a busy inode within the caller's budget.
+    fn ensure_mock_helper_ready(
+        mut probe: impl FnMut() -> io::Result<ExitStatus>,
+        mut retry_busy: impl FnMut() -> bool,
+    ) -> io::Result<()> {
+        loop {
+            match probe() {
+                Ok(status) if status.success() => return Ok(()),
+                Ok(status) => {
+                    return Err(io::Error::other(format!(
+                        "mock helper readiness exited with {status}"
+                    )));
+                }
+                Err(error) if error.kind() == io::ErrorKind::ExecutableFileBusy && retry_busy() => {
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// Publishes a closed fresh inode and proves readiness without running its body.
+    fn install_mock_helper(executable: &std::path::Path, body: &str) {
+        let mut staged = tempfile::Builder::new()
+            .prefix(".mock-yt-dlp-")
+            .tempfile_in(executable.parent().expect("mock helper directory"))
+            .expect("stage mock extractor");
+        staged
+            .write_all(
+                format!(
+                    "#!/bin/sh\nif [ \"${{1-}}\" = '{MOCK_READY_ARGUMENT}' ]; then exit 0; fi\n{body}\n"
+                )
+                .as_bytes(),
+            )
+            .expect("write mock extractor");
+        staged.as_file().sync_all().expect("sync mock extractor");
+        staged
+            .as_file()
+            .set_permissions(fs::Permissions::from_mode(0o700))
+            .expect("executable helper");
+        // Close the writer before exposing the replacement pathname. Existing
+        // writable handles keep only the old inode, not this executable.
+        let staged = staged.into_temp_path();
+        fs::rename(&staged, executable).expect("publish closed mock extractor");
+
+        let started = Instant::now();
+        ensure_mock_helper_ready(
+            || {
+                Command::new(executable)
+                    .arg(MOCK_READY_ARGUMENT)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+            },
+            || {
+                // Parallel instrumentation may briefly retain another writable
+                // handle. Wait only after that exact spawn error, not for any
+                // production helper failure or fixture-body execution.
+                let remaining = Duration::from_secs(1).saturating_sub(started.elapsed());
+                if remaining.is_zero() {
+                    return false;
+                }
+                thread::sleep(remaining.min(Duration::from_millis(1)));
+                true
+            },
+        )
+        .expect("mock extractor must become executable");
+    }
 
     /// Owns a deterministic extractor fixture without contacting any service.
     struct MockHelper {
@@ -757,13 +831,11 @@ mod tests {
         fn new(metadata: Value, body: &str) -> Self {
             let directory = tempfile::tempdir().expect("mock helper directory");
             let executable = directory.path().join("mock-yt-dlp");
-            let script = format!(
-                "#!/bin/sh\ncase \" $* \" in\n*' --skip-download '*) printf '%s\\n' '{}' ;;\n*) {} ;;\nesac\n",
+            let body = format!(
+                "case \" $* \" in\n*' --skip-download '*) printf '%s\\n' '{}' ;;\n*) {} ;;\nesac",
                 metadata, body
             );
-            fs::write(&executable, script).expect("mock extractor");
-            fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
-                .expect("executable helper");
+            install_mock_helper(&executable, &body);
             Self {
                 _directory: directory,
                 config: LiveFromStartConfig {
@@ -773,6 +845,164 @@ mod tests {
                 },
             }
         }
+    }
+
+    /// Republishing a helper must not rewrite an inode still held for writing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mock_helper_publication_replaces_a_busy_inode_without_rewriting_it() {
+        let directory = tempfile::tempdir().expect("mock publication directory");
+        let executable = directory.path().join("mock-yt-dlp");
+        install_mock_helper(&executable, "printf 'original-fixture'");
+        let original = fs::read(&executable).expect("original helper contents");
+        let mut writer = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&executable)
+            .expect("hold original executable open for writing");
+        let busy = Command::new(&executable)
+            .output()
+            .expect_err("an open executable writer must prevent Linux execution");
+        assert_eq!(busy.kind(), io::ErrorKind::ExecutableFileBusy);
+
+        install_mock_helper(&executable, "printf 'replacement-fixture'");
+        let output = Command::new(&executable)
+            .output()
+            .expect("replacement helper must not retain the busy inode");
+        assert!(output.status.success(), "replacement helper: {output:?}");
+        assert_eq!(output.stdout, b"replacement-fixture");
+        let mut retained = Vec::new();
+        writer
+            .read_to_end(&mut retained)
+            .expect("retained original inode");
+        assert_eq!(
+            retained, original,
+            "publication must not modify the old inode"
+        );
+    }
+
+    /// A readiness probe must not consume metadata or execute streaming behavior.
+    #[test]
+    fn mock_helper_readiness_skips_body_and_preserves_normal_invocation() {
+        let directory = tempfile::tempdir().expect("mock readiness directory");
+        let executable = directory.path().join("mock-yt-dlp");
+        let marker = executable.with_extension("body-ran");
+        install_mock_helper(
+            &executable,
+            "printf 'fixture body' > \"$0.body-ran\"; exit 7",
+        );
+        assert!(
+            !marker.exists(),
+            "publication readiness must not run the body"
+        );
+        let ready = Command::new(&executable)
+            .arg(MOCK_READY_ARGUMENT)
+            .output()
+            .expect("readiness invocation");
+        assert!(ready.status.success());
+        assert!(ready.stdout.is_empty());
+        assert!(ready.stderr.is_empty());
+        assert!(!marker.exists(), "explicit readiness must not run the body");
+
+        let output = Command::new(&executable)
+            .arg("--ordinary-fixture-argument")
+            .output()
+            .expect("ordinary fixture invocation");
+        assert_eq!(output.status.code(), Some(7));
+        assert_eq!(
+            fs::read(marker).expect("fixture body marker"),
+            b"fixture body"
+        );
+    }
+
+    /// Only transient executable-busy errors consume the fixture retry budget.
+    #[test]
+    fn mock_helper_readiness_retries_executable_busy_until_success() {
+        let mut probes = 0;
+        let mut retries = 0;
+        ensure_mock_helper_ready(
+            || {
+                probes += 1;
+                assert!(
+                    probes <= 3,
+                    "readiness must stop after successful execution"
+                );
+                if probes <= 2 {
+                    Err(io::ErrorKind::ExecutableFileBusy.into())
+                } else {
+                    Ok(ExitStatus::from_raw(0))
+                }
+            },
+            || {
+                retries += 1;
+                true
+            },
+        )
+        .expect("busy fixture becomes ready");
+        assert_eq!(probes, 3);
+        assert_eq!(retries, 2);
+    }
+
+    /// A finite budget cannot spin indefinitely on a permanently busy fixture.
+    #[test]
+    fn mock_helper_readiness_stops_when_busy_retry_budget_is_exhausted() {
+        let mut probes = 0;
+        let mut retries_left = 3;
+        let error = ensure_mock_helper_ready(
+            || {
+                probes += 1;
+                assert!(probes <= 4, "busy exhaustion must stop additional probes");
+                Err(io::ErrorKind::ExecutableFileBusy.into())
+            },
+            || {
+                if retries_left == 0 {
+                    return false;
+                }
+                retries_left -= 1;
+                true
+            },
+        )
+        .expect_err("permanently busy fixture exhausts its budget");
+        assert_eq!(error.kind(), io::ErrorKind::ExecutableFileBusy);
+        assert_eq!(probes, 4);
+        assert_eq!(retries_left, 0);
+    }
+
+    /// Missing or inaccessible fixtures fail immediately without invoking retries.
+    #[test]
+    fn mock_helper_readiness_does_not_retry_other_spawn_errors() {
+        for kind in [io::ErrorKind::NotFound, io::ErrorKind::PermissionDenied] {
+            let mut probes = 0;
+            let error = ensure_mock_helper_ready(
+                || {
+                    probes += 1;
+                    assert_eq!(probes, 1, "unrelated spawn errors must not be retried");
+                    Err(kind.into())
+                },
+                || panic!("only executable-busy errors may use the retry budget"),
+            )
+            .expect_err("unrelated fixture spawn failure");
+            assert_eq!(error.kind(), kind);
+            assert_eq!(probes, 1);
+        }
+    }
+
+    /// A running probe's nonzero exit is a fixture error, not a retryable spawn race.
+    #[test]
+    fn mock_helper_readiness_rejects_nonzero_exit_without_retrying() {
+        let mut probes = 0;
+        let error = ensure_mock_helper_ready(
+            || {
+                probes += 1;
+                assert_eq!(probes, 1, "nonzero readiness exits must not be retried");
+                Ok(ExitStatus::from_raw(7 << 8))
+            },
+            || panic!("nonzero readiness exits must not use the retry budget"),
+        )
+        .expect_err("failed readiness fixture");
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(error.to_string().contains("7"));
+        assert_eq!(probes, 1);
     }
 
     /// Supplies a recent, fully available generator format for startup tests.
@@ -965,7 +1195,7 @@ mod tests {
     #[test]
     fn unresponsive_metadata_times_out_without_launching_audio() {
         let mut fixture = MockHelper::new(metadata(), "printf 'unused-audio'");
-        fs::write(&fixture.config.executable, "#!/bin/sh\nsleep 60\n").unwrap();
+        install_mock_helper(&fixture.config.executable, "sleep 60");
         fixture.config.startup_timeout = Duration::from_millis(150);
         let started = Instant::now();
         assert!(
