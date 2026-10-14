@@ -3552,6 +3552,14 @@ reproduce a particular partial download. The remaining audio is not saved.
 
 Youta is licensed under the [MIT License](LICENSE).
 
+## Links
+
+- [Youta talk and meetup in Batumi](https://www.youtube.com/watch?v=swzZX4Y30Ak)
+  — August 2026, in Russian
+- [Article about Youta on Habr](https://habr.com/en/posts/1081424/)
+- [linux.org.ru](https://www.linux.org.ru/forum/multimedia/18378245)
+- [AlternativeTo.net](https://alternativeto.net/software/youta/about/)
+
 ## My other Wikimedia-related projects
 
 ### GitHub
@@ -3622,10 +3630,3 @@ Youta is licensed under the [MIT License](LICENSE).
 - [ytfzf](https://github.com/pystardust/ytfzf) is a POSIX and `fzf`-based
   search, watch, and download frontend with thumbnails, subscriptions, and
   history; its upstream repository says it is no longer actively maintained.
-
-## Talks and articles
-
-- [Youta talk and meetup in Batumi](https://www.youtube.com/watch?v=swzZX4Y30Ak)
-  — August 2026, in Russian
-- [Article about Youta on Habr](https://habr.com/en/posts/1081424/)
-- [linux.org.ru](https://www.linux.org.ru/forum/multimedia/18378245)
