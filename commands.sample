@@ -20,7 +20,19 @@
 # %m passes the full selected description already shown in Details as one text
 # argument, captured when the button is invoked; it fetches no extra metadata.
 # An empty description is valid; an unavailable description prevents execution.
-# All four macros use the selected item, never the playing item.
+# These four macros use the selected item, never the playing item.
+# %t passes the current playing or paused cursor as HH:MM:SS.mmm, with at least
+# two hour digits and no wrap after 24 hours. It uses Youta's existing position,
+# captured when the button is invoked, even if a download delays execution.
+# Stopped playback or an unavailable position prevents execution. LIVE uses the
+# available cursor relative to the rewind buffer, not broadcast start or the
+# displayed elapsed clock. Unseekable LIVE or no available buffer cursor means
+# an error instead of a zero time.
+# Buttons need an eligible selected item even when the command uses only %t;
+# typed commands in the : editor can use %t without a selection on any tab,
+# including Statistics.
+# Select the playing item before combining %t with selected-target macros:
+# ffmpeg -ss %t -i %d -c copy /tmp/from-cursor.mkv
 # When %m is the complete command word in a simple command, it writes the full
 # description without adding a newline: %m > mynote saves it exactly. As an
 # argument or with a suffix, it passes one quoted text value, never shell source.
@@ -62,3 +74,8 @@ command = 'gimp %i'
 name = 'Save description'
 description = 'Save the full selected Details description without adding a newline.'
 command = '%m > mynote'
+
+[[commands]]
+name = 'Show playback time'
+description = 'Display the current playback cursor captured when this button is invoked.'
+command = "printf '%s\\n' %t"

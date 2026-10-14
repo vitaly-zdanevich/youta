@@ -196,6 +196,7 @@ impl AppController {
                 downloaded_path: local_path.clone(),
                 image_path: None,
                 metadata: self.capture_command_metadata(),
+                playback_position: self.capture_command_playhead(),
                 directory,
             },
             download: self.capture_command_download(),

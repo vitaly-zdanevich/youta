@@ -111,6 +111,59 @@ fn typed_prompt_metadata_without_selection_keeps_the_editor_open() {
     assert!(controller.view.status_line.contains("Select an item"));
 }
 
+/// A command on an empty tab captures the playing cursor, not any selected item.
+#[cfg(unix)]
+#[test]
+fn typed_prompt_time_needs_no_selection_and_freezes_the_opening_cursor() {
+    let (mut controller, _directory) = fixture();
+    let position = Duration::from_millis(84_350);
+    super::custom_command_tests::install_command_playhead(&mut controller, position);
+    controller.view.playback.paused = true;
+    controller.view.screen = Screen::Statistics;
+    controller.view.rows.clear();
+    controller.view.details = None;
+    controller.dispatch(UiAction::BeginLocalCommand);
+    controller.view.playback.position = Duration::from_secs(120);
+    type_text(&mut controller, "printf '%s' %t");
+    controller.dispatch(UiAction::SubmitLocalCommand);
+    assert!(controller.view.local_command.is_none());
+    let plan = controller
+        .take_custom_command_plan()
+        .expect("captured playback cursor");
+    assert!(plan.argument.is_empty());
+    assert_eq!(plan.playback_position, Some(position));
+    let output = plan.capture_output().unwrap();
+    assert!(output.success);
+    assert_eq!(output.output, "00:01:24.350");
+}
+
+/// Starting playback after opening an idle prompt cannot inject a later cursor into it.
+#[test]
+fn typed_prompt_time_without_initial_playback_preserves_the_editor_and_reports_error() {
+    let (mut controller, _directory) = fixture();
+    controller.view.screen = Screen::Statistics;
+    controller.view.rows.clear();
+    controller.view.details = None;
+    controller.dispatch(UiAction::BeginLocalCommand);
+    super::custom_command_tests::install_command_playhead(&mut controller, Duration::from_secs(42));
+    type_text(&mut controller, "echo %t");
+    controller.dispatch(UiAction::SubmitLocalCommand);
+    assert!(controller.view.local_command.is_some());
+    assert!(controller.view.status_line.contains("%t"));
+    assert!(controller.take_custom_command_plan().is_none());
+    controller.dispatch(UiAction::DismissLocalCommand);
+    controller.dispatch(UiAction::BeginLocalCommand);
+    type_text(&mut controller, "echo %t");
+    controller.dispatch(UiAction::SubmitLocalCommand);
+    assert_eq!(
+        controller
+            .take_custom_command_plan()
+            .unwrap()
+            .playback_position,
+        Some(Duration::from_secs(42))
+    );
+}
+
 /// Image commands freeze artwork before typing, independently of playback and later metadata.
 #[cfg(feature = "remote-artwork")]
 #[test]

@@ -946,6 +946,7 @@ mod tests {
             downloaded_path: None,
             image_path: None,
             metadata: None,
+            playback_position: None,
             directory: temporary.path().to_owned(),
         };
         super::spawn_custom_command(plan, Arc::new(sender)).unwrap();
@@ -980,6 +981,7 @@ mod tests {
             downloaded_path: None,
             image_path: Some(image_path),
             metadata: None,
+            playback_position: None,
             directory: temporary.path().to_owned(),
         };
         super::spawn_custom_command(plan, Arc::new(sender)).unwrap();
@@ -1010,6 +1012,7 @@ mod tests {
             metadata: Some(Arc::new(youta::local_command::CommandMetadata::new(
                 description,
             ))),
+            playback_position: None,
             directory: temporary.path().to_owned(),
         };
         super::spawn_custom_command(plan, Arc::new(sender)).unwrap();
@@ -1027,6 +1030,34 @@ mod tests {
             description.as_bytes()
         );
         assert!(!temporary.path().join("METADATA_INJECTION").exists());
+        assert!(inbox.try_recv().is_err());
+    }
+
+    /// GUI workers pass a captured playback cursor without requiring selected media or downloads.
+    #[cfg(all(feature = "cmd", unix))]
+    #[test]
+    fn custom_command_worker_formats_the_captured_playback_cursor() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (sender, inbox) = channel();
+        let plan = youta::local_command::ShellCommandPlan {
+            template: "printf '%s' %t".to_owned(),
+            argument: "".into(),
+            downloaded_path: None,
+            image_path: None,
+            metadata: None,
+            playback_position: Some(std::time::Duration::from_millis(3_723_456)),
+            directory: temporary.path().to_owned(),
+        };
+        super::spawn_custom_command(plan, Arc::new(sender)).unwrap();
+        let Message::CustomCommandFinished(result) = inbox
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+        else {
+            panic!("expected playback cursor command completion");
+        };
+        let output = result.unwrap();
+        assert!(output.success);
+        assert_eq!(output.output, "01:02:03.456");
         assert!(inbox.try_recv().is_err());
     }
 

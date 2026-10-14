@@ -154,6 +154,7 @@ mod tests {
             downloaded_path: None,
             image_path: None,
             metadata: None,
+            playback_position: None,
             directory: directory.to_owned(),
         }
     }

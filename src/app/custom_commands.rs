@@ -312,6 +312,7 @@ impl AppController {
             downloaded_path: local.clone(),
             image_path: None,
             metadata: self.capture_command_metadata(),
+            playback_position: self.capture_command_playhead(),
         };
         let local_selection = if self.view.screen == Screen::Local {
             local.and_then(|path| {
@@ -384,6 +385,23 @@ impl AppController {
             source,
             image: self.capture_command_image(),
         }
+    }
+
+    /// Captures an authoritative playing or paused cursor without querying the backend.
+    pub(super) fn capture_command_playhead(&self) -> Option<Duration> {
+        if self.playback_phase != PlaybackPhase::Playing || self.view.playback.idle {
+            return None;
+        }
+        let owner = self.current_media.as_ref()?;
+        if self.view.playing_media_id.as_ref() != Some(owner) {
+            return None;
+        }
+        // A LIVE cursor is buffer-relative. No range means normalization supplied
+        // a zero placeholder, not a timestamp a command can reliably consume.
+        if self.view.playback.live && self.view.playback.live_seekable_range.is_none() {
+            return None;
+        }
+        Some(self.view.playback.position)
     }
 
     /// Freezes the selected Details description, never stale Local or playing metadata.
@@ -501,6 +519,11 @@ impl AppController {
         }
         if self.custom_commands.mode == CustomCommandMode::Unavailable {
             return Err("Shell commands are unavailable in this frontend".to_owned());
+        }
+        if plan.requires_playback_position()? && plan.playback_position.is_none() {
+            return Err(
+                "No playback cursor was available when this command was captured (%t)".to_owned(),
+            );
         }
         if plan.requires_metadata()? && plan.metadata.is_none() {
             return Err("Wait for the selected item's description before using %m".to_owned());

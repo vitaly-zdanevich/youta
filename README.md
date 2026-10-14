@@ -250,14 +250,29 @@ Unavailable images prevent the command from running. `%m` supplies the selected
 item's full description text shown in Details, captured when the `:` editor
 opens or a command button is invoked. It uses the description already loaded
 and does not fetch additional metadata. An empty description is valid; an
-unavailable description prevents the command from running. All four macros
-require a selected item and never fall back to the playing item. For example:
+unavailable description prevents the command from running. These four macros
+require a selected item and never fall back to the playing item.
+
+`%t` supplies the current playback cursor as `HH:MM:SS.mmm`, with at least two
+hour digits and no wrap after 24 hours. It uses the position already available
+in Youta, captured when the `:` editor opens or a command button is invoked;
+submitting the command or waiting for a download does not update that position.
+Playing and paused media both supply a time. Stopped playback or an unavailable
+position prevents the command from running. For LIVE playback, `%t` uses the
+available cursor relative to the rewind buffer, not broadcast start or the
+displayed elapsed clock. An unseekable LIVE stream or one without an available
+buffer cursor reports an error instead of supplying a zero time.
+A typed `%t` command needs no selection and works on any tab, including
+Statistics. When combining `%t` with a selected-item macro, select the playing
+item to use its playback cursor and file together. For example:
 
 ```sh
 ffmpeg -i %d -c:a libmp3lame /tmp/output.mp3
 gimp %i
 %m > mynote
 printf '%s' %m > mynote
+printf '%s' %t
+ffmpeg -ss %t -i %d -c copy /tmp/from-cursor.mkv
 ```
 
 When `%m` is the complete command word in a simple command, it writes the full
@@ -295,7 +310,8 @@ entry. `Ctrl+R` opens the ten newest matching commands; type a case-sensitive
 substring, choose with `Up` / `Down`, and press `Enter` to run it against the
 current selection. `Esc` closes history search without running anything.
 
-History stores the command you type, never the description expanded by `%m`.
+History stores the command you type, never the description expanded by `%m`
+or the playback time expanded by `%t`.
 The latest 100 submitted commands persist as plain text, one command per line,
 in `~/.config/youta/cmd-log` (up to 8192 bytes per command). Delete this file
 while Youta is closed to clear command history. Youta writes it with owner-only
@@ -319,10 +335,13 @@ Optional `provider` restricts the button to the selected item's actual source
 it makes the button available for every eligible provider. Optional
 `font_color` and `background_color` accept `#rgb` or `#rrggbb` values.
 
-Buttons use the same `%`, `%d`, `%i`, and `%m` macros as the `:` editor: the selected
-original URL or local path, downloaded/local media, largest available
-image/artwork, and full Details description. They pass one argument safely,
-support suffixes such as `%i.png`, and never fall back to the playing item.
+Buttons use the same `%`, `%d`, `%i`, `%m`, and `%t` macros as the `:` editor: the
+selected original URL or local path, downloaded/local media, largest available
+image/artwork, full Details description, and current playback cursor. They pass
+one argument safely and support suffixes such as `%i.png`. The selected-item
+macros never fall back to the playing item; `%t` always uses current playback,
+captured when the button is invoked. Buttons still require an eligible selected
+item, including buttons whose command uses only `%t`.
 The download, editable-copy, and quoting rules above also apply.
 For example, `gimp %i` opens the selected
 image for editing, and `%m > mynote` saves its description exactly. Commands

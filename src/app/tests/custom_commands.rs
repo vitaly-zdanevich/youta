@@ -290,6 +290,98 @@ fn custom_metadata_commands_distinguish_empty_and_missing_descriptions() {
     assert!(controller.view.status_line.contains("description"));
 }
 
+/// A retained playback identity supplies time independently of the selected provider.
+pub(super) fn install_command_playhead(controller: &mut AppController, position: Duration) {
+    let owner = MediaId::new(SourceKind::SoundCloud, "playing-command-fixture");
+    controller.current_media = Some(owner.clone());
+    controller.view.playing_media_id = Some(owner);
+    controller.playback_phase = PlaybackPhase::Playing;
+    controller.view.playback.idle = false;
+    controller.view.playback.paused = false;
+    controller.view.playback.position = position;
+}
+
+/// Loaded and loading snapshots are not timestamps until playback has actually started.
+#[test]
+fn command_playheads_require_an_authoritative_playing_owner_and_accept_pause() {
+    let (mut controller, _directory) = fixture("");
+    let position = Duration::from_millis(84_350);
+    install_command_playhead(&mut controller, position);
+    assert_eq!(controller.capture_command_playhead(), Some(position));
+    controller.view.playback.paused = true;
+    controller.view.playback.duration = None;
+    assert_eq!(controller.capture_command_playhead(), Some(position));
+    controller.view.playback.position = Duration::ZERO;
+    assert_eq!(controller.capture_command_playhead(), Some(Duration::ZERO));
+    for phase in [
+        PlaybackPhase::Idle,
+        PlaybackPhase::Loading,
+        PlaybackPhase::Loaded,
+    ] {
+        controller.playback_phase = phase;
+        assert!(controller.capture_command_playhead().is_none());
+    }
+    install_command_playhead(&mut controller, position);
+    controller.view.playback.idle = true;
+    assert!(controller.capture_command_playhead().is_none());
+    controller.view.playback.idle = false;
+    controller.current_media = None;
+    assert!(controller.capture_command_playhead().is_none());
+    install_command_playhead(&mut controller, position);
+    controller.view.playing_media_id = Some(MediaId::new(SourceKind::YouTube, "unrelated-owner"));
+    assert!(controller.capture_command_playhead().is_none());
+}
+
+/// LIVE uses the cursor's buffer coordinate, not the broadcast clock or a zero placeholder.
+#[test]
+fn command_playheads_use_seekable_live_buffer_positions() {
+    let (mut controller, _directory) = fixture("");
+    let position = Duration::from_millis(84_350);
+    install_command_playhead(&mut controller, position);
+    controller.view.playback.live = true;
+    controller.view.live_elapsed_seconds = Some(3_600);
+    assert!(controller.capture_command_playhead().is_none());
+    controller.view.playback.live_seekable_range = Some(crate::playback::BufferedRange {
+        start: Duration::from_secs(900),
+        end: Duration::from_secs(1_100),
+    });
+    assert_eq!(controller.capture_command_playhead(), Some(position));
+}
+
+/// A custom button validates time before media downloads and freezes it through completion.
+#[test]
+fn custom_time_commands_error_without_playback_and_keep_time_through_downloads() {
+    let (mut controller, _directory) =
+        fixture("[[commands]]\nname='Cursor'\ncommand='echo %d %t'\n");
+    controller.dispatch(UiAction::RunCustomCommand(0));
+    assert!(controller.take_custom_command_plan().is_none());
+    assert!(controller.view.status_line.contains("%t"));
+    assert!(controller.manual_downloads.queue.entries.is_empty());
+    let position = Duration::from_millis(84_350);
+    install_command_playhead(&mut controller, position);
+    controller.view.playback.paused = true;
+    controller.dispatch(UiAction::RunCustomCommand(0));
+    let owner = controller
+        .manual_downloads
+        .active
+        .expect("ordinary media download");
+    controller.view.playback.position = Duration::from_secs(120);
+    controller.view.playback.idle = true;
+    controller.current_media = None;
+    controller.view.playing_media_id = None;
+    let downloaded = controller
+        .config
+        .downloads_dir()
+        .join("captured-cursor.opus");
+    std::fs::write(&downloaded, b"fixture media").unwrap();
+    controller.finish_manual_download_for(owner, Ok(downloaded));
+    controller.refresh_custom_command_buttons();
+    let plan = controller
+        .take_custom_command_plan()
+        .expect("captured time command");
+    assert_eq!(plan.playback_position, Some(position));
+}
+
 /// Bounds asynchronous fixture waiting without introducing a production polling timer.
 #[cfg(feature = "remote-artwork")]
 pub(super) fn wait_for_image_command(
@@ -639,6 +731,7 @@ fn captured_shell_commands_keep_the_source_and_normal_download_chooser() {
         downloaded_path: None,
         image_path: None,
         metadata: None,
+        playback_position: None,
         directory: directory.path().to_owned(),
     };
     controller.view.screen = Screen::Statistics;
@@ -675,6 +768,7 @@ fn captured_shell_commands_allow_plain_commands_without_download_sources() {
         downloaded_path: None,
         image_path: None,
         metadata: None,
+        playback_position: None,
         directory: directory.path().to_owned(),
     };
     controller
@@ -711,6 +805,7 @@ fn captured_shell_commands_reuse_downloads_before_checking_source_errors() {
         downloaded_path: None,
         image_path: None,
         metadata: None,
+        playback_position: None,
         directory: directory.path().to_owned(),
     };
     controller

@@ -609,7 +609,25 @@ supplies the selected item's full description text shown in Details, captured
 when the colon editor opens or a command button is invoked. It uses the
 description already loaded without fetching additional metadata. An empty
 description is valid; an unavailable description prevents command execution.
-All four macros require a selected item and never fall back to the playing item.
+These four macros require a selected item and never fall back to the playing
+item.
+.B %t
+supplies the current playback cursor as HH:MM:SS.mmm, with at least two hour
+digits and no wrap after 24 hours. It uses the position already available in
+Youta, captured when the colon editor opens or a command button is invoked.
+Submitting the command or waiting for a download does not update that position.
+Playing and paused media both supply a time. Stopped playback or an unavailable
+position prevents command execution. For LIVE playback, %t uses the available
+cursor relative to the rewind buffer, not broadcast start or the displayed
+elapsed clock. An unseekable LIVE stream or one without an available buffer
+cursor reports an error instead of supplying a zero time.
+A typed %t command needs no selection and works on any tab, including
+Statistics. For example,
+.B printf '%s' %t
+displays the captured cursor. Select the playing item before combining %t with
+a selected-item macro:
+.B ffmpeg \-ss %t \-i %d \-c copy /tmp/from-cursor.mkv
+copies its media from that cursor.
 .IP
 When
 .B %m
@@ -976,12 +994,16 @@ Buttons use the same macros as the colon editor: an unquoted
 .B %
 passes the selected original URL or full local path,
 .B %d
-passes downloaded/local media, and
+passes downloaded/local media,
 .B %i
-passes the largest available image/artwork, and
+passes the largest available image/artwork,
 .B %m
-passes the full Details description.
-All four pass one argument safely and never fall back to the playing item.
+passes the full Details description, and
+.B %t
+passes the current playback cursor captured when the button is invoked.
+All five pass one argument safely. The selected-item macros never fall back to
+the playing item; %t always uses current playback. Buttons still require an
+eligible selected item, including commands that use only %t.
 The download, editable-copy, and quoting rules above also apply.
 Suffixes such as
 .B %i.png
@@ -1082,7 +1104,8 @@ executed; rename to commands to enable it.
 .I cmd-log
 Plaintext terminal command history: the latest 100 submitted commands,
 one per line, up to 8192 bytes each. History stores the typed command and never
-the description expanded by %m. Requires the cmd feature. Delete while Youta is
+the description expanded by %m or the playback time expanded by %t.
+Requires the cmd feature. Delete while Youta is
 closed to clear it. Written with owner-only Unix permissions; included in
 configuration Git synchronization. Commands may contain passwords or tokens.
 Command text is excluded from diagnostics and bug-report screenshots.

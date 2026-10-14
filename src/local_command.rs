@@ -1,13 +1,14 @@
-//! Explicit Bash commands with optional selected media, image, and description data.
+//! Explicit Bash commands with optional media, image, description, and playback data.
 //!
-//! Only the user-authored template is shell source. A selected target travels
-//! as an OS-string positional argument, never as interpolated shell syntax.
+//! Only the user-authored template is shell source. Captured targets and playback
+//! timestamps travel as positional arguments, never as interpolated shell syntax.
 
 use std::ffi::OsString;
 use std::fmt;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
+use std::time::Duration;
 
 pub mod buttons;
 mod capture;
@@ -29,6 +30,8 @@ pub struct ShellCommandPlan {
     pub image_path: Option<PathBuf>,
     /// Selected description for `%m`, kept private and prepared only when requested.
     pub metadata: Option<Arc<CommandMetadata>>,
+    /// Playback cursor frozen at invocation for `%t`, independent of the selected target.
+    pub playback_position: Option<Duration>,
     /// Working directory captured when the user invokes the command.
     pub directory: PathBuf,
 }
@@ -104,6 +107,7 @@ impl LocalCommandPlan {
             downloaded_path: Some(self.path.clone()),
             image_path: None,
             metadata: None,
+            playback_position: None,
             argument: self.path.into_os_string(),
             directory: self.directory,
         }
@@ -124,6 +128,7 @@ impl ShellCommandPlan {
     pub fn command(&self) -> Result<Command, String> {
         let expanded = self.expanded_source()?;
         let metadata_path = self.metadata_argument()?;
+        let playback_position = self.playback_position_argument()?;
         let mut command = Command::new("bash");
         command
             .args([
@@ -131,7 +136,7 @@ impl ShellCommandPlan {
                 "--norc",
                 "-i",
                 "-c",
-                "\"$BASH\" --noprofile --norc -c \"$1\" youta \"$2\" \"$3\" \"$4\" \"$5\"; exit \"$?\"",
+                "\"$BASH\" --noprofile --norc -c \"$1\" youta \"$2\" \"$3\" \"$4\" \"$5\" \"$6\"; exit \"$?\"",
                 "youta",
             ])
             .arg(expanded)
@@ -147,6 +152,7 @@ impl ShellCommandPlan {
                     .unwrap_or(std::path::Path::new("")),
             )
 			.arg(metadata_path)
+			.arg(playback_position)
             .current_dir(&self.directory)
             .env("HISTFILE", "/dev/null")
             .env_remove("BASH_ENV")
@@ -163,6 +169,7 @@ impl ShellCommandPlan {
     pub fn noninteractive_command(&self) -> Result<Command, String> {
         let expanded = self.expanded_source()?;
         let metadata_path = self.metadata_argument()?;
+        let playback_position = self.playback_position_argument()?;
         let mut command = Command::new("bash");
         command
             .args(["--noprofile", "--norc", "-c"])
@@ -180,6 +187,7 @@ impl ShellCommandPlan {
                     .unwrap_or(std::path::Path::new("")),
             )
             .arg(metadata_path)
+            .arg(playback_position)
             .current_dir(&self.directory)
             .env("HISTFILE", "/dev/null")
             .env_remove("BASH_ENV")
@@ -189,6 +197,7 @@ impl ShellCommandPlan {
 
     /// Detects whether an unquoted `%`, `%d`, `%i`, or `%m` requires a selected target.
     ///
+    /// The playback-position marker `%t` is independent of the selected target.
     /// Quoted, escaped, commented, and embedded percent signs remain literal, so
     /// ordinary commands can run without selecting a media item.
     ///
@@ -222,6 +231,24 @@ impl ShellCommandPlan {
         expand_targets(&self.template).map(|expansion| expansion.requires_metadata)
     }
 
+    /// Detects an unquoted `%t` without requiring a selected media item.
+    ///
+    /// # Errors
+    /// Returns the same grammar validation errors as command construction.
+    pub fn requires_playback_position(&self) -> Result<bool, String> {
+        expand_targets(&self.template).map(|expansion| expansion.requires_playback_position)
+    }
+
+    /// Formats only requested cursor data as one argument, keeping it out of shell source.
+    fn playback_position_argument(&self) -> Result<String, String> {
+        if !self.requires_playback_position()? {
+            return Ok(String::new());
+        }
+        self.playback_position
+            .map(format_playback_position)
+            .ok_or_else(|| "The command requires a captured playback position for %t".to_owned())
+    }
+
     /// Prepares the private description file only when an executable plan requests `%m`.
     fn metadata_argument(&self) -> Result<PathBuf, String> {
         if !self.requires_metadata()? {
@@ -233,7 +260,7 @@ impl ShellCommandPlan {
             .path()
     }
 
-    /// Refuses unresolved media, image, and description macros, including direct API calls.
+    /// Refuses unresolved media, image, description, and playback macros, including direct calls.
     fn expanded_source(&self) -> Result<String, String> {
         let expansion = expand_targets(&self.template)?;
         if expansion.requires_download && self.downloaded_path.is_none() {
@@ -245,8 +272,23 @@ impl ShellCommandPlan {
         if expansion.requires_metadata && self.metadata.is_none() {
             return Err("The command requires selected description text for %m".to_owned());
         }
+        if expansion.requires_playback_position && self.playback_position.is_none() {
+            return Err("The command requires a captured playback position for %t".to_owned());
+        }
         Ok(expansion.source)
     }
+}
+
+/// Formats a captured cursor as `HH:MM:SS.mmm`, retaining hours beyond one day.
+///
+/// Integer Duration components avoid floating-point rounding and discard submillisecond data.
+fn format_playback_position(position: Duration) -> String {
+    let seconds = position.as_secs();
+    let hours = seconds / 3_600;
+    let minutes = (seconds % 3_600) / 60;
+    let seconds = seconds % 60;
+    let milliseconds = position.subsec_millis();
+    format!("{hours:02}:{minutes:02}:{seconds:02}.{milliseconds:03}")
 }
 
 /// Expands percent markers that start simple, unquoted shell arguments.
@@ -260,11 +302,12 @@ impl ShellCommandPlan {
 /// `%m` prints the captured description at a simple command start, or supplies
 /// one quoted argument after a command name. Its private file preserves long
 /// descriptions and trailing newlines without inserting provider text as code.
+/// `%t` supplies the captured playback position as one quoted argument, independently of selection.
 fn expand_selected_path(template: &str) -> Result<String, String> {
     expand_targets(template).map(|expansion| expansion.source)
 }
 
-/// Validated shell source and the selected-target requirements discovered by its lexer.
+/// Validated shell source and the captured-data requirements discovered by its lexer.
 struct TargetExpansion {
     /// Shell source with recognized target macros replaced by readonly variables.
     source: String,
@@ -276,6 +319,8 @@ struct TargetExpansion {
     requires_image: bool,
     /// Description text must have been captured from the selected Details pane.
     requires_metadata: bool,
+    /// Playback position must have been captured when the command was invoked.
+    requires_playback_position: bool,
 }
 
 /// Recognizes assignment prefixes that make a later `%m` command position ambiguous.
@@ -303,9 +348,11 @@ fn expand_targets(template: &str) -> Result<TargetExpansion, String> {
     let mut quote = Quote::None;
     let mut word_start = true;
     let mut expanded = false;
+    let mut selection = false;
     let mut download = false;
     let mut image = false;
     let mut metadata = false;
+    let mut playback_position = false;
     let mut command_start = true;
     let mut first_word = String::new();
     let mut first_word_finished = false;
@@ -372,10 +419,12 @@ fn expand_targets(template: &str) -> Result<TargetExpansion, String> {
                     characters.next();
                     result.push_str("\"${__youta_downloaded_path}\"");
                     download = true;
+                    selection = true;
                 } else if characters.peek() == Some(&'i') {
                     characters.next();
                     result.push_str("\"${__youta_image_path}\"");
                     image = true;
+                    selection = true;
                 } else if characters.peek() == Some(&'m') {
                     characters.next();
                     if ambiguous_metadata_position {
@@ -395,8 +444,14 @@ fn expand_targets(template: &str) -> Result<TargetExpansion, String> {
                         result.push_str("\"${__youta_metadata}\"");
                     }
                     metadata = true;
+                    selection = true;
+                } else if characters.peek() == Some(&'t') {
+                    characters.next();
+                    result.push_str("\"${__youta_playback_position}\"");
+                    playback_position = true;
                 } else {
                     result.push_str("\"${__youta_selected_path}\"");
+                    selection = true;
                 }
                 expanded = true;
                 word_start = false;
@@ -457,11 +512,12 @@ fn expand_targets(template: &str) -> Result<TargetExpansion, String> {
             requires_download: false,
             requires_image: false,
             requires_metadata: false,
+            requires_playback_position: false,
         });
     }
     if complex {
         return Err(
-			"The % path shortcuts support simple unquoted arguments only; for Bash substitutions, arithmetic, grouping, or backticks, use the selected path as quoted \"$1\", downloaded path as quoted \"$2\", or image path as quoted \"$3\" before changing positional parameters. The %m description shortcut also requires simple shell grammar"
+			"The % path shortcuts support simple unquoted arguments only; for Bash substitutions, arithmetic, grouping, or backticks, use the selected path as quoted \"$1\", downloaded path as quoted \"$2\", or image path as quoted \"$3\" before changing positional parameters. The %m description and %t playback-position shortcuts also require simple shell grammar"
                 .to_owned(),
         );
     }
@@ -485,20 +541,252 @@ fn expand_targets(template: &str) -> Result<TargetExpansion, String> {
     } else {
         ""
     };
+    let selection_prefix = if selection {
+        "readonly __youta_selected_path=\"$1\"; "
+    } else {
+        ""
+    };
+    let playback_position_prefix = if playback_position {
+        "readonly __youta_playback_position=\"$5\"; "
+    } else {
+        ""
+    };
     Ok(TargetExpansion {
         source: format!(
-            "readonly __youta_selected_path=\"$1\"; {download_prefix}{image_prefix}{metadata_prefix}{result}"
+            "{selection_prefix}{download_prefix}{image_prefix}{metadata_prefix}{playback_position_prefix}{result}"
         ),
-        requires_selection: expanded,
+        requires_selection: selection,
         requires_download: download,
         requires_image: image,
         requires_metadata: metadata,
+        requires_playback_position: playback_position,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The playback marker uses its own argument instead of appending `t` to the selection.
+    #[test]
+    fn playback_marker_uses_fifth_argument_instead_of_selected_path() {
+        let output = Command::new("bash")
+            .args(["--noprofile", "--norc", "-c"])
+            .arg(expand_targets("printf '%s' %t").unwrap().source)
+            .args(["youta", "/tmp/selected file", "", "", "", "01:02:03.456"])
+            .env_remove("BASH_ENV")
+            .env_remove("ENV")
+            .output()
+            .expect("Bash playback timestamp fixture");
+        assert!(output.status.success(), "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+        assert_eq!(output.stdout, b"01:02:03.456");
+    }
+
+    /// Builds private timestamp fixtures without requiring selection or media preparation.
+    fn playback_plan(template: &str, position: Option<Duration>) -> ShellCommandPlan {
+        ShellCommandPlan {
+            template: template.to_owned(),
+            argument: OsString::new(),
+            downloaded_path: None,
+            image_path: None,
+            metadata: None,
+            playback_position: position,
+            directory: std::env::temp_dir(),
+        }
+    }
+
+    /// Playback timestamps preserve integer precision, fixed widths, and hours beyond 24.
+    #[test]
+    fn playback_position_format_preserves_hours_and_floors_submilliseconds() {
+        for (position, expected) in [
+            (Duration::ZERO, "00:00:00.000"),
+            (Duration::from_millis(1), "00:00:00.001"),
+            (Duration::from_secs(3_600), "01:00:00.000"),
+            (Duration::new(3_723, 456_999_999), "01:02:03.456"),
+            (Duration::from_secs(90_061), "25:01:01.000"),
+            (Duration::from_nanos(999_999), "00:00:00.000"),
+            (Duration::from_nanos(1_999_999), "00:00:00.001"),
+            (Duration::MAX, "5124095576030431:00:15.999"),
+        ] {
+            assert_eq!(format_playback_position(position), expected);
+        }
+    }
+
+    /// A playback marker has an independent requirement and retains existing macro requirements.
+    #[test]
+    fn playback_requirements_are_independent_of_selected_target_requirements() {
+        for (template, selection, download, image, metadata) in [
+            ("%t", false, false, false, false),
+            ("printf '%s' %t %t.suffix", false, false, false, false),
+            ("printf '%s' %t %", true, false, false, false),
+            ("printf '%s' %t %d", true, true, false, false),
+            ("printf '%s' %t %i", true, false, true, false),
+            ("printf '%s' %t %m", true, false, false, true),
+        ] {
+            let plan = playback_plan(template, None);
+            assert!(plan.requires_playback_position().unwrap(), "{template}");
+            assert_eq!(plan.requires_selection().unwrap(), selection, "{template}");
+            assert_eq!(plan.requires_download().unwrap(), download, "{template}");
+            assert_eq!(plan.requires_image().unwrap(), image, "{template}");
+            assert_eq!(plan.requires_metadata().unwrap(), metadata, "{template}");
+        }
+        for template in ["printf '%s' %", "printf '%s' %d", "printf '%s' %i", "%m"] {
+            let plan = playback_plan(template, None);
+            assert!(!plan.requires_playback_position().unwrap(), "{template}");
+            assert!(plan.requires_selection().unwrap(), "{template}");
+        }
+    }
+
+    /// Quotes, escaped and embedded markers, and comments never request playback data.
+    #[test]
+    fn literal_playback_markers_do_not_request_a_position() {
+        for template in [
+            "printf '%t'",
+            "printf \"%t\"",
+            "printf '%s' $'%t'",
+            "printf '%s' \\%t",
+            "printf '%s' embedded%t",
+            "printf '%s' plain # %t is a comment",
+            "printf '%s' \"$(printf '%s' '%t')\"",
+        ] {
+            let plan = playback_plan(template, None);
+            assert!(!plan.requires_playback_position().unwrap(), "{template}");
+            assert!(!plan.requires_selection().unwrap(), "{template}");
+            assert_eq!(expand_targets(template).unwrap().source, template);
+            assert!(plan.command().is_ok(), "{template}");
+            assert!(plan.noninteractive_command().is_ok(), "{template}");
+        }
+    }
+
+    /// Unsupported nested grammar is rejected even when `%t` does not require selection.
+    #[test]
+    fn playback_markers_preserve_complex_shell_grammar_validation() {
+        for template in [
+            "printf '%s' $(echo %t)",
+            "printf '%s' $((5%2)) %t",
+            "(printf '%s' %t)",
+            "cat <<EOF %t",
+            "printf '%s' `echo plain` %t",
+        ] {
+            let plan = playback_plan(template, Some(Duration::ZERO));
+            let error = plan.requires_playback_position().unwrap_err();
+            assert!(
+                error.contains("support simple unquoted arguments only"),
+                "{template}"
+            );
+            assert_eq!(plan.requires_selection().unwrap_err(), error);
+            assert_eq!(plan.command().unwrap_err(), error);
+            assert_eq!(plan.noninteractive_command().unwrap_err(), error);
+        }
+    }
+
+    /// Both shell builders refuse missing cursor data before a command can execute.
+    #[test]
+    fn unresolved_playback_marker_rejects_both_command_builders() {
+        for template in [
+            "printf '%s' %t",
+            "set -- replacement; printf '%s' %t.suffix",
+        ] {
+            let plan = playback_plan(template, None);
+            for error in [
+                plan.command().unwrap_err(),
+                plan.noninteractive_command().unwrap_err(),
+            ] {
+                assert_eq!(
+                    error,
+                    "The command requires a captured playback position for %t"
+                );
+            }
+        }
+    }
+
+    /// Playback data stays one argument with suffixes, even after positional parameters change.
+    #[test]
+    fn playback_markers_preserve_suffixes_and_survive_set_without_a_selection() {
+        for prefix in ["", "set -- replacement; "] {
+            let plan = playback_plan(
+                &format!("{prefix}printf '%s\\0' %t %t.suffix"),
+                Some(Duration::new(3_723, 456_999_999)),
+            );
+            for mut command in metadata_test_commands(&plan) {
+                let output = command.output().expect("Bash playback suffix fixture");
+                assert!(output.status.success(), "{output:?}");
+                assert!(output.stderr.is_empty(), "{output:?}");
+                assert_eq!(
+                    output.stdout,
+                    concat!("01:02:03.456\0", "01:02:03.456.suffix\0").as_bytes()
+                );
+            }
+        }
+    }
+
+    /// The fifth argument preserves all older mappings and command-position metadata behavior.
+    #[test]
+    fn playback_argument_does_not_displace_existing_macro_arguments() {
+        let mut plan = metadata_plan(
+            "set -- replacement; printf '%s\\0' % %d %i %m %t; %m",
+            "selected description\n\n",
+        );
+        plan.downloaded_path = Some(PathBuf::from("/tmp/downloaded media.flac"));
+        plan.image_path = Some(PathBuf::from("/tmp/selected artwork.png"));
+        plan.playback_position = Some(Duration::new(3_723, 456_000_000));
+        let metadata_path = plan.metadata.as_ref().unwrap().path().unwrap();
+        let terminal = plan.command().unwrap();
+        assert!(
+            terminal
+                .get_args()
+                .nth(4)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("\"$6\"")
+        );
+        for command in [terminal, plan.noninteractive_command().unwrap()] {
+            let arguments = command.get_args().collect::<Vec<_>>();
+            let captured = &arguments[arguments.len() - 5..];
+            assert_eq!(captured[0], plan.argument.as_os_str());
+            assert_eq!(
+                captured[1],
+                plan.downloaded_path.as_ref().unwrap().as_os_str()
+            );
+            assert_eq!(captured[2], plan.image_path.as_ref().unwrap().as_os_str());
+            assert_eq!(captured[3], metadata_path.as_os_str());
+            assert_eq!(captured[4], std::ffi::OsStr::new("01:02:03.456"));
+        }
+        for mut command in metadata_test_commands(&plan) {
+            let output = command.output().expect("Bash combined playback fixture");
+            assert!(output.status.success(), "{output:?}");
+            assert!(output.stderr.is_empty(), "{output:?}");
+            assert_eq!(
+                output.stdout,
+                concat!(
+                    "https://example.test/original\0/tmp/downloaded media.flac\0",
+                    "/tmp/selected artwork.png\0selected description\n\n\0",
+                    "01:02:03.456\0selected description\n\n"
+                )
+                .as_bytes()
+            );
+        }
+        assert_eq!(format!("{plan:?}"), "ShellCommandPlan { .. }");
+    }
+
+    /// Unused captured time never appears in either shell's arguments.
+    #[test]
+    fn unused_playback_position_stays_out_of_shell_arguments() {
+        let plan = playback_plan("printf '%s' plain", Some(Duration::new(3_723, 456_000_000)));
+        for command in [
+            plan.command().unwrap(),
+            plan.noninteractive_command().unwrap(),
+        ] {
+            assert_eq!(command.get_args().last(), Some(std::ffi::OsStr::new("")));
+            assert!(
+                command
+                    .get_args()
+                    .all(|argument| !argument.to_string_lossy().contains("01:02:03.456"))
+            );
+        }
+    }
 
     /// The requested command-position macro saves the complete selected description.
     #[test]
@@ -534,6 +822,7 @@ mod tests {
             downloaded_path: None,
             image_path: None,
             metadata: Some(Arc::new(CommandMetadata::new(description))),
+            playback_position: None,
             directory: std::env::temp_dir(),
         }
     }
@@ -821,18 +1110,24 @@ mod tests {
         let terminal_arguments = terminal.get_args().collect::<Vec<_>>();
         let path = plan.metadata.as_ref().unwrap().path().unwrap();
         assert_eq!(
-            terminal_arguments[terminal_arguments.len() - 4],
+            terminal_arguments[terminal_arguments.len() - 5],
             plan.argument.as_os_str()
         );
-        assert_eq!(terminal_arguments.last(), Some(&path.as_os_str()));
+        assert_eq!(
+            terminal_arguments[terminal_arguments.len() - 2],
+            path.as_os_str()
+        );
         assert!(terminal_arguments[4].to_str().unwrap().contains("\"$5\""));
         let desktop = plan.noninteractive_command().unwrap();
         let desktop_arguments = desktop.get_args().collect::<Vec<_>>();
         assert_eq!(
-            desktop_arguments[desktop_arguments.len() - 4],
+            desktop_arguments[desktop_arguments.len() - 5],
             plan.argument.as_os_str()
         );
-        assert_eq!(desktop_arguments.last(), Some(&path.as_os_str()));
+        assert_eq!(
+            desktop_arguments[desktop_arguments.len() - 2],
+            path.as_os_str()
+        );
         for command in [terminal, desktop] {
             assert!(command.get_args().all(|argument| {
                 !argument
@@ -906,6 +1201,7 @@ mod tests {
                 downloaded_path: None,
                 image_path: None,
                 metadata: None,
+                playback_position: None,
                 directory: std::env::temp_dir(),
             };
             assert_eq!(plan.requires_selection().unwrap(), selection, "{template}");
@@ -933,6 +1229,7 @@ mod tests {
                 downloaded_path: None,
                 image_path: None,
                 metadata: None,
+                playback_position: None,
                 directory: std::env::temp_dir(),
             };
             let error = plan.requires_selection().unwrap_err();
@@ -1007,6 +1304,7 @@ mod tests {
                 downloaded_path: None,
                 image_path: None,
                 metadata: None,
+                playback_position: None,
                 directory: std::env::temp_dir(),
             };
             assert_eq!(expand_targets(template).unwrap().source, template);
@@ -1033,6 +1331,7 @@ mod tests {
                 downloaded_path: None,
                 image_path: None,
                 metadata: None,
+                playback_position: None,
                 directory: std::env::temp_dir(),
             };
             assert_eq!(expand_targets(template).unwrap().source, template);
@@ -1052,6 +1351,7 @@ mod tests {
                 downloaded_path: None,
                 image_path: None,
                 metadata: None,
+                playback_position: None,
                 directory: std::env::temp_dir(),
             };
             assert!(plan.requires_selection().unwrap());
@@ -1087,12 +1387,13 @@ mod tests {
                     downloaded_path: Some(PathBuf::from("/tmp/downloaded media.flac")),
                     image_path: Some(PathBuf::from(OsString::from_vec(image.clone()))),
                     metadata: None,
+                    playback_position: None,
                     directory: std::env::temp_dir(),
                 };
                 let terminal = plan.command().unwrap();
                 let arguments = terminal.get_args().collect::<Vec<_>>();
                 assert_eq!(
-                    arguments.get(arguments.len() - 2),
+                    arguments.get(arguments.len() - 3),
                     Some(&plan.image_path.as_ref().unwrap().as_os_str())
                 );
                 assert!(arguments[4].to_str().unwrap().contains("\"$4\""));
@@ -1149,6 +1450,7 @@ mod tests {
                 downloaded_path: None,
                 image_path: None,
                 metadata: None,
+                playback_position: None,
                 directory: std::env::temp_dir(),
             };
             assert!(plan.requires_download().unwrap(), "{template}");
@@ -1187,14 +1489,15 @@ mod tests {
 					downloaded_path: Some(PathBuf::from(OsString::from_vec(downloaded.clone()))),
 					image_path: None,
 					metadata: None,
+					playback_position: None,
 					directory: std::env::temp_dir(),
 				};
 				assert!(plan.requires_download().unwrap());
 				let terminal = plan.command().unwrap();
 				let arguments = terminal.get_args().collect::<Vec<_>>();
-				assert_eq!(arguments[arguments.len() - 4], plan.argument.as_os_str());
+				assert_eq!(arguments[arguments.len() - 5], plan.argument.as_os_str());
 				assert_eq!(
-					arguments[arguments.len() - 3],
+					arguments[arguments.len() - 4],
 					plan.downloaded_path.as_ref().unwrap().as_os_str()
 				);
 				let output = plan.noninteractive_command().unwrap().output().expect("Bash fixture");
@@ -1359,8 +1662,8 @@ mod tests {
         assert_eq!(command.get_program(), "bash");
         assert_eq!(command.get_current_dir(), Some(plan.directory.as_path()));
         let arguments = command.get_args().collect::<Vec<_>>();
+        assert_eq!(arguments[arguments.len() - 5], plan.path.as_os_str());
         assert_eq!(arguments[arguments.len() - 4], plan.path.as_os_str());
-        assert_eq!(arguments[arguments.len() - 3], plan.path.as_os_str());
         assert_eq!(arguments.last(), Some(&std::ffi::OsStr::new("")));
     }
 }

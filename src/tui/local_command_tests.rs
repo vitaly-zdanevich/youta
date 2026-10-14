@@ -71,7 +71,7 @@ fn expect_ui_key(input: &mut TerminalInput) {
     }
 }
 
-/// Exercises image/metadata macros, output, errors, interrupted exec, and stdin.
+/// Exercises captured image/metadata/time macros, errors, interrupted exec, and stdin.
 fn run_child(directory: PathBuf) {
     let path = directory.join("track' $(touch COMMAND_INJECTION) ;\n song.flac");
     std::fs::write(&path, b"command fixture").unwrap();
@@ -98,6 +98,13 @@ fn run_child(directory: PathBuf) {
             true,
         ),
         ("metadata", "%m > description-note", true),
+        (
+            "time",
+            "expected=\"$5\"; set -- %t; \
+			 [ \"$#\" -eq 1 ] && [ \"$1\" = \"$expected\" ] && [ \"$1\" = '01:02:03.456' ] || exit 35; \
+			 printf 'TIME_ONE_ARG_OK\\n'",
+            true,
+        ),
         ("exec", "exec printf 'COMMAND_EXEC_OK\\n'", true),
         ("nonzero", "printf 'COMMAND_NONZERO\\n'; exit 17", false),
         ("validation", "echo $(echo %)", false),
@@ -136,6 +143,7 @@ fn run_child(directory: PathBuf) {
         plan.image_path = (name == "image").then(|| image.clone());
         plan.metadata =
             (name == "metadata").then(|| Arc::new(CommandMetadata::new(METADATA_DESCRIPTION)));
+        plan.playback_position = (name == "time").then(|| Duration::from_millis(3_723_456));
         let result = local_command::execute_shell_command_plan(&mut session, &mut input, plan);
         assert_eq!(result.is_ok(), succeeds, "{name}: {result:?}");
         if name == "metadata" {

@@ -97,7 +97,7 @@ pub(super) fn render_command(
     if area.height > 1 {
         frame.render_widget(
             Paragraph::new(
-                "% URL/path %d media %i image %m text Enter run Esc cancel Tab comp Up/Dn hist ^R",
+                "% URL/path %d file %i img %m text %t time Enter run Esc cancel Tab Up/Dn hist ^R",
             )
             .style(theme.muted),
             Rect::new(area.x, area.y + 1, area.width, 1),
@@ -259,9 +259,9 @@ mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
 
-    /// The compact prompt explains all four selected-target macros at 80 columns.
+    /// The compact prompt explains selected targets and playback time at 80 columns.
     #[test]
-    fn command_hints_explain_selected_media_image_and_description_targets() {
+    fn command_hints_explain_selected_targets_and_current_playback_time() {
         let mut terminal = Terminal::new(TestBackend::new(80, 2)).unwrap();
         terminal
             .draw(|frame| {
@@ -277,12 +277,13 @@ mod tests {
             .map(|column| terminal.backend().buffer()[(column, 1)].symbol())
             .collect::<String>();
         assert!(hint.contains("% URL/path"));
-        assert!(hint.contains("%d media"));
-        assert!(hint.contains("%i image"));
+        assert!(hint.contains("%d file"));
+        assert!(hint.contains("%i img"));
         assert!(hint.contains("%m text"));
+        assert!(hint.contains("%t time"));
         assert!(hint.contains("Enter run"));
         assert!(hint.contains("Esc cancel"));
-        assert!(hint.contains("Tab comp"));
+        assert!(hint.contains("Tab"));
         assert!(hint.contains("Up/Dn hist"));
         assert!(hint.contains("^R"));
     }
