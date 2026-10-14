@@ -152,6 +152,7 @@ mod tests {
             template: template.to_owned(),
             argument: "/tmp/a file;$(not-shell-source)".into(),
             downloaded_path: None,
+            image_path: None,
             directory: directory.to_owned(),
         }
     }

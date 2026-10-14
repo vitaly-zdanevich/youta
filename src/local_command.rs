@@ -1,4 +1,4 @@
-//! Explicit Bash commands with an optional selected local path or provider URL.
+//! Explicit Bash commands with optional selected media and image paths.
 //!
 //! Only the user-authored template is shell source. A selected target travels
 //! as an OS-string positional argument, never as interpolated shell syntax.
@@ -21,6 +21,8 @@ pub struct ShellCommandPlan {
     pub argument: OsString,
     /// Completed media file for `%d`, absent until a requested download succeeds.
     pub downloaded_path: Option<PathBuf>,
+    /// Prepared image file for `%i`, absent until the captured artwork is available.
+    pub image_path: Option<PathBuf>,
     /// Working directory captured when the user invokes the command.
     pub directory: PathBuf,
 }
@@ -94,6 +96,7 @@ impl LocalCommandPlan {
         ShellCommandPlan {
             template: self.template,
             downloaded_path: Some(self.path.clone()),
+            image_path: None,
             argument: self.path.into_os_string(),
             directory: self.directory,
         }
@@ -118,13 +121,18 @@ impl ShellCommandPlan {
                 "--norc",
                 "-i",
                 "-c",
-                "\"$BASH\" --noprofile --norc -c \"$1\" youta \"$2\" \"$3\"; exit \"$?\"",
+                "\"$BASH\" --noprofile --norc -c \"$1\" youta \"$2\" \"$3\" \"$4\"; exit \"$?\"",
                 "youta",
             ])
             .arg(expanded)
             .arg(&self.argument)
             .arg(
                 self.downloaded_path
+                    .as_deref()
+                    .unwrap_or(std::path::Path::new("")),
+            )
+            .arg(
+                self.image_path
                     .as_deref()
                     .unwrap_or(std::path::Path::new("")),
             )
@@ -151,6 +159,11 @@ impl ShellCommandPlan {
                     .as_deref()
                     .unwrap_or(std::path::Path::new("")),
             )
+            .arg(
+                self.image_path
+                    .as_deref()
+                    .unwrap_or(std::path::Path::new("")),
+            )
             .current_dir(&self.directory)
             .env("HISTFILE", "/dev/null")
             .env_remove("BASH_ENV")
@@ -158,7 +171,7 @@ impl ShellCommandPlan {
         Ok(command)
     }
 
-    /// Detects whether an unquoted `%` or `%d` macro requires a selected target.
+    /// Detects whether an unquoted `%`, `%d`, or `%i` macro requires a selected target.
     ///
     /// Quoted, escaped, commented, and embedded percent signs remain literal, so
     /// ordinary commands can run without selecting a media item.
@@ -177,11 +190,22 @@ impl ShellCommandPlan {
         expand_targets(&self.template).map(|expansion| expansion.requires_download)
     }
 
-    /// Refuses to execute an unresolved download macro, even through direct API calls.
+    /// Detects an unquoted `%i` macro without treating printf formats as image requests.
+    ///
+    /// # Errors
+    /// Returns the same grammar validation errors as command construction.
+    pub fn requires_image(&self) -> Result<bool, String> {
+        expand_targets(&self.template).map(|expansion| expansion.requires_image)
+    }
+
+    /// Refuses unresolved downloaded-media and image macros, including direct API calls.
     fn expanded_source(&self) -> Result<String, String> {
         let expansion = expand_targets(&self.template)?;
         if expansion.requires_download && self.downloaded_path.is_none() {
             return Err("The command requires a completed download for %d".to_owned());
+        }
+        if expansion.requires_image && self.image_path.is_none() {
+            return Err("The command requires a prepared image for %i".to_owned());
         }
         Ok(expansion.source)
     }
@@ -203,13 +227,15 @@ fn expand_selected_path(template: &str) -> Result<String, String> {
 struct TargetExpansion {
     /// Shell source with recognized target macros replaced by readonly variables.
     source: String,
-    /// At least one original or downloaded target macro was recognized.
+    /// At least one original, downloaded, or image target macro was recognized.
     requires_selection: bool,
     /// A downloaded target macro needs a completed local file before execution.
     requires_download: bool,
+    /// An image target macro needs a prepared local artwork file before execution.
+    requires_image: bool,
 }
 
-/// Lexes the two supported argument-start macros while preserving literal percent signs.
+/// Lexes the three supported argument-start macros while preserving literal percent signs.
 fn expand_targets(template: &str) -> Result<TargetExpansion, String> {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Quote {
@@ -223,6 +249,7 @@ fn expand_targets(template: &str) -> Result<TargetExpansion, String> {
     let mut word_start = true;
     let mut expanded = false;
     let mut download = false;
+    let mut image = false;
     // Conservatively reject nested grammar whenever a macro was recognized.
     // Looking for these spellings even in quoted text intentionally favors a
     // clear limitation over pretending this small scanner is a Bash parser.
@@ -237,6 +264,10 @@ fn expand_targets(template: &str) -> Result<TargetExpansion, String> {
                     characters.next();
                     result.push_str("\"${__youta_downloaded_path}\"");
                     download = true;
+                } else if characters.peek() == Some(&'i') {
+                    characters.next();
+                    result.push_str("\"${__youta_image_path}\"");
+                    image = true;
                 } else {
                     result.push_str("\"${__youta_selected_path}\"");
                 }
@@ -296,11 +327,12 @@ fn expand_targets(template: &str) -> Result<TargetExpansion, String> {
             source: template.to_owned(),
             requires_selection: false,
             requires_download: false,
+            requires_image: false,
         });
     }
     if complex {
         return Err(
-            "The % path shortcut supports simple unquoted arguments only; for Bash substitutions, arithmetic, grouping, or backticks, use the selected path as quoted \"$1\" before changing positional parameters"
+			"The % path shortcuts support simple unquoted arguments only; for Bash substitutions, arithmetic, grouping, or backticks, use the selected path as quoted \"$1\", downloaded path as quoted \"$2\", or image path as quoted \"$3\" before changing positional parameters"
                 .to_owned(),
         );
     }
@@ -309,10 +341,18 @@ fn expand_targets(template: &str) -> Result<TargetExpansion, String> {
     } else {
         ""
     };
+    let image_prefix = if image {
+        "readonly __youta_image_path=\"$3\"; "
+    } else {
+        ""
+    };
     Ok(TargetExpansion {
-        source: format!("readonly __youta_selected_path=\"$1\"; {download_prefix}{result}"),
+        source: format!(
+            "readonly __youta_selected_path=\"$1\"; {download_prefix}{image_prefix}{result}"
+        ),
         requires_selection: expanded,
         requires_download: download,
+        requires_image: image,
     })
 }
 
@@ -320,38 +360,72 @@ fn expand_targets(template: &str) -> Result<TargetExpansion, String> {
 mod tests {
     use super::*;
 
+    /// Image macros use a separate positional argument and retain literal suffixes.
+    #[test]
+    fn image_markers_expand_independently_from_media_target_markers() {
+        let expansion = expand_targets("printf '%s' % %d %i %i.png").unwrap();
+        assert!(expansion.requires_selection);
+        assert!(expansion.requires_download);
+        assert!(expansion.requires_image);
+        assert_eq!(
+            expansion.source,
+            concat!(
+                "readonly __youta_selected_path=\"$1\"; ",
+                "readonly __youta_downloaded_path=\"$2\"; ",
+                "readonly __youta_image_path=\"$3\"; ",
+                "printf '%s' \"${__youta_selected_path}\" \"${__youta_downloaded_path}\" ",
+                "\"${__youta_image_path}\" \"${__youta_image_path}\".png"
+            )
+        );
+    }
+
     /// Only unquoted macros at argument starts require a captured media selection.
     #[test]
     fn selection_is_required_only_for_unquoted_argument_start_macros() {
-        for (template, selection, download) in [
-            ("pwd", false, false),
-            ("printf '%s' '%'", false, false),
-            ("printf '%s' \"%\"", false, false),
-            ("printf '%s' $'%'", false, false),
-            ("printf '%s' \\%", false, false),
-            ("printf '%s' 100%", false, false),
-            ("printf '%d' 7", false, false),
-            ("printf '%s' \"%d\"", false, false),
-            ("printf '%s' $'%d'", false, false),
-            ("printf '%s' \\%d", false, false),
-            ("printf '%s' embedded%d", false, false),
-            ("printf '%s' plain # % %d are comments", false, false),
-            ("printf '%s' $((5%2))", false, false),
-            ("printf '%s' ${name%pattern}", false, false),
-            ("printf '%s' %", true, false),
-            ("printf '%s' %.flac", true, false),
-            ("printf '%s' %d", true, true),
-            ("printf '%s' %d.flac", true, true),
-            ("printf '%s' % %d", true, true),
+        for (template, selection, download, image) in [
+            ("pwd", false, false, false),
+            ("printf '%s' '%'", false, false, false),
+            ("printf '%s' \"%\"", false, false, false),
+            ("printf '%s' $'%'", false, false, false),
+            ("printf '%s' \\%", false, false, false),
+            ("printf '%s' 100%", false, false, false),
+            ("printf '%d' 7", false, false, false),
+            ("printf '%s' \"%d\"", false, false, false),
+            ("printf '%s' $'%d'", false, false, false),
+            ("printf '%s' \\%d", false, false, false),
+            ("printf '%s' embedded%d", false, false, false),
+            ("printf '%i' 7", false, false, false),
+            ("printf '%s' \"%i\"", false, false, false),
+            ("printf '%s' $'%i'", false, false, false),
+            ("printf '%s' \\%i", false, false, false),
+            ("printf '%s' embedded%i", false, false, false),
+            (
+                "printf '%s' plain # % %d %i are comments",
+                false,
+                false,
+                false,
+            ),
+            ("printf '%s' $((5%2))", false, false, false),
+            ("printf '%s' ${name%pattern}", false, false, false),
+            ("printf '%s' %", true, false, false),
+            ("printf '%s' %.flac", true, false, false),
+            ("printf '%s' %d", true, true, false),
+            ("printf '%s' %d.flac", true, true, false),
+            ("printf '%s' % %d", true, true, false),
+            ("printf '%s' %i", true, false, true),
+            ("printf '%s' %i.png", true, false, true),
+            ("printf '%s' % %d %i", true, true, true),
         ] {
             let plan = ShellCommandPlan {
                 template: template.to_owned(),
                 argument: OsString::new(),
                 downloaded_path: None,
+                image_path: None,
                 directory: std::env::temp_dir(),
             };
             assert_eq!(plan.requires_selection().unwrap(), selection, "{template}");
             assert_eq!(plan.requires_download().unwrap(), download, "{template}");
+            assert_eq!(plan.requires_image().unwrap(), image, "{template}");
         }
     }
 
@@ -363,15 +437,21 @@ mod tests {
             "printf '%s' $((5%2)) %d",
             "(printf '%s' %)",
             "cat <<EOF %d",
+            "printf '%s' $(echo %i) %i",
+            "printf '%s' $((5%2)) %i",
+            "(printf '%s' %i)",
+            "cat <<EOF %i",
         ] {
             let plan = ShellCommandPlan {
                 template: template.to_owned(),
                 argument: OsString::new(),
                 downloaded_path: None,
+                image_path: None,
                 directory: std::env::temp_dir(),
             };
             let error = plan.requires_selection().unwrap_err();
             assert_eq!(plan.requires_download().unwrap_err(), error);
+            assert_eq!(plan.requires_image().unwrap_err(), error);
             assert_eq!(plan.command().unwrap_err(), error);
             assert_eq!(plan.noninteractive_command().unwrap_err(), error);
         }
@@ -439,12 +519,117 @@ mod tests {
                 template: template.to_owned(),
                 argument: "https://example.test/original".into(),
                 downloaded_path: None,
+                image_path: None,
                 directory: std::env::temp_dir(),
             };
             assert_eq!(expand_targets(template).unwrap().source, template);
             assert!(!plan.requires_download().unwrap(), "{template}");
             assert!(plan.command().is_ok(), "{template}");
             assert!(plan.noninteractive_command().is_ok(), "{template}");
+        }
+    }
+
+    /// Image detection preserves formats, quoting, escaping, comments, and embedded markers.
+    #[test]
+    fn literal_image_markers_do_not_request_an_image() {
+        for template in [
+            "printf '%i' 7",
+            "printf \"%i\" 7",
+            "printf '%s' $'%i'",
+            "printf '%s' \\%i",
+            "printf '%s' embedded%i",
+            "printf '%s' plain # %i is a comment",
+        ] {
+            let plan = ShellCommandPlan {
+                template: template.to_owned(),
+                argument: OsString::new(),
+                downloaded_path: None,
+                image_path: None,
+                directory: std::env::temp_dir(),
+            };
+            assert_eq!(expand_targets(template).unwrap().source, template);
+            assert!(!plan.requires_image().unwrap(), "{template}");
+            assert!(plan.command().is_ok(), "{template}");
+            assert!(plan.noninteractive_command().is_ok(), "{template}");
+        }
+    }
+
+    /// Direct callers cannot run an image macro until its captured artwork is prepared.
+    #[test]
+    fn unresolved_image_marker_rejects_both_command_builders() {
+        for template in ["printf '%s' %i", "printf '%s' % %i.png"] {
+            let mut plan = ShellCommandPlan {
+                template: template.to_owned(),
+                argument: "https://example.test/private-original".into(),
+                downloaded_path: None,
+                image_path: None,
+                directory: std::env::temp_dir(),
+            };
+            assert!(plan.requires_selection().unwrap());
+            assert!(plan.requires_image().unwrap());
+            assert!(!plan.requires_download().unwrap());
+            for error in [
+                plan.command().unwrap_err(),
+                plan.noninteractive_command().unwrap_err(),
+            ] {
+                assert!(error.contains("prepared image for %i"));
+                assert!(!error.contains("private-original"));
+            }
+            plan.image_path = Some(std::env::temp_dir().join("captured artwork.png"));
+            assert!(plan.command().is_ok());
+            assert!(plan.noninteractive_command().is_ok());
+        }
+    }
+
+    /// Image bytes remain opaque through both wrappers, including after `set --`.
+    #[cfg(unix)]
+    #[test]
+    fn image_markers_preserve_hostile_bytes_suffixes_and_argument_boundaries() {
+        use std::os::unix::ffi::OsStringExt;
+        for image in [
+            b"/tmp/with spaces/artwork.png".to_vec(),
+            b"/tmp/'\";$(printf INJECTED >&2)`printf INJECTED >&2`\\\n%*.png".to_vec(),
+            b"/tmp/non-utf8-\xff\xfe artwork.png".to_vec(),
+        ] {
+            for prefix in ["", "set -- replacement; "] {
+                let plan = ShellCommandPlan {
+                    template: format!("{prefix}printf '%s\\0' % %d %i %i.png"),
+                    argument: "https://example.test/original path".into(),
+                    downloaded_path: Some(PathBuf::from("/tmp/downloaded media.flac")),
+                    image_path: Some(PathBuf::from(OsString::from_vec(image.clone()))),
+                    directory: std::env::temp_dir(),
+                };
+                let terminal = plan.command().unwrap();
+                let arguments = terminal.get_args().collect::<Vec<_>>();
+                assert_eq!(
+                    arguments.last(),
+                    Some(&plan.image_path.as_ref().unwrap().as_os_str())
+                );
+                assert!(arguments[4].to_str().unwrap().contains("\"$4\""));
+                // Omit interactive job control for the fixture while retaining the outer argv mapping.
+                let mut outer = Command::new("bash");
+                outer
+                    .args(arguments.into_iter().filter(|argument| *argument != "-i"))
+                    .env_remove("BASH_ENV")
+                    .env_remove("ENV");
+                for mut command in [outer, plan.noninteractive_command().unwrap()] {
+                    let output = command.output().expect("Bash fixture");
+                    assert!(output.status.success());
+                    assert!(output.stderr.is_empty());
+                    assert_eq!(
+                        output.stdout,
+                        [
+                            b"https://example.test/original path\0/tmp/downloaded media.flac\0"
+                                .to_vec(),
+                            image.clone(),
+                            vec![0],
+                            image.clone(),
+                            b".png\0".to_vec(),
+                        ]
+                        .concat()
+                    );
+                }
+            }
         }
     }
 
@@ -472,6 +657,7 @@ mod tests {
                 template: template.to_owned(),
                 argument: "https://example.test/private-original".into(),
                 downloaded_path: None,
+                image_path: None,
                 directory: std::env::temp_dir(),
             };
             assert!(plan.requires_download().unwrap(), "{template}");
@@ -508,14 +694,15 @@ mod tests {
 					template: format!("{prefix}printf '%s\\0' % %d %.flac %d.flac"),
 					argument: OsString::from_vec(original.clone()),
 					downloaded_path: Some(PathBuf::from(OsString::from_vec(downloaded.clone()))),
+					image_path: None,
 					directory: std::env::temp_dir(),
 				};
 				assert!(plan.requires_download().unwrap());
 				let terminal = plan.command().unwrap();
 				let arguments = terminal.get_args().collect::<Vec<_>>();
-				assert_eq!(arguments[arguments.len() - 2], plan.argument.as_os_str());
+				assert_eq!(arguments[arguments.len() - 3], plan.argument.as_os_str());
 				assert_eq!(
-					arguments[arguments.len() - 1],
+					arguments[arguments.len() - 2],
 					plan.downloaded_path.as_ref().unwrap().as_os_str()
 				);
 				let output = plan.noninteractive_command().unwrap().output().expect("Bash fixture");
@@ -549,6 +736,7 @@ mod tests {
         .into_shell_plan();
         assert_eq!(plan.argument.as_os_str(), path.as_os_str());
         assert_eq!(plan.downloaded_path.as_ref(), Some(&path));
+        assert!(plan.image_path.is_none());
         assert_eq!(plan.directory, directory);
         assert!(plan.requires_download().unwrap());
         let output = plan
@@ -672,9 +860,15 @@ mod tests {
             directory: PathBuf::from("/private"),
         };
         assert_eq!(format!("{plan:?}"), "LocalCommandPlan { .. }");
+        let mut shell_plan = plan.clone().into_shell_plan();
+        shell_plan.image_path = Some(PathBuf::from("/private/artwork.png"));
+        assert_eq!(format!("{shell_plan:?}"), "ShellCommandPlan { .. }");
         let command = plan.command().unwrap();
         assert_eq!(command.get_program(), "bash");
         assert_eq!(command.get_current_dir(), Some(plan.directory.as_path()));
-        assert_eq!(command.get_args().last(), Some(plan.path.as_os_str()));
+        let arguments = command.get_args().collect::<Vec<_>>();
+        assert_eq!(arguments[arguments.len() - 3], plan.path.as_os_str());
+        assert_eq!(arguments[arguments.len() - 2], plan.path.as_os_str());
+        assert_eq!(arguments.last(), Some(&std::ffi::OsStr::new("")));
     }
 }

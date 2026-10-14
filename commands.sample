@@ -12,9 +12,16 @@
 # an existing download, or uses the normal download/format chooser and waits
 # for the download to finish before running the command. Failed or cancelled
 # downloads do not run commands. For Local selections, % and %d both pass the
-# full selected filesystem path. %.flac or %d.flac appends a suffix.
+# full selected filesystem path. %i passes the largest available selected
+# image/artwork, fetched only when requested and reusing completed downloads.
+# Remote/embedded artwork uses an editable copy to protect Youta's cache;
+# local images and sidecar covers use their original paths. This works when the
+# terminal cannot display images. No available image means no command runs.
+# All three macros use the selected item, never the playing item.
+# %.flac, %d.flac, and %i.png append a suffix.
 # Quoted/escaped percent signs remain literal, so printf '%s\n' % keeps its
 # format. For complex Bash grammar, use the quoted "$1" argument instead of %.
+# When %d/%i requests a prepared path, it is also supplied as "$2"/"$3".
 # Selected targets are never interpolated as shell source.
 # No command runs until you click its button or press its configured hotkey.
 #
@@ -34,3 +41,8 @@ provider = 'local'
 hotkey = 'Ctrl+Alt+F'
 font_color = '#fff'
 background_color = '#245'
+
+[[commands]]
+name = 'Edit image'
+description = 'Open the selected image or artwork in GIMP.'
+command = 'gimp %i'

@@ -594,11 +594,24 @@ path. Use
 for its downloaded or local path: reuse a completed download, or open the normal
 download/format chooser and wait for completion before executing.
 Failed or cancelled downloads never execute the command. For local entries,
-both macros supply the same full path. Macros require a selected item and never
-fall back to the playing item. Suffixes such as
-.B %.mp3
+these two macros supply the same full path.
+.B %i
+supplies the selected item's largest available image or artwork, fetched only
+when the command requests it and reusing completed image downloads.
+Remote or embedded artwork uses an editable copy to protect Youta's cache;
+local images and sidecar covers use their original paths. This works even when the
+terminal does not display images. Unavailable images prevent command execution.
+For example,
+.B gimp %i
+opens the selected image for editing.
+All three macros require a selected item and never fall back to the playing item.
+Online images require the remote-artwork build feature; local media covers
+require local-artwork. Selected local image files need neither artwork feature.
+Suffixes such as
+.BR %.mp3 ,
+.BR %d.flac ,
 and
-.B %d.flac
+.B %i.png
 append to the corresponding target. Quoted and escaped percent signs remain
 literal.
 For substitutions, arithmetic, grouping, and other complex Bash syntax, use
@@ -606,6 +619,11 @@ For substitutions, arithmetic, grouping, and other complex Bash syntax, use
 instead of the percent shortcut: the selected original URL or local path is
 Bash's first positional parameter. Changing positional parameters changes $1
 but not the percent shortcut.
+When %d or %i requests a prepared path, it is also supplied as
+.B \(dq$2\(dq
+or
+.BR \(dq$3\(dq ,
+respectively.
 .IP
 While entering a command,
 .B Tab
@@ -932,19 +950,21 @@ and
 .B background_color
 accept #rgb or #rrggbb values.
 .PP
-An unquoted
+Buttons use the same macros as the colon editor: an unquoted
 .B %
-passes the original selected provider URL or full local path as one argument,
-using the same selection rules as the colon editor. Neither macro falls back
-to the playing item.
+passes the selected original URL or full local path,
 .B %d
-passes a downloaded file path: reuse a completed download, or use the normal
-download/format chooser and wait for completion before executing.
-Failed or cancelled downloads never execute the command.
-For Local items both macros pass the same full filesystem path.
+passes downloaded/local media, and
+.B %i
+passes the largest available image/artwork.
+All three pass one argument safely and never fall back to the playing item.
+The download, editable-copy, and quoting rules above also apply.
 Suffixes such as
-.B %d.flac
+.B %i.png
 are supported; quoted or escaped percent signs remain literal.
+For example,
+.B gimp %i
+opens the selected image for editing.
 Buttons are unavailable inside read-only archive folders.
 .PP
 Optional

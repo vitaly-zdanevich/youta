@@ -66,6 +66,8 @@ fn expect_ui_key(input: &mut TerminalInput) {
 fn run_child(directory: PathBuf) {
     let path = directory.join("track' $(touch COMMAND_INJECTION) ;\n song.flac");
     std::fs::write(&path, b"command fixture").unwrap();
+    let image = directory.join("cover' $(touch COMMAND_INJECTION) ; image.png");
+    std::fs::write(&image, b"\x89PNG\r\n\x1a\nimage fixture").unwrap();
 
     let mut session = TerminalSession::enter().unwrap();
     let mut input = TerminalInput::new().unwrap();
@@ -77,6 +79,13 @@ fn run_child(directory: PathBuf) {
              [ \"$PWD\" = \"$YOUTA_LOCAL_COMMAND_TEST_DIRECTORY\" ] || exit 32; \
              printf 'PATH_ONE_ARG_OK\\n'; \
              printf '%s\\n' COMMAND_STDOUT; printf '%s\\n' COMMAND_STDERR >&2",
+            true,
+        ),
+        (
+            "image",
+            "expected=\"$3\"; set -- %i; \
+             [ \"$#\" -eq 1 ] && [ \"$1\" = \"$expected\" ] && [ -f \"$1\" ] || exit 34; \
+             printf 'IMAGE_ONE_ARG_OK\\n'",
             true,
         ),
         ("exec", "exec printf 'COMMAND_EXEC_OK\\n'", true),
@@ -104,19 +113,18 @@ fn run_child(directory: PathBuf) {
             let _ = input.read().unwrap();
         }
         marker(&format!("COMMAND_BEGIN_{name}"));
-        let result = execute_local_command_plan(
-            &mut session,
-            &mut input,
-            LocalCommandPlan {
-                template: template.to_owned(),
-                path: path.clone(),
-                directory: if name == "missing_directory" {
-                    directory.join("missing-command-working-directory")
-                } else {
-                    directory.clone()
-                },
+        let mut plan = LocalCommandPlan {
+            template: template.to_owned(),
+            path: path.clone(),
+            directory: if name == "missing_directory" {
+                directory.join("missing-command-working-directory")
+            } else {
+                directory.clone()
             },
-        );
+        }
+        .into_shell_plan();
+        plan.image_path = (name == "image").then(|| image.clone());
+        let result = local_command::execute_shell_command_plan(&mut session, &mut input, plan);
         assert_eq!(result.is_ok(), succeeds, "{name}: {result:?}");
         marker(&format!("COMMAND_RETURNED_{name}"));
         expect_ui_key(&mut input);

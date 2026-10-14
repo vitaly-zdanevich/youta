@@ -489,7 +489,7 @@ fn tui_colon_opens_command_prompt_on_idle_youtube_without_selection() {
     let input = child.stdin.as_mut().expect("pseudo-terminal input");
     input.write_all(b":").expect("open global command prompt");
     input.flush().expect("flush command shortcut");
-    wait_for_text_file(&transcript, "% selected URL/path", "terminal transcript");
+    wait_for_text_file(&transcript, "% URL/path", "terminal transcript");
     input.write_all(b"\x1b").expect("cancel command prompt");
     input.flush().expect("flush command cancellation");
     // A standalone-Escape gap prevents the terminal from decoding quit as Alt+q.

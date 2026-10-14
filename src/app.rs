@@ -37818,6 +37818,8 @@ impl UiController for AppController {
         );
         self.drain_github_issue_submission_results();
         self.poll_bug_report_submission();
+        #[cfg(feature = "cmd")]
+        self.poll_custom_command_image();
         if self.diagnostic_only {
             return;
         }

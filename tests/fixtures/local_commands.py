@@ -112,7 +112,7 @@ def main():
 				drain(0.02)
 			raise AssertionError(f'Foreground exec sleep did not start: {transcript[-12000:]!r}')
 
-		for index, name in enumerate(('normal', 'exec', 'nonzero', 'validation', 'missing_directory', 'interrupt', 'read')):
+		for index, name in enumerate(('normal', 'image', 'exec', 'nonzero', 'validation', 'missing_directory', 'interrupt', 'read')):
 			wait_for(f'COMMAND_BEGIN_{name}'.encode())
 			if name == 'interrupt':
 				wait_for(b'COMMAND_INTERRUPT_READY')
@@ -127,10 +127,12 @@ def main():
 					assert marker in output, (marker, output)
 			elif name == 'exec':
 				assert b'COMMAND_EXEC_OK' in output, output
+			elif name == 'image':
+				assert b'IMAGE_ONE_ARG_OK' in output, output
 			elif name == 'read':
 				assert b'COMMAND_INPUT_OK' in output, output
 			elif name == 'validation':
-				assert b'supports simple unquoted arguments only' in output, output
+				assert b'support simple unquoted arguments only' in output, output
 			elif name == 'missing_directory':
 				assert b'cannot run Bash' in output, output
 				assert b'UNEXPECTED_SPAWN' not in output, output

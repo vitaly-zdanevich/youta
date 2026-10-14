@@ -944,6 +944,7 @@ mod tests {
             template: "printf 'worker fixture'; printf 'failure fixture' >&2; exit 3".to_owned(),
             argument: "https://example.org/selected-item".into(),
             downloaded_path: None,
+            image_path: None,
             directory: temporary.path().to_owned(),
         };
         super::spawn_custom_command(plan, Arc::new(sender)).unwrap();
@@ -958,6 +959,37 @@ mod tests {
         assert!(output.output.contains("worker fixture"));
         assert!(output.output.contains("failure fixture"));
         assert!(!format!("{output:?}").contains("fixture"));
+        assert!(inbox.try_recv().is_err());
+    }
+
+    /// The GUI worker passes prepared image filenames as opaque arguments rather than URL text.
+    #[cfg(all(feature = "cmd", unix))]
+    #[test]
+    fn custom_command_worker_returns_the_prepared_image_path_without_injection() {
+        let temporary = tempfile::tempdir().unwrap();
+        let image_path = temporary
+            .path()
+            .join("artwork '\";$(printf INJECTED >&2)`printf INJECTED >&2` with spaces.png");
+        std::fs::write(&image_path, b"\x89PNG\r\n\x1a\nimage fixture").unwrap();
+        let expected = format!("{}\n", image_path.to_str().unwrap());
+        let (sender, inbox) = channel();
+        let plan = youta::local_command::ShellCommandPlan {
+            template: "printf '%s\\n' %i".to_owned(),
+            argument: "https://example.org/selected-item".into(),
+            downloaded_path: None,
+            image_path: Some(image_path),
+            directory: temporary.path().to_owned(),
+        };
+        super::spawn_custom_command(plan, Arc::new(sender)).unwrap();
+        let Message::CustomCommandFinished(result) = inbox
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+        else {
+            panic!("expected image command completion");
+        };
+        let output = result.unwrap();
+        assert!(output.success);
+        assert_eq!(output.output, expected);
         assert!(inbox.try_recv().is_err());
     }
 

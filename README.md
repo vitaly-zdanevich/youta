@@ -241,19 +241,31 @@ supplies the full parent-directory path. `%d` supplies the selected downloaded
 or local path: Youta reuses a completed download, or opens the normal
 download/format chooser and waits for the download before running the command.
 Failed or cancelled downloads never run it. For local entries, `%` and `%d`
-both supply the same full path. These macros require a selected item and never
-fall back to the playing item. For example:
+both supply the same full path. `%i` supplies the selected item's largest
+available image or artwork, fetching it only when the command requests `%i`
+and reusing a completed image download. Remote or embedded artwork is passed
+as an editable copy that protects Youta's cache; local images and sidecar covers
+use their original paths. This works even when the terminal does not display images.
+Unavailable images prevent the command from running. All three macros require
+a selected item and never fall back to the playing item. For example:
 
 ```sh
 ffmpeg -i %d -c:a libmp3lame /tmp/output.mp3
+gimp %i
 ```
 
-Suffixes such as `%.mp3` and `%d.flac` append to the corresponding target.
+Online images require the `remote-artwork` build feature (included by default
+through `images`); local media covers require `local-artwork`. Selected local
+image files need neither artwork feature.
+
+Suffixes such as `%.mp3`, `%d.flac`, and `%i.png` append to the corresponding target.
 Quoted or escaped percent signs remain literal, so `printf '%s\n' %` works.
 For complex Bash syntax such as substitutions, arithmetic, or grouping, use
 `"$1"` instead of `%`; the selected original URL or local path is supplied as
 Bash's first positional parameter. Changing positional parameters with
 `set --` changes `$1`, but not the `%` shortcut.
+When `%d` or `%i` requests a prepared path, it is also supplied as `"$2"` or
+`"$3"`, respectively.
 Commands run with your permissions and can modify or delete files; they are
 not sandboxed or limited to the selected entry. Bash startup files are not
 loaded.
@@ -291,15 +303,12 @@ Optional `provider` restricts the button to the selected item's actual source
 it makes the button available for every eligible provider. Optional
 `font_color` and `background_color` accept `#rgb` or `#rrggbb` values.
 
-An unquoted `%` supplies the selected item's original URL, or its full path
-for local items, using the same selection rules as the `:` editor. Neither
-macro falls back to the playing item. `%d` supplies its downloaded file path:
-Youta reuses an existing completed download, or opens the normal download/format
-chooser and waits for the download before running the command. Failed or cancelled
-downloads never run the command. For Local items, `%` and `%d` both supply the
-same full path. Both macros pass one argument safely and support suffixes,
-such as `%d.flac`; the quoting rules above still apply. Commands are unavailable
-inside read-only archive folders.
+Buttons use the same `%`, `%d`, and `%i` macros as the `:` editor: the selected
+original URL or local path, downloaded/local media, and largest available
+image/artwork. They pass one argument safely, support suffixes such as `%i.png`,
+and never fall back to the playing item. The download, editable-copy, and
+quoting rules above also apply. For example, `gimp %i` opens the selected
+image for editing. Commands are unavailable inside read-only archive folders.
 
 Optional `hotkey` accepts a character, named key, or `F1`-`F24`, with
 `Ctrl+`, `Alt+`, or `Shift+` modifiers. It overrides built-in shortcuts only in

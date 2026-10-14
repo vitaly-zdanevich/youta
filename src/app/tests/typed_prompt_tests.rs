@@ -66,6 +66,36 @@ fn typed_prompt_captures_selected_url_before_typing_and_ignores_playback() {
     assert!(controller.view.local_command.is_some());
 }
 
+/// Image commands freeze artwork before typing, independently of playback and later metadata.
+#[cfg(feature = "remote-artwork")]
+#[test]
+fn typed_prompt_image_uses_the_artwork_captured_before_typing() {
+    let (mut controller, _directory) = fixture();
+    let selected = url::Url::parse("https://i.ytimg.com/vi/selected/full.jpg").unwrap();
+    let bytes = b"\x89PNG\r\n\x1a\nselected image, not playing or later selection";
+    super::custom_command_tests::cache_command_image(&controller, &selected, bytes);
+    controller
+        .view
+        .details
+        .as_mut()
+        .unwrap()
+        .expanded_thumbnail_url = Some(selected);
+    controller.dispatch(UiAction::BeginLocalCommand);
+    select_other_item(&mut controller);
+    controller
+        .view
+        .details
+        .as_mut()
+        .unwrap()
+        .expanded_thumbnail_url = Some(url::Url::parse("https://example.org/other.jpg").unwrap());
+    type_text(&mut controller, "echo %i");
+    controller.dispatch(UiAction::SubmitLocalCommand);
+    assert!(controller.view.local_command.is_none());
+    let plan = super::custom_command_tests::wait_for_image_command(&mut controller);
+    assert_eq!(std::fs::read(plan.image_path.unwrap()).unwrap(), bytes);
+    assert_eq!(plan.argument, "https://www.youtube.com/watch?v=dQw4w9WgXcQ");
+}
+
 /// A typed download command retains its captured URL through choice, transfer, and a modal.
 #[test]
 fn typed_prompt_download_uses_captured_source_and_waits_until_modal_closes() {

@@ -97,7 +97,7 @@ pub(super) fn render_command(
     if area.height > 1 {
         frame.render_widget(
             Paragraph::new(
-                "% selected URL/path  %d downloaded/local  Enter run  Esc cancel  Tab complete  Up/Down history  Ctrl+R search",
+                "% URL/path %d media %i image Enter run Esc cancel Tab comp Up/Down hist ^R find",
             )
             .style(theme.muted),
             Rect::new(area.x, area.y + 1, area.width, 1),
@@ -259,9 +259,9 @@ mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
 
-    /// The compact prompt explains both selected-target macros on remote tabs too.
+    /// The compact prompt explains all three selected-target macros at 80 columns.
     #[test]
-    fn command_hints_explain_selected_and_downloaded_targets() {
+    fn command_hints_explain_selected_media_and_image_targets() {
         let mut terminal = Terminal::new(TestBackend::new(80, 2)).unwrap();
         terminal
             .draw(|frame| {
@@ -276,9 +276,14 @@ mod tests {
         let hint = (0..80)
             .map(|column| terminal.backend().buffer()[(column, 1)].symbol())
             .collect::<String>();
-        assert!(hint.contains("% selected URL/path"));
-        assert!(hint.contains("%d downloaded/local"));
+        assert!(hint.contains("% URL/path"));
+        assert!(hint.contains("%d media"));
+        assert!(hint.contains("%i image"));
         assert!(hint.contains("Enter run"));
+        assert!(hint.contains("Esc cancel"));
+        assert!(hint.contains("Tab comp"));
+        assert!(hint.contains("Up/Down hist"));
+        assert!(hint.contains("^R find"));
     }
 
     /// Global command help remains in shared actions instead of the Local row.

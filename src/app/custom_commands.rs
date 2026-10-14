@@ -1,5 +1,7 @@
 //! Provider-filtered, explicit shell buttons and download-bound command continuations.
 
+mod image;
+
 use super::*;
 use crate::download_queue::DownloadQueueState;
 use crate::local_command::{
@@ -7,6 +9,7 @@ use crate::local_command::{
     buttons::{self, CommandButton},
 };
 use crate::view::{CustomCommandButtonView, CustomCommandMode, CustomCommandOutputView};
+use image::CommandImageSource;
 
 /// Private configuration and one captured invocation; never persisted with the session.
 #[derive(Default)]
@@ -19,17 +22,54 @@ pub(super) struct CustomCommands {
     /// Whether the accepted invocation owns a typed command's private history result.
     pub(super) from_prompt: bool,
     waiting_download: Option<(u64, String, ShellCommandPlan)>,
+    waiting_image: Option<PendingCommandImage>,
     ready: Option<(String, ShellCommandPlan)>,
     local_selection: Option<(PathBuf, PathBuf)>,
 }
 
-/// Selection-bound download information kept private until an invocation needs `%d`.
+/// Selection-bound media and image information kept private until a command needs it.
 #[derive(Clone)]
 pub(super) struct CapturedCommandDownload {
     /// Exact identity used to find a previously completed, validated download.
     pub(super) identity: Option<MediaId>,
     /// Deferred source errors do not prevent plain commands or reuse of completed files.
     pub(super) source: Result<crate::download_queue::DownloadSource, String>,
+    /// Frozen artwork source; opening the editor does not fetch or extract it.
+    image: Result<CommandImageSource, String>,
+}
+
+/// A one-shot worker owns preparation and one continuation, never the current selection.
+struct PendingCommandImage {
+    replies: Receiver<Result<PathBuf, String>>,
+    completed: Option<Result<PathBuf, String>>,
+    worker: Option<JoinHandle<()>>,
+    name: String,
+    plan: ShellCommandPlan,
+    download: CapturedCommandDownload,
+    local_selection: Option<(PathBuf, PathBuf)>,
+}
+
+impl Drop for PendingCommandImage {
+    fn drop(&mut self) {
+        // Shutdown retains ownership of bounded I/O instead of abandoning a download.
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+#[cfg(all(test, feature = "remote-artwork"))]
+impl CustomCommands {
+    /// Makes modal tests wait for publication, not for an arbitrary scheduling delay.
+    pub(super) fn wait_for_image_fixture(&mut self) {
+        let pending = self.waiting_image.as_mut().expect("pending image fixture");
+        pending.completed = Some(
+            pending
+                .replies
+                .recv_timeout(Duration::from_secs(5))
+                .expect("image fixture completion"),
+        );
+    }
 }
 
 impl AppController {
@@ -37,6 +77,7 @@ impl AppController {
     pub(super) fn configure_custom_commands(&mut self, mode: CustomCommandMode) {
         self.custom_commands.mode = mode;
         if mode == CustomCommandMode::Unavailable {
+            self.custom_commands.waiting_image = None;
             self.custom_commands.waiting_download = None;
             self.custom_commands.ready = None;
             self.custom_commands.from_prompt = false;
@@ -231,6 +272,7 @@ impl AppController {
     /// Captures the target before downloading or yielding the frontend its command plan.
     pub(super) fn run_custom_command(&mut self, index: usize) {
         if self.custom_commands.running
+            || self.custom_commands.waiting_image.is_some()
             || self.custom_commands.waiting_download.is_some()
             || self.custom_commands.ready.is_some()
             || self.custom_commands.mode == CustomCommandMode::Unavailable
@@ -268,6 +310,7 @@ impl AppController {
             argument,
             directory,
             downloaded_path: local.clone(),
+            image_path: None,
         };
         let local_selection = if self.view.screen == Screen::Local {
             local.and_then(|path| {
@@ -335,7 +378,71 @@ impl AppController {
             }
             Ok(source)
         });
-        CapturedCommandDownload { identity, source }
+        CapturedCommandDownload {
+            identity,
+            source,
+            image: self.capture_command_image(),
+        }
+    }
+
+    /// Captures only selected, provider-advertised artwork; terminal size cannot limit `%i`.
+    fn capture_command_image(&self) -> Result<CommandImageSource, String> {
+        let (source, argument, local) = self
+            .custom_command_target()
+            .ok_or_else(|| "Select an item before using %i in a command".to_owned())?;
+        if let Some(path) = local {
+            let is_image = crate::local_browser::classify_local_file(&path)
+                == Some(crate::local_browser::LocalEntryKind::Image);
+            return Ok(CommandImageSource::Local { path, is_image });
+        }
+        let details = self.view.details.as_ref();
+        let largest = if source == SourceKind::YouTube {
+            let id = argument
+                .to_str()
+                .and_then(|argument| url::Url::parse(argument).ok())
+                .and_then(|url| {
+                    url.query_pairs()
+                        .find(|(key, _)| key == "v")
+                        .map(|(_, value)| value.into_owned())
+                });
+            let thumbnails = id.as_ref().and_then(|id| {
+                let cached = self
+                    .youtube_video_details_cache
+                    .get(id)
+                    .map(|details| details.thumbnails.as_slice())
+                    .unwrap_or_default();
+                let selected = match self.selected_youtube_item() {
+                    Some(SearchItem::Video(video)) if video.video_id == *id => {
+                        video.thumbnails.as_slice()
+                    }
+                    _ => &[],
+                };
+                // Partial detail replies must not hide an upgrade already advertised in search.
+                let candidates = cached.iter().chain(selected).cloned().collect::<Vec<_>>();
+                (!candidates.is_empty()).then_some(candidates)
+            });
+            thumbnails.and_then(|thumbnails| {
+                thumbnails
+                    .first()
+                    .and_then(|preview| largest_youtube_thumbnail_url(&thumbnails, preview, None))
+                    .or_else(|| thumbnails.last().map(|thumbnail| thumbnail.url.clone()))
+            })
+        } else {
+            None
+        };
+        let image = largest
+            .or_else(|| {
+                details.and_then(|details| {
+                    details
+                        .expanded_thumbnail_url
+                        .clone()
+                        .or_else(|| details.thumbnail_url.clone())
+                })
+            })
+            .filter(|url| matches!(url.scheme(), "http" | "https"));
+        image
+            .map(CommandImageSource::Remote)
+            .ok_or_else(|| "No image is available for the selected item (%i)".to_owned())
     }
 
     /// Shares validated cache reuse, the ordinary format chooser, and one captured continuation.
@@ -347,6 +454,7 @@ impl AppController {
         local_selection: Option<(PathBuf, PathBuf)>,
     ) -> Result<(), String> {
         if self.custom_commands.running
+            || self.custom_commands.waiting_image.is_some()
             || self.custom_commands.waiting_download.is_some()
             || self.custom_commands.ready.is_some()
         {
@@ -354,6 +462,29 @@ impl AppController {
         }
         if self.custom_commands.mode == CustomCommandMode::Unavailable {
             return Err("Shell commands are unavailable in this frontend".to_owned());
+        }
+        if plan.requires_image()? && plan.image_path.is_none() {
+            let source = download.image.clone()?;
+            let cache_directory = self.config.thumbnail_cache_dir();
+            let (sender, replies) = bounded(1);
+            let responses = ResponseSender::new(sender, self.worker_notifier.clone());
+            let worker = thread::Builder::new()
+                .name("youta-command-image".to_owned())
+                .spawn(move || {
+                    let _ = responses.send(image::prepare(source, &cache_directory));
+                })
+                .map_err(|_| "Cannot start the command image worker".to_owned())?;
+            self.custom_commands.waiting_image = Some(PendingCommandImage {
+                replies,
+                completed: None,
+                worker: Some(worker),
+                name,
+                plan,
+                download,
+                local_selection,
+            });
+            self.view.status_line = "Preparing image for custom command...".to_owned();
+            return Ok(());
         }
         if plan.requires_download()? && plan.downloaded_path.is_none() {
             // Reuse completed output even when no downloader is enabled in this build.
@@ -380,6 +511,55 @@ impl AppController {
         self.custom_commands.local_selection = local_selection;
         self.start_custom_command(name, plan);
         Ok(())
+    }
+
+    /// Accepts one published image without waiting on network I/O in the UI loop.
+    pub(super) fn poll_custom_command_image(&mut self) {
+        let Some(pending) = self.custom_commands.waiting_image.as_mut() else {
+            return;
+        };
+        if pending.completed.is_none() {
+            pending.completed = match pending.replies.try_recv() {
+                Ok(result) => Some(result),
+                Err(TryRecvError::Disconnected) => {
+                    Some(Err("The command image worker stopped".to_owned()))
+                }
+                Err(TryRecvError::Empty) => return,
+            };
+        }
+        // A successful preparation waits behind an editor or popup just like `%d`.
+        if pending.completed.as_ref().is_some_and(Result::is_ok)
+            && (self.view.quitting
+                || crate::keymap::custom_command_button_action(&self.view, usize::MAX)
+                    != Some(UiAction::RunCustomCommand(usize::MAX)))
+        {
+            return;
+        }
+        let mut pending = self
+            .custom_commands
+            .waiting_image
+            .take()
+            .expect("pending image");
+        let result = pending.completed.take().expect("completed image");
+        if let Some(worker) = pending.worker.take() {
+            // Sending was its final operation; unfinished handles only retain thread cleanup.
+            if worker.is_finished() {
+                let _ = worker.join();
+            }
+        }
+        let result = result.and_then(|path| {
+            pending.plan.image_path = Some(path);
+            self.run_captured_shell_command(
+                pending.name.clone(),
+                pending.plan.clone(),
+                pending.download.clone(),
+                pending.local_selection.clone(),
+            )
+        });
+        if let Err(error) = result {
+            self.custom_commands.from_prompt = false;
+            self.view.status_line = format!("Custom command not run: {error}");
+        }
     }
 
     /// Transfers a validated captured plan once; repeated clicks cannot start another process.

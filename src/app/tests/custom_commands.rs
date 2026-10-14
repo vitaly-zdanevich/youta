@@ -169,6 +169,160 @@ fn custom_commands_cancelled_or_failed_download_never_runs() {
     }
 }
 
+/// An item without artwork must not launch an image editor on a URL followed by `i`.
+#[test]
+fn custom_image_command_without_artwork_does_not_run() {
+    let (mut controller, _directory) = fixture("[[commands]]\nname='Image'\ncommand='gimp %i'\n");
+    controller.dispatch(UiAction::RunCustomCommand(0));
+    assert!(controller.take_custom_command_plan().is_none());
+    assert!(
+        controller
+            .view
+            .status_line
+            .contains("No image is available")
+    );
+    assert!(controller.manual_downloads.queue.entries.is_empty());
+}
+
+/// Bounds asynchronous fixture waiting without introducing a production polling timer.
+#[cfg(feature = "remote-artwork")]
+pub(super) fn wait_for_image_command(
+    controller: &mut AppController,
+) -> crate::local_command::ShellCommandPlan {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        controller.poll_custom_command_image();
+        if let Some(plan) = controller.take_custom_command_plan() {
+            return plan;
+        }
+        assert!(Instant::now() < deadline, "{}", controller.view.status_line);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// Fixtures use the existing private cache rather than live provider requests.
+#[cfg(feature = "remote-artwork")]
+pub(super) fn cache_command_image(controller: &AppController, source: &url::Url, bytes: &[u8]) {
+    crate::artwork::ThumbnailCache::new(controller.config.thumbnail_cache_dir())
+        .store(source, bytes)
+        .unwrap();
+}
+
+/// All online providers export their selected full-size artwork without downloading media.
+#[cfg(feature = "remote-artwork")]
+#[test]
+fn custom_image_commands_use_captured_full_artwork_for_online_providers() {
+    for source in [
+        SourceKind::YouTube,
+        SourceKind::SoundCloud,
+        SourceKind::ArchiveOrg,
+        SourceKind::Bandcamp,
+    ] {
+        let (mut controller, _directory) =
+            fixture("[[commands]]\nname='Image'\ncommand='echo %i'\n");
+        let identity = MediaId::new(source, "selected-image");
+        let image = url::Url::parse("https://i.ytimg.com/vi/fixture/full.jpg").unwrap();
+        let bytes = b"\x89PNG\r\n\x1a\nselected full artwork";
+        cache_command_image(&controller, &image, bytes);
+        controller.view.screen = Screen::History;
+        controller.view.rows = vec![RowView {
+            media_id: Some(identity.clone()),
+            ..Default::default()
+        }];
+        controller.view.details = Some(DetailView {
+            media_id: Some(identity),
+            webpage_url: Some(url::Url::parse("https://example.org/selected-image").unwrap()),
+            thumbnail_url: Some(url::Url::parse("https://example.org/small.jpg").unwrap()),
+            expanded_thumbnail_url: Some(image),
+            ..Default::default()
+        });
+        controller.dispatch(UiAction::RunCustomCommand(0));
+        assert!(controller.take_custom_command_plan().is_none());
+        controller.view.screen = Screen::Statistics;
+        controller.view.rows.clear();
+        controller.view.details = None;
+        let plan = wait_for_image_command(&mut controller);
+        assert_eq!(std::fs::read(plan.image_path.unwrap()).unwrap(), bytes);
+        assert!(plan.downloaded_path.is_none());
+        assert!(controller.manual_downloads.queue.entries.is_empty());
+    }
+}
+
+/// An available provider upgrade is not capped by the user's terminal dimensions.
+#[cfg(feature = "remote-artwork")]
+#[test]
+fn custom_image_commands_use_largest_advertised_youtube_image() {
+    let (mut controller, _directory) = fixture("[[commands]]\nname='Image'\ncommand='echo %i'\n");
+    let full = url::Url::parse("https://i.ytimg.com/vi/dQw4w9WgXcQ/maxresdefault.jpg").unwrap();
+    let small = url::Url::parse("https://i.ytimg.com/vi/dQw4w9WgXcQ/default.jpg").unwrap();
+    let mut video = fixture_download_video();
+    video.thumbnails = vec![
+        Thumbnail {
+            url: small.clone(),
+            width: Some(120),
+            height: Some(90),
+            quality: None,
+        },
+        Thumbnail {
+            url: full.clone(),
+            width: Some(1280),
+            height: Some(720),
+            quality: None,
+        },
+    ];
+    controller.youtube_results = vec![SearchItem::Video(video)];
+    controller.youtube_video_details_cache.insert(
+        "dQw4w9WgXcQ".to_owned(),
+        linked_video_details("dQw4w9WgXcQ", "Partial details", ""),
+    );
+    controller.view.details.as_mut().unwrap().thumbnail_url = Some(small.clone());
+    controller
+        .view
+        .details
+        .as_mut()
+        .unwrap()
+        .expanded_thumbnail_url = Some(small);
+    let bytes = b"\x89PNG\r\n\x1a\nfull provider image";
+    cache_command_image(&controller, &full, bytes);
+    controller.dispatch(UiAction::RunCustomCommand(0));
+    let plan = wait_for_image_command(&mut controller);
+    assert_eq!(std::fs::read(plan.image_path.unwrap()).unwrap(), bytes);
+}
+
+/// Image preparation respects modal ownership before handing a shell to either frontend.
+#[cfg(feature = "remote-artwork")]
+#[test]
+fn custom_image_command_waits_behind_popups_and_then_downloads_captured_media() {
+    let (mut controller, _directory) = fixture("[[commands]]\nname='Both'\ncommand='echo %i %d'\n");
+    let source = url::Url::parse("https://i.ytimg.com/vi/fixture/full.jpg").unwrap();
+    cache_command_image(&controller, &source, b"\x89PNG\r\n\x1a\nimage");
+    controller.view.details.as_mut().unwrap().thumbnail_url = Some(source);
+    controller.dispatch(UiAction::RunCustomCommand(0));
+    controller.view.help_open = true;
+    controller.custom_commands.wait_for_image_fixture();
+    controller.poll_custom_command_image();
+    assert!(controller.take_custom_command_plan().is_none());
+    assert!(controller.manual_downloads.active.is_none());
+    controller.view.help_open = false;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while controller.manual_downloads.active.is_none() {
+        controller.poll_custom_command_image();
+        assert!(Instant::now() < deadline, "{}", controller.view.status_line);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let owner = controller.manual_downloads.active.unwrap();
+    controller.view.details = None;
+    controller.view.rows.clear();
+    let downloaded = controller.config.downloads_dir().join("downloaded.opus");
+    std::fs::write(&downloaded, b"media").unwrap();
+    controller.finish_manual_download_for(owner, Ok(downloaded.clone()));
+    controller.refresh_custom_command_buttons();
+    let plan = controller.take_custom_command_plan().unwrap();
+    assert!(plan.image_path.unwrap().is_file());
+    assert_eq!(plan.downloaded_path, Some(downloaded));
+    assert_eq!(plan.argument, "https://www.youtube.com/watch?v=dQw4w9WgXcQ");
+}
+
 /// Opening a linked YouTube video must not download the still-selected background row.
 #[test]
 fn custom_commands_linked_video_uses_same_identity_for_url_and_download() {
@@ -377,6 +531,7 @@ fn captured_shell_commands_keep_the_source_and_normal_download_chooser() {
         template: "echo % %d".to_owned(),
         argument: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".into(),
         downloaded_path: None,
+        image_path: None,
         directory: directory.path().to_owned(),
     };
     controller.view.screen = Screen::Statistics;
@@ -411,6 +566,7 @@ fn captured_shell_commands_allow_plain_commands_without_download_sources() {
         template: "pwd".to_owned(),
         argument: Default::default(),
         downloaded_path: None,
+        image_path: None,
         directory: directory.path().to_owned(),
     };
     controller
@@ -445,6 +601,7 @@ fn captured_shell_commands_reuse_downloads_before_checking_source_errors() {
         template: "echo %d".to_owned(),
         argument: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".into(),
         downloaded_path: None,
+        image_path: None,
         directory: directory.path().to_owned(),
     };
     controller

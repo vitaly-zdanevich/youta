@@ -194,6 +194,7 @@ impl AppController {
                 template: String::new(),
                 argument: target.map(|(_, argument, _)| argument).unwrap_or_default(),
                 downloaded_path: local_path.clone(),
+                image_path: None,
                 directory,
             },
             download: self.capture_command_download(),
@@ -320,7 +321,7 @@ impl AppController {
         match selection.plan.requires_selection() {
             Ok(true) if !selection.has_target => {
                 self.view.status_line =
-                    "Select an item before using % or %d in a command".to_owned();
+                    "Select an item before using %, %d or %i in a command".to_owned();
                 return;
             }
             Err(error) => {

@@ -481,9 +481,10 @@ mod tests {
         )
         .unwrap();
         let buttons = load(directory.path()).unwrap();
-        assert_eq!(buttons.len(), 1);
+        assert_eq!(buttons.len(), 2);
         assert_eq!(buttons[0].command, "ffmpeg -n -i % %.flac");
         assert_eq!(buttons[0].hotkey.as_ref().unwrap().label, "Ctrl+Alt+F");
+        assert_eq!(buttons[1].command, "gimp %i");
         fs::write(directory.path().join("commands.sample"), "keep this edit").unwrap();
         ensure_sample(directory.path()).unwrap();
         assert_eq!(
