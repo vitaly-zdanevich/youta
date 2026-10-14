@@ -23,8 +23,7 @@
 ![30-second demonstration of Youta terminal and desktop interfaces](docs/images/youta-demo-30s.avif)
 
 [30-second animated AVIF demo](docs/images/youta-demo-30s.avif): 15 seconds of
-the terminal interface, then 15 seconds of the desktop GUI. The GUI segment
-uses sample data and simulated playback.
+the terminal interface, then 15 seconds of the desktop GUI.
 
 Youta is a low-resource audio player and subscription manager written in Rust,
 with terminal and desktop front-ends. It saves and shows listening progress.
