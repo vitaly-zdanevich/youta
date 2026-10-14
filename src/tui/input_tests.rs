@@ -12,6 +12,7 @@ const CHILD_SOCKET: &str = "YOUTA_INPUT_TEST_SOCKET";
 /// The Python driver supplies a PTY without adding unsafe code or a production
 /// dependency. The child reaches the same test through an explicit environment
 /// marker, leaving the parent test process's global Crossterm reader untouched.
+/// Button-free SGR mouse motion must reach the input adapter as passive movement.
 #[test]
 fn terminal_completion_events_and_editor_handoff() {
     if let Some(socket) = std::env::var_os(CHILD_SOCKET) {
@@ -109,6 +110,15 @@ fn run_child(socket: PathBuf) {
     expect_input(
         &mut input,
         &Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+    );
+    expect_input(
+        &mut input,
+        &Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 9,
+            row: 7,
+            modifiers: KeyModifiers::NONE,
+        }),
     );
     expect_input(
         &mut input,

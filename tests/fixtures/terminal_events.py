@@ -73,7 +73,7 @@ class TerminalOutput:
 
 
 def main():
-	'''Verify notifications, decoded input, and repeated editor/TUI ownership.'''
+	'''Verify notifications, passive mouse motion, and repeated editor ownership.'''
 	master, slave = os.openpty()
 	child = None
 	try:
@@ -93,7 +93,8 @@ def main():
 			worker.connect(sys.argv[2])
 			worker.sendall(b'w')
 		wait_for(b'INPUT_READY')
-		os.write(master, b'\x1b[A\x1b[<0;5;6M')
+		# SGR button 35 reports button-free movement at one-based coordinates.
+		os.write(master, b'\x1b[A\x1b[<35;10;8M\x1b[<0;5;6M')
 		wait_for(b'RESIZE_READY')
 		resize(master, 100, 30)
 		for cycle in range(2):

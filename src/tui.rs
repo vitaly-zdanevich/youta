@@ -4,6 +4,10 @@
 //! writes to the terminal and does not create a second user interface.
 
 mod bug_report;
+#[cfg(feature = "hover")]
+mod hover;
+#[cfg(all(test, feature = "hover"))]
+mod hover_wait_tests;
 mod input;
 mod input_stream;
 #[cfg(all(test, target_os = "linux", feature = "local-browser"))]
@@ -20,6 +24,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crossterm::cursor::{Hide, MoveTo, Show};
+#[cfg(feature = "hover")]
+use crossterm::event::{DisableFocusChange, EnableFocusChange};
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
     MouseButton, MouseEvent, MouseEventKind,
@@ -1080,6 +1086,8 @@ fn run_with_input(
         renderer.set_worker_waker(Some(input.worker_waker()));
     }
     let mut hit_map = HitMap::default();
+    #[cfg(feature = "hover")]
+    let mut hover = hover::HoverState::default();
     let mut virtual_cursor = VirtualCursor::default();
     // Discovery reads filesystem metadata once and runs nothing, so the
     // terminal owns its clipboard transport for the whole session.
@@ -1099,6 +1107,8 @@ fn run_with_input(
                     &mut hit_map,
                     Some(renderer.as_mut()),
                 );
+                #[cfg(feature = "hover")]
+                hover.render(frame, &hit_map, controller.view());
                 render_local_rename_cursor(frame, controller.view(), !virtual_cursor.active);
                 #[cfg(feature = "cmd")]
                 local_command::render_cursor(frame, controller.view(), !virtual_cursor.active);
@@ -1109,6 +1119,8 @@ fn run_with_input(
             session.terminal.draw(|frame| {
                 fullscreen_artwork_area = frame.area();
                 render_frame(frame, controller.view(), settings, &mut hit_map, None);
+                #[cfg(feature = "hover")]
+                hover.render(frame, &hit_map, controller.view());
                 render_local_rename_cursor(frame, controller.view(), !virtual_cursor.active);
                 #[cfg(feature = "cmd")]
                 local_command::render_cursor(frame, controller.view(), !virtual_cursor.active);
@@ -1131,12 +1143,34 @@ fn run_with_input(
         }
 
         let wait = event_wait(controller.view(), settings).min(controller.next_tick_delay());
-        let wait_outcome = wait_for_event_or_thumbnail(wait, renderer.as_deref_mut(), |timeout| {
+        #[cfg(feature = "hover")]
+        let event = wait_for_visible_terminal_event(
+            wait,
+            &mut hover,
+            &mut virtual_cursor,
+            &hit_map,
+            controller.view(),
+            |timeout| match wait_for_event_or_thumbnail(
+                timeout,
+                renderer.as_deref_mut(),
+                |timeout| input.poll(timeout),
+            )? {
+                WaitOutcome::TerminalEvent => input.read().map(Some),
+                _ => Ok(None),
+            },
+        )?;
+        #[cfg(not(feature = "hover"))]
+        let event = match wait_for_event_or_thumbnail(wait, renderer.as_deref_mut(), |timeout| {
             input.poll(timeout)
-        })?;
-        if wait_outcome == WaitOutcome::TerminalEvent {
-            match input.read()? {
+        })? {
+            WaitOutcome::TerminalEvent => Some(input.read()?),
+            _ => None,
+        };
+        if let Some(event) = event {
+            match event {
                 Event::Key(key) => {
+                    #[cfg(feature = "hover")]
+                    hover.clear();
                     #[cfg(feature = "cmd")]
                     if controller.view().local_command.is_some() {
                         virtual_cursor.active = false;
@@ -1197,6 +1231,8 @@ fn run_with_input(
                     }
                 }
                 Event::Mouse(mouse) => {
+                    #[cfg(feature = "hover")]
+                    hover.update_mouse(mouse, &hit_map, controller.view());
                     virtual_cursor.follow_mouse(&mouse);
                     if let Some(action) = mouse_action(mouse, &hit_map, controller.view()) {
                         bug_report::dispatch_terminal_action(
@@ -1208,9 +1244,15 @@ fn run_with_input(
                     }
                 }
                 Event::Resize(columns, rows) => {
+                    #[cfg(feature = "hover")]
+                    hover.clear();
                     synchronize_search_page_capacities(controller, Rect::new(0, 0, columns, rows));
                     let (width, height) = current_terminal_window_pixels();
                     controller.dispatch(UiAction::SetTerminalWindowPixels { width, height });
+                }
+                #[cfg(feature = "hover")]
+                Event::FocusLost => {
+                    hover.clear();
                 }
                 _ => {}
             }
@@ -1228,6 +1270,8 @@ fn run_with_input(
         }
         #[cfg(feature = "local-browser")]
         if let Some(plan) = controller.take_text_file_open_plan() {
+            #[cfg(feature = "hover")]
+            hover.clear();
             if let Some(renderer) = renderer.as_deref_mut() {
                 renderer.clear();
             }
@@ -1236,6 +1280,8 @@ fn run_with_input(
         }
         #[cfg(feature = "cmd")]
         if let Some(plan) = controller.take_local_command_plan() {
+            #[cfg(feature = "hover")]
+            hover.clear();
             if let Some(renderer) = renderer.as_deref_mut() {
                 renderer.clear();
             }
@@ -1244,6 +1290,8 @@ fn run_with_input(
         }
         #[cfg(feature = "cmd")]
         if let Some(plan) = controller.take_custom_command_plan() {
+            #[cfg(feature = "hover")]
+            hover.clear();
             if let Some(renderer) = renderer.as_deref_mut() {
                 renderer.clear();
             }
@@ -1731,6 +1779,44 @@ fn wait_for_event_or_thumbnail(
     terminal_event_ready(wait)
 }
 
+/// Ignores visually unchanged mouse motion without extending the existing tick deadline.
+///
+/// Worker replies, artwork completion, keys, clicks, and changed hover targets
+/// still wake the frame immediately. The keyboard pointer also requires a frame
+/// when its visible cell moves, even inside the same hovered control.
+#[cfg(feature = "hover")]
+fn wait_for_visible_terminal_event(
+    wait: Duration,
+    hover: &mut hover::HoverState,
+    virtual_cursor: &mut VirtualCursor,
+    hit_map: &HitMap,
+    view: &ViewModel,
+    mut next_event: impl FnMut(Duration) -> io::Result<Option<Event>>,
+) -> io::Result<Option<Event>> {
+    let started = std::time::Instant::now();
+    loop {
+        let remaining = wait.saturating_sub(started.elapsed());
+        let Some(event) = next_event(remaining)? else {
+            return Ok(None);
+        };
+        if let Event::Mouse(mouse) = event
+            && mouse.kind == MouseEventKind::Moved
+        {
+            let previous_pointer = (virtual_cursor.column, virtual_cursor.row);
+            virtual_cursor.follow_mouse(&mouse);
+            let pointer_changed = previous_pointer != (virtual_cursor.column, virtual_cursor.row);
+            if hover.update_mouse(mouse, hit_map, view) || pointer_changed {
+                return Ok(Some(event));
+            }
+            if started.elapsed() >= wait {
+                return Ok(None);
+            }
+            continue;
+        }
+        return Ok(Some(event));
+    }
+}
+
 /// Stable-width ASCII frames shared by background activity indicators.
 const ASCII_ACTIVITY_FRAMES: [char; 4] = ['|', '/', '-', '\\'];
 
@@ -1902,18 +1988,18 @@ fn write_terminal_startup(writer: &mut impl io::Write) -> io::Result<()> {
         MoveTo(0, 0),
         EnableMouseCapture,
         Hide
-    )
+    )?;
+    #[cfg(feature = "hover")]
+    execute!(writer, EnableFocusChange)?;
+    Ok(())
 }
 
 /// Restores shell/editor wrapping on exit, suspension, or failed terminal setup.
 fn write_terminal_exit(writer: &mut impl io::Write) -> io::Result<()> {
-    execute!(
-        writer,
-        EnableLineWrap,
-        Show,
-        DisableMouseCapture,
-        LeaveAlternateScreen
-    )
+    execute!(writer, EnableLineWrap, Show, DisableMouseCapture,)?;
+    #[cfg(feature = "hover")]
+    execute!(writer, DisableFocusChange)?;
+    execute!(writer, LeaveAlternateScreen)
 }
 
 struct TerminalSetupGuard {

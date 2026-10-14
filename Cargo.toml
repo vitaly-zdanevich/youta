@@ -4,7 +4,7 @@ resolver = "3"
 
 [package]
 name = "youta"
-version = "1.15.0"
+version = "1.16.0"
 edition = "2024"
 rust-version = "1.95"
 description = "A low-resource YouTube TUI audio player and local subscription manager that uses yt-dlp and saves and shows listening progress"
@@ -42,6 +42,7 @@ default = [
     "commons-upload",
     "evernote",
     "gpm",
+    "hover",
     "images",
     "lan-sharing",
     "local-archives",
@@ -139,6 +140,8 @@ tui = [
     "dep:mio",
     "dep:ratatui",
 ]
+# Passive terminal tab/button feedback, independently removable from mouse clicks.
+hover = ["tui"]
 # Offline QR codes for exact selected YouTube videos.
 #
 # `src/qr_code.rs` encodes to a plain module matrix and renders nothing, so this

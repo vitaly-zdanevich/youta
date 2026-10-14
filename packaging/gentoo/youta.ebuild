@@ -33,7 +33,7 @@ KEYWORDS="~amd64 ~arm64 ~x86"
 IUSE="
 	+acoustid +alsa +ascii-visualizer +audio-quality archive-rar +archive-zip +archive-org +archive-upload apple-podcasts +bbc-radio
 	bandcamp bilibili bundled-sqlite +cache +cmd cpu_flags_x86_sse2 dearrow discord +evernote
-	+commons-upload +funkwhale +generic-ytdlp google-drive gpm gpodder gui +invidious jack +jamendo
+	+commons-upload +funkwhale +generic-ytdlp google-drive gpm gpodder gui +hover +invidious jack +jamendo
 	keyring +lan-sharing +lastfm +librivox +litres +local +local-archives +mpv native +nyan-cat odysee +peertube pipewire
 	podcast-index pulseaudio +qr +radio +rss rumble +rutube s3-upload +soundcloud +soundstream
 	+sponsorblock sqlite ssh +summary telegram test +images torrent +tracker-music +tui +vimeo vk
@@ -58,6 +58,7 @@ REQUIRED_USE="
 	gpodder? ( rss )
 	generic-ytdlp? ( yt-dlp )
 	gpm? ( tui )
+	hover? ( tui )
 	gui? ( tui )
 	images? ( tui )
 	lan-sharing? ( local qr yt-dlp )
@@ -186,6 +187,7 @@ src_configure() {
 		$(usev generic-ytdlp)
 		$(usev google-drive)
 		$(usev gpm)
+		$(usev hover)
 		$(usev gpodder)
 		$(usev images)
 		$(usev invidious)

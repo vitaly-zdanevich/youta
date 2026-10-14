@@ -1171,7 +1171,7 @@ dependencies, or the optional Linux virtual-console mouse client with:
 
 ```sh
 cargo build --release --locked --no-default-features \
-	--features app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info,web-browser,youtube-captions
+	--features app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,hover,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info,web-browser,youtube-captions
 ```
 
 The `app` profile includes the experimental YandexMusic adapter but does not
@@ -1182,7 +1182,7 @@ with:
 
 ```sh
 cargo build --release --locked --no-default-features \
-	--features app-core,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info,web-browser,youtube-captions
+	--features app-core,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,hover,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info,web-browser,youtube-captions
 ```
 
 Omit `images` from that command for the Yandex-free text-only variant. Omit
@@ -1206,6 +1206,7 @@ leave it out of an explicit `--no-default-features` feature list:
 | `commons-upload` | Commons authentication, upload client, and review UI. |
 | `evernote` | Evernote client and audio-note UI. |
 | `gpm` | Linux virtual-console mouse input; opt in explicitly in either custom example. |
+| `hover` | Passive terminal tab/button backgrounds and coalesced mouse-motion redraws. |
 | `images` | Image decoding and terminal graphics protocols. |
 | `lan-sharing` | Session HTTP server, audio proxy, and local/channel podcast feed builder. |
 | `local-archives` | Read-only ZIP/RAR folders in Local. |
@@ -2247,6 +2248,18 @@ The rendering integration uses
 [`ratatui-image`](https://docs.rs/ratatui-image/11.0.6/ratatui_image/).
 
 ## Mouse input on a Linux virtual console
+
+In terminals that report mouse movement, such as Kitty, hovering over an
+inactive tab or an enabled button adds a subtle background without changing
+selection or activating the control. Selected colors remain unchanged;
+disabled controls and controls behind a popup do not highlight. Movement
+within the same control does not cause extra redraws. This uses the existing
+[Crossterm mouse events](https://docs.rs/crossterm/0.29.0/crossterm/event/enum.MouseEventKind.html)
+and also works with GPM motion events on a Linux console.
+The `hover` Cargo feature is enabled by default but is not forced by `app`,
+`app-core`, or `tui`. Leave it out of an explicit `--no-default-features`
+feature list to omit hover code, or use `USE="-hover"` with the next-release
+Gentoo source ebuild. Mouse clicks and wheel scrolling remain available.
 
 The default build includes the small `gpm` feature. When Youta is attached
 directly to `/dev/ttyN`, it opportunistically connects to an already-running
@@ -3453,6 +3466,7 @@ The source package maps the default-enabled `ascii-visualizer`, `audio-quality`,
 | `USE="-cache"` | Session RAM audio caching in both frontends. |
 | `USE="-commons-upload"` | Commons client and review UI. |
 | `USE="-evernote"` | Evernote EDAM client and note UI. |
+| `USE="-hover"` (next release template) | Terminal hover backgrounds and motion coalescing; clicks and scrolling remain. |
 | `USE="-lan-sharing"` | Session HTTP server, LAN-share/feed actions, and their QR workflow. |
 | `USE="-local-archives"` | ZIP/RAR Local folders and the RAR helper dependency. |
 | `USE="-sponsorblock"` | SponsorBlock API client, preference, cache, and playback skipping. |

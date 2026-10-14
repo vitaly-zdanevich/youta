@@ -126,6 +126,62 @@ src_configure
     }
 }
 
+/// Hover is default-on for the terminal package but is not forwarded into the GUI core.
+#[test]
+fn hover_use_flag_controls_only_its_independent_terminal_feature() {
+    let template = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("packaging/gentoo/youta.ebuild");
+    let script = r#"
+inherit() { :; }
+use() { [[ " ${USE_FIXTURE} " == *" $1 "* ]]; }
+usev() { if use "$1"; then printf '%s\n' "${2:-$1}"; fi; }
+usex() { if use "$1"; then printf '%s' "$2"; else printf '%s' "$3"; fi; }
+cargo_src_configure() { printf 'TUI'; printf '|%s' "${myfeatures[@]}"; printf '\n'; }
+cargo_src_compile() { :; }
+cargo_src_test() { :; }
+cargo_env() { printf 'GUI'; printf '|%s' "$@"; printf '\n'; }
+source "$1"
+[[ " ${IUSE} " == *"+hover"* ]] || exit 1
+[[ " ${REQUIRED_USE} " == *"hover? ( tui )"* ]] || exit 1
+src_configure
+src_compile
+src_test
+"#;
+    for enabled in [false, true] {
+        let output = Command::new("bash")
+            .args(["-ec", script, "gentoo-hover-test"])
+            .arg(&template)
+            .env(
+                "USE_FIXTURE",
+                if enabled { "tui gui hover" } else { "tui gui" },
+            )
+            .env("PV", "99.0.0")
+            .env("P", "youta-99.0.0")
+            .env("CARGO", "cargo")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let trace = String::from_utf8(output.stdout).unwrap();
+        let features = trace_fields(&trace, "TUI|");
+        assert_eq!(features.contains(&"hover"), enabled);
+        assert!(features.contains(&"tui"));
+        for operation in ["build", "test"] {
+            let fields = trace_fields(&trace, &format!("GUI|cargo|{operation}|"));
+            let features = fields
+                .windows(2)
+                .find_map(|pair| (pair[0] == "--features").then_some(pair[1]))
+                .unwrap_or("");
+            assert!(
+                !features.split(',').any(|feature| feature == "hover"),
+                "terminal hover must not pull a renderer into GUI core"
+            );
+        }
+    }
+}
+
 /// Installs the terminal manual for both terminal-only and desktop packages.
 #[test]
 fn man_page_is_installed_with_and_without_the_desktop() {
