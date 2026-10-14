@@ -186,7 +186,8 @@ Open downloaded media (Offline) during normal browsing.
 Open Log when playback-history recording is enabled.
 .TP
 .B F4
-Open playlists (Lists).
+Open playlists (Lists), except on Funkwhale where it opens pod setup.
+Inside Funkwhale setup, F4 opens or retries the public-pod directory.
 .TP
 .B F5
 Open listening statistics.
@@ -904,6 +905,52 @@ clicks, and
 or
 .B F8
 exits pointer mode.
+.SH FUNKWHALE PODS
+The Funkwhale tab follows Bandcamp in the terminal and desktop.
+Its first visit opens pod setup; no pod is preset.
+Press
+.B F4
+on this tab, or the desktop Pod setup button, to edit it later.
+Enter a custom HTTP(S) base URL, including any pod subpath.
+An address without a scheme defaults to HTTPS.
+Press Enter or Save to persist it; clear the address and save to remove it.
+Esc closes setup without saving.
+.PP
+Inside setup, F4 or Choose public pod loads the official directory at
+https://www.funkwhale.audio/join/ only when requested.
+The list shows advertised names and registration status when available.
+Up/Down selects a pod; Enter or a click fills the address draft.
+Save separately to use that pod.
+Registration status describes account signup, not anonymous listening access.
+Directory errors leave manual URL entry available; F4 retries.
+.PP
+The setting is
+.B providers.funkwhale_instance_url
+in config.toml.
+.B YOUTA_PROVIDERS__FUNKWHALE_INSTANCE_URL
+overrides it; change or remove that environment variable before saving a pod.
+Press / to search and Enter to play.
+Requests fit the visible list, up to 100 tracks, with explicit Load more tracks
+pagination. Details show available metadata, artwork, and original track and
+artist URLs. HTTP 401/403 errors identify pod authentication restrictions;
+account login and OAuth are not implemented.
+.PP
+The adapter tries v1, falls back to v2 only on 404, and uses advertised audio
+listen URLs directly without yt-dlp. Log and queue entries save canonical
+pod-scoped track-page URLs; replay resolves fresh audio from the original pod.
+Turning off Save log and searches removes saved Funkwhale searches and prevents
+their restoration.
+.PP
+The independent
+.B funkwhale
+Cargo feature is enabled by default in both frontends.
+Omit it from an explicit
+.B \-\-no-default-features
+build, or use
+.B USE=\(dq\-funkwhale\(dq
+with the Gentoo source template, to remove the adapter and tab.
+The app, app-core, sources, and tui profiles do not force this feature.
+Official API documentation: https://docs.funkwhale.audio/developer/api/ .
 .SH BUG REPORTS
 Press
 .B Ctrl+Alt+B

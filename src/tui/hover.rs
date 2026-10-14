@@ -130,6 +130,8 @@ fn control_at_pointer(mouse: MouseEvent, hit_map: &HitMap, view: &ViewModel) -> 
         &hit_map.local_file_buttons,
         &hit_map.rss_subscription_buttons,
         &hit_map.yandex_music_setup_buttons,
+        #[cfg(feature = "funkwhale")]
+        &hit_map.funkwhale_setup_buttons,
         &hit_map.youtube_setup_buttons,
         &hit_map.preferences_buttons,
     ];
@@ -167,6 +169,7 @@ fn is_button_action(action: &UiAction) -> bool {
     !matches!(
         action,
         UiAction::SelectInvidiousInstance(_)
+            | UiAction::SelectFunkwhalePod(_)
             | UiAction::SelectDownloadChoice { .. }
             | UiAction::SelectArchivePlaybackChoice { .. }
             | UiAction::SelectDownloadQueueEntry(_)

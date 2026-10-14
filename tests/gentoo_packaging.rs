@@ -182,6 +182,73 @@ src_test
     }
 }
 
+/// The default-on Funkwhale flag controls both GUI phases independently of TUI selection.
+#[test]
+fn funkwhale_use_controls_terminal_and_gui_build_and_test_features() {
+    let template = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("packaging/gentoo/youta.ebuild");
+    let script = r#"
+inherit() { :; }
+use() { [[ " ${USE_FIXTURE} " == *" $1 "* ]]; }
+usev() { if use "$1"; then printf '%s\n' "${2:-$1}"; fi; }
+usex() { if use "$1"; then printf '%s' "$2"; else printf '%s' "$3"; fi; }
+cargo_src_configure() { printf 'TUI'; printf '|%s' "${myfeatures[@]}"; printf '\n'; }
+cargo_src_compile() { :; }
+cargo_src_test() { :; }
+cargo_env() { printf 'GUI'; printf '|%s' "$@"; printf '\n'; }
+source "$1"
+[[ " ${IUSE} " == *"+funkwhale"* ]] || exit 1
+src_configure
+src_compile
+src_test
+"#;
+    for enabled in [false, true] {
+        for tui in [false, true] {
+            let output = Command::new("bash")
+                .args(["-ec", script, "gentoo-funkwhale-test"])
+                .arg(&template)
+                .env(
+                    "USE_FIXTURE",
+                    format!(
+                        "gui cmd {} {}",
+                        if enabled { "funkwhale" } else { "" },
+                        if tui { "tui" } else { "" }
+                    ),
+                )
+                .env("PV", "99.0.0")
+                .env("P", "youta-99.0.0")
+                .env("CARGO", "cargo")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let trace = String::from_utf8(output.stdout).unwrap();
+            let features = trace_fields(&trace, "TUI|");
+            assert_eq!(features.contains(&"funkwhale"), enabled);
+            assert_eq!(features.contains(&"tui"), tui);
+            for operation in ["build", "test"] {
+                let fields = trace_fields(&trace, &format!("GUI|cargo|{operation}|"));
+                let selected = fields
+                    .windows(2)
+                    .find_map(|pair| (pair[0] == "--features").then_some(pair[1]))
+                    .unwrap_or("");
+                assert_eq!(
+                    selected.split(',').any(|feature| feature == "funkwhale"),
+                    enabled,
+                    "GUI {operation} must honor Funkwhale USE"
+                );
+                assert!(
+                    selected.split(',').any(|feature| feature == "cmd"),
+                    "Funkwhale forwarding must preserve feature separators"
+                );
+                assert!(!selected.split(',').any(|feature| feature == "tui"));
+            }
+        }
+    }
+}
+
 /// Installs the terminal manual for both terminal-only and desktop packages.
 #[test]
 fn man_page_is_installed_with_and_without_the_desktop() {

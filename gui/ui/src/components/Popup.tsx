@@ -1,5 +1,5 @@
 import * as Dialog from "@radix-ui/react-dialog";
-import type { ReactNode } from "react";
+import type { KeyboardEvent, ReactNode } from 'react';
 
 /**
  * The shell every popup is drawn in.
@@ -25,6 +25,7 @@ export function Popup({
   onDismiss,
   dismissLabel = "Close",
   dismissDisabled = false,
+	onKeyDown,
   footer,
   children,
 }: {
@@ -44,6 +45,8 @@ export function Popup({
   dismissLabel?: string;
   /** Prevents closing while an irreversible background action is unresolved. */
   dismissDisabled?: boolean;
+	/** Optional native-control navigation owned by a dialog instead of the document keymap. */
+	onKeyDown?: (event: KeyboardEvent<HTMLDivElement>) => void;
   footer?: ReactNode;
   children: ReactNode;
 }) {
@@ -57,6 +60,7 @@ export function Popup({
           style={{ zIndex: 50 + Math.round(layer * 100) }}
         >
           <Dialog.Content
+						onKeyDown={onKeyDown}
             onOpenAutoFocus={(event) => event.preventDefault()}
             onEscapeKeyDown={(event) => event.preventDefault()}
             onPointerDownOutside={(event) => event.preventDefault()}
@@ -77,6 +81,12 @@ export function Popup({
                 aria-label={dismissLabel}
                 disabled={dismissDisabled}
                 onClick={onDismiss}
+								onKeyDown={(event) => {
+									if (event.ctrlKey || event.altKey || event.metaKey || (event.key !== 'Enter' && event.key !== ' ')) return;
+									event.preventDefault();
+									event.stopPropagation();
+									if (!dismissDisabled && !event.repeat) onDismiss();
+								}}
                 className="ml-auto shrink-0 rounded-[5px] border border-line-strong px-[7px] py-[2px] text-[11px] text-ink-dim disabled:cursor-not-allowed disabled:opacity-40 not-disabled:hover:border-ink-faint not-disabled:hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
               >
                 Esc
@@ -101,11 +111,14 @@ export function Popup({
 export function PopupButton({
   children,
   onClick,
+	onKeyDown,
   emphasis = false,
   disabled = false,
 }: {
   children: ReactNode;
   onClick: () => void;
+	/** Lets an explicit control own activation instead of the shared modal keymap. */
+	onKeyDown?: (event: KeyboardEvent<HTMLButtonElement>) => void;
   emphasis?: boolean;
   disabled?: boolean;
 }) {
@@ -114,6 +127,7 @@ export function PopupButton({
       type="button"
       disabled={disabled}
       onClick={onClick}
+			onKeyDown={onKeyDown}
       className={`rounded-[5px] border px-[9px] py-[3px] text-[11px] disabled:opacity-40 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent ${
         emphasis
           ? "border-accent text-ink"

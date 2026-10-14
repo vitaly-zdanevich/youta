@@ -36,6 +36,8 @@ struct Location {
 /// Real controller adapters used by a focused source page and its Back destination.
 #[derive(Clone)]
 enum Content {
+    #[cfg(feature = "funkwhale")]
+    Funkwhale(super::funkwhale::FunkwhaleNavigationSnapshot),
     Search(Box<SearchLocation>),
     Music {
         items: Vec<SearchItem>,
@@ -116,6 +118,7 @@ impl AppController {
             self.radio_filter_edit_snapshot = None;
         }
         match self.view.screen {
+            Screen::Funkwhale => self.leave_funkwhale_screen(),
             Screen::Search => {
                 self.youtube_search_query
                     .clone_from(&self.view.search_query);
@@ -331,6 +334,7 @@ impl AppController {
             SourceKind::SoundCloud => Screen::SoundCloud,
             SourceKind::YandexMusic => Screen::YandexMusic,
             SourceKind::Bandcamp => Screen::Bandcamp,
+            SourceKind::Funkwhale => Screen::Funkwhale,
             SourceKind::ApplePodcasts => Screen::ApplePodcasts,
             SourceKind::ArchiveOrg => Screen::ArchiveOrg,
             SourceKind::LibriVox => Screen::LibriVox,
@@ -427,6 +431,12 @@ impl AppController {
     fn now_playing_location(&self, item: &QueueItem) -> Option<Location> {
         let id = &item.media.id;
         let (screen, content, selected) = match id.source {
+            #[cfg(feature = "funkwhale")]
+            SourceKind::Funkwhale => (
+                Screen::Funkwhale,
+                Content::Funkwhale(self.funkwhale_navigation_snapshot(item)?),
+                0,
+            ),
             SourceKind::YouTube => {
                 let music = item.media.webpage_url.host_str() == Some("music.youtube.com")
                     || self.view.screen == Screen::YouTubeMusic;
@@ -657,6 +667,7 @@ impl AppController {
             return &self.view.search_query;
         }
         match screen {
+            Screen::Funkwhale => &self.funkwhale.query,
             Screen::YouTubeMusic => &self.youtube_music_search_query,
             Screen::YandexMusic => &self.yandex_music_search_query,
             #[cfg(feature = "bandcamp")]
@@ -673,6 +684,8 @@ impl AppController {
     /// Combines global and provider-local ownership for a reversible focused page.
     fn now_playing_location_generation(&self, screen: Screen) -> (u64, u64) {
         let provider = match screen {
+            #[cfg(feature = "funkwhale")]
+            Screen::Funkwhale => self.funkwhale_navigation_generation(),
             #[cfg(feature = "yandex-music")]
             Screen::YandexMusic => self.yandex_music_generation,
             #[cfg(feature = "librivox")]
@@ -695,6 +708,7 @@ impl AppController {
             self.view.selected
         } else {
             match screen {
+                Screen::Funkwhale => self.funkwhale.selected,
                 Screen::YouTubeMusic => self.youtube_music_selected,
                 Screen::YandexMusic => self.yandex_music_selected,
                 #[cfg(feature = "bandcamp")]
@@ -714,6 +728,8 @@ impl AppController {
         };
         self.supersede_search_generation();
         match &mut location.content {
+            #[cfg(feature = "funkwhale")]
+            Content::Funkwhale(snapshot) => self.swap_funkwhale_navigation(snapshot),
             Content::Search(search) => {
                 let selected_result = search.selected_result;
                 search.selected_result = (screen == Screen::Search
@@ -810,6 +826,10 @@ impl AppController {
         self.view.search_query = query.clone();
         self.view.selected = selected;
         match screen {
+            Screen::Funkwhale => {
+                self.funkwhale.query = query;
+                self.funkwhale.selected = selected;
+            }
             Screen::YouTubeMusic => {
                 self.youtube_music_search_query = query;
                 self.youtube_music_selected = selected;
@@ -868,6 +888,10 @@ impl AppController {
     /// Reveals existing typed provider data before using the legacy queue-only fallback.
     pub(super) fn reveal_cached_now_playing(&mut self, item: &QueueItem) -> bool {
         let id = &item.media.id;
+        #[cfg(feature = "funkwhale")]
+        if self.reveal_funkwhale_now_playing(id) {
+            return true;
+        }
         #[cfg(feature = "rss")]
         if id.source == SourceKind::Rss && self.reveal_playing_rss(id) {
             return true;

@@ -423,6 +423,30 @@ fn the_typescript_contract_names_only_fields_the_reducer_emits() {
     let view = ViewModel::default();
     let mut emitted: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
     emitted.insert("ViewModel", emitted_keys(&view));
+    let funkwhale = serde_json::to_value(ViewModel {
+        funkwhale_setup_popup: Some(youta::view::FunkwhaleSetupPopupView {
+            url: "https://music.example/".to_owned(),
+            config_file_path: "/private/fixture/config.toml".to_owned(),
+            picker: Some(youta::view::FunkwhalePodPickerView {
+                pods: vec![youta::view::FunkwhalePodView {
+                    label: "Fixture pod".to_owned(),
+                    url: "https://music.example/".to_owned(),
+                    open_registrations: Some(true),
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..ViewModel::default()
+    })
+    .expect("public Funkwhale setup projection");
+    let funkwhale = &funkwhale["funkwhale_setup_popup"];
+    emitted.insert("FunkwhaleSetupPopupView", emitted_keys(funkwhale));
+    emitted.insert("FunkwhalePodPickerView", emitted_keys(&funkwhale["picker"]));
+    emitted.insert(
+        "FunkwhalePodView",
+        emitted_keys(&funkwhale["picker"]["pods"][0]),
+    );
     let provider = serde_json::to_value(ViewModel {
         youtube_setup_popup: Some(youta::view::YouTubeSetupPopupView {
             invidious_instances: Some(youta::view::InvidiousInstancePickerView {
@@ -827,6 +851,23 @@ fn soundcloud_tab_follows_youtube_music_and_exposes_search_to_the_window() {
     );
 }
 
+/// Funkwhale source metadata follows Bandcamp only when its removable provider is compiled.
+#[test]
+fn funkwhale_tab_follows_bandcamp_and_respects_the_gui_feature() {
+    let screens = serde_json::to_value(super::screens()).expect("serialized screen catalogue");
+    let screens = screens.as_array().expect("screen catalogue array");
+    let funkwhale = screens
+        .iter()
+        .position(|screen| screen["id"] == "Funkwhale");
+    assert_eq!(funkwhale.is_some(), cfg!(feature = "funkwhale"));
+    if let Some(index) = funkwhale {
+        assert_eq!(screens[index - 1]["id"], "Bandcamp");
+        assert_eq!(screens[index]["label"], "Funkwhale");
+        assert_eq!(screens[index]["search_verb"], "Search");
+        assert_eq!(screens[index]["details_kind"], "Generic");
+    }
+}
+
 /// Public track facts retain their source semantics and lazy artwork URLs over IPC.
 #[test]
 fn soundcloud_details_preserve_known_zero_counts_genre_and_artwork_variants() {
@@ -911,6 +952,46 @@ fn public_comments_preserve_the_provider_discriminator_for_gui_labels() {
     }
 }
 
+/// Local URL text and private configuration paths never enter native-window snapshots.
+#[test]
+fn funkwhale_setup_projection_redacts_drafts_paths_and_validation_details() {
+    for draft in [
+        "https://",
+        "https://user:secret@music.example/",
+        "https://music.example/?token=secret",
+        "https://music.example/#secret",
+    ] {
+        let json = serde_json::to_value(ViewModel {
+            funkwhale_setup_popup: Some(youta::view::FunkwhaleSetupPopupView {
+                url: draft.to_owned(),
+                config_file_path: "/private/fixture/config.toml".to_owned(),
+                error: Some(format!("Invalid private draft: {draft}")),
+                ..Default::default()
+            }),
+            ..ViewModel::default()
+        })
+        .unwrap();
+        let popup = &json["funkwhale_setup_popup"];
+        assert_eq!(popup["url"], "");
+        assert_eq!(popup["config_file_path"], "config.toml");
+        assert_eq!(popup["error"], "Could not save the pod address");
+        assert!(!json.to_string().contains("secret"));
+        assert!(!json.to_string().contains("/private/fixture"));
+    }
+    let json = serde_json::to_value(ViewModel {
+        funkwhale_setup_popup: Some(youta::view::FunkwhaleSetupPopupView {
+            url: "https://music.example".to_owned(),
+            ..Default::default()
+        }),
+        ..ViewModel::default()
+    })
+    .unwrap();
+    assert_eq!(
+        json["funkwhale_setup_popup"]["url"], "https://music.example",
+        "safe drafts must not normalize the URL while the user types its hostname"
+    );
+}
+
 /// The interfaces this test checks must actually be present in the file.
 ///
 /// Without this, renaming an interface would quietly remove it from coverage
@@ -921,6 +1002,9 @@ fn every_checked_interface_is_actually_declared() {
     let declared = declared_interfaces(&source);
     for interface in [
         "ViewModel",
+        "FunkwhaleSetupPopupView",
+        "FunkwhalePodPickerView",
+        "FunkwhalePodView",
         "PopupGeometry",
         "ScrollGeometry",
         "PlaybackStatus",

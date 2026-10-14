@@ -116,6 +116,9 @@ pub const YOUTUBE_API_KEY_ENV: &str = "YOUTA_PROVIDERS__YOUTUBE_API_KEY";
 /// Environment variable that overrides the Yandex Music OAuth access token.
 pub const YANDEX_MUSIC_TOKEN_ENV: &str = "YOUTA_PROVIDERS__YANDEX_MUSIC_TOKEN";
 
+/// Environment override for the user-selected Funkwhale pod address.
+pub const FUNKWHALE_INSTANCE_URL_ENV: &str = "YOUTA_PROVIDERS__FUNKWHALE_INSTANCE_URL";
+
 /// Environment variable that overrides the Evernote authentication token.
 pub const EVERNOTE_AUTH_TOKEN_ENV: &str = "YOUTA_PROVIDERS__EVERNOTE_AUTH_TOKEN";
 
@@ -560,6 +563,34 @@ impl Config {
                 self.providers.invidious_base_url = Some(url);
             }
         }
+        Ok(())
+    }
+
+    /// Saves or removes the Funkwhale pod, preserving unrelated configuration and comments.
+    ///
+    /// # Errors
+    /// Rejects credential-bearing URLs, active environment overrides, and failed private writes.
+    #[cfg(all(feature = "controller", feature = "funkwhale"))]
+    pub fn save_funkwhale_pod(&mut self, pod: Option<Url>) -> Result<(), ConfigError> {
+        if std::env::var_os(FUNKWHALE_INSTANCE_URL_ENV).is_some() {
+            return Err(ConfigError::Invalid(format!(
+                "{FUNKWHALE_INSTANCE_URL_ENV} overrides the saved pod; change or remove it before saving"
+            )));
+        }
+        let pod = pod
+            .map(|url| validate_provider_url(url, "Funkwhale"))
+            .transpose()?;
+        self.ensure_directories()?;
+        let path = self.config_file();
+        let mut document = read_editable_config(&path)?;
+        let providers = editable_table(&mut document, "providers")?;
+        if let Some(pod) = &pod {
+            providers["funkwhale_instance_url"] = value(pod.to_string());
+        } else {
+            providers.remove("funkwhale_instance_url");
+        }
+        write_private_config(&path, document.to_string().as_bytes())?;
+        self.providers.funkwhale_instance_url = pod;
         Ok(())
     }
 
@@ -2593,6 +2624,210 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    /// Saving and clearing a pod preserve unrelated TOML, comments, and private credentials.
+    #[cfg(all(feature = "controller", feature = "funkwhale"))]
+    #[test]
+    fn funkwhale_pod_save_normalizes_round_trips_and_preserves_unrelated_settings() {
+        let directory = tempdir().unwrap();
+        let mut config = Config::for_dir(directory.path());
+        config.ensure_directories().unwrap();
+        fs::write(config.config_file(), "# preserve pod notes\n[playback]\nvolume_percent = 35 # preserve volume notes\n[providers]\nbandcamp_audio_format = 'flac'\n").unwrap();
+        let credentials = b"# preserve secret notes\n[providers]\nyoutube_api_key = 'AIzaFixture_key_123456789012345678'\n";
+        write_private_config(&config.credentials_file(), credentials).unwrap();
+        config =
+            Config::load_from_dir_with_environment(directory.path().to_owned(), false).unwrap();
+        let original_providers = config.providers.clone();
+        let normalized = Url::parse("https://pod.example.test/music/").unwrap();
+        config
+            .save_funkwhale_pod(Some(Url::parse("https://pod.example.test/music").unwrap()))
+            .unwrap();
+        assert_eq!(
+            config.providers.funkwhale_instance_url.as_ref(),
+            Some(&normalized)
+        );
+        let saved = fs::read_to_string(config.config_file()).unwrap();
+        for retained in [
+            "# preserve pod notes",
+            "volume_percent = 35 # preserve volume notes",
+            "bandcamp_audio_format = 'flac'",
+        ] {
+            assert!(saved.contains(retained), "{retained}");
+        }
+        assert!(saved.contains("funkwhale_instance_url = \"https://pod.example.test/music/\""));
+        assert_eq!(fs::read(config.credentials_file()).unwrap(), credentials);
+        let reloaded =
+            Config::load_from_dir_with_environment(directory.path().to_owned(), false).unwrap();
+        assert_eq!(reloaded.providers, config.providers);
+        assert_eq!(reloaded.playback.volume_percent, 35);
+        config.save_funkwhale_pod(None).unwrap();
+        assert_eq!(config.providers, original_providers);
+        let cleared = fs::read_to_string(config.config_file()).unwrap();
+        assert!(!cleared.contains("funkwhale_instance_url"));
+        assert!(cleared.contains("# preserve pod notes"));
+        assert_eq!(fs::read(config.credentials_file()).unwrap(), credentials);
+        assert!(
+            Config::load_from_dir_with_environment(directory.path().to_owned(), false)
+                .unwrap()
+                .providers
+                .funkwhale_instance_url
+                .is_none()
+        );
+    }
+
+    /// Invalid pod URLs fail before creating files or mutating the accepted configuration.
+    #[cfg(all(feature = "controller", feature = "funkwhale"))]
+    #[test]
+    fn funkwhale_pod_save_rejects_unsafe_urls_before_mutating_memory_or_disk() {
+        for value in [
+            "ftp://pod.example.test/",
+            "file:///private/pod",
+            "mailto:pod@example.test",
+            "https://user@pod.example.test/",
+            "https://user:secret@pod.example.test/",
+            "https://pod.example.test/?token=secret",
+            "https://pod.example.test/#secret",
+        ] {
+            let directory = tempdir().unwrap();
+            let root = directory.path().join("not-created");
+            let mut config = Config::for_dir(&root);
+            let original = config.clone();
+            let error = config
+                .save_funkwhale_pod(Some(Url::parse(value).unwrap()))
+                .unwrap_err();
+            assert!(matches!(error, ConfigError::Invalid(_)), "{value}: {error}");
+            assert!(!error.to_string().contains("secret"));
+            assert_eq!(config, original);
+            assert!(!root.exists(), "invalid input must not create directories");
+        }
+    }
+
+    /// Malformed or oversized configuration never loses its bytes or accepted pod on a failed save.
+    #[cfg(all(feature = "controller", feature = "funkwhale"))]
+    #[test]
+    fn funkwhale_pod_save_refuses_invalid_existing_toml_without_partial_updates() {
+        for original in [
+            b"[providers\nmalformed = true".to_vec(),
+            b"providers = 'not a table'\n".to_vec(),
+            vec![b'#'; usize::try_from(MAX_CONFIG_BYTES + 1).unwrap()],
+        ] {
+            let directory = tempdir().unwrap();
+            let mut config = Config::for_dir(directory.path());
+            config.providers.funkwhale_instance_url =
+                Some(Url::parse("https://previous.example.test/").unwrap());
+            fs::write(config.config_file(), &original).unwrap();
+            let before = config.clone();
+            for pod in [
+                Some(Url::parse("https://replacement.example.test/").unwrap()),
+                None,
+            ] {
+                assert!(config.save_funkwhale_pod(pod).is_err());
+                assert_eq!(fs::read(config.config_file()).unwrap(), original);
+                assert_eq!(config, before);
+            }
+        }
+    }
+
+    /// An active pod environment override rejects both saving and clearing without writes.
+    #[cfg(all(feature = "controller", feature = "funkwhale"))]
+    #[test]
+    fn funkwhale_pod_environment_override_locks_save_and_clear_without_mutation() {
+        const CHILD: &str = "YOUTA_FUNKWHALE_SAVE_TEST_CHILD";
+        const DIRECTORY: &str = "YOUTA_FUNKWHALE_SAVE_TEST_DIR";
+        if std::env::var_os(CHILD).is_some() {
+            let root = PathBuf::from(std::env::var_os(DIRECTORY).unwrap());
+            let mut config = Config::load_from_dir(root).unwrap();
+            let before = config.clone();
+            let original = fs::read(config.config_file()).unwrap();
+            assert_eq!(
+                config
+                    .providers
+                    .funkwhale_instance_url
+                    .as_ref()
+                    .unwrap()
+                    .as_str(),
+                "https://environment.example.test/"
+            );
+            for pod in [
+                Some(Url::parse("https://replacement.example.test/").unwrap()),
+                None,
+            ] {
+                let error = config.save_funkwhale_pod(pod).unwrap_err();
+                assert!(error.to_string().contains(FUNKWHALE_INSTANCE_URL_ENV));
+                assert_eq!(config, before);
+                assert_eq!(fs::read(config.config_file()).unwrap(), original);
+                assert!(!config.credentials_file().exists());
+                assert!(!config.gitignore_file().exists());
+                assert!(!config.downloads_dir().exists());
+            }
+            return;
+        }
+        let directory = tempdir().unwrap();
+        fs::write(
+			directory.path().join("config.toml"),
+			"# retain saved pod\n[providers]\nfunkwhale_instance_url = 'https://saved.example.test/'\n",
+		)
+		.unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+				.args(["--exact", "config::tests::funkwhale_pod_environment_override_locks_save_and_clear_without_mutation", "--nocapture"])
+				.env_clear()
+				.env(CHILD, "1")
+				.env(DIRECTORY, directory.path())
+				.env(CONFIG_DIR_ENV, directory.path())
+				.env(FUNKWHALE_INSTANCE_URL_ENV, "https://environment.example.test/")
+				.output()
+				.unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Atomic replacement retains old open-file bytes and publishes only private files.
+    #[cfg(all(unix, feature = "controller", feature = "funkwhale"))]
+    #[test]
+    fn funkwhale_pod_save_publishes_atomically_with_private_directory_and_file_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("youta");
+        let mut config = Config::for_dir(&root);
+        config
+            .save_funkwhale_pod(Some(Url::parse("https://first.example.test/").unwrap()))
+            .unwrap();
+        let original = fs::read(config.config_file()).unwrap();
+        let mut original_file = fs::File::open(config.config_file()).unwrap();
+        config
+            .save_funkwhale_pod(Some(Url::parse("https://second.example.test/").unwrap()))
+            .unwrap();
+        let mut retained = Vec::new();
+        original_file.read_to_end(&mut retained).unwrap();
+        assert_eq!(
+            retained, original,
+            "an old reader must retain its complete snapshot"
+        );
+        assert!(
+            fs::read_to_string(config.config_file())
+                .unwrap()
+                .contains("https://second.example.test/")
+        );
+        assert_eq!(
+            fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(config.config_file())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        let temporary = config
+            .config_file()
+            .with_extension(format!("toml.{}.tmp", std::process::id()));
+        assert!(!temporary.exists());
+    }
 
     #[cfg(feature = "controller")]
     #[test]

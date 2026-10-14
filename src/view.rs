@@ -107,6 +107,8 @@ pub enum Screen {
     YandexMusic,
     /// Artist, album, and track discovery through `Bandcamp`.
     Bandcamp,
+    /// Audio tracks from one user-configured Funkwhale pod.
+    Funkwhale,
     /// Podcast-show discovery through Apple's public catalogue.
     ApplePodcasts,
     /// Public audio discovery through archive.org.
@@ -135,12 +137,13 @@ pub enum Screen {
 
 impl Screen {
     /// Stable ordering shared by the terminal, desktop tabs, and native menus.
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 18] = [
         Self::Search,
         Self::YouTubeMusic,
         Self::SoundCloud,
         Self::YandexMusic,
         Self::Bandcamp,
+        Self::Funkwhale,
         Self::ApplePodcasts,
         Self::ArchiveOrg,
         Self::LibriVox,
@@ -162,6 +165,7 @@ impl Screen {
             Self::SoundCloud => cfg!(feature = "soundcloud"),
             Self::YandexMusic => cfg!(feature = "yandex-music"),
             Self::Bandcamp => cfg!(feature = "bandcamp"),
+            Self::Funkwhale => cfg!(feature = "funkwhale"),
             Self::ApplePodcasts => cfg!(feature = "apple-podcasts"),
             Self::ArchiveOrg => cfg!(feature = "archive-org"),
             Self::LibriVox => cfg!(feature = "librivox"),
@@ -196,6 +200,7 @@ impl Screen {
             Self::YandexMusic => InformationPanelKind::YandexMusic,
             Self::SoundCloud
             | Self::Bandcamp
+            | Self::Funkwhale
             | Self::ArchiveOrg
             | Self::Web
             | Self::Playlists
@@ -220,6 +225,7 @@ impl Screen {
             | Self::SoundCloud
             | Self::YandexMusic
             | Self::Bandcamp
+            | Self::Funkwhale
             | Self::ApplePodcasts
             | Self::ArchiveOrg
             | Self::LibriVox
@@ -243,6 +249,7 @@ impl Screen {
             Self::SoundCloud => "SoundCloud",
             Self::YandexMusic => "Yandex",
             Self::Bandcamp => "Bandcamp",
+            Self::Funkwhale => "Funkwhale",
             Self::ApplePodcasts => "Podcasts",
             Self::ArchiveOrg => "archive.org",
             Self::LibriVox => "LibriVox",
@@ -267,6 +274,7 @@ impl Screen {
             Self::SoundCloud => "SoundCloud",
             Self::YandexMusic => "Yandex",
             Self::Bandcamp => "Bandcamp",
+            Self::Funkwhale => "Funkwhale",
             Self::ApplePodcasts => "Podcasts",
             Self::ArchiveOrg => "archive.org",
             Self::LibriVox => "LibriVox",
@@ -547,6 +555,8 @@ pub enum SearchActivity {
     YandexMusic,
     /// A public track and album search through `Bandcamp`.
     Bandcamp,
+    /// A public track search through the selected Funkwhale pod.
+    Funkwhale,
     /// A show search through Apple's public podcast catalogue.
     ApplePodcasts,
     /// A public audio search through archive.org.
@@ -569,6 +579,7 @@ impl SearchActivity {
             Self::SoundCloud => Screen::SoundCloud,
             Self::YandexMusic => Screen::YandexMusic,
             Self::Bandcamp => Screen::Bandcamp,
+            Self::Funkwhale => Screen::Funkwhale,
             Self::ApplePodcasts => Screen::ApplePodcasts,
             Self::ArchiveOrg => Screen::ArchiveOrg,
             Self::LibriVox => Screen::LibriVox,
@@ -2619,6 +2630,97 @@ pub struct InvidiousInstancePickerView {
     pub error: Option<String>,
 }
 
+/// One validated public entry from Funkwhale's official pod directory.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct FunkwhalePodView {
+    /// Human-readable public pod name.
+    pub label: String,
+    /// Credential-free HTTP(S) pod base URL.
+    pub url: String,
+    /// Whether the official directory advertises open registration.
+    pub open_registrations: Option<bool>,
+}
+
+/// Lazy public-pod selection without any requests to unchosen pods.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct FunkwhalePodPickerView {
+    /// Validated directory entries, bounded by the discovery client.
+    pub pods: Vec<FunkwhalePodView>,
+    /// Highlighted entry; Enter fills the setup field without saving.
+    pub selected: usize,
+    /// A notified directory request is in progress.
+    pub loading: bool,
+    /// Safe directory failure visible while manual entry remains available.
+    pub error: Option<String>,
+}
+
+/// Private pod-address draft; only a redacted projection crosses frontend IPC.
+#[derive(Clone, Default, Eq, PartialEq)]
+pub struct FunkwhaleSetupPopupView {
+    /// Editable pod address; credentials and query parameters are never accepted.
+    pub url: String,
+    /// Exact general configuration file used by the terminal's setup hint.
+    pub config_file_path: String,
+    /// Validation failure, shown only in the in-process terminal.
+    pub error: Option<String>,
+    /// Public directory dropdown, fetched only when explicitly opened.
+    pub picker: Option<FunkwhalePodPickerView>,
+}
+
+impl std::fmt::Debug for FunkwhaleSetupPopupView {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FunkwhaleSetupPopupView")
+            .field("url_length", &self.url.len())
+            .field("has_error", &self.error.is_some())
+            .field("picker", &self.picker)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Serializes public setup state without exporting unchecked drafts or home paths.
+fn serialize_funkwhale_setup<S: serde::Serializer>(
+    popup: &Option<FunkwhaleSetupPopupView>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    #[derive(Serialize)]
+    struct PublicSetup<'a> {
+        url: String,
+        config_file_path: &'static str,
+        error: Option<&'static str>,
+        picker: &'a Option<FunkwhalePodPickerView>,
+    }
+    let projection = popup.as_ref().map(|popup| {
+        let address = popup.url.trim();
+        let address = if address.contains("://") {
+            address.to_owned()
+        } else {
+            format!("https://{address}")
+        };
+        let url = url::Url::parse(&address)
+            .ok()
+            .filter(|url| {
+                matches!(url.scheme(), "http" | "https")
+                    && url.host_str().is_some()
+                    && url.username().is_empty()
+                    && url.password().is_none()
+                    && url.query().is_none()
+                    && url.fragment().is_none()
+            })
+            .map_or_else(String::new, |_| popup.url.clone());
+        PublicSetup {
+            url,
+            config_file_path: "config.toml",
+            error: popup
+                .error
+                .as_ref()
+                .map(|_| "Could not save the pod address"),
+            picker: &popup.picker,
+        }
+    });
+    projection.serialize(serializer)
+}
+
 /// Editable provider setup opened automatically or explicitly from Preferences.
 ///
 /// The API key remains in controller-owned memory while the popup is open.
@@ -3487,6 +3589,9 @@ pub struct ViewModel {
         serialize_with = "serialize_editor_presence"
     )]
     pub yandex_music_setup_popup: Option<YandexMusicSetupPopupView>,
+    /// Pod setup with public directory entries and a redacted URL draft.
+    #[serde(serialize_with = "serialize_funkwhale_setup")]
+    pub funkwhale_setup_popup: Option<FunkwhaleSetupPopupView>,
     /// Whether this build contains the removable Commons upload capability.
     #[cfg(feature = "commons-upload")]
     pub commons_upload_supported: bool,
@@ -3638,6 +3743,7 @@ impl ViewModel {
             || self.private_note_popup.is_some()
             || self.youtube_setup_popup.is_some()
             || self.yandex_music_setup_popup.is_some()
+            || self.funkwhale_setup_popup.is_some()
             || self.rss_subscription_popup.is_some()
             || self.preferences_popup.is_some()
             || self.playlist_popup.is_some()
@@ -4044,6 +4150,7 @@ impl Default for ViewModel {
             podcast_feed_options_popup: None,
             youtube_setup_popup: None,
             yandex_music_setup_popup: None,
+            funkwhale_setup_popup: None,
             #[cfg(feature = "commons-upload")]
             commons_upload_supported: true,
             #[cfg(feature = "commons-upload")]
@@ -4135,6 +4242,28 @@ pub enum DetailsScroll {
 /// Semantic action emitted by keyboard or mouse input.
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub enum UiAction {
+    /// Configure or replace the Funkwhale pod without choosing one silently.
+    OpenFunkwhaleSetup,
+    /// Dismiss the draft without changing the active pod.
+    CloseFunkwhaleSetup,
+    /// Replace the private pod-address draft from a graphical editor.
+    SetFunkwhalePodUrl(String),
+    /// Append one terminal-entered character to the pod-address draft.
+    EditFunkwhalePodUrl(char),
+    /// Remove the final complete grapheme from the pod-address draft.
+    BackspaceFunkwhalePodUrl,
+    /// Clear the editable pod address, allowing the saved setting to be removed.
+    ClearFunkwhalePodUrl,
+    /// Validate and persist the pod address without altering unrelated settings.
+    SaveFunkwhaleSetup,
+    /// Lazily open the official public-pod directory dropdown.
+    OpenFunkwhalePodPicker,
+    /// Return to manual pod-address entry without choosing a directory entry.
+    CloseFunkwhalePodPicker,
+    /// Move the public-pod dropdown highlight without contacting any pod.
+    MoveFunkwhalePod(i64),
+    /// Copy one validated public pod into the draft; Save remains explicit.
+    SelectFunkwhalePod(usize),
     /// Exit Youta after saving state.
     Quit,
     /// Record graphical-opener and physical-Linux-console capabilities.
@@ -5210,6 +5339,8 @@ pub trait UiController {
     /// Reports visible SoundCloud track slots, excluding its continuation row.
     /// Frontends without terminal geometry may retain the controller's default.
     fn set_soundcloud_search_page_capacity(&mut self, _rows: usize) {}
+    /// Reports visible Funkwhale track slots, excluding its continuation row.
+    fn set_funkwhale_search_page_capacity(&mut self, _rows: usize) {}
 
     /// Applies one semantic user action.
     fn dispatch(&mut self, action: UiAction);
@@ -5280,6 +5411,64 @@ pub trait UiController {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// New provider ordering remains stable while feature-trimmed builds hide its tab.
+    #[test]
+    fn funkwhale_tab_follows_bandcamp_and_is_independently_optional() {
+        let index = Screen::ALL
+            .iter()
+            .position(|screen| *screen == Screen::Bandcamp)
+            .unwrap();
+        assert_eq!(Screen::ALL[index + 1], Screen::Funkwhale);
+        assert_eq!(Screen::Funkwhale.enabled(), cfg!(feature = "funkwhale"));
+        assert_eq!(
+            Screen::Funkwhale.details_kind(),
+            InformationPanelKind::Generic
+        );
+        assert_eq!(Screen::Funkwhale.search_verb(), Some("Search"));
+    }
+
+    /// Unchecked setup drafts never leak credentials, query tokens, or local home paths.
+    #[test]
+    fn funkwhale_setup_projection_redacts_private_drafts_and_diagnostics() {
+        for draft in [
+            "https://user:secret@pod.example/",
+            "https://pod.example/?token=secret",
+            "https://pod.example/#secret",
+            "file:///secret",
+            "not a URL",
+        ] {
+            let popup = FunkwhaleSetupPopupView {
+                url: draft.to_owned(),
+                config_file_path: "/home/private/config.toml".to_owned(),
+                error: Some("secret diagnostic".to_owned()),
+                picker: None,
+            };
+            assert!(!format!("{popup:?}").contains("secret"));
+            let view = ViewModel {
+                funkwhale_setup_popup: Some(popup),
+                ..ViewModel::default()
+            };
+            let value = serde_json::to_value(&view).unwrap();
+            let popup = &value["funkwhale_setup_popup"];
+            assert_eq!(popup["url"], "");
+            assert_eq!(popup["config_file_path"], "config.toml");
+            assert_eq!(popup["error"], "Could not save the pod address");
+            assert!(!view.bug_report_screenshot_allowed());
+        }
+        let view = ViewModel {
+            funkwhale_setup_popup: Some(FunkwhaleSetupPopupView {
+                url: "pod.example/prefix".to_owned(),
+                ..FunkwhaleSetupPopupView::default()
+            }),
+            ..ViewModel::default()
+        };
+        assert_eq!(
+            serde_json::to_value(view).unwrap()["funkwhale_setup_popup"]["url"],
+            "pod.example/prefix",
+            "validation must not move a typing cursor by normalizing the draft"
+        );
+    }
 
     /// Shell templates and reverse-search history can contain credentials and never leave IPC.
     #[cfg(feature = "cmd")]
@@ -5617,7 +5806,7 @@ mod tests {
             .iter()
             .position(|screen| *screen == Screen::Local)
             .unwrap();
-        assert_eq!(Screen::ALL.len(), 17);
+        assert_eq!(Screen::ALL.len(), 18);
         assert_eq!(Screen::ALL[local + 1], Screen::Web);
         assert_eq!(Screen::ALL[local + 2], Screen::Playlists);
         assert_eq!(Screen::Web.label(), "Web");

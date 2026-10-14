@@ -8,6 +8,7 @@ const TRUNCATION_NOTICE = '\n[Screenshot truncated]';
 export function captureBugReportScreenshot(view: ViewModel, readVisibleText: () => string): string | null {
 	if (view.bug_report_popup || view.private_note_open || view.rss_subscription_open
 		|| view.yandex_music_setup_open || view.youtube_provider_editor
+		|| view.funkwhale_setup_popup
 		|| view.commons_credentials_editor || view.evernote_credentials_editor
 		|| view.s3_credentials_editor || view.archive_credentials_editor
 		|| view.evernote_popup || view.commons_upload_popup || view.s3_upload_popup

@@ -258,6 +258,9 @@ src_compile() {
 		if use cmd; then
 			gui_features+=,cmd
 		fi
+		if use funkwhale; then
+			gui_features+=,funkwhale
+		fi
 		if use archive-org; then
 			gui_features+=,archive-org
 		fi
@@ -330,6 +333,10 @@ src_test() {
 		if use cmd; then
 			[[ -n ${gui_test_features} ]] && gui_test_features+=,
 			gui_test_features+=cmd
+		fi
+		if use funkwhale; then
+			[[ -n ${gui_test_features} ]] && gui_test_features+=,
+			gui_test_features+=funkwhale
 		fi
 		if use archive-org; then
 			[[ -n ${gui_test_features} ]] && gui_test_features+=,

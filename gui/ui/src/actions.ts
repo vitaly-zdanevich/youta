@@ -26,6 +26,7 @@ export type ActionScreen =
 	| 'SoundCloud'
 	| 'YandexMusic'
 	| 'Bandcamp'
+	| 'Funkwhale'
 	| 'ApplePodcasts'
 	| 'ArchiveOrg'
 	| 'LibriVox'
@@ -98,6 +99,13 @@ export type UnitUiAction =
 	| 'CancelVideoSummary'
 	| 'CheckAndDownloadNewEpisodes'
 	| 'ClearQueue'
+	| 'OpenFunkwhaleSetup'
+	| 'CloseFunkwhaleSetup'
+	| 'BackspaceFunkwhalePodUrl'
+	| 'ClearFunkwhalePodUrl'
+	| 'SaveFunkwhaleSetup'
+	| 'OpenFunkwhalePodPicker'
+	| 'CloseFunkwhalePodPicker'
 	| 'ConfirmChannelDownload'
 	| 'ConfirmDownloadedTrash'
 	| 'ConfirmGitHubIssueSubmission'
@@ -246,6 +254,10 @@ export type UnitUiAction =
  * generations, and explicit null values are part of the wire contract.
  */
 export interface UiActionPayloads {
+	SetFunkwhalePodUrl: string;
+	EditFunkwhalePodUrl: string;
+	MoveFunkwhalePod: number;
+	SelectFunkwhalePod: number;
 	RunCustomCommand: number;
 	SelectBugReportField: BugReportField;
 	MoveBugReportField: number;

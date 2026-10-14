@@ -180,6 +180,7 @@ impl AppController {
                 Screen::Search | Screen::YouTubeMusic => Some(SourceKind::YouTube),
                 Screen::SoundCloud => Some(SourceKind::SoundCloud),
                 Screen::Bandcamp => Some(SourceKind::Bandcamp),
+                Screen::Funkwhale => Some(SourceKind::Funkwhale),
                 Screen::ApplePodcasts => Some(SourceKind::ApplePodcasts),
                 Screen::ArchiveOrg => Some(SourceKind::ArchiveOrg),
                 Screen::LibriVox => Some(SourceKind::LibriVox),

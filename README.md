@@ -701,6 +701,8 @@ implement the same playback interface without changing screens or history.
   browsing, and bounded batch downloads;
 - an independent Bandcamp tab that searches public track and album pages and
   resolves only the selected release for explicit playback through `yt-dlp`;
+- an independent Funkwhale tab after Bandcamp, with explicit pod setup,
+  public-pod discovery, anonymous catalogue search, and direct audio playback;
 - an independent Podcasts tab that searches the public, unauthenticated
   Apple catalogue by storefront and lazily loads playable episode metadata;
 - an archive.org tab for public audio search, item and track browsing, downloads,
@@ -732,10 +734,10 @@ resolver:
   can search videos, channels, and playlists known to that instance; federated
   or global-search coverage depends on the instance administrator. See the
   [PeerTube REST API](https://docs.joinpeertube.org/api-rest-reference).
-- **Funkwhale** is a first-class, configurable-instance audio provider. Youta
-  targets Funkwhale's stable REST API first and may share a narrow compatibility
-  layer with its supported subset of Subsonic. See the [Funkwhale API
-  documentation](https://docs.funkwhale.audio/developer/api/).
+- **Funkwhale** has its own tab after Bandcamp and uses one user-selected pod's
+  official REST API for public audio search and playback. No pod is preset.
+  See [Funkwhale pods](#funkwhale-pods) for setup and the
+  [official API schema](https://docs.funkwhale.audio/swagger/schema.yml).
 - **Jamendo** is a first-class music provider using only the official v3 tracks
   API. It offers bounded paginated search, duration/release filters,
   total-listen ordering, direct track lookup, artwork, stream links, and
@@ -1171,7 +1173,7 @@ dependencies, or the optional Linux virtual-console mouse client with:
 
 ```sh
 cargo build --release --locked --no-default-features \
-	--features app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,hover,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info,web-browser,youtube-captions
+	--features app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info,web-browser,youtube-captions
 ```
 
 The `app` profile includes the experimental YandexMusic adapter but does not
@@ -1182,7 +1184,7 @@ with:
 
 ```sh
 cargo build --release --locked --no-default-features \
-	--features app-core,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,hover,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info,web-browser,youtube-captions
+	--features app-core,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info,web-browser,youtube-captions
 ```
 
 Omit `images` from that command for the Yandex-free text-only variant. Omit
@@ -1205,6 +1207,7 @@ leave it out of an explicit `--no-default-features` feature list:
 | `url-info` | On-demand website metadata and public RDAP/WHOIS facts for Local comments, YouTube descriptions, and Apple Podcasts or RSS podcast descriptions. |
 | `commons-upload` | Commons authentication, upload client, and review UI. |
 | `evernote` | Evernote client and audio-note UI. |
+| `funkwhale` | Funkwhale tab, pod setup, public-pod directory, REST catalogue, and direct audio playback. |
 | `gpm` | Linux virtual-console mouse input; opt in explicitly in either custom example. |
 | `hover` | Passive terminal tab/button backgrounds and coalesced mouse-motion redraws. |
 | `images` | Image decoding and terminal graphics protocols. |
@@ -1933,6 +1936,48 @@ profiles. Cancellation terminates the active caption or Codex process tree.
 Windows descendant termination is best-effort through `taskkill /T`, matching
 Youta's existing helper-process boundary. Youta does not retry a failed summary
 automatically.
+
+### Funkwhale pods
+
+The **Funkwhale** tab follows Bandcamp in the terminal and desktop. Its first
+visit opens pod setup because Youta has no preset pod. Press `F4` on this tab,
+or use the desktop **Pod setup** button, to change the saved address later.
+Enter a custom HTTP(S) base URL; an address without a scheme defaults to HTTPS.
+Pod subpaths are supported. Save with Enter or **Save**; clear the address and
+save to remove it. Esc closes setup without saving its draft.
+
+Inside setup, `F4` / **Choose public pod** opens the
+[official Funkwhale Join directory](https://www.funkwhale.audio/join/).
+The list loads only when opened and displays advertised pod names and open or
+closed registration when available. Use Up/Down or click a pod; Enter fills the
+address draft. Save separately to use it. A registration label describes
+account signup, not anonymous listening availability. Directory failure leaves
+manual URL entry available, and `F4` retries the directory request.
+
+The saved setting is `providers.funkwhale_instance_url` in `config.toml`.
+`YOUTA_PROVIDERS__FUNKWHALE_INSTANCE_URL` overrides it; remove or change that
+environment variable before saving a different pod in setup.
+Press `/` to search the selected pod, then Enter to play a track. Searches use
+the visible page capacity, up to 100 tracks, with explicit **Load more tracks**
+pagination. Details include the pod's metadata, available artwork, and original
+track and artist URLs. Catalogue and playback availability depend on the pod:
+HTTP 401/403 errors identify an authentication restriction. Youta does not
+implement Funkwhale account login or OAuth in this release.
+
+The adapter tries the stable v1 music API first, switches to v2 only on 404,
+and retains the working version for that provider. Audio uses the advertised
+listen URL directly, without `yt-dlp`. Log and queue entries retain canonical
+pod-scoped track-page URLs; playback resolves a fresh stream from the original
+pod, so equal numeric IDs on different pods cannot select the wrong track.
+Turning off **Save log and searches** also clears saved Funkwhale queries and
+prevents their restoration.
+
+The independent `funkwhale` Cargo feature is enabled by default in both
+frontends. Omit it from an explicit `--no-default-features` build to remove the
+adapter and tab; `app`, `app-core`, `sources`, and `tui` do not force it.
+The Gentoo source template maps `USE="-funkwhale"` to the same removal in
+terminal and desktop builds. See the
+[Funkwhale API documentation](https://docs.funkwhale.audio/developer/api/).
 
 ### Playback resolution and format preferences
 
@@ -3455,7 +3500,7 @@ can independently disable them with
 conventional `USE="-images"` and `USE="-qr"` overrides.
 
 The source package maps the default-enabled `ascii-visualizer`, `audio-quality`, `cache`,
-`commons-upload`, `evernote`, `lan-sharing`, `local-archives`, `nyan-cat`,
+`commons-upload`, `evernote`, `funkwhale`, `lan-sharing`, `local-archives`, `nyan-cat`,
 `sponsorblock`, `summary`, and `youtube-captions` flags to their Cargo features.
 
 | Source package override | What it removes |
@@ -3466,6 +3511,7 @@ The source package maps the default-enabled `ascii-visualizer`, `audio-quality`,
 | `USE="-cache"` | Session RAM audio caching in both frontends. |
 | `USE="-commons-upload"` | Commons client and review UI. |
 | `USE="-evernote"` | Evernote EDAM client and note UI. |
+| `USE="-funkwhale"` (next release template) | Funkwhale tab, pod setup/directory, and API client in both frontends. |
 | `USE="-hover"` (next release template) | Terminal hover backgrounds and motion coalescing; clicks and scrolling remain. |
 | `USE="-lan-sharing"` | Session HTTP server, LAN-share/feed actions, and their QR workflow. |
 | `USE="-local-archives"` | ZIP/RAR Local folders and the RAR helper dependency. |

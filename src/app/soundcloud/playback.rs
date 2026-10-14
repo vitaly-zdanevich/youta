@@ -46,6 +46,8 @@ impl AppController {
         queue_cursor_already_positioned: bool,
         origin: Option<AutoplayOrigin>,
     ) {
+        #[cfg(feature = "funkwhale")]
+        self.cancel_funkwhale_playback();
         self.cancel_pending_soundcloud_playback();
         let canonical = match self
             .soundcloak_client()

@@ -14,6 +14,7 @@ import { AsciiVisualizer } from './components/AsciiVisualizer';
 import { BugReportPopup } from './components/BugReportPopup';
 import { CustomCommandOutputPopup } from './components/CustomCommands';
 import { SiteFilePopup } from './components/SiteFilePopup';
+import { FunkwhaleSetupPopup } from './components/FunkwhaleSetupPopup';
 import { captureBugReportScreenshot, visibleWindowText } from './bugReport';
 import {
   AudioQualityPopup,
@@ -285,6 +286,7 @@ export function App() {
 			<EvernoteCredentialsPopup editor={view.evernote_credentials_editor} />
 		) : null}
 		{view.archive_upload_popup ? <ArchiveUploadPopup popup={view.archive_upload_popup} /> : null}
+		{view.funkwhale_setup_popup ? <FunkwhaleSetupPopup popup={view.funkwhale_setup_popup} /> : null}
 		{view.archive_credentials_editor ? <ArchiveCredentialsPopup editor={view.archive_credentials_editor} /> : null}
 		{view.s3_upload_popup ? <S3UploadPopup popup={view.s3_upload_popup} /> : null}
 		{view.s3_credentials_editor ? <S3CredentialsPopup editor={view.s3_credentials_editor} /> : null}

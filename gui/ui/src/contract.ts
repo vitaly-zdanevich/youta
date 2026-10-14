@@ -1140,6 +1140,7 @@ export interface ViewModel {
 	custom_command_output?: CustomCommandOutputView | null;
   // Redacted projections expose editor controls without returning credentials.
 	youtube_provider_editor: YouTubeProviderEditorView | null;
+	funkwhale_setup_popup: FunkwhaleSetupPopupView | null;
   yandex_music_setup_open: boolean;
   commons_upload_supported: boolean;
   commons_upload_available: boolean;
@@ -1163,6 +1164,29 @@ export interface ViewModel {
   search_animation_frame: number;
   local_fingerprint_animation_frame: number;
   playback_start_animation_frame: number;
+}
+
+/** A public pod entry supplied by the native Funkwhale directory client. */
+export interface FunkwhalePodView {
+	label: string;
+	url: string;
+	open_registrations: boolean | null;
+}
+
+/** On-demand public pod results; selection fills the editor without saving it. */
+export interface FunkwhalePodPickerView {
+	pods: FunkwhalePodView[];
+	selected: number;
+	loading: boolean;
+	error: string | null;
+}
+
+/** Credential-free setup projection; partial URL drafts stay local to the editor. */
+export interface FunkwhaleSetupPopupView {
+	url: string;
+	config_file_path: string;
+	error: string | null;
+	picker: FunkwhalePodPickerView | null;
 }
 
 /** Exact reducer field tags; typed values stay in the native process. */

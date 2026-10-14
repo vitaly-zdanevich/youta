@@ -36,6 +36,16 @@ test('bug report GUI capture is byte bounded and survives unavailable DOM text',
 	assert.equal(captureBugReportScreenshot({}, () => { throw new Error('DOM unavailable'); }), null);
 });
 
+/** A local URL draft may contain credentials before native validation rejects it. */
+test('Funkwhale setup never reads the locally edited URL into a report screenshot', () => {
+	let reads = 0;
+	assert.equal(captureBugReportScreenshot({ funkwhale_setup_popup: { url: '', picker: null } }, () => {
+		reads++;
+		return 'Unchecked URL draft';
+	}), null);
+	assert.equal(reads, 0);
+});
+
 test('visible GUI capture marks DOM traversal limits without reading beyond them', () => {
 	const prior = globalThis.NodeFilter;
 	globalThis.NodeFilter = { SHOW_TEXT: 4 };

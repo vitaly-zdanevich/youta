@@ -1388,6 +1388,8 @@ pub enum Screen {
     YandexMusic,
     /// Bandcamp track and album search results.
     Bandcamp,
+    /// Track search on the configured Funkwhale pod.
+    Funkwhale,
     /// `Apple Podcasts` show search results and details.
     ApplePodcasts,
     /// Internet Archive media search and item-file navigation.
@@ -1554,6 +1556,9 @@ pub struct SessionState {
     /// Last selected row in the independent Bandcamp result list.
     #[serde(default)]
     pub bandcamp_selected_row: Option<usize>,
+    /// Last selected row in the independent Funkwhale result list.
+    #[serde(default)]
+    pub funkwhale_selected_row: Option<usize>,
     /// Last selected row in the independent `Apple Podcasts` result list.
     #[serde(default)]
     pub apple_podcasts_selected_row: Option<usize>,
@@ -1591,6 +1596,9 @@ pub struct SessionState {
     /// Last search text entered on the independent Bandcamp tab.
     #[serde(default)]
     pub bandcamp_search_text: String,
+    /// Last query submitted to the configured Funkwhale pod.
+    #[serde(default)]
+    pub funkwhale_search_text: String,
     /// Last search text entered on the independent `Podcasts` tab.
     #[serde(default)]
     pub apple_podcasts_search_text: String,
@@ -1634,6 +1642,7 @@ impl Default for SessionState {
             soundcloud_selected_row: None,
             yandex_music_selected_row: None,
             bandcamp_selected_row: None,
+            funkwhale_selected_row: None,
             apple_podcasts_selected_row: None,
             archive_org_selected_row: None,
             librivox_selected_row: None,
@@ -1646,6 +1655,7 @@ impl Default for SessionState {
             soundcloud_search_text: String::new(),
             yandex_music_search_text: String::new(),
             bandcamp_search_text: String::new(),
+            funkwhale_search_text: String::new(),
             apple_podcasts_search_text: String::new(),
             archive_org_search_text: String::new(),
             archive_org_search_scope: ArchiveOrgSearchScope::Text,
@@ -1674,6 +1684,7 @@ impl SessionState {
             | Screen::SoundCloud
             | Screen::YandexMusic
             | Screen::Bandcamp
+            | Screen::Funkwhale
             | Screen::ApplePodcasts
             | Screen::ArchiveOrg
             | Screen::LibriVox
@@ -1700,6 +1711,7 @@ impl SessionState {
         self.soundcloud_selected_row = None;
         self.yandex_music_selected_row = None;
         self.bandcamp_selected_row = None;
+        self.funkwhale_selected_row = None;
         self.apple_podcasts_selected_row = None;
         self.archive_org_selected_row = None;
         self.librivox_selected_row = None;
@@ -1711,6 +1723,7 @@ impl SessionState {
         self.soundcloud_search_text.clear();
         self.yandex_music_search_text.clear();
         self.bandcamp_search_text.clear();
+        self.funkwhale_search_text.clear();
         self.apple_podcasts_search_text.clear();
         self.archive_org_search_text.clear();
         self.archive_org_search_scope = ArchiveOrgSearchScope::Text;
@@ -1992,6 +2005,78 @@ mod tests {
         assert!(!state.navigate_back());
     }
 
+    /// Funkwhale browsing state survives restarts without depending on the provider feature.
+    #[test]
+    fn funkwhale_session_round_trips_query_selection_and_tab_without_provider_state() {
+        let state = SessionState {
+            screen: Screen::Funkwhale,
+            funkwhale_selected_row: Some(4),
+            funkwhale_search_text: "ambient Мінск".to_owned(),
+            soundcloud_selected_row: Some(2),
+            soundcloud_search_text: "independent SoundCloud query".to_owned(),
+            ..SessionState::default()
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        assert_eq!(serde_json::from_str::<SessionState>(&json).unwrap(), state);
+        let mut legacy: serde_json::Value = serde_json::from_str(&json).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("funkwhale_selected_row");
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("funkwhale_search_text");
+        let restored: SessionState = serde_json::from_value(legacy).unwrap();
+        assert_eq!(restored.funkwhale_selected_row, None);
+        assert_eq!(restored.funkwhale_search_text, "");
+        assert_eq!(restored.screen, Screen::Funkwhale);
+        assert_eq!(
+            restored.soundcloud_search_text,
+            state.soundcloud_search_text
+        );
+        assert_eq!(restored.soundcloud_selected_row, Some(2));
+    }
+
+    /// Privacy clearing removes Funkwhale browsing and remote identities on every active tab.
+    #[test]
+    fn funkwhale_session_privacy_clears_queries_rows_and_remote_media_on_all_tabs() {
+        for screen in [Screen::Funkwhale, Screen::Local] {
+            let mut state = SessionState {
+                screen: screen.clone(),
+                back_stack: vec![Screen::Funkwhale],
+                selected_media: Some(MediaId::new(SourceKind::Funkwhale, "private-track")),
+                selected_row: 7,
+                details_scroll: 12,
+                funkwhale_selected_row: Some(7),
+                funkwhale_search_text: "private-funkwhale-query".to_owned(),
+                local_path: Some("/music".to_owned()),
+                waveform_visible: true,
+                ..SessionState::default()
+            };
+            state.clear_online_browsing();
+            assert_eq!(state.screen, screen);
+            assert_eq!(state.funkwhale_selected_row, None);
+            assert_eq!(state.funkwhale_search_text, "");
+            assert!(state.selected_media.is_none());
+            assert!(state.back_stack.is_empty());
+            assert_eq!(
+                state.selected_row,
+                if screen == Screen::Funkwhale { 0 } else { 7 }
+            );
+            assert_eq!(
+                state.details_scroll,
+                if screen == Screen::Funkwhale { 0 } else { 12 }
+            );
+            assert_eq!(state.local_path.as_deref(), Some("/music"));
+            assert!(state.waveform_visible);
+            assert!(!serde_json::to_string(&state).unwrap().contains("private-"));
+            let cleared = state.clone();
+            state.clear_online_browsing();
+            assert_eq!(state, cleared);
+        }
+    }
+
     /// Populates every persisted provider field, including features absent from this build.
     fn private_online_session(screen: Screen) -> SessionState {
         SessionState {
@@ -2005,6 +2090,7 @@ mod tests {
             soundcloud_selected_row: Some(3),
             yandex_music_selected_row: Some(4),
             bandcamp_selected_row: Some(5),
+            funkwhale_selected_row: Some(10),
             apple_podcasts_selected_row: Some(6),
             archive_org_selected_row: Some(7),
             librivox_selected_row: Some(8),
@@ -2017,6 +2103,7 @@ mod tests {
             soundcloud_search_text: "private-soundcloud".to_owned(),
             yandex_music_search_text: "private-yandex-music".to_owned(),
             bandcamp_search_text: "private-bandcamp".to_owned(),
+            funkwhale_search_text: "private-funkwhale".to_owned(),
             apple_podcasts_search_text: "private-apple-podcasts".to_owned(),
             archive_org_search_text: "private-archive".to_owned(),
             archive_org_search_scope: ArchiveOrgSearchScope::Creator,

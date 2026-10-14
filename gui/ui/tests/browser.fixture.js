@@ -67,6 +67,8 @@
 		{ id: 'Search', label: 'YouTube', details_kind: 'Video', search_verb: 'Search' },
 		{ id: 'YouTubeMusic', label: 'YT Music', details_kind: 'Video', search_verb: 'Search' },
 		{ id: 'SoundCloud', label: 'SoundCloud', details_kind: 'Generic', search_verb: 'Search' },
+		{ id: 'Bandcamp', label: 'Bandcamp', details_kind: 'Generic', search_verb: 'Search' },
+		{ id: 'Funkwhale', label: 'Funkwhale', details_kind: 'Generic', search_verb: 'Search' },
 		{ id: 'ApplePodcasts', label: 'Podcasts', details_kind: 'Podcast', search_verb: 'Search' },
 		{ id: 'ArchiveOrg', label: 'archive.org', details_kind: 'Generic', search_verb: 'Search' },
 		{ id: 'LibriVox', label: 'LibriVox', details_kind: 'Podcast', search_verb: 'Search' },
@@ -524,6 +526,82 @@
 		await key('Q', { Char: 'Q' }, { shiftKey: true });
 		snapshot(previous);
 		await until(() => !document.querySelector('[data-subscriptions-screen]'), 'restore the prior screen after live fixtures');
+	}
+
+	/** The desktop URL editor retains partial text while public pod choices remain native actions. */
+	async function checkFunkwhaleSetup() {
+		const previous = clone(view);
+		snapshot({ screen: 'Funkwhale', rows: [], details: null, search_editing: false });
+		await until(() => button('Pod setup'), 'Funkwhale setup header');
+		const sourceLabels = [...document.querySelector('[aria-label=Sources]').querySelectorAll('button')]
+			.map((node) => node.textContent.trim());
+		assert(sourceLabels.indexOf('Funkwhale') === sourceLabels.indexOf('Bandcamp') + 1,
+			'Funkwhale follows Bandcamp in the native source catalogue');
+		await action('OpenFunkwhaleSetup', () => button('Pod setup').click(), 'Funkwhale header opens its setup dialog');
+		const setup = { url: '', config_file_path: 'config.toml', error: null, picker: null };
+		snapshot({ funkwhale_setup_popup: setup });
+		const input = await until(() => dialog()?.querySelector('input[type=url]'), 'manual pod URL editor');
+		await until(() => document.activeElement === input, 'pod URL receives initial focus');
+		await action({ SetFunkwhalePodUrl: 'https://' }, () => {
+			Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, 'https://');
+			input.dispatchEvent(new Event('input', { bubbles: true }));
+		}, 'Manual partial URL edits reach only the core setup action');
+		snapshot({ funkwhale_setup_popup: { ...setup }, status_line: 'Partial URL remains private', transient_footer_notice: null });
+		await until(() => document.body.textContent.includes('Partial URL remains private'), 'redacted setup snapshot');
+		assert(input.value === 'https://', 'Redacted native snapshots preserve partially typed URL text');
+		const custom = 'https://custom.example/';
+		await action({ SetFunkwhalePodUrl: custom }, () => {
+			Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, custom);
+			input.dispatchEvent(new Event('input', { bubbles: true }));
+		}, 'Custom pod URLs use the same native validation path');
+		const beforeEnter = calls.length;
+		await action('SaveFunkwhaleSetup', () => input.dispatchEvent(new KeyboardEvent('keydown', {
+			key: 'Enter', bubbles: true, cancelable: true,
+		})), 'URL Enter explicitly saves the pod draft once');
+		assert(!calls.slice(beforeEnter).some((call) => call.command === 'key')
+			&& calls.slice(beforeEnter).filter((call) => call.command === 'dispatch').length === 1,
+			'URL Enter cannot also reach search or playback keyboard routing');
+		snapshot({ funkwhale_setup_popup: { ...setup, url: custom, error: 'Could not save the pod URL.' } });
+		await until(() => dialog()?.querySelector('[role=alert]'), 'pod setup validation feedback');
+		await action('OpenFunkwhalePodPicker', () => button('Choose public pod', dialog()).click(), 'Public pod discovery starts only on explicit request');
+		const picker = { pods: [], selected: 0, loading: true, error: null };
+		snapshot({ funkwhale_setup_popup: { ...setup, url: custom, picker } });
+		await until(() => dialog()?.querySelector('[role=status]'), 'public pod loading state');
+		assert(input.disabled && button('Save', dialog()).disabled, 'An open pod list cannot save or alter the parked URL field');
+		snapshot({ funkwhale_setup_popup: { ...setup, picker: { ...picker, loading: false, error: '<script>Directory unavailable</script>' } } });
+		await until(() => dialog()?.textContent.includes('<script>Directory unavailable</script>'), 'public pod directory error');
+		assert(!dialog().querySelector('script'), 'Directory failure text never becomes markup');
+		await action('OpenFunkwhalePodPicker', () => button('Retry', dialog()).click(), 'Public pod lookup can retry after failure');
+		snapshot({ funkwhale_setup_popup: { ...setup, picker: { ...picker, loading: false } } });
+		await until(() => dialog()?.textContent.includes('No public pods'), 'empty public pod directory');
+		const pods = Array.from({ length: 30 }, (_, index) => ({
+			label: `Music pod ${index}`, url: `https://pod-${index}.example/`, open_registrations: index % 2 === 0,
+		}));
+		snapshot({ funkwhale_setup_popup: { ...setup, picker: { ...picker, pods, selected: 29, loading: false } } });
+		const selected = await until(() => dialog()?.querySelector('[role=option][aria-selected=true]'), 'selected public pod');
+		await until(() => dialog()?.querySelector('[role=listbox]')?.scrollTop > 0, 'selected public pod scrolls into view');
+		assert(selected.textContent.includes('Music pod 29') && selected.textContent.includes('Registration closed'),
+			'Pod labels, URLs and registration availability render from the native projection');
+		await action({ MoveFunkwhalePod: -1 }, () => selected.dispatchEvent(new KeyboardEvent('keydown', {
+			key: 'ArrowUp', bubbles: true, cancelable: true,
+		})), 'ArrowUp changes only the native pod highlight');
+		snapshot({ funkwhale_setup_popup: { ...setup, picker: { ...picker, pods, selected: 28, loading: false } } });
+		const next = await until(() => dialog()?.querySelector('[role=option][aria-selected=true]')?.textContent.includes('Music pod 28')
+			&& dialog().querySelector('[role=option][aria-selected=true]'), 'updated public pod highlight');
+		const beforeSelection = calls.length;
+		await action({ SelectFunkwhalePod: 28 }, () => next.dispatchEvent(new KeyboardEvent('keydown', {
+			key: 'Enter', bubbles: true, cancelable: true,
+		})), 'Pod Enter fills the selected native URL');
+		assert(!calls.slice(beforeSelection).some((call) => call.command === 'dispatch' && call.args.action === 'SaveFunkwhaleSetup'),
+			'Choosing a public pod requires a separate Save action');
+		snapshot({ funkwhale_setup_popup: { ...setup, url: pods[28].url } });
+		await until(() => input.value === pods[28].url && !input.disabled, 'selected pod fills the manual URL field');
+		await action('CloseFunkwhaleSetup', () => input.dispatchEvent(new KeyboardEvent('keydown', {
+			key: 'Escape', bubbles: true, cancelable: true,
+		})), 'URL Escape cancels setup through its native action');
+		snapshot({ funkwhale_setup_popup: null, screen: 'Bandcamp' });
+		await until(() => !dialog() && !button('Pod setup'), 'setup is scoped to the Funkwhale source');
+		snapshot(previous);
 	}
 
 	/** Exercise provider settings without providing a credential to the web-view fixture. */
@@ -1356,6 +1434,7 @@
 		await checkPreferencesFocus();
 		await checkUnsubscribeConfirmation();
 		await checkProviderSettings();
+		await checkFunkwhaleSetup();
 		await checkArchivePlaybackChoices();
 		assert(!button('[Esc] Back'), 'Archive root hides Back when no return route exists');
 		const tabs = [...document.querySelectorAll('[aria-label=Sources] button')].map((node) => node.textContent);

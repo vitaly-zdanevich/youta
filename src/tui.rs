@@ -4,6 +4,8 @@
 //! writes to the terminal and does not create a second user interface.
 
 mod bug_report;
+#[cfg(feature = "funkwhale")]
+mod funkwhale;
 #[cfg(feature = "hover")]
 mod hover;
 #[cfg(all(test, feature = "hover"))]
@@ -1340,6 +1342,8 @@ fn synchronize_search_page_capacities(controller: &mut impl UiController, area: 
     controller.set_archive_org_search_page_capacity(capacity);
     let capacity = soundcloud_search_page_capacity(area, controller.view());
     controller.set_soundcloud_search_page_capacity(capacity);
+    let capacity = source_search_page_capacity(area, controller.view(), Screen::Funkwhale);
+    controller.set_funkwhale_search_page_capacity(capacity);
 }
 
 /// Applies the controller's live physical-TTY artwork preference.
@@ -2133,6 +2137,12 @@ struct HitMap {
     youtube_setup_buttons: Vec<(UiAction, Rect)>,
     yandex_music_setup_field: Option<Rect>,
     yandex_music_setup_buttons: Vec<(UiAction, Rect)>,
+    /// Visible controls for the explicit Funkwhale pod-address setup.
+    #[cfg(feature = "funkwhale")]
+    funkwhale_setup_buttons: Vec<(UiAction, Rect)>,
+    /// Exact public directory rows; these are selections, not hoverable buttons.
+    #[cfg(feature = "funkwhale")]
+    funkwhale_pod_rows: Vec<(usize, Rect)>,
     #[cfg(feature = "commons-upload")]
     commons_upload_fields: Vec<(CommonsUploadField, Rect)>,
     #[cfg(feature = "commons-upload")]
@@ -2600,6 +2610,7 @@ fn render_frame(
         || view.project_history_popup.is_some()
         || view.youtube_setup_popup.is_some()
         || view.yandex_music_setup_popup.is_some()
+        || view.funkwhale_setup_popup.is_some()
         || view.rss_subscription_popup.is_some()
         || view.unsubscribe_popup.is_some()
         || view.preferences_popup.is_some()
@@ -2717,6 +2728,14 @@ fn render_frame(
     }
     hit_map.yandex_music_setup_field = None;
     hit_map.yandex_music_setup_buttons.clear();
+    #[cfg(feature = "funkwhale")]
+    {
+        hit_map.funkwhale_setup_buttons.clear();
+        hit_map.funkwhale_pod_rows.clear();
+        if let Some(popup) = view.funkwhale_setup_popup.as_ref() {
+            funkwhale::render_popup(frame, popup, settings.show_hotkeys, &theme, hit_map);
+        }
+    }
     if let Some(setup) = view.yandex_music_setup_popup.as_ref() {
         render_yandex_music_setup_popup(
             frame,
@@ -3330,6 +3349,7 @@ fn search_panel_title(view: &ViewModel) -> String {
             ),
             Screen::YouTubeMusic
             | Screen::SoundCloud
+            | Screen::Funkwhale
             | Screen::Bandcamp
             | Screen::ApplePodcasts
             | Screen::ArchiveOrg
@@ -3478,6 +3498,7 @@ fn main_list_pane_areas(mut pane: Rect, screen: Screen) -> (Rect, Rect) {
         | Screen::YouTubeMusic
         | Screen::ArchiveOrg
         | Screen::SoundCloud
+        | Screen::Funkwhale
         | Screen::ApplePodcasts
         | Screen::TrackerMusic
         | Screen::Local => 1,
@@ -3543,6 +3564,7 @@ fn render_body(
             | Screen::YouTubeMusic
             | Screen::ArchiveOrg
             | Screen::SoundCloud
+            | Screen::Funkwhale
             | Screen::ApplePodcasts
             | Screen::TrackerMusic
             | Screen::Local
@@ -3613,6 +3635,17 @@ fn render_catalog_playback_controls(
         return;
     }
     let mut x = area.x;
+    #[cfg(feature = "funkwhale")]
+    if view.screen == Screen::Funkwhale {
+        let label = button("F4", "Pod", show_hotkeys);
+        let width = terminal_text_width(&label).min(area.width);
+        let target = Rect::new(x, area.y, width, 1);
+        frame.render_widget(Paragraph::new(label).style(theme.accent), target);
+        hit_map
+            .detail_buttons
+            .push((UiAction::OpenFunkwhaleSetup, target));
+        x = x.saturating_add(width).saturating_add(2);
+    }
     // Back has priority in narrow catalogue panes; the playback hotkeys remain global.
     for (key, label, action) in ((view.screen == Screen::ArchiveOrg
         && view.archive_org_back_available)
@@ -4572,6 +4605,7 @@ fn completed_search_has_no_rows(view: &ViewModel) -> bool {
         Screen::Search
         | Screen::YouTubeMusic
         | Screen::SoundCloud
+        | Screen::Funkwhale
         | Screen::Bandcamp
         | Screen::ApplePodcasts
         | Screen::ArchiveOrg
@@ -15950,6 +15984,10 @@ fn mouse_action_unfiltered(
             _ => None,
         };
     }
+    #[cfg(feature = "funkwhale")]
+    if view.funkwhale_setup_popup.is_some() {
+        return funkwhale::mouse_action(mouse, hit_map);
+    }
     if let Some(popup) = view.site_file_popup.as_ref() {
         return match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => hit_map
@@ -18635,6 +18673,7 @@ for encoded, expected in json.load(sys.stdin):
             Screen::YouTubeMusic,
             Screen::SoundCloud,
             Screen::Bandcamp,
+            Screen::Funkwhale,
             Screen::ApplePodcasts,
             Screen::ArchiveOrg,
             Screen::LibriVox,
@@ -45581,6 +45620,8 @@ prose 07:25 remains clickable but is not a chapter";
                 Screen::YandexMusic,
                 #[cfg(feature = "bandcamp")]
                 Screen::Bandcamp,
+                #[cfg(feature = "funkwhale")]
+                Screen::Funkwhale,
                 #[cfg(feature = "apple-podcasts")]
                 Screen::ApplePodcasts,
                 #[cfg(feature = "archive-org")]

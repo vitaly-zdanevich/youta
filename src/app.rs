@@ -27,6 +27,7 @@ mod deadlines;
 mod download_choice;
 mod email_links;
 mod end_pause;
+mod funkwhale;
 mod invidious_instances;
 #[cfg(feature = "yt-dlp")]
 mod live_start;
@@ -822,6 +823,8 @@ pub enum SearchRoute {
     YandexMusic,
     /// The Bandcamp tab queries public track and album search pages.
     Bandcamp,
+    /// Track catalogue on the explicitly configured Funkwhale pod.
+    Funkwhale,
     /// The podcast tab queries Apple's public, storefront-specific catalogue.
     ApplePodcasts,
     /// The archive.org tab queries its public audio catalogue.
@@ -2426,6 +2429,7 @@ pub const fn search_route(screen: Screen) -> SearchRoute {
         Screen::SoundCloud => SearchRoute::SoundCloud,
         Screen::YandexMusic => SearchRoute::YandexMusic,
         Screen::Bandcamp => SearchRoute::Bandcamp,
+        Screen::Funkwhale => SearchRoute::Funkwhale,
         Screen::ApplePodcasts => SearchRoute::ApplePodcasts,
         Screen::ArchiveOrg => SearchRoute::ArchiveOrg,
         Screen::LibriVox => SearchRoute::LibriVox,
@@ -3909,6 +3913,11 @@ enum AutoplayOrigin {
         items: Arc<[QueueItem]>,
         index: usize,
     },
+    #[cfg(feature = "funkwhale")]
+    Funkwhale {
+        items: Arc<[QueueItem]>,
+        index: usize,
+    },
     #[cfg(feature = "yandex-music")]
     YandexMusic {
         /// Credential-free tracks captured from the activated provider list.
@@ -4832,6 +4841,8 @@ pub struct AppController {
     bandcamp_next_page: Option<u16>,
     /// Independent SoundCloud query, bounded worker, and canonical result set.
     soundcloud: soundcloud::SoundCloudState,
+    /// Pod-scoped catalogue, lazy directory, and bounded notified request lane.
+    funkwhale: funkwhale::FunkwhaleState,
     /// Query retained independently for the tracker-archive tab.
     tracker_search_query: String,
     /// Selected tracker row retained while another tab is visible.
@@ -6122,6 +6133,8 @@ impl AppController {
                 StoredScreen::YandexMusic => saved.yandex_music_search_text.clone(),
                 #[cfg(feature = "bandcamp")]
                 StoredScreen::Bandcamp => saved.bandcamp_search_text.clone(),
+                #[cfg(feature = "funkwhale")]
+                StoredScreen::Funkwhale => saved.funkwhale_search_text.clone(),
                 StoredScreen::ApplePodcasts => saved.apple_podcasts_search_text.clone(),
                 #[cfg(feature = "archive-org")]
                 StoredScreen::ArchiveOrg => saved.archive_org_search_text.clone(),
@@ -6528,6 +6541,7 @@ impl AppController {
             archive_org_search_scope: saved.archive_org_search_scope,
             archive_org_selected,
             soundcloud: soundcloud::SoundCloudState::restored(&saved),
+            funkwhale: funkwhale::FunkwhaleState::restored(&saved),
             librivox_search_query,
             librivox_selected,
             #[cfg(feature = "web-browser")]
@@ -7319,6 +7333,8 @@ impl AppController {
         let preparing = history_pending;
         #[cfg(feature = "yt-dlp")]
         let preparing = preparing || self.live_start.preparing();
+        #[cfg(feature = "funkwhale")]
+        let preparing = preparing || self.funkwhale_playback_pending();
         let was_pending = self.view.playback_activity_pending();
         self.view.playback_preparing = preparing
             && !self.view.quitting
@@ -7962,6 +7978,7 @@ impl AppController {
                 Err(error) => self.view.status_line = error.to_owned(),
             },
             SearchRoute::SoundCloud => self.submit_soundcloud_search(query),
+            SearchRoute::Funkwhale => self.submit_funkwhale_search(query),
             SearchRoute::YandexMusic if query.is_empty() => {
                 #[cfg(feature = "yandex-music")]
                 self.open_yandex_music_home();
@@ -9476,6 +9493,8 @@ impl AppController {
         queue_cursor_already_positioned: bool,
         origin: Option<AutoplayOrigin>,
     ) {
+        #[cfg(feature = "funkwhale")]
+        self.cancel_funkwhale_playback();
         #[cfg(feature = "soundcloud")]
         self.cancel_pending_soundcloud_playback();
         self.cancel_pending_yandex_music_playback();
@@ -15999,6 +16018,7 @@ impl AppController {
             | Screen::SoundCloud
             | Screen::YandexMusic
             | Screen::Bandcamp
+            | Screen::Funkwhale
             | Screen::ApplePodcasts
             | Screen::ArchiveOrg
             | Screen::LibriVox
@@ -16054,6 +16074,7 @@ impl AppController {
                         | Screen::SoundCloud
                         | Screen::YandexMusic
                         | Screen::Bandcamp
+                        | Screen::Funkwhale
                         | Screen::ApplePodcasts
                         | Screen::ArchiveOrg
                         | Screen::LibriVox
@@ -16093,6 +16114,7 @@ impl AppController {
                 | Screen::SoundCloud
                 | Screen::YandexMusic
                 | Screen::Bandcamp
+                | Screen::Funkwhale
                 | Screen::ApplePodcasts
                 | Screen::ArchiveOrg
                 | Screen::LibriVox
@@ -17401,6 +17423,10 @@ impl AppController {
 
     fn update_non_youtube_detail(&mut self) {
         match self.view.screen {
+            Screen::Funkwhale => {
+                self.update_funkwhale_detail();
+                return;
+            }
             Screen::SoundCloud => {
                 self.update_soundcloud_detail();
                 return;
@@ -17637,6 +17663,8 @@ impl AppController {
             }
         } else if self.view.screen == Screen::SoundCloud {
             self.update_soundcloud_detail();
+        } else if self.view.screen == Screen::Funkwhale {
+            self.update_funkwhale_detail();
         } else if self.view.screen == Screen::Bandcamp {
             #[cfg(feature = "bandcamp")]
             {
@@ -17706,6 +17734,8 @@ impl AppController {
             }
         } else if self.view.screen == Screen::SoundCloud {
             self.update_soundcloud_detail();
+        } else if self.view.screen == Screen::Funkwhale {
+            self.update_funkwhale_detail();
         } else if self.view.screen == Screen::Bandcamp {
             #[cfg(feature = "bandcamp")]
             {
@@ -17778,6 +17808,9 @@ impl AppController {
     }
 
     fn selected_queue_item(&self) -> Result<QueueItem, String> {
+        if self.view.screen == Screen::Funkwhale {
+            return self.selected_funkwhale_queue_item();
+        }
         if self.view.screen == Screen::SoundCloud {
             return self.selected_soundcloud_queue_item();
         }
@@ -18035,6 +18068,11 @@ impl AppController {
             return playlist_snapshot_from_local_media_presentation(&item, &title, &description);
         }
 
+        if self.view.screen == Screen::Funkwhale {
+            return self
+                .selected_funkwhale_queue_item()
+                .and_then(|item| playlist_snapshot_from_queue_item(&item));
+        }
         if self.view.screen == Screen::SoundCloud {
             return self
                 .selected_soundcloud_queue_item()
@@ -18605,7 +18643,11 @@ impl AppController {
                     None
                 }
             }
-            Screen::ArchiveOrg | Screen::LibriVox | Screen::Web | Screen::SoundCloud => {
+            Screen::ArchiveOrg
+            | Screen::LibriVox
+            | Screen::Web
+            | Screen::SoundCloud
+            | Screen::Funkwhale => {
                 let details = self.view.details.as_ref()?;
                 let media_id = details.media_id.clone()?;
                 Some(PrivateNoteSelection {
@@ -21459,6 +21501,10 @@ impl AppController {
     }
 
     fn activate_selection(&mut self) {
+        if self.view.screen == Screen::Funkwhale {
+            self.activate_funkwhale_selection();
+            return;
+        }
         #[cfg(feature = "yt-dlp")]
         self.cancel_live_start_preparation();
         if self.view.screen == Screen::SoundCloud {
@@ -21613,6 +21659,8 @@ impl AppController {
                 return;
             }
         };
+        #[cfg(feature = "funkwhale")]
+        self.cancel_funkwhale_playback();
         match self.bandcamp_resolution.request(
             media,
             self.config.providers.bandcamp_audio_format,
@@ -25889,6 +25937,10 @@ impl AppController {
 
     /// Identifies the same-source cursor represented by a queue item.
     fn autoplay_origin_for_media(&self, media_id: &MediaId) -> Option<AutoplayOrigin> {
+        #[cfg(feature = "funkwhale")]
+        if self.view.screen == Screen::Funkwhale {
+            return self.funkwhale_autoplay_origin(media_id);
+        }
         #[cfg(feature = "soundcloud")]
         if self.view.screen == Screen::SoundCloud {
             return self.soundcloud_autoplay_origin(media_id);
@@ -26261,6 +26313,18 @@ impl AppController {
                     },
                 )
             }
+            #[cfg(feature = "funkwhale")]
+            AutoplayOrigin::Funkwhale { items, index } => {
+                neighbour_list_step(items, *index, direction, |index, item: &QueueItem| {
+                    Some(AutoplayStep::Play {
+                        item: Box::new(item.clone()),
+                        origin: AutoplayOrigin::Funkwhale {
+                            items: Arc::clone(items),
+                            index,
+                        },
+                    })
+                })
+            }
             #[cfg(feature = "soundcloud")]
             AutoplayOrigin::SoundCloud { items, index } => {
                 neighbour_list_step(items, *index, direction, |index, item: &QueueItem| {
@@ -26510,6 +26574,20 @@ impl AppController {
         origin: Option<AutoplayOrigin>,
         resolved_input: Option<PlaybackInput>,
     ) {
+        #[cfg(feature = "funkwhale")]
+        if item.media.id.source == SourceKind::Funkwhale {
+            if resolved_input.is_none() || !self.funkwhale_resolved_candidate(&item.media.id) {
+                self.request_funkwhale_playback(item, queue_cursor_already_positioned, origin);
+                return;
+            }
+        } else {
+            self.cancel_funkwhale_playback();
+        }
+        #[cfg(not(feature = "funkwhale"))]
+        if item.media.id.source == SourceKind::Funkwhale {
+            self.view.status_line = "This build omits the `funkwhale` feature".to_owned();
+            return;
+        }
         #[cfg(feature = "yt-dlp")]
         let live_start_input = self.live_start.accepting_input;
         #[cfg(not(feature = "yt-dlp"))]
@@ -27396,7 +27474,7 @@ impl AppController {
                     self.persist_position();
                 }
                 let autoplay_origin = self.current_autoplay_origin.clone();
-                #[cfg(feature = "soundcloud")]
+                #[cfg(any(feature = "soundcloud", feature = "funkwhale"))]
                 let ended_media = self.current_media.clone();
                 #[cfg(feature = "waveform")]
                 let local_waveform_follow_from = self.local_waveform_follow_intent_after_eof();
@@ -27404,6 +27482,28 @@ impl AppController {
                 #[cfg(feature = "waveform")]
                 {
                     self.local_waveform_follow_from = local_waveform_follow_from;
+                }
+                #[cfg(feature = "funkwhale")]
+                if self.funkwhale_playback_pending() {
+                    // The explicit request owns the next start, not old autoplay.
+                    if !self.funkwhale_playback_owns_queue_cursor()
+                        && self
+                            .playback_queue
+                            .current()
+                            .is_some_and(|item| Some(&item.media.id) == ended_media.as_ref())
+                    {
+                        self.playback_queue.current_index = self
+                            .playback_queue
+                            .current_index
+                            .and_then(|index| index.checked_add(1))
+                            .filter(|index| *index < self.playback_queue.items.len());
+                    }
+                    #[cfg(feature = "waveform")]
+                    {
+                        self.local_waveform_follow_from = None;
+                    }
+                    self.view.status_line = "Resolving Funkwhale playback...".to_owned();
+                    return;
                 }
                 #[cfg(feature = "soundcloud")]
                 if self.soundcloud_playback_pending() {
@@ -27491,6 +27591,8 @@ impl AppController {
                 }
             }
             PlaybackEndReason::Stop => {
+                #[cfg(feature = "funkwhale")]
+                self.cancel_funkwhale_playback();
                 #[cfg(feature = "soundcloud")]
                 self.cancel_pending_soundcloud_playback();
                 self.queued_autoplay_resume_origin = None;
@@ -27874,6 +27976,10 @@ impl AppController {
             self.view.right_panel_mode = RightPanelMode::Details;
         }
         match screen {
+            Screen::Funkwhale => {
+                self.view.search_query.clone_from(&self.funkwhale.query);
+                self.view.selected = self.funkwhale.selected;
+            }
             Screen::SoundCloud => {
                 self.view.search_query.clone_from(&self.soundcloud.query);
                 self.view.selected = self.soundcloud.selected;
@@ -28024,6 +28130,7 @@ impl AppController {
 
     fn populate_local_screen(&mut self) {
         match self.view.screen {
+            Screen::Funkwhale => self.populate_funkwhale(),
             Screen::Search => {
                 if !self.local_results.is_empty() {
                     self.refresh_local_rows();
@@ -28635,6 +28742,8 @@ impl AppController {
         queue_cursor_already_positioned: bool,
         origin: Option<AutoplayOrigin>,
     ) {
+        #[cfg(feature = "funkwhale")]
+        self.cancel_funkwhale_playback();
         let station_id = item.media.id.external_id.clone();
         if bbc_station_by_id(&station_id).is_none() {
             self.show_error_message(
@@ -35728,6 +35837,9 @@ impl AppController {
         } else if self.view.screen == Screen::SoundCloud {
             self.soundcloud.query.clone_from(&self.view.search_query);
             self.soundcloud.selected = self.view.selected;
+        } else if self.view.screen == Screen::Funkwhale {
+            self.funkwhale.query.clone_from(&self.view.search_query);
+            self.funkwhale.selected = self.view.selected;
         } else if self.view.screen == Screen::YandexMusic {
             self.yandex_music_search_query
                 .clone_from(&self.view.search_query);
@@ -35823,6 +35935,7 @@ impl AppController {
             youtube_selected_row: Some(self.youtube_selected),
             youtube_music_selected_row: Some(self.youtube_music_selected),
             soundcloud_selected_row: Some(self.soundcloud.selected),
+            funkwhale_selected_row: Some(self.funkwhale.selected),
             yandex_music_selected_row: Some(self.yandex_music_selected),
             #[cfg(feature = "bandcamp")]
             bandcamp_selected_row: Some(self.bandcamp_selected),
@@ -35844,6 +35957,7 @@ impl AppController {
             search_text: self.youtube_search_query.clone(),
             youtube_music_search_text: self.youtube_music_search_query.clone(),
             soundcloud_search_text: self.soundcloud.query.clone(),
+            funkwhale_search_text: self.funkwhale.query.clone(),
             yandex_music_search_text: self.yandex_music_search_query.clone(),
             #[cfg(feature = "bandcamp")]
             bandcamp_search_text: self.bandcamp_search_query.clone(),
@@ -35900,6 +36014,8 @@ impl AppController {
     }
 
     fn shutdown(&mut self) -> bool {
+        #[cfg(feature = "funkwhale")]
+        self.shutdown_funkwhale();
         #[cfg(feature = "soundcloud")]
         self.cancel_pending_soundcloud_playback();
         if let Some(succeeded) = self.shutdown_persistence_succeeded {
@@ -36058,6 +36174,11 @@ impl UiController for AppController {
         self.update_soundcloud_search_page_capacity(rows);
     }
 
+    #[cfg(feature = "funkwhale")]
+    fn set_funkwhale_search_page_capacity(&mut self, rows: usize) {
+        self.update_funkwhale_search_page_capacity(rows);
+    }
+
     fn dispatch(&mut self, action: UiAction) {
         #[cfg(feature = "cmd")]
         if self.custom_commands.running || self.view.custom_command_output.is_some() {
@@ -36107,6 +36228,19 @@ impl UiController for AppController {
             return;
         }
         self.synchronize_preferences_action_focus(&action);
+        if self.view.funkwhale_setup_popup.is_some()
+            && !funkwhale::setup_action(&action)
+            && !matches!(
+                action,
+                UiAction::SetTerminalWindowPixels { .. }
+                    | UiAction::SetExternalOpenerAvailable(_)
+                    | UiAction::OpenBugReport
+            )
+            && self.view.error_popup.is_none()
+            && self.view.bug_report_popup.is_none()
+        {
+            return;
+        }
         if !self.view.external_opener_available
             && self.view.action_requires_external_opener(&action)
         {
@@ -36115,6 +36249,17 @@ impl UiController for AppController {
             return;
         }
         match action {
+            action @ (UiAction::OpenFunkwhaleSetup
+            | UiAction::CloseFunkwhaleSetup
+            | UiAction::SetFunkwhalePodUrl(_)
+            | UiAction::EditFunkwhalePodUrl(_)
+            | UiAction::BackspaceFunkwhalePodUrl
+            | UiAction::ClearFunkwhalePodUrl
+            | UiAction::SaveFunkwhaleSetup
+            | UiAction::OpenFunkwhalePodPicker
+            | UiAction::CloseFunkwhalePodPicker
+            | UiAction::MoveFunkwhalePod(_)
+            | UiAction::SelectFunkwhalePod(_)) => self.dispatch_funkwhale_setup(action),
             UiAction::Quit => {
                 if self.pending_github_issue_submission.is_some()
                     || self.bug_report.pending.is_some()
@@ -36127,6 +36272,8 @@ impl UiController for AppController {
                 } else {
                     #[cfg(feature = "soundcloud")]
                     self.cancel_pending_soundcloud_playback();
+                    #[cfg(feature = "funkwhale")]
+                    self.shutdown_funkwhale();
                     self.clear_playback_start_activity();
                     self.view.quitting = true;
                 }
@@ -37807,6 +37954,7 @@ impl UiController for AppController {
             self.last_animation_tick = now;
         }
         self.poll_soundcloud_worker();
+        self.poll_funkwhale_worker();
         #[cfg(feature = "soundcloud")]
         self.poll_soundcloud_comments();
         #[cfg(feature = "soundcloud")]
@@ -44945,6 +45093,8 @@ fn stored_screen_from_tui(screen: Screen) -> StoredScreen {
         Screen::Bandcamp => StoredScreen::Bandcamp,
         #[cfg(not(feature = "bandcamp"))]
         Screen::Bandcamp => StoredScreen::Search,
+        Screen::Funkwhale if cfg!(feature = "funkwhale") => StoredScreen::Funkwhale,
+        Screen::Funkwhale => StoredScreen::Search,
         #[cfg(feature = "apple-podcasts")]
         Screen::ApplePodcasts => StoredScreen::ApplePodcasts,
         #[cfg(not(feature = "apple-podcasts"))]
@@ -45021,6 +45171,8 @@ fn tui_screen_from_stored(screen: &StoredScreen) -> Screen {
         StoredScreen::Bandcamp => Screen::Bandcamp,
         #[cfg(not(feature = "bandcamp"))]
         StoredScreen::Bandcamp => Screen::Search,
+        StoredScreen::Funkwhale if cfg!(feature = "funkwhale") => Screen::Funkwhale,
+        StoredScreen::Funkwhale => Screen::Search,
         #[cfg(feature = "apple-podcasts")]
         StoredScreen::ApplePodcasts => Screen::ApplePodcasts,
         #[cfg(not(feature = "apple-podcasts"))]

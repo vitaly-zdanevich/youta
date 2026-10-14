@@ -1548,6 +1548,159 @@ mod wire_tests {
         );
     }
 
+    /// Funkwhale setup owns its F4 shortcut only when the provider is compiled in.
+    #[test]
+    fn funkwhale_setup_shortcut_respects_screen_and_feature() {
+        use crate::view::Screen;
+        for screen in [Screen::Funkwhale, Screen::Bandcamp, Screen::Search] {
+            let view = ViewModel {
+                screen,
+                ..ViewModel::default()
+            };
+            assert_eq!(
+                key_action(KeyPress::new(Key::F(4)), &view, None, None),
+                Some(
+                    if screen == Screen::Funkwhale && cfg!(feature = "funkwhale") {
+                        UiAction::OpenFunkwhaleSetup
+                    } else {
+                        UiAction::ShowScreen(Screen::Playlists)
+                    }
+                )
+            );
+        }
+    }
+
+    /// Setup text cannot leak into playback, navigation, or screen shortcuts.
+    #[cfg(feature = "funkwhale")]
+    #[test]
+    fn funkwhale_setup_modal_edits_without_global_shortcuts() {
+        use crate::view::FunkwhaleSetupPopupView;
+        let view = ViewModel {
+            funkwhale_setup_popup: Some(FunkwhaleSetupPopupView::default()),
+            playback: PlaybackStatus {
+                idle: false,
+                ..PlaybackStatus::default()
+            },
+            ..ViewModel::default()
+        };
+        for (key, expected) in [
+            (Key::Enter, Some(UiAction::SaveFunkwhaleSetup)),
+            (Key::Esc, Some(UiAction::CloseFunkwhaleSetup)),
+            (Key::Backspace, Some(UiAction::BackspaceFunkwhalePodUrl)),
+            (Key::F(4), Some(UiAction::OpenFunkwhalePodPicker)),
+            (Key::Char('q'), Some(UiAction::EditFunkwhalePodUrl('q'))),
+            (Key::Char(' '), Some(UiAction::EditFunkwhalePodUrl(' '))),
+            (Key::Char('Б'), Some(UiAction::EditFunkwhalePodUrl('Б'))),
+            (Key::Char('\n'), None),
+            (Key::F(1), None),
+            (Key::F(7), None),
+            (Key::Tab, None),
+            (Key::Left, None),
+            (Key::Right, None),
+        ] {
+            assert_eq!(
+                key_action(KeyPress::new(key), &view, None, None),
+                expected,
+                "{key:?}"
+            );
+        }
+        for character in ['u', 'U'] {
+            assert_eq!(
+                key_action(
+                    KeyPress {
+                        ctrl: true,
+                        ..KeyPress::new(Key::Char(character))
+                    },
+                    &view,
+                    None,
+                    None
+                ),
+                Some(UiAction::ClearFunkwhalePodUrl)
+            );
+        }
+        for press in [
+            KeyPress {
+                ctrl: true,
+                ..KeyPress::new(Key::Char('c'))
+            },
+            KeyPress {
+                alt: true,
+                ..KeyPress::new(Key::Left)
+            },
+            KeyPress {
+                alt: true,
+                ..KeyPress::new(Key::Char('u'))
+            },
+        ] {
+            assert_eq!(key_action(press, &view, None, None), None);
+        }
+    }
+
+    /// The picker highlights or fills a pod, while loading and error states stay inert.
+    #[cfg(feature = "funkwhale")]
+    #[test]
+    fn funkwhale_picker_owns_keys_and_separates_selection_from_save() {
+        use crate::view::{FunkwhalePodPickerView, FunkwhalePodView, FunkwhaleSetupPopupView};
+        let mut view = ViewModel {
+            funkwhale_setup_popup: Some(FunkwhaleSetupPopupView {
+                picker: Some(FunkwhalePodPickerView {
+                    pods: vec![FunkwhalePodView::default(), FunkwhalePodView::default()],
+                    selected: 1,
+                    ..FunkwhalePodPickerView::default()
+                }),
+                ..FunkwhaleSetupPopupView::default()
+            }),
+            ..ViewModel::default()
+        };
+        for (key, expected) in [
+            (Key::Up, Some(UiAction::MoveFunkwhalePod(-1))),
+            (Key::Down, Some(UiAction::MoveFunkwhalePod(1))),
+            (Key::PageUp, Some(UiAction::MoveFunkwhalePod(-7))),
+            (Key::PageDown, Some(UiAction::MoveFunkwhalePod(7))),
+            (Key::Enter, Some(UiAction::SelectFunkwhalePod(1))),
+            (Key::Esc, Some(UiAction::CloseFunkwhalePodPicker)),
+            (Key::F(4), Some(UiAction::OpenFunkwhalePodPicker)),
+            (Key::Char('q'), None),
+            (Key::Char(' '), None),
+            (Key::Backspace, None),
+        ] {
+            assert_eq!(
+                key_action(KeyPress::new(key), &view, Some(7), None),
+                expected,
+                "{key:?}"
+            );
+        }
+        for unavailable in [
+            FunkwhalePodPickerView {
+                loading: true,
+                ..FunkwhalePodPickerView::default()
+            },
+            FunkwhalePodPickerView {
+                error: Some("Directory unavailable".to_owned()),
+                ..FunkwhalePodPickerView::default()
+            },
+            FunkwhalePodPickerView::default(),
+            FunkwhalePodPickerView {
+                pods: vec![FunkwhalePodView::default()],
+                selected: 99,
+                ..FunkwhalePodPickerView::default()
+            },
+        ] {
+            view.funkwhale_setup_popup.as_mut().unwrap().picker = Some(unavailable);
+            for key in [Key::Enter, Key::Up, Key::Down, Key::PageUp, Key::PageDown] {
+                assert_eq!(key_action(KeyPress::new(key), &view, None, None), None);
+            }
+            assert_eq!(
+                key_action(KeyPress::new(Key::Esc), &view, None, None),
+                Some(UiAction::CloseFunkwhalePodPicker)
+            );
+            assert_eq!(
+                key_action(KeyPress::new(Key::F(4)), &view, None, None),
+                Some(UiAction::OpenFunkwhalePodPicker)
+            );
+        }
+    }
+
     /// The window builds this JSON by hand in JavaScript, so the exact shape is
     /// part of the contract rather than an implementation detail of Serde.
     #[test]
@@ -2928,6 +3081,43 @@ fn subscription_items_active(view: &ViewModel) -> bool {
                 && view.subscriptions.focus == SubscriptionPane::Items))
 }
 
+/// Keeps private URL editing and public pod selection inside their modal owner.
+#[cfg(feature = "funkwhale")]
+fn funkwhale_setup_key_action(
+    key: KeyPress,
+    setup: &FunkwhaleSetupPopupView,
+    page_rows: Option<usize>,
+) -> Option<UiAction> {
+    if let Some(picker) = setup.picker.as_ref() {
+        let selectable =
+            !picker.loading && picker.error.is_none() && picker.selected < picker.pods.len();
+        let page = i64::try_from(page_rows.unwrap_or(10).max(1)).unwrap_or(i64::MAX);
+        return match key.key {
+            Key::Esc => Some(UiAction::CloseFunkwhalePodPicker),
+            Key::F(4) if !key.modified() => Some(UiAction::OpenFunkwhalePodPicker),
+            Key::Up if selectable && !key.chorded() => Some(UiAction::MoveFunkwhalePod(-1)),
+            Key::Down if selectable && !key.chorded() => Some(UiAction::MoveFunkwhalePod(1)),
+            Key::PageUp if selectable && !key.chorded() => Some(UiAction::MoveFunkwhalePod(-page)),
+            Key::PageDown if selectable && !key.chorded() => Some(UiAction::MoveFunkwhalePod(page)),
+            Key::Enter if selectable && !key.chorded() => {
+                Some(UiAction::SelectFunkwhalePod(picker.selected))
+            }
+            _ => None,
+        };
+    }
+    match key.key {
+        Key::Esc => Some(UiAction::CloseFunkwhaleSetup),
+        Key::Enter if !key.chorded() => Some(UiAction::SaveFunkwhaleSetup),
+        Key::F(4) if !key.modified() => Some(UiAction::OpenFunkwhalePodPicker),
+        Key::Backspace if !key.chorded() => Some(UiAction::BackspaceFunkwhalePodUrl),
+        Key::Char('u' | 'U') if key.ctrl && !key.alt => Some(UiAction::ClearFunkwhalePodUrl),
+        Key::Char(character) if !character.is_control() && !key.chorded() => {
+            Some(UiAction::EditFunkwhalePodUrl(character))
+        }
+        _ => None,
+    }
+}
+
 /// Maps one key using the current rendered main-list page capacity.
 ///
 /// Outside modal editors, Ctrl increases arrow seeking from five to twenty
@@ -4130,6 +4320,10 @@ fn unfiltered_key_action(
             _ => None,
         };
     }
+    #[cfg(feature = "funkwhale")]
+    if let Some(setup) = view.funkwhale_setup_popup.as_ref() {
+        return funkwhale_setup_key_action(key, setup, page_rows);
+    }
     if view.text_selection_mode
         && !view
             .details
@@ -4345,6 +4539,10 @@ fn unfiltered_key_action(
             Some(UiAction::ShowScreen(Screen::Local))
         }
         Key::F(3) if view.playback_history_enabled => Some(UiAction::ShowScreen(Screen::History)),
+        #[cfg(feature = "funkwhale")]
+        Key::F(4) if view.screen == Screen::Funkwhale && !key.modified() => {
+            Some(UiAction::OpenFunkwhaleSetup)
+        }
         Key::F(4) => Some(UiAction::ShowScreen(Screen::Playlists)),
         Key::F(5) => Some(UiAction::ShowScreen(Screen::Statistics)),
         Key::F(11) if !key.modified() && cfg!(feature = "apple-podcasts") => {

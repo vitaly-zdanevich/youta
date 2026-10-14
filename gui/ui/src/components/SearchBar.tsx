@@ -98,6 +98,13 @@ export function SearchBar({
         )}
       </div>
 		{/* Search and Subscriptions share the same saved Shorts preference. */}
+		{view.screen === 'Funkwhale' ? (
+			<button type='button' disabled={view.search_editing}
+				onClick={() => void dispatch('OpenFunkwhaleSetup')}
+				className='shrink-0 rounded-[5px] border border-line-strong px-[9px] py-[3px] text-[11px] text-accent disabled:opacity-50 not-disabled:hover:border-ink-faint focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent'>
+				Pod setup
+			</button>
+		) : null}
 		{view.screen === 'Search' ? (
 			<button
 				type='button'
