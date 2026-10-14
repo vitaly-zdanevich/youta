@@ -1,4 +1,4 @@
-//! Explicit Bash commands with optional selected media and image paths.
+//! Explicit Bash commands with optional selected media, image, and description data.
 //!
 //! Only the user-authored template is shell source. A selected target travels
 //! as an OS-string positional argument, never as interpolated shell syntax.
@@ -7,9 +7,13 @@ use std::ffi::OsString;
 use std::fmt;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::Arc;
 
 pub mod buttons;
 mod capture;
+mod metadata;
+
+pub use metadata::CommandMetadata;
 
 /// A user-authored command with an optional captured local path or original provider URL.
 #[derive(Clone, PartialEq, Eq)]
@@ -23,6 +27,8 @@ pub struct ShellCommandPlan {
     pub downloaded_path: Option<PathBuf>,
     /// Prepared image file for `%i`, absent until the captured artwork is available.
     pub image_path: Option<PathBuf>,
+    /// Selected description for `%m`, kept private and prepared only when requested.
+    pub metadata: Option<Arc<CommandMetadata>>,
     /// Working directory captured when the user invokes the command.
     pub directory: PathBuf,
 }
@@ -97,6 +103,7 @@ impl LocalCommandPlan {
             template: self.template,
             downloaded_path: Some(self.path.clone()),
             image_path: None,
+            metadata: None,
             argument: self.path.into_os_string(),
             directory: self.directory,
         }
@@ -109,11 +116,14 @@ impl ShellCommandPlan {
     /// The explicit final `exit` prevents Bash 5.2 from replacing the outer
     /// shell with its final command, so job control restores the original
     /// foreground process group while preserving the command's exit status.
+    /// Keep this plan or a clone alive until the child exits: `%m` reads a private
+    /// file whose lifetime belongs to the captured metadata, not to [`Command`].
     ///
     /// # Errors
     /// Returns a validation error for unsupported percent-macro shell grammar.
     pub fn command(&self) -> Result<Command, String> {
         let expanded = self.expanded_source()?;
+        let metadata_path = self.metadata_argument()?;
         let mut command = Command::new("bash");
         command
             .args([
@@ -121,7 +131,7 @@ impl ShellCommandPlan {
                 "--norc",
                 "-i",
                 "-c",
-                "\"$BASH\" --noprofile --norc -c \"$1\" youta \"$2\" \"$3\" \"$4\"; exit \"$?\"",
+                "\"$BASH\" --noprofile --norc -c \"$1\" youta \"$2\" \"$3\" \"$4\" \"$5\"; exit \"$?\"",
                 "youta",
             ])
             .arg(expanded)
@@ -136,6 +146,7 @@ impl ShellCommandPlan {
                     .as_deref()
                     .unwrap_or(std::path::Path::new("")),
             )
+			.arg(metadata_path)
             .current_dir(&self.directory)
             .env("HISTFILE", "/dev/null")
             .env_remove("BASH_ENV")
@@ -145,13 +156,17 @@ impl ShellCommandPlan {
 
     /// Builds a noninteractive shell for a desktop worker, with the same safe argument.
     ///
+    /// Keep the plan alive until the child exits so its private `%m` file remains available.
+    ///
     /// # Errors
     /// Returns a validation error for unsupported percent-macro shell grammar.
     pub fn noninteractive_command(&self) -> Result<Command, String> {
+        let expanded = self.expanded_source()?;
+        let metadata_path = self.metadata_argument()?;
         let mut command = Command::new("bash");
         command
             .args(["--noprofile", "--norc", "-c"])
-            .arg(self.expanded_source()?)
+            .arg(expanded)
             .arg("youta")
             .arg(&self.argument)
             .arg(
@@ -164,6 +179,7 @@ impl ShellCommandPlan {
                     .as_deref()
                     .unwrap_or(std::path::Path::new("")),
             )
+            .arg(metadata_path)
             .current_dir(&self.directory)
             .env("HISTFILE", "/dev/null")
             .env_remove("BASH_ENV")
@@ -171,7 +187,7 @@ impl ShellCommandPlan {
         Ok(command)
     }
 
-    /// Detects whether an unquoted `%`, `%d`, or `%i` macro requires a selected target.
+    /// Detects whether an unquoted `%`, `%d`, `%i`, or `%m` requires a selected target.
     ///
     /// Quoted, escaped, commented, and embedded percent signs remain literal, so
     /// ordinary commands can run without selecting a media item.
@@ -198,7 +214,26 @@ impl ShellCommandPlan {
         expand_targets(&self.template).map(|expansion| expansion.requires_image)
     }
 
-    /// Refuses unresolved downloaded-media and image macros, including direct API calls.
+    /// Detects an unquoted `%m` without preparing the captured description file.
+    ///
+    /// # Errors
+    /// Returns the same grammar validation errors as command construction.
+    pub fn requires_metadata(&self) -> Result<bool, String> {
+        expand_targets(&self.template).map(|expansion| expansion.requires_metadata)
+    }
+
+    /// Prepares the private description file only when an executable plan requests `%m`.
+    fn metadata_argument(&self) -> Result<PathBuf, String> {
+        if !self.requires_metadata()? {
+            return Ok(PathBuf::new());
+        }
+        self.metadata
+            .as_ref()
+            .ok_or_else(|| "The command requires selected description text for %m".to_owned())?
+            .path()
+    }
+
+    /// Refuses unresolved media, image, and description macros, including direct API calls.
     fn expanded_source(&self) -> Result<String, String> {
         let expansion = expand_targets(&self.template)?;
         if expansion.requires_download && self.downloaded_path.is_none() {
@@ -206,6 +241,9 @@ impl ShellCommandPlan {
         }
         if expansion.requires_image && self.image_path.is_none() {
             return Err("The command requires a prepared image for %i".to_owned());
+        }
+        if expansion.requires_metadata && self.metadata.is_none() {
+            return Err("The command requires selected description text for %m".to_owned());
         }
         Ok(expansion.source)
     }
@@ -219,6 +257,9 @@ impl ShellCommandPlan {
 /// deliberately not parsed: combining it with a detected macro is rejected,
 /// and callers can instead use the original selected path in quoted `"$1"`.
 /// A private readonly variable preserves macros after the user runs `set --`.
+/// `%m` prints the captured description at a simple command start, or supplies
+/// one quoted argument after a command name. Its private file preserves long
+/// descriptions and trailing newlines without inserting provider text as code.
 fn expand_selected_path(template: &str) -> Result<String, String> {
     expand_targets(template).map(|expansion| expansion.source)
 }
@@ -227,15 +268,29 @@ fn expand_selected_path(template: &str) -> Result<String, String> {
 struct TargetExpansion {
     /// Shell source with recognized target macros replaced by readonly variables.
     source: String,
-    /// At least one original, downloaded, or image target macro was recognized.
+    /// At least one original, downloaded, image, or description macro was recognized.
     requires_selection: bool,
     /// A downloaded target macro needs a completed local file before execution.
     requires_download: bool,
     /// An image target macro needs a prepared local artwork file before execution.
     requires_image: bool,
+    /// Description text must have been captured from the selected Details pane.
+    requires_metadata: bool,
 }
 
-/// Lexes the three supported argument-start macros while preserving literal percent signs.
+/// Recognizes assignment prefixes that make a later `%m` command position ambiguous.
+fn shell_assignment_prefix(word: &str) -> bool {
+    let Some((name, _)) = word.split_once('=') else {
+        return false;
+    };
+    let name = name.strip_suffix('+').unwrap_or(name);
+    let name = name.split_once('[').map_or(name, |(name, _)| name);
+    let mut characters = name.chars();
+    matches!(characters.next(), Some('a'..='z' | 'A'..='Z' | '_'))
+        && characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
+}
+
+/// Lexes argument macros and standalone `%m` commands without parsing nested Bash grammar.
 fn expand_targets(template: &str) -> Result<TargetExpansion, String> {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Quote {
@@ -250,6 +305,15 @@ fn expand_targets(template: &str) -> Result<TargetExpansion, String> {
     let mut expanded = false;
     let mut download = false;
     let mut image = false;
+    let mut metadata = false;
+    let mut command_start = true;
+    let mut first_word = String::new();
+    let mut first_word_finished = false;
+    let mut ambiguous_metadata_position = false;
+    let mut previous = None;
+    // Track only the first word and ordinary separators of each simple command.
+    // Leading assignments, redirections, or control words make `%m` ambiguous,
+    // so reject those combinations instead of guessing Bash's command position.
     // Conservatively reject nested grammar whenever a macro was recognized.
     // Looking for these spellings even in quoted text intentionally favors a
     // clear limitation over pretending this small scanner is a Bash parser.
@@ -258,6 +322,50 @@ fn expand_targets(template: &str) -> Result<TargetExpansion, String> {
         .any(|syntax| template.contains(syntax));
     let mut characters = template.chars().peekable();
     while let Some(character) = characters.next() {
+        let at_command_start = command_start;
+        if quote == Quote::None
+            && matches!(character, ' ' | '\t' | '\n' | ';' | '|' | '&' | '<' | '>')
+        {
+            if !first_word_finished && !first_word.is_empty() {
+                ambiguous_metadata_position |= shell_assignment_prefix(&first_word)
+                    || matches!(
+                        first_word.as_str(),
+                        "!" | "time"
+                            | "if"
+                            | "then"
+                            | "else"
+                            | "elif"
+                            | "while"
+                            | "until"
+                            | "do"
+                            | "for"
+                            | "select"
+                            | "case"
+                            | "in"
+                            | "function"
+                    );
+                first_word_finished = true;
+            }
+            let redirect_ampersand = character == '&'
+                && (characters.peek() == Some(&'>') || matches!(previous, Some('<' | '>')));
+            if matches!(character, '<' | '>') || redirect_ampersand {
+                ambiguous_metadata_position |= command_start
+                    || (!first_word.is_empty()
+                        && first_word
+                            .chars()
+                            .all(|character| character.is_ascii_digit()));
+            } else if matches!(character, '\n' | ';' | '|' | '&') {
+                command_start = true;
+                first_word.clear();
+                first_word_finished = false;
+                ambiguous_metadata_position = false;
+            }
+        } else {
+            if !first_word_finished {
+                first_word.push(character);
+            }
+            command_start = false;
+        }
         match (quote, character) {
             (Quote::None, '%') if word_start => {
                 if characters.peek() == Some(&'d') {
@@ -268,6 +376,25 @@ fn expand_targets(template: &str) -> Result<TargetExpansion, String> {
                     characters.next();
                     result.push_str("\"${__youta_image_path}\"");
                     image = true;
+                } else if characters.peek() == Some(&'m') {
+                    characters.next();
+                    if ambiguous_metadata_position {
+                        return Err(
+							"The %m shortcut supports simple command or argument positions only; leading assignments, leading redirects, and Bash control statements are unsupported"
+								.to_owned(),
+						);
+                    }
+                    if at_command_start {
+                        if characters.peek().is_some_and(|character| {
+                            !matches!(character, ' ' | '\t' | '\n' | ';' | '|' | '&' | '<' | '>')
+                        }) {
+                            return Err("The command-position %m shortcut must be a standalone word; use printf '%s' %m for description suffixes".to_owned());
+                        }
+                        result.push_str("builtin printf '%s' \"${__youta_metadata}\"");
+                    } else {
+                        result.push_str("\"${__youta_metadata}\"");
+                    }
+                    metadata = true;
                 } else {
                     result.push_str("\"${__youta_selected_path}\"");
                 }
@@ -321,6 +448,7 @@ fn expand_targets(template: &str) -> Result<TargetExpansion, String> {
             }
             _ => result.push(character),
         }
+        previous = Some(character);
     }
     if !expanded {
         return Ok(TargetExpansion {
@@ -328,11 +456,12 @@ fn expand_targets(template: &str) -> Result<TargetExpansion, String> {
             requires_selection: false,
             requires_download: false,
             requires_image: false,
+            requires_metadata: false,
         });
     }
     if complex {
         return Err(
-			"The % path shortcuts support simple unquoted arguments only; for Bash substitutions, arithmetic, grouping, or backticks, use the selected path as quoted \"$1\", downloaded path as quoted \"$2\", or image path as quoted \"$3\" before changing positional parameters"
+			"The % path shortcuts support simple unquoted arguments only; for Bash substitutions, arithmetic, grouping, or backticks, use the selected path as quoted \"$1\", downloaded path as quoted \"$2\", or image path as quoted \"$3\" before changing positional parameters. The %m description shortcut also requires simple shell grammar"
                 .to_owned(),
         );
     }
@@ -346,19 +475,374 @@ fn expand_targets(template: &str) -> Result<TargetExpansion, String> {
     } else {
         ""
     };
+    let metadata_prefix = if metadata {
+        concat!(
+            "if ! builtin test -r \"$4\"; then builtin printf '%s\\n' 'Cannot read captured description for %m' >&2; exit 1; fi; ",
+            "__youta_metadata=''; IFS= builtin read -r -d '' __youta_metadata < \"$4\" || ",
+            "if builtin test \"$?\" -ne 1; then builtin printf '%s\\n' 'Cannot read captured description for %m' >&2; exit 1; fi; ",
+            "readonly __youta_metadata; "
+        )
+    } else {
+        ""
+    };
     Ok(TargetExpansion {
         source: format!(
-            "readonly __youta_selected_path=\"$1\"; {download_prefix}{image_prefix}{result}"
+            "readonly __youta_selected_path=\"$1\"; {download_prefix}{image_prefix}{metadata_prefix}{result}"
         ),
         requires_selection: expanded,
         requires_download: download,
         requires_image: image,
+        requires_metadata: metadata,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The requested command-position macro saves the complete selected description.
+    #[test]
+    fn metadata_command_redirects_description_without_added_newlines() {
+        let directory = tempfile::tempdir().unwrap();
+        let description = "Selected description\nSecond line\n\n";
+        let metadata = directory.path().join("metadata");
+        std::fs::write(&metadata, description).unwrap();
+        let output = Command::new("bash")
+            .args(["--noprofile", "--norc", "-c"])
+            .arg(expand_targets("%m > mynote").unwrap().source)
+            .args(["youta", "original", "", ""])
+            .arg(metadata)
+            .current_dir(directory.path())
+            .env_remove("BASH_ENV")
+            .env_remove("ENV")
+            .output()
+            .expect("Bash metadata redirection fixture");
+        assert!(output.status.success(), "{output:?}");
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.is_empty());
+        assert_eq!(
+            std::fs::read(directory.path().join("mynote")).unwrap(),
+            description.as_bytes()
+        );
+    }
+
+    /// Captures test descriptions privately without requiring provider or filesystem fixtures.
+    fn metadata_plan(template: &str, description: &str) -> ShellCommandPlan {
+        ShellCommandPlan {
+            template: template.to_owned(),
+            argument: "https://example.test/original".into(),
+            downloaded_path: None,
+            image_path: None,
+            metadata: Some(Arc::new(CommandMetadata::new(description))),
+            directory: std::env::temp_dir(),
+        }
+    }
+
+    /// Keeps the foreground argv mapping while omitting job control from pipe-based tests.
+    fn metadata_test_commands(plan: &ShellCommandPlan) -> [Command; 2] {
+        let terminal = plan.command().unwrap();
+        let mut outer = Command::new("bash");
+        outer
+            .args(terminal.get_args().filter(|argument| *argument != "-i"))
+            .current_dir(&plan.directory)
+            .env_remove("BASH_ENV")
+            .env_remove("ENV");
+        [outer, plan.noninteractive_command().unwrap()]
+    }
+
+    /// Metadata has a distinct requirement and remains literal when quoted or embedded.
+    #[test]
+    fn metadata_detection_preserves_quotes_escapes_comments_and_suffixes() {
+        for template in [
+            "printf '%m'",
+            "printf \"%m\"",
+            "printf '%s' $'%m'",
+            "printf '%s' \\%m",
+            "printf '%s' embedded%m",
+            "printf '%s' plain # %m is a comment",
+            "printf '%s' \"$(printf '%s' '%m')\"",
+        ] {
+            let mut plan = metadata_plan(template, "unused description\0");
+            plan.metadata = None;
+            assert!(!plan.requires_metadata().unwrap(), "{template}");
+            assert!(!plan.requires_selection().unwrap(), "{template}");
+            assert_eq!(expand_targets(template).unwrap().source, template);
+            assert!(plan.command().is_ok(), "{template}");
+            assert!(plan.noninteractive_command().is_ok(), "{template}");
+        }
+        for template in ["%m", "%m > mynote", "printf '%s' %m", "printf '%s' %m.txt"] {
+            let plan = metadata_plan(template, "selected description");
+            assert!(plan.requires_metadata().unwrap(), "{template}");
+            assert!(plan.requires_selection().unwrap(), "{template}");
+            assert!(!plan.requires_download().unwrap(), "{template}");
+            assert!(!plan.requires_image().unwrap(), "{template}");
+        }
+    }
+
+    /// Plain commands do not prepare description files or validate unused text.
+    #[test]
+    fn unused_metadata_never_reaches_the_shell_argument_vector() {
+        let plan = metadata_plan("printf '%s' plain", "private description\0");
+        for command in [
+            plan.command().unwrap(),
+            plan.noninteractive_command().unwrap(),
+        ] {
+            assert_eq!(command.get_args().last(), Some(std::ffi::OsStr::new("")));
+            assert!(command.get_args().all(|argument| {
+                !argument.to_string_lossy().contains("private description")
+                    && !argument
+                        .to_string_lossy()
+                        .contains("youta-command-metadata-")
+            }));
+        }
+    }
+
+    /// Missing descriptions fail before execution, while a selected empty description is valid.
+    #[test]
+    fn metadata_requires_a_capture_but_accepts_an_empty_description() {
+        for template in ["%m", "printf '%s' %m"] {
+            let mut plan = metadata_plan(template, "");
+            plan.metadata = None;
+            for error in [
+                plan.command().unwrap_err(),
+                plan.noninteractive_command().unwrap_err(),
+            ] {
+                assert!(error.contains("selected description text for %m"));
+                assert!(!error.contains("example.test"));
+            }
+            plan.metadata = Some(Arc::new(CommandMetadata::new("")));
+            for mut command in metadata_test_commands(&plan) {
+                let output = command.output().expect("empty metadata fixture");
+                assert!(output.status.success(), "{output:?}");
+                assert!(output.stdout.is_empty());
+                assert!(output.stderr.is_empty());
+            }
+        }
+    }
+
+    /// Command-position metadata remains an emitter across ordinary shell separators.
+    #[test]
+    fn metadata_command_positions_follow_simple_shell_boundaries() {
+        for template in [
+            "%m",
+            " \t %m",
+            "true; %m",
+            "true && %m",
+            "false || %m",
+            ": | %m",
+            "true & %m",
+            "true\n%m",
+            "VALUE=original; %m",
+        ] {
+            let plan = metadata_plan(template, "selected description\n\n");
+            for mut command in metadata_test_commands(&plan) {
+                let output = command.output().expect("metadata command-position fixture");
+                assert!(output.status.success(), "{template}: {output:?}");
+                assert_eq!(output.stdout, b"selected description\n\n", "{template}");
+                assert!(output.stderr.is_empty(), "{template}: {output:?}");
+            }
+        }
+    }
+
+    /// Ambiguous leading assignments and redirections are rejected before macro expansion.
+    #[test]
+    fn metadata_rejects_ambiguous_command_prefixes_and_command_suffixes() {
+        for template in [
+            "VALUE=original %m",
+            "VALUE='with spaces' %m",
+            "VALUE+=original %m",
+            "VALUE[0]=original %m",
+            "> mynote %m",
+            "2> mynote %m",
+            "2>&1 %m",
+            ">&2 %m",
+            "&> mynote %m",
+            "< input %m",
+            "true; VALUE=original %m",
+            "true && 2> mynote %m",
+            "! %m",
+            "time %m",
+            "if true; then %m; fi",
+        ] {
+            let plan = metadata_plan(template, "private description");
+            let error = plan.requires_metadata().unwrap_err();
+            assert!(
+                error.contains("simple command or argument positions"),
+                "{template}: {error}"
+            );
+            assert_eq!(plan.requires_selection().unwrap_err(), error);
+            assert_eq!(plan.command().unwrap_err(), error);
+            assert_eq!(plan.noninteractive_command().unwrap_err(), error);
+        }
+        for template in ["%m.txt", "%m'suffix'", "%m\\ suffix"] {
+            let error = expand_targets(template)
+                .err()
+                .expect("unsupported command suffix");
+            assert!(error.contains("standalone word"), "{template}: {error}");
+        }
+    }
+
+    /// Metadata follows the existing macro prohibition on nested Bash grammar.
+    #[test]
+    fn metadata_rejects_complex_macro_grammar_without_changing_literals() {
+        for template in [
+            "printf '%s' $(echo %m)",
+            "printf '%s' $((5%2)) %m",
+            "(printf '%s' %m)",
+            "cat <<EOF %m",
+            "printf '%s' `echo plain` %m",
+        ] {
+            let plan = metadata_plan(template, "private description");
+            let error = plan.requires_metadata().unwrap_err();
+            assert!(
+                error.contains("support simple unquoted arguments only"),
+                "{template}: {error}"
+            );
+            assert_eq!(plan.command().unwrap_err(), error);
+            assert_eq!(plan.noninteractive_command().unwrap_err(), error);
+        }
+    }
+
+    /// Multiline descriptions stay one argument and cannot inject code, including after `set --`.
+    #[test]
+    fn metadata_arguments_preserve_hostile_text_and_literal_suffixes() {
+        let directory = tempfile::tempdir().unwrap();
+        let description = "-n ' \"; $(touch METADATA_INJECTION) `touch METADATA_INJECTION` \\\n%m %d %i % * [glob]\nUnicode: Мінск 🦀\n\n\n";
+        for prefix in ["", "set -- replacement; "] {
+            let mut plan =
+                metadata_plan(&format!("{prefix}printf '%s\\0' %m %m.suffix"), description);
+            plan.directory = directory.path().to_path_buf();
+            for mut command in metadata_test_commands(&plan) {
+                let output = command.output().expect("hostile metadata argument fixture");
+                assert!(output.status.success(), "{output:?}");
+                assert!(output.stderr.is_empty(), "{output:?}");
+                assert_eq!(
+                    output.stdout,
+                    [
+                        description.as_bytes(),
+                        b"\0",
+                        description.as_bytes(),
+                        b".suffix\0",
+                    ]
+                    .concat()
+                );
+            }
+        }
+        assert!(!directory.path().join("METADATA_INJECTION").exists());
+    }
+
+    /// Description transport does not displace original, downloaded, or artwork arguments.
+    #[test]
+    fn metadata_and_path_macros_remain_independent_after_set() {
+        let mut plan = metadata_plan(
+            "set -- replacement; printf '%s\\0' % %d %i %m; %m",
+            "selected description\n\n",
+        );
+        plan.downloaded_path = Some(PathBuf::from("/tmp/downloaded media.flac"));
+        plan.image_path = Some(PathBuf::from("/tmp/selected artwork.png"));
+        assert!(plan.requires_metadata().unwrap());
+        assert!(plan.requires_download().unwrap());
+        assert!(plan.requires_image().unwrap());
+        for mut command in metadata_test_commands(&plan) {
+            let output = command
+                .output()
+                .expect("combined metadata and path fixture");
+            assert!(output.status.success(), "{output:?}");
+            assert!(output.stderr.is_empty(), "{output:?}");
+            assert_eq!(
+                output.stdout,
+                concat!(
+                    "https://example.test/original\0/tmp/downloaded media.flac\0",
+                    "/tmp/selected artwork.png\0selected description\n\n\0",
+                    "selected description\n\n"
+                )
+                .as_bytes()
+            );
+        }
+    }
+
+    /// Descriptions exceeding the OS argument bound and all trailing newlines survive both shells.
+    #[test]
+    fn metadata_emitters_preserve_long_descriptions_and_exact_trailing_newlines() {
+        for description in [
+            String::new(),
+            "no final newline".to_owned(),
+            "\n\n\n".to_owned(),
+            format!("{}\n\n\n", "x".repeat(256 * 1024)),
+        ] {
+            for template in ["%m", "set -- replacement; %m"] {
+                let plan = metadata_plan(template, &description);
+                for mut command in metadata_test_commands(&plan) {
+                    let output = command.output().expect("exact metadata emitter fixture");
+                    assert!(output.status.success(), "{output:?}");
+                    assert!(output.stderr.is_empty(), "{output:?}");
+                    assert_eq!(output.stdout, description.as_bytes());
+                }
+            }
+        }
+    }
+
+    /// File loading does not replace the shell's IFS or treat normal EOF as an errexit failure.
+    #[test]
+    fn metadata_loading_preserves_ifs_and_errexit_options() {
+        let plan = metadata_plan("builtin printf '%s' \"$IFS\"; %m", "selected\n\n");
+        for mut command in metadata_test_commands(&plan) {
+            let output = command
+                .env("SHELLOPTS", "errexit:nounset")
+                .output()
+                .expect("metadata shell option fixture");
+            assert!(output.status.success(), "{output:?}");
+            assert!(output.stderr.is_empty(), "{output:?}");
+            assert_eq!(output.stdout, b" \t\nselected\n\n");
+        }
+    }
+
+    /// The fixed file-read error does not disclose a missing private path or description.
+    #[test]
+    fn metadata_loading_reports_missing_files_without_private_paths() {
+        let output = Command::new("bash")
+            .args(["--noprofile", "--norc", "-c"])
+            .arg(expand_targets("%m").unwrap().source)
+            .args(["youta", "", "", "", "/missing/private-description-path"])
+            .env_remove("BASH_ENV")
+            .env_remove("ENV")
+            .output()
+            .expect("missing metadata file fixture");
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert_eq!(output.stderr, b"Cannot read captured description for %m\n");
+    }
+
+    /// Shell arguments contain a private file path rather than provider text or added shell source.
+    #[test]
+    fn metadata_uses_only_the_fourth_inner_argument_and_stays_out_of_debug() {
+        let plan = metadata_plan("printf '%s' %m", "PRIVATE PROVIDER DESCRIPTION");
+        let terminal = plan.command().unwrap();
+        let terminal_arguments = terminal.get_args().collect::<Vec<_>>();
+        let path = plan.metadata.as_ref().unwrap().path().unwrap();
+        assert_eq!(
+            terminal_arguments[terminal_arguments.len() - 4],
+            plan.argument.as_os_str()
+        );
+        assert_eq!(terminal_arguments.last(), Some(&path.as_os_str()));
+        assert!(terminal_arguments[4].to_str().unwrap().contains("\"$5\""));
+        let desktop = plan.noninteractive_command().unwrap();
+        let desktop_arguments = desktop.get_args().collect::<Vec<_>>();
+        assert_eq!(
+            desktop_arguments[desktop_arguments.len() - 4],
+            plan.argument.as_os_str()
+        );
+        assert_eq!(desktop_arguments.last(), Some(&path.as_os_str()));
+        for command in [terminal, desktop] {
+            assert!(command.get_args().all(|argument| {
+                !argument
+                    .to_string_lossy()
+                    .contains("PRIVATE PROVIDER DESCRIPTION")
+            }));
+        }
+        assert_eq!(format!("{plan:?}"), "ShellCommandPlan { .. }");
+        assert!(!format!("{:?}", plan.metadata).contains("PRIVATE PROVIDER DESCRIPTION"));
+    }
 
     /// Image macros use a separate positional argument and retain literal suffixes.
     #[test]
@@ -421,6 +905,7 @@ mod tests {
                 argument: OsString::new(),
                 downloaded_path: None,
                 image_path: None,
+                metadata: None,
                 directory: std::env::temp_dir(),
             };
             assert_eq!(plan.requires_selection().unwrap(), selection, "{template}");
@@ -447,6 +932,7 @@ mod tests {
                 argument: OsString::new(),
                 downloaded_path: None,
                 image_path: None,
+                metadata: None,
                 directory: std::env::temp_dir(),
             };
             let error = plan.requires_selection().unwrap_err();
@@ -520,6 +1006,7 @@ mod tests {
                 argument: "https://example.test/original".into(),
                 downloaded_path: None,
                 image_path: None,
+                metadata: None,
                 directory: std::env::temp_dir(),
             };
             assert_eq!(expand_targets(template).unwrap().source, template);
@@ -545,6 +1032,7 @@ mod tests {
                 argument: OsString::new(),
                 downloaded_path: None,
                 image_path: None,
+                metadata: None,
                 directory: std::env::temp_dir(),
             };
             assert_eq!(expand_targets(template).unwrap().source, template);
@@ -563,6 +1051,7 @@ mod tests {
                 argument: "https://example.test/private-original".into(),
                 downloaded_path: None,
                 image_path: None,
+                metadata: None,
                 directory: std::env::temp_dir(),
             };
             assert!(plan.requires_selection().unwrap());
@@ -597,12 +1086,13 @@ mod tests {
                     argument: "https://example.test/original path".into(),
                     downloaded_path: Some(PathBuf::from("/tmp/downloaded media.flac")),
                     image_path: Some(PathBuf::from(OsString::from_vec(image.clone()))),
+                    metadata: None,
                     directory: std::env::temp_dir(),
                 };
                 let terminal = plan.command().unwrap();
                 let arguments = terminal.get_args().collect::<Vec<_>>();
                 assert_eq!(
-                    arguments.last(),
+                    arguments.get(arguments.len() - 2),
                     Some(&plan.image_path.as_ref().unwrap().as_os_str())
                 );
                 assert!(arguments[4].to_str().unwrap().contains("\"$4\""));
@@ -658,6 +1148,7 @@ mod tests {
                 argument: "https://example.test/private-original".into(),
                 downloaded_path: None,
                 image_path: None,
+                metadata: None,
                 directory: std::env::temp_dir(),
             };
             assert!(plan.requires_download().unwrap(), "{template}");
@@ -695,14 +1186,15 @@ mod tests {
 					argument: OsString::from_vec(original.clone()),
 					downloaded_path: Some(PathBuf::from(OsString::from_vec(downloaded.clone()))),
 					image_path: None,
+					metadata: None,
 					directory: std::env::temp_dir(),
 				};
 				assert!(plan.requires_download().unwrap());
 				let terminal = plan.command().unwrap();
 				let arguments = terminal.get_args().collect::<Vec<_>>();
-				assert_eq!(arguments[arguments.len() - 3], plan.argument.as_os_str());
+				assert_eq!(arguments[arguments.len() - 4], plan.argument.as_os_str());
 				assert_eq!(
-					arguments[arguments.len() - 2],
+					arguments[arguments.len() - 3],
 					plan.downloaded_path.as_ref().unwrap().as_os_str()
 				);
 				let output = plan.noninteractive_command().unwrap().output().expect("Bash fixture");
@@ -867,8 +1359,8 @@ mod tests {
         assert_eq!(command.get_program(), "bash");
         assert_eq!(command.get_current_dir(), Some(plan.directory.as_path()));
         let arguments = command.get_args().collect::<Vec<_>>();
+        assert_eq!(arguments[arguments.len() - 4], plan.path.as_os_str());
         assert_eq!(arguments[arguments.len() - 3], plan.path.as_os_str());
-        assert_eq!(arguments[arguments.len() - 2], plan.path.as_os_str());
         assert_eq!(arguments.last(), Some(&std::ffi::OsStr::new("")));
     }
 }

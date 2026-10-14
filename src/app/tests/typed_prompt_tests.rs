@@ -66,6 +66,51 @@ fn typed_prompt_captures_selected_url_before_typing_and_ignores_playback() {
     assert!(controller.view.local_command.is_some());
 }
 
+/// Metadata is frozen when the editor opens, independently of later Details or playback.
+#[cfg(unix)]
+#[test]
+fn typed_prompt_metadata_saves_the_description_captured_before_typing() {
+    let (mut controller, directory) = fixture();
+    let text = "Captured selected description\n$(touch PROMPT_METADATA_INJECTION)\nМінск\n\n";
+    controller.view.details.as_mut().unwrap().description = text.to_owned();
+    controller.dispatch(UiAction::BeginLocalCommand);
+    select_other_item(&mut controller);
+    controller.view.details.as_mut().unwrap().description =
+        "Later selected item, not captured".to_owned();
+    type_text(&mut controller, "%m > mynote");
+    controller.dispatch(UiAction::SubmitLocalCommand);
+    assert!(controller.view.local_command.is_none());
+    let mut plan = controller
+        .take_custom_command_plan()
+        .expect("captured metadata plan");
+    plan.directory = directory.path().to_owned();
+    let result = plan.capture_output().unwrap();
+    assert!(result.success);
+    assert_eq!(
+        std::fs::read(directory.path().join("mynote")).unwrap(),
+        text.as_bytes()
+    );
+    assert!(!directory.path().join("PROMPT_METADATA_INJECTION").exists());
+    assert!(!format!("{plan:?}").contains("Captured selected description"));
+    let log = std::fs::read_to_string(controller.config.config_dir().join("cmd-log")).unwrap();
+    assert!(log.contains("%m > mynote"));
+    assert!(!log.contains("Captured selected description"));
+}
+
+/// A playing item or stale Details on an empty tab cannot supply `%m` to the prompt.
+#[test]
+fn typed_prompt_metadata_without_selection_keeps_the_editor_open() {
+    let (mut controller, _directory) = fixture();
+    controller.view.screen = Screen::Statistics;
+    controller.view.rows.clear();
+    controller.dispatch(UiAction::BeginLocalCommand);
+    type_text(&mut controller, "%m > mynote");
+    controller.dispatch(UiAction::SubmitLocalCommand);
+    assert!(controller.view.local_command.is_some());
+    assert!(controller.take_custom_command_plan().is_none());
+    assert!(controller.view.status_line.contains("Select an item"));
+}
+
 /// Image commands freeze artwork before typing, independently of playback and later metadata.
 #[cfg(feature = "remote-artwork")]
 #[test]

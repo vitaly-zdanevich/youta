@@ -604,7 +604,29 @@ terminal does not display images. Unavailable images prevent command execution.
 For example,
 .B gimp %i
 opens the selected image for editing.
-All three macros require a selected item and never fall back to the playing item.
+.B %m
+supplies the selected item's full description text shown in Details, captured
+when the colon editor opens or a command button is invoked. It uses the
+description already loaded without fetching additional metadata. An empty
+description is valid; an unavailable description prevents command execution.
+All four macros require a selected item and never fall back to the playing item.
+.IP
+When
+.B %m
+is the complete command word in a simple command, it writes the full description
+without adding a newline:
+.B :%m > mynote
+saves it exactly. As an argument or with a suffix,
+.B %m
+passes one safely quoted text value, never shell source. For example,
+.B printf '%s' %m > mynote
+saves the same text. Quoted or escaped %m remains literal.
+Youta transports long descriptions through an owner-only temporary file,
+deleted when the command plan is released.
+For descriptions in complex Bash syntax, first save the text with
+.BR "%m > mynote" ,
+then read that file in a separate command.
+.IP
 Online images require the remote-artwork build feature; local media covers
 require local-artwork. Selected local image files need neither artwork feature.
 Suffixes such as
@@ -956,8 +978,10 @@ passes the selected original URL or full local path,
 .B %d
 passes downloaded/local media, and
 .B %i
-passes the largest available image/artwork.
-All three pass one argument safely and never fall back to the playing item.
+passes the largest available image/artwork, and
+.B %m
+passes the full Details description.
+All four pass one argument safely and never fall back to the playing item.
 The download, editable-copy, and quoting rules above also apply.
 Suffixes such as
 .B %i.png
@@ -965,6 +989,8 @@ are supported; quoted or escaped percent signs remain literal.
 For example,
 .B gimp %i
 opens the selected image for editing.
+.B %m > mynote
+saves the selected description exactly, without adding a newline.
 Buttons are unavailable inside read-only archive folders.
 .PP
 Optional
@@ -1055,11 +1081,11 @@ executed; rename to commands to enable it.
 .TP
 .I cmd-log
 Plaintext terminal command history: the latest 100 submitted commands,
-one per line,
-up to 8192 bytes each. Requires the cmd feature. Delete while Youta is closed to
-clear it. Written with owner-only Unix permissions; included in configuration
-Git synchronization. Commands may contain passwords or tokens. Command text is
-excluded from diagnostics and bug-report screenshots.
+one per line, up to 8192 bytes each. History stores the typed command and never
+the description expanded by %m. Requires the cmd feature. Delete while Youta is
+closed to clear it. Written with owner-only Unix permissions; included in
+configuration Git synchronization. Commands may contain passwords or tokens.
+Command text is excluded from diagnostics and bug-report screenshots.
 .TP
 .I state/*.toml
 Canonical progress, history, notes, bookmarks, statistics, playlists, and

@@ -153,6 +153,7 @@ mod tests {
             argument: "/tmp/a file;$(not-shell-source)".into(),
             downloaded_path: None,
             image_path: None,
+            metadata: None,
             directory: directory.to_owned(),
         }
     }

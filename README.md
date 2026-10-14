@@ -246,13 +246,28 @@ available image or artwork, fetching it only when the command requests `%i`
 and reusing a completed image download. Remote or embedded artwork is passed
 as an editable copy that protects Youta's cache; local images and sidecar covers
 use their original paths. This works even when the terminal does not display images.
-Unavailable images prevent the command from running. All three macros require
-a selected item and never fall back to the playing item. For example:
+Unavailable images prevent the command from running. `%m` supplies the selected
+item's full description text shown in Details, captured when the `:` editor
+opens or a command button is invoked. It uses the description already loaded
+and does not fetch additional metadata. An empty description is valid; an
+unavailable description prevents the command from running. All four macros
+require a selected item and never fall back to the playing item. For example:
 
 ```sh
 ffmpeg -i %d -c:a libmp3lame /tmp/output.mp3
 gimp %i
+%m > mynote
+printf '%s' %m > mynote
 ```
+
+When `%m` is the complete command word in a simple command, it writes the full
+description without adding a newline, so `:%m > mynote` saves it exactly. As an
+argument or with a suffix, `%m` passes the description as one safely quoted text
+value; it is never shell source. Quoted or escaped `%m` remains literal. Youta
+transports long descriptions through an owner-only temporary file, deleted when
+the command plan is released.
+For descriptions in complex Bash syntax, first save the text with `%m > mynote`,
+then read that file in a separate command.
 
 Online images require the `remote-artwork` build feature (included by default
 through `images`); local media covers require `local-artwork`. Selected local
@@ -280,6 +295,7 @@ entry. `Ctrl+R` opens the ten newest matching commands; type a case-sensitive
 substring, choose with `Up` / `Down`, and press `Enter` to run it against the
 current selection. `Esc` closes history search without running anything.
 
+History stores the command you type, never the description expanded by `%m`.
 The latest 100 submitted commands persist as plain text, one command per line,
 in `~/.config/youta/cmd-log` (up to 8192 bytes per command). Delete this file
 while Youta is closed to clear command history. Youta writes it with owner-only
@@ -303,12 +319,14 @@ Optional `provider` restricts the button to the selected item's actual source
 it makes the button available for every eligible provider. Optional
 `font_color` and `background_color` accept `#rgb` or `#rrggbb` values.
 
-Buttons use the same `%`, `%d`, and `%i` macros as the `:` editor: the selected
-original URL or local path, downloaded/local media, and largest available
-image/artwork. They pass one argument safely, support suffixes such as `%i.png`,
-and never fall back to the playing item. The download, editable-copy, and
-quoting rules above also apply. For example, `gimp %i` opens the selected
-image for editing. Commands are unavailable inside read-only archive folders.
+Buttons use the same `%`, `%d`, `%i`, and `%m` macros as the `:` editor: the selected
+original URL or local path, downloaded/local media, largest available
+image/artwork, and full Details description. They pass one argument safely,
+support suffixes such as `%i.png`, and never fall back to the playing item.
+The download, editable-copy, and quoting rules above also apply.
+For example, `gimp %i` opens the selected
+image for editing, and `%m > mynote` saves its description exactly. Commands
+are unavailable inside read-only archive folders.
 
 Optional `hotkey` accepts a character, named key, or `F1`-`F24`, with
 `Ctrl+`, `Alt+`, or `Shift+` modifiers. It overrides built-in shortcuts only in

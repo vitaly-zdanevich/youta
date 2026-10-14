@@ -1,11 +1,16 @@
 //! Real-PTY coverage for Local commands, job control, and terminal restoration.
 
 use super::*;
-use crate::local_command::LocalCommandPlan;
+use crate::local_command::{CommandMetadata, LocalCommandPlan};
 use std::io::Write;
 use std::process::Command;
+use std::sync::Arc;
 
 const CHILD_DIRECTORY: &str = "YOUTA_LOCAL_COMMAND_TEST_DIRECTORY";
+
+/// Multiline private metadata containing syntax that must remain inert in Bash.
+const METADATA_DESCRIPTION: &str =
+    "Мінск: \"description\" 'quoted'\n$(touch METADATA_INJECTION); `touch METADATA_INJECTION`\n\n";
 
 /// Hands an isolated controlling terminal to the actual foreground command runner.
 #[test]
@@ -31,6 +36,10 @@ fn local_commands_preserve_output_and_restore_terminal_input() {
     assert!(
         !fixture.path().join("COMMAND_INJECTION").exists(),
         "a filename must never execute shell syntax"
+    );
+    assert!(
+        !fixture.path().join("METADATA_INJECTION").exists(),
+        "description text must never execute shell syntax"
     );
 }
 
@@ -62,7 +71,7 @@ fn expect_ui_key(input: &mut TerminalInput) {
     }
 }
 
-/// Exercises output, validation/spawn errors, successful/interrupted exec, and stdin.
+/// Exercises image/metadata macros, output, errors, interrupted exec, and stdin.
 fn run_child(directory: PathBuf) {
     let path = directory.join("track' $(touch COMMAND_INJECTION) ;\n song.flac");
     std::fs::write(&path, b"command fixture").unwrap();
@@ -88,6 +97,7 @@ fn run_child(directory: PathBuf) {
              printf 'IMAGE_ONE_ARG_OK\\n'",
             true,
         ),
+        ("metadata", "%m > description-note", true),
         ("exec", "exec printf 'COMMAND_EXEC_OK\\n'", true),
         ("nonzero", "printf 'COMMAND_NONZERO\\n'; exit 17", false),
         ("validation", "echo $(echo %)", false),
@@ -124,14 +134,24 @@ fn run_child(directory: PathBuf) {
         }
         .into_shell_plan();
         plan.image_path = (name == "image").then(|| image.clone());
+        plan.metadata =
+            (name == "metadata").then(|| Arc::new(CommandMetadata::new(METADATA_DESCRIPTION)));
         let result = local_command::execute_shell_command_plan(&mut session, &mut input, plan);
         assert_eq!(result.is_ok(), succeeds, "{name}: {result:?}");
+        if name == "metadata" {
+            assert_eq!(
+                std::fs::read(directory.join("description-note")).unwrap(),
+                METADATA_DESCRIPTION.as_bytes()
+            );
+            assert!(!directory.join("METADATA_INJECTION").exists());
+        }
         marker(&format!("COMMAND_RETURNED_{name}"));
         expect_ui_key(&mut input);
         marker(&format!("COMMAND_DONE_{name}"));
     }
 
     assert!(!directory.join("COMMAND_INJECTION").exists());
+    assert!(!directory.join("METADATA_INJECTION").exists());
     drop(input);
     drop(session);
     marker("LOCAL_COMMAND_TEST_DONE");

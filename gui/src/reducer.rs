@@ -945,6 +945,7 @@ mod tests {
             argument: "https://example.org/selected-item".into(),
             downloaded_path: None,
             image_path: None,
+            metadata: None,
             directory: temporary.path().to_owned(),
         };
         super::spawn_custom_command(plan, Arc::new(sender)).unwrap();
@@ -978,6 +979,7 @@ mod tests {
             argument: "https://example.org/selected-item".into(),
             downloaded_path: None,
             image_path: Some(image_path),
+            metadata: None,
             directory: temporary.path().to_owned(),
         };
         super::spawn_custom_command(plan, Arc::new(sender)).unwrap();
@@ -990,6 +992,41 @@ mod tests {
         let output = result.unwrap();
         assert!(output.success);
         assert_eq!(output.output, expected);
+        assert!(inbox.try_recv().is_err());
+    }
+
+    /// GUI shell workers preserve private description bytes without evaluating their contents.
+    #[cfg(all(feature = "cmd", unix))]
+    #[test]
+    fn custom_command_worker_saves_captured_description_without_injection() {
+        let temporary = tempfile::tempdir().unwrap();
+        let description = "Мінск: \"description\" 'quoted'\n$(touch METADATA_INJECTION); `touch METADATA_INJECTION`\n\n";
+        let (sender, inbox) = channel();
+        let plan = youta::local_command::ShellCommandPlan {
+            template: "%m > saved-note".to_owned(),
+            argument: "https://example.org/selected-item".into(),
+            downloaded_path: None,
+            image_path: None,
+            metadata: Some(Arc::new(youta::local_command::CommandMetadata::new(
+                description,
+            ))),
+            directory: temporary.path().to_owned(),
+        };
+        super::spawn_custom_command(plan, Arc::new(sender)).unwrap();
+        let Message::CustomCommandFinished(result) = inbox
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+        else {
+            panic!("expected description command completion");
+        };
+        let output = result.unwrap();
+        assert!(output.success);
+        assert!(output.output.is_empty());
+        assert_eq!(
+            std::fs::read(temporary.path().join("saved-note")).unwrap(),
+            description.as_bytes()
+        );
+        assert!(!temporary.path().join("METADATA_INJECTION").exists());
         assert!(inbox.try_recv().is_err());
     }
 

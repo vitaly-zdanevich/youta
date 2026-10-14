@@ -311,6 +311,7 @@ impl AppController {
             directory,
             downloaded_path: local.clone(),
             image_path: None,
+            metadata: self.capture_command_metadata(),
         };
         let local_selection = if self.view.screen == Screen::Local {
             local.and_then(|path| {
@@ -383,6 +384,44 @@ impl AppController {
             source,
             image: self.capture_command_image(),
         }
+    }
+
+    /// Freezes the selected Details description, never stale Local or playing metadata.
+    pub(super) fn capture_command_metadata(
+        &self,
+    ) -> Option<Arc<crate::local_command::CommandMetadata>> {
+        let (_, argument, local) = self.custom_command_target()?;
+        let details = self.view.details.as_ref()?;
+        let expected = if let Some(path) = local {
+            Some(local_media_id(&path))
+        } else if let Some(linked) = self.active_description_video.as_ref() {
+            Some(MediaId::new(SourceKind::YouTube, &linked.video_id))
+        } else if self.view.screen == Screen::Subscriptions {
+            self.selected_playlist_identity()
+                .map(|(identity, _)| identity)
+        } else {
+            self.view
+                .rows
+                .get(self.view.selected)
+                .and_then(|row| row.media_id.clone())
+        };
+        if let Some(expected) = expected {
+            if details.media_id.as_ref() != Some(&expected) {
+                return None;
+            }
+        } else {
+            // Channels and direct routes can lack a playable row identity. Their
+            // original URL must still match the description currently displayed.
+            let target = argument
+                .to_str()
+                .and_then(|value| url::Url::parse(value).ok())?;
+            if details.webpage_url.as_ref() != Some(&target) {
+                return None;
+            }
+        }
+        Some(Arc::new(crate::local_command::CommandMetadata::new(
+            details.description.clone(),
+        )))
     }
 
     /// Captures only selected, provider-advertised artwork; terminal size cannot limit `%i`.
@@ -462,6 +501,9 @@ impl AppController {
         }
         if self.custom_commands.mode == CustomCommandMode::Unavailable {
             return Err("Shell commands are unavailable in this frontend".to_owned());
+        }
+        if plan.requires_metadata()? && plan.metadata.is_none() {
+            return Err("Wait for the selected item's description before using %m".to_owned());
         }
         if plan.requires_image()? && plan.image_path.is_none() {
             let source = download.image.clone()?;

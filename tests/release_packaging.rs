@@ -840,7 +840,11 @@ fn yandex_music_feature_and_credentials_remain_optional_and_documented() {
 fn command_prompt_is_default_but_independently_removable() {
     let manifest = manifest();
     assert!(feature_entries(&manifest, "default").contains(&"cmd"));
-    assert_eq!(feature_entries(&manifest, "cmd"), ["local-browser"]);
+    // Private description files avoid operating-system argument-size limits.
+    assert_eq!(
+        feature_entries(&manifest, "cmd"),
+        ["local-browser", "dep:tempfile"]
+    );
     for profile in [
         "local",
         "local-browser",

@@ -112,7 +112,7 @@ def main():
 				drain(0.02)
 			raise AssertionError(f'Foreground exec sleep did not start: {transcript[-12000:]!r}')
 
-		for index, name in enumerate(('normal', 'image', 'exec', 'nonzero', 'validation', 'missing_directory', 'interrupt', 'read')):
+		for index, name in enumerate(('normal', 'image', 'metadata', 'exec', 'nonzero', 'validation', 'missing_directory', 'interrupt', 'read')):
 			wait_for(f'COMMAND_BEGIN_{name}'.encode())
 			if name == 'interrupt':
 				wait_for(b'COMMAND_INTERRUPT_READY')
@@ -129,6 +129,10 @@ def main():
 				assert b'COMMAND_EXEC_OK' in output, output
 			elif name == 'image':
 				assert b'IMAGE_ONE_ARG_OK' in output, output
+			elif name == 'metadata':
+				description = 'Мінск: "description" \'quoted\'\n$(touch METADATA_INJECTION); `touch METADATA_INJECTION`\n\n'
+				assert (Path(sys.argv[2]) / 'description-note').read_bytes() == description.encode('utf-8')
+				assert not (Path(sys.argv[2]) / 'METADATA_INJECTION').exists()
 			elif name == 'read':
 				assert b'COMMAND_INPUT_OK' in output, output
 			elif name == 'validation':

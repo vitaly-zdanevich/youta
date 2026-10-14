@@ -184,6 +184,112 @@ fn custom_image_command_without_artwork_does_not_run() {
     assert!(controller.manual_downloads.queue.entries.is_empty());
 }
 
+/// Description commands export the selected provider's loaded text, not shell syntax.
+#[cfg(unix)]
+#[test]
+fn custom_metadata_commands_save_exact_selected_descriptions_for_all_providers() {
+    for source in [
+        SourceKind::YouTube,
+        SourceKind::SoundCloud,
+        SourceKind::ArchiveOrg,
+        SourceKind::Bandcamp,
+        SourceKind::Radio,
+        SourceKind::RemoteFiles,
+    ] {
+        let (mut controller, directory) =
+            fixture("[[commands]]\nname='Save'\ncommand='%m > mynote'\n");
+        let identity = MediaId::new(source, "selected-description");
+        let text = "Description from the selected item\nМінск 🦀\n$(touch METADATA_INJECTION) `touch METADATA_INJECTION`\n\n";
+        controller.view.screen = Screen::History;
+        controller.view.rows = vec![RowView {
+            media_id: Some(identity.clone()),
+            ..Default::default()
+        }];
+        controller.view.details = Some(DetailView {
+            media_id: Some(identity),
+            description: text.to_owned(),
+            webpage_url: Some(url::Url::parse("https://example.org/selected-description").unwrap()),
+            ..Default::default()
+        });
+        controller.dispatch(UiAction::RunCustomCommand(0));
+        let mut plan = controller
+            .take_custom_command_plan()
+            .expect("selected metadata command");
+        // Relative redirection belongs to this fixture, never the user's repository.
+        plan.directory = directory.path().to_owned();
+        let output = plan.capture_output().unwrap();
+        assert!(output.success);
+        assert!(output.output.is_empty());
+        assert_eq!(
+            std::fs::read(directory.path().join("mynote")).unwrap(),
+            text.as_bytes()
+        );
+        assert!(!directory.path().join("METADATA_INJECTION").exists());
+        assert!(controller.manual_downloads.queue.entries.is_empty());
+    }
+}
+
+/// A Local row can own a URL/path before its Details reply; its old description is not eligible.
+#[test]
+fn custom_metadata_commands_reject_stale_local_descriptions() {
+    let (mut controller, directory) = fixture("[[commands]]\nname='Save'\ncommand='%m > mynote'\n");
+    let media = directory.path().join("media");
+    std::fs::create_dir(&media).unwrap();
+    let selected = media.join("selected.flac");
+    std::fs::write(&selected, b"fixture").unwrap();
+    controller.view.screen = Screen::Local;
+    controller.local_listing = Some(
+        crate::local_browser::list_local_directory(
+            &media,
+            crate::local_browser::LocalBrowseLimits::default(),
+        )
+        .unwrap(),
+    );
+    controller.view.selected = 1;
+    controller.view.rows = vec![RowView {
+        media_id: Some(local_media_id(&selected)),
+        ..Default::default()
+    }];
+    controller.view.details = Some(DetailView {
+        media_id: Some(local_media_id(&selected)),
+        description: "Selected Local description".to_owned(),
+        ..Default::default()
+    });
+    let metadata = controller
+        .capture_command_metadata()
+        .expect("matching Local metadata");
+    let original = directory.path().join("previous.flac");
+    controller.view.details.as_mut().unwrap().media_id = Some(local_media_id(&original));
+    assert!(controller.capture_command_metadata().is_none());
+    controller.view.details.as_mut().unwrap().media_id = None;
+    assert!(controller.capture_command_metadata().is_none());
+    assert!(!format!("{metadata:?}").contains("Selected Local"));
+}
+
+/// Matching empty text is valid, while absent Details never turns into playing metadata.
+#[test]
+fn custom_metadata_commands_distinguish_empty_and_missing_descriptions() {
+    let (mut controller, _directory) =
+        fixture("[[commands]]\nname='Save'\ncommand='%m > mynote'\n");
+    controller.dispatch(UiAction::RunCustomCommand(0));
+    assert!(
+        controller
+            .take_custom_command_plan()
+            .unwrap()
+            .metadata
+            .is_some()
+    );
+    controller.report_custom_command_result(Ok(CommandOutput {
+        output: String::new(),
+        success: true,
+    }));
+    controller.dispatch(UiAction::DismissCustomCommandOutput);
+    controller.view.details = None;
+    controller.dispatch(UiAction::RunCustomCommand(0));
+    assert!(controller.take_custom_command_plan().is_none());
+    assert!(controller.view.status_line.contains("description"));
+}
+
 /// Bounds asynchronous fixture waiting without introducing a production polling timer.
 #[cfg(feature = "remote-artwork")]
 pub(super) fn wait_for_image_command(
@@ -532,6 +638,7 @@ fn captured_shell_commands_keep_the_source_and_normal_download_chooser() {
         argument: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".into(),
         downloaded_path: None,
         image_path: None,
+        metadata: None,
         directory: directory.path().to_owned(),
     };
     controller.view.screen = Screen::Statistics;
@@ -567,6 +674,7 @@ fn captured_shell_commands_allow_plain_commands_without_download_sources() {
         argument: Default::default(),
         downloaded_path: None,
         image_path: None,
+        metadata: None,
         directory: directory.path().to_owned(),
     };
     controller
@@ -602,6 +710,7 @@ fn captured_shell_commands_reuse_downloads_before_checking_source_errors() {
         argument: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".into(),
         downloaded_path: None,
         image_path: None,
+        metadata: None,
         directory: directory.path().to_owned(),
     };
     controller
