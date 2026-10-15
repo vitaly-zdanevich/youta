@@ -2017,6 +2017,426 @@ impl PlaybackBackend for RecordingBackend {
     }
 }
 
+/// Starts an admitted public Funkwhale input with an observable backend and frozen resume point.
+fn retry_controller() -> (AppController, Arc<Mutex<Vec<PlaybackInput>>>) {
+    let mut app = controller();
+    app.diagnostic_helpers_cache = Some(Vec::new());
+    let inputs = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&inputs);
+    app.playback_factory = Some(Box::new(move || {
+        Ok(Box::new(RecordingBackend(Arc::clone(&recorded))))
+    }));
+    let summary = track("pod.example", 1);
+    let mut item = queue_item(&summary).unwrap();
+    item.start_at_seconds = Some(37);
+    complete(
+        &mut app,
+        vec![summary.clone(), track("pod.example", 2)],
+        None,
+    );
+    let origin = app.funkwhale_autoplay_origin(&item.media.id);
+    app.request_funkwhale_playback(item.clone(), false, origin.clone());
+    app.apply_funkwhale_reply(
+        Job::Playback {
+            generation: app.funkwhale.playback_generation,
+            item: Box::new(item),
+            queued: false,
+            origin,
+        },
+        Ok(Reply::Playback(
+            details(&summary),
+            summary.stream_url.unwrap(),
+        )),
+    );
+    app.playback_queue
+        .push(queue_item(&track("pod.example", 2)).unwrap());
+    (app, inputs)
+}
+
+/// Mirrors the actual mpv diagnostic reported when opening a temporary unavailable stream.
+fn funkwhale_http_end(status: u16) -> PlaybackEnd {
+    PlaybackEnd {
+        reason: PlaybackEndReason::Error,
+        error: Some("loading failed".to_owned()),
+        file_error: Some("unrecognized file format".to_owned()),
+        diagnostic: Some(format!(
+            "ffmpeg: https: HTTP error {status} Service Unavailable"
+        )),
+    }
+}
+
+#[test]
+fn starting_funkwhale_http503_keeps_the_queue_without_immediate_diagnostic_dump() {
+    let (mut app, inputs) = retry_controller();
+    app.handle_playback_end(funkwhale_http_end(503), Duration::ZERO);
+    assert!(
+        app.view.error_popup.is_none(),
+        "temporary stream failures should be retried first"
+    );
+    assert_eq!(app.playback_queue.current_index, Some(0));
+    assert_eq!(app.playback_queue.items.len(), 2);
+    assert!(app.current_media.is_some());
+    assert_eq!(
+        inputs.lock().unwrap().len(),
+        1,
+        "backoff never blocks or immediately reopens a stream"
+    );
+}
+
+#[test]
+fn funkwhale_http_retries_are_delayed_bounded_and_keep_the_original_queue_position() {
+    let (mut app, inputs) = retry_controller();
+    let summary = track("pod.example", 1);
+    for (attempt, expected_delay) in [Duration::from_millis(500), Duration::from_secs(2)]
+        .into_iter()
+        .enumerate()
+    {
+        let now = Instant::now();
+        assert!(app.retry_funkwhale_playback_end(&funkwhale_http_end(503), now));
+        let deadline = app.funkwhale_playback_retry_deadline().unwrap();
+        assert_eq!(deadline.duration_since(now), expected_delay);
+        app.diagnostic_only = false;
+        assert!(app.scheduled_tick_delay(now) <= expected_delay);
+        app.diagnostic_only = true;
+        app.poll_due_funkwhale_playback_retry(deadline - Duration::from_millis(1));
+        assert_eq!(inputs.lock().unwrap().len(), attempt + 1);
+        assert!(app.view.playback_starting);
+        assert!(app.funkwhale_playback_pending());
+
+        app.view.selected = 1;
+        app.poll_due_funkwhale_playback_retry(deadline);
+        let item = app.playback_queue.current().unwrap().clone();
+        let origin = app.current_autoplay_origin.clone();
+        app.apply_funkwhale_reply(
+            Job::Playback {
+                generation: app.funkwhale.playback_generation,
+                item: Box::new(item),
+                queued: true,
+                origin,
+            },
+            Ok(Reply::Playback(
+                details(&summary),
+                url::Url::parse(&format!("https://fresh.example/audio-{attempt}.opus")).unwrap(),
+            )),
+        );
+        assert_eq!(app.playback_queue.current_index, Some(0));
+        assert_eq!(app.playback_queue.items.len(), 2);
+        assert_eq!(
+            app.current_media.as_ref(),
+            Some(&MediaId::new(SourceKind::Funkwhale, &summary.video_id))
+        );
+        assert_eq!(
+            inputs.lock().unwrap().last().unwrap().start_at,
+            Duration::from_secs(37)
+        );
+    }
+    app.diagnostic_helpers_cache = None;
+    app.handle_playback_end(funkwhale_http_end(503), Duration::ZERO);
+    let popup = app
+        .view
+        .error_popup
+        .as_ref()
+        .expect("exhausted temporary service failure");
+    assert_eq!(popup.report, "Media error: HTTP 503 Service Unavailable");
+    assert!(!popup.reportable);
+    assert!(app.funkwhale_playback_retry_deadline().is_none());
+    assert_eq!(inputs.lock().unwrap().len(), 3);
+    assert_eq!(app.playback_queue.current_index, Some(0));
+    assert_eq!(app.playback_queue.items.len(), 2);
+    assert_eq!(app.playback_phase, PlaybackPhase::Idle);
+    assert!(app.store.history(false, 10).unwrap().is_empty());
+    assert!(
+        app.diagnostic_helpers_cache.is_none(),
+        "routine HTTP failures do not probe helper versions"
+    );
+}
+
+#[test]
+fn funkwhale_retry_resolution_failures_share_the_budget_and_stop_transient_feedback() {
+    let (mut app, inputs) = retry_controller();
+    app.handle_playback_end(funkwhale_http_end(503), Duration::ZERO);
+    for _ in 0..2 {
+        let deadline = app.funkwhale_playback_retry_deadline().unwrap();
+        app.poll_due_funkwhale_playback_retry(deadline);
+        let item = app.playback_queue.current().unwrap().clone();
+        app.apply_funkwhale_reply(
+            Job::Playback {
+                generation: app.funkwhale.playback_generation,
+                item: Box::new(item),
+                queued: true,
+                origin: None,
+            },
+            Err("provider returned HTTP status 503".to_owned()),
+        );
+    }
+    assert!(app.funkwhale_playback_retry_deadline().is_none());
+    assert!(app.current_media.is_none());
+    assert!(!app.view.playback_starting);
+    app.refresh_playback_preparation_activity();
+    assert!(!app.view.playback_preparing);
+    assert_eq!(inputs.lock().unwrap().len(), 1);
+    let popup = app.view.error_popup.as_ref().unwrap();
+    assert!(popup.report.contains("503"));
+    assert!(!popup.reportable);
+}
+
+#[test]
+fn funkwhale_retry_resolves_a_fresh_stream_on_the_original_pod_each_time() {
+    let pod = RecentPodFixture::new(false);
+    let mut app = recent_controller(&pod, false);
+    let inputs = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&inputs);
+    app.playback_factory = Some(Box::new(move || {
+        Ok(Box::new(RecordingBackend(Arc::clone(&recorded))))
+    }));
+    let mut summary = track("pod.example", 1);
+    let page = pod.base.join("library/tracks/1").unwrap();
+    summary.video_id = page.to_string();
+    summary.webpage_url = Some(page);
+    let mut item = queue_item(&summary).unwrap();
+    item.start_at_seconds = Some(37);
+    app.request_funkwhale_playback(item, false, None);
+    finish_recent_requests(&mut app, |app| app.current_media.is_some());
+    assert_eq!(inputs.lock().unwrap().len(), 1);
+    app.config.providers.funkwhale_instance_url =
+        Some(url::Url::parse("https://another.example/").unwrap());
+    for expected in 2..=3 {
+        app.handle_playback_end(funkwhale_http_end(503), Duration::ZERO);
+        let deadline = app.funkwhale_playback_retry_deadline().unwrap();
+        app.poll_due_funkwhale_playback_retry(deadline);
+        finish_recent_requests(&mut app, |_| inputs.lock().unwrap().len() == expected);
+    }
+    let inputs = inputs.lock().unwrap();
+    assert_ne!(inputs[0].location, inputs[1].location);
+    assert_ne!(inputs[1].location, inputs[2].location);
+    assert!(
+        inputs
+            .iter()
+            .all(|input| input.start_at == Duration::from_secs(37))
+    );
+    assert_eq!(app.playback_queue.items.len(), 1);
+    assert_eq!(app.playback_queue.current_index, Some(0));
+    assert_eq!(pod.requests(), vec!["/api/v1/tracks/1/"; 3]);
+}
+
+#[test]
+fn funkwhale_pending_retry_is_revoked_by_stop_new_source_and_a_new_funkwhale_intent() {
+    for change in 0..3 {
+        let (mut app, inputs) = retry_controller();
+        app.handle_playback_end(funkwhale_http_end(503), Duration::ZERO);
+        let deadline = app.funkwhale_playback_retry_deadline().unwrap();
+        match change {
+            0 => app.handle_playback_end(
+                PlaybackEnd {
+                    reason: PlaybackEndReason::Stop,
+                    error: None,
+                    file_error: None,
+                    diagnostic: None,
+                },
+                Duration::ZERO,
+            ),
+            1 => app.cancel_funkwhale_playback(),
+            _ => app.request_funkwhale_playback(
+                queue_item(&track("pod.example", 2)).unwrap(),
+                false,
+                None,
+            ),
+        }
+        assert!(app.funkwhale_playback_retry_deadline().is_none());
+        app.poll_due_funkwhale_playback_retry(deadline);
+        assert_eq!(inputs.lock().unwrap().len(), 1);
+    }
+}
+
+#[test]
+fn newer_same_track_resolution_does_not_consume_its_retry_budget_for_the_old_load() {
+    let (mut app, _) = retry_controller();
+    let summary = track("pod.example", 1);
+    let item = app.playback_queue.current().unwrap().clone();
+    app.request_funkwhale_playback(item.clone(), true, None);
+    let job = Job::Playback {
+        generation: app.funkwhale.playback_generation,
+        item: Box::new(item),
+        queued: true,
+        origin: None,
+    };
+    app.funkwhale.jobs.push_back(job.clone());
+    assert!(!app.retry_funkwhale_playback_end(&funkwhale_http_end(503), Instant::now()));
+    assert!(app.funkwhale_playback_retry_deadline().is_none());
+    app.reset_playback_state();
+    app.funkwhale.jobs.clear();
+    app.apply_funkwhale_reply(
+        job,
+        Ok(Reply::Playback(
+            details(&summary),
+            summary.stream_url.unwrap(),
+        )),
+    );
+    let now = Instant::now();
+    assert!(app.retry_funkwhale_playback_end(&funkwhale_http_end(503), now));
+    assert_eq!(
+        app.funkwhale_playback_retry_deadline()
+            .unwrap()
+            .duration_since(now),
+        Duration::from_millis(500)
+    );
+}
+
+/// Emits one late successful start while recording every transport mutation.
+struct LateStartedBackend {
+    inputs: Arc<Mutex<Vec<PlaybackInput>>>,
+    commands: Arc<Mutex<Vec<PlayerCommand>>>,
+    shutdowns: Arc<std::sync::atomic::AtomicUsize>,
+    started: bool,
+}
+
+impl PlaybackBackend for LateStartedBackend {
+    fn play(&mut self, input: &PlaybackInput) -> crate::playback::Result<()> {
+        self.inputs.lock().unwrap().push(input.clone());
+        Ok(())
+    }
+
+    fn command(&mut self, command: PlayerCommand) -> crate::playback::Result<()> {
+        self.commands.lock().unwrap().push(command);
+        Ok(())
+    }
+
+    fn status(&mut self) -> crate::playback::Result<PlaybackStatus> {
+        Ok(PlaybackStatus::default())
+    }
+
+    fn poll_event(&mut self) -> crate::playback::Result<Option<PlaybackEvent>> {
+        Ok(std::mem::take(&mut self.started).then_some(PlaybackEvent::PlaybackStarted))
+    }
+
+    fn shutdown(&mut self) -> crate::playback::Result<()> {
+        self.shutdowns.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+#[test]
+fn late_success_cancels_an_inflight_retry_refresh_without_stopping_the_player() {
+    let (mut app, inputs) = retry_controller();
+    let summary = track("pod.example", 1);
+    app.handle_playback_end(funkwhale_http_end(503), Duration::ZERO);
+    let due = app.funkwhale_playback_retry_deadline().unwrap();
+    app.poll_due_funkwhale_playback_retry(due);
+    let job = Job::Playback {
+        generation: app.funkwhale.playback_generation,
+        item: Box::new(app.playback_queue.current().unwrap().clone()),
+        queued: true,
+        origin: None,
+    };
+    app.funkwhale.jobs.push_back(job.clone());
+    let commands = Arc::new(Mutex::new(Vec::new()));
+    let shutdowns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    app.player = Some(Box::new(LateStartedBackend {
+        inputs: Arc::clone(&inputs),
+        commands: Arc::clone(&commands),
+        shutdowns: Arc::clone(&shutdowns),
+        started: true,
+    }));
+    app.drain_player_events(Duration::ZERO);
+    assert_eq!(app.playback_phase, PlaybackPhase::Playing);
+    assert!(app.player.is_some());
+    assert!(commands.lock().unwrap().is_empty());
+    assert_eq!(shutdowns.load(Ordering::Relaxed), 0);
+    assert!(!app.funkwhale_playback_pending());
+    app.apply_funkwhale_reply(
+        job,
+        Ok(Reply::Playback(
+            details(&summary),
+            summary.stream_url.unwrap(),
+        )),
+    );
+    assert_eq!(
+        inputs.lock().unwrap().len(),
+        1,
+        "obsolete fresh URLs must not restart successful audio"
+    );
+    assert!(app.view.error_popup.is_none());
+    app.player = None;
+}
+
+#[test]
+fn funkwhale_does_not_retry_permanent_nonhttp_or_already_started_failures() {
+    for (status, phase) in [
+        (403, PlaybackPhase::Loading),
+        (404, PlaybackPhase::Loaded),
+        (503, PlaybackPhase::Playing),
+    ] {
+        let (mut app, _) = retry_controller();
+        app.playback_phase = phase;
+        assert!(!app.retry_funkwhale_playback_end(&funkwhale_http_end(status), Instant::now()));
+        assert!(app.funkwhale_playback_retry_deadline().is_none());
+    }
+    let (mut app, _) = retry_controller();
+    let end = PlaybackEnd {
+        reason: PlaybackEndReason::Error,
+        error: Some("codec 503 is unsupported".to_owned()),
+        file_error: None,
+        diagnostic: Some("https://audio.example/503".to_owned()),
+    };
+    assert!(!app.retry_funkwhale_playback_end(&end, Instant::now()));
+    assert_eq!(playback_end_http_status(&end), None);
+
+    let (mut app, inputs) = retry_controller();
+    app.handle_playback_end(funkwhale_http_end(503), Duration::ZERO);
+    let deadline = app.funkwhale_playback_retry_deadline().unwrap();
+    app.playback_phase = PlaybackPhase::Playing;
+    app.poll_due_funkwhale_playback_retry(deadline);
+    assert_eq!(
+        inputs.lock().unwrap().len(),
+        1,
+        "late successful audio must not be restarted by a delayed retry"
+    );
+    assert!(app.funkwhale_playback_retry_deadline().is_none());
+}
+
+#[test]
+fn http_media_status_requires_explicit_error_syntax_and_keeps_403_guidance() {
+    for status in [400, 401, 404, 429, 500, 502, 503, 504] {
+        for field in 0..3 {
+            let mut end = PlaybackEnd {
+                reason: PlaybackEndReason::Error,
+                error: None,
+                file_error: None,
+                diagnostic: None,
+            };
+            let message =
+                format!("ffmpeg: https: HTTP error {status} temporary or permanent error");
+            match field {
+                0 => end.error = Some(message),
+                1 => end.file_error = Some(message),
+                _ => end.diagnostic = Some(message),
+            };
+            assert_eq!(playback_end_http_status(&end), Some(status));
+            let (mut app, _) = retry_controller();
+            app.show_playback_end_error("Playback failed", playback_end_message(&end), &end, false);
+            let popup = app.view.error_popup.as_ref().unwrap();
+            assert_eq!(popup.report, playback_http_error_summary(status));
+            assert!(!popup.report.contains('\n'));
+            assert!(!popup.reportable);
+        }
+    }
+    for message in [
+        "Unsupported codec 503",
+        "https://server.example/503",
+        "HTTP error 5030 invalid",
+        "HTTP error 503abc invalid",
+        "HTTP status 200 OK",
+    ] {
+        let end = PlaybackEnd {
+            reason: PlaybackEndReason::Error,
+            error: Some(message.to_owned()),
+            file_error: None,
+            diagnostic: None,
+        };
+        assert_eq!(playback_end_http_status(&end), None);
+    }
+}
+
 #[test]
 fn accepted_audio_uses_the_backend_but_keeps_canonical_queue_metadata() {
     let mut app = controller();

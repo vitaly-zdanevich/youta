@@ -1964,6 +1964,10 @@ This does not save or restore a search. Submitting an empty search also opens
 recent tracks for that session. Press `/` to search the selected pod, then
 Enter to play a track. Resolution uses the shared ASCII activity animation;
 unavailable audio produces a visible error identifying its pod and track.
+If a stream fails before playback starts with HTTP 500, 502, 503, or 504,
+Youta retries twice, after 0.5 and 2 seconds, resolving fresh audio from the
+original pod without advancing the queue. A final HTTP failure is shown as
+one concise error line, without a system-information report.
 In the TUI, searches use the visible page capacity, up to 100 tracks, with explicit **Load more tracks**
 pagination. Details include the pod's metadata, available artwork, and original
 track and artist URLs. Artist catalogues show albums; Enter opens an album's

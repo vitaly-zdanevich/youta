@@ -27352,6 +27352,8 @@ impl AppController {
                     }
                     if self.playback_phase != PlaybackPhase::Playing {
                         self.playback_phase = PlaybackPhase::Playing;
+                        #[cfg(feature = "funkwhale")]
+                        self.clear_funkwhale_playback_retry();
                         self.playback_load_kind = PlaybackLoadKind::Regular;
                         self.clear_playback_start_activity();
                         self.view.playing_media_id = self.current_media.clone();
@@ -27436,6 +27438,10 @@ impl AppController {
         #[cfg(feature = "radio")]
         self.discard_active_radio_recording();
         if self.retry_youtube_load(&end) {
+            return;
+        }
+        #[cfg(feature = "funkwhale")]
+        if self.retry_funkwhale_playback_end(&end, Instant::now()) {
             return;
         }
         let playback_started = self.playback_phase == PlaybackPhase::Playing;
@@ -27766,6 +27772,8 @@ impl AppController {
     }
 
     fn reset_playback_state(&mut self) {
+        #[cfg(feature = "funkwhale")]
+        self.clear_funkwhale_playback_retry();
         #[cfg(feature = "yt-dlp")]
         self.cancel_live_start();
         self.clear_now_playing_context();
@@ -32009,6 +32017,15 @@ impl AppController {
         end: &PlaybackEnd,
         tracker_module: bool,
     ) {
+        if let Some(status) = playback_end_http_status(end)
+            && status != 403
+            && !(tracker_module && playback_end_reports_unsupported_format(end))
+        {
+            let summary = playback_http_error_summary(status);
+            self.show_actionable_message(title, &summary);
+            self.view.status_line = format!("{title}: {summary}");
+            return;
+        }
         if playback_end_reports_timeout(end)
             && !playback_end_reports_http_403(end)
             && !(tracker_module && playback_end_reports_unsupported_format(end))
@@ -47971,6 +47988,67 @@ fn unix_time() -> i64 {
 fn playback_end_message(end: &PlaybackEnd) -> String {
     playback_end_details(end)
         .unwrap_or_else(|| "mpv reported a playback error without additional details".to_owned())
+}
+
+/// Reads explicit failed HTTP status syntax, never unrelated codec numbers or HTTPS URLs.
+fn playback_end_http_status(end: &PlaybackEnd) -> Option<u16> {
+    for message in [
+        end.error.as_deref(),
+        end.file_error.as_deref(),
+        end.diagnostic.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let lower = message.to_ascii_lowercase();
+        for marker in [
+            "http error ",
+            "http status ",
+            "http status: ",
+            "http/1.1 ",
+            "http/2 ",
+            "http ",
+        ] {
+            let mut remaining = lower.as_str();
+            while let Some(index) = remaining.find(marker) {
+                let after = &remaining[index + marker.len()..];
+                let digits = after.bytes().take_while(u8::is_ascii_digit).count();
+                if digits == 3
+                    && after.as_bytes().get(3).is_none_or(|byte| {
+                        byte.is_ascii_whitespace() || matches!(byte, b':' | b',' | b')')
+                    })
+                    && let Ok(status) = after[..3].parse::<u16>()
+                    && (400..=599).contains(&status)
+                {
+                    return Some(status);
+                }
+                remaining = after;
+            }
+        }
+    }
+    None
+}
+
+/// Uses fixed public status names so signed URLs and helper diagnostics stay out of routine errors.
+fn playback_http_error_summary(status: u16) -> String {
+    let reason = match status {
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        408 => "Request Timeout",
+        410 => "Gone",
+        416 => "Range Not Satisfiable",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        504 => "Gateway Timeout",
+        _ => "",
+    };
+    format!("Media error: HTTP {status} {reason}")
+        .trim_end()
+        .to_owned()
 }
 
 /// Detects a concrete media timeout even when the decoder reports only a generic format error.

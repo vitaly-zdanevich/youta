@@ -18,6 +18,8 @@ impl AppController {
         if self.diagnostic_only {
             return delay.max(Duration::from_millis(1));
         }
+        #[cfg(feature = "funkwhale")]
+        include(self.funkwhale_playback_retry_deadline());
         include(
             self.scheduled_channel_details
                 .as_ref()

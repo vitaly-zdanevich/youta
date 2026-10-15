@@ -6,6 +6,8 @@
 #[cfg(feature = "funkwhale")]
 mod license;
 #[cfg(feature = "funkwhale")]
+mod retry;
+#[cfg(feature = "funkwhale")]
 mod uploader;
 
 #[cfg(feature = "funkwhale")]
@@ -53,6 +55,8 @@ pub(super) struct FunkwhaleState {
     generation: u64,
     #[cfg(feature = "funkwhale")]
     playback_generation: u64,
+    #[cfg(feature = "funkwhale")]
+    playback_retry: Option<retry::FunkwhalePlaybackRetry>,
     #[cfg(feature = "funkwhale")]
     admitting: Option<MediaId>,
     #[cfg(feature = "funkwhale")]
@@ -1030,6 +1034,7 @@ impl AppController {
                 "Funkwhale item identity does not match its original page".to_owned();
             return;
         }
+        self.remember_funkwhale_playback_retry(&item, origin.as_ref());
         self.view.status_line = "Resolving Funkwhale audio...".to_owned();
         self.queue_funkwhale_job(Job::Playback {
             generation: self.funkwhale.playback_generation,
@@ -1042,6 +1047,7 @@ impl AppController {
     /// Invalidates only pending playback; the current accepted stream keeps playing.
     #[cfg(feature = "funkwhale")]
     pub(super) fn cancel_funkwhale_playback(&mut self) {
+        self.funkwhale.playback_retry = None;
         self.funkwhale.playback_generation = self.funkwhale.playback_generation.wrapping_add(1);
         self.funkwhale
             .jobs
@@ -1058,6 +1064,7 @@ impl AppController {
     #[cfg(feature = "funkwhale")]
     pub(super) fn funkwhale_playback_pending(&self) -> bool {
         self.pending_funkwhale_playback_job().is_some()
+            || self.funkwhale_playback_retry_deadline().is_some()
     }
 
     /// Distinguishes an already-positioned queue action from a new insertion after EOF.
@@ -1234,6 +1241,7 @@ impl AppController {
             if self.view.quitting || self.shutdown_persistence_succeeded.is_some() {
                 return;
             }
+            self.poll_due_funkwhale_playback_retry(Instant::now());
             if !self.config.persistence.save_playback_history {
                 self.funkwhale.restore = false;
                 self.funkwhale.restore_selected = None;
@@ -1525,6 +1533,9 @@ impl AppController {
                     self.funkwhale.admitting = None;
                 }
                 Err(error) => {
+                    if self.retry_funkwhale_resolution_error(&item, &error) {
+                        return;
+                    }
                     let message = format!("Funkwhale track {}: {error}", item.media.webpage_url);
                     self.view.status_line.clone_from(&message);
                     self.show_actionable_message("Cannot play Funkwhale track", message);

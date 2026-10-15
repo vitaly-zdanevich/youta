@@ -944,6 +944,10 @@ This does not save or restore a search. Submit an empty search to browse recent
 tracks for the current session. Press / to search and Enter to play.
 Audio resolution shows the shared ASCII activity animation; failures produce
 a visible error identifying the original pod and track.
+Before playback starts, temporary HTTP 500/502/503/504 stream failures retry
+twice after 0.5 and 2 seconds, resolving fresh original-pod audio without
+advancing the queue. Final HTTP failures show one concise error line rather
+than a system-information report.
 Requests fit the visible list, up to 100 tracks, with explicit Load more tracks
 pagination. Details show available metadata, artwork, and original track and
 artist URLs. Artist catalogues show albums; Enter opens an album's tracks.
