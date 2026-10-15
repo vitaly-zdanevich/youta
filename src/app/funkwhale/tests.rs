@@ -1540,6 +1540,28 @@ fn default_recent_catalogue_keeps_twenty_track_stride_without_automatic_next_pag
     assert_eq!(app.funkwhale.page_size, 20);
 }
 
+#[cfg(any(feature = "commons-upload", feature = "archive-upload"))]
+#[test]
+fn real_funkwhale_track_selection_exposes_uploads_but_continuation_does_not() {
+    let mut app = controller();
+    let mut selected = track("pod.example", 1);
+    selected.video_id = selected.video_id.trim_end_matches('/').to_owned();
+    selected.webpage_url = Some(url::Url::parse(&selected.video_id).unwrap());
+    complete(&mut app, vec![selected], Some(2));
+    app.refresh_selected_playlist_state();
+    #[cfg(feature = "commons-upload")]
+    assert!(app.view.commons_upload_available);
+    #[cfg(feature = "archive-upload")]
+    assert!(app.view.archive_upload_available);
+    app.view.selected = app.funkwhale.items.len();
+    app.update_funkwhale_detail();
+    app.refresh_selected_playlist_state();
+    #[cfg(feature = "commons-upload")]
+    assert!(!app.view.commons_upload_available);
+    #[cfg(feature = "archive-upload")]
+    assert!(!app.view.archive_upload_available);
+}
+
 #[test]
 fn artist_rows_show_only_albums_and_pagination_retains_the_original_pod() {
     let mut app = controller();

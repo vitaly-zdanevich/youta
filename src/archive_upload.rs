@@ -39,6 +39,8 @@ pub enum ArchiveUploadSource {
     YouTube,
     /// Private local selection, whose filesystem location is never publication metadata.
     Local,
+    /// Original pod-scoped audio track page, resolved only after confirmation.
+    Funkwhale,
 }
 
 /// Editable publication metadata; defaults are deliberately not publishable.
@@ -55,7 +57,7 @@ pub struct ArchiveUploadDraft {
     /// Immutable origin supplied by the controller, not an editable metadata field.
     #[serde(default)]
     pub source: ArchiveUploadSource,
-    /// Canonical `YouTube` watch URL, or empty for a private Local selection.
+    /// Canonical public source page, or empty for a private Local selection.
     pub source_url: String,
     /// Whether prepared media includes video instead of the default Opus audio.
     pub upload_video: bool,
@@ -108,6 +110,34 @@ impl ArchiveUploadDraft {
         Ok(draft)
     }
 
+    /// Creates an audio-only review retaining the original Funkwhale track page.
+    ///
+    /// This does not resolve audio or contact either service. The upload worker
+    /// obtains a fresh playable locator only after explicit confirmation.
+    ///
+    /// # Errors
+    /// Rejects an omitted provider, noncanonical origin, invalid metadata or an
+    /// unavailable operating-system random source.
+    pub fn new_funkwhale(
+        source_url: Url,
+        title: String,
+        description: String,
+        creator: Option<String>,
+    ) -> Result<Self, String> {
+        canonical_funkwhale_source(source_url.as_str())?;
+        let draft = Self {
+            identifier: format!("funkwhale-{}", identifier_suffix()?),
+            title,
+            description,
+            creator: creator.unwrap_or_default(),
+            source: ArchiveUploadSource::Funkwhale,
+            source_url: source_url.into(),
+            upload_video: false,
+        };
+        draft.validate_metadata()?;
+        Ok(draft)
+    }
+
     /// Validates the editable fields and immutable source before confirmation.
     ///
     /// # Errors
@@ -151,6 +181,12 @@ impl ArchiveUploadDraft {
                 );
             }
             ArchiveUploadSource::Local => {}
+            ArchiveUploadSource::Funkwhale => {
+                canonical_funkwhale_source(&self.source_url)?;
+                if self.upload_video {
+                    return Err("Funkwhale uploads support audio only".to_owned());
+                }
+            }
         }
         Ok(())
     }
@@ -164,7 +200,7 @@ impl ArchiveUploadDraft {
     }
 }
 
-/// Uses the same collision-resistant suffix for both supported review origins.
+/// Uses the same collision-resistant suffix for every supported review origin.
 fn identifier_suffix() -> Result<String, String> {
     let mut random = [0_u8; 16];
     getrandom::fill(&mut random)
@@ -190,6 +226,27 @@ fn canonical_youtube_id(source: &str) -> Result<&str, String> {
         });
     identifier
         .ok_or_else(|| "Archive upload requires the original canonical YouTube watch URL".into())
+}
+
+/// Accepts an unchanged original track page, including its optional trailing slash.
+fn canonical_funkwhale_source(source: &str) -> Result<(), String> {
+    #[cfg(feature = "funkwhale")]
+    {
+        let invalid =
+            || "Archive upload requires the original canonical Funkwhale track page".to_owned();
+        let url = Url::parse(source).map_err(|_| invalid())?;
+        if url.as_str() != source {
+            return Err(invalid());
+        }
+        crate::archive_upload_media::funkwhale::canonical_source(&url)
+            .map(|_| ())
+            .map_err(|_| invalid())
+    }
+    #[cfg(not(feature = "funkwhale"))]
+    {
+        let _ = source;
+        Err("This build omits Funkwhale support".to_owned())
+    }
 }
 
 fn valid_xml_character(character: char) -> bool {
@@ -526,7 +583,7 @@ impl ArchiveUploadClient {
                 "x-archive-meta-description",
                 metadata_header(&draft.description),
             );
-        if draft.source == ArchiveUploadSource::YouTube {
+        if draft.source != ArchiveUploadSource::Local {
             request = request.header("x-archive-meta-source", metadata_header(&draft.source_url));
         }
         if !draft.creator.trim().is_empty() {
@@ -909,6 +966,117 @@ mod tests {
 
     fn source() -> Url {
         Url::parse("https://www.youtube.com/watch?v=abcdefghijk").expect("fixture source")
+    }
+
+    /// Funkwhale provenance is a canonical original track page, never a transient stream.
+    #[cfg(feature = "funkwhale")]
+    #[test]
+    fn funkwhale_drafts_accept_only_canonical_audio_origins() {
+        let mut draft: ArchiveUploadDraft = serde_json::from_value(serde_json::json!({
+            "source": "Funkwhale",
+            "identifier": "funkwhale-fixture",
+            "title": "Audio",
+            "description": "Reviewed public description",
+            "creator": "Artist",
+            "source_url": "https://pod.example/prefix/library/tracks/42/",
+            "upload_video": false
+        }))
+        .expect("Funkwhale draft");
+        assert!(draft.validate().is_ok());
+        for source in [
+            "https://pod.example/library/tracks/00042/",
+            "https://pod.example/library/artists/42/",
+            "https://pod.example/api/v2/listen/temporary/",
+            "https://user:password@pod.example/library/tracks/42/",
+            "https://pod.example/library/tracks/42/?token=private",
+            "https://pod.example/library/tracks/42/#fragment",
+            "file:///library/tracks/42/",
+        ] {
+            draft.source_url = source.to_owned();
+            assert!(draft.validate().is_err(), "accepted {source}");
+        }
+        draft.source_url = "https://pod.example/library/tracks/42/".to_owned();
+        draft.upload_video = true;
+        assert!(
+            draft.validate().is_err(),
+            "Funkwhale cannot publish a video mode"
+        );
+    }
+
+    /// Only the reviewed public source URL is published, not the resolved audio locator.
+    #[cfg(feature = "funkwhale")]
+    #[test]
+    fn funkwhale_upload_retains_original_source_provenance() {
+        let server = Server::new(vec![(404, None), (200, None)]);
+        let file = prepared_file(b"Funkwhale prepared audio");
+        let draft: ArchiveUploadDraft = serde_json::from_value(serde_json::json!({
+            "source": "Funkwhale", "identifier": "funkwhale-fixture",
+            "title": "Audio", "description": "Reviewed", "creator": "Artist",
+            "source_url": "https://pod.example/library/tracks/42", "upload_video": false
+        }))
+        .unwrap();
+        server
+            .client()
+            .upload_file(
+                &fake_credentials(),
+                &draft,
+                file.path(),
+                "media.opus",
+                &Arc::new(AtomicBool::new(false)),
+                |_| {},
+            )
+            .unwrap();
+        let requests = server.requests();
+        assert!(
+            String::from_utf8_lossy(&requests[1])
+                .to_ascii_lowercase()
+                .contains(
+                    &format!(
+                        "x-archive-meta-source: {}",
+                        metadata_header(&draft.source_url)
+                    )
+                    .to_ascii_lowercase()
+                )
+        );
+    }
+
+    /// Draft construction freezes public provenance without needing a provider request.
+    #[cfg(feature = "funkwhale")]
+    #[test]
+    fn funkwhale_factory_creates_distinct_audio_only_review_drafts() {
+        let source = Url::parse("https://pod.example/library/tracks/42").unwrap();
+        let first = ArchiveUploadDraft::new_funkwhale(
+            source.clone(),
+            "Track".into(),
+            "Description".into(),
+            Some("Artist".into()),
+        )
+        .unwrap();
+        let second =
+            ArchiveUploadDraft::new_funkwhale(source.clone(), "Track".into(), String::new(), None)
+                .unwrap();
+        assert_ne!(first.identifier, second.identifier);
+        assert!(first.identifier.starts_with("funkwhale-"));
+        assert_eq!(first.identifier.len(), "funkwhale-".len() + 32);
+        assert_eq!(first.source, ArchiveUploadSource::Funkwhale);
+        assert_eq!(first.source_url, source.as_str());
+        assert!(!first.upload_video);
+        assert_eq!(first.creator, "Artist");
+        assert!(first.validate().is_ok());
+    }
+
+    /// Serialized provider origins cannot turn on support omitted at build time.
+    #[cfg(not(feature = "funkwhale"))]
+    #[test]
+    fn funkwhale_factory_rejects_provider_omitted_builds() {
+        let error = ArchiveUploadDraft::new_funkwhale(
+            Url::parse("https://pod.example/library/tracks/42/").unwrap(),
+            "Track".into(),
+            String::new(),
+            None,
+        )
+        .unwrap_err();
+        assert!(error.contains("omits Funkwhale"));
     }
 
     #[test]

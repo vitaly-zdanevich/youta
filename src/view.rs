@@ -3707,7 +3707,7 @@ pub struct ViewModel {
     /// Whether this binary contains the removable Archive upload capability.
     #[cfg(feature = "archive-upload")]
     pub archive_upload_supported: bool,
-    /// Whether the exact selected YouTube video can enter upload review.
+    /// Whether the exact supported media selection can enter Archive upload review.
     #[cfg(feature = "archive-upload")]
     pub archive_upload_available: bool,
     /// Public Archive upload review/progress snapshot.

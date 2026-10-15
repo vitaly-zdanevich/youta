@@ -53,6 +53,29 @@ impl ArchiveUploadService for SystemArchiveUploadService {
                 cancellation,
                 |bytes, total| progress(ArchiveUploadPhase::Preparing, bytes, total),
             )?
+        } else if job.media.id.source == SourceKind::Funkwhale {
+            if job.draft.source != ArchiveUploadSource::Funkwhale
+                || job.draft.source_url != job.media.webpage_url.as_str()
+            {
+                return Err(
+                    "The reviewed Funkwhale source no longer matches its selected track".to_owned(),
+                );
+            }
+            #[cfg(feature = "funkwhale")]
+            {
+                crate::archive_upload_media::prepare_funkwhale_archive_media(
+                    &job.config,
+                    &job.media,
+                    &job.playback_location,
+                    job.draft.upload_video,
+                    cancellation,
+                    |bytes, total| progress(ArchiveUploadPhase::Preparing, bytes, total),
+                )?
+            }
+            #[cfg(not(feature = "funkwhale"))]
+            {
+                return Err("This build omits Funkwhale support".to_owned());
+            }
         } else {
             crate::archive_upload_media::prepare_archive_media(
                 &job.config,
@@ -96,6 +119,54 @@ struct ArchiveUploadWorker {
 #[cfg(test)]
 mod wake_tests {
     use super::*;
+
+    /// A changed draft cannot publish another track's provenance or start resolution.
+    #[cfg(feature = "funkwhale")]
+    #[test]
+    fn native_funkwhale_upload_rejects_mismatched_review_before_network() {
+        let directory = crate::test_support::canonical_tempdir("archive Funkwhale review");
+        let page = url::Url::parse("https://pod.example/library/tracks/42/").unwrap();
+        let media = MediaItem {
+            id: MediaId::new(SourceKind::Funkwhale, page.as_str()),
+            kind: MediaKind::Audio,
+            title: "Selected audio".to_owned(),
+            creator: None,
+            description: None,
+            webpage_url: page.clone(),
+            thumbnail_url: None,
+            duration_seconds: None,
+            published_at: None,
+            statistics: MediaStatistics::default(),
+            license: MediaLicense::Unknown,
+            chapters: Vec::new(),
+            captions: Vec::new(),
+        };
+        let draft = ArchiveUploadDraft::new_funkwhale(
+            url::Url::parse("https://pod.example/library/tracks/43/").unwrap(),
+            media.title.clone(),
+            String::new(),
+            None,
+        )
+        .unwrap();
+        let error = SystemArchiveUploadService
+            .run(
+                ArchiveUploadJob {
+                    config: Config::for_dir(directory.path()),
+                    playback_location: page.into(),
+                    media,
+                    draft,
+                    credentials: ArchiveUploadCredentials::new(
+                        "FAKE_ACCESS".into(),
+                        "FAKE_SECRET".into(),
+                    )
+                    .unwrap(),
+                },
+                &Arc::new(AtomicBool::new(false)),
+                &mut |_, _, _| panic!("mismatched review cannot start preparation"),
+            )
+            .unwrap_err();
+        assert!(error.contains("reviewed Funkwhale source"));
+    }
 
     /// The final queue entry retires ownership before thread cleanup can finish.
     #[test]
@@ -202,7 +273,7 @@ impl AppController {
         }
     }
 
-    /// Captures one YouTube or local item before an editable, non-publishing review.
+    /// Captures one supported item before an editable, non-publishing review.
     pub(super) fn open_archive_upload(&mut self) {
         if self.archive_upload.worker.is_some() || self.view.archive_credentials_popup.is_some() {
             return;
@@ -211,14 +282,13 @@ impl AppController {
             Ok(item) if archive_upload_video_available(&item).is_some() => item,
             _ => {
                 self.view.status_line =
-                    "Select a YouTube video or local media file to upload to archive.org"
-                        .to_owned();
+                    "Select a supported audio or video item to upload to archive.org".to_owned();
                 return;
             }
         };
         let video_available = archive_upload_video_available(&item).unwrap_or(false);
         let media = &mut item.media;
-        if media.id.source == SourceKind::YouTube
+        if matches!(media.id.source, SourceKind::YouTube | SourceKind::Funkwhale)
             && let Some(details) = self
                 .view
                 .details
@@ -235,6 +305,13 @@ impl AppController {
         // Local details contain filesystem paths, which are never public metadata.
         let draft = if media.id.source == SourceKind::Local {
             ArchiveUploadDraft::new_local(media.title.clone(), String::new(), media.creator.clone())
+        } else if media.id.source == SourceKind::Funkwhale {
+            ArchiveUploadDraft::new_funkwhale(
+                media.webpage_url.clone(),
+                media.title.clone(),
+                media.description.clone().unwrap_or_default(),
+                media.creator.clone(),
+            )
         } else {
             ArchiveUploadDraft::new(
                 media.webpage_url.clone(),
@@ -358,6 +435,10 @@ impl AppController {
                     draft.source_url == item.media.webpage_url.as_str()
                 }
                 (SourceKind::Local, ArchiveUploadSource::Local) => draft.source_url.is_empty(),
+                (SourceKind::Funkwhale, ArchiveUploadSource::Funkwhale) => {
+                    funkwhale_upload::supported(&item)
+                        && draft.source_url == item.media.webpage_url.as_str()
+                }
                 _ => false,
             };
             let format_matches = archive_upload_video_available(&item)
@@ -624,6 +705,9 @@ impl AppController {
 
 /// Returns finite source capabilities without resolving or disclosing local paths.
 fn archive_upload_video_available(item: &QueueItem) -> Option<bool> {
+    if funkwhale_upload::supported(item) {
+        return Some(false);
+    }
     match item.media.id.source {
         SourceKind::YouTube if matches!(item.media.kind, MediaKind::Audio | MediaKind::Video) => {
             Some(true)

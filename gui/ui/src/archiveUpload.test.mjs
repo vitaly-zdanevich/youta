@@ -81,16 +81,18 @@ test('Archive upload has one video checkbox and requires an explicit generation-
 	}
 });
 
-test('Local audio reviews mute unavailable video even when a remembered draft was enabled', () => {
-	for (const phase of ['Review', 'Preparing']) {
-		const popup = { ...fixture(), phase, video_available: false,
-			draft: { ...fixture().draft, source: 'Local', source_url: '', upload_video: true } };
-		const tree = module.exports.ArchiveUploadPopup({ popup });
-		const checkbox = nodes(tree).find((node) => node.props.role === 'checkbox');
-		assert.equal(checkbox.props.disabled, true);
-		assert.equal(checkbox.props['aria-checked'], false);
-		assert.ok(text(checkbox).includes('unavailable for this source'));
-		if (phase === 'Preparing') assert.ok(text(tree).includes('Preparing Opus audio'));
+test('Local and Funkwhale audio reviews mute unavailable video even when a remembered draft was enabled', () => {
+	for (const [source, source_url] of [['Local', ''], ['Funkwhale', 'https://pod.example/library/tracks/27/']]) {
+		for (const phase of ['Review', 'Preparing']) {
+			const popup = { ...fixture(), phase, video_available: false,
+				draft: { ...fixture().draft, source, source_url, upload_video: true } };
+			const tree = module.exports.ArchiveUploadPopup({ popup });
+			const checkbox = nodes(tree).find((node) => node.props.role === 'checkbox');
+			assert.equal(checkbox.props.disabled, true);
+			assert.equal(checkbox.props['aria-checked'], false);
+			assert.ok(text(checkbox).includes('unavailable for this source'));
+			if (phase === 'Preparing') assert.ok(text(tree).includes('Preparing Opus audio'));
+		}
 	}
 });
 
@@ -158,7 +160,7 @@ test('Archive window mounts the public popup and a credentials projection contai
 	assert.ok(!draftFields.includes('rights_confirmed'));
 	assert.match(app, /<ArchiveUploadPopup popup=\{view\.archive_upload_popup\}/);
 	assert.match(app, /<ArchiveCredentialsPopup editor=\{view\.archive_credentials_editor\}/);
-	assert.ok(source.includes("['I', 'upload selected YouTube or Local media to archive.org']"));
+	assert.ok(source.includes("['I', 'upload selected media to archive.org']"));
 });
 
 test('Archive credentials render only masked editor state and explicitly remain session-only', () => {

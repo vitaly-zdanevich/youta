@@ -25,7 +25,11 @@ pub(crate) mod original_cache_download;
 
 #[cfg(feature = "archive-upload")]
 pub mod archive_upload;
-#[cfg(any(feature = "archive-upload", feature = "s3-upload"))]
+#[cfg(any(
+    feature = "archive-upload",
+    feature = "s3-upload",
+    all(feature = "commons-upload", feature = "funkwhale")
+))]
 pub mod archive_upload_media;
 pub mod bug_report;
 pub mod build_info;

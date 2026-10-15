@@ -34,6 +34,8 @@ const MAXIMUM_PREPARATION_DIAGNOSTIC_BYTES: usize = 64 * 1024;
 pub enum OpusAudioSource {
     /// Credential-free public page or direct media URL handled by `yt-dlp`.
     PublicPage(Url),
+    /// Original Funkwhale track page resolved natively only after export approval.
+    Funkwhale(Url),
     /// Authenticated Yandex Music track resolved through Youta's native client.
     YandexMusic {
         /// Stable track identifier.
@@ -67,6 +69,36 @@ pub fn prepare_provider_opus(
     match source {
         OpusAudioSource::PublicPage(source_url) => {
             prepare_public_page_opus(source_url, staging_directory, yt_dlp_executable, progress)
+        }
+        OpusAudioSource::Funkwhale(source_url) => {
+            #[cfg(all(
+                feature = "funkwhale",
+                any(
+                    feature = "commons-upload",
+                    feature = "archive-upload",
+                    feature = "s3-upload"
+                )
+            ))]
+            {
+                crate::archive_upload_media::funkwhale::prepare_opus_in_directory(
+                    source_url,
+                    staging_directory,
+                    ffmpeg_executable,
+                    progress,
+                )
+            }
+            #[cfg(not(all(
+                feature = "funkwhale",
+                any(
+                    feature = "commons-upload",
+                    feature = "archive-upload",
+                    feature = "s3-upload"
+                )
+            )))]
+            {
+                let _ = (source_url, ffmpeg_executable, progress);
+                Err("This build omits Funkwhale audio export support".to_owned())
+            }
         }
         OpusAudioSource::YandexMusic { track_id, token } => {
             #[cfg(feature = "yandex-music")]
@@ -278,6 +310,23 @@ mod tests {
     use std::io::Write as _;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+
+    /// Omitted native support cannot fall through to an HTML downloader.
+    #[cfg(not(feature = "funkwhale"))]
+    #[test]
+    fn feature_disabled_funkwhale_export_never_invokes_a_downloader() {
+        let temporary = crate::test_support::canonical_tempdir("disabled Funkwhale export");
+        let result = prepare_provider_opus(
+            &OpusAudioSource::Funkwhale(
+                Url::parse("https://pod.invalid/library/tracks/42/").unwrap(),
+            ),
+            &temporary.path().join("staging"),
+            Path::new("yt-dlp-must-not-run"),
+            Path::new("ffmpeg-must-not-run"),
+            |_, _| {},
+        );
+        assert!(result.unwrap_err().contains("omits Funkwhale"));
+    }
 
     #[test]
     fn local_opus_is_copied_into_private_staging_without_a_downloader() {

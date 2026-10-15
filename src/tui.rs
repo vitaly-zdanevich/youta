@@ -19291,6 +19291,76 @@ for encoded, expected in json.load(sys.stdin):
         );
     }
 
+    /// Funkwhale reuses the shared publication buttons, keymap and precise hit targets.
+    #[cfg(all(feature = "commons-upload", feature = "archive-upload"))]
+    #[test]
+    fn funkwhale_upload_controls_follow_exact_selected_capabilities() {
+        for available in [false, true] {
+            let view = ViewModel {
+                screen: Screen::Funkwhale,
+                commons_upload_available: available,
+                archive_upload_supported: true,
+                archive_upload_available: available,
+                details: Some(DetailView {
+                    title: "Selected audio".to_owned(),
+                    media_id: Some(MediaId::new(
+                        SourceKind::Funkwhale,
+                        "https://pod.example/library/tracks/1/",
+                    )),
+                    ..DetailView::default()
+                }),
+                ..ViewModel::default()
+            };
+            let mut terminal = Terminal::new(TestBackend::new(150, 24)).unwrap();
+            let mut hits = HitMap::default();
+            terminal
+                .draw(|frame| {
+                    render_details(
+                        frame,
+                        frame.area(),
+                        &view,
+                        true,
+                        0,
+                        &Theme::new(false),
+                        &mut hits,
+                        None,
+                    )
+                })
+                .unwrap();
+            for (key, label, action) in [
+                ('U', "[U] To Commons", UiAction::OpenCommonsUpload),
+                ('I', "[I] To archive.org", UiAction::OpenArchiveUpload),
+            ] {
+                assert_eq!(rendered_text(&terminal).contains(label), available);
+                let target = hits
+                    .detail_buttons
+                    .iter()
+                    .find_map(|(candidate, target)| (*candidate == action).then_some(*target));
+                assert_eq!(target.is_some(), available);
+                let key_result =
+                    key_action(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE), &view);
+                if let Some(target) = target {
+                    assert_eq!(key_result, Some(action.clone()));
+                    assert_eq!(
+                        mouse_action(
+                            MouseEvent {
+                                kind: MouseEventKind::Down(MouseButton::Left),
+                                column: target.x,
+                                row: target.y,
+                                modifiers: KeyModifiers::NONE
+                            },
+                            &hits,
+                            &view
+                        ),
+                        Some(action)
+                    );
+                } else {
+                    assert_ne!(key_result, Some(action));
+                }
+            }
+        }
+    }
+
     #[test]
     fn music_artist_controls_share_one_exact_key_and_mouse_target() {
         for screen in [Screen::SoundCloud, Screen::YandexMusic] {

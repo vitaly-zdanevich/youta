@@ -33,6 +33,8 @@ mod funkwhale;
 mod funkwhale_download;
 #[cfg(all(feature = "funkwhale", feature = "acoustid"))]
 mod funkwhale_fingerprint;
+#[cfg(any(feature = "commons-upload", feature = "archive-upload"))]
+mod funkwhale_upload;
 mod invidious_instances;
 #[cfg(feature = "yt-dlp")]
 mod live_start;
@@ -3238,6 +3240,8 @@ enum LocalBrowseResponse {
 struct CommonsUploadSelection {
     media: MediaItem,
     source: CommonsAudioSource,
+    /// The exact reviewed artist page, independent of later selection changes.
+    channel_url: Option<url::Url>,
 }
 
 /// Provider identity and audio locator retained while an Evernote note is reviewed.
@@ -3468,9 +3472,9 @@ impl EvernoteSelection {
             tags: String::new(),
             source_url: match &self.source {
                 OpusAudioSource::LocalFile(_) => String::new(),
-                OpusAudioSource::PublicPage(_) | OpusAudioSource::YandexMusic { .. } => {
-                    self.media.webpage_url.to_string()
-                }
+                OpusAudioSource::PublicPage(_)
+                | OpusAudioSource::Funkwhale(_)
+                | OpusAudioSource::YandexMusic { .. } => self.media.webpage_url.to_string(),
             },
         }
     }
@@ -18455,7 +18459,7 @@ impl AppController {
                 matches!(
                     item.media.id.source,
                     SourceKind::YouTube | SourceKind::YandexMusic | SourceKind::ApplePodcasts
-                )
+                ) || funkwhale_upload::supported(&item)
             });
         }
         #[cfg(feature = "evernote")]
@@ -19725,12 +19729,14 @@ impl AppController {
                 return;
             }
         };
+        let funkwhale_supported = funkwhale_upload::supported(&item);
         let mut media = item.media;
         if !matches!(
             media.id.source,
             SourceKind::YouTube | SourceKind::YandexMusic | SourceKind::ApplePodcasts
-        ) {
-            "Commons audio upload supports YouTube, Yandex Music, and Apple Podcasts"
+        ) && !funkwhale_supported
+        {
+            "Commons audio upload is not available for this selection"
                 .clone_into(&mut self.view.status_line);
             return;
         }
@@ -19752,6 +19758,8 @@ impl AppController {
                 details.channel_webpage_url.clone()
             });
         let source = match media.id.source {
+            #[cfg(feature = "funkwhale")]
+            SourceKind::Funkwhale => CommonsAudioSource::Funkwhale(media.webpage_url.clone()),
             SourceKind::YouTube => CommonsAudioSource::PublicPage(media.webpage_url.clone()),
             SourceKind::ApplePodcasts => {
                 let Ok(url) = url::Url::parse(&item.playback_location) else {
@@ -19775,7 +19783,11 @@ impl AppController {
             _ => unreachable!("supported Commons sources were checked above"),
         };
         let draft = CommonsUploadDraft::from_media(&media, channel_url.as_ref());
-        let selection = CommonsUploadSelection { media, source };
+        let selection = CommonsUploadSelection {
+            media,
+            source,
+            channel_url,
+        };
         self.commons_upload_selection = Some(selection);
         if let Some(discovered) = discover_commons_authentication(&self.config) {
             self.commons_upload_authentication = Some(discovered.authentication);
@@ -20535,12 +20547,8 @@ impl AppController {
             self.view.commons_credentials_popup = None;
             return;
         };
-        let channel_url = self
-            .view
-            .details
-            .as_ref()
-            .and_then(|details| details.channel_webpage_url.as_ref());
-        let draft = CommonsUploadDraft::from_media(&selection.media, channel_url);
+        let draft =
+            CommonsUploadDraft::from_media(&selection.media, selection.channel_url.as_ref());
         self.open_commons_review(draft);
     }
 
@@ -48372,6 +48380,12 @@ mod tests {
     mod download_choice_tests;
     #[path = "end_pause.rs"]
     mod end_pause_tests;
+    #[cfg(all(
+        feature = "funkwhale",
+        any(feature = "commons-upload", feature = "archive-upload")
+    ))]
+    #[path = "funkwhale_upload.rs"]
+    mod funkwhale_upload_tests;
     #[cfg(feature = "yt-dlp")]
     #[path = "live_start.rs"]
     mod live_start_tests;

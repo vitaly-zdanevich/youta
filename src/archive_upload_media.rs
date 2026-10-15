@@ -16,7 +16,11 @@ use crate::playback::ytdlp::{
     build_download_command, parse_download_event,
 };
 
+#[cfg(feature = "funkwhale")]
+pub(crate) mod funkwhale;
 pub(crate) mod local;
+#[cfg(feature = "funkwhale")]
+pub use funkwhale::prepare_funkwhale_archive_media;
 
 /// A private staged file whose temporary directory is removed when this guard drops.
 #[derive(Debug)]
@@ -313,7 +317,7 @@ pub(crate) fn prepare_staged_media(
 }
 
 /// Runs one fixed command off the UI thread, retaining no unbounded output queue.
-fn supervise_staging_command(
+pub(crate) fn supervise_staging_command(
     mut command: Command,
     expected_output: Option<PathBuf>,
     directory: &Path,
@@ -650,6 +654,14 @@ fn consume_line(line: &[u8], state: &Mutex<OutputState>) -> Result<(), String> {
     let mut output = state
         .lock()
         .map_err(|_| "Media preparation reader failed")?;
+    // Native FFmpeg staging reports output bytes rather than yt-dlp's framing.
+    if let Some(bytes) = text
+        .strip_prefix("total_size=")
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        output.progress = Some((bytes, None));
+        return Ok(());
+    }
     match parse_download_event(text) {
         Some(DownloadEvent::Progress {
             downloaded_bytes,

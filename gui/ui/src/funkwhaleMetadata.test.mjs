@@ -279,6 +279,26 @@ test('Funkwhale missing license is omitted', () => {
 	}
 });
 
+/** Publication controls consume exact controller capabilities, not source-name guesses. */
+test('Funkwhale exposes the normal Commons and Archive actions only for an eligible selection', () => {
+	for (const available of [false, true]) {
+		actions.length = 0;
+		const view = {
+			screen: 'Funkwhale', playlist_item: null, custom_command_buttons: [], yandex_music_actions: {},
+			commons_upload_available: available, archive_upload_supported: true, archive_upload_available: available,
+			details: { source: 'Funkwhale', title: 'Track', media_id: { source: 'funkwhale', external_id: 'track' },
+				channel_id: '', playlist_names: [], links: [], description: '', timecodes: [], video_links: [], wikidata_entities: [], dearrow_title: null },
+		};
+		const publication = nodes(Details({ kind: 'Generic', view })).filter((node) => node.type === 'button' && ['[U] To Commons', '[I] To archive.org'].includes(text(node)));
+		assert.deepEqual(publication.map(text), available ? ['[U] To Commons', '[I] To archive.org'] : []);
+		assert.deepEqual(actions, [], 'rendering cannot open a review or publish');
+		if (available) {
+			publication[0].props.onClick();
+			publication[1].props.onClick();
+			assert.deepEqual(actions, ['OpenCommonsUpload', 'OpenArchiveUpload']);
+		}
+	}
+});
 
 /** Identification starts through the shared explicit action, never while rendering. */
 test('Funkwhale exposes AcoustID and its pending state only when the core enables it', () => {

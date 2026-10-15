@@ -860,11 +860,14 @@ Wikimedia Commons upload, or Evernote note review, respectively, when the
 corresponding integration and item are available.
 Review the destination and fields before submitting.
 .B I
-supports YouTube videos and eligible Local media files when the
+supports YouTube videos, playable Funkwhale audio tracks, and eligible Local media files when the
 .B archive-upload
 feature is built; this feature is independent of archive.org browsing.
 Local private paths are omitted from public upload metadata.
 Audio is prepared as Opus; eligible Local video can instead use stream-copy MKV.
+Funkwhale is audio-only for both Commons and Archive uploads.
+Its original track page stays public provenance; fresh audio is resolved from
+the original pod only after upload confirmation, never while opening review.
 Folders and unavailable selections cannot start publication.
 .TP
 .BR L ", " b

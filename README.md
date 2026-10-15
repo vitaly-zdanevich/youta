@@ -1199,7 +1199,7 @@ leave it out of an explicit `--no-default-features` feature list:
 | Feature | What it adds |
 | --- | --- |
 | `archive-org` | Internet Archive audio catalogue, metadata, reviews, and track browsing. |
-| `archive-upload` | Reviewed YouTube and Local audio/video uploads to Internet Archive. |
+| `archive-upload` | Reviewed YouTube/Local media and Funkwhale audio uploads to Internet Archive. |
 | `ascii-visualizer` | CAVA capture and fullscreen terminal/desktop spectrum renderers. |
 | `audio-quality` | Local spectral analysis and RustFFT. |
 | `cache` | Session RAM audio cache with a 90% system/container memory-pressure ceiling on Linux. |
@@ -2037,6 +2037,14 @@ Opus without asking; `original` also skips the question. Audio bytes are still
 validated by the downloader, so incorrect pod metadata cannot silently enable
 re-encoding. Downloads use the normal queue and retain the canonical track URL
 for retries.
+
+With the corresponding upload features enabled, `[U] To Commons` and
+`[I] To archive.org` open the usual metadata and credentials reviews for the
+selected Funkwhale track. Audio is staged privately as Opus before uploading.
+Opening the review does not download or publish anything; confirmation resolves
+fresh advertised audio from the track's original pod. Public provenance keeps
+the original track-page URL, not a temporary audio URL. Review the source's
+rights before publishing.
 
 With `acoustid` enabled, `[f] AcoustID` identifies the selected Funkwhale track
 using the same Chromaprint helper and application key as Local fingerprinting.
@@ -2971,10 +2979,10 @@ has no HTTPS endpoint.
 
 ## Internet Archive uploads
 
-Select a YouTube video or supported Local media file and choose
+Select a YouTube video, playable Funkwhale track, or supported Local media file and choose
 `[I] To archive.org`, or press uppercase `I` (also listed in Help).
 Review the fresh item identifier,
-title, description and creator before publishing. For YouTube, the original URL is
+title, description and creator before publishing. For YouTube and Funkwhale, the original URL is
 attached automatically as source metadata, without an extra field in the popup.
 Local reviews omit private filesystem paths from public metadata. Folders and
 unavailable selections do not offer this action.
@@ -2982,7 +2990,8 @@ Nothing is uploaded merely by opening the popup or entering credentials.
 
 Audio is prepared as Opus by default. For Local video, `Upload video` stages a
 stream-copy MKV; it is unavailable for audio-only files. The original local files
-remain unchanged.
+remain unchanged. Funkwhale is audio-only and resolves fresh public audio from
+the original pod only after upload confirmation.
 For YouTube, `Upload video` keeps the highest-quality available video and audio
 without reencoding; resolution and frame rate take priority over the AV1/Opus
 codec preference. The checkbox remembers its value
@@ -3074,7 +3083,7 @@ See [S3 conditional writes and multipart cleanup](https://docs.aws.amazon.com/Am
 ## Wikimedia Commons transfer
 
 The default-on `commons-upload` feature adds a reviewed audio upload for exact
-YouTube, Yandex Music, and Apple Podcasts selections. The Details button is
+YouTube, Yandex Music, Apple Podcasts, and Funkwhale selections. The Details button is
 `[U] To Commons`, showing its existing uppercase `U` shortcut (also listed in
 Help). Distributors and local builders can omit the client, multipart support,
 and its UI with `--no-default-features` or by leaving `commons-upload` out of a

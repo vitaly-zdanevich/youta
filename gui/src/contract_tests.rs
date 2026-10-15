@@ -492,6 +492,25 @@ fn funkwhale_tags_keep_exact_internal_identity_in_the_window_contract() {
     assert!(contract_source().contains("{ FunkwhaleTag: string }"));
 }
 
+/// Public Funkwhale provenance uses its own source spelling without exposing a media URL.
+#[cfg(feature = "archive-upload")]
+#[test]
+fn funkwhale_archive_source_is_declared_by_the_window_review_contract() {
+    assert_eq!(
+        serde_json::to_value(youta::archive_upload::ArchiveUploadSource::Funkwhale).unwrap(),
+        serde_json::json!("Funkwhale")
+    );
+    let source = contract_source();
+    let draft = source
+        .split("export interface ArchiveUploadDraft {")
+        .nth(1)
+        .unwrap()
+        .split('}')
+        .next()
+        .unwrap();
+    assert!(draft.contains("source: 'YouTube' | 'Local' | 'Funkwhale';"));
+}
+
 /// Every declared field must exist in the JSON the reducer publishes.
 #[test]
 fn the_typescript_contract_names_only_fields_the_reducer_emits() {

@@ -1023,7 +1023,7 @@ export interface S3CredentialsEditorView {
 /** Public metadata reviewed before creating an Archive.org item. */
 export interface ArchiveUploadDraft {
 	/** Public source kind; Local drafts do not carry private filesystem paths. */
-	source: 'YouTube' | 'Local';
+	source: 'YouTube' | 'Local' | 'Funkwhale';
 	identifier: string;
 	title: string;
 	description: string;

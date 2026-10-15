@@ -202,7 +202,7 @@ export function HelpPopup({
 				] satisfies Array<[string, string]>)
 			: []),
 		...(archiveUploadSupported
-			? ([['I', 'upload selected YouTube or Local media to archive.org']] satisfies Array<[string, string]>)
+			? ([['I', 'upload selected media to archive.org']] satisfies Array<[string, string]>)
 			: []),
 		...(s3UploadSupported
 			? ([['M', 'upload selected media to S3']] satisfies Array<[string, string]>)
