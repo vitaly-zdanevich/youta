@@ -278,3 +278,27 @@ test('Funkwhale missing license is omitted', () => {
 		assert.equal(text(tree).includes('License:'), false);
 	}
 });
+
+
+/** Identification starts through the shared explicit action, never while rendering. */
+test('Funkwhale exposes AcoustID and its pending state only when the core enables it', () => {
+	for (const available of [false, true]) {
+		for (const pending of [false, true]) {
+			actions.length = 0;
+			const view = {
+				screen: 'Funkwhale', playlist_item: null, custom_command_buttons: [], yandex_music_actions: {},
+				details: { source: 'Funkwhale', title: 'Track', media_id: { source: 'funkwhale', external_id: 'track' },
+					local_fingerprint_available: available, local_fingerprint_pending: pending,
+					channel_id: '', playlist_names: [], links: [], description: '', timecodes: [], video_links: [], wikidata_entities: [], dearrow_title: null },
+			};
+			const buttons = nodes(Details({ kind: 'Generic', view })).filter((node) => node.type === 'button' && ['[f] AcoustID', 'Identifying...'].includes(text(node)));
+			assert.equal(buttons.length, available ? 1 : 0);
+			assert.deepEqual(actions, [], 'rendering does not fetch audio or identify it');
+			if (available) {
+				assert.equal(text(buttons[0]), pending ? 'Identifying...' : '[f] AcoustID');
+				buttons[0].props.onClick();
+				assert.deepEqual(actions, ['FingerprintLocalAudio']);
+			}
+		}
+	}
+});

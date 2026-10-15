@@ -4834,7 +4834,8 @@ fn unfiltered_key_action(
             Some(UiAction::DownloadTwentyYandexMusicRecommendations)
         }
         Key::Char('f')
-            if view.screen == Screen::Local
+            if !key.modified()
+                && (view.screen == Screen::Local || view.screen == Screen::Funkwhale)
                 && view
                     .details
                     .as_ref()

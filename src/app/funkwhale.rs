@@ -910,6 +910,8 @@ impl AppController {
                     id: track.video_id,
                 });
             }
+            #[cfg(feature = "acoustid")]
+            self.apply_funkwhale_fingerprint_details();
         }
     }
 

@@ -5476,11 +5476,23 @@ fn render_information_panel(
             UiAction::ToggleRadioRecording,
         );
     }
-    if kind == InformationPanelKind::Local && details.local_fingerprint_available {
+    if (kind == InformationPanelKind::Local || view.screen == Screen::Funkwhale)
+        && details.local_fingerprint_available
+    {
+        let funkwhale = view.screen == Screen::Funkwhale;
         let action_text = if details.local_fingerprint_pending {
             let frame = ASCII_ACTIVITY_FRAMES
                 [view.local_fingerprint_animation_frame % ASCII_ACTIVITY_FRAMES.len()];
-            format!("Fingerprinting {frame}")
+            format!(
+                "{} {frame}",
+                if funkwhale {
+                    "Identifying"
+                } else {
+                    "Fingerprinting"
+                }
+            )
+        } else if funkwhale {
+            "AcoustID".to_owned()
         } else {
             "Fingerprint".to_owned()
         };
@@ -29564,6 +29576,64 @@ for encoded, expected in json.load(sys.stdin):
         }
         assert_eq!(restored, source);
         assert_eq!(highlighted, "ПРИВЕТ");
+    }
+
+    /// Funkwhale offers the existing explicit identifier without an upload feature.
+    #[cfg(all(feature = "funkwhale", feature = "acoustid"))]
+    #[test]
+    fn funkwhale_acoustid_action_has_mouse_keyboard_and_activity_feedback() {
+        for pending in [false, true] {
+            let mut view = ViewModel {
+                screen: Screen::Funkwhale,
+                details: Some(DetailView {
+                    media_id: Some(MediaId::new(
+                        SourceKind::Funkwhale,
+                        "https://pod.example/library/tracks/1",
+                    )),
+                    local_fingerprint_available: true,
+                    local_fingerprint_pending: pending,
+                    ..DetailView::default()
+                }),
+                ..ViewModel::default()
+            };
+            let mut terminal = Terminal::new(TestBackend::new(80, 18)).unwrap();
+            let mut hit_map = HitMap::default();
+            terminal
+                .draw(|frame| {
+                    render_details(
+                        frame,
+                        frame.area(),
+                        &view,
+                        true,
+                        0,
+                        &Theme::new(false),
+                        &mut hit_map,
+                        None,
+                    )
+                })
+                .unwrap();
+            let rendered = rendered_text(&terminal);
+            assert!(rendered.contains(if pending {
+                "Identifying"
+            } else {
+                "[f] AcoustID"
+            }));
+            assert!(
+                hit_map
+                    .detail_buttons
+                    .iter()
+                    .any(|(action, _)| *action == UiAction::FingerprintLocalAudio)
+            );
+            assert_eq!(
+                crate::keymap::key_action(KeyPress::new(Key::Char('f')), &view, None, None),
+                Some(UiAction::FingerprintLocalAudio)
+            );
+            view.search_editing = true;
+            assert_eq!(
+                crate::keymap::key_action(KeyPress::new(Key::Char('f')), &view, None, None),
+                Some(UiAction::AppendSearch('f'))
+            );
+        }
     }
 
     /// Funkwhale uploader names retain two-line display and internal TTY hit targets.

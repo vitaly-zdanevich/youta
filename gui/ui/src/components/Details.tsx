@@ -652,7 +652,7 @@ export function Details({ view, kind }: { view: ViewModel; kind: InformationPane
         ) : null}
         {details.local_fingerprint_available ? (
           <Action onClick={() => void dispatch("FingerprintLocalAudio")}>
-            {details.local_fingerprint_pending ? "Identifying..." : "Identify"}
+            {details.local_fingerprint_pending ? "Identifying..." : view.screen === 'Funkwhale' ? '[f] AcoustID' : "Identify"}
           </Action>
         ) : null}
         {view.audio_quality_supported &&

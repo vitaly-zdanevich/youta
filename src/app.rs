@@ -31,6 +31,8 @@ mod end_pause;
 mod funkwhale;
 #[cfg(all(feature = "funkwhale", feature = "yt-dlp"))]
 mod funkwhale_download;
+#[cfg(all(feature = "funkwhale", feature = "acoustid"))]
+mod funkwhale_fingerprint;
 mod invidious_instances;
 #[cfg(feature = "yt-dlp")]
 mod live_start;
@@ -1840,7 +1842,22 @@ enum LocalFingerprintWorkerRequest {
         path: PathBuf,
         cancellation: AudioIdentificationCancellation,
     },
+    #[cfg(feature = "funkwhale")]
+    IdentifyFunkwhale(funkwhale_fingerprint::Request),
     Shutdown,
+}
+
+#[cfg(feature = "acoustid")]
+impl LocalFingerprintWorkerRequest {
+    /// Cancels either source before replacing a queued identification request.
+    fn cancel(self) {
+        match self {
+            Self::Identify { cancellation, .. } => cancellation.cancel(),
+            #[cfg(feature = "funkwhale")]
+            Self::IdentifyFunkwhale(request) => request.cancellation.cancel(),
+            Self::Shutdown => {}
+        }
+    }
 }
 
 /// Identity-owned completion returned by the local-audio worker.
@@ -5187,6 +5204,9 @@ pub struct AppController {
     /// Whether a disconnected fingerprint worker has already been reported.
     #[cfg(feature = "acoustid")]
     local_fingerprint_disconnect_reported: bool,
+    /// Explicit public-track identification sharing the Local worker and rate limiter.
+    #[cfg(all(feature = "acoustid", feature = "funkwhale"))]
+    funkwhale_fingerprint: funkwhale_fingerprint::State,
     /// Exact in-flight P4404 lookup requested by Local fingerprint details.
     #[cfg(all(feature = "acoustid", feature = "wikidata"))]
     pending_local_fingerprint_wikidata: Option<PendingLocalFingerprintWikidata>,
@@ -6714,6 +6734,8 @@ impl AppController {
             local_fingerprint_revalidate_at: None,
             #[cfg(feature = "acoustid")]
             local_fingerprint_disconnect_reported: false,
+            #[cfg(all(feature = "acoustid", feature = "funkwhale"))]
+            funkwhale_fingerprint: funkwhale_fingerprint::State::new(worker_notifier.clone()),
             #[cfg(all(feature = "acoustid", feature = "wikidata"))]
             pending_local_fingerprint_wikidata: None,
             #[cfg(feature = "waveform")]
@@ -24371,13 +24393,13 @@ impl AppController {
     /// Cancels active and queued fingerprint work without discarding safe cache entries.
     #[cfg(feature = "acoustid")]
     fn cancel_local_fingerprint(&mut self) {
+        #[cfg(feature = "funkwhale")]
+        self.cancel_funkwhale_fingerprint();
         if let Some(pending) = self.pending_local_fingerprint.take() {
             pending.cancellation.cancel();
         }
         while let Ok(command) = self.local_fingerprint_request_drain.try_recv() {
-            if let LocalFingerprintWorkerRequest::Identify { cancellation, .. } = command {
-                cancellation.cancel();
-            }
+            command.cancel();
         }
         self.view.local_fingerprint_animation_frame = 0;
         if let Some(details) = self.view.details.as_mut() {
@@ -24438,8 +24460,15 @@ impl AppController {
         let Some((_, key)) = self.selected_local_fingerprint_target() else {
             self.displayed_local_fingerprint = None;
             self.local_fingerprint_revalidate_at = None;
-            self.view.selected_detail_link = None;
-            if let Some(details) = self.view.details.as_mut() {
+            let local_screen = self.view.screen == Screen::Local;
+            if let Some(details) = self.view.details.as_mut().filter(|details| {
+                local_screen
+                    && details
+                        .media_id
+                        .as_ref()
+                        .is_none_or(|media_id| media_id.source == SourceKind::Local)
+            }) {
+                self.view.selected_detail_link = None;
                 details.local_fingerprint_available = false;
                 details.local_fingerprint_pending = false;
                 details.lastfm_artist_description.clear();
@@ -24550,6 +24579,10 @@ impl AppController {
 
         self.displayed_local_fingerprint = None;
         self.local_fingerprint_revalidate_at = None;
+        // A timer belonging to a former Local selection cannot mutate a new provider's panel.
+        if self.view.screen != Screen::Local {
+            return;
+        }
         let current_target = self.selected_local_fingerprint_target();
         let first_recording = self.apply_local_fingerprint_details();
         self.request_local_fingerprint_wikidata(first_recording.as_deref());
@@ -24566,6 +24599,11 @@ impl AppController {
     /// Starts one explicit identity-bound Chromaprint and AcoustID lookup.
     #[cfg(feature = "acoustid")]
     fn fingerprint_selected_local_audio(&mut self) {
+        #[cfg(feature = "funkwhale")]
+        if self.view.screen == Screen::Funkwhale {
+            self.fingerprint_selected_funkwhale_audio();
+            return;
+        }
         let Some((media_id, key)) = self.selected_local_fingerprint_target() else {
             self.view.status_line =
                 "Fingerprinting is available for local audio files only".to_owned();
@@ -24619,10 +24657,8 @@ impl AppController {
             match sender.try_send(command) {
                 Ok(()) => break true,
                 Err(TrySendError::Full(returned)) => {
-                    if let Ok(stale) = self.local_fingerprint_request_drain.try_recv()
-                        && let LocalFingerprintWorkerRequest::Identify { cancellation, .. } = stale
-                    {
-                        cancellation.cancel();
+                    if let Ok(stale) = self.local_fingerprint_request_drain.try_recv() {
+                        stale.cancel();
                     }
                     command = returned;
                 }
@@ -25792,7 +25828,10 @@ impl AppController {
     /// Advances the selected fingerprint button's ASCII activity frame.
     #[cfg(feature = "acoustid")]
     fn advance_local_fingerprint_animation(&mut self) {
-        if self.animation_tick_due && self.pending_local_fingerprint.is_some() {
+        let pending = self.pending_local_fingerprint.is_some();
+        #[cfg(feature = "funkwhale")]
+        let pending = pending || self.funkwhale_fingerprint_pending();
+        if self.animation_tick_due && pending {
             self.view.local_fingerprint_animation_frame =
                 self.view.local_fingerprint_animation_frame.wrapping_add(1);
         }
@@ -38142,6 +38181,8 @@ impl UiController for AppController {
         self.drain_yandex_music_media_job_responses();
         #[cfg(feature = "acoustid")]
         self.drain_local_fingerprint_responses();
+        #[cfg(all(feature = "acoustid", feature = "funkwhale"))]
+        self.drain_funkwhale_fingerprint_responses();
         #[cfg(feature = "waveform")]
         self.drain_local_waveform_responses();
         #[cfg(feature = "sponsorblock")]
@@ -38915,7 +38956,17 @@ fn local_fingerprint_worker(
     mut identifier: Box<dyn AudioIdentifier>,
 ) {
     let responses = responses.into();
+    #[cfg(feature = "funkwhale")]
+    let mut remote_cache = funkwhale_fingerprint::WorkerCache::default();
     while let Ok(command) = requests.recv() {
+        #[cfg(feature = "funkwhale")]
+        let command = match command {
+            LocalFingerprintWorkerRequest::IdentifyFunkwhale(request) => {
+                funkwhale_fingerprint::identify(request, identifier.as_mut(), &mut remote_cache);
+                continue;
+            }
+            command => command,
+        };
         let LocalFingerprintWorkerRequest::Identify {
             generation,
             path,

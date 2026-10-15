@@ -4,7 +4,7 @@ resolver = "3"
 
 [package]
 name = "youta"
-version = "1.19.0"
+version = "1.20.0"
 edition = "2024"
 rust-version = "1.95"
 description = "A low-resource YouTube TUI audio player and local subscription manager that uses yt-dlp and saves and shows listening progress"
@@ -250,7 +250,7 @@ evernote = [
 #
 # The official `fpcalc` helper performs media decoding and fingerprinting, so
 # this feature does not add a second Rust media-decoding stack.
-acoustid = ["network", "local-browser"]
+acoustid = ["network", "local-browser", "dep:tempfile"]
 # Compatibility umbrella retaining every Local-file capability.
 local = [
     "local-browser",

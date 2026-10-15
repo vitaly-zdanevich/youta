@@ -1148,8 +1148,8 @@ The default build expects `mpv` and `yt-dlp` at runtime for online playback,
 folders. ZIP folders need no external extractor. Install CAVA with
 `emerge media-sound/cava`, `apt install cava`, `dnf install cava`, or
 `brew install cava`; custom builds can omit the `ascii-visualizer` feature.
-It also expects Chromaprint's `fpcalc` only when an AcoustID key enables local
-audio identification. On Gentoo, the `tools` USE flag is disabled by default;
+It also expects Chromaprint's `fpcalc` only for explicit Local or Funkwhale
+audio identification through AcoustID. On Gentoo, the `tools` USE flag is disabled by default;
 enable it when emerging
 [media-libs/chromaprint](https://packages.gentoo.org/packages/media-libs/chromaprint)
 because installing only the library does not provide `fpcalc`. These remain
@@ -1309,7 +1309,8 @@ acoustid_client_key = '...'
 `auto` prefers that key when the official adapter is compiled in, then falls
 back to `invidious_base_url`. `official` and `invidious` select only that
 backend. Both the TUI and `youta search` use this selection. The AcoustID key
-enables the Local Details `[f] Fingerprint` action; `fpcalc_executable` in
+enables identification through Local Details `[f] Fingerprint` and Funkwhale
+`[f] AcoustID`; `fpcalc_executable` in
 `config.toml` can select a non-default Chromaprint helper path. `FFmpeg` and
 `FFprobe` are named the same way, by `ffmpeg_executable` and
 `ffprobe_executable`: the first draws local waveforms, analyzes local audio
@@ -2036,6 +2037,14 @@ Opus without asking; `original` also skips the question. Audio bytes are still
 validated by the downloader, so incorrect pod metadata cannot silently enable
 re-encoding. Downloads use the normal queue and retain the canonical track URL
 for retries.
+
+With `acoustid` enabled, `[f] AcoustID` identifies the selected Funkwhale track
+using the same Chromaprint helper and application key as Local fingerprinting.
+Audio is downloaded only on request, into temporary private staging with a
+128 MiB limit, and removed when identification finishes or is cancelled.
+Only the fingerprint and duration go to AcoustID, not the audio file.
+MusicBrainz matches appear alongside the existing track links. Changing the
+selection cancels pending identification; no fingerprinting runs during search.
 
 The independent `funkwhale` Cargo feature is enabled by default in both
 frontends. Omit it from an explicit `--no-default-features` build to remove the
