@@ -85,7 +85,7 @@ install manual pages.
   and [packaging and tests](#packaging-and-quality)
 - [Roadmap](#service-roadmap), [license](#license),
   [related Wikimedia projects](#my-other-wikimedia-related-projects), and
-  [similar terminal players](#similar-terminal-youtube-projects)
+  [similar software](#similar-software): [TUI](#tui) and [GUI](#gui)
 - [Talks and articles](#talks-and-articles)
 
 ## Why this design
@@ -3719,7 +3719,12 @@ Youta is licensed under the [MIT License](LICENSE).
 - [video-to-webm-av1-opus](https://gitlab.com/vitaly-zdanevich/video-to-webm-av1-opus) —
   file-manager script that converts video to Commons-compatible AV1/Opus WebM
 
-## Similar terminal YouTube projects
+## Similar software
+
+Other media players and download frontends, including wrappers around
+[`yt-dlp`](https://github.com/yt-dlp/yt-dlp).
+
+### TUI
 
 - [youtube-tui](https://github.com/Siriusmart/youtube-tui) is a Rust TUI for
   browsing YouTube videos, channels, and playlists, with filters, history,
@@ -3744,3 +3749,16 @@ Youta is licensed under the [MIT License](LICENSE).
 - [ytfzf](https://github.com/pystardust/ytfzf) is a POSIX and `fzf`-based
   search, watch, and download frontend with thumbnails, subscriptions, and
   history; its upstream repository says it is no longer actively maintained.
+
+### GUI
+
+- [CloudMus](https://github.com/cloudmus/cloudmus) is a Qt desktop music player
+  for YouTube Music, Yandex Music, and local files. Gentoo packages are available
+  in [my overlay](https://github.com/vitaly-zdanevich/gentoo-overlay/tree/main/media-sound/cloudmus).
+- [Parabolic](https://github.com/NickvisionApps/Parabolic) is a graphical
+  `yt-dlp` frontend for downloading web audio and video, with format selection,
+  concurrent downloads, metadata, and subtitles.
+- [yt-dlg](https://github.com/yt-dlg/yt-dlg) is a cross-platform wxPython
+  download frontend that uses `yt-dlp` by default and also supports `youtube-dl`.
+- [Tartube](https://github.com/axcore/tartube) is a Python/GTK download manager
+  for `yt-dlp` and `youtube-dl`, with channel and playlist organization.
