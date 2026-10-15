@@ -156,3 +156,26 @@ test('an unknown artist identity never creates an Artist button', () => {
 		assert.equal(nodes(render(screen, false)).some((node) => node.type === 'button' && text(node).includes('Artist')), false, screen);
 	}
 });
+
+/** No selected Details owner leaves an empty panel, even with stale action capabilities. */
+test('empty Details omit the generic selection hint and stale controls', () => {
+	for (const screen of ['Search', 'YouTubeMusic', 'SoundCloud', 'Funkwhale', 'ArchiveOrg', 'YandexMusic', 'Local']) {
+		actions.length = 0;
+		const tree = module.exports.Details({ kind: 'Generic', view: {
+			screen, details: null, selected_artist_available: true, private_note_available: true,
+			commons_upload_available: true, archive_upload_available: true,
+		} });
+		assert.equal(text(tree), '', screen);
+		assert.equal(nodes(tree).some((node) => node.type === 'button'), false, screen);
+		assert.deepEqual(actions, [], 'an unselected panel cannot request metadata or perform actions');
+	}
+});
+
+/** Web retains its specific input guidance rather than losing all empty-state messages. */
+test('empty Web Details retain useful directory guidance', () => {
+	const tree = module.exports.Details({ kind: 'Generic', view: {
+		screen: 'Web', details: null, search_query: '', search_editing: false, search_activity: null,
+	} });
+	assert.ok(text(tree).includes('Open an HTTP or HTTPS directory URL'));
+	assert.equal(nodes(tree).some((node) => node.type === 'button'), false);
+});

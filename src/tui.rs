@@ -4600,7 +4600,7 @@ fn render_details_with_terminal_window(
     } else if completed_search_has_no_rows(view) {
         "Nothing found"
     } else {
-        "Select an item to load details lazily."
+        ""
     };
     render_information_panel(
         frame,
@@ -28504,6 +28504,50 @@ for encoded, expected in json.load(sys.stdin):
             action,
             UiAction::ToggleTodoPlaylist | UiAction::OpenPlaylistPopup
         )));
+    }
+
+    /// No selected metadata owner leaves no generic hint or actionable controls.
+    #[test]
+    fn unselected_details_are_blank_without_generic_placeholder_or_stale_controls() {
+        for screen in [
+            Screen::Search,
+            Screen::YouTubeMusic,
+            Screen::SoundCloud,
+            Screen::Funkwhale,
+            Screen::ArchiveOrg,
+            Screen::YandexMusic,
+            Screen::Local,
+        ] {
+            let view = ViewModel {
+                screen,
+                selected_artist_available: true,
+                private_note_available: true,
+                rows: vec![RowView {
+                    title: "Metadata not selected".to_owned(),
+                    ..RowView::default()
+                }],
+                ..ViewModel::default()
+            };
+            let mut terminal = Terminal::new(TestBackend::new(90, 18)).unwrap();
+            let mut hits = HitMap::default();
+            terminal
+                .draw(|frame| {
+                    render_details(
+                        frame,
+                        frame.area(),
+                        &view,
+                        true,
+                        0,
+                        &Theme::new(false),
+                        &mut hits,
+                        None,
+                    )
+                })
+                .unwrap();
+            assert_eq!(rendered_text(&terminal).trim(), "", "{screen:?}");
+            assert!(hits.detail_buttons.is_empty());
+            assert!(hits.detail_links.is_empty());
+        }
     }
 
     #[test]
