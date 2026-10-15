@@ -3159,6 +3159,20 @@ fn source_tab_label(screen: Screen, view: &ViewModel, compact: bool) -> String {
     format!("{marker}{label}")
 }
 
+/// Lets a paused tab's own marker replace the preceding separator pipe.
+///
+/// The marker remains inside the tab's clickable label. Full rows keep its
+/// leading space, while compact rows need no gap before the two ASCII bars.
+fn source_tab_separator(screen: Screen, view: &ViewModel, compact: bool) -> &'static str {
+    let paused = !view.playback.idle && view.playback.paused && view.playing_screen == Some(screen);
+    match (compact, paused) {
+        (true, true) => "",
+        (false, true) => " ",
+        (true, false) => "│",
+        (false, false) => " │ ",
+    }
+}
+
 fn render_tabs(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -3170,36 +3184,32 @@ fn render_tabs(
     if area.is_empty() {
         return;
     }
-    const FULL_DIVIDER: &str = " │ ";
-    const COMPACT_DIVIDER: &str = "│";
     let available = Screen::ALL
         .into_iter()
         .filter(|screen| screen.available(view.playback_history_enabled))
         .collect::<Vec<_>>();
-    let full_width = available
-        .iter()
-        .map(|screen| usize::from(terminal_text_width(&source_tab_label(*screen, view, false))))
-        .sum::<usize>()
-        .saturating_add(
-            usize::from(terminal_text_width(FULL_DIVIDER))
-                .saturating_mul(available.len().saturating_sub(1)),
-        );
-    let compact = full_width > usize::from(area.width);
-    let divider = if compact {
-        COMPACT_DIVIDER
-    } else {
-        FULL_DIVIDER
+    let required_width = |compact| {
+        available
+            .iter()
+            .enumerate()
+            .map(|(index, screen)| {
+                usize::from(terminal_text_width(&source_tab_label(
+                    *screen, view, compact,
+                ))) + if index == 0 {
+                    0
+                } else {
+                    usize::from(terminal_text_width(source_tab_separator(
+                        *screen, view, compact,
+                    )))
+                }
+            })
+            .sum::<usize>()
     };
-    let divider_width = terminal_text_width(divider);
-    let compact_width = available
-        .iter()
-        .map(|screen| usize::from(terminal_text_width(&source_tab_label(*screen, view, true))))
-        .sum::<usize>()
-        .saturating_add(
-            usize::from(divider_width).saturating_mul(available.len().saturating_sub(1)),
-        );
+    let full_width = required_width(false);
+    let compact = full_width > usize::from(area.width);
+    let compact_width = required_width(true);
     let visible = if compact && compact_width > usize::from(area.width) {
-        active_tab_window(&available, view, area.width, divider_width)
+        active_tab_window(&available, view, area.width)
     } else {
         0..available.len()
     };
@@ -3210,8 +3220,9 @@ fn render_tabs(
             if x >= area.right() {
                 break;
             }
+            let divider = source_tab_separator(screen, view, compact);
             spans.push(Span::styled(divider, theme.muted));
-            x = x.saturating_add(divider_width);
+            x = x.saturating_add(terminal_text_width(divider));
         }
         if x >= area.right() {
             break;
@@ -3240,7 +3251,6 @@ fn active_tab_window(
     screens: &[Screen],
     view: &ViewModel,
     available_width: u16,
-    divider_width: u16,
 ) -> std::ops::Range<usize> {
     let Some(active_index) = screens
         .iter()
@@ -3257,8 +3267,14 @@ fn active_tab_window(
     let mut used = widths[active_index].min(available_width);
 
     while start > 0 || end < screens.len() {
-        let left_cost = (start > 0).then(|| divider_width.saturating_add(widths[start - 1]));
-        let right_cost = (end < screens.len()).then(|| divider_width.saturating_add(widths[end]));
+        let left_cost = (start > 0).then(|| {
+            terminal_text_width(source_tab_separator(screens[start], view, true))
+                .saturating_add(widths[start - 1])
+        });
+        let right_cost = (end < screens.len()).then(|| {
+            terminal_text_width(source_tab_separator(screens[end], view, true))
+                .saturating_add(widths[end])
+        });
         let prefer_left =
             active_index.saturating_sub(start) <= end.saturating_sub(active_index + 1);
         let added = if prefer_left {
@@ -46073,12 +46089,7 @@ prose 07:25 remains clickable but is not a chapter";
             .filter(|screen| screen.available(view.playback_history_enabled))
             .collect::<Vec<_>>();
         let compact_divider_width = terminal_text_width("│");
-        let visible = active_tab_window(
-            &compact_screens,
-            &view,
-            compact_width,
-            compact_divider_width,
-        );
+        let visible = active_tab_window(&compact_screens, &view, compact_width);
         assert_eq!(
             compact_hit_map
                 .tabs
@@ -46129,6 +46140,220 @@ prose 07:25 remains clickable but is not a chapter";
                 assert_eq!(mouse_action(divider_click, &compact_hit_map, &view), None);
             }
         }
+    }
+
+    /// A paused source's marker supplies the preceding divider without changing its identity.
+    #[test]
+    fn paused_source_tabs_replace_preceding_dividers_without_changing_click_targets() {
+        for history_enabled in [false, true] {
+            let screens = Screen::ALL
+                .into_iter()
+                .filter(|screen| screen.available(history_enabled))
+                .collect::<Vec<_>>();
+            for paused_screen in screens.iter().copied() {
+                let view = ViewModel {
+                    screen: paused_screen,
+                    playing_screen: Some(paused_screen),
+                    playback_history_enabled: history_enabled,
+                    playback: PlaybackStatus {
+                        idle: false,
+                        paused: true,
+                        ..PlaybackStatus::default()
+                    },
+                    ..ViewModel::default()
+                };
+                let expected = screens
+                    .iter()
+                    .map(|screen| {
+                        if *screen == paused_screen {
+                            format!("|| {}", screen.label())
+                        } else {
+                            screen.label().to_owned()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" │ ")
+                    .replace(" │ || ", " || ");
+                // The exact boundary also proves the obsolete divider is not
+                // charged to the full-label budget before choosing compact mode.
+                for width in [
+                    terminal_text_width(&expected),
+                    terminal_text_width(&expected) + 9,
+                ] {
+                    let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+                    let mut hit_map = HitMap::default();
+                    terminal
+                        .draw(|frame| {
+                            render_tabs(
+                                frame,
+                                frame.area(),
+                                &view,
+                                &Theme::new(false),
+                                &mut hit_map,
+                            );
+                        })
+                        .unwrap();
+                    assert_eq!(rendered_text(&terminal).trim_end(), expected);
+                    let mut expected_x = 0_u16;
+                    for (index, (screen, area)) in hit_map.tabs.iter().enumerate() {
+                        if index > 0 {
+                            expected_x += if *screen == paused_screen { 1 } else { 3 };
+                        }
+                        let label = if *screen == paused_screen {
+                            format!("|| {}", screen.label())
+                        } else {
+                            screen.label().to_owned()
+                        };
+                        assert_eq!(
+                            *area,
+                            Rect::new(expected_x, 0, terminal_text_width(&label), 1)
+                        );
+                        for column in area.x..area.right() {
+                            assert_eq!(
+                                mouse_action(
+                                    MouseEvent {
+                                        kind: MouseEventKind::Down(MouseButton::Left),
+                                        column,
+                                        row: 0,
+                                        modifiers: KeyModifiers::NONE
+                                    },
+                                    &hit_map,
+                                    &view
+                                ),
+                                Some(UiAction::ShowScreen(*screen))
+                            );
+                        }
+                        expected_x = area.right();
+                    }
+                    assert_eq!(hit_map.tabs.len(), screens.len());
+                    for adjacent in hit_map.tabs.windows(2) {
+                        for column in adjacent[0].1.right()..adjacent[1].1.x {
+                            assert_eq!(
+                                mouse_action(
+                                    MouseEvent {
+                                        kind: MouseEventKind::Down(MouseButton::Left),
+                                        column,
+                                        row: 0,
+                                        modifiers: KeyModifiers::NONE
+                                    },
+                                    &hit_map,
+                                    &view
+                                ),
+                                None
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Compact pause markers replace the pipe even when the tab window starts there.
+    #[test]
+    fn paused_source_tabs_keep_first_visible_markers_and_compact_click_targets() {
+        for (screen, width, expected) in [
+            (Screen::Local, 12, "Subs|| Local"),
+            (Screen::Local, 8, "|| Local"),
+            (Screen::Search, 5, "|| YT"),
+        ] {
+            let view = ViewModel {
+                screen,
+                playing_screen: Some(screen),
+                playback: PlaybackStatus {
+                    idle: false,
+                    paused: true,
+                    ..PlaybackStatus::default()
+                },
+                ..ViewModel::default()
+            };
+            let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+            let mut hit_map = HitMap::default();
+            terminal
+                .draw(|frame| {
+                    render_tabs(frame, frame.area(), &view, &Theme::new(false), &mut hit_map);
+                })
+                .unwrap();
+            assert_eq!(rendered_text(&terminal).trim_end(), expected);
+            for (screen, area) in &hit_map.tabs {
+                for column in area.x..area.right() {
+                    assert_eq!(
+                        mouse_action(
+                            MouseEvent {
+                                kind: MouseEventKind::Down(MouseButton::Left),
+                                column,
+                                row: 0,
+                                modifiers: KeyModifiers::NONE
+                            },
+                            &hit_map,
+                            &view
+                        ),
+                        Some(UiAction::ShowScreen(*screen))
+                    );
+                }
+            }
+            assert!(hit_map.tabs.iter().all(|(_, area)| area.right() <= width));
+            assert!(
+                hit_map
+                    .tabs
+                    .windows(2)
+                    .all(|tabs| tabs[0].1.right() <= tabs[1].1.x)
+            );
+        }
+    }
+
+    /// Both expansion directions and the whole compact row use the real per-tab gap.
+    #[test]
+    fn paused_source_tab_width_budgets_reuse_the_marker_as_the_divider() {
+        let screens = [Screen::Search, Screen::Local, Screen::Downloaded];
+        for active in [Screen::Search, Screen::Local] {
+            let view = ViewModel {
+                screen: active,
+                playing_screen: Some(Screen::Local),
+                playback: PlaybackStatus {
+                    idle: false,
+                    paused: true,
+                    ..PlaybackStatus::default()
+                },
+                ..ViewModel::default()
+            };
+            assert_eq!(active_tab_window(&screens, &view, 10), 0..2);
+        }
+        let view = ViewModel {
+            screen: Screen::Local,
+            playing_screen: Some(Screen::Local),
+            playback: PlaybackStatus {
+                idle: false,
+                paused: true,
+                ..PlaybackStatus::default()
+            },
+            ..ViewModel::default()
+        };
+        let screens = Screen::ALL
+            .into_iter()
+            .filter(|screen| screen.available(view.playback_history_enabled))
+            .collect::<Vec<_>>();
+        let expected = screens
+            .iter()
+            .map(|screen| {
+                if *screen == Screen::Local {
+                    format!("|| {}", screen.compact_label())
+                } else {
+                    screen.compact_label().to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("│")
+            .replace("│|| ", "|| ");
+        let mut terminal =
+            Terminal::new(TestBackend::new(terminal_text_width(&expected), 1)).unwrap();
+        let mut hit_map = HitMap::default();
+        terminal
+            .draw(|frame| {
+                render_tabs(frame, frame.area(), &view, &Theme::new(false), &mut hit_map);
+            })
+            .unwrap();
+        assert_eq!(rendered_text(&terminal).trim_end(), expected);
+        assert_eq!(hit_map.tabs.len(), screens.len());
     }
 
     /// Marker width participates in compact layout and never changes click identity.
@@ -46186,7 +46411,11 @@ prose 07:25 remains clickable but is not a chapter";
                     hit_map
                         .tabs
                         .windows(2)
-                        .all(|tabs| tabs[0].1.right() < tabs[1].1.x)
+                        .all(|tabs| tabs[0].1.right() < tabs[1].1.x
+                            || (!idle
+                                && paused
+                                && tabs[1].0 == Screen::Local
+                                && tabs[0].1.right() == tabs[1].1.x))
                 );
             }
         }
