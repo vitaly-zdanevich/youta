@@ -1595,13 +1595,17 @@ fn render_virtual_cursor_overlay(
 ///
 /// Global search warming follows its explicit preference. Subscription source
 /// artwork is restored only from previously cached channel metadata and is
-/// always warmed so moving between known channels does not wait for a network
-/// request.
+/// warmed in regular terminals so known channels do not wait for a network
+/// request. Physical Linux consoles never prefetch, even when their visible
+/// half-block artwork is enabled; an empty backlog revokes queued speculation.
 fn synchronize_thumbnail_prefetch(
     view: &ViewModel,
     settings: &UiSettings,
     renderer: &mut dyn ThumbnailRenderer,
 ) -> bool {
+    if view.physical_linux_console {
+        return renderer.synchronize_prefetch(&[]);
+    }
     let mut sources = Vec::new();
     if let Some(source) = view
         .details
@@ -1643,6 +1647,8 @@ fn synchronize_thumbnail_prefetch(
 /// SoundCloud warms its distinct larger rendition for the selected track only.
 /// Archive waveforms reuse the already-decoded native preview source, so they
 /// can warm a fullscreen protocol without a second image download or decode.
+/// Physical Linux consoles clear only speculative work; explicitly opened
+/// fullscreen artwork retains its foreground request and visible rendering.
 fn synchronize_selected_artwork_prefetch(
     view: &ViewModel,
     fullscreen: Rect,
@@ -1657,6 +1663,9 @@ fn synchronize_selected_artwork_prefetch(
         .is_some_and(|details| details.thumbnail_expanded)
     {
         return false;
+    }
+    if view.physical_linux_console {
+        return renderer.synchronize_expansion(None, fullscreen);
     }
     let source = view
         .details
@@ -35339,6 +35348,173 @@ for encoded, expected in json.load(sys.stdin):
         view.details = None;
         synchronize_selected_artwork_prefetch(&view, area, large, &mut renderer);
         assert_eq!(renderer.expansion_prefetches.last(), Some(&(None, area)));
+    }
+
+    /// Physical consoles never warm a result, channel, or enlarged selected image.
+    #[test]
+    fn physical_linux_console_rejects_speculative_artwork_with_images_on_or_off() {
+        let preview = url::Url::parse("https://i.ytimg.com/vi/selected/sddefault.jpg").unwrap();
+        let expanded =
+            url::Url::parse("https://i.ytimg.com/vi/selected/maxresdefault.jpg").unwrap();
+        let channel = url::Url::parse("https://yt3.ggpht.com/known-channel=s800").unwrap();
+        let area = Rect::new(0, 0, 160, 60);
+        let metrics = TerminalWindowMetrics::new(160, 60, 1600, 1200);
+        for physical_linux_console in [false, true] {
+            for show_images_in_tty in [false, true] {
+                for screen in [Screen::Search, Screen::YouTubeMusic, Screen::Subscriptions] {
+                    let mut view = ViewModel {
+                        screen,
+                        physical_linux_console,
+                        show_images_in_tty,
+                        rows: vec![RowView {
+                            thumbnail_url: Some(preview.clone()),
+                            ..RowView::default()
+                        }],
+                        details: Some(DetailView {
+                            media_id: Some(MediaId::new(SourceKind::YouTube, "selected")),
+                            thumbnail_url: Some(preview.clone()),
+                            expanded_thumbnail_url: Some(expanded.clone()),
+                            thumbnail_dimensions: Some((640, 480)),
+                            ..DetailView::default()
+                        }),
+                        ..ViewModel::default()
+                    };
+                    view.subscriptions.sources = vec![RowView {
+                        thumbnail_url: Some(channel.clone()),
+                        ..RowView::default()
+                    }];
+                    let mut renderer = MockThumbnailRenderer {
+                        enabled: true,
+                        ..MockThumbnailRenderer::default()
+                    };
+                    synchronize_thumbnail_prefetch(&view, &UiSettings::default(), &mut renderer);
+                    synchronize_selected_artwork_prefetch(&view, area, metrics, &mut renderer);
+                    let expected = if physical_linux_console {
+                        vec![]
+                    } else if screen == Screen::Subscriptions {
+                        vec![channel.clone()]
+                    } else {
+                        vec![preview.clone()]
+                    };
+                    assert_eq!(
+                        renderer.prefetch_batches,
+                        [expected],
+                        "{screen:?}, console={physical_linux_console}, images={show_images_in_tty}"
+                    );
+                    assert_eq!(
+                        renderer.expansion_prefetches,
+                        [((!physical_linux_console).then(|| expanded.clone()), area)]
+                    );
+                }
+            }
+        }
+    }
+
+    /// The physical-console policy covers non-YouTube large artwork as well.
+    #[test]
+    fn physical_linux_console_clears_other_provider_enlargement_backlogs() {
+        let preview = url::Url::parse("https://images.example/preview.jpg").unwrap();
+        let expanded = url::Url::parse("https://images.example/original.jpg").unwrap();
+        let area = Rect::new(0, 0, 160, 60);
+        for source in [
+            SourceKind::ApplePodcasts,
+            SourceKind::SoundCloud,
+            SourceKind::YandexMusic,
+            SourceKind::Funkwhale,
+        ] {
+            let view = ViewModel {
+                physical_linux_console: true,
+                show_images_in_tty: true,
+                details: Some(DetailView {
+                    media_id: Some(MediaId::new(source, "selected")),
+                    thumbnail_url: Some(preview.clone()),
+                    expanded_thumbnail_url: Some(expanded.clone()),
+                    ..DetailView::default()
+                }),
+                ..ViewModel::default()
+            };
+            let mut renderer = MockThumbnailRenderer {
+                enabled: true,
+                ..MockThumbnailRenderer::default()
+            };
+            synchronize_thumbnail_prefetch(&view, &UiSettings::default(), &mut renderer);
+            synchronize_selected_artwork_prefetch(&view, area, None, &mut renderer);
+            assert_eq!(renderer.prefetch_batches, [Vec::<url::Url>::new()]);
+            assert_eq!(renderer.expansion_prefetches, [(None, area)]);
+        }
+    }
+
+    /// A disabled speculative policy must not cancel the user's explicit fullscreen request.
+    #[test]
+    fn physical_linux_console_keeps_visible_preview_and_explicit_fullscreen_loading() {
+        let preview = url::Url::parse("https://i.ytimg.com/vi/selected/sddefault.jpg").unwrap();
+        let expanded =
+            url::Url::parse("https://i.ytimg.com/vi/selected/maxresdefault.jpg").unwrap();
+        let mut view = ViewModel {
+            physical_linux_console: true,
+            show_images_in_tty: true,
+            details: Some(DetailView {
+                media_id: Some(MediaId::new(SourceKind::YouTube, "selected")),
+                thumbnail_url: Some(preview.clone()),
+                expanded_thumbnail_url: Some(expanded.clone()),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut renderer = MockThumbnailRenderer {
+            enabled: true,
+            rendered_artwork: true,
+            ..MockThumbnailRenderer::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        let mut hit_map = HitMap::default();
+        terminal
+            .draw(|frame| {
+                render_frame(
+                    frame,
+                    &view,
+                    &UiSettings::default(),
+                    &mut hit_map,
+                    Some(&mut renderer),
+                )
+            })
+            .unwrap();
+        assert!(
+            renderer
+                .synchronized
+                .iter()
+                .any(|(source, _)| source.as_ref() == Some(&preview))
+        );
+        view.details.as_mut().unwrap().thumbnail_expanded = true;
+        terminal
+            .draw(|frame| {
+                render_frame(
+                    frame,
+                    &view,
+                    &UiSettings::default(),
+                    &mut hit_map,
+                    Some(&mut renderer),
+                )
+            })
+            .unwrap();
+        assert!(
+            renderer
+                .synchronized
+                .iter()
+                .any(|(source, _)| source.as_ref() == Some(&expanded))
+        );
+        renderer.pending = true;
+        assert!(!synchronize_selected_artwork_prefetch(
+            &view,
+            Rect::new(0, 0, 120, 40),
+            None,
+            &mut renderer
+        ));
+        assert!(
+            renderer.expansion_prefetches.is_empty(),
+            "an explicit fullscreen load must neither be warmed again nor canceled"
+        );
+        assert!(renderer.pending);
     }
 
     #[test]

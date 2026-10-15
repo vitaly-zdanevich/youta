@@ -2285,7 +2285,10 @@ is `YOUTA_UI__PREFETCH_SEARCH_THUMBNAILS=false`. Previously learned channel
 artwork for local subscriptions is warmed independently, so moving between
 known channels can reuse the persistent cache without a foreground network
 request. Unsupported terminals perform no thumbnail network work regardless of
-this preference. To exclude the renderer and its image
+this preference. Physical Linux consoles do not prefetch result/channel thumbnails
+or enlarged artwork, even with TTY images enabled. Images needed for visible
+artwork or an explicit fullscreen request still load normally.
+To exclude the renderer and its image
 dependencies, use the complete text-only command under
 [Smaller and custom builds](#smaller-and-custom-builds). Include `images`
 explicitly in a custom build to restore rendering.
