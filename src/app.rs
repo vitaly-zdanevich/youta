@@ -15,6 +15,7 @@ mod archive_org;
 mod archive_org_highlight;
 #[cfg(feature = "archive-upload")]
 mod archive_upload;
+mod artist;
 #[cfg(feature = "bandcamp")]
 mod bandcamp_resolver;
 mod bug_report;
@@ -7207,6 +7208,7 @@ impl AppController {
             }
         }
         controller.refresh_selected_playlist_state();
+        controller.refresh_selected_artist_availability();
         controller.refresh_video_summary_availability();
         #[cfg(feature = "yandex-music")]
         if controller.view.screen == Screen::YandexMusic
@@ -7927,7 +7929,7 @@ impl AppController {
         if query.is_empty()
             && !matches!(
                 self.view.screen,
-                Screen::ArchiveOrg | Screen::LibriVox | Screen::YandexMusic
+                Screen::ArchiveOrg | Screen::LibriVox | Screen::YandexMusic | Screen::Funkwhale
             )
         {
             self.view.status_line = if self.view.screen == Screen::Web {
@@ -23188,6 +23190,10 @@ impl AppController {
         if self.view.screen == Screen::SoundCloud && self.go_back_soundcloud_catalog() {
             return;
         }
+        #[cfg(feature = "funkwhale")]
+        if self.view.screen == Screen::Funkwhale && self.back_funkwhale_artist() {
+            return;
+        }
         #[cfg(feature = "archive-org")]
         if self.view.screen == Screen::ArchiveOrg && self.go_back_archive_org() {
             return;
@@ -31636,6 +31642,23 @@ impl AppController {
                     self.open_soundcloud_artist(url, true)
                 }
                 DetailLinkInternalTarget::SoundCloudTag(tag) => self.search_soundcloud_tag(tag),
+                DetailLinkInternalTarget::FunkwhaleTag(tag) => {
+                    #[cfg(feature = "funkwhale")]
+                    self.search_funkwhale_tag(tag);
+                    #[cfg(not(feature = "funkwhale"))]
+                    let _ = tag;
+                }
+                DetailLinkInternalTarget::FunkwhaleArtist(_) => self.open_selected_artist(),
+                DetailLinkInternalTarget::FunkwhaleAlbum(url) => {
+                    #[cfg(feature = "funkwhale")]
+                    self.open_funkwhale_album(url);
+                    #[cfg(not(feature = "funkwhale"))]
+                    let _ = url;
+                }
+                DetailLinkInternalTarget::FunkwhaleUploader(_) => {
+                    #[cfg(feature = "funkwhale")]
+                    self.open_funkwhale_uploader();
+                }
                 DetailLinkInternalTarget::YandexMusicArtist(artist_id) => {
                     #[cfg(feature = "yandex-music")]
                     self.open_yandex_music_artist(artist_id);
@@ -36164,6 +36187,24 @@ impl UiController for AppController {
         }
     }
 
+    fn set_search_page_capacities(
+        &mut self,
+        screen: Screen,
+        capacities: crate::view::SearchPageCapacities,
+    ) {
+        match screen {
+            #[cfg(feature = "archive-org")]
+            Screen::ArchiveOrg => self.update_archive_org_search_page_capacities(capacities),
+            #[cfg(feature = "soundcloud")]
+            Screen::SoundCloud => self.update_soundcloud_search_page_capacities(capacities),
+            #[cfg(feature = "funkwhale")]
+            Screen::Funkwhale => self.update_funkwhale_search_page_capacities(capacities),
+            _ => {
+                let _ = capacities;
+            }
+        }
+    }
+
     #[cfg(feature = "archive-org")]
     fn set_archive_org_search_page_capacity(&mut self, rows: usize) {
         self.update_archive_org_search_page_capacity(rows);
@@ -36458,6 +36499,7 @@ impl UiController for AppController {
                     self.view.status_line = "This build omits Yandex Music".to_owned();
                 }
             }
+            UiAction::OpenSelectedArtist => self.open_selected_artist(),
             UiAction::OpenYandexMusicArtist => {
                 #[cfg(feature = "yandex-music")]
                 self.open_selected_yandex_music_artist();
@@ -37271,6 +37313,22 @@ impl UiController for AppController {
             UiAction::OpenSoundCloudArtist(url) => self.open_soundcloud_artist(url, false),
             UiAction::OpenSoundCloudArtistAlbums(url) => self.open_soundcloud_artist(url, true),
             UiAction::SearchSoundCloudTag(tag) => self.search_soundcloud_tag(tag),
+            UiAction::SearchFunkwhaleTag(tag) => {
+                #[cfg(feature = "funkwhale")]
+                self.search_funkwhale_tag(tag);
+                #[cfg(not(feature = "funkwhale"))]
+                let _ = tag;
+            }
+            UiAction::OpenFunkwhaleAlbum(url) => {
+                #[cfg(feature = "funkwhale")]
+                self.open_funkwhale_album(url);
+                #[cfg(not(feature = "funkwhale"))]
+                let _ = url;
+            }
+            UiAction::OpenFunkwhaleUploader => {
+                #[cfg(feature = "funkwhale")]
+                self.open_funkwhale_uploader();
+            }
             UiAction::SearchYouTubeHashtag(tag) => self.search_youtube_hashtag(&tag),
             UiAction::SetVideoCommentsScroll(offset) => {
                 if let Some(popup) = self.view.video_comments_popup.as_mut() {
@@ -37808,6 +37866,7 @@ impl UiController for AppController {
         self.cancel_stale_local_audio_quality();
         self.refresh_video_summary_availability();
         self.refresh_download_markers(false);
+        self.refresh_selected_artist_availability();
         self.session_dirty |= !self.diagnostic_only;
         if self.view.quitting
             && !self.diagnostic_only
@@ -38114,6 +38173,7 @@ impl UiController for AppController {
             self.save_session();
         }
         self.refresh_playback_preparation_activity();
+        self.refresh_selected_artist_availability();
         self.refresh_email_links();
         #[cfg(feature = "url-info")]
         self.refresh_url_info();
@@ -49074,7 +49134,9 @@ mod tests {
         controller.refresh_yandex_music_rows();
 
         assert!(controller.view.yandex_music_actions.artist_available);
-        controller.dispatch(UiAction::OpenYandexMusicArtist);
+        controller.refresh_selected_artist_availability();
+        assert!(controller.view.selected_artist_available);
+        controller.dispatch(UiAction::OpenSelectedArtist);
         let artist_generation = match captured_requests
             .recv_timeout(Duration::from_secs(1))
             .expect("exact artist request")

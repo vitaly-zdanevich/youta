@@ -175,7 +175,11 @@ impl AppController {
             // Twenty restoration pages must still cover the bounded 1,000-item
             // result set after a viewport shrinks. This is a fresh fetch with
             // no retained offsets; ordinary searches keep the frontend's size.
-            let limit = self.archive_org.search_page_capacity.unwrap_or(50).max(50);
+            let limit = self
+                .archive_org
+                .search_page_capacity
+                .map_or(50, |capacity| capacity.for_query(&location.query))
+                .max(50);
             self.start_archive_org_search_with_limit(location.query.clone(), location.scope, limit);
         }
         self.archive_org.restoring = Some(location);

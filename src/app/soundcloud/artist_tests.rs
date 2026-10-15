@@ -215,6 +215,49 @@ fn soundcloud_artist_history_byte_budget_writer_stops_at_the_first_limit() {
 }
 
 #[test]
+fn shared_artist_button_opens_selected_identity_and_keeps_back_navigation() {
+    let (mut app, transport) = controller(vec![
+        user(),
+        json!({"collection":[track(1)], "next_href":null}),
+    ]);
+    let selected_artist = url::Url::parse("https://soundcloud.com/fixture-artist").unwrap();
+    app.soundcloud.items[1].artist_url = Some(selected_artist.clone());
+    // Details deliberately disagrees: authoritative metadata is the selected row.
+    app.view.details.as_mut().unwrap().channel_id = "https://soundcloud.com/wrong".to_owned();
+    app.refresh_selected_artist_availability();
+    assert!(app.view.selected_artist_available);
+    app.dispatch(UiAction::OpenSelectedArtist);
+    settle(&mut app);
+    assert_eq!(app.view.rows[0].title, "Track 1");
+    assert!(app.view.soundcloud_back_available);
+    assert_eq!(transport.requests.lock().unwrap().len(), 2);
+    app.dispatch(UiAction::GoBack);
+    assert_eq!(app.view.selected, 1);
+    assert_eq!(
+        app.soundcloud.items[1].artist_url.as_ref(),
+        Some(&selected_artist)
+    );
+}
+
+#[test]
+fn shared_artist_control_rejects_missing_or_forged_profiles_without_http() {
+    let (mut app, transport) = controller(Vec::new());
+    for artist in [
+        None,
+        Some("https://attacker.example/artist"),
+        Some("https://soundcloud.com/artist/track"),
+        Some("https://user:password@soundcloud.com/artist"),
+    ] {
+        app.soundcloud.items[1].artist_url = artist.map(|value| url::Url::parse(value).unwrap());
+        app.refresh_selected_artist_availability();
+        assert!(!app.view.selected_artist_available, "{artist:?}");
+        app.dispatch(UiAction::OpenSelectedArtist);
+        assert!(!app.view.soundcloud_back_available);
+    }
+    assert!(transport.requests.lock().unwrap().is_empty());
+}
+
+#[test]
 fn soundcloud_artist_mock_tracks_and_back_restore_exact_cached_search() {
     let (mut app, transport) = controller(vec![
         user(),
@@ -356,6 +399,30 @@ fn soundcloud_artist_empty_pages_are_bounded_and_retain_owned_continuation() {
         last.query_pairs()
             .any(|(key, value)| key == "limit" && value == "2")
     );
+}
+
+#[test]
+fn artist_catalogue_capacity_uses_the_soundcloud_owned_display_query() {
+    for (own_query, other_query, expected) in [("", "other tab", 10), ("saved search", "", 9)] {
+        let (mut app, _) = controller(Vec::new());
+        app.soundcloud.query = own_query.into();
+        app.view.search_query = other_query.into();
+        app.update_soundcloud_search_page_capacities(crate::view::SearchPageCapacities {
+            with_heading: 9,
+            without_heading: 10,
+        });
+        app.open_soundcloud_artist("https://soundcloud.com/fixture-artist".into(), false);
+        assert_eq!(app.soundcloud.page_limit, Some(expected));
+        assert_eq!(
+            app.soundcloud.catalog.pending.as_ref().unwrap().limit,
+            expected
+        );
+        app.update_soundcloud_search_page_capacities(crate::view::SearchPageCapacities {
+            with_heading: 90,
+            without_heading: 91,
+        });
+        assert_eq!(app.soundcloud.page_limit, Some(expected));
+    }
 }
 
 #[test]

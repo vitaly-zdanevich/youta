@@ -436,6 +436,194 @@ mod wire_tests {
         );
     }
 
+    /// Artist navigation uses one bare shortcut without consuming query text or chords.
+    #[test]
+    fn artist_shortcut_uses_the_shared_selected_capability_without_editor_or_chord_leaks() {
+        use crate::view::Screen;
+
+        for screen in [Screen::SoundCloud, Screen::Funkwhale, Screen::YandexMusic] {
+            let mut view = ViewModel {
+                screen,
+                selected_artist_available: true,
+                ..ViewModel::default()
+            };
+            assert_eq!(
+                key_action(KeyPress::new(Key::Char('g')), &view, None, None),
+                Some(UiAction::OpenSelectedArtist)
+            );
+            for modifiers in 1..8 {
+                let key = KeyPress {
+                    ctrl: modifiers & 1 != 0,
+                    alt: modifiers & 2 != 0,
+                    shift: modifiers & 4 != 0,
+                    ..KeyPress::new(Key::Char('g'))
+                };
+                assert_ne!(
+                    key_action(key, &view, None, None),
+                    Some(UiAction::OpenSelectedArtist)
+                );
+            }
+            view.search_editing = true;
+            assert_eq!(
+                key_action(KeyPress::new(Key::Char('g')), &view, None, None),
+                Some(UiAction::AppendSearch('g'))
+            );
+            view.search_editing = false;
+            view.selected_artist_available = false;
+            assert_ne!(
+                key_action(KeyPress::new(Key::Char('g')), &view, None, None),
+                Some(UiAction::OpenSelectedArtist)
+            );
+        }
+    }
+
+    /// Album browsing preserves editor text, modifiers, and selected-item ownership.
+    #[cfg(feature = "funkwhale")]
+    #[test]
+    fn funkwhale_album_shortcut_keeps_query_modifiers_and_selection_isolated() {
+        use crate::view::{DetailLinkInternalTarget, DetailLinkView, RowView, Screen};
+
+        let album = "https://pod.example/library/albums/9";
+        let id = crate::domain::MediaId::new(
+            crate::domain::SourceKind::Funkwhale,
+            "https://pod.example/library/tracks/42",
+        );
+        let mut view = ViewModel {
+            screen: Screen::Funkwhale,
+            external_opener_available: false,
+            rows: vec![RowView {
+                media_id: Some(id.clone()),
+                ..RowView::default()
+            }],
+            details: Some(DetailView {
+                media_id: Some(id),
+                links: vec![DetailLinkView {
+                    internal_target: Some(DetailLinkInternalTarget::FunkwhaleAlbum(
+                        album.to_owned(),
+                    )),
+                    ..DetailLinkView::default()
+                }],
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let expected = UiAction::OpenFunkwhaleAlbum(album.to_owned());
+        assert_eq!(
+            key_action(KeyPress::new(Key::Char('b')), &view, None, None),
+            Some(expected.clone())
+        );
+        for modifiers in 1..8 {
+            let key = KeyPress {
+                ctrl: modifiers & 1 != 0,
+                alt: modifiers & 2 != 0,
+                shift: modifiers & 4 != 0,
+                ..KeyPress::new(Key::Char('b'))
+            };
+            assert_ne!(key_action(key, &view, None, None), Some(expected.clone()));
+        }
+        view.search_editing = true;
+        assert_eq!(
+            key_action(KeyPress::new(Key::Char('b')), &view, None, None),
+            Some(UiAction::AppendSearch('b'))
+        );
+        view.search_editing = false;
+        view.rows.clear();
+        assert_ne!(
+            key_action(KeyPress::new(Key::Char('b')), &view, None, None),
+            Some(expected)
+        );
+    }
+
+    /// Nested Funkwhale routes support Back and ordinary viewport navigation.
+    #[cfg(feature = "funkwhale")]
+    #[test]
+    fn funkwhale_browse_routes_keep_back_and_page_navigation() {
+        use crate::view::Screen;
+
+        let mut view = ViewModel {
+            screen: Screen::Funkwhale,
+            funkwhale_back_available: true,
+            ..ViewModel::default()
+        };
+        assert_eq!(
+            key_action(KeyPress::new(Key::Esc), &view, Some(20), None),
+            Some(UiAction::GoBack)
+        );
+        assert_eq!(
+            key_action(KeyPress::new(Key::PageUp), &view, Some(20), None),
+            Some(UiAction::MoveSelection(-20))
+        );
+        assert_eq!(
+            key_action(KeyPress::new(Key::PageDown), &view, Some(20), None),
+            Some(UiAction::MoveSelection(20))
+        );
+        view.funkwhale_back_available = false;
+        assert_ne!(
+            key_action(KeyPress::new(Key::Esc), &view, Some(20), None),
+            Some(UiAction::GoBack)
+        );
+        view.search_editing = true;
+        assert_ne!(
+            key_action(KeyPress::new(Key::PageDown), &view, Some(20), None),
+            Some(UiAction::MoveSelection(20))
+        );
+    }
+
+    /// Uploader browsing uses a bare key without stealing Queue or editor input.
+    #[cfg(feature = "funkwhale")]
+    #[test]
+    fn funkwhale_uploader_shortcut_is_selection_owned_and_editor_safe() {
+        use crate::view::{DetailLinkInternalTarget, DetailLinkView, RowView, Screen};
+
+        let id = crate::domain::MediaId::new(
+            crate::domain::SourceKind::Funkwhale,
+            "https://pod.example/library/tracks/42",
+        );
+        let mut view = ViewModel {
+            screen: Screen::Funkwhale,
+            rows: vec![RowView {
+                media_id: Some(id.clone()),
+                ..RowView::default()
+            }],
+            details: Some(DetailView {
+                media_id: Some(id),
+                links: vec![DetailLinkView {
+                    internal_target: Some(DetailLinkInternalTarget::FunkwhaleUploader(
+                        "emil@pod.example".to_owned(),
+                    )),
+                    ..DetailLinkView::default()
+                }],
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let expected = Some(UiAction::OpenFunkwhaleUploader);
+        assert_eq!(
+            key_action(KeyPress::new(Key::Char('e')), &view, None, None),
+            expected
+        );
+        for modifiers in 1..8 {
+            let key = KeyPress {
+                ctrl: modifiers & 1 != 0,
+                alt: modifiers & 2 != 0,
+                shift: modifiers & 4 != 0,
+                ..KeyPress::new(Key::Char('e'))
+            };
+            assert_ne!(key_action(key, &view, None, None), expected);
+        }
+        view.search_editing = true;
+        assert_eq!(
+            key_action(KeyPress::new(Key::Char('e')), &view, None, None),
+            Some(UiAction::AppendSearch('e'))
+        );
+        view.search_editing = false;
+        view.rows.clear();
+        assert_ne!(
+            key_action(KeyPress::new(Key::Char('e')), &view, None, None),
+            expected
+        );
+    }
+
     /// Tab navigation uses only bare function keys, independently of feed availability.
     #[test]
     fn f2_f11_f12_open_tabs_only_during_normal_browsing() {
@@ -4616,10 +4804,14 @@ fn unfiltered_key_action(
         Key::Char('X') if view.youtube_channel_auto_download_available() => {
             Some(UiAction::ToggleChannelAutoDownload)
         }
-        Key::Char('g')
-            if view.screen == Screen::YandexMusic && view.yandex_music_actions.artist_available =>
-        {
-            Some(UiAction::OpenYandexMusicArtist)
+        Key::Char('g') if !key.modified() && view.selected_artist_available => {
+            Some(UiAction::OpenSelectedArtist)
+        }
+        Key::Char('b') if !key.modified() && view.screen == Screen::Funkwhale => view
+            .funkwhale_album_url()
+            .map(|url| UiAction::OpenFunkwhaleAlbum(url.to_owned())),
+        Key::Char('e') if !key.modified() && view.funkwhale_uploader_available() => {
+            Some(UiAction::OpenFunkwhaleUploader)
         }
         Key::Char('b')
             if view.screen == Screen::YandexMusic && view.yandex_music_actions.album_available =>
@@ -4787,6 +4979,9 @@ fn unfiltered_key_action(
         {
             Some(UiAction::GoBack)
         }
+        Key::Esc if view.screen == Screen::Funkwhale && view.funkwhale_back_available => {
+            Some(UiAction::GoBack)
+        }
         Key::Esc if view.details_focused => Some(UiAction::SetDetailsFocus(false)),
         Key::Esc
             if view.screen == Screen::YandexMusic
@@ -4834,6 +5029,7 @@ fn unfiltered_key_action(
                 view.screen,
                 Screen::ApplePodcasts
                     | Screen::SoundCloud
+                    | Screen::Funkwhale
                     | Screen::ArchiveOrg
                     | Screen::LibriVox
                     | Screen::Local
@@ -4851,6 +5047,7 @@ fn unfiltered_key_action(
                 view.screen,
                 Screen::ApplePodcasts
                     | Screen::SoundCloud
+                    | Screen::Funkwhale
                     | Screen::ArchiveOrg
                     | Screen::LibriVox
                     | Screen::Local

@@ -1961,6 +1961,14 @@ pub enum DetailLinkInternalTarget {
     SoundCloudArtistAlbums(String),
     /// Search the exact public SoundCloud tag through the configured instance.
     SoundCloudTag(String),
+    /// Search the exact advertised tag on the current Funkwhale pod.
+    FunkwhaleTag(String),
+    /// Browse the selected track's exact artist on its original Funkwhale pod.
+    FunkwhaleArtist(String),
+    /// Browse an exact album on the selected track's original Funkwhale pod.
+    FunkwhaleAlbum(String),
+    /// Browse public uploads belonging to the selected upload's exact actor.
+    FunkwhaleUploader(String),
     /// One stable Yandex Music artist identifier.
     YandexMusicArtist(String),
     /// One stable Yandex Music album, show, or audiobook identifier.
@@ -1984,6 +1992,10 @@ impl DetailLinkInternalTarget {
             Self::SoundCloudArtist(url) => UiAction::OpenSoundCloudArtist(url.clone()),
             Self::SoundCloudArtistAlbums(url) => UiAction::OpenSoundCloudArtistAlbums(url.clone()),
             Self::SoundCloudTag(tag) => UiAction::SearchSoundCloudTag(tag.clone()),
+            Self::FunkwhaleTag(tag) => UiAction::SearchFunkwhaleTag(tag.clone()),
+            Self::FunkwhaleArtist(_) => UiAction::OpenSelectedArtist,
+            Self::FunkwhaleAlbum(url) => UiAction::OpenFunkwhaleAlbum(url.clone()),
+            Self::FunkwhaleUploader(_) => UiAction::OpenFunkwhaleUploader,
             Self::YandexMusicArtist(id) => UiAction::OpenYandexMusicArtistById(id.clone()),
             Self::YandexMusicAlbum(id) => UiAction::OpenYandexMusicAlbumById(id.clone()),
             Self::LibriVoxAuthor(id) => UiAction::OpenLibriVoxAuthorById(id.clone()),
@@ -3358,6 +3370,51 @@ pub struct AsciiVisualizerView {
     pub lines: Vec<String>,
 }
 
+/// Result slots measured with and without an idle query heading.
+///
+/// A frontend reports both layouts before provider activation. Each provider
+/// chooses using its own submitted query, never another tab's current editor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SearchPageCapacities {
+    /// Slots after reserving a query heading and the source's ordinary controls.
+    pub with_heading: usize,
+    /// Slots when an empty, inactive query does not consume a heading row.
+    pub without_heading: usize,
+}
+
+impl SearchPageCapacities {
+    /// Keeps non-terminal frontends and legacy fixed-size hooks unchanged.
+    #[must_use]
+    pub const fn fixed(rows: usize) -> Self {
+        Self {
+            with_heading: rows,
+            without_heading: rows,
+        }
+    }
+
+    /// Chooses the page-one layout from this provider's submitted query.
+    #[must_use]
+    pub fn for_query(self, query: &str) -> usize {
+        if query.trim().is_empty() {
+            self.without_heading
+        } else {
+            self.with_heading
+        }
+    }
+
+    /// Applies a provider's bounds independently to both measured layouts.
+    ///
+    /// # Panics
+    /// Panics if `min` exceeds `max`, matching [`usize::clamp`].
+    #[must_use]
+    pub fn clamped(self, min: usize, max: usize) -> Self {
+        Self {
+            with_heading: self.with_heading.clamp(min, max),
+            without_heading: self.without_heading.clamp(min, max),
+        }
+    }
+}
+
 /// Complete immutable view rendered for one frame.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ViewModel {
@@ -3451,6 +3508,8 @@ pub struct ViewModel {
     pub archive_org_back_available: bool,
     /// Whether SoundCloud has a cached parent catalogue to restore without fetching.
     pub soundcloud_back_available: bool,
+    /// Whether a nested Funkwhale catalogue has a retained Back destination.
+    pub funkwhale_back_available: bool,
     /// Authoritative playback-source tab, retained while paused; idle playback hides its marker.
     pub playing_screen: Option<Screen>,
     /// Selected Commons media control inside the expanded Wikidata spoiler.
@@ -3684,6 +3743,8 @@ pub struct ViewModel {
     pub private_note_available: bool,
     /// Selection-sensitive actions for the Yandex Music tab.
     pub yandex_music_actions: YandexMusicActionsView,
+    /// The selected music row has an exact artist route available inside Youta.
+    pub selected_artist_available: bool,
     /// Explicit rename, copy, move, or recoverable Trash confirmation for a local file.
     pub local_file_popup: Option<LocalFilePopupView>,
     /// Blocking foreground Copy/Move progress, absent while choosing a destination.
@@ -3875,6 +3936,10 @@ impl ViewModel {
                                 | DetailLinkInternalTarget::SoundCloudArtist(_)
                                 | DetailLinkInternalTarget::SoundCloudArtistAlbums(_)
                                 | DetailLinkInternalTarget::SoundCloudTag(_)
+                                | DetailLinkInternalTarget::FunkwhaleTag(_)
+                                | DetailLinkInternalTarget::FunkwhaleArtist(_)
+                                | DetailLinkInternalTarget::FunkwhaleAlbum(_)
+                                | DetailLinkInternalTarget::FunkwhaleUploader(_)
                         )
                     )
                 })
@@ -3882,6 +3947,58 @@ impl ViewModel {
             return false;
         }
         action.requires_external_opener()
+    }
+
+    /// Returns the selected Funkwhale track's album without accepting stale Details.
+    ///
+    /// The controller validates the exact pod-local destination again before
+    /// browsing. This projection only exposes a keyboard action for matching
+    /// selected media, including on terminals without an external URL opener.
+    #[must_use]
+    pub fn funkwhale_album_url(&self) -> Option<&str> {
+        if !cfg!(feature = "funkwhale") || self.screen != Screen::Funkwhale {
+            return None;
+        }
+        let selected = self.rows.get(self.selected)?.media_id.as_ref()?;
+        let details = self.details.as_ref()?;
+        if selected.source != SourceKind::Funkwhale || details.media_id.as_ref() != Some(selected) {
+            return None;
+        }
+        details
+            .links
+            .iter()
+            .find_map(|link| match &link.internal_target {
+                Some(DetailLinkInternalTarget::FunkwhaleAlbum(url)) => Some(url.as_str()),
+                _ => None,
+            })
+    }
+
+    /// Exposes uploader browsing only for a matching selected Funkwhale track.
+    ///
+    /// Actor identity is provided by the upload record, never inferred from a
+    /// displayed artist or username. The controller validates it again.
+    #[must_use]
+    pub fn funkwhale_uploader_available(&self) -> bool {
+        if !cfg!(feature = "funkwhale") || self.screen != Screen::Funkwhale {
+            return false;
+        }
+        let Some(selected) = self
+            .rows
+            .get(self.selected)
+            .and_then(|row| row.media_id.as_ref())
+        else {
+            return false;
+        };
+        self.details.as_ref().is_some_and(|details| {
+            selected.source == SourceKind::Funkwhale
+                && details.media_id.as_ref() == Some(selected)
+                && details.links.iter().any(|link| {
+                    matches!(
+                        link.internal_target,
+                        Some(DetailLinkInternalTarget::FunkwhaleUploader(_))
+                    )
+                })
+        })
     }
 
     /// Whether the selection supports public comments and is not known to have none.
@@ -4089,6 +4206,7 @@ impl Default for ViewModel {
             detail_link_reveal: None,
             archive_org_back_available: false,
             soundcloud_back_available: false,
+            funkwhale_back_available: false,
             playing_screen: None,
             selected_wikidata_media: None,
             right_panel_mode: RightPanelMode::Details,
@@ -4191,6 +4309,7 @@ impl Default for ViewModel {
             private_note_popup: None,
             private_note_available: false,
             yandex_music_actions: YandexMusicActionsView::default(),
+            selected_artist_available: false,
             local_file_popup: None,
             local_file_progress: None,
             #[cfg(feature = "cmd")]
@@ -4353,6 +4472,8 @@ pub enum UiAction {
     /// Toggle the selected Yandex Music track's disliked state.
     ToggleYandexMusicDislike,
     /// Open the selected row's primary artist inside Youta.
+    OpenSelectedArtist,
+    /// Open the selected Yandex Music row's primary artist inside Youta.
     OpenYandexMusicArtist,
     /// Open the selected track's album or selected album row.
     OpenYandexMusicAlbum,
@@ -4878,6 +4999,12 @@ pub enum UiAction {
     OpenSoundCloudArtistAlbums(String),
     /// Search one exact public SoundCloud tag, retaining its parent for Back.
     SearchSoundCloudTag(String),
+    /// Search an exact advertised Funkwhale tag without leaving the configured pod.
+    SearchFunkwhaleTag(String),
+    /// Browse an exact selected Funkwhale album without leaving its original pod.
+    OpenFunkwhaleAlbum(String),
+    /// Opens all public playable uploads of the selected Funkwhale uploader.
+    OpenFunkwhaleUploader,
     /// Search `YouTube` videos for one validated hashtag without the leading hash.
     SearchYouTubeHashtag(String),
     /// Set the exact wrapped-line offset in the public-comments popup.
@@ -5342,6 +5469,21 @@ pub trait UiController {
     /// Reports visible Funkwhale track slots, excluding its continuation row.
     fn set_funkwhale_search_page_capacity(&mut self, _rows: usize) {}
 
+    /// Reports both query-heading layouts without inspecting dormant provider state.
+    ///
+    /// Existing controllers may retain their fixed-capacity hook. Source-aware
+    /// controllers override this to choose page one from their own saved query.
+    fn set_search_page_capacities(&mut self, screen: Screen, capacities: SearchPageCapacities) {
+        match screen {
+            Screen::ArchiveOrg => {
+                self.set_archive_org_search_page_capacity(capacities.with_heading)
+            }
+            Screen::SoundCloud => self.set_soundcloud_search_page_capacity(capacities.with_heading),
+            Screen::Funkwhale => self.set_funkwhale_search_page_capacity(capacities.with_heading),
+            _ => {}
+        }
+    }
+
     /// Applies one semantic user action.
     fn dispatch(&mut self, action: UiAction);
 
@@ -5411,6 +5553,157 @@ pub trait UiController {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Visible source URLs remain internal actions even without a terminal URL opener.
+    #[test]
+    fn funkwhale_artist_and_album_links_have_internal_actions() {
+        let album = "https://pod.example/library/albums/9";
+        for (target, expected) in [
+            (
+                DetailLinkInternalTarget::FunkwhaleArtist(
+                    "https://pod.example/library/artists/7".to_owned(),
+                ),
+                UiAction::OpenSelectedArtist,
+            ),
+            (
+                DetailLinkInternalTarget::FunkwhaleAlbum(album.to_owned()),
+                UiAction::OpenFunkwhaleAlbum(album.to_owned()),
+            ),
+            (
+                DetailLinkInternalTarget::FunkwhaleUploader("emil@pod.example".to_owned()),
+                UiAction::OpenFunkwhaleUploader,
+            ),
+        ] {
+            assert_eq!(target.action(), expected);
+            let view = ViewModel {
+                screen: Screen::Funkwhale,
+                external_opener_available: false,
+                details: Some(DetailView {
+                    links: vec![DetailLinkView {
+                        internal_target: Some(target),
+                        ..DetailLinkView::default()
+                    }],
+                    ..DetailView::default()
+                }),
+                ..ViewModel::default()
+            };
+            assert!(!view.action_requires_external_opener(&UiAction::ActivateDetailLink(0)));
+            assert!(!expected.requires_external_opener());
+        }
+    }
+
+    /// Album shortcuts belong to matching selected media, never another row or tab.
+    #[test]
+    fn funkwhale_album_projection_requires_matching_selected_media_and_feature() {
+        let album = "https://pod.example/library/albums/9";
+        let id = MediaId::new(
+            SourceKind::Funkwhale,
+            "https://pod.example/library/tracks/42",
+        );
+        let mut view = ViewModel {
+            screen: Screen::Funkwhale,
+            rows: vec![RowView {
+                media_id: Some(id.clone()),
+                ..RowView::default()
+            }],
+            details: Some(DetailView {
+                media_id: Some(id),
+                links: vec![DetailLinkView {
+                    internal_target: Some(DetailLinkInternalTarget::FunkwhaleAlbum(
+                        album.to_owned(),
+                    )),
+                    ..DetailLinkView::default()
+                }],
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        assert_eq!(
+            view.funkwhale_album_url(),
+            cfg!(feature = "funkwhale").then_some(album)
+        );
+        view.rows[0]
+            .media_id
+            .as_mut()
+            .unwrap()
+            .external_id
+            .push('3');
+        assert!(view.funkwhale_album_url().is_none());
+        view.rows[0].media_id = view.details.as_ref().unwrap().media_id.clone();
+        view.screen = Screen::SoundCloud;
+        assert!(view.funkwhale_album_url().is_none());
+        view.screen = Screen::Funkwhale;
+        view.rows.clear();
+        assert!(view.funkwhale_album_url().is_none());
+    }
+
+    /// Uploader shortcuts cannot act on stale Details or an album directory row.
+    #[test]
+    fn funkwhale_uploader_projection_owns_the_selected_track() {
+        let id = MediaId::new(
+            SourceKind::Funkwhale,
+            "https://pod.example/library/tracks/42",
+        );
+        let mut view = ViewModel {
+            screen: Screen::Funkwhale,
+            rows: vec![RowView {
+                media_id: Some(id.clone()),
+                ..RowView::default()
+            }],
+            details: Some(DetailView {
+                media_id: Some(id),
+                links: vec![DetailLinkView {
+                    internal_target: Some(DetailLinkInternalTarget::FunkwhaleUploader(
+                        "emil@pod.example".to_owned(),
+                    )),
+                    ..DetailLinkView::default()
+                }],
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        assert_eq!(
+            view.funkwhale_uploader_available(),
+            cfg!(feature = "funkwhale")
+        );
+        view.screen = Screen::Local;
+        assert!(!view.funkwhale_uploader_available());
+        view.screen = Screen::Funkwhale;
+        view.rows[0].media_id = None;
+        assert!(!view.funkwhale_uploader_available());
+        view.rows[0].media_id = Some(MediaId::new(
+            SourceKind::Funkwhale,
+            "https://pod.example/library/tracks/43",
+        ));
+        assert!(!view.funkwhale_uploader_available());
+    }
+
+    /// Source tags remain internal even on physical terminals without a URL opener.
+    #[test]
+    fn funkwhale_tags_have_typed_internal_actions_without_external_url_requirements() {
+        let target = DetailLinkInternalTarget::FunkwhaleTag("field recording".to_owned());
+        assert_eq!(
+            target.action(),
+            UiAction::SearchFunkwhaleTag("field recording".to_owned())
+        );
+        let view = ViewModel {
+            screen: Screen::Funkwhale,
+            external_opener_available: false,
+            details: Some(DetailView {
+                links: vec![DetailLinkView {
+                    label: "field recording".to_owned(),
+                    internal_target: Some(target),
+                    ..DetailLinkView::default()
+                }],
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        assert!(!view.action_requires_external_opener(&UiAction::ActivateDetailLink(0)));
+        assert!(
+            !UiAction::SearchFunkwhaleTag("field recording".to_owned()).requires_external_opener()
+        );
+    }
 
     /// New provider ordering remains stable while feature-trimmed builds hide its tab.
     #[test]

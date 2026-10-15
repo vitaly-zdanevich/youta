@@ -1,7 +1,7 @@
 import { useEffect, useRef } from "react";
 import type { ReactNode } from "react";
 
-import type { DetailHighlightField, DetailLinkView, DetailView, InformationPanelKind, UrlInfoView, ViewModel } from "../contract";
+import type { DetailHighlightField, DetailLinkView, DetailView, InformationPanelKind, UiAction, UrlInfoView, ViewModel } from "../contract";
 import { dispatch } from "../ipc";
 import { highlightRanges } from '../searchHighlights';
 import { Artwork } from "./Artwork";
@@ -26,6 +26,7 @@ const YOUTUBE = "you-tube";
 type FactTextKey = 'length' | 'likes' | 'views' | 'comments' | 'published' | 'source' | 'license';
 const FACT_HIGHLIGHT_FIELDS: Partial<Record<string, [DetailHighlightField, FactTextKey]>> = {
 	Length: ['Length', 'length'], Likes: ['Likes', 'likes'], Favourites: ['Likes', 'likes'],
+	Duration: ['Length', 'length'], 'Added to pod': ['Published', 'published'],
 	Views: ['Views', 'views'], Downloads: ['Views', 'views'], Comments: ['Comments', 'comments'],
 	Published: ['Published', 'published'], Uploaded: ['Published', 'published'],
 	Source: ['Source', 'source'], License: ['License', 'license'],
@@ -105,6 +106,9 @@ function factsFor(kind: InformationPanelKind, details: DetailView): Array<[strin
     case "YandexMusic":
       break;
     case "Generic":
+			if (details.media_id?.source === 'funkwhale') {
+				rows.push(['Duration', fact(details.length)], ['Added to pod', fact(details.published)]);
+			}
 			// Archive.org supplies item-level statistics, not YouTube likes/views.
 			if (details.media_id?.source === 'archive-org') {
 				const files = details.archive_file_counts;
@@ -136,8 +140,8 @@ function factsFor(kind: InformationPanelKind, details: DetailView): Array<[strin
       break;
   }
 	rows.push(['Source', fact(details.source)]);
-	// Keep plain rights notices, but avoid repeating an Archive licence with a link.
-	if (details.media_id?.source !== 'archive-org' || !details.links.some((link) => link.prefix === 'License: ')) {
+	// Keep plain rights notices, but do not repeat a canonical license link as a fact.
+	if ((details.media_id?.source !== 'archive-org' && details.media_id?.source !== 'funkwhale') || !details.links.some((link) => link.prefix === 'License: ')) {
 		rows.push(['License', fact(details.license)]);
 	}
   if (details.playlist_names.length > 0) {
@@ -234,7 +238,29 @@ function UrlInformation({ entries, externalOpenerAvailable }: {
 	</section>;
 }
 
-/** The external-link list, with its lazily expanded Wikidata spoilers. */
+/** Inline catalogue and source links own activation before the global playback keys. */
+function CatalogueLink({ children, action, title, selected = false, selectIndex }: {
+	children: ReactNode;
+	action: UiAction;
+	title: string;
+	selected?: boolean;
+	selectIndex?: number;
+}) {
+	return <button type='button' title={title}
+		onClick={() => void dispatch(action)}
+		onFocus={selectIndex === undefined ? undefined : () => void dispatch({ SelectDetailLink: selectIndex })}
+		onKeyDown={(event) => {
+			if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey || (event.key !== 'Enter' && event.key !== ' ')) return;
+			event.preventDefault();
+			event.stopPropagation();
+			if (!event.repeat) void dispatch(action);
+		}}
+		className={`min-w-0 rounded-[3px] break-all text-left underline decoration-dotted underline-offset-2 hover:text-accent focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-accent ${selected ? 'text-accent' : 'text-ink'}`}>
+		{children}
+	</button>;
+}
+
+/** Provider links expose canonical HTTP destinations with typed in-app navigation. */
 function Links({
   links,
   details,
@@ -270,6 +296,30 @@ function Links({
         const showUrl = link.presentation.startsWith("LabelAndUrl") && link.label !== "";
 				// Keep existing provider markers independent of external URL capabilities.
 				const target = link.internal_target;
+				const funkwhaleArtist = target !== null && 'FunkwhaleArtist' in target;
+				const funkwhaleAlbum = target !== null && 'FunkwhaleAlbum' in target ? target.FunkwhaleAlbum : null;
+				if (funkwhaleArtist) return <li key={`${link.url}-${index}`}>
+					<span className='block'>
+						<CatalogueLink title='Open inside Youta' action='OpenSelectedArtist'>Artist [g]: {details.channel_name}</CatalogueLink>
+					</span>
+					<span className='block'>
+						<CatalogueLink title='Open inside Youta' action={{ ActivateDetailLink: index }} selectIndex={index} selected={index === selectedLink}>
+							<SearchHighlight text={link.url} ranges={highlightRanges(details.search_highlights, { LinkUrl: index })} />
+						</CatalogueLink>
+					</span>
+				</li>;
+				if (funkwhaleArtist || funkwhaleAlbum !== null) return <li key={`${link.url}-${index}`}>
+					<span className='flex flex-wrap items-baseline gap-x-[6px]'>
+						<CatalogueLink title='Open inside Youta' action={funkwhaleArtist ? 'OpenSelectedArtist' : { OpenFunkwhaleAlbum: funkwhaleAlbum! }}>
+							{funkwhaleArtist ? 'Artist [g]' : <>Album [{details.media_id === null ? 'Enter' : 'b'}] <SearchHighlight text={link.label} ranges={highlightRanges(details.search_highlights, { LinkLabel: index })} /></>}
+						</CatalogueLink>
+						{funkwhaleArtist ? null : <span className='text-ink-faint'>-</span>}
+						<CatalogueLink title='Open inside Youta'
+							action={{ ActivateDetailLink: index }} selectIndex={index} selected={index === selectedLink}>
+							<SearchHighlight text={link.url} ranges={highlightRanges(details.search_highlights, { LinkUrl: index })} />
+						</CatalogueLink>
+					</span>
+				</li>;
 				const email = link.url.startsWith('mailto:');
 				const uploader = target !== null && 'ArchiveUploader' in target;
 				const internal = target === null ? null
@@ -628,8 +678,8 @@ export function Details({ view, kind }: { view: ViewModel; kind: InformationPane
             </Action>
           </>
         ) : null}
-        {kind === "YandexMusic" && yandex.artist_available ? (
-          <Action onClick={() => void dispatch("OpenYandexMusicArtist")}>Artist</Action>
+		{view.selected_artist_available && view.screen !== 'Funkwhale' ? (
+			<Action onClick={() => void dispatch('OpenSelectedArtist')}>[g] Artist</Action>
         ) : null}
         {kind === "YandexMusic" && yandex.album_available ? (
           <Action onClick={() => void dispatch("OpenYandexMusicAlbum")}>Album</Action>

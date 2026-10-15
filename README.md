@@ -1597,7 +1597,8 @@ entries and hides the Log tab. It also omits online queries and browsing routes
 from saved sessions, so online search text and results do not reopen after a
 restart on any online tab. Previously saved online queries and search results
 are removed when the setting is turned off or Youta starts with it off. Online
-search tabs stay empty until you explicitly search or browse. Existing playback logs,
+search tabs stay empty until you explicitly search or browse, except Funkwhale,
+which loads the configured pod's recent tracks without restoring a search. Existing playback logs,
 media/artwork caches, and Git history are retained. Playback progress, listening
 statistics, other session state, and graceful-shutdown Git synchronization
 remain enabled. Setting it back to `true` exposes the retained playback history
@@ -1957,10 +1958,46 @@ manual URL entry available, and `F4` retries the directory request.
 The saved setting is `providers.funkwhale_instance_url` in `config.toml`.
 `YOUTA_PROVIDERS__FUNKWHALE_INSTANCE_URL` overrides it; remove or change that
 environment variable before saving a different pod in setup.
-Press `/` to search the selected pod, then Enter to play a track. Searches use
-the visible page capacity, up to 100 tracks, with explicit **Load more tracks**
+The selected pod initially shows up to 20 recently added playable tracks,
+newest first, from one catalogue page, even with **Save log and searches** off.
+This does not save or restore a search. Submitting an empty search also opens
+recent tracks for that session. Press `/` to search the selected pod, then
+Enter to play a track. Resolution uses the shared ASCII activity animation;
+unavailable audio produces a visible error identifying its pod and track.
+In the TUI, searches use the visible page capacity, up to 100 tracks, with explicit **Load more tracks**
 pagination. Details include the pod's metadata, available artwork, and original
-track and artist URLs. Catalogue and playback availability depend on the pod:
+track and artist URLs. Artist catalogues show albums; Enter opens an album's
+tracks. A separate **Standalone tracks** entry keeps tracks without albums
+accessible, but is hidden when a one-record check confirms it is empty. A
+failed check leaves the entry accessible instead of hiding possible tracks.
+Details show `Artist [g]: NAME`, with its canonical URL on the next line, and
+one unified `Album [b] NAME - URL` line when available. Click the name or URL,
+or press its hotkey, to browse that exact artist or album inside Youta. Album
+tracks follow disc and track order; HTTP URLs remain visible for copying.
+Tags in Details are clickable: they search the same pod using its exact tag
+filter, without changing the tag into a title search. Esc or Alt+Left restores
+the previous catalogue, artist view, selection and query.
+Descriptions are plain text with clickable URLs rather than raw HTML, and
+recognizable legacy Cyrillic encoding damage is repaired for display only.
+Details also show advertised upload size, file format, bitrate and duration
+when available. Container and codec share one format line when both are
+supplied, for example `Format: Ogg, Opus`; a missing codec is not guessed.
+Listening counts appear only when supplied by the pod. A supplied license
+appears as a readable label and canonical link when its code is known;
+unknown license values remain plain text. Missing
+licenses and listening totals are omitted. Download counts are not reported as
+listenings. Upload metadata
+may differ from a transcoded playback stream. Selecting a track lazily reads
+its advertised upload record for **Uploaded by** and the actual upload date,
+when public. These are separate from the credited artist and **Added to pod**
+date; a restricted upload endpoint simply omits the optional fields. This extra
+request is not made for every result or during playback resolution.
+`Uploaded by [e]` is clickable and opens that user's public playable uploads
+on the same pod. The actor URL stays on the next line; uploader identity is
+read from the upload record, not guessed from the credited artist.
+Tracks explicitly marked unplayable are omitted even if the pod ignores the
+playable-search filter.
+Catalogue and playback availability depend on the pod:
 HTTP 401/403 errors identify an authentication restriction. Youta does not
 implement Funkwhale account login or OAuth in this release.
 
@@ -1971,6 +2008,14 @@ pod-scoped track-page URLs; playback resolves a fresh stream from the original
 pod, so equal numeric IDs on different pods cannot select the wrong track.
 Turning off **Save log and searches** also clears saved Funkwhale queries and
 prevents their restoration.
+
+On SoundCloud, Funkwhale, and Yandex Music, `g` opens the selected
+item's exact artist inside Youta without subscribing or launching a browser.
+SoundCloud opens uploaded tracks with an Albums link; Yandex exposes popular
+tracks and albums; Funkwhale lists albums with a separate entry for tracks
+without an album. Funkwhale places the hotkey on its Artist link rather
+than showing a duplicate button. Missing artist identities omit the action.
+Esc or Alt+Left restores the previous catalogue.
 
 The independent `funkwhale` Cargo feature is enabled by default in both
 frontends. Omit it from an explicit `--no-default-features` build to remove the
@@ -2567,7 +2612,8 @@ video-thumbnail entry. `YOUTA_PERSISTENCE__SAVE_PLAYBACK_HISTORY=false` switches
 off **Save log and searches**: no new log entries; searches are not saved or
 restored after restart. Log is hidden, and previously saved online queries and
 search results are removed. Online search tabs stay empty until an explicit search or
-browse action. Existing playback logs, media/artwork caches, and Git history
+browse action, except Funkwhale's recent-track catalogue on the configured pod.
+Existing playback logs, media/artwork caches, and Git history
 remain; playback progress, listening statistics, other session state, and
 graceful-shutdown Git synchronization remain enabled. Re-enabling it exposes
 the retained playback history in Log again. `YOUTA_VIDEO_SUMMARY__BACKEND=codex`

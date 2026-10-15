@@ -4,7 +4,7 @@ resolver = "3"
 
 [package]
 name = "youta"
-version = "1.17.6"
+version = "1.18.0"
 edition = "2024"
 rust-version = "1.95"
 description = "A low-resource YouTube TUI audio player and local subscription manager that uses yt-dlp and saves and shows listening progress"
@@ -312,7 +312,7 @@ podcast-index = ["rss"]
 gpodder = ["rss"]
 radio = ["network"]
 bbc-radio = ["radio"]
-funkwhale = ["network", "dep:html5gum"]
+funkwhale = ["network", "dep:html5gum", "dep:encoding_rs"]
 jamendo = ["network"]
 soundcloud = ["network", "yt-dlp"]
 soundstream = ["network"]

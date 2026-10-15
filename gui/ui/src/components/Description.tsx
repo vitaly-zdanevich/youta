@@ -100,6 +100,8 @@ export function Description({
 				if (span.kind === 'detail') {
 					// Email targets are canonical parser output, never inferred from displayed text.
 					const email = links[span.index]?.url.startsWith('mailto:') === true;
+					const target = links[span.index]?.internal_target;
+					const funkwhaleMetadata = target != null && ('FunkwhaleUploader' in target || 'FunkwhaleTag' in target);
 					return <button
 						key={key}
 						type='button'
@@ -109,6 +111,13 @@ export function Description({
 						onFocus={() => void dispatch({ SelectDetailLink: span.index })}
 						onClick={() => void dispatch({ ActivateDetailLink: span.index })}
 						onKeyDown={(event) => {
+							if (funkwhaleMetadata) {
+								if (event.ctrlKey || event.altKey || event.metaKey || event.shiftKey || (event.key !== 'Enter' && event.key !== ' ')) return;
+								event.preventDefault();
+								event.stopPropagation();
+								if (!event.repeat) void dispatch({ ActivateDetailLink: span.index });
+								return;
+							}
 							if (!email || event.key !== 'Enter') return;
 							// Tab focus does not change reducer focus; bypass global track activation.
 							event.preventDefault();

@@ -200,6 +200,19 @@ impl AppController {
 
 #[cfg(feature = "soundcloud")]
 impl AppController {
+    /// Returns only an advertised canonical artist identity belonging to the selected row.
+    pub(in crate::app) fn selected_soundcloud_artist_url(&self) -> Option<url::Url> {
+        if self.view.screen != Screen::SoundCloud {
+            return None;
+        }
+        let url = match &self.soundcloud.catalog.route {
+            Route::Albums { items, .. } => items.get(self.view.selected)?.artist_url.as_ref()?,
+            _ => self.selected_soundcloud_track()?.artist_url.as_ref()?,
+        };
+        SoundcloakClient::validate_profile_url(url).ok()?;
+        Some(url.clone())
+    }
+
     /// Retrieves the selected real track, accounting for unavailable ordered album slots.
     pub(in crate::app) fn selected_soundcloud_track(&self) -> Option<&SoundcloakTrack> {
         match &self.soundcloud.catalog.route {
@@ -346,7 +359,11 @@ impl AppController {
         self.soundcloud.items.clear();
         self.soundcloud.next_page = None;
         self.soundcloud.selected = 0;
-        self.soundcloud.page_limit = Some(self.soundcloud.search_page_capacity.unwrap_or(50));
+        self.soundcloud.page_limit = Some(
+            self.soundcloud
+                .search_page_capacity
+                .map_or(50, |capacity| capacity.for_query(&self.soundcloud.query)),
+        );
         self.soundcloud.catalog.pending = Some(Job {
             generation: self.soundcloud.catalog.generation,
             limit: self.soundcloud.page_limit.unwrap_or(50),

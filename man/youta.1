@@ -863,9 +863,18 @@ Local private paths are omitted from public upload metadata.
 Audio is prepared as Opus; eligible Local video can instead use stream-copy MKV.
 Folders and unavailable selections cannot start publication.
 .TP
-.BR L ", " g ", " b
-In Yandex Music, like or undo like of a track, open its artist, or open its
-album, respectively, when available.
+.BR L ", " b
+In Yandex Music, like or undo like of a track, or open its album, respectively,
+when available. On Funkwhale, b opens the selected track's exact album inside
+Youta when available.
+.TP
+.B g
+Open Artist inside Youta for the selected SoundCloud, Funkwhale, or Yandex Music
+item when its exact artist identity is available. Esc or Alt+Left returns.
+.TP
+.B e
+On Funkwhale, open the selected upload's exact user's public playable uploads
+inside Youta. The Uploaded by line shows the same shortcut when available.
 .TP
 .BR Shift+F1 " (or F13)"
 Start sharing the selected Local file or folder over the LAN when supported.
@@ -929,10 +938,42 @@ The setting is
 in config.toml.
 .B YOUTA_PROVIDERS__FUNKWHALE_INSTANCE_URL
 overrides it; change or remove that environment variable before saving a pod.
-Press / to search and Enter to play.
+The selected pod initially shows up to 20 recently added playable tracks,
+newest first, from one catalogue page, even with Save log and searches off.
+This does not save or restore a search. Submit an empty search to browse recent
+tracks for the current session. Press / to search and Enter to play.
+Audio resolution shows the shared ASCII activity animation; failures produce
+a visible error identifying the original pod and track.
 Requests fit the visible list, up to 100 tracks, with explicit Load more tracks
 pagination. Details show available metadata, artwork, and original track and
-artist URLs. HTTP 401/403 errors identify pod authentication restrictions;
+artist URLs. Artist catalogues show albums; Enter opens an album's tracks.
+A separate Standalone tracks entry opens tracks without an album.
+It is hidden when a one-record check confirms it is empty; a failed check
+keeps the entry accessible rather than hiding possible tracks.
+Details show Artist [g]: NAME with its canonical URL on the next line,
+and one unified Album [b] NAME - URL line. Click the name or URL, or use its
+hotkey, to browse that exact artist or album inside Youta. Album tracks follow
+disc and track order. Canonical HTTP URLs remain visible for copying.
+Tags in Details are clickable and search the same pod using its exact tag
+filter. Esc or Alt+Left restores the previous catalogue, artist view, selection
+and query. Descriptions render as plain text with clickable URLs; recognizable legacy
+Cyrillic encoding damage is repaired for display only.
+Advertised upload size, file format, bitrate and duration appear when supplied.
+Container and codec share one format line when both are advertised,
+for example Format: Ogg, Opus; a missing codec is not guessed.
+Listening counts appear only if provided; downloads are not
+mislabelled as listenings. A supplied license has a readable label and canonical
+link when its code is known; unknown values remain plain text. Missing licenses
+and listening totals are omitted. Upload facts may differ from transcoded playback.
+Selecting a track lazily requests its advertised upload record for Uploaded by
+and the actual Upload date when public. Neither is inferred from the artist or
+the track's Added to pod date. Restricted upload records omit these optional
+fields; searches and playback resolution do not request them per result.
+Uploaded by [e] is clickable and opens that actor's public playable uploads
+on the original pod. The actor URL remains on the next line; the credited
+artist is not used to guess an uploader.
+Explicitly unplayable tracks are omitted even if the pod ignores its filter.
+HTTP 401/403 errors identify pod authentication restrictions;
 account login and OAuth are not implemented.
 .PP
 The adapter tries v1, falls back to v2 only on 404, and uses advertised audio
@@ -940,6 +981,15 @@ listen URLs directly without yt-dlp. Log and queue entries save canonical
 pod-scoped track-page URLs; replay resolves fresh audio from the original pod.
 Turning off Save log and searches removes saved Funkwhale searches and prevents
 their restoration.
+.PP
+On SoundCloud, Funkwhale and Yandex Music,
+.B g
+opens the selected item's exact artist inside Youta without subscribing or
+launching a browser. SoundCloud offers uploaded tracks and an Albums link;
+Yandex offers popular tracks and albums; Funkwhale lists albums with a separate
+entry for tracks without an album. Funkwhale places the hotkey on its Artist
+link instead of showing a duplicate button. Missing artist identities omit the action.
+Esc or Alt+Left restores the previous catalogue.
 .PP
 The independent
 .B funkwhale
@@ -1126,7 +1176,8 @@ in config.toml, or
 to stop new log entries and hide Log. Searches are not saved or restored after
 restart. Previously saved online queries and search results are removed when
 the setting is turned off or Youta starts with it off. Online search tabs stay empty
-until an explicit search or browse action. Online browsing routes are omitted
+until an explicit search or browse action, except Funkwhale's recent-track
+catalogue on the configured pod. Online browsing routes are omitted
 from saved sessions.
 Existing playback logs, media/artwork caches, and Git history are retained.
 Playback progress, listening statistics, other session state, and

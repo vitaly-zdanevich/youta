@@ -73,6 +73,8 @@ export type SourceKind =
 
 /** Unit variants reachable through controls or their typed action tables. */
 export type UnitUiAction =
+	| 'OpenSelectedArtist'
+	| 'OpenFunkwhaleUploader'
 	| 'OpenBugReport'
 	| 'DeleteBugReportCharacter'
 	| 'DeleteBugReportForward'
@@ -293,7 +295,9 @@ export interface UiActionPayloads {
 	ActivateCommentEmail: { source: SourceKind; video_id: string; comment_index: number; email_index: number; };
 	OpenSoundCloudArtist: string;
 	OpenSoundCloudArtistAlbums: string;
+	OpenFunkwhaleAlbum: string;
 	SearchSoundCloudTag: string;
+	SearchFunkwhaleTag: string;
 	SearchYouTubeHashtag: string;
 	OpenWikidataValue: string;
 	OpenYandexMusicAlbumById: string;

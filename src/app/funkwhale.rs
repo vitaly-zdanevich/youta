@@ -4,6 +4,11 @@
 //! Opening setup does not select a pod or fetch a directory implicitly.
 
 #[cfg(feature = "funkwhale")]
+mod license;
+#[cfg(feature = "funkwhale")]
+mod uploader;
+
+#[cfg(feature = "funkwhale")]
 use super::worker_notifications::reap_published_worker;
 use super::*;
 
@@ -11,7 +16,10 @@ use super::*;
 use crate::view::{FunkwhalePodPickerView, FunkwhalePodView, FunkwhaleSetupPopupView};
 
 #[cfg(feature = "funkwhale")]
-use crate::providers::funkwhale::{FunkwhalePod, FunkwhaleProvider, discover_public_pods};
+use crate::providers::funkwhale::{
+    FunkwhaleAlbum, FunkwhaleAlbumPage, FunkwhalePod, FunkwhaleProvider, FunkwhaleUploadMetadata,
+    FunkwhaleUploader, discover_public_pods,
+};
 #[cfg(feature = "funkwhale")]
 use crate::providers::{Provider, SearchRequest, SearchTarget};
 
@@ -23,7 +31,18 @@ pub(super) struct FunkwhaleState {
     #[cfg(feature = "funkwhale")]
     items: Vec<VideoSummary>,
     #[cfg(feature = "funkwhale")]
+    albums: Vec<FunkwhaleAlbum>,
+    #[cfg(feature = "funkwhale")]
+    standalone: bool,
+    /// Unknown keeps the entry accessible; only a successful absence probe hides it.
+    #[cfg(feature = "funkwhale")]
+    standalone_presence: Option<bool>,
+    #[cfg(feature = "funkwhale")]
     details: HashMap<String, VideoDetails>,
+    #[cfg(feature = "funkwhale")]
+    upload_metadata: HashMap<String, FunkwhaleUploadMetadata>,
+    #[cfg(feature = "funkwhale")]
+    upload_metadata_checked: HashSet<String>,
     #[cfg(feature = "funkwhale")]
     failed_details: HashSet<String>,
     #[cfg(feature = "funkwhale")]
@@ -39,7 +58,7 @@ pub(super) struct FunkwhaleState {
     #[cfg(feature = "funkwhale")]
     next_page: Option<u32>,
     #[cfg(feature = "funkwhale")]
-    capacity: usize,
+    capacity: Option<crate::view::SearchPageCapacities>,
     #[cfg(feature = "funkwhale")]
     page_size: usize,
     #[cfg(feature = "funkwhale")]
@@ -54,6 +73,18 @@ pub(super) struct FunkwhaleState {
     pods: Option<Vec<FunkwhalePod>>,
     #[cfg(feature = "funkwhale")]
     clients: VecDeque<FunkwhaleProvider>,
+    #[cfg(feature = "funkwhale")]
+    artist: Option<(String, String)>,
+    #[cfg(feature = "funkwhale")]
+    album: Option<(String, String)>,
+    #[cfg(feature = "funkwhale")]
+    tag: Option<(String, url::Url)>,
+    #[cfg(feature = "funkwhale")]
+    uploader: Option<(FunkwhaleUploader, url::Url)>,
+    #[cfg(feature = "funkwhale")]
+    recent_attempted: bool,
+    #[cfg(feature = "funkwhale")]
+    artist_back: VecDeque<ArtistReturn>,
 }
 
 impl FunkwhaleState {
@@ -71,7 +102,7 @@ impl FunkwhaleState {
     }
 }
 
-/// Exactly one HTTP operation runs while at most four latest intents wait.
+/// One bounded source operation runs while at most four latest intents wait.
 #[cfg(feature = "funkwhale")]
 #[derive(Clone)]
 enum Job {
@@ -81,6 +112,11 @@ enum Job {
         query: String,
         page: u32,
         size: usize,
+        artist: Option<String>,
+        album: Option<String>,
+        tag: Option<String>,
+        standalone: bool,
+        uploader: Option<FunkwhaleUploader>,
     },
     Details {
         generation: u64,
@@ -99,7 +135,8 @@ enum Job {
 #[cfg(feature = "funkwhale")]
 enum Reply {
     Search(crate::providers::SearchPage),
-    Details(VideoDetails),
+    Albums(FunkwhaleAlbumPage, Option<Result<bool, String>>),
+    DetailsWithUpload(VideoDetails, Option<FunkwhaleUploadMetadata>),
     Playback(VideoDetails, url::Url),
     Pods(Vec<FunkwhalePod>),
 }
@@ -116,11 +153,255 @@ struct Worker {
 #[derive(Clone)]
 pub(super) struct FunkwhaleNavigationSnapshot {
     items: Vec<VideoSummary>,
+    albums: Vec<FunkwhaleAlbum>,
+    standalone: bool,
+    standalone_presence: Option<bool>,
     next_page: Option<u32>,
     page_size: usize,
+    artist: Option<(String, String)>,
+    album: Option<(String, String)>,
+    tag: Option<(String, url::Url)>,
+    uploader: Option<(FunkwhaleUploader, url::Url)>,
+}
+
+/// One explicit artist navigation's previous pod catalogue, query and cursor.
+#[cfg(feature = "funkwhale")]
+struct ArtistReturn {
+    page: FunkwhaleNavigationSnapshot,
+    query: String,
+    selected: usize,
+}
+
+/// Playback refreshes ordinary track facts without repeating optional upload lookups.
+#[cfg(feature = "funkwhale")]
+enum UploadMetadataUpdate {
+    Unchanged,
+    Replace(Option<FunkwhaleUploadMetadata>),
 }
 
 impl AppController {
+    /// Distinguishes non-playable album rows from every track-based Funkwhale route.
+    #[cfg(feature = "funkwhale")]
+    fn funkwhale_artist_directory(&self) -> bool {
+        self.funkwhale.artist.is_some() && !self.funkwhale.standalone
+    }
+
+    /// Keeps uncertain artist catalogues reachable without showing proven-empty folders.
+    #[cfg(feature = "funkwhale")]
+    fn funkwhale_standalone_entry_visible(&self) -> bool {
+        self.funkwhale_artist_directory() && self.funkwhale.standalone_presence != Some(false)
+    }
+
+    /// Opens one explicitly requested artist-track page, excluding album-bound tracks.
+    #[cfg(feature = "funkwhale")]
+    fn open_funkwhale_standalone_tracks(&mut self) {
+        if !self.funkwhale_artist_directory() {
+            return;
+        }
+        let page = FunkwhaleNavigationSnapshot {
+            items: self.funkwhale.items.clone(),
+            albums: self.funkwhale.albums.clone(),
+            standalone: false,
+            standalone_presence: self.funkwhale.standalone_presence,
+            next_page: self.funkwhale.next_page,
+            page_size: self.funkwhale.page_size,
+            artist: self.funkwhale.artist.clone(),
+            album: self.funkwhale.album.clone(),
+            tag: self.funkwhale.tag.clone(),
+            uploader: self.funkwhale.uploader.clone(),
+        };
+        if self.funkwhale.artist_back.len() == 16 {
+            self.funkwhale.artist_back.pop_front();
+        }
+        self.funkwhale.artist_back.push_back(ArtistReturn {
+            page,
+            query: self.funkwhale.query.clone(),
+            selected: self.view.selected,
+        });
+        self.funkwhale.standalone = true;
+        self.start_funkwhale_catalogue(String::new());
+    }
+
+    /// Resolves only the selected retained track's exact artist on its original pod.
+    #[cfg(feature = "funkwhale")]
+    fn selected_funkwhale_artist(&self) -> Option<(String, String)> {
+        if self.view.screen != Screen::Funkwhale {
+            return None;
+        }
+        let track = self.funkwhale.items.get(self.view.selected)?;
+        let pod = FunkwhaleProvider::instance_url_from_track_id(&track.video_id).ok()?;
+        let artist_pod = FunkwhaleProvider::instance_url_from_artist_id(&track.channel_id).ok()?;
+        if artist_pod != pod {
+            return None;
+        }
+        Some((track.channel_id.clone(), track.channel_name.clone()))
+    }
+
+    /// Reports whether the selected source row has a proven pod-local artist identity.
+    #[cfg(feature = "funkwhale")]
+    pub(super) fn can_open_funkwhale_artist(&self) -> bool {
+        self.selected_funkwhale_artist().is_some()
+    }
+
+    /// Opens an artist's album directory, keeping playable tracks one level below it.
+    #[cfg(feature = "funkwhale")]
+    pub(super) fn open_funkwhale_artist(&mut self) {
+        let Some(artist) = self.selected_funkwhale_artist() else {
+            return;
+        };
+        if self.funkwhale.artist.as_ref() == Some(&artist) && !self.funkwhale.standalone {
+            return;
+        }
+        let page = FunkwhaleNavigationSnapshot {
+            items: self.funkwhale.items.clone(),
+            albums: self.funkwhale.albums.clone(),
+            standalone: self.funkwhale.standalone,
+            standalone_presence: self.funkwhale.standalone_presence,
+            next_page: self.funkwhale.next_page,
+            page_size: self.funkwhale.page_size,
+            artist: self.funkwhale.artist.clone(),
+            album: self.funkwhale.album.clone(),
+            tag: self.funkwhale.tag.clone(),
+            uploader: self.funkwhale.uploader.clone(),
+        };
+        if self.funkwhale.artist_back.len() == 16 {
+            self.funkwhale.artist_back.pop_front();
+        }
+        self.funkwhale.artist_back.push_back(ArtistReturn {
+            page,
+            query: self.funkwhale.query.clone(),
+            selected: self.view.selected,
+        });
+        self.funkwhale.artist = Some(artist);
+        self.funkwhale.standalone = false;
+        self.funkwhale.standalone_presence = None;
+        self.funkwhale.album = None;
+        self.funkwhale.tag = None;
+        self.funkwhale.uploader = None;
+        self.start_funkwhale_catalogue(String::new());
+    }
+
+    /// Opens only the selected track's advertised original-pod album with reversible navigation.
+    #[cfg(feature = "funkwhale")]
+    pub(super) fn open_funkwhale_album(&mut self, url: String) {
+        if self.view.screen != Screen::Funkwhale {
+            return;
+        }
+        let album = if self.funkwhale_artist_directory() {
+            self.funkwhale
+                .albums
+                .get(self.view.selected)
+                .map(|album| (album.url.to_string(), album.title.clone()))
+        } else {
+            self.funkwhale
+                .items
+                .get(self.view.selected)
+                .and_then(|track| track_album(track, self.funkwhale.details.get(&track.video_id)))
+        };
+        let Some(album) = album else {
+            return;
+        };
+        if album.0 != url || self.funkwhale.album.as_ref() == Some(&album) {
+            return;
+        }
+        let page = FunkwhaleNavigationSnapshot {
+            items: self.funkwhale.items.clone(),
+            albums: self.funkwhale.albums.clone(),
+            standalone: self.funkwhale.standalone,
+            standalone_presence: self.funkwhale.standalone_presence,
+            next_page: self.funkwhale.next_page,
+            page_size: self.funkwhale.page_size,
+            artist: self.funkwhale.artist.clone(),
+            album: self.funkwhale.album.clone(),
+            tag: self.funkwhale.tag.clone(),
+            uploader: self.funkwhale.uploader.clone(),
+        };
+        if self.funkwhale.artist_back.len() == 16 {
+            self.funkwhale.artist_back.pop_front();
+        }
+        self.funkwhale.artist_back.push_back(ArtistReturn {
+            page,
+            query: self.funkwhale.query.clone(),
+            selected: self.view.selected,
+        });
+        self.funkwhale.artist = None;
+        self.funkwhale.standalone = false;
+        self.funkwhale.standalone_presence = None;
+        self.funkwhale.album = Some(album);
+        self.funkwhale.tag = None;
+        self.funkwhale.uploader = None;
+        self.start_funkwhale_catalogue(String::new());
+    }
+
+    /// Opens a clicked tag on the selected track's pod with reversible navigation.
+    #[cfg(feature = "funkwhale")]
+    pub(super) fn search_funkwhale_tag(&mut self, tag: String) {
+        if self.view.screen != Screen::Funkwhale {
+            return;
+        }
+        let Some(track) = self.funkwhale.items.get(self.view.selected) else {
+            return;
+        };
+        if !self
+            .funkwhale
+            .details
+            .get(&track.video_id)
+            .is_some_and(|details| details.keywords.iter().any(|value| value == &tag))
+        {
+            return;
+        }
+        let Ok(pod) = FunkwhaleProvider::instance_url_from_track_id(&track.video_id) else {
+            return;
+        };
+        if tag.trim().is_empty() || tag.len() > 1024 || tag.chars().any(char::is_control) {
+            return;
+        }
+        let page = FunkwhaleNavigationSnapshot {
+            items: self.funkwhale.items.clone(),
+            albums: self.funkwhale.albums.clone(),
+            standalone: self.funkwhale.standalone,
+            standalone_presence: self.funkwhale.standalone_presence,
+            next_page: self.funkwhale.next_page,
+            page_size: self.funkwhale.page_size,
+            artist: self.funkwhale.artist.clone(),
+            album: self.funkwhale.album.clone(),
+            tag: self.funkwhale.tag.clone(),
+            uploader: self.funkwhale.uploader.clone(),
+        };
+        if self.funkwhale.artist_back.len() == 16 {
+            self.funkwhale.artist_back.pop_front();
+        }
+        self.funkwhale.artist_back.push_back(ArtistReturn {
+            page,
+            query: self.funkwhale.query.clone(),
+            selected: self.view.selected,
+        });
+        self.funkwhale.artist = None;
+        self.funkwhale.standalone = false;
+        self.funkwhale.standalone_presence = None;
+        self.funkwhale.album = None;
+        self.funkwhale.tag = Some((tag.clone(), pod));
+        self.funkwhale.uploader = None;
+        self.start_funkwhale_catalogue(tag);
+    }
+
+    /// Restores one artist's previous source catalogue while rejecting old completions.
+    #[cfg(feature = "funkwhale")]
+    pub(super) fn back_funkwhale_artist(&mut self) -> bool {
+        if self.view.screen != Screen::Funkwhale {
+            return false;
+        }
+        let Some(mut previous) = self.funkwhale.artist_back.pop_back() else {
+            return false;
+        };
+        self.swap_funkwhale_navigation(&mut previous.page);
+        self.funkwhale.query = previous.query;
+        self.view.search_query.clone_from(&self.funkwhale.query);
+        self.funkwhale.selected = previous.selected;
+        self.populate_funkwhale();
+        true
+    }
+
     /// Opens explicit pod configuration without network access or an implicit default.
     pub(super) fn open_funkwhale_setup(&mut self) {
         #[cfg(feature = "funkwhale")]
@@ -260,10 +541,21 @@ impl AppController {
         self.funkwhale.generation = self.funkwhale.generation.wrapping_add(1);
         self.cancel_funkwhale_playback();
         self.funkwhale.items.clear();
+        self.funkwhale.albums.clear();
+        self.funkwhale.standalone = false;
+        self.funkwhale.standalone_presence = None;
         self.funkwhale.details.clear();
+        self.funkwhale.upload_metadata.clear();
+        self.funkwhale.upload_metadata_checked.clear();
         self.funkwhale.failed_details.clear();
         self.funkwhale.jobs.clear();
         self.funkwhale.next_page = None;
+        self.funkwhale.artist = None;
+        self.funkwhale.album = None;
+        self.funkwhale.tag = None;
+        self.funkwhale.uploader = None;
+        self.funkwhale.artist_back.clear();
+        self.funkwhale.recent_attempted = false;
         self.funkwhale.selected = 0;
         self.funkwhale.page_turn = None;
         self.view.funkwhale_setup_popup = None;
@@ -302,11 +594,54 @@ impl AppController {
     /// Reports a future page capacity without changing an existing page stride.
     #[cfg(feature = "funkwhale")]
     pub(super) fn update_funkwhale_search_page_capacity(&mut self, rows: usize) {
-        self.funkwhale.capacity = rows.clamp(1, 100);
+        self.update_funkwhale_search_page_capacities(crate::view::SearchPageCapacities::fixed(
+            rows,
+        ));
+    }
+
+    /// Retains both heading layouts until this source submits its own first-page query.
+    #[cfg(feature = "funkwhale")]
+    pub(super) fn update_funkwhale_search_page_capacities(
+        &mut self,
+        capacities: crate::view::SearchPageCapacities,
+    ) {
+        self.funkwhale.capacity = Some(capacities.clamped(1, 100));
     }
 
     /// Starts a query only on the pod explicitly chosen by the user.
     pub(super) fn submit_funkwhale_search(&mut self, query: String) {
+        #[cfg(feature = "funkwhale")]
+        {
+            self.funkwhale.artist = None;
+            self.funkwhale.standalone = false;
+            self.funkwhale.standalone_presence = None;
+            self.funkwhale.album = None;
+            self.funkwhale.tag = None;
+            self.funkwhale.uploader = None;
+            self.funkwhale.artist_back.clear();
+        }
+        self.start_funkwhale_catalogue(query);
+    }
+
+    /// Keeps artist pagination on its original pod even after a different pod is configured.
+    #[cfg(feature = "funkwhale")]
+    pub(super) fn funkwhale_catalogue_pod(&self) -> Option<url::Url> {
+        self.funkwhale
+            .artist
+            .as_ref()
+            .and_then(|(identity, _)| FunkwhaleProvider::instance_url_from_artist_id(identity).ok())
+            .or_else(|| {
+                self.funkwhale.album.as_ref().and_then(|(identity, _)| {
+                    FunkwhaleProvider::instance_url_from_album_id(identity).ok()
+                })
+            })
+            .or_else(|| self.funkwhale.tag.as_ref().map(|(_, pod)| pod.clone()))
+            .or_else(|| self.funkwhale.uploader.as_ref().map(|(_, pod)| pod.clone()))
+            .or_else(|| self.config.providers.funkwhale_instance_url.clone())
+    }
+
+    /// Starts one explicit query, recent catalogue or exact artist page on its owning pod.
+    fn start_funkwhale_catalogue(&mut self, query: String) {
         self.funkwhale.query = query;
         if self.view.screen == Screen::Funkwhale {
             self.view.search_query.clone_from(&self.funkwhale.query);
@@ -315,12 +650,15 @@ impl AppController {
         {
             self.funkwhale.restore = false;
             self.funkwhale.restore_selected = None;
-            let Some(pod) = self.config.providers.funkwhale_instance_url.clone() else {
+            self.funkwhale.recent_attempted = true;
+            let pod = self.funkwhale_catalogue_pod();
+            let Some(pod) = pod else {
                 self.open_funkwhale_setup();
                 return;
             };
             self.funkwhale.generation = self.funkwhale.generation.wrapping_add(1);
             self.funkwhale.items.clear();
+            self.funkwhale.albums.clear();
             self.funkwhale.next_page = None;
             self.funkwhale.page_turn = None;
             self.funkwhale.selected = 0;
@@ -328,10 +666,17 @@ impl AppController {
             self.funkwhale
                 .jobs
                 .retain(|job| matches!(job, Job::Pods | Job::Playback { .. }));
-            self.funkwhale.page_size = if self.funkwhale.capacity == 0 {
-                50
+            self.funkwhale.page_size = if self.funkwhale.query.trim().is_empty()
+                && self.funkwhale.artist.is_none()
+                && self.funkwhale.album.is_none()
+                && self.funkwhale.tag.is_none()
+                && self.funkwhale.uploader.is_none()
+            {
+                20
             } else {
-                self.funkwhale.capacity
+                self.funkwhale
+                    .capacity
+                    .map_or(50, |capacity| capacity.for_query(&self.funkwhale.query))
             };
             self.populate_funkwhale();
             self.begin_search_activity(SearchActivity::Funkwhale);
@@ -341,6 +686,23 @@ impl AppController {
                 query: self.funkwhale.query.clone(),
                 page: 1,
                 size: self.funkwhale.page_size,
+                artist: self
+                    .funkwhale
+                    .artist
+                    .as_ref()
+                    .map(|(identity, _)| identity.clone()),
+                album: self
+                    .funkwhale
+                    .album
+                    .as_ref()
+                    .map(|(identity, _)| identity.clone()),
+                tag: self.funkwhale.tag.as_ref().map(|(tag, _)| tag.clone()),
+                standalone: self.funkwhale.standalone,
+                uploader: self
+                    .funkwhale
+                    .uploader
+                    .as_ref()
+                    .map(|(actor, _)| actor.clone()),
             });
         }
     }
@@ -349,27 +711,77 @@ impl AppController {
     pub(super) fn populate_funkwhale(&mut self) {
         #[cfg(feature = "funkwhale")]
         {
-            self.view.rows = self
-                .funkwhale
-                .items
-                .iter()
-                .map(|track| RowView {
-                    media_id: Some(MediaId::new(SourceKind::Funkwhale, &track.video_id)),
-                    title: track.title.clone(),
-                    subtitle: track.channel_name.clone(),
-                    source: "Funkwhale".to_owned(),
-                    thumbnail_url: track
-                        .thumbnails
-                        .first()
-                        .map(|thumbnail| thumbnail.url.clone()),
-                    compact: true,
-                    ..RowView::default()
-                })
-                .collect();
+            self.view.funkwhale_back_available = !self.funkwhale.artist_back.is_empty();
+            self.view.rows = if self.funkwhale_artist_directory() {
+                let mut rows = self
+                    .funkwhale
+                    .albums
+                    .iter()
+                    .map(|album| RowView {
+                        title: album.title.clone(),
+                        subtitle: [
+                            album.tracks_count.map(|count| format!("{count} tracks")),
+                            album.release_date.clone(),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<_>>()
+                        .join(" · "),
+                        source: "Funkwhale".to_owned(),
+                        thumbnail_url: album
+                            .thumbnails
+                            .first()
+                            .map(|thumbnail| thumbnail.url.clone()),
+                        compact: true,
+                        ..RowView::default()
+                    })
+                    .collect::<Vec<_>>();
+                if self.funkwhale_standalone_entry_visible() {
+                    rows.push(RowView {
+                        title: "Standalone tracks".to_owned(),
+                        compact: true,
+                        ..RowView::default()
+                    });
+                }
+                rows
+            } else {
+                self.funkwhale
+                    .items
+                    .iter()
+                    .map(|track| RowView {
+                        media_id: Some(MediaId::new(SourceKind::Funkwhale, &track.video_id)),
+                        title: track.title.clone(),
+                        subtitle: if self.funkwhale.artist.is_some() {
+                            track
+                                .description
+                                .lines()
+                                .find_map(|line| line.strip_prefix("Album: "))
+                                .map_or_else(
+                                    || track.channel_name.clone(),
+                                    |album| format!("{} · {album}", track.channel_name),
+                                )
+                        } else {
+                            track.channel_name.clone()
+                        },
+                        source: "Funkwhale".to_owned(),
+                        thumbnail_url: track
+                            .thumbnails
+                            .first()
+                            .map(|thumbnail| thumbnail.url.clone()),
+                        compact: true,
+                        ..RowView::default()
+                    })
+                    .collect()
+            };
             hydrate_row_playback_progress(&self.store, &mut self.view.rows);
             if self.funkwhale.next_page.is_some() {
                 self.view.rows.push(RowView {
-                    title: "Load more tracks...".to_owned(),
+                    title: if self.funkwhale_artist_directory() {
+                        "Load more albums..."
+                    } else {
+                        "Load more tracks..."
+                    }
+                    .to_owned(),
                     compact: true,
                     ..RowView::default()
                 });
@@ -381,10 +793,26 @@ impl AppController {
             self.update_funkwhale_detail();
             self.view.status_line =
                 if let Some(pod) = self.config.providers.funkwhale_instance_url.as_ref() {
+                    let catalogue = self
+                        .funkwhale
+                        .artist
+                        .as_ref()
+                        .map(|(_, name)| format!("Artist: {name} - "))
+                        .unwrap_or_default();
                     format!(
-                        "Funkwhale - {} - {} tracks",
+                        "Funkwhale - {} - {}{} {}",
                         pod,
-                        self.funkwhale.items.len()
+                        catalogue,
+                        if self.funkwhale_artist_directory() {
+                            self.funkwhale.albums.len()
+                        } else {
+                            self.funkwhale.items.len()
+                        },
+                        if self.funkwhale_artist_directory() {
+                            "albums"
+                        } else {
+                            "tracks"
+                        },
                     )
                 } else {
                     "Funkwhale needs a pod address; F4 to configure".to_owned()
@@ -397,6 +825,7 @@ impl AppController {
         }
         #[cfg(not(feature = "funkwhale"))]
         {
+            self.view.funkwhale_back_available = false;
             self.view.rows.clear();
             self.view.details = None;
             self.view.status_line = "This build omits the `funkwhale` feature".to_owned();
@@ -415,15 +844,62 @@ impl AppController {
             {
                 self.funkwhale.page_turn = None;
             }
+            if self.funkwhale_artist_directory() {
+                self.view.details = self.funkwhale.albums.get(self.view.selected).map(|album| {
+                    let artist = self.funkwhale.artist.as_ref().expect("artist directory");
+                    DetailView {
+                        title: album.title.clone(),
+                        source: "Funkwhale".to_owned(),
+                        channel_name: artist.1.clone(),
+                        channel_id: artist.0.clone(),
+                        channel_webpage_url: url::Url::parse(&artist.0).ok(),
+                        webpage_url: Some(album.url.clone()),
+                        description: [
+                            album.tracks_count.map(|count| format!("Tracks: {count}")),
+                            (!album.description.is_empty()).then(|| album.description.clone()),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<_>>()
+                        .join("\n\n"),
+                        published: album.release_date.clone().unwrap_or_default(),
+                        thumbnail_url: album
+                            .thumbnails
+                            .first()
+                            .map(|thumbnail| thumbnail.url.clone()),
+                        expanded_thumbnail_url: album
+                            .thumbnails
+                            .first()
+                            .map(|thumbnail| thumbnail.url.clone()),
+                        links: vec![DetailLinkView {
+                            label: album.title.clone(),
+                            url: album.url.to_string(),
+                            internal_target: Some(DetailLinkInternalTarget::FunkwhaleAlbum(
+                                album.url.to_string(),
+                            )),
+                            ..DetailLinkView::default()
+                        }],
+                        ..DetailView::default()
+                    }
+                });
+                return;
+            }
             let Some(track) = self.funkwhale.items.get(self.view.selected).cloned() else {
                 self.view.details = None;
                 return;
             };
             let details = self.funkwhale.details.get(&track.video_id);
             let mut next = detail_view(&track, details);
+            self.project_funkwhale_uploader(&track, &mut next);
             preserve_thumbnail_expansion(self.view.details.as_ref(), &mut next);
             self.view.details = Some(next);
-            if details.is_none() && !self.funkwhale.failed_details.contains(&track.video_id) {
+            if (details.is_none()
+                || !self
+                    .funkwhale
+                    .upload_metadata_checked
+                    .contains(&track.video_id))
+                && !self.funkwhale.failed_details.contains(&track.video_id)
+            {
                 self.queue_funkwhale_job(Job::Details {
                     generation: self.funkwhale.generation,
                     id: track.video_id,
@@ -436,11 +912,24 @@ impl AppController {
     pub(super) fn activate_funkwhale_selection(&mut self) {
         #[cfg(feature = "funkwhale")]
         {
-            if self.view.selected == self.funkwhale.items.len() {
-                if let (Some(page), Some(pod)) = (
-                    self.funkwhale.next_page,
-                    self.config.providers.funkwhale_instance_url.clone(),
-                ) {
+            let continuation = if self.funkwhale_artist_directory() {
+                if let Some(album) = self.funkwhale.albums.get(self.view.selected) {
+                    self.open_funkwhale_album(album.url.to_string());
+                    return;
+                }
+                let standalone = self.funkwhale_standalone_entry_visible();
+                if standalone && self.view.selected == self.funkwhale.albums.len() {
+                    self.open_funkwhale_standalone_tracks();
+                    return;
+                }
+                self.funkwhale.albums.len() + usize::from(standalone)
+            } else {
+                self.funkwhale.items.len()
+            };
+            if self.view.selected == continuation {
+                if let (Some(page), Some(pod)) =
+                    (self.funkwhale.next_page, self.funkwhale_catalogue_pod())
+                {
                     if self.view.search_activity == Some(SearchActivity::Funkwhale) {
                         return;
                     }
@@ -452,6 +941,23 @@ impl AppController {
                         query: self.funkwhale.query.clone(),
                         page,
                         size: self.funkwhale.page_size,
+                        artist: self
+                            .funkwhale
+                            .artist
+                            .as_ref()
+                            .map(|(identity, _)| identity.clone()),
+                        album: self
+                            .funkwhale
+                            .album
+                            .as_ref()
+                            .map(|(identity, _)| identity.clone()),
+                        tag: self.funkwhale.tag.as_ref().map(|(tag, _)| tag.clone()),
+                        standalone: self.funkwhale.standalone,
+                        uploader: self
+                            .funkwhale
+                            .uploader
+                            .as_ref()
+                            .map(|(actor, _)| actor.clone()),
                     });
                 }
                 return;
@@ -467,6 +973,9 @@ impl AppController {
     pub(super) fn selected_funkwhale_queue_item(&self) -> Result<QueueItem, String> {
         #[cfg(feature = "funkwhale")]
         {
+            if self.funkwhale_artist_directory() {
+                return Err("Select a Funkwhale track, not an album".to_owned());
+            }
             self.funkwhale
                 .items
                 .get(self.view.selected)
@@ -649,8 +1158,15 @@ impl AppController {
             });
         Some(FunkwhaleNavigationSnapshot {
             items: vec![track],
+            albums: Vec::new(),
+            standalone: false,
+            standalone_presence: None,
             next_page: None,
             page_size: self.funkwhale.page_size,
+            artist: None,
+            album: None,
+            tag: None,
+            uploader: None,
         })
     }
 
@@ -665,8 +1181,18 @@ impl AppController {
         self.funkwhale.restore = false;
         self.finish_search_activity(SearchActivity::Funkwhale);
         std::mem::swap(&mut self.funkwhale.items, &mut snapshot.items);
+        std::mem::swap(&mut self.funkwhale.albums, &mut snapshot.albums);
+        std::mem::swap(&mut self.funkwhale.standalone, &mut snapshot.standalone);
+        std::mem::swap(
+            &mut self.funkwhale.standalone_presence,
+            &mut snapshot.standalone_presence,
+        );
         std::mem::swap(&mut self.funkwhale.next_page, &mut snapshot.next_page);
         std::mem::swap(&mut self.funkwhale.page_size, &mut snapshot.page_size);
+        std::mem::swap(&mut self.funkwhale.artist, &mut snapshot.artist);
+        std::mem::swap(&mut self.funkwhale.album, &mut snapshot.album);
+        std::mem::swap(&mut self.funkwhale.tag, &mut snapshot.tag);
+        std::mem::swap(&mut self.funkwhale.uploader, &mut snapshot.uploader);
     }
 
     /// Reports source-local ownership to the shared now-playing Back guard.
@@ -706,6 +1232,24 @@ impl AppController {
         #[cfg(feature = "funkwhale")]
         {
             if self.view.quitting || self.shutdown_persistence_succeeded.is_some() {
+                return;
+            }
+            if !self.config.persistence.save_playback_history {
+                self.funkwhale.restore = false;
+                self.funkwhale.restore_selected = None;
+            }
+            // The pod's default twenty-track page is not a restored user query:
+            // it needs neither terminal geometry nor permission to save history.
+            if self.view.screen == Screen::Funkwhale
+                && !self.funkwhale.recent_attempted
+                && !self.funkwhale.restore
+                && self.funkwhale.query.trim().is_empty()
+                && self.funkwhale.items.is_empty()
+                && self.view.funkwhale_setup_popup.is_none()
+                && self.config.providers.funkwhale_instance_url.is_some()
+                && !self.view.search_editing
+            {
+                self.submit_funkwhale_search(String::new());
                 return;
             }
             if self.view.screen == Screen::Funkwhale && self.funkwhale.restore {
@@ -805,6 +1349,36 @@ impl AppController {
         Ok(Some(client))
     }
 
+    /// Bounds selected metadata by canonical track owner and preserves enrichment during playback.
+    #[cfg(feature = "funkwhale")]
+    fn cache_funkwhale_details(&mut self, mut details: VideoDetails, upload: UploadMetadataUpdate) {
+        if self.funkwhale.details.len() >= 128
+            && !self.funkwhale.details.contains_key(&details.video_id)
+        {
+            self.funkwhale.details.clear();
+            self.funkwhale.upload_metadata.clear();
+            self.funkwhale.upload_metadata_checked.clear();
+        }
+        if let UploadMetadataUpdate::Replace(upload) = upload {
+            self.funkwhale
+                .upload_metadata_checked
+                .insert(details.video_id.clone());
+            if let Some(upload) = upload {
+                self.funkwhale
+                    .upload_metadata
+                    .insert(details.video_id.clone(), upload);
+            } else {
+                self.funkwhale.upload_metadata.remove(&details.video_id);
+            }
+        }
+        if let Some(upload) = self.funkwhale.upload_metadata.get(&details.video_id) {
+            append_upload_metadata(&mut details, upload);
+        }
+        self.funkwhale
+            .details
+            .insert(details.video_id.clone(), details);
+    }
+
     /// Accepts only current search, selection, and playback owners, never another tab's metadata.
     #[cfg(feature = "funkwhale")]
     fn apply_funkwhale_reply(&mut self, job: Job, result: Result<Reply, String>) {
@@ -814,8 +1388,42 @@ impl AppController {
             } if generation == self.funkwhale.generation => {
                 self.finish_search_activity(SearchActivity::Funkwhale);
                 match result {
-                    Ok(Reply::Search(page)) => {
+                    Ok(Reply::Albums(page, presence)) if self.funkwhale_artist_directory() => {
+                        if let Some(presence) = presence {
+                            self.funkwhale.standalone_presence = presence.ok();
+                        }
+                        let before = self.funkwhale.albums.len();
+                        let empty_page = page.items.is_empty();
+                        for album in page.items {
+                            if self.funkwhale.albums.len() < 1000
+                                && !self.funkwhale.albums.iter().any(|old| old.url == album.url)
+                            {
+                                self.funkwhale.albums.push(album);
+                            }
+                        }
+                        self.funkwhale.next_page = ((self.funkwhale.albums.len() > before
+                            || empty_page)
+                            && self.funkwhale.albums.len() < 1000)
+                            .then_some(page.next_page)
+                            .flatten();
+                        if self.funkwhale.page_turn.take().is_some_and(|row| {
+                            self.view.screen == Screen::Funkwhale && self.funkwhale.selected == row
+                        }) {
+                            self.funkwhale.selected = if self.funkwhale.next_page.is_some() {
+                                self.funkwhale.albums.len()
+                                    + usize::from(self.funkwhale_standalone_entry_visible())
+                            } else {
+                                self.funkwhale.albums.len().saturating_sub(1)
+                            };
+                        }
+                        if self.view.screen == Screen::Funkwhale {
+                            self.populate_funkwhale();
+                            self.refresh_selected_playlist_state();
+                        }
+                    }
+                    Ok(Reply::Search(page)) if !self.funkwhale_artist_directory() => {
                         let before = self.funkwhale.items.len();
+                        let empty_page = page.items.is_empty();
                         for item in page.items {
                             if let SearchItem::Video(track) = item
                                 && self.funkwhale.items.len() < 1000
@@ -828,7 +1436,8 @@ impl AppController {
                                 self.funkwhale.items.push(track);
                             }
                         }
-                        self.funkwhale.next_page = (self.funkwhale.items.len() > before
+                        self.funkwhale.next_page = ((self.funkwhale.items.len() > before
+                            || empty_page)
                             && self.funkwhale.items.len() < 1000)
                             .then_some(page.next_page)
                             .flatten();
@@ -849,7 +1458,9 @@ impl AppController {
                     Err(error) => {
                         self.funkwhale.page_turn = None;
                         if self.view.screen == Screen::Funkwhale {
-                            self.view.status_line = format!("Funkwhale pod {pod}: {error}");
+                            let message = format!("Funkwhale pod {pod}: {error}");
+                            self.view.status_line.clone_from(&message);
+                            self.show_actionable_message("Cannot load Funkwhale tracks", message);
                         }
                     }
                     _ => {}
@@ -857,11 +1468,11 @@ impl AppController {
             }
             Job::Details { generation, id } if generation == self.funkwhale.generation => {
                 match result {
-                    Ok(Reply::Details(details)) if details.video_id == id => {
-                        if self.funkwhale.details.len() >= 128 {
-                            self.funkwhale.details.clear();
-                        }
-                        self.funkwhale.details.insert(id.clone(), details);
+                    Ok(Reply::DetailsWithUpload(details, upload)) if details.video_id == id => {
+                        self.cache_funkwhale_details(
+                            details,
+                            UploadMetadataUpdate::Replace(upload),
+                        );
                     }
                     Err(error) => {
                         self.funkwhale.failed_details.insert(id.clone());
@@ -906,12 +1517,7 @@ impl AppController {
                         .license
                         .clone()
                         .map_or(MediaLicense::Unknown, MediaLicense::Other);
-                    if self.funkwhale.details.len() >= 128 {
-                        self.funkwhale.details.clear();
-                    }
-                    self.funkwhale
-                        .details
-                        .insert(details.video_id.clone(), details);
+                    self.cache_funkwhale_details(details, UploadMetadataUpdate::Unchanged);
                     let mut input = PlaybackInput::new(stream.to_string());
                     input.bypass_ytdl = true;
                     self.funkwhale.admitting = Some(item.media.id.clone());
@@ -919,12 +1525,15 @@ impl AppController {
                     self.funkwhale.admitting = None;
                 }
                 Err(error) => {
-                    self.view.status_line =
-                        format!("Funkwhale track {}: {error}", item.media.webpage_url)
+                    let message = format!("Funkwhale track {}: {error}", item.media.webpage_url);
+                    self.view.status_line.clone_from(&message);
+                    self.show_actionable_message("Cannot play Funkwhale track", message);
                 }
                 _ => {
-                    self.view.status_line =
-                        "Funkwhale returned a different track; playback was not started".to_owned()
+                    let message =
+                        "Funkwhale returned a different track; playback was not started".to_owned();
+                    self.view.status_line.clone_from(&message);
+                    self.show_error_message("Cannot play Funkwhale track", message);
                 }
             },
             Job::Pods => match result {
@@ -965,7 +1574,7 @@ impl AppController {
     }
 }
 
-/// Performs one read-only, bounded request off the UI thread.
+/// Performs one read-only operation, including the first album page's bounded presence probe.
 #[cfg(feature = "funkwhale")]
 fn run_job(job: &Job, client: Option<FunkwhaleProvider>) -> Result<Reply, String> {
     let request = || -> Result<Reply, crate::providers::ProviderError> {
@@ -979,17 +1588,51 @@ fn run_job(job: &Job, client: Option<FunkwhaleProvider>) -> Result<Reply, String
         match job {
             Job::Pods => discover_public_pods().map(Reply::Pods),
             Job::Search {
-                query, page, size, ..
+                query,
+                page,
+                size,
+                artist,
+                album,
+                tag,
+                standalone,
+                uploader,
+                ..
             } => {
+                let provider = client()?.clone().with_page_size(*size);
+                if let Some(actor) = uploader {
+                    return provider.uploader_tracks(actor, *page).map(Reply::Search);
+                }
+                if let Some(artist) = artist {
+                    return if *standalone {
+                        provider
+                            .standalone_artist_tracks(artist, *page)
+                            .map(Reply::Search)
+                    } else {
+                        let albums = provider.artist_albums(artist, *page)?;
+                        let presence = (*page == 1).then(|| {
+                            provider
+                                .artist_has_standalone_tracks(artist)
+                                .map_err(|error| error.to_string())
+                        });
+                        Ok(Reply::Albums(albums, presence))
+                    };
+                }
+                if let Some(album) = album {
+                    return provider.album_tracks(album, *page).map(Reply::Search);
+                }
+                if let Some(tag) = tag {
+                    return provider.tag_tracks(tag, *page).map(Reply::Search);
+                }
+                if query.trim().is_empty() {
+                    return provider.recent_tracks(*page).map(Reply::Search);
+                }
                 let mut request = SearchRequest::new(query.clone(), SearchTarget::Videos);
                 request.page = *page;
-                client()?
-                    .clone()
-                    .with_page_size(*size)
-                    .search(&request)
-                    .map(Reply::Search)
+                provider.search(&request).map(Reply::Search)
             }
-            Job::Details { id, .. } => client()?.video_details(id).map(Reply::Details),
+            Job::Details { id, .. } => client()?
+                .video_details_with_upload_metadata(id)
+                .map(|(details, upload)| Reply::DetailsWithUpload(details, upload)),
             Job::Playback { item, .. } => {
                 let provider = client()?;
                 let details = provider.video_details(&item.media.id.external_id)?;
@@ -1082,10 +1725,77 @@ fn queue_item(track: &VideoSummary) -> Result<QueueItem, String> {
     })
 }
 
+/// Appends only facts from the advertised upload record, not the credited artist or added date.
+#[cfg(feature = "funkwhale")]
+fn append_upload_metadata(details: &mut VideoDetails, upload: &FunkwhaleUploadMetadata) {
+    let mut lines = Vec::new();
+    if let Some(name) = upload.uploader_name.as_deref().or_else(|| {
+        upload
+            .uploader_actor
+            .as_ref()
+            .map(FunkwhaleUploader::full_username)
+    }) {
+        lines.push(if upload.uploader_actor.is_some() {
+            format!("Uploaded by [e]: {name}")
+        } else {
+            format!("Uploaded by: {name}")
+        });
+        if let Some(url) = upload.uploader_url.as_ref() {
+            lines.push(url.to_string());
+        }
+    }
+    if let Some(date) = upload.created_at {
+        lines.push(format!("Upload date: {}", format_unix_utc_date(date)));
+    }
+    if !lines.is_empty() {
+        if !details.description.is_empty() {
+            details.description.push_str("\n\n");
+        }
+        details.description.push_str(&lines.join("\n"));
+    }
+}
+
+/// Extracts one provider-advertised album without accepting another pod or an invented title search.
+#[cfg(feature = "funkwhale")]
+fn track_album(summary: &VideoSummary, details: Option<&VideoDetails>) -> Option<(String, String)> {
+    let pod = FunkwhaleProvider::instance_url_from_track_id(&summary.video_id).ok()?;
+    for description in details
+        .map(|details| details.description.as_str())
+        .into_iter()
+        .chain(std::iter::once(summary.description.as_str()))
+    {
+        let Some(name) = description
+            .lines()
+            .find_map(|line| line.strip_prefix("Album: "))
+            .filter(|name| !name.is_empty())
+        else {
+            continue;
+        };
+        let Some(page) = description
+            .lines()
+            .rev()
+            .find_map(|line| line.strip_prefix("Album page: "))
+        else {
+            continue;
+        };
+        let album_pod = FunkwhaleProvider::instance_url_from_album_id(page).ok()?;
+        if album_pod != pod {
+            return None;
+        }
+        let url = url::Url::parse(page).ok()?;
+        let id = url.path().trim_end_matches('/').rsplit('/').next()?;
+        if id.parse::<u64>().ok()?.to_string() != id {
+            return None;
+        }
+        return Some((page.to_owned(), name.to_owned()));
+    }
+    None
+}
+
 /// Distinguishes source metadata from YouTube facts without inventing missing counts.
 #[cfg(feature = "funkwhale")]
 fn detail_view(summary: &VideoSummary, details: Option<&VideoDetails>) -> DetailView {
-    let description = details.map_or_else(
+    let mut description = details.map_or_else(
         || summary.description.clone(),
         |details| details.description.clone(),
     );
@@ -1093,20 +1803,79 @@ fn detail_view(summary: &VideoSummary, details: Option<&VideoDetails>) -> Detail
         details.thumbnails.as_slice()
     });
     let mut links = Vec::new();
-    if let Ok(artist) = url::Url::parse(&summary.channel_id) {
+    let mut license = details
+        .and_then(|details| details.license.clone())
+        .unwrap_or_default();
+    let license_link = license::link(&license);
+    if let Some(link) = license_link.as_ref() {
+        license.clone_from(&link.label);
+    }
+    if let Some(track) = summary.webpage_url.as_ref() {
         links.push(DetailLinkView {
-            label: "Artist".to_owned(),
-            url: artist.to_string(),
+            label: "Track".to_owned(),
+            url: track.to_string(),
             ..DetailLinkView::default()
         });
     }
-    let description = if let Some(details) = details
+    if let Ok(artist) = url::Url::parse(&summary.channel_id)
+        && let Ok(pod) = FunkwhaleProvider::instance_url_from_track_id(&summary.video_id)
+        && FunkwhaleProvider::instance_url_from_artist_id(&summary.channel_id).ok() == Some(pod)
+    {
+        links.push(DetailLinkView {
+            label: "Artist".to_owned(),
+            url: artist.to_string(),
+            internal_target: Some(DetailLinkInternalTarget::FunkwhaleArtist(
+                artist.to_string(),
+            )),
+            ..DetailLinkView::default()
+        });
+    }
+    if let Some((url, name)) = track_album(summary, details) {
+        let lines = description.lines().collect::<Vec<_>>();
+        let album_name = format!("Album: {name}");
+        let album_page = format!("Album page: {url}");
+        let name_line = lines.iter().position(|line| *line == album_name);
+        let url_line = lines.iter().rposition(|line| *line == album_page);
+        description = lines
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, line)| {
+                (Some(index) != name_line && Some(index) != url_line).then_some(line)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        links.push(DetailLinkView {
+            label: name,
+            url: url.clone(),
+            internal_target: Some(DetailLinkInternalTarget::FunkwhaleAlbum(url)),
+            ..DetailLinkView::default()
+        });
+    }
+    if let Some(link) = license_link {
+        links.push(link);
+    }
+    if let Some(details) = details
         && !details.keywords.is_empty()
     {
-        format!("{description}\n\nTags: {}", details.keywords.join(", "))
-    } else {
-        description
-    };
+        description.push_str("\n\nTags: ");
+        for (index, tag) in details.keywords.iter().enumerate() {
+            if index > 0 {
+                description.push_str(", ");
+            }
+            let start_byte = description.len();
+            description.push_str(tag);
+            links.push(DetailLinkView {
+                label: tag.clone(),
+                presentation: DetailLinkPresentation::LabelOnly,
+                internal_target: Some(DetailLinkInternalTarget::FunkwhaleTag(tag.clone())),
+                description_range: Some(DetailHighlightRange {
+                    start_byte,
+                    end_byte: description.len(),
+                }),
+                ..DetailLinkView::default()
+            });
+        }
+    }
     DetailView {
         media_id: Some(MediaId::new(SourceKind::Funkwhale, &summary.video_id)),
         title: summary.title.clone(),
@@ -1122,9 +1891,7 @@ fn detail_view(summary: &VideoSummary, details: Option<&VideoDetails>) -> Detail
         published: summary
             .published_at
             .map_or_else(String::new, format_unix_utc_date),
-        license: details
-            .and_then(|details| details.license.clone())
-            .unwrap_or_default(),
+        license,
         description,
         links,
         thumbnail_url: thumbnails.first().map(|thumbnail| thumbnail.url.clone()),

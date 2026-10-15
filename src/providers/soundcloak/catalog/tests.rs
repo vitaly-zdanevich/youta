@@ -1,6 +1,31 @@
 //! Sanitized catalogue fixtures exercise production parsing without HTTP or media fetches.
 
 use super::*;
+
+/// Availability checks must share the endpoint identity policy without constructing HTTP clients.
+#[test]
+fn profile_identity_validation_is_pure_and_rejects_non_artists() {
+    for value in [
+        "https://soundcloud.com/artist",
+        "https://soundcloud.com/jonatanleandoer127",
+    ] {
+        assert!(SoundcloakClient::validate_profile_url(&Url::parse(value).unwrap()).is_ok());
+    }
+    for value in [
+        "http://soundcloud.com/artist",
+        "https://other.example/artist",
+        "https://soundcloud.com/artist/track",
+        "https://soundcloud.com/search",
+        "https://user:password@soundcloud.com/artist",
+        "https://soundcloud.com/artist?token=secret",
+        "https://soundcloud.com/artist#fragment",
+    ] {
+        assert!(
+            SoundcloakClient::validate_profile_url(&Url::parse(value).unwrap()).is_err(),
+            "{value}"
+        );
+    }
+}
 use serde_json::json;
 use std::collections::VecDeque;
 use std::sync::Mutex;

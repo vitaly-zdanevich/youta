@@ -143,6 +143,14 @@ impl SoundcloakClient {
         })
     }
 
+    /// Validates a public artist identity without allocating or contacting an HTTP client.
+    ///
+    /// # Errors
+    /// Rejects anything other than a canonical public original profile URL.
+    pub fn validate_profile_url(url: &Url) -> Result<(), ProviderError> {
+        profile_slug(url).map(|_| ())
+    }
+
     /// Constructs a profile's human-readable instance page without fetching it.
     ///
     /// # Errors

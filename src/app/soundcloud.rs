@@ -46,7 +46,7 @@ pub(super) struct SoundCloudState {
     tag: Option<String>,
     /// Latest frontend result capacity, used only for a new query.
     #[cfg(feature = "soundcloud")]
-    search_page_capacity: Option<usize>,
+    search_page_capacity: Option<crate::view::SearchPageCapacities>,
     /// Fixed offset stride for the current result set, unaffected by resizing.
     #[cfg(feature = "soundcloud")]
     page_limit: Option<usize>,
@@ -102,7 +102,18 @@ impl AppController {
     /// Reports future search capacity without fetching or changing existing offsets.
     #[cfg(feature = "soundcloud")]
     pub(super) fn update_soundcloud_search_page_capacity(&mut self, rows: usize) {
-        self.soundcloud.search_page_capacity = Some(rows.clamp(1, 100));
+        self.update_soundcloud_search_page_capacities(crate::view::SearchPageCapacities::fixed(
+            rows,
+        ));
+    }
+
+    /// Defers heading selection to this source's actual submitted first-page query.
+    #[cfg(feature = "soundcloud")]
+    pub(super) fn update_soundcloud_search_page_capacities(
+        &mut self,
+        capacities: crate::view::SearchPageCapacities,
+    ) {
+        self.soundcloud.search_page_capacity = Some(capacities.clamped(1, 100));
     }
 
     /// Configures metadata and playback with the same user-selected instance.
@@ -140,7 +151,11 @@ impl AppController {
         self.soundcloud.generation = self.soundcloud.generation.wrapping_add(1);
         self.soundcloud.query.clone_from(&query);
         self.soundcloud.submitted_query.clone_from(&query);
-        self.soundcloud.page_limit = Some(self.soundcloud.search_page_capacity.unwrap_or(50));
+        self.soundcloud.page_limit = Some(
+            self.soundcloud
+                .search_page_capacity
+                .map_or(50, |capacity| capacity.for_query(&query)),
+        );
         self.soundcloud.page_turn = None;
         self.soundcloud.selected = 0;
         self.soundcloud.items.clear();

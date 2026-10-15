@@ -59,7 +59,7 @@ pub(super) struct ArchiveOrgState {
     /// Metadata field owning the displayed results and their continuations.
     submitted_scope: ArchiveOrgSearchScope,
     /// Latest frontend capacity; absent for frontends that do not report terminal rows.
-    search_page_capacity: Option<usize>,
+    search_page_capacity: Option<crate::view::SearchPageCapacities>,
     /// Fixed stride for this result set, independent of subsequent terminal resizes.
     page_limit: Option<usize>,
     /// Explicit continuation owner and old boundary; never steal a changed selection.
@@ -164,8 +164,17 @@ enum ArchiveResponse {
 impl AppController {
     /// Updates future searches without changing in-flight or cached page offsets.
     pub(super) fn update_archive_org_search_page_capacity(&mut self, rows: usize) {
-        // Match the provider's existing bounded rows range.
-        self.archive_org.search_page_capacity = Some(rows.clamp(1, 100));
+        self.update_archive_org_search_page_capacities(crate::view::SearchPageCapacities::fixed(
+            rows,
+        ));
+    }
+
+    /// Chooses heading space from Archive's own submitted query, not the active tab's draft.
+    pub(super) fn update_archive_org_search_page_capacities(
+        &mut self,
+        capacities: crate::view::SearchPageCapacities,
+    ) {
+        self.archive_org.search_page_capacity = Some(capacities.clamped(1, 100));
     }
 
     /// Resolves exact existing files for a manual download without changing navigation.
@@ -337,7 +346,10 @@ impl AppController {
             query: query.trim().to_owned(),
             scope,
             page: 1,
-            limit: self.archive_org.search_page_capacity.unwrap_or(50),
+            limit: self
+                .archive_org
+                .search_page_capacity
+                .map_or(50, |capacity| capacity.for_query(&query)),
         };
         if let Err(error) = request.validate() {
             self.view.status_line = error.to_string();
@@ -354,7 +366,10 @@ impl AppController {
 
     /// Owns accepted text and field independently of any subsequent editor draft.
     fn start_archive_org_search(&mut self, query: String, scope: ArchiveOrgSearchScope) {
-        let limit = self.archive_org.search_page_capacity.unwrap_or(50);
+        let limit = self
+            .archive_org
+            .search_page_capacity
+            .map_or(50, |capacity| capacity.for_query(&query));
         self.start_archive_org_search_with_limit(query, scope, limit);
     }
 

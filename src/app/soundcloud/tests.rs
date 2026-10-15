@@ -860,6 +860,24 @@ fn soundcloud_first_request_uses_bounded_visible_capacity() {
 }
 
 #[test]
+fn soundcloud_capacity_uses_its_own_query_and_keeps_the_chosen_stride() {
+    let (mut app, _) = paging_controller();
+    app.update_soundcloud_search_page_capacities(crate::view::SearchPageCapacities {
+        with_heading: 9,
+        without_heading: 10,
+    });
+    app.view.search_query.clear();
+    app.submit_soundcloud_search("own query".into());
+    finish_soundcloud_page(&mut app);
+    assert_eq!(app.soundcloud.page_limit, Some(9));
+    app.update_soundcloud_search_page_capacities(crate::view::SearchPageCapacities {
+        with_heading: 90,
+        without_heading: 91,
+    });
+    assert_eq!(app.soundcloud.page_limit, Some(9));
+}
+
+#[test]
 fn soundcloud_load_more_turns_one_page_and_keeps_its_stride_after_resize() {
     let (mut app, requests) = paging_controller();
     app.set_soundcloud_search_page_capacity(10);

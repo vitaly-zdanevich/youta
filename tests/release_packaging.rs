@@ -25,7 +25,7 @@ fn funkwhale_is_default_but_independently_removable_in_both_frontends() {
         );
     }
     let provider = feature_closure(&manifest, "funkwhale");
-    for required in ["network", "dep:html5gum"] {
+    for required in ["network", "dep:html5gum", "dep:encoding_rs"] {
         assert!(provider.contains(required), "{required}");
     }
     for unrelated in [

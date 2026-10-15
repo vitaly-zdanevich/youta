@@ -44,6 +44,7 @@ pub mod file_identity;
 pub mod lan_share;
 #[cfg(any(
     feature = "archive-org",
+    feature = "funkwhale",
     all(feature = "local-metadata", feature = "controller")
 ))]
 mod legacy_text;

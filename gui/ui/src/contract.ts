@@ -122,6 +122,10 @@ export type DetailLinkInternalTarget =
 	| { ArchiveUploader: string }
 	| { SoundCloudArtist: string }
 	| { SoundCloudArtistAlbums: string }
+	| { FunkwhaleArtist: string }
+	| { FunkwhaleAlbum: string }
+	| { FunkwhaleUploader: string }
+	| { FunkwhaleTag: string }
 	| { SoundCloudTag: string };
 
 /** One selectable external link beside a media item or channel. */
@@ -1080,6 +1084,8 @@ export interface ViewModel {
 	archive_org_back_available: boolean;
 	/** Whether SoundCloud can restore a previous artist, album or search route. */
 	soundcloud_back_available: boolean;
+	/** A nested Funkwhale catalogue retains its previous route and cursor. */
+	funkwhale_back_available: boolean;
   selected_wikidata_media: number | null;
   subscriptions: SubscriptionsView;
   waveform: WaveformView;
@@ -1105,6 +1111,7 @@ export interface ViewModel {
   playlist_item: PlaylistItemView | null;
   playlist_edit_available: boolean;
   yandex_music_actions: YandexMusicActionsView;
+	selected_artist_available: boolean;
   channel_download_supported: boolean;
   channel_download_popup: ChannelDownloadPopupView | null;
   download: DownloadView | null;

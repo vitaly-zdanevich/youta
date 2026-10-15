@@ -1,14 +1,15 @@
 //! Conservative, display-only repair of Windows-1251 decoded as Latin-1.
 //!
 //! Local tag readers call this only for legacy/Latin-1 metadata; Archive's
-//! per-file display titles use the same strong evidence. Stored bytes, paths,
-//! URLs and explicitly Unicode-declared local tags are never rewritten.
+//! per-file display titles and Funkwhale's already-garbled display metadata
+//! use the same strong evidence. Stored bytes, paths, URLs and explicitly
+//! Unicode-declared local tags are never rewritten.
 
 /// Repairs a strong Windows-1251-as-Latin-1 signature for display only.
 ///
 /// The repair is deliberately restricted to long, Cyrillic-looking words and
 /// never writes metadata back to the media file. Ambiguous short strings and
-/// ordinary accented Latin text retain the exact value supplied by Lofty.
+/// ordinary accented Latin text retain the exact value supplied by the source.
 pub(crate) fn normalized_legacy_windows_1251_value(value: Option<&str>) -> Option<String> {
     let value = value.map(str::trim).filter(|value| !value.is_empty())?;
     let bytes = value

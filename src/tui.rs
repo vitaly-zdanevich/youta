@@ -3674,7 +3674,8 @@ fn render_catalog_playback_controls(
     // Back has priority in narrow catalogue panes; the playback hotkeys remain global.
     for (key, label, action) in ((view.screen == Screen::ArchiveOrg
         && view.archive_org_back_available)
-        || (view.screen == Screen::SoundCloud && view.soundcloud_back_available))
+        || (view.screen == Screen::SoundCloud && view.soundcloud_back_available)
+        || (view.screen == Screen::Funkwhale && view.funkwhale_back_available))
         .then_some(("Esc", "Back", UiAction::GoBack))
         .into_iter()
         .chain((view.screen == Screen::Search).then_some((
@@ -5465,17 +5466,16 @@ fn render_information_panel(
                 UiAction::ToggleYandexMusicDislike,
             )
         });
-    let yandex_artist_button = (view.screen == Screen::YandexMusic
-        && view.yandex_music_actions.artist_available)
-        .then(|| {
+    let artist_button =
+        (view.selected_artist_available && view.screen != Screen::Funkwhale).then(|| {
             push_left_detail_button(
                 &mut lines,
                 &right_buttons,
                 &mut next_left_row,
                 inner.width,
-                button("g", "Open artist", show_hotkeys),
+                button("g", "Artist", show_hotkeys),
                 theme.accent,
-                UiAction::OpenYandexMusicArtist,
+                UiAction::OpenSelectedArtist,
             )
         });
     let yandex_album_button = (view.screen == Screen::YandexMusic
@@ -5879,6 +5879,23 @@ fn render_information_panel(
             }
         }
         InformationPanelKind::Generic => {
+            if details
+                .media_id
+                .as_ref()
+                .is_some_and(|media| media.source == SourceKind::Funkwhale)
+            {
+                for (label, value) in [
+                    ("Duration", details.length.as_str()),
+                    ("Added to pod", details.published.as_str()),
+                ] {
+                    if !value.trim().is_empty() && !value.eq_ignore_ascii_case("unknown") {
+                        lines.push(Line::from(vec![
+                            Span::styled(format!("{label}: "), theme.muted),
+                            Span::raw(value),
+                        ]));
+                    }
+                }
+            }
             if soundcloud_details && let Some(track) = details.soundcloud.as_ref() {
                 for (label, value) in [
                     ("Length", details.length.clone()),
@@ -5982,14 +5999,18 @@ fn render_information_panel(
                 .map(Line::raw),
         );
     }
-    // Archive rights notices without links still need a plain-text fallback.
-    let archive_linked_license =
-        archive_org_details && details.links.iter().any(|link| link.prefix == "License: ");
-    if !archive_linked_license
+    // Rights notices without canonical license links retain their plain text.
+    let funkwhale_details = details
+        .media_id
+        .as_ref()
+        .is_some_and(|media| media.source == SourceKind::Funkwhale);
+    let linked_license = (archive_org_details || funkwhale_details)
+        && details.links.iter().any(|link| link.prefix == "License: ");
+    if !linked_license
         && (is_creative_commons_license(&details.license)
             || is_librivox_public_domain_license(&details.source, &details.license)
             || (archive_org_details && is_specified_archive_license(&details.license))
-            || (soundcloud_details && !details.license.is_empty()))
+            || ((soundcloud_details || funkwhale_details) && !details.license.is_empty()))
     {
         let label = display_license_label(&details.license);
         let mut spans = vec![Span::styled("License: ", theme.muted)];
@@ -6018,7 +6039,7 @@ fn render_information_panel(
         radio_favorite_button,
         yandex_like_button,
         yandex_dislike_button,
-        yandex_artist_button,
+        artist_button,
         yandex_album_button,
         yandex_download_album_button,
         yandex_download_recommendations_button,
@@ -6394,6 +6415,13 @@ fn render_information_panel(
                 continue;
             }
             link_rows.push(Some((index, link)));
+            if matches!(
+                link.internal_target,
+                Some(DetailLinkInternalTarget::FunkwhaleArtist(_))
+            ) {
+                // The artist's labelled name and canonical URL own distinct rows.
+                link_rows.push(Some((index, link)));
+            }
             let next_is_wikidata = details
                 .links
                 .get(index.saturating_add(1))
@@ -6429,9 +6457,11 @@ fn render_information_panel(
                 .saturating_sub(usize::from(link_height));
             for row in link_rows
                 .iter()
+                .enumerate()
                 .skip(first_row)
                 .take(usize::from(link_height))
             {
+                let (row_index, row) = row;
                 let Some((index, link)) = row else {
                     cursor_y = cursor_y.saturating_add(1);
                     continue;
@@ -6439,6 +6469,42 @@ fn render_information_panel(
                 let link_area = Rect::new(inner.x, cursor_y, inner.width, 1);
                 let mut content_offset = 0_u16;
                 let mut spans = Vec::new();
+                if let Some(target @ DetailLinkInternalTarget::FunkwhaleArtist(_)) =
+                    link.internal_target.as_ref()
+                {
+                    let url_row = row_index > 0
+                        && link_rows[row_index - 1]
+                            .as_ref()
+                            .is_some_and(|(previous, _)| previous == index);
+                    let label = if url_row {
+                        link.url.clone()
+                    } else if show_hotkeys {
+                        format!("Artist [g]: {}", details.channel_name)
+                    } else {
+                        format!("Artist: {}", details.channel_name)
+                    };
+                    let width = terminal_text_width(&label).min(link_area.width);
+                    let style = if url_row && view.selected_detail_link == Some(*index) {
+                        theme.selected
+                    } else {
+                        theme.accent
+                    }
+                    .add_modifier(Modifier::UNDERLINED);
+                    frame.render_widget(Paragraph::new(Line::styled(label, style)), link_area);
+                    if width > 0 {
+                        let target_area = Rect::new(link_area.x, link_area.y, width, 1);
+                        if url_row {
+                            hit_map.detail_links.push((*index, target_area));
+                        } else {
+                            hit_map.detail_buttons.push((target.action(), target_area));
+                        }
+                    }
+                    if show_text_selection {
+                        capture_selectable_details_row(frame, hit_map, link_area);
+                    }
+                    cursor_y = cursor_y.saturating_add(1);
+                    continue;
+                }
                 if let Some(item_id) = link.wikidata_item_id.as_deref() {
                     let expanded = details.expanded_wikidata_item.as_deref() == Some(item_id);
                     let disclosure = button("W", if expanded { "▾" } else { "▸" }, show_hotkeys);
@@ -6471,6 +6537,94 @@ fn render_information_panel(
                     ));
                     content_offset =
                         content_offset.saturating_add(terminal_text_width(&link.prefix));
+                }
+                // Funkwhale catalogue navigation belongs beside its canonical
+                // HTTP URL, replacing its redundant action-column button.
+                let funkwhale_catalogue = match link.internal_target.as_ref() {
+                    Some(target @ DetailLinkInternalTarget::FunkwhaleArtist(_)) => {
+                        Some(("Artist", "g", false, target))
+                    }
+                    Some(target @ DetailLinkInternalTarget::FunkwhaleAlbum(_)) => Some((
+                        "Album",
+                        if details.media_id.is_none() {
+                            "Enter"
+                        } else {
+                            "b"
+                        },
+                        true,
+                        target,
+                    )),
+                    _ => None,
+                };
+                if let Some((kind, hotkey, album, target)) = funkwhale_catalogue {
+                    let catalogue_style = theme.accent.add_modifier(Modifier::UNDERLINED);
+                    let mut catalogue_label = kind.to_owned();
+                    if show_hotkeys {
+                        catalogue_label.push_str(&format!(" [{hotkey}]"));
+                    }
+                    spans.push(Span::styled(catalogue_label.clone(), catalogue_style));
+                    if album {
+                        spans.push(Span::raw(" "));
+                        spans.extend(highlighted_detail_text(
+                            details,
+                            DetailHighlightField::LinkLabel(*index),
+                            &link.label,
+                            catalogue_style,
+                        ));
+                        catalogue_label.push(' ');
+                        catalogue_label.push_str(&link.label);
+                    }
+                    let catalogue_width = terminal_text_width(&catalogue_label);
+                    let catalogue_offset = content_offset.min(link_area.width);
+                    let target_width =
+                        catalogue_width.min(link_area.width.saturating_sub(catalogue_offset));
+                    if target_width > 0 {
+                        hit_map.detail_buttons.push((
+                            target.action(),
+                            Rect::new(
+                                link_area.x.saturating_add(catalogue_offset),
+                                link_area.y,
+                                target_width,
+                                1,
+                            ),
+                        ));
+                    }
+                    let separator = if album { " - " } else { " " };
+                    spans.push(Span::styled(separator, theme.muted));
+                    content_offset = content_offset
+                        .saturating_add(catalogue_width)
+                        .saturating_add(terminal_text_width(separator));
+                    spans.extend(highlighted_detail_text(
+                        details,
+                        DetailHighlightField::LinkUrl(*index),
+                        &link.url,
+                        if view.selected_detail_link == Some(*index) {
+                            theme.selected
+                        } else {
+                            theme.accent
+                        }
+                        .add_modifier(Modifier::UNDERLINED),
+                    ));
+                    let url_offset = content_offset.min(link_area.width);
+                    let url_width = terminal_text_width(&link.url)
+                        .min(link_area.width.saturating_sub(url_offset));
+                    if url_width > 0 {
+                        hit_map.detail_links.push((
+                            *index,
+                            Rect::new(
+                                link_area.x.saturating_add(url_offset),
+                                link_area.y,
+                                url_width,
+                                1,
+                            ),
+                        ));
+                    }
+                    frame.render_widget(Paragraph::new(Line::from(spans)), link_area);
+                    if show_text_selection {
+                        capture_selectable_details_row(frame, hit_map, link_area);
+                    }
+                    cursor_y = cursor_y.saturating_add(1);
+                    continue;
                 }
                 let external_offset = content_offset;
                 // Archive names navigate internally; the adjacent canonical URL
@@ -18823,9 +18977,236 @@ for encoded, expected in json.load(sys.stdin):
     }
 
     #[test]
+    fn music_artist_controls_share_one_exact_key_and_mouse_target() {
+        for screen in [Screen::SoundCloud, Screen::YandexMusic] {
+            let mut view = ViewModel {
+                screen,
+                selected_artist_available: true,
+                details: Some(DetailView {
+                    title: "Artist fixture track".to_owned(),
+                    ..DetailView::default()
+                }),
+                ..ViewModel::default()
+            };
+            let mut terminal = Terminal::new(TestBackend::new(140, 30)).unwrap();
+            let mut hit_map = HitMap::default();
+            terminal
+                .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+                .unwrap();
+            assert!(
+                rendered_text(&terminal).contains("[g] Artist"),
+                "{screen:?}"
+            );
+            let target = hit_map
+                .detail_buttons
+                .iter()
+                .find_map(|(action, target)| {
+                    (*action == UiAction::OpenSelectedArtist).then_some(*target)
+                })
+                .expect("Artist has an exact hit target");
+            assert_eq!(
+                mouse_action(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: target.x,
+                        row: target.y,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    &hit_map,
+                    &view
+                ),
+                Some(UiAction::OpenSelectedArtist)
+            );
+            assert_eq!(
+                key_action(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE), &view),
+                Some(UiAction::OpenSelectedArtist)
+            );
+            view.selected_artist_available = false;
+            assert_ne!(
+                key_action(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE), &view),
+                Some(UiAction::OpenSelectedArtist)
+            );
+            view.selected_artist_available = true;
+            view.search_editing = true;
+            assert_ne!(
+                key_action(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE), &view),
+                Some(UiAction::OpenSelectedArtist),
+                "g remains query text while searching"
+            );
+        }
+    }
+
+    /// Funkwhale catalogue controls share their metadata row, not the action column.
+    #[test]
+    fn funkwhale_artist_album_links_have_inline_hotkeys_and_separate_source_targets() {
+        let artist_url = "https://audio.example/library/artists/42";
+        let album_url = "https://audio.example/library/albums/24";
+        let track_id = MediaId::new(
+            SourceKind::Funkwhale,
+            "https://audio.example/library/tracks/7",
+        );
+        let mut view = ViewModel {
+            screen: Screen::Funkwhale,
+            selected_artist_available: true,
+            rows: vec![RowView {
+                media_id: Some(track_id.clone()),
+                ..RowView::default()
+            }],
+            selected: 0,
+            details: Some(DetailView {
+                title: "Fixture track".to_owned(),
+                channel_name: "Sonoridad".to_owned(),
+                media_id: Some(track_id),
+                links: vec![
+                    DetailLinkView {
+                        label: "Artist".to_owned(),
+                        url: artist_url.to_owned(),
+                        internal_target: Some(DetailLinkInternalTarget::FunkwhaleArtist(
+                            artist_url.to_owned(),
+                        )),
+                        ..DetailLinkView::default()
+                    },
+                    DetailLinkView {
+                        label: "Album name".to_owned(),
+                        url: album_url.to_owned(),
+                        internal_target: Some(DetailLinkInternalTarget::FunkwhaleAlbum(
+                            album_url.to_owned(),
+                        )),
+                        ..DetailLinkView::default()
+                    },
+                ],
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(200, 30)).unwrap();
+        let mut hits = HitMap::default();
+        for external_available in [false, true] {
+            view.external_opener_available = external_available;
+            terminal
+                .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hits))
+                .unwrap();
+            let rendered = rendered_text(&terminal);
+            assert!(rendered.contains("Artist [g]: Sonoridad"));
+            assert!(rendered.contains(artist_url));
+            assert!(rendered.contains(&format!("Album [b] Album name - {album_url}")));
+            assert!(!rendered.contains("[g] Artist"));
+            assert!(!rendered.contains('↪'));
+            for (index, (label, action)) in [
+                ("Artist [g]: Sonoridad", UiAction::OpenSelectedArtist),
+                (
+                    "Album [b] Album name",
+                    UiAction::OpenFunkwhaleAlbum(album_url.to_owned()),
+                ),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let target = hits
+                    .detail_buttons
+                    .iter()
+                    .find_map(|(candidate, area)| (candidate == &action).then_some(*area))
+                    .expect("inline catalogue target");
+                assert_eq!(target.width, terminal_text_width(label));
+                assert_eq!(
+                    mouse_action(
+                        MouseEvent {
+                            kind: MouseEventKind::Down(MouseButton::Left),
+                            column: target.x,
+                            row: target.y,
+                            modifiers: KeyModifiers::NONE,
+                        },
+                        &hits,
+                        &view
+                    ),
+                    Some(action)
+                );
+                let source = hits
+                    .detail_links
+                    .iter()
+                    .find_map(|(candidate, area)| (*candidate == index).then_some(*area));
+                assert!(
+                    source.is_some(),
+                    "canonical catalogue links work without a browser"
+                );
+                if let Some(source) = source {
+                    let url = if index == 0 { artist_url } else { album_url };
+                    assert_eq!(source.width, terminal_text_width(url));
+                    if index == 0 {
+                        assert_eq!(source.y, target.y + 1);
+                        assert_eq!(source.x, target.x);
+                    } else {
+                        assert_eq!(source.y, target.y);
+                        assert!(source.x > target.right());
+                    }
+                    assert_eq!(
+                        mouse_action(
+                            MouseEvent {
+                                kind: MouseEventKind::Down(MouseButton::Left),
+                                column: source.x,
+                                row: source.y,
+                                modifiers: KeyModifiers::NONE,
+                            },
+                            &hits,
+                            &view
+                        ),
+                        Some(UiAction::ActivateDetailLink(index))
+                    );
+                }
+                view.selected_detail_link = Some(index);
+                assert_eq!(
+                    key_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT), &view),
+                    Some(UiAction::ActivateDetailLink(index)),
+                    "indexed keyboard catalogue navigation works without a browser"
+                );
+            }
+        }
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE), &view),
+            Some(UiAction::OpenSelectedArtist)
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE), &view),
+            Some(UiAction::OpenFunkwhaleAlbum(album_url.to_owned()))
+        );
+        for modifiers in [KeyModifiers::ALT, KeyModifiers::CONTROL] {
+            assert_ne!(
+                key_action(KeyEvent::new(KeyCode::Char('b'), modifiers), &view),
+                Some(UiAction::OpenFunkwhaleAlbum(album_url.to_owned()))
+            );
+        }
+        view.search_editing = true;
+        assert_ne!(
+            key_action(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE), &view),
+            Some(UiAction::OpenFunkwhaleAlbum(album_url.to_owned()))
+        );
+        view.search_editing = false;
+        terminal
+            .draw(|frame| {
+                render(
+                    frame,
+                    &view,
+                    &UiSettings {
+                        show_hotkeys: false,
+                        ..UiSettings::default()
+                    },
+                    &mut hits,
+                )
+            })
+            .unwrap();
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("Artist: Sonoridad"));
+        assert!(rendered.contains(artist_url));
+        assert!(rendered.contains(&format!("Album Album name - {album_url}")));
+        assert!(!rendered.contains("[g]"));
+        assert!(!rendered.contains("[b]"));
+    }
+
+    #[test]
     fn yandex_music_details_render_source_specific_actions_with_exact_hit_targets() {
         let mut view = ViewModel {
             screen: Screen::YandexMusic,
+            selected_artist_available: true,
             external_opener_available: true,
             details: Some(DetailView {
                 media_id: Some(MediaId::new(SourceKind::YandexMusic, "303")),
@@ -18859,7 +19240,7 @@ for encoded, expected in json.load(sys.stdin):
             "[o] xdg-open track",
             "[L] Like",
             "[X] Dislike",
-            "[g] Open artist",
+            "[g] Artist",
             "[b] Open album",
             "[Shift+D] Download album",
             "[R] Download 20 recommendations",
@@ -18878,7 +19259,7 @@ for encoded, expected in json.load(sys.stdin):
             UiAction::OpenInBrowser,
             UiAction::ToggleYandexMusicLike,
             UiAction::ToggleYandexMusicDislike,
-            UiAction::OpenYandexMusicArtist,
+            UiAction::OpenSelectedArtist,
             UiAction::OpenYandexMusicAlbum,
             UiAction::DownloadYandexMusicAlbum,
             UiAction::DownloadTwentyYandexMusicRecommendations,
@@ -18924,9 +19305,7 @@ for encoded, expected in json.load(sys.stdin):
         let artist_row = hit_map
             .detail_buttons
             .iter()
-            .find_map(|(action, area)| {
-                (*action == UiAction::OpenYandexMusicArtist).then_some(area.y)
-            })
+            .find_map(|(action, area)| (*action == UiAction::OpenSelectedArtist).then_some(area.y))
             .expect("Open artist row");
         let album_row = hit_map
             .detail_buttons
@@ -18941,23 +19320,24 @@ for encoded, expected in json.load(sys.stdin):
         );
         assert_eq!(
             key_action(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE), &view),
-            Some(UiAction::OpenYandexMusicArtist)
+            Some(UiAction::OpenSelectedArtist)
         );
 
         view.yandex_music_actions = YandexMusicActionsView {
             album_available: true,
             ..YandexMusicActionsView::default()
         };
+        view.selected_artist_available = false;
         terminal
             .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
             .expect("draw Yandex Music album actions");
         let rendered = rendered_text(&terminal);
         assert!(rendered.contains("[o] xdg-open item"));
         assert!(!rendered.contains("xdg-open track"));
-        assert!(!rendered.contains("[g] Open artist"));
+        assert!(!rendered.contains("[g] Artist"));
         assert_ne!(
             key_action(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE), &view),
-            Some(UiAction::OpenYandexMusicArtist),
+            Some(UiAction::OpenSelectedArtist),
             "the artist action must require an exact selected artist"
         );
     }
@@ -28760,6 +29140,158 @@ for encoded, expected in json.load(sys.stdin):
         assert_eq!(highlighted, "ПРИВЕТ");
     }
 
+    /// Funkwhale uploader names retain two-line display and internal TTY hit targets.
+    #[test]
+    fn funkwhale_uploader_inline_button_does_not_require_a_browser() {
+        let label = "Uploaded by [e]: emil@pod.example";
+        let view = ViewModel {
+            screen: Screen::Funkwhale,
+            external_opener_available: false,
+            details_focused: true,
+            selected_detail_link: Some(0),
+            details: Some(DetailView {
+                description: format!("{label}\nhttps://pod.example/federation/actors/emil"),
+                links: vec![DetailLinkView {
+                    label: label.to_owned(),
+                    internal_target: Some(DetailLinkInternalTarget::FunkwhaleUploader(
+                        "emil@pod.example".to_owned(),
+                    )),
+                    description_range: Some(DetailHighlightRange {
+                        start_byte: 0,
+                        end_byte: label.len(),
+                    }),
+                    presentation: DetailLinkPresentation::LabelOnly,
+                    ..DetailLinkView::default()
+                }],
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
+        let mut hit_map = HitMap::default();
+        terminal
+            .draw(|frame| {
+                render_details(
+                    frame,
+                    frame.area(),
+                    &view,
+                    true,
+                    0,
+                    &Theme::new(false),
+                    &mut hit_map,
+                    None,
+                )
+            })
+            .unwrap();
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains(label));
+        let (_, area) = hit_map
+            .detail_links
+            .iter()
+            .find(|(index, _)| *index == 0)
+            .expect("uploader button hit target");
+        assert_eq!(
+            mouse_action(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: area.x,
+                    row: area.y,
+                    modifiers: KeyModifiers::NONE
+                },
+                &hit_map,
+                &view
+            ),
+            Some(UiAction::ActivateDetailLink(0))
+        );
+        assert!(!view.action_requires_external_opener(&UiAction::ActivateDetailLink(0)));
+    }
+
+    /// Funkwhale tags share inline-link hit targets without requiring a browser.
+    #[test]
+    fn funkwhale_inline_tags_wrap_and_remain_keyboard_actionable_in_tty() {
+        let tag = "field recording 世界 Музыка and ambient soundscapes";
+        let description = format!("Notes\n\nTags: {tag}, end");
+        let start_byte = description.find(tag).unwrap();
+        let view = ViewModel {
+            screen: Screen::Funkwhale,
+            external_opener_available: false,
+            details_focused: true,
+            selected_detail_link: Some(0),
+            details: Some(DetailView {
+                media_id: Some(MediaId::new(
+                    SourceKind::Funkwhale,
+                    "https://pod.example/library/tracks/1/",
+                )),
+                length: "2:03".to_owned(),
+                published: "2024 April 13".to_owned(),
+                description,
+                links: vec![DetailLinkView {
+                    label: tag.to_owned(),
+                    presentation: DetailLinkPresentation::LabelOnly,
+                    internal_target: Some(DetailLinkInternalTarget::FunkwhaleTag(tag.to_owned())),
+                    description_range: Some(DetailHighlightRange {
+                        start_byte,
+                        end_byte: start_byte + tag.len(),
+                    }),
+                    ..DetailLinkView::default()
+                }],
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(36, 16)).unwrap();
+        let mut hit_map = HitMap::default();
+        terminal
+            .draw(|frame| {
+                render_details(
+                    frame,
+                    frame.area(),
+                    &view,
+                    true,
+                    0,
+                    &Theme::new(false),
+                    &mut hit_map,
+                    None,
+                )
+            })
+            .unwrap();
+        let text = rendered_text(&terminal);
+        assert!(text.contains("Duration: 2:03"));
+        assert!(text.contains("Added to pod: 2024 April 13"));
+        let targets = hit_map
+            .detail_links
+            .iter()
+            .filter(|(index, _)| *index == 0)
+            .collect::<Vec<_>>();
+        assert!(
+            targets.len() > 1,
+            "long tags should wrap without losing their target"
+        );
+        assert_eq!(
+            targets.iter().map(|(_, target)| target.width).sum::<u16>(),
+            terminal_text_width(tag)
+        );
+        for (_, target) in targets {
+            assert_eq!(
+                mouse_action(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: target.x,
+                        row: target.y,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    &hit_map,
+                    &view
+                ),
+                Some(UiAction::ActivateDetailLink(0))
+            );
+        }
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &view),
+            Some(UiAction::ActivateDetailLink(0))
+        );
+    }
+
     /// Hashtag bytes keep the same hit target through Unicode wrapping and scrolling.
     #[test]
     fn youtube_hashtag_links_wrap_scroll_and_exclude_adjacent_punctuation() {
@@ -32242,6 +32774,40 @@ for encoded, expected in json.load(sys.stdin):
         }
     }
 
+    /// Nested Funkwhale catalogues expose Back without requiring an active search.
+    #[test]
+    fn funkwhale_back_control_matches_its_escape_shortcut() {
+        for available in [false, true] {
+            let view = ViewModel {
+                screen: Screen::Funkwhale,
+                funkwhale_back_available: available,
+                ..ViewModel::default()
+            };
+            let mut terminal = Terminal::new(TestBackend::new(70, 2)).unwrap();
+            let mut hit_map = HitMap::default();
+            terminal
+                .draw(|frame| {
+                    render_catalog_playback_controls(
+                        frame,
+                        frame.area(),
+                        &view,
+                        true,
+                        &Theme::new(false),
+                        &mut hit_map,
+                    )
+                })
+                .unwrap();
+            assert_eq!(rendered_text(&terminal).contains("[Esc] Back"), available);
+            assert_eq!(
+                hit_map
+                    .detail_buttons
+                    .iter()
+                    .any(|(action, _)| *action == UiAction::GoBack),
+                available
+            );
+        }
+    }
+
     /// Back remains visible even in the narrow list pane of an 80-column layout.
     #[test]
     fn archive_back_control_is_actionable_only_when_a_return_exists() {
@@ -32765,6 +33331,58 @@ for encoded, expected in json.load(sys.stdin):
         assert_eq!(rendered.matches("License:").count(), 1);
         assert!(rendered.contains("https://creativecommons.org/licenses/by-nc-nd/3.0/"));
         assert!(hit_map.detail_links.iter().any(|(index, _)| *index == 0));
+    }
+
+    /// Funkwhale licenses are linked once; unknown rights stay verbatim and missing rights stay absent.
+    #[test]
+    fn funkwhale_licenses_show_once_without_inventing_rights() {
+        for (license, linked) in [
+            ("CC BY 4.0", true),
+            ("pod-specific-rights", false),
+            ("", false),
+        ] {
+            let view = ViewModel {
+                screen: Screen::Funkwhale,
+                external_opener_available: true,
+                details: Some(DetailView {
+                    media_id: Some(MediaId::new(
+                        SourceKind::Funkwhale,
+                        "https://audio.example/library/tracks/7",
+                    )),
+                    license: license.to_owned(),
+                    links: if linked {
+                        vec![DetailLinkView {
+                            prefix: "License: ".to_owned(),
+                            label: license.to_owned(),
+                            url: "https://creativecommons.org/licenses/by/4.0/".to_owned(),
+                            ..DetailLinkView::default()
+                        }]
+                    } else {
+                        Vec::new()
+                    },
+                    ..DetailView::default()
+                }),
+                ..ViewModel::default()
+            };
+            let mut terminal = Terminal::new(TestBackend::new(240, 40)).unwrap();
+            let mut hits = HitMap::default();
+            terminal
+                .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hits))
+                .unwrap();
+            let text = rendered_text(&terminal);
+            assert_eq!(
+                text.matches("License:").count(),
+                usize::from(!license.is_empty()),
+                "{text}"
+            );
+            if !license.is_empty() {
+                assert!(text.contains(license));
+            }
+            if linked {
+                assert!(text.contains("https://creativecommons.org/licenses/by/4.0/"));
+                assert!(hits.detail_links.iter().any(|(index, _)| *index == 0));
+            }
+        }
     }
 
     /// Only loaded Archive metadata supplies file counts, including a known zero.

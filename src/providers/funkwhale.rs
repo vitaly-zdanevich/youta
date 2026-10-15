@@ -6,9 +6,16 @@
 //! provider lifetime. Both versions use the same documented paginated media
 //! representation.
 
+mod albums;
 mod discovery;
+mod text;
+mod upload;
+mod uploader;
 
+pub use albums::{FunkwhaleAlbum, FunkwhaleAlbumPage};
 pub use discovery::{FunkwhalePod, PUBLIC_PODS_URL, discover_public_pods, parse_public_pods};
+pub use upload::FunkwhaleUploadMetadata;
+pub use uploader::FunkwhaleUploader;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -96,21 +103,25 @@ impl FunkwhaleProvider {
     ///
     /// Rejects legacy numeric IDs without an owner, unsafe URLs, and invalid track paths.
     pub fn instance_url_from_track_id(identity: &str) -> Result<Url, ProviderError> {
-        let mut url = Url::parse(identity).map_err(|error| {
-            ProviderError::InvalidRequest(format!(
-                "Funkwhale track identity requires its original pod URL: {error}"
-            ))
-        })?;
-        validate_base_url(url.clone())?;
-        let (prefix, track_id) = url.path().rsplit_once("/library/tracks/").ok_or_else(|| {
-            ProviderError::InvalidRequest(
-                "Funkwhale track identity has no canonical track path".to_owned(),
-            )
-        })?;
-        validate_track_id(track_id.strip_suffix('/').unwrap_or(track_id))?;
-        let path = format!("{prefix}/");
-        url.set_path(&path);
-        validate_base_url(url)
+        instance_url_from_identity(identity, "tracks")
+    }
+
+    /// Recovers the original pod from an exact, credential-free artist page.
+    ///
+    /// # Errors
+    ///
+    /// Rejects unowned numeric IDs, unsafe URLs, and noncanonical artist paths.
+    pub fn instance_url_from_artist_id(identity: &str) -> Result<Url, ProviderError> {
+        instance_url_from_identity(identity, "artists")
+    }
+
+    /// Recovers the original pod from an exact, credential-free album page.
+    ///
+    /// # Errors
+    ///
+    /// Rejects unsafe URLs and paths without a positive pod-local album identity.
+    pub fn instance_url_from_album_id(identity: &str) -> Result<Url, ProviderError> {
+        instance_url_from_identity(identity, "albums")
     }
 
     /// Selects one to one hundred results per page; an unchanged provider uses twenty.
@@ -118,6 +129,182 @@ impl FunkwhaleProvider {
     pub fn with_page_size(mut self, page_size: usize) -> Self {
         self.page_size = u32::try_from(page_size).unwrap_or(u32::MAX).clamp(1, 100);
         self
+    }
+
+    /// Returns playable tracks in newest catalogue-record order without a search term.
+    ///
+    /// # Errors
+    ///
+    /// Returns a provider error for invalid pagination or an unavailable pod API.
+    pub fn recent_tracks(&self, page: u32) -> Result<SearchPage, ProviderError> {
+        self.with_detected_api(|version| self.fetch_catalogue_page(None, page, version))
+    }
+
+    /// Lists this pod's exact artist catalogue grouped by album and track position.
+    ///
+    /// # Errors
+    ///
+    /// Rejects another pod's artist identity and propagates bounded API failures.
+    pub fn artist_tracks(&self, artist: &str, page: u32) -> Result<SearchPage, ProviderError> {
+        self.with_detected_api(|version| self.fetch_catalogue_page(Some(artist), page, version))
+    }
+
+    /// Lists one original-pod album in disc and track order without a title search.
+    ///
+    /// # Errors
+    ///
+    /// Rejects noncanonical or cross-pod album URLs and propagates bounded API failures.
+    pub fn album_tracks(&self, album: &str, page: u32) -> Result<SearchPage, ProviderError> {
+        self.with_detected_api(|version| {
+            let url = self.build_album_catalogue_url(album, page, version)?;
+            let raw = get_bounded_json(&self.agent, &url, self.max_json_bytes)?;
+            self.convert_track_page(raw, page)
+        })
+    }
+
+    /// Builds the documented exact album filter with deterministic multi-disc ordering.
+    fn build_album_catalogue_url(
+        &self,
+        album: &str,
+        page: u32,
+        version: u8,
+    ) -> Result<Url, ProviderError> {
+        let prefix = self
+            .base_url
+            .join("library/albums/")
+            .map_err(|error| ProviderError::InvalidBaseUrl(error.to_string()))?;
+        let id = album
+            .strip_prefix(prefix.as_str())
+            .map(|id| id.strip_suffix('/').unwrap_or(id))
+            .filter(|id| validate_track_id(id).is_ok())
+            .filter(|id| {
+                id.parse::<u64>()
+                    .is_ok_and(|value| value.to_string() == *id)
+            })
+            .ok_or_else(|| {
+                ProviderError::InvalidRequest(
+                    "Funkwhale album must be this pod's original album page".to_owned(),
+                )
+            })?;
+        let mut url = self.build_catalogue_url(None, page, version)?;
+        let pairs = url
+            .query_pairs()
+            .filter(|(key, _)| key != "ordering")
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect::<Vec<_>>();
+        url.set_query(None);
+        url.query_pairs_mut()
+            .extend_pairs(pairs)
+            .append_pair("album", id)
+            .append_pair("ordering", "disc_number,position");
+        Ok(url)
+    }
+
+    /// Browses the exact advertised tag without converting it into a title query.
+    ///
+    /// # Errors
+    ///
+    /// Rejects empty/control-containing tags and propagates bounded pod API failures.
+    pub fn tag_tracks(&self, tag: &str, page: u32) -> Result<SearchPage, ProviderError> {
+        self.with_detected_api(|version| {
+            let url = self.build_tag_catalogue_url(tag, page, version)?;
+            let raw = get_bounded_json(&self.agent, &url, self.max_json_bytes)?;
+            self.convert_track_page(raw, page)
+        })
+    }
+
+    /// URL-encodes one exact Funkwhale tag filter, preserving spaces and Unicode.
+    fn build_tag_catalogue_url(
+        &self,
+        tag: &str,
+        page: u32,
+        version: u8,
+    ) -> Result<Url, ProviderError> {
+        if !valid_tag(tag) {
+            return Err(ProviderError::InvalidRequest(
+                "Funkwhale tag must be a bounded nonempty visible value".to_owned(),
+            ));
+        }
+        let mut url = self.build_catalogue_url(None, page, version)?;
+        url.query_pairs_mut().append_pair("tag", tag);
+        Ok(url)
+    }
+
+    /// Validates a canonical artist page without allowing credentials or another pod.
+    ///
+    /// # Errors
+    ///
+    /// Returns a provider error unless the URL identifies a positive pod-local artist ID.
+    pub fn validate_artist_identity(&self, identity: &str) -> Result<(), ProviderError> {
+        self.artist_numeric_id(identity).map(|_| ())
+    }
+
+    /// Converts only the configured pod's canonical artist identity into an API filter.
+    fn artist_numeric_id(&self, identity: &str) -> Result<String, ProviderError> {
+        let prefix = self
+            .base_url
+            .join("library/artists/")
+            .map_err(|error| ProviderError::InvalidBaseUrl(error.to_string()))?;
+        let id = identity
+            .strip_prefix(prefix.as_str())
+            .map(|id| id.strip_suffix('/').unwrap_or(id))
+            .filter(|id| validate_track_id(id).is_ok())
+            .ok_or_else(|| {
+                ProviderError::InvalidRequest(
+                    "Funkwhale artist must be this pod's original artist page".to_owned(),
+                )
+            })?;
+        Ok(id.parse::<u64>().expect("validated artist ID").to_string())
+    }
+
+    /// Creates an empty-query catalogue request with an explicit stable ordering.
+    fn build_catalogue_url(
+        &self,
+        artist: Option<&str>,
+        page: u32,
+        version: u8,
+    ) -> Result<Url, ProviderError> {
+        if page == 0 {
+            return Err(ProviderError::InvalidRequest(
+                "Funkwhale page must be positive".to_owned(),
+            ));
+        }
+        let artist_id = artist
+            .map(|identity| self.artist_numeric_id(identity))
+            .transpose()?;
+        let mut url = self.api_url(version, "tracks")?;
+        {
+            let mut query = url.query_pairs_mut();
+            query.append_pair("q", "");
+            query.append_pair("page", &page.to_string());
+            query.append_pair("page_size", &self.page_size.to_string());
+            query.append_pair("playable", "true");
+            query.append_pair("include_channels", "true");
+            query.append_pair(
+                "ordering",
+                if artist_id.is_some() {
+                    "album__title,disc_number,position"
+                } else {
+                    "-creation_date"
+                },
+            );
+            if let Some(id) = artist_id {
+                query.append_pair("artist", &id);
+            }
+        }
+        Ok(url)
+    }
+
+    /// Reads one bounded catalogue page using the same visibility filter as searches.
+    fn fetch_catalogue_page(
+        &self,
+        artist: Option<&str>,
+        page: u32,
+        version: u8,
+    ) -> Result<SearchPage, ProviderError> {
+        let url = self.build_catalogue_url(artist, page, version)?;
+        let raw = get_bounded_json(&self.agent, &url, self.max_json_bytes)?;
+        self.convert_track_page(raw, page)
     }
 
     /// Resolves an advertised audio URL without treating a missing URL as authentication.
@@ -137,6 +324,43 @@ impl FunkwhaleProvider {
                     .to_owned(),
             )
         })
+    }
+
+    /// Adds optional actual uploader/date facts only for an explicitly selected track.
+    ///
+    /// Search pages and playback resolution never request this extra upload record.
+    /// Pods may deny its optional endpoint; missing facts do not prevent playback.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when the track itself cannot be read or validated.
+    pub fn video_details_with_upload_metadata(
+        &self,
+        video_id: &str,
+    ) -> Result<(VideoDetails, Option<FunkwhaleUploadMetadata>), ProviderError> {
+        let track_id = self.numeric_track_id(video_id)?;
+        self.with_detected_api(|version| {
+            let url = self.build_track_url(&track_id, version)?;
+            let raw: RawTrack = get_bounded_json(&self.agent, &url, self.max_json_bytes)?;
+            validate_raw_track(&raw)?;
+            let metadata = self.selected_upload_metadata(&raw, version, |url| {
+                upload::fetch_upload_metadata(&self.agent, url, self.max_json_bytes)
+            });
+            self.convert_track_details(raw)
+                .map(|details| (details, metadata))
+        })
+    }
+
+    /// Keeps denied/unsupported upload metadata optional and tied to the first advertised upload.
+    fn selected_upload_metadata(
+        &self,
+        track: &RawTrack,
+        version: u8,
+        fetch: impl FnOnce(&Url) -> Result<FunkwhaleUploadMetadata, ProviderError>,
+    ) -> Option<FunkwhaleUploadMetadata> {
+        let uuid = track.uploads.first()?.uuid.as_deref()?;
+        let url = self.build_upload_url(uuid, version)?;
+        fetch(&url).ok()
     }
 
     fn validate_search(request: &SearchRequest) -> Result<(), ProviderError> {
@@ -190,6 +414,25 @@ impl FunkwhaleProvider {
             url.set_path(&path);
         }
         Ok(url)
+    }
+
+    /// Accepts only an advertised UUID component, never a remote upload URL or path.
+    fn build_upload_url(&self, uuid: &str, version: u8) -> Option<Url> {
+        if uuid.len() != 36
+            || !uuid.bytes().enumerate().all(|(index, byte)| {
+                if matches!(index, 8 | 13 | 18 | 23) {
+                    byte == b'-'
+                } else {
+                    byte.is_ascii_hexdigit()
+                }
+            })
+        {
+            return None;
+        }
+        self.api_url(version, "uploads")
+            .ok()?
+            .join(&format!("{uuid}/"))
+            .ok()
     }
 
     /// Accepts legacy numeric IDs or canonical page identities owned by this exact pod.
@@ -307,6 +550,7 @@ impl FunkwhaleProvider {
         let items = raw
             .results
             .into_iter()
+            .filter(|track| track.is_playable != Some(false))
             .map(|track| self.convert_track_summary(track).map(SearchItem::Video))
             .collect::<Result<Vec<_>, _>>()?;
 
@@ -350,13 +594,14 @@ impl FunkwhaleProvider {
         let stream_url = self.track_stream_url(&raw)?;
         let published_at = raw.creation_date.as_deref().and_then(parse_rfc3339_epoch);
         let thumbnails = self.track_thumbnails(&raw);
+        let description = self.track_description(&raw);
 
         Ok(VideoSummary {
             video_id: self.scoped_identity("tracks", raw.id),
-            title: raw.title,
-            channel_name,
+            title: display_text(&raw.title),
+            channel_name: display_text(&channel_name),
             channel_id: self.artist_identity(&channel_id),
-            description: content_text(raw.description),
+            description,
             duration_seconds: track_duration(&raw.uploads),
             // Funkwhale exposes download counts, not equivalent view counts.
             view_count: None,
@@ -380,7 +625,7 @@ impl FunkwhaleProvider {
 
         Ok(ChannelSummary {
             channel_id: self.scoped_identity("artists", raw.id),
-            name: raw.name,
+            name: display_text(&raw.name),
             description: content_text(raw.description),
             subscriber_count: None,
             video_count: raw.tracks_count,
@@ -398,13 +643,14 @@ impl FunkwhaleProvider {
         let stream_url = self.track_stream_url(&raw)?;
         let published_at = raw.creation_date.as_deref().and_then(parse_rfc3339_epoch);
         let thumbnails = self.track_thumbnails(&raw);
+        let description = self.track_description(&raw);
 
         Ok(VideoDetails {
             video_id: self.scoped_identity("tracks", raw.id),
-            title: raw.title,
-            channel_name,
+            title: display_text(&raw.title),
+            channel_name: display_text(&channel_name),
             channel_id: self.artist_identity(&channel_id),
-            description: content_text(raw.description),
+            description,
             duration_seconds: track_duration(&raw.uploads),
             view_count: None,
             like_count: None,
@@ -416,7 +662,7 @@ impl FunkwhaleProvider {
             ratings_allowed: None,
             live: false,
             was_live: false,
-            keywords: raw.tags,
+            keywords: normalized_tags(raw.tags),
             orientation: VideoOrientation::Unknown,
             thumbnails,
             webpage_url,
@@ -508,6 +754,20 @@ impl FunkwhaleProvider {
         url.set_fragment(Some(&format!("artist:{artist}")));
         url.to_string()
     }
+
+    /// Keeps album identity and advertised upload facts beside visible description text.
+    fn track_description(&self, track: &RawTrack) -> String {
+        let mut description = track_description(track);
+        if let Some(album) = track.album.as_ref().filter(|album| album.id > 0)
+            && let Some(page) = self.local_webpage("albums", album.id)
+        {
+            if !description.is_empty() {
+                description.push('\n');
+            }
+            description.push_str(&format!("Album page: {page}"));
+        }
+        description
+    }
 }
 
 impl Provider for FunkwhaleProvider {
@@ -543,6 +803,26 @@ impl Provider for FunkwhaleProvider {
     }
 }
 
+/// Parses a canonical library identity without allocating an HTTP client.
+fn instance_url_from_identity(identity: &str, resource: &str) -> Result<Url, ProviderError> {
+    let mut url = Url::parse(identity).map_err(|error| {
+        ProviderError::InvalidRequest(format!(
+            "Funkwhale identity requires its original pod URL: {error}"
+        ))
+    })?;
+    validate_base_url(url.clone())?;
+    let marker = format!("/library/{resource}/");
+    let (prefix, id) = url.path().rsplit_once(&marker).ok_or_else(|| {
+        ProviderError::InvalidRequest(format!(
+            "Funkwhale identity has no canonical {resource} path"
+        ))
+    })?;
+    validate_track_id(id.strip_suffix('/').unwrap_or(id))?;
+    let path = format!("{prefix}/");
+    url.set_path(&path);
+    validate_base_url(url)
+}
+
 fn validate_track_id(track_id: &str) -> Result<(), ProviderError> {
     if track_id.is_empty()
         || track_id.len() > 20
@@ -554,6 +834,25 @@ fn validate_track_id(track_id: &str) -> Result<(), ProviderError> {
         ));
     }
     Ok(())
+}
+
+/// Retains one exact display/filter value only when it can produce a bounded action.
+fn valid_tag(tag: &str) -> bool {
+    !tag.trim().is_empty() && tag.len() <= 1024 && !tag.chars().any(char::is_control)
+}
+
+/// Bounds inline link targets without changing accepted Unicode spelling or spacing.
+fn normalized_tags(tags: Vec<String>) -> Vec<String> {
+    let mut values = Vec::new();
+    for tag in tags.into_iter().take(4096) {
+        if valid_tag(&tag) && !values.contains(&tag) {
+            values.push(tag);
+            if values.len() == 128 {
+                break;
+            }
+        }
+    }
+    values
 }
 
 fn validate_raw_track(raw: &RawTrack) -> Result<(), ProviderError> {
@@ -637,37 +936,113 @@ fn track_duration(uploads: &[RawUpload]) -> Option<u64> {
 }
 
 fn content_text(content: Option<RawContent>) -> String {
-    match content {
-        None => String::new(),
-        Some(RawContent::Text(text)) => text,
+    let (value, declared_html) = match content {
+        None => return String::new(),
+        Some(RawContent::Text(text)) => return text::plain_description(&text, false),
         Some(RawContent::Object {
             text,
             content,
             html,
-        }) => text
-            .or(content)
-            .or_else(|| html.map(|value| strip_markup(&value)))
-            .unwrap_or_default(),
-    }
+            content_type,
+        }) => {
+            let declared_html = content_type
+                .as_deref()
+                .is_some_and(|kind| kind.eq_ignore_ascii_case("text/html"));
+            if let Some(value) = text.or(content) {
+                (value, declared_html)
+            } else {
+                (html.unwrap_or_default(), true)
+            }
+        }
+    };
+    text::plain_description(&value, declared_html)
 }
 
-fn strip_markup(value: &str) -> String {
-    let mut result = String::with_capacity(value.len());
-    let mut in_tag = false;
-    for character in value.chars() {
-        match character {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            _ if !in_tag => result.push(character),
-            _ => {}
+/// Repairs only a strong legacy encoding signature; identities and locators stay exact.
+fn display_text(value: &str) -> String {
+    crate::legacy_text::normalized_legacy_windows_1251_value(Some(value)).unwrap_or_default()
+}
+
+/// Adds facts advertised by one upload without inventing listening counts from downloads.
+fn track_description(track: &RawTrack) -> String {
+    let mut lines = Vec::new();
+    if let Some(album) = track
+        .album
+        .as_ref()
+        .and_then(|album| album.title.as_deref())
+        .filter(|title| !title.trim().is_empty())
+    {
+        lines.push(format!("Album: {}", display_text(album)));
+    }
+    if let Some(upload) = track.uploads.first() {
+        if let Some(size) = upload.size {
+            let size = if size < 1024 {
+                format!("{size} B")
+            } else if size < 1024 * 1024 {
+                format!("{:.2} KiB", size as f64 / 1024.0)
+            } else if size < 1024 * 1024 * 1024 {
+                format!("{:.2} MiB", size as f64 / (1024.0 * 1024.0))
+            } else {
+                format!("{:.2} GiB", size as f64 / (1024.0 * 1024.0 * 1024.0))
+            };
+            lines.push(format!("Size: {size}"));
+        }
+        let container = upload
+            .extension
+            .as_deref()
+            .and_then(audio_fact)
+            .or_else(|| {
+                upload
+                    .mimetype
+                    .as_deref()
+                    .and_then(|value| value.strip_prefix("audio/"))
+                    .and_then(audio_fact)
+            })
+            .map(audio_format_label);
+        let codec = upload
+            .codec
+            .as_deref()
+            .and_then(audio_fact)
+            .map(audio_format_label);
+        match (container, codec) {
+            (Some(container), Some(codec)) if container != codec => {
+                lines.push(format!("Format: {container}, {codec}"));
+            }
+            (Some(container), _) => lines.push(format!("Format: {container}")),
+            (None, Some(codec)) => lines.push(format!("Codec: {codec}")),
+            (None, None) => {}
+        }
+        if let Some(bitrate) = upload.bitrate.filter(|value| *value > 0) {
+            lines.push(format!(
+                "Bitrate: {} kbit/s",
+                bitrate.saturating_add(500) / 1000
+            ));
         }
     }
-    result
-        .replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
+    if let Some(listenings) = track.listenings_count {
+        lines.push(format!("Listenings: {listenings}"));
+    }
+    let description = content_text(track.description.clone());
+    if !description.is_empty() {
+        if !lines.is_empty() {
+            lines.push(String::new());
+        }
+        lines.push(description);
+    }
+    lines.join("\n")
+}
+
+/// Labels supplied identifiers without probing audio or inferring a missing codec.
+fn audio_format_label(value: &str) -> String {
+    match value.to_ascii_lowercase().as_str() {
+        "ogg" | "oga" => "Ogg".to_owned(),
+        "opus" => "Opus".to_owned(),
+        "vorbis" => "Vorbis".to_owned(),
+        "wav" | "wave" | "vnd.wave" | "x-wav" => "WAV".to_owned(),
+        "flac" | "x-flac" => "FLAC".to_owned(),
+        "mp3" => "MP3".to_owned(),
+        _ => value.to_ascii_uppercase(),
+    }
 }
 
 fn page_has_more(
@@ -720,6 +1095,8 @@ struct RawTrack {
     tags: Vec<String>,
     #[serde(default)]
     cover: Option<RawCover>,
+    #[serde(default, deserialize_with = "deserialize_optional_u64")]
+    listenings_count: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -737,6 +1114,10 @@ struct RawArtist {
 
 #[derive(Debug, Deserialize)]
 struct RawAlbum {
+    #[serde(default, deserialize_with = "deserialize_u64")]
+    id: u64,
+    #[serde(default)]
+    title: Option<String>,
     #[serde(default)]
     artist: Option<RawArtistReference>,
     #[serde(default)]
@@ -765,10 +1146,32 @@ struct RawArtistReference {
 
 #[derive(Debug, Deserialize)]
 struct RawUpload {
+    #[serde(default)]
+    uuid: Option<String>,
     #[serde(default, deserialize_with = "deserialize_optional_u64")]
     duration: Option<u64>,
     #[serde(default)]
     listen_url: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_u64")]
+    size: Option<u64>,
+    #[serde(default, deserialize_with = "deserialize_optional_u64")]
+    bitrate: Option<u64>,
+    #[serde(default)]
+    mimetype: Option<String>,
+    #[serde(default)]
+    extension: Option<String>,
+    #[serde(default)]
+    codec: Option<String>,
+}
+
+/// Omits provider placeholders rather than presenting them as audio facts.
+fn audio_fact(value: &str) -> Option<&str> {
+    let value = value.trim();
+    (!value.is_empty()
+        && !["none", "null", "unknown", "n/a"]
+            .iter()
+            .any(|placeholder| value.eq_ignore_ascii_case(placeholder)))
+    .then_some(value)
 }
 
 #[derive(Debug, Deserialize)]
@@ -777,7 +1180,7 @@ struct RawCover {
     urls: BTreeMap<String, Value>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(untagged)]
 enum RawContent {
     Text(String),
@@ -788,6 +1191,8 @@ enum RawContent {
         content: Option<String>,
         #[serde(default)]
         html: Option<String>,
+        #[serde(default)]
+        content_type: Option<String>,
     },
 }
 
@@ -869,6 +1274,334 @@ mod tests {
             Url::parse("https://funk.example.test/prefix").expect("fixture URL should parse"),
         )
         .expect("fixture provider should construct")
+    }
+
+    #[test]
+    fn explicit_unplayable_tracks_are_excluded_even_when_the_pod_ignores_the_filter() {
+        let raw = serde_json::from_value(serde_json::json!({
+            "count": 2,
+            "results": [
+                {"id": 27158, "title": "Intro", "artist_credit": [{"name": "Joy in Resistance"}], "is_playable": false, "uploads": [], "listen_url": "/api/v2/listen/missing/"},
+                {"id": 42, "title": "Available", "artist_credit": [{"name": "Artist"}], "is_playable": true, "listen_url": "/api/v2/listen/available/"}
+            ]
+        })).unwrap();
+        let page = provider().convert_track_page(raw, 1).unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert!(matches!(&page.items[0], SearchItem::Video(track) if track.title == "Available"));
+    }
+
+    #[test]
+    fn description_declared_html_is_plain_text_with_visible_clickable_urls() {
+        let content = serde_json::from_value(serde_json::json!({
+            "text": "<p><a href=\"http://www.jamendo.com\">Jamendo</a> cc_standard</p><script>hidden()</script>",
+            "content_type": "text/html",
+            "html": "<p>fallback must not replace the original</p>"
+        })).unwrap();
+        assert_eq!(
+            content_text(Some(content)),
+            "Jamendo (http://www.jamendo.com) cc_standard"
+        );
+        let content = serde_json::from_value(serde_json::json!(
+            "<p><a href=\"http://www.jamendo.com\">http://www.jamendo.com</a> cc_standard</p>"
+        ))
+        .unwrap();
+        assert_eq!(
+            content_text(Some(content)),
+            "http://www.jamendo.com cc_standard"
+        );
+    }
+
+    #[test]
+    fn description_repairs_confirmed_cp1251_mojibake_without_corrupting_latin_text() {
+        for (input, expected) in [
+            ("Òîëüêî äëÿ îçíàêîìëåíèÿ", "Только для ознакомления"),
+            ("Björk · déjà vu", "Björk · déjà vu"),
+            ("Только для ознакомления", "Только для ознакомления"),
+        ] {
+            assert_eq!(
+                content_text(Some(RawContent::Text(input.to_owned()))),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn upload_details_expose_audio_facts_but_never_call_downloads_listenings() {
+        let mut raw: RawTrack = serde_json::from_value(serde_json::json!({
+            "id": 27084, "title": "This is love!", "artist_credit": [{"artist": {"id": 5794}, "credit": "Wadi Dubroffski"}],
+            "downloads_count": 16,
+            "uploads": [{"size": 27941291, "duration": 146, "bitrate": 1529248, "mimetype": "audio/flac", "extension": "flac"}]
+        })).unwrap();
+        let details = provider().convert_track_details(raw).unwrap();
+        assert!(details.description.contains("Size: 26.65 MiB"));
+        assert!(!details.description.contains("Advertised audio upload:"));
+        assert!(details.description.contains("Format: FLAC"));
+        assert!(!details.description.contains("Codec:"));
+        assert!(details.description.contains("Bitrate: 1529 kbit/s"));
+        assert_eq!(details.duration_seconds, Some(146));
+        assert!(!details.description.contains("Listenings:"));
+        raw = serde_json::from_value(serde_json::json!({"id": 1, "title": "Track", "artist_credit": [{"name": "Artist"}], "listenings_count": 7})).unwrap();
+        assert!(
+            provider()
+                .convert_track_details(raw)
+                .unwrap()
+                .description
+                .contains("Listenings: 7")
+        );
+    }
+
+    /// Pod placeholders cannot mask a real MIME-derived audio container.
+    #[test]
+    fn unknown_extension_falls_back_to_the_real_audio_mime_format() {
+        for extension in ["none", "NONE", " null ", "unknown", "n/a", ""] {
+            let raw: RawTrack = serde_json::from_value(serde_json::json!({
+                "id": 27378,
+                "title": "Strata",
+                "artist_credit": [{"name": "Sonoridad"}],
+                "uploads": [{"extension": extension, "mimetype": "audio/vnd.wave", "codec": "none"}]
+            }))
+            .unwrap();
+            let description = provider().convert_track_details(raw).unwrap().description;
+            assert!(
+                description.contains("Format: WAV"),
+                "{extension}: {description}"
+            );
+            assert!(!description.contains("Format: NONE"));
+            assert!(!description.contains("Codec: NONE"));
+        }
+        let raw: RawTrack = serde_json::from_value(serde_json::json!({
+            "id": 1, "title": "Unknown audio", "artist_credit": [{"name": "Artist"}], "uploads": [{"extension": "none", "codec": "null"}]
+        })).unwrap();
+        let description = provider().convert_track_details(raw).unwrap().description;
+        assert!(!description.contains("Format:"));
+        assert!(!description.contains("Codec:"));
+    }
+
+    /// Containers such as Ogg do not imply Opus or Vorbis without advertised codec metadata.
+    #[test]
+    fn advertised_container_and_codec_share_one_human_readable_format_line() {
+        for (extension, mimetype, codec, expected) in [
+            (
+                Some("ogg"),
+                Some("audio/ogg"),
+                Some("opus"),
+                "Format: Ogg, Opus",
+            ),
+            (
+                Some("oga"),
+                Some("audio/ogg"),
+                Some("vorbis"),
+                "Format: Ogg, Vorbis",
+            ),
+            (Some("ogg"), Some("audio/ogg"), None, "Format: Ogg"),
+            (
+                Some("opus"),
+                Some("audio/opus"),
+                Some("Opus"),
+                "Format: Opus",
+            ),
+            (
+                Some("flac"),
+                Some("audio/flac"),
+                Some("FLAC"),
+                "Format: FLAC",
+            ),
+            (Some("wave"), Some("audio/vnd.wave"), None, "Format: WAV"),
+            (
+                Some("none"),
+                Some("audio/mpeg"),
+                Some("none"),
+                "Format: MPEG",
+            ),
+            (Some("mp3"), Some("audio/mpeg"), None, "Format: MP3"),
+            (Some("unknown"), None, Some("opus"), "Codec: Opus"),
+            (None, Some("audio/ogg"), Some("null"), "Format: Ogg"),
+        ] {
+            let raw: RawTrack = serde_json::from_value(serde_json::json!({
+                "id": 27, "title": "Advertised audio", "artist_credit": [{"name": "Artist"}],
+                "uploads": [{"extension": extension, "mimetype": mimetype, "codec": codec}]
+            }))
+            .unwrap();
+            let description = provider().convert_track_details(raw).unwrap().description;
+            let facts = description
+                .lines()
+                .filter(|line| line.starts_with("Format: ") || line.starts_with("Codec: "))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                facts,
+                vec![expected],
+                "{extension:?}/{mimetype:?}/{codec:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn recent_and_artist_catalogues_have_exact_filters_and_stable_order() {
+        let provider = provider().with_page_size(10);
+        let recent = provider.build_catalogue_url(None, 1, API_V2).unwrap();
+        assert!(
+            recent
+                .query_pairs()
+                .any(|(key, value)| key == "ordering" && value == "-creation_date")
+        );
+        assert!(
+            recent
+                .query_pairs()
+                .any(|(key, value)| key == "page_size" && value == "10")
+        );
+        let artist = provider
+            .build_catalogue_url(
+                Some("https://funk.example.test/prefix/library/artists/5811/"),
+                2,
+                API_V2,
+            )
+            .unwrap();
+        assert!(
+            artist
+                .query_pairs()
+                .any(|(key, value)| key == "artist" && value == "5811")
+        );
+        assert!(
+            artist
+                .query_pairs()
+                .any(|(key, value)| key == "ordering"
+                    && value == "album__title,disc_number,position")
+        );
+        assert!(
+            provider
+                .build_catalogue_url(
+                    Some("https://other.example/library/artists/5811"),
+                    1,
+                    API_V2
+                )
+                .is_err()
+        );
+        assert!(provider.build_catalogue_url(None, 0, API_V2).is_err());
+    }
+
+    #[test]
+    fn tag_filters_preserve_the_exact_unicode_value_and_never_become_title_searches() {
+        let tag = "Ambient & музыка / #field recording";
+        let url = provider().build_tag_catalogue_url(tag, 2, API_V2).unwrap();
+        assert!(
+            url.query_pairs()
+                .any(|(key, value)| key == "tag" && value == tag)
+        );
+        assert!(
+            url.query_pairs()
+                .any(|(key, value)| key == "q" && value.is_empty())
+        );
+        assert!(!url.query_pairs().any(|(key, _)| key == "artist"));
+        assert!(provider().build_tag_catalogue_url("\n", 1, API_V2).is_err());
+    }
+
+    #[test]
+    fn album_catalogue_uses_exact_local_identity_and_disc_track_order() {
+        let provider = provider().with_page_size(20);
+        let url = provider
+            .build_album_catalogue_url(
+                "https://funk.example.test/prefix/library/albums/42/",
+                2,
+                API_V2,
+            )
+            .unwrap();
+        for (key, value) in [
+            ("album", "42"),
+            ("ordering", "disc_number,position"),
+            ("page_size", "20"),
+            ("page", "2"),
+            ("playable", "true"),
+        ] {
+            assert!(
+                url.query_pairs()
+                    .any(|(actual_key, actual_value)| actual_key == key && actual_value == value)
+            );
+        }
+        assert!(
+            !url.query_pairs()
+                .any(|(key, _)| matches!(key.as_ref(), "artist" | "tag"))
+        );
+        for album in [
+            "https://other.example/prefix/library/albums/42/",
+            "https://funk.example.test/prefix/library/albums/042/",
+            "https://funk.example.test/prefix/library/albums/42/?token=bad",
+        ] {
+            assert!(
+                provider
+                    .build_album_catalogue_url(album, 1, API_V2)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn tags_reject_unactionable_values_deduplicate_and_bound_inline_targets() {
+        let original = " Ambient & музыка ";
+        let mut tags = vec![
+            original.to_owned(),
+            original.to_owned(),
+            String::new(),
+            "\t".to_owned(),
+            "x".repeat(1025),
+        ];
+        tags.extend((0..200).map(|index| format!("tag{index}")));
+        let tags = normalized_tags(tags);
+        assert_eq!(tags.len(), 128);
+        assert_eq!(tags[0], original);
+        assert_eq!(
+            tags.iter().filter(|tag| tag.as_str() == original).count(),
+            1
+        );
+        assert!(tags.iter().all(|tag| valid_tag(tag)));
+    }
+
+    #[test]
+    fn selected_upload_metadata_uses_only_an_advertised_canonical_uuid_on_the_same_pod() {
+        let provider = provider();
+        let id = "17c770f0-1a57-40e9-85de-d2ca75b1d42d";
+        assert_eq!(
+            provider.build_upload_url(id, API_V2).unwrap().as_str(),
+            "https://funk.example.test/prefix/api/v2/uploads/17c770f0-1a57-40e9-85de-d2ca75b1d42d/"
+        );
+        for invalid in [
+            "",
+            "../private",
+            "https://other.example/id",
+            "17c770f0-1a57-40e9-85de-d2ca75b1d42d?token=x",
+        ] {
+            assert!(provider.build_upload_url(invalid, API_V2).is_none());
+        }
+    }
+
+    #[test]
+    fn inaccessible_optional_upload_metadata_never_changes_track_playability() {
+        let mut page: RawPage<RawTrack> = serde_json::from_str(TRACK_PAGE_FIXTURE).unwrap();
+        let mut raw = page.results.remove(0);
+        raw.uploads[0].uuid = Some("17c770f0-1a57-40e9-85de-d2ca75b1d42d".to_owned());
+        let provider = provider();
+        let calls = std::cell::Cell::new(0);
+        let metadata = provider.selected_upload_metadata(&raw, API_V2, |_| {
+            calls.set(calls.get() + 1);
+            Err(ProviderError::HttpStatus(403))
+        });
+        assert!(metadata.is_none());
+        assert_eq!(calls.get(), 1);
+        assert!(
+            provider
+                .convert_track_details(raw)
+                .unwrap()
+                .stream_url
+                .is_some()
+        );
+        let mut page: RawPage<RawTrack> = serde_json::from_str(TRACK_PAGE_FIXTURE).unwrap();
+        let raw = page.results.remove(0);
+        assert!(
+            provider
+                .selected_upload_metadata(&raw, API_V2, |_| {
+                    panic!("no advertised upload UUID must not trigger another request")
+                })
+                .is_none()
+        );
     }
 
     #[test]

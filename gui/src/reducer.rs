@@ -544,6 +544,11 @@ pub fn start<R: Runtime>(
             let mut controller = AppController::new(config, store, provider, playback);
             #[cfg(feature = "cmd")]
             controller.set_custom_command_mode(CustomCommandMode::Dialog);
+            // The virtualized window does not report terminal row geometry.
+            // Give deferred Funkwhale catalogues the same bounded page stride
+            // used by explicit GUI searches; this never starts hidden-tab work.
+            #[cfg(feature = "funkwhale")]
+            controller.set_funkwhale_search_page_capacity(50);
             controller.set_worker_waker(Some(Waker::from(worker_wake.clone())));
 
             published_artwork.record(controller.view());

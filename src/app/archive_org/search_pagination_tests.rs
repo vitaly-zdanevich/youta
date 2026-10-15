@@ -74,6 +74,25 @@ fn archive_search_page_capacity_controls_first_http_request() {
     }
 }
 
+#[test]
+fn archive_capacity_uses_its_submitted_query_not_another_tabs_heading() {
+    let (_temporary, mut app) = controller();
+    app.update_archive_org_search_page_capacities(crate::view::SearchPageCapacities {
+        with_heading: 9,
+        without_heading: 10,
+    });
+    app.view.search_query = "another source".into();
+    app.submit_archive_org_search(String::new());
+    assert_eq!(request(&app).limit, 10);
+    app.submit_archive_org_search("archive query".into());
+    assert_eq!(request(&app).limit, 9);
+    app.update_archive_org_search_page_capacities(crate::view::SearchPageCapacities {
+        with_heading: 90,
+        without_heading: 91,
+    });
+    assert_eq!(app.archive_org.page_limit, Some(9));
+}
+
 /// Explicit continuation moves by one result viewport, keeping every new row visible.
 #[test]
 fn archive_load_more_turns_one_screen_and_selects_its_last_row() {

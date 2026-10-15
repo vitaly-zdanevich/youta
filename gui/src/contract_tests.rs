@@ -414,6 +414,84 @@ fn window_filters_and_edits_playback_history_from_the_shared_view_policy() {
     assert!(!popups.contains("[h] Save log and searches"));
 }
 
+/// Artist controls share one selection-owned capability and action across music sources.
+#[test]
+fn music_artist_control_uses_the_shared_selection_owned_action() {
+    let view = serde_json::to_value(ViewModel {
+        selected_artist_available: true,
+        ..ViewModel::default()
+    })
+    .expect("public selection metadata");
+    assert_eq!(view["selected_artist_available"], true);
+    assert_eq!(
+        serde_json::from_value::<youta::view::UiAction>(serde_json::json!("OpenSelectedArtist"))
+            .expect("shared artist action"),
+        youta::view::UiAction::OpenSelectedArtist
+    );
+    let source = window_source("components/Details.tsx");
+    assert!(source.contains("view.selected_artist_available"));
+    assert!(source.contains("dispatch('OpenSelectedArtist')"));
+    assert!(source.contains("[g] Artist"));
+    assert!(!source.contains("dispatch(\"OpenYandexMusicArtist\")"));
+}
+
+/// Canonical Funkwhale HTTP links carry exact, browser-independent catalogue actions.
+#[test]
+fn funkwhale_artist_album_links_keep_their_typed_window_destinations() {
+    use youta::view::{DetailLinkInternalTarget, UiAction};
+
+    let artist_url = "https://audio.example/library/artists/42";
+    let album_url = "https://audio.example/library/albums/24";
+    for (target, expected, action) in [
+        (
+            DetailLinkInternalTarget::FunkwhaleArtist(artist_url.to_owned()),
+            serde_json::json!({ "FunkwhaleArtist": artist_url }),
+            UiAction::OpenSelectedArtist,
+        ),
+        (
+            DetailLinkInternalTarget::FunkwhaleAlbum(album_url.to_owned()),
+            serde_json::json!({ "FunkwhaleAlbum": album_url }),
+            UiAction::OpenFunkwhaleAlbum(album_url.to_owned()),
+        ),
+        (
+            DetailLinkInternalTarget::FunkwhaleUploader("emil@audio.example".to_owned()),
+            serde_json::json!({ "FunkwhaleUploader": "emil@audio.example" }),
+            UiAction::OpenFunkwhaleUploader,
+        ),
+    ] {
+        assert_eq!(serde_json::to_value(&target).unwrap(), expected);
+        assert_eq!(target.action(), action);
+    }
+    assert_eq!(
+        serde_json::from_value::<UiAction>(serde_json::json!({ "OpenFunkwhaleAlbum": album_url }))
+            .expect("typed album action"),
+        UiAction::OpenFunkwhaleAlbum(album_url.to_owned())
+    );
+    for declaration in [
+        "{ FunkwhaleArtist: string }",
+        "{ FunkwhaleAlbum: string }",
+        "{ FunkwhaleUploader: string }",
+    ] {
+        assert!(contract_source().contains(declaration));
+    }
+}
+
+/// Typed Funkwhale tags cross IPC as exact strings while rendering reuses indexed links.
+#[test]
+fn funkwhale_tags_keep_exact_internal_identity_in_the_window_contract() {
+    let target =
+        youta::view::DetailLinkInternalTarget::FunkwhaleTag("field recording 世界".to_owned());
+    assert_eq!(
+        serde_json::to_value(&target).unwrap(),
+        serde_json::json!({"FunkwhaleTag":"field recording 世界"})
+    );
+    assert_eq!(
+        target.action(),
+        youta::view::UiAction::SearchFunkwhaleTag("field recording 世界".to_owned())
+    );
+    assert!(contract_source().contains("{ FunkwhaleTag: string }"));
+}
+
 /// Every declared field must exist in the JSON the reducer publishes.
 #[test]
 fn the_typescript_contract_names_only_fields_the_reducer_emits() {
@@ -852,6 +930,24 @@ fn soundcloud_tab_follows_youtube_music_and_exposes_search_to_the_window() {
 }
 
 /// Funkwhale source metadata follows Bandcamp only when its removable provider is compiled.
+/// Deferred catalogues need a bounded GUI stride before their first visible tick.
+#[test]
+fn funkwhale_gui_initializes_catalogue_capacity_before_publication() {
+    let reducer = include_str!("reducer.rs");
+    let capacity = reducer
+        .find("controller.set_funkwhale_search_page_capacity(50);")
+        .expect("virtualized GUI supplies a bounded Funkwhale page stride");
+    let publication = reducer
+        .find("published_artwork.record(controller.view());")
+        .expect("initial view publication");
+    assert!(capacity < publication);
+    assert!(
+        reducer[..capacity]
+            .trim_end()
+            .ends_with("#[cfg(feature = \"funkwhale\")]")
+    );
+}
+
 #[test]
 fn funkwhale_tab_follows_bandcamp_and_respects_the_gui_feature() {
     let screens = serde_json::to_value(super::screens()).expect("serialized screen catalogue");
