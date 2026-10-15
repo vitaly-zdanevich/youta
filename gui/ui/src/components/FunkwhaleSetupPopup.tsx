@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { KeyboardEvent, ReactNode } from 'react';
 
 import type { UiAction } from '../actions';
@@ -43,16 +43,22 @@ export function FunkwhaleSetupPopup({ popup }: { popup: FunkwhaleSetupPopupView 
 	const editing = useRef(false);
 	const input = useRef<HTMLInputElement>(null);
 	const selected = useRef<HTMLButtonElement>(null);
+	const previousPicking = useRef(picking);
+	/** Portals can attach after parent effects; only mount or picker transitions claim focus. */
+	const attachInput = useCallback((node: HTMLInputElement | null) => {
+		input.current = node;
+		if (node && !picking) node.focus();
+	}, [picking]);
 	useEffect(() => {
+		const pickerClosed = previousPicking.current && !picking;
+		previousPicking.current = picking;
 		if (picking) {
 			editing.current = false;
-		} else if (popup.url && !editing.current) {
+		} else if (popup.url && (!editing.current || pickerClosed)) {
+			// Ref focus precedes effects, but an explicit pod selection still owns the new draft.
 			setDraft(popup.url);
 		}
 	}, [popup.url, picking]);
-	useEffect(() => {
-		if (!picking) input.current?.focus();
-	}, [picking]);
 	useEffect(() => {
 		selected.current?.scrollIntoView({ block: 'nearest' });
 		selected.current?.focus();
@@ -138,7 +144,7 @@ export function FunkwhaleSetupPopup({ popup }: { popup: FunkwhaleSetupPopupView 
 			<p className='m-0 text-ink-dim'>Choose a public pod or enter your own pod URL. Leave the URL empty and save to remove the saved pod.</p>
 			<label className='grid min-w-0 gap-1 text-ink-faint'>
 				Pod URL
-				<input ref={input} type='url' value={draft} disabled={picking}
+				<input ref={attachInput} type='url' value={draft} disabled={picking}
 					placeholder='https://your-pod.example/' autoComplete='off' autoCapitalize='none' spellCheck={false}
 					onFocus={() => { editing.current = true; }}
 					onBlur={() => { editing.current = false; }}

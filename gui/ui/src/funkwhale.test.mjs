@@ -25,6 +25,13 @@ const hooks = {
 		if (!(index in slots)) slots[index] = { current: initial };
 		return slots[index];
 	},
+	useCallback(callback, dependencies) {
+		const index = cursor++;
+		if (!(index in slots) || dependencies.some((value, part) => !Object.is(value, slots[index].dependencies[part]))) {
+			slots[index] = { callback, dependencies };
+		}
+		return slots[index].callback;
+	},
 	useEffect(callback, dependencies) {
 		const index = cursor++;
 		if (!(index in slots) || dependencies.some((value, part) => !Object.is(value, slots[index][part]))) {
@@ -85,19 +92,55 @@ function reset() {
 }
 
 /** Supply the exact public setup contract, never a browser-fetched pod list. */
-function render(patch = {}) {
+function render(patch = {}, beforeEffects = () => {}) {
 	assert.equal(typeof component.FunkwhaleSetupPopup, 'function');
 	cursor = 0;
 	effects = [];
 	const tree = component.FunkwhaleSetupPopup({ popup: {
 		url: 'https://music.example/', config_file_path: 'config.toml', error: null, picker: null, ...patch,
 	} });
+	beforeEffects(tree);
 	for (const effect of effects) effect();
 	return tree;
 }
 
 const button = (tree, label) => nodes(tree).find((node) => node.type === 'button'
 	&& (text(node) === label || node.props['aria-label'] === label));
+
+/** Radix may mount portal children after parent effects; focus belongs to the attached input. */
+test('pod URL focuses on actual portal attachment and picker close without refocusing retained drafts', () => {
+	reset();
+	const input = nodes(render()).find((node) => node.type === 'input');
+	assert.equal(typeof input.props.ref, 'function');
+	let focused = 0;
+	const node = { focus: () => { focused++; } };
+	input.props.ref(node);
+	assert.equal(focused, 1, 'the input receives focus even when portal attachment follows the initial effects');
+	const retained = nodes(render({ error: 'Public fixture failure', config_file_path: 'redacted snapshot.toml' }))
+		.find((node) => node.type === 'input');
+	assert.equal(retained.props.ref, input.props.ref, 'a native snapshot must not detach/re-attach the ref or reset caret/focus');
+	assert.equal(focused, 1);
+	const picker = { pods: [], selected: 0, loading: true, error: null };
+	const picking = nodes(render({ picker })).find((node) => node.type === 'input');
+	picking.props.ref(node);
+	assert.equal(focused, 1, 'the disabled URL does not steal pod-list focus');
+	const returned = nodes(render()).find((node) => node.type === 'input');
+	returned.props.ref(node);
+	assert.equal(focused, 2, 'closing the list returns focus to its URL editor');
+});
+
+/** Ref attachment emits focus before passive effects copy an explicit pod-list selection. */
+test('picker selection replaces the URL even when returning input focus precedes draft effects', () => {
+	reset();
+	render({ url: 'https://manual.example/' });
+	render({ url: 'https://manual.example/', picker: { pods: [], selected: 0, loading: true, error: null } });
+	const selectedUrl = 'https://selected.example/';
+	render({ url: selectedUrl }, (tree) => {
+		const input = nodes(tree).find((node) => node.type === 'input');
+		input.props.ref({ focus: () => input.props.onFocus() });
+	});
+	assert.equal(nodes(render({ url: selectedUrl })).find((node) => node.type === 'input').props.value, selectedUrl);
+});
 const input = (tree) => nodes(tree).find((node) => node.type === 'input');
 const picker = { pods: [], selected: 0, loading: false, error: null };
 
@@ -121,6 +164,20 @@ test('setup dialog accepts a manual URL and retains partial typing across redact
 	assert.equal(input(render({ url: '' })).props.value, 'https://', 'safe empty projections must not erase the local draft');
 	input(render({ url: '' })).props.onChange({ currentTarget: { value: 'https://custom.example/' } });
 	assert.deepEqual(actions.at(-1), { SetFunkwhalePodUrl: 'https://custom.example/' });
+});
+
+/** Esc from discovery is not a selection: an empty safe projection cannot erase a private partial URL. */
+test('cancelling pod discovery preserves the partial manual URL while restoring input focus', () => {
+	reset();
+	const initial = input(render());
+	initial.props.onFocus();
+	initial.props.onChange({ currentTarget: { value: 'https://partial-' } });
+	render({ url: '', picker: { pods: [], selected: 0, loading: true, error: null } });
+	render({ url: '' }, (tree) => {
+		const returned = input(tree);
+		returned.props.ref({ focus: () => returned.props.onFocus() });
+	});
+	assert.equal(input(render({ url: '' })).props.value, 'https://partial-');
 });
 
 test('manual setup controls save, clear, and cancel through explicit core actions', () => {
