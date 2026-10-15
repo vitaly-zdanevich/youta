@@ -13,7 +13,13 @@ const compiled = ts.transpileModule(source, {
 	compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX },
 }).outputText;
 const module = { exports: {} };
-const mockRequire = (name) => name === '../ipc' ? { dispatch: (action) => actions.push(action) } : require(name);
+const presentationSource = await readFile(new URL('./searchPresentation.ts', import.meta.url), 'utf8');
+const presentationModule = { exports: {} };
+new Function('require', 'module', 'exports', ts.transpileModule(presentationSource, {
+	compilerOptions: { module: ts.ModuleKind.CommonJS },
+}).outputText)(require, presentationModule, presentationModule.exports);
+const mockRequire = (name) => name === '../ipc' ? { dispatch: (action) => actions.push(action) }
+	: name === '../searchPresentation' ? presentationModule.exports : require(name);
 new Function('require', 'module', 'exports', compiled)(mockRequire, module, module.exports);
 
 /** Traverse actual JSX host elements without creating a browser or mocking rendering decisions. */

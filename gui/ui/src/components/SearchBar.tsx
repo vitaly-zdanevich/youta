@@ -1,5 +1,7 @@
 import type { ViewModel } from "../contract";
+import type { MouseEvent, KeyboardEvent, ReactNode } from 'react';
 import { dispatch } from "../ipc";
+import { searchEditorVisible } from '../searchPresentation';
 
 /**
  * How many bytes Rust spends on one code point.
@@ -32,6 +34,21 @@ export function splitAtByte(text: string, byte: number): [string, string] {
   return [text.slice(0, index), text.slice(index)];
 }
 
+/** Search controls surrender focus and consume activation before global playback shortcuts. */
+export function SearchButton({ children, className }: { children: ReactNode; className: string }) {
+	const activate = (event: MouseEvent<HTMLButtonElement> | KeyboardEvent<HTMLButtonElement>) => {
+		event.currentTarget.blur();
+		void dispatch('BeginSearch');
+	};
+	return <button type='button' className={className} onClick={activate}
+		onKeyDown={(event) => {
+			if (event.ctrlKey || event.altKey || event.metaKey || (event.key !== 'Enter' && event.key !== ' ')) return;
+			event.preventDefault();
+			event.stopPropagation();
+			if (!event.repeat) activate(event);
+		}}>{children}</button>;
+}
+
 /**
  * The query editor for a screen that collects one.
  *
@@ -57,14 +74,27 @@ export function SearchBar({
 	const web = view.screen === 'Web';
 	// Web opens an address; appending the tab label would read "Open URL Web".
 	const placeholder = web ? verb : `${verb} ${label}`;
+	const editorVisible = searchEditorVisible(view);
+	const loading = view.search_activity === view.screen
+		|| (view.screen === 'Search' && view.search_activity === 'YouTube')
+		|| (view.screen === 'TrackerMusic' && view.search_activity === 'TrackerArchives');
+	const backAvailable = view.screen === 'ArchiveOrg' ? view.archive_org_back_available
+		: view.screen === 'SoundCloud' ? view.soundcloud_back_available
+			: view.screen === 'Funkwhale' && view.funkwhale_back_available;
+	const routeLabel = view.screen === 'YandexMusic'
+		? { Recommendations: 'My Wave', Album: 'Album', Artist: 'Artist', Search: '' }[view.yandex_music_route]
+		: '';
+	const compactSearch = !editorVisible && ((view.rows?.length ?? 0) > 0 || view.details != null);
+	const hasControls = web || view.screen === 'Search' || view.screen === 'Funkwhale' || backAvailable || compactSearch;
+	if (!editorVisible && !hasControls && !loading && !routeLabel) return null;
 
   return (
     <div
-      role="search"
-      aria-label={placeholder}
+      role={editorVisible ? 'search' : 'toolbar'}
+      aria-label={editorVisible ? placeholder : `${label} controls`}
       className="flex items-center gap-[9px] border-b border-line bg-surface px-[13px] py-[7px]"
     >
-      <span aria-hidden className="text-[13px] text-ink-faint">
+      {editorVisible ? <><span aria-hidden className="text-[13px] text-ink-faint">
         ⌕
       </span>
       <div
@@ -96,7 +126,8 @@ export function SearchBar({
         ) : (
           view.search_query
         )}
-      </div>
+      </div></> : routeLabel ? <span className='flex-1 text-[13px] text-ink-dim'>{routeLabel}</span> : null}
+		{compactSearch ? <SearchButton className='shrink-0 rounded-[5px] px-[8px] py-[3px] text-[11px] text-accent focus-visible:outline-2 focus-visible:outline-accent'>Search</SearchButton> : null}
 		{/* Search and Subscriptions share the same saved Shorts preference. */}
 		{view.screen === 'Funkwhale' ? (
 			<button type='button' disabled={view.search_editing}
@@ -135,23 +166,19 @@ export function SearchBar({
 			</button>
 		</>
       ) : null}
-			{view.screen === 'ArchiveOrg' || view.screen === 'SoundCloud' ? (
-				<>
-					{view.search_activity === view.screen ? (
-						<span role='status' aria-label={`Loading ${label}`} className='animate-spin text-accent'>◌</span>
-					) : null}
-					{(view.screen === 'ArchiveOrg' ? view.archive_org_back_available : view.soundcloud_back_available) ? (
+			{loading && !web ? (
+				<span role='status' aria-label={`Loading ${label}`} className='animate-spin text-accent'>◌</span>
+			) : null}
+					{backAvailable ? (
 						<button type='button' disabled={view.search_editing} onClick={() => void dispatch('GoBack')} className='shrink-0 text-[11px] text-accent disabled:opacity-50'>
 							[Esc] Back
 						</button>
 					) : null}
-				</>
-			) : null}
-      <span className="shrink-0 text-[11px] whitespace-nowrap text-ink-faint">
+      {editorVisible ? <span className="shrink-0 text-[11px] whitespace-nowrap text-ink-faint">
         {view.search_editing
           ? `Enter to ${verb.toLowerCase()} · Esc to cancel`
           : "Press /"}
-      </span>
+      </span> : null}
     </div>
   );
 }

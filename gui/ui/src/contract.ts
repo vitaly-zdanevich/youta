@@ -1064,6 +1064,8 @@ export interface ViewModel {
 	youtube_channel_browsing: boolean;
   playback_history_enabled: boolean;
   search_editing: boolean;
+	/** Non-search Yandex routes retain their own meaningful context instead of empty guidance. */
+	yandex_music_route: 'Recommendations' | 'Search' | 'Album' | 'Artist';
 	/** Active provider/directory request, including the session-only Web browser. */
 	search_activity: string | null;
   search_query: string;
@@ -1142,6 +1144,8 @@ export interface ViewModel {
 	unsubscribe_popup: UnsubscribePopupView | null;
   queue_popup: QueuePopupView | null;
   local_file_popup: LocalFilePopupView | null;
+	/** Presence only: command text remains inside the native reducer. */
+	local_command_open?: boolean;
 	local_file_progress: LocalFileProgressView | null;
 	custom_command_buttons?: CustomCommandButtonView[];
 	custom_command_output?: CustomCommandOutputView | null;

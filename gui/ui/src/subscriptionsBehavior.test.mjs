@@ -85,6 +85,7 @@ async function channelRouteTree(screen, browsing) {
 	const appModule = { exports: {} };
 	const appRequire = (name) => {
 		if (name === 'react') return { ...React, useEffect: () => {}, useRef: (current) => ({ current }), useCallback: (fn) => fn };
+		if (name === './searchPresentation') return { emptySearchPromptVisible: () => false };
 		if (name === './useYouta') return { useYouta: () => ({ view, sources: [
 			{ id: 'Search', label: 'YouTube', search_verb: 'Search', details_kind: 'Video' },
 			{ id: 'Subscriptions', label: 'Subs', search_verb: null, details_kind: 'Video' },

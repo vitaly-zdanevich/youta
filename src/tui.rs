@@ -1318,32 +1318,42 @@ fn run_with_input(
 /// narrow panes, playback/download rows, the search heading and catalogue controls;
 /// one additional result row is reserved for explicit continuation. Tiny terminals
 /// still request one item, and the controller applies the provider's safety ceiling.
+#[cfg(test)]
 fn archive_org_search_page_capacity(area: Rect, view: &ViewModel) -> usize {
-    source_search_page_capacity(area, view, Screen::ArchiveOrg)
+    source_search_page_capacities(area, view, Screen::ArchiveOrg).for_query(&view.search_query)
 }
 
 /// Measures SoundCloud's compact rows after reserving its playback-control footer.
+#[cfg(test)]
 fn soundcloud_search_page_capacity(area: Rect, view: &ViewModel) -> usize {
-    source_search_page_capacity(area, view, Screen::SoundCloud)
+    source_search_page_capacities(area, view, Screen::SoundCloud).for_query(&view.search_query)
 }
 
 /// Shares the renderer's exact source geometry and reserves one continuation row.
-fn source_search_page_capacity(area: Rect, view: &ViewModel, screen: Screen) -> usize {
+fn source_search_page_capacities(
+    area: Rect,
+    view: &ViewModel,
+    screen: Screen,
+) -> SearchPageCapacities {
     let body = main_frame_sections(area, view)[1];
     let pane = main_body_panes(body)[0];
     let (list, _) = main_list_pane_areas(pane, screen);
-    let rows = main_panel_content_area(list, true);
-    usize::from(rows.height.saturating_sub(1)).max(1)
+    let capacity = |heading| {
+        let rows = main_panel_content_area(list, heading);
+        usize::from(rows.height.saturating_sub(1)).max(1)
+    };
+    SearchPageCapacities {
+        with_heading: capacity(true),
+        without_heading: capacity(false),
+    }
 }
 
 /// Publishes available result slots before an initial tick or search action can fetch a page.
 fn synchronize_search_page_capacities(controller: &mut impl UiController, area: Rect) {
-    let capacity = archive_org_search_page_capacity(area, controller.view());
-    controller.set_archive_org_search_page_capacity(capacity);
-    let capacity = soundcloud_search_page_capacity(area, controller.view());
-    controller.set_soundcloud_search_page_capacity(capacity);
-    let capacity = source_search_page_capacity(area, controller.view(), Screen::Funkwhale);
-    controller.set_funkwhale_search_page_capacity(capacity);
+    for screen in [Screen::ArchiveOrg, Screen::SoundCloud, Screen::Funkwhale] {
+        let capacities = source_search_page_capacities(area, controller.view(), screen);
+        controller.set_search_page_capacities(screen, capacities);
+    }
 }
 
 /// Applies the controller's live physical-TTY artwork preference.
@@ -3306,9 +3316,8 @@ fn active_tab_window(
 
 /// Builds a concise result-panel title without repeating the active tab label.
 ///
-/// Search screens retain the search kind while idle and show only the submitted
-/// query once results exist. Non-search screens rely on the active top tab and
-/// therefore do not consume a second row for a duplicate title.
+/// An empty inactive query yields its row to results. Editing, submitted queries,
+/// loading indicators and meaningful browse-route titles remain visible.
 fn search_panel_title(view: &ViewModel) -> String {
     if !view.search_editing {
         // Which screens collect a query is not restated here: the window asks
@@ -3319,6 +3328,16 @@ fn search_panel_title(view: &ViewModel) -> String {
         // Radio filters as the user types, so an idle empty filter says nothing
         // the tab has not already said.
         if view.screen == Screen::Radio && view.search_query.trim().is_empty() {
+            return String::new();
+        }
+        if view.screen.search_verb() == Some("Search")
+            && view.search_query.trim().is_empty()
+            && (view.screen != Screen::YandexMusic
+                || view.yandex_music_route == YandexMusicRouteView::Search)
+            && !view
+                .search_activity
+                .is_some_and(|activity| activity.screen() == view.screen)
+        {
             return String::new();
         }
     }
@@ -3404,6 +3423,84 @@ fn search_panel_title(view: &ViewModel) -> String {
     } else {
         search_title
     }
+}
+
+/// Whether the empty main body can offer search rather than browsing guidance.
+fn empty_search_prompt_visible(view: &ViewModel) -> bool {
+    if view.screen.search_verb() != Some("Search")
+        || (view.screen == Screen::YandexMusic
+            && view.yandex_music_route != YandexMusicRouteView::Search)
+        || view.search_editing
+        || view.search_activity.is_some()
+        || !view.rows.is_empty()
+        || view.details.is_some()
+        || view.right_panel_mode != RightPanelMode::Details
+        || view.help_open
+        || view.site_file_popup.is_some()
+        || view.audio_quality_popup.is_some()
+        || view.video_summary_popup.is_some()
+        || view.project_history_popup.is_some()
+        || view.youtube_setup_popup.is_some()
+        || view.yandex_music_setup_popup.is_some()
+        || view.funkwhale_setup_popup.is_some()
+        || view.rss_subscription_popup.is_some()
+        || view.unsubscribe_popup.is_some()
+        || view.preferences_popup.is_some()
+        || view.playlist_popup.is_some()
+        || view.queue_popup.is_some()
+        || view.private_note_popup.is_some()
+        || view.bug_report_popup.is_some()
+        || view.local_file_popup.is_some()
+        || view.local_file_progress.is_some()
+        || view.download_choice_popup.is_some()
+        || view.archive_playback_choice_popup.is_some()
+        || view.download_queue_popup.is_some()
+        || view.video_comments_popup.is_some()
+        || view.error_popup.is_some()
+    {
+        return false;
+    }
+    #[cfg(feature = "ascii-visualizer")]
+    if view.ascii_visualizer.is_some() {
+        return false;
+    }
+    #[cfg(feature = "cmd")]
+    if view.local_command.is_some() || view.custom_command_output.is_some() {
+        return false;
+    }
+    #[cfg(feature = "yt-dlp")]
+    if view.channel_download_popup.is_some() {
+        return false;
+    }
+    #[cfg(feature = "youtube-captions")]
+    if view.youtube_captions_popup.is_some() {
+        return false;
+    }
+    #[cfg(feature = "commons-upload")]
+    if view.commons_upload_popup.is_some() || view.commons_credentials_popup.is_some() {
+        return false;
+    }
+    #[cfg(feature = "evernote")]
+    if view.evernote_popup.is_some() || view.evernote_credentials_popup.is_some() {
+        return false;
+    }
+    #[cfg(feature = "s3-upload")]
+    if view.s3_upload_popup.is_some() || view.s3_credentials_popup.is_some() {
+        return false;
+    }
+    #[cfg(feature = "archive-upload")]
+    if view.archive_upload_popup.is_some() || view.archive_credentials_popup.is_some() {
+        return false;
+    }
+    #[cfg(feature = "qr")]
+    if view.video_qr_popup.is_some() {
+        return false;
+    }
+    #[cfg(feature = "lan-sharing")]
+    if view.lan_share_popup.is_some() || view.podcast_feed_options_popup.is_some() {
+        return false;
+    }
+    true
 }
 
 /// Returns the playback-progress marker displayed independently of subscription state.
@@ -3581,6 +3678,17 @@ fn render_body(
 
     let search_title = search_panel_title(view);
     let (list_area, controls) = main_list_pane_areas(panes[0], view.screen);
+    let show_empty_prompt = empty_search_prompt_visible(view);
+    if show_empty_prompt && !area.is_empty() {
+        hit_map.rows =
+            render_main_panel_heading(frame, list_area, search_title.trim(), theme.heading);
+        frame.render_widget(
+            Paragraph::new("To search, press /")
+                .alignment(Alignment::Center)
+                .style(theme.base),
+            Rect::new(area.x, area.y + area.height / 2, area.width, 1),
+        );
+    }
     if view.screen == Screen::Web {
         render_web_controls(frame, controls, show_hotkeys, view.autoplay, theme, hit_map);
     } else if matches!(
@@ -3595,6 +3703,9 @@ fn render_body(
             | Screen::Local
     ) {
         render_catalog_playback_controls(frame, controls, view, show_hotkeys, theme, hit_map);
+    }
+    if show_empty_prompt {
+        return;
     }
     hit_map.rows_row_height = row_list_height(&view.rows);
     (hit_map.rows, hit_map.rows_first_index) = render_row_list(
@@ -18845,9 +18956,9 @@ for encoded, expected in json.load(sys.stdin):
     #[test]
     fn top_left_panel_titles_do_not_repeat_the_active_tab() {
         let mut view = ViewModel::default();
-        assert_eq!(search_panel_title(&view), " Video search ");
+        assert_eq!(search_panel_title(&view), "");
         view.search_kind = SearchKind::Channels;
-        assert_eq!(search_panel_title(&view), " Channel search ");
+        assert_eq!(search_panel_title(&view), "");
 
         for screen in [
             Screen::YouTubeMusic,
@@ -18863,7 +18974,7 @@ for encoded, expected in json.load(sys.stdin):
             view.search_query.clear();
             assert_eq!(
                 search_panel_title(&view),
-                " Search ",
+                "",
                 "{screen:?} must not repeat its source name"
             );
             view.search_query = "fixture query".to_owned();
@@ -18932,7 +19043,7 @@ for encoded, expected in json.load(sys.stdin):
         ] {
             view.yandex_music_search_kind = kind;
             view.search_query.clear();
-            assert_eq!(search_panel_title(&view), format!(" {title} search "));
+            assert_eq!(search_panel_title(&view), "");
 
             view.search_query = "fixture query".to_owned();
             assert_eq!(
@@ -18974,6 +19085,115 @@ for encoded, expected in json.load(sys.stdin):
     #[test]
     fn yandex_music_search_defaults_to_the_complete_catalogue() {
         assert_eq!(YandexMusicSearchKind::default().label(), "all");
+    }
+
+    /// Empty search guidance uses the complete body, not one of the two list/detail panes.
+    #[test]
+    fn empty_search_prompt_is_centered_without_consuming_a_heading_row() {
+        for (width, height) in [(120, 24), (60, 24)] {
+            for query in ["", "missing fixture"] {
+                let view = ViewModel {
+                    screen: Screen::ArchiveOrg,
+                    search_query: query.to_owned(),
+                    ..ViewModel::default()
+                };
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                let mut hits = HitMap::default();
+                terminal
+                    .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hits))
+                    .unwrap();
+                let body = main_frame_sections(Rect::new(0, 0, width, height), &view)[1];
+                let text = "To search, press /";
+                let y = body.y + body.height / 2;
+                let x = body.x + body.width.saturating_sub(text.len() as u16) / 2;
+                let line = (x..x + text.len() as u16)
+                    .map(|column| terminal.backend().buffer()[(column, y)].symbol())
+                    .collect::<String>();
+                assert_eq!(line, text, "{width}x{height}, query={query:?}");
+                assert!(!rendered_text(&terminal).contains("Nothing found"));
+                assert_eq!(search_panel_title(&view).is_empty(), query.is_empty());
+                assert!(view.rows.is_empty());
+                assert!(!hits.detail_buttons.iter().any(|(action, _)| matches!(
+                    action,
+                    UiAction::OpenSelectedArtist | UiAction::OpenVideoComments
+                )));
+                assert!(hits.detail_links.is_empty());
+            }
+        }
+    }
+
+    /// Real work, selection and source-specific browsing must not be covered by empty guidance.
+    #[test]
+    fn empty_search_prompt_preserves_loading_details_errors_and_browse_routes() {
+        let base = ViewModel::default();
+        assert!(empty_search_prompt_visible(&base));
+        for view in [
+            ViewModel {
+                search_editing: true,
+                ..base.clone()
+            },
+            ViewModel {
+                search_activity: Some(crate::view::SearchActivity::YouTube),
+                ..base.clone()
+            },
+            ViewModel {
+                rows: vec![RowView::default()],
+                ..base.clone()
+            },
+            ViewModel {
+                details: Some(DetailView::default()),
+                ..base.clone()
+            },
+            ViewModel {
+                help_open: true,
+                ..base.clone()
+            },
+            ViewModel {
+                error_popup: Some(ErrorPopupView::default()),
+                ..base.clone()
+            },
+            ViewModel {
+                screen: Screen::Local,
+                ..base.clone()
+            },
+            ViewModel {
+                screen: Screen::Web,
+                ..base.clone()
+            },
+            ViewModel {
+                screen: Screen::Radio,
+                ..base.clone()
+            },
+            ViewModel {
+                screen: Screen::YandexMusic,
+                yandex_music_route: YandexMusicRouteView::Artist,
+                ..base.clone()
+            },
+            ViewModel {
+                screen: Screen::YandexMusic,
+                yandex_music_route: YandexMusicRouteView::Album,
+                ..base.clone()
+            },
+            ViewModel {
+                screen: Screen::YandexMusic,
+                yandex_music_route: YandexMusicRouteView::Recommendations,
+                ..base.clone()
+            },
+        ] {
+            assert!(!empty_search_prompt_visible(&view), "{view:?}");
+        }
+        let loading = ViewModel {
+            search_activity: Some(crate::view::SearchActivity::YouTube),
+            ..base.clone()
+        };
+        assert!(!search_panel_title(&loading).is_empty());
+        assert!(
+            search_panel_title(&ViewModel {
+                search_editing: true,
+                ..base
+            })
+            .contains("Search: |")
+        );
     }
 
     #[test]
@@ -19696,6 +19916,7 @@ for encoded, expected in json.load(sys.stdin):
         let playing = MediaId::new(crate::domain::SourceKind::YouTube, "playing");
         let selected = MediaId::new(crate::domain::SourceKind::YouTube, "selected");
         let mut view = ViewModel {
+            search_query: "fixture".to_owned(),
             rows: vec![
                 RowView {
                     media_id: Some(playing.clone()),
@@ -19837,6 +20058,7 @@ for encoded, expected in json.load(sys.stdin):
         let mut terminal = Terminal::new(backend).expect("terminal");
         let playing = MediaId::new(SourceKind::YouTube, "playing-vertical");
         let view = ViewModel {
+            search_query: "fixture".to_owned(),
             rows: vec![
                 RowView {
                     media_id: Some(playing.clone()),
@@ -20370,6 +20592,7 @@ for encoded, expected in json.load(sys.stdin):
         let backend = TestBackend::new(120, 16);
         let mut terminal = Terminal::new(backend).expect("terminal");
         let view = ViewModel {
+            search_query: "fixture".to_owned(),
             rows: vec![
                 RowView {
                     title: "Selected channel source".to_owned(),
@@ -20746,7 +20969,10 @@ for encoded, expected in json.load(sys.stdin):
             } else {
                 past_color
             };
-            let mut view = ViewModel::default();
+            let mut view = ViewModel {
+                search_query: "fixture".to_owned(),
+                ..ViewModel::default()
+            };
             for (title, was_live, live, started) in [
                 ("Selected past stream", true, false, true),
                 ("Past stream", true, false, false),
@@ -20862,6 +21088,7 @@ for encoded, expected in json.load(sys.stdin):
         let backend = TestBackend::new(100, 10);
         let mut terminal = Terminal::new(backend).expect("terminal");
         let view = ViewModel {
+            search_query: "fixture".to_owned(),
             rows: vec![RowView {
                 media_id: Some(MediaId::new(crate::domain::SourceKind::YouTube, "selected")),
                 title: "Selected row".to_owned(),
@@ -20899,6 +21126,7 @@ for encoded, expected in json.load(sys.stdin):
         let backend = TestBackend::new(100, 12);
         let mut terminal = Terminal::new(backend).expect("terminal");
         let view = ViewModel {
+            search_query: "fixture".to_owned(),
             rows: vec![
                 RowView {
                     media_id: Some(MediaId::new(SourceKind::YouTube, "unwatched")),
@@ -21181,6 +21409,7 @@ for encoded, expected in json.load(sys.stdin):
         let backend = TestBackend::new(100, 8);
         let mut terminal = Terminal::new(backend).expect("terminal");
         let view = ViewModel {
+            search_query: "fixture".to_owned(),
             rows: vec![
                 RowView {
                     title: "Selected channel source".to_owned(),
@@ -21236,6 +21465,7 @@ for encoded, expected in json.load(sys.stdin):
         let backend = TestBackend::new(100, 10);
         let mut terminal = Terminal::new(backend).expect("terminal");
         let view = ViewModel {
+            search_query: "fixture".to_owned(),
             physical_linux_console: true,
             rows: vec![
                 RowView {
@@ -21357,7 +21587,7 @@ for encoded, expected in json.load(sys.stdin):
                 "main panes must not render the {border} box-border glyph"
             );
         }
-        assert!(rendered.contains("Video search"));
+        assert!(!rendered.contains("Video search"));
         assert!(!rendered.contains("YouTube video search"));
         assert!(rendered.contains("Borderless result"));
         assert!(rendered.contains("Borderless details content"));
@@ -21368,7 +21598,7 @@ for encoded, expected in json.load(sys.stdin):
                 .all(|(action, _)| action != &UiAction::ToggleTextSelectionMode),
             "text selection must not consume right-panel space"
         );
-        assert_eq!(hit_map.rows.y, 1);
+        assert_eq!(hit_map.rows.y, 0);
         assert_eq!(hit_map.rows.bottom(), buffer.area.bottom() - 1);
         assert_eq!(hit_map.rows.right(), hit_map.details_panel.x);
         assert_eq!(
@@ -22164,11 +22394,11 @@ for encoded, expected in json.load(sys.stdin):
         }
         assert_eq!(
             archive_org_search_page_capacity(Rect::new(0, 0, 120, 24), &ViewModel::default()),
-            17
+            18
         );
         assert_eq!(
             archive_org_search_page_capacity(Rect::new(0, 0, 120, 80), &ViewModel::default()),
-            73
+            74
         );
         assert_eq!(
             archive_org_search_page_capacity(Rect::default(), &ViewModel::default()),
@@ -22402,6 +22632,75 @@ for encoded, expected in json.load(sys.stdin):
         synchronize_search_page_capacities(&mut controller, Rect::new(0, 0, 120, 80));
         controller.dispatch(UiAction::SubmitSearch);
         assert_eq!(controller.observed, [17, 73]);
+    }
+
+    /// Dormant providers receive both layouts instead of inheriting the active tab's query.
+    #[test]
+    fn source_search_capacities_preserve_empty_recent_and_nonempty_query_geometry() {
+        #[derive(Default)]
+        struct Controller {
+            view: ViewModel,
+            capacities: Vec<(Screen, SearchPageCapacities)>,
+        }
+        impl UiController for Controller {
+            fn view(&self) -> &ViewModel {
+                &self.view
+            }
+            fn dispatch(&mut self, _: UiAction) {}
+            fn tick(&mut self) {}
+            fn set_search_page_capacities(
+                &mut self,
+                screen: Screen,
+                capacities: SearchPageCapacities,
+            ) {
+                self.capacities.push((screen, capacities));
+            }
+        }
+        for query in ["", "another provider's query"] {
+            let mut controller = Controller {
+                view: ViewModel {
+                    screen: Screen::Local,
+                    search_query: query.to_owned(),
+                    ..ViewModel::default()
+                },
+                ..Controller::default()
+            };
+            synchronize_search_page_capacities(&mut controller, Rect::new(0, 0, 120, 24));
+            for (screen, capacities) in controller.capacities {
+                assert_eq!(
+                    capacities,
+                    SearchPageCapacities {
+                        with_heading: 17,
+                        without_heading: 18
+                    }
+                );
+                for own_query in ["", "submitted fixture"] {
+                    let capacity = capacities.for_query(own_query);
+                    let view = ViewModel {
+                        screen,
+                        search_query: own_query.to_owned(),
+                        rows: (0..=capacity)
+                            .map(|_| RowView {
+                                compact: true,
+                                title: "row".to_owned(),
+                                ..RowView::default()
+                            })
+                            .collect(),
+                        ..ViewModel::default()
+                    };
+                    let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+                    let mut hits = HitMap::default();
+                    terminal
+                        .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hits))
+                        .unwrap();
+                    assert_eq!(
+                        usize::from(hits.rows.height),
+                        capacity + 1,
+                        "{screen:?}, own query={own_query:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

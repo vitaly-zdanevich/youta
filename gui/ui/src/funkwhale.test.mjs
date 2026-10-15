@@ -51,6 +51,7 @@ async function load(relative) {
 	const mockRequire = (name) => {
 		if (name === 'react') return hooks;
 		if (name === '../ipc') return { dispatch: (action) => actions.push(action) };
+		if (name === '../searchPresentation') return searchPresentation;
 		if (name === './popups') return { LAYER: { credentialEditor: 2 } };
 		if (name === '@radix-ui/react-dialog') return Object.fromEntries(['Root', 'Portal', 'Content', 'Title']
 			.map((name) => [name, ({ children, ...props }) => React.createElement('div', props, children)]));
@@ -65,6 +66,7 @@ async function load(relative) {
 	return module.exports;
 }
 
+const searchPresentation = await load('./searchPresentation.ts');
 const component = await load('./components/FunkwhaleSetupPopup.tsx');
 const search = await load('./components/SearchBar.tsx');
 const tabs = await load('./components/Tabs.tsx');

@@ -6,7 +6,7 @@ import { ArtworkPopup } from './components/ArtworkPopup';
 import { DownloadBar } from "./components/DownloadBar";
 import { Player } from "./components/Player";
 import { ROW_HEIGHT, RowList } from "./components/RowList";
-import { SearchBar } from "./components/SearchBar";
+import { SearchBar, SearchButton } from "./components/SearchBar";
 import { Subscriptions } from "./components/Subscriptions";
 import { Tabs } from "./components/Tabs";
 import { Waveform } from "./components/Waveform";
@@ -49,6 +49,7 @@ import {
 } from "./components/popups";
 import { namedKey } from "./keys";
 import { openBugReport, sendKey } from './ipc';
+import { emptySearchPromptVisible } from './searchPresentation';
 import { popupGeometry } from "./popupGeometry";
 import { subscriptionPageRows } from "./subscriptionPageRows";
 import { useYouta } from "./useYouta";
@@ -200,11 +201,9 @@ export function App() {
         {/* Only where the reducer accepts a query; the catalogue says which
             screens those are, so this window never offers a field whose Enter
             would answer "search is not available on this screen". */}
-        {active?.search_verb == null ? (
-          <span />
-        ) : (
+        <div>{active?.search_verb == null ? null : (
           <SearchBar view={view} verb={active.search_verb} label={active.label} />
-        )}
+        )}</div>
 
         {onSubscriptions ? (
 		<div ref={body} data-subscriptions-screen className="grid min-h-0">
@@ -217,8 +216,15 @@ export function App() {
           </div>
         ) : (
           <main ref={body} className="grid min-h-0 grid-cols-[minmax(0,1.3fr)_minmax(0,1fr)]">
+            {emptySearchPromptVisible(view) ? (
+				<SearchButton
+					className='col-span-2 flex items-center justify-center text-[13px] text-ink-dim focus-visible:outline-2 focus-visible:outline-accent'>
+					To search, press /
+				</SearchButton>
+			) : <>
             <RowList rows={view.rows} selected={view.selected} playing={view.playing_media_id} />
             {details}
+			</>}
           </main>
         )}
 

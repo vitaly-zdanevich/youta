@@ -405,7 +405,7 @@
 				autoplay: enabled, repeating: enabled,
 				subscriptions: { ...view.subscriptions, show_youtube_shorts: enabled } });
 			const shorts = await until(() => {
-				const search = document.querySelector('[role=search]');
+				const search = document.querySelector('[role=toolbar]');
 				return search && button(`[h] Shorts: ${enabled ? 'on' : 'off'}`, search);
 			}, 'YouTube search Shorts state');
 			assert(shorts.getAttribute('aria-pressed') === String(enabled) && !shorts.disabled,
@@ -814,11 +814,11 @@
 		assert(tabs.indexOf('SoundCloud') === tabs.indexOf('YT Music') + 1, 'SoundCloud follows YT Music in the source catalogue');
 		await action({ ShowScreen: 'SoundCloud' }, () => button('SoundCloud').click(), 'SoundCloud tab selects its shared reducer screen');
 		snapshot({ screen: 'SoundCloud', search_query: '', rows: [], details: null });
-		await until(() => document.querySelector('[title="Search SoundCloud"]'), 'SoundCloud search');
-		await action('BeginSearch', () => document.querySelector('[title="Search SoundCloud"]')
-			.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })), 'SoundCloud search enters the shared query editor');
+		await until(() => button('To search, press /'), 'SoundCloud empty search prompt');
+		assert(!document.querySelector('[role=search]'), 'SoundCloud idle empty query does not waste an editor row');
+		await action('BeginSearch', () => button('To search, press /').click(), 'SoundCloud empty prompt enters the shared query editor');
 		snapshot({ search_editing: true, search_query: 'ambient', search_cursor_byte: 7 });
-		await until(() => document.querySelector('[role=search]').textContent.includes('ambient'), 'SoundCloud query snapshot');
+		await until(() => document.querySelector('[role=search]')?.textContent.includes('ambient'), 'SoundCloud query snapshot');
 		await key('Enter', 'Enter');
 		const track = { ...row('SoundCloud fixture track', { source: 'sound-cloud', external_id: 'https://soundcloud.com/artist/track' }), source: 'SoundCloud' };
 		snapshot({ search_editing: false, rows: [track] });
@@ -852,7 +852,7 @@
 		await checkSoundCloudArtworkOwnership(trackDetails);
 		await checkSoundCloudNavigation(trackDetails);
 		snapshot(previous);
-		await until(() => document.querySelector('[title="Search archive.org"]'), 'restored Archive fixture');
+		await until(() => button('To search, press /'), 'restored Archive fixture');
 	}
 
 	/** Author, artist and tag navigation remain internal shared actions, without a browser opener. */
@@ -1404,7 +1404,21 @@
 	}
 
 	async function run() {
-		await until(() => document.querySelector('[title="Search archive.org"]'), 'Archive search');
+		const prompt = await until(() => button('To search, press /'), 'Archive empty search prompt');
+		const main = document.querySelector('main').getBoundingClientRect();
+		const bounds = prompt.getBoundingClientRect();
+		assert(Math.abs(bounds.left - main.left) < 1 && Math.abs(bounds.right - main.right) < 1,
+			'Empty search guidance spans both list and details columns');
+		assert(!document.querySelector('[role=search]'), 'Idle empty search hides the unused query field');
+		for (const activationKey of ['Enter', ' ']) {
+			prompt.focus();
+			const start = calls.length;
+			const event = new KeyboardEvent('keydown', { key: activationKey, bubbles: true, cancelable: true });
+			await action('BeginSearch', () => prompt.dispatchEvent(event), 'Centered prompt keyboard activation begins search');
+			assert(event.defaultPrevented && document.activeElement !== prompt
+				&& !calls.slice(start).some((call) => call.command === 'key'),
+				'Prompt activation relinquishes focus and never falls through to playback shortcuts');
+		}
 		await checkBugReportComposer();
 		await checkSoundCloudTab();
 		const beforeTabMarkers = clone(view);
@@ -1439,12 +1453,11 @@
 		assert(!button('[Esc] Back'), 'Archive root hides Back when no return route exists');
 		const tabs = [...document.querySelectorAll('[aria-label=Sources] button')].map((node) => node.textContent);
 		assert(tabs.indexOf('archive.org') < tabs.indexOf('LibriVox'), 'Archive tab preserves source catalogue order');
-		await action('BeginSearch', () => document.querySelector('[title="Search archive.org"]')
-			.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })), 'Search click enters the shared editor');
+		await action('BeginSearch', () => button('To search, press /').click(), 'Empty search prompt enters the shared editor');
 		snapshot({ search_editing: true });
 		await key('f', { Char: 'f' });
 		snapshot({ search_query: 'fixture', search_cursor_byte: 7 });
-		await until(() => document.querySelector('[role=search]').textContent.includes('fixture'), 'query snapshot');
+		await until(() => document.querySelector('[role=search]')?.textContent.includes('fixture'), 'query snapshot');
 		await key('Enter', 'Enter');
 		snapshot({ search_editing: false, search_activity: 'ArchiveOrg' });
 		await until(() => document.querySelector('[aria-label="Loading archive.org"]'), 'loading status');

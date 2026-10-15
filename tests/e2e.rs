@@ -14,6 +14,11 @@ const TUI_READINESS_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 #[cfg(all(target_os = "linux", feature = "tui"))]
 const TUI_READINESS_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 
+/// The idle source footer exists even when an empty search row is hidden.
+/// A single word avoids cursor escapes between spaces in raw terminal transcripts.
+#[cfg(all(target_os = "linux", feature = "tui"))]
+const TUI_IDLE_READINESS: &str = "Autoplay:";
+
 /// Waits for a flushed pseudo-terminal transcript to contain `expected`.
 ///
 /// The bounded poll replaces startup and rendering timing guesses. It tolerates
@@ -349,7 +354,7 @@ fn tui_missing_provider_opens_setup_with_storage_location() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("launch Youta in a pseudo-terminal");
-    wait_for_transcript_text(&transcript, "Video search");
+    wait_for_transcript_text(&transcript, TUI_IDLE_READINESS);
     let input = child.stdin.as_mut().expect("pseudo-terminal input");
     input.write_all(b"/ambient focus\r").expect("submit search");
     input.flush().expect("flush search");
@@ -485,7 +490,7 @@ fn tui_colon_opens_command_prompt_on_idle_youtube_without_selection() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("launch idle YouTube in a pseudo-terminal");
-    wait_for_text_file(&transcript, "Video search", "terminal transcript");
+    wait_for_text_file(&transcript, TUI_IDLE_READINESS, "terminal transcript");
     let input = child.stdin.as_mut().expect("pseudo-terminal input");
     input.write_all(b":").expect("open global command prompt");
     input.flush().expect("flush command shortcut");
@@ -564,7 +569,7 @@ fn tui_subscriptions_openers_and_preferences_persist_end_to_end() {
         &first_transcript,
         &opened_links,
         None,
-        "Video search",
+        TUI_IDLE_READINESS,
         &[
             (b"S", 300),
             // Both opener hotkeys must be accepted while the first helper is
@@ -756,7 +761,7 @@ fn tui_error_popup_runs_copy_browser_review_and_confirmed_submission_actions() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("launch Youta in a pseudo-terminal");
-    wait_for_transcript_text(&transcript, "Video search");
+    wait_for_transcript_text(&transcript, TUI_IDLE_READINESS);
     let input = child.stdin.as_mut().expect("pseudo-terminal input");
     input
         .write_all(b"/https://media.example.test/fixture.opus\r")
@@ -944,7 +949,7 @@ exec "$YOUTA_TEST_BINARY" --config-dir "$YOUTA_TEST_CONFIG_DIR" tui
         .stderr(Stdio::piped())
         .spawn()
         .expect("launch isolated report PTY");
-    wait_for_text_file(&transcript, "Video search", "terminal transcript");
+    wait_for_text_file(&transcript, TUI_IDLE_READINESS, "terminal transcript");
     let initial_tty = fs::read_to_string(&tty_log).expect("initial PTY termios");
     assert!(
         initial_tty
@@ -1044,7 +1049,7 @@ exec "$YOUTA_TEST_BINARY" --config-dir "$YOUTA_TEST_CONFIG_DIR" tui
         .expect("default-checked screenshot")
         .1;
     assert!(
-        screenshot.contains("Video search"),
+        screenshot.contains("[A] Autoplay:") && screenshot.contains("[~] Repeat:"),
         "the screenshot must describe the pre-composer screen"
     );
     assert!(!screenshot.contains("TTY manual report fixture"));
