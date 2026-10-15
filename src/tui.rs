@@ -3888,7 +3888,8 @@ fn render_row_list(
             } else {
                 row_style
             };
-            let show_watched_marker = has_playback_progress && !youtube_video_title;
+            // The current item's transport icon replaces only its listening-state circle.
+            let show_watched_marker = has_playback_progress && !youtube_video_title && !playing;
             // Dedicated YouTube searches use visible markers; mixed-source lists keep slots.
             let tight_youtube_music_prefix = !row.compact
                 && matches!(source_labels, RowSourceLabels::YouTubeMusicSearch)
@@ -19611,6 +19612,184 @@ for encoded, expected in json.load(sys.stdin):
         }
     }
 
+    /// Transport icons replace only listening-state circles on the current media identity.
+    #[test]
+    fn playing_rows_omit_progress_circles_across_sources_without_losing_percentages() {
+        let sources = [
+            SourceKind::YouTube,
+            SourceKind::Rss,
+            SourceKind::ApplePodcasts,
+            SourceKind::Local,
+            SourceKind::WikimediaCommons,
+            SourceKind::ArchiveOrg,
+            SourceKind::LibriVox,
+            SourceKind::YandexMusic,
+            SourceKind::Bandcamp,
+            SourceKind::Odysee,
+            SourceKind::Rumble,
+            SourceKind::Bilibili,
+            SourceKind::PeerTube,
+            SourceKind::Funkwhale,
+            SourceKind::Vimeo,
+            SourceKind::RuTube,
+            SourceKind::SoundCloud,
+            SourceKind::Jamendo,
+            SourceKind::SoundStream,
+            SourceKind::LitRes,
+            SourceKind::BbcRadio,
+            SourceKind::ModArchive,
+            SourceKind::GenericYtDlp,
+            SourceKind::Vk,
+            SourceKind::Telegram,
+            SourceKind::Radio,
+            SourceKind::RemoteFiles,
+            SourceKind::Other("future-provider".to_owned()),
+        ];
+        for source in sources {
+            let media_id = MediaId::new(source.clone(), "current-fixture");
+            for compact in [false, true] {
+                for source_labels in [RowSourceLabels::All, RowSourceLabels::Hidden] {
+                    for paused in [false, true] {
+                        for selected in [0, 1] {
+                            for (started, percent, marker) in [
+                                (false, 0, "●"),
+                                (true, 0, "◐"),
+                                (true, 42, "◐"),
+                                (true, 100, "○"),
+                            ] {
+                                let rows = [
+                                    RowView {
+                                        media_id: Some(media_id.clone()),
+                                        title: "Current item".to_owned(),
+                                        subtitle: "Creator · 3:32".to_owned(),
+                                        source: source.as_str().to_owned(),
+                                        playback_started: started,
+                                        watched_percent: percent,
+                                        compact,
+                                        ..RowView::default()
+                                    },
+                                    RowView {
+                                        media_id: Some(MediaId::new(
+                                            source.clone(),
+                                            "other-fixture",
+                                        )),
+                                        title: "Other item".to_owned(),
+                                        playback_started: started,
+                                        watched_percent: percent,
+                                        compact,
+                                        ..RowView::default()
+                                    },
+                                ];
+                                let mut terminal = Terminal::new(TestBackend::new(120, 4)).unwrap();
+                                terminal
+                                    .draw(|frame| {
+                                        let theme = Theme::new(false);
+                                        render_row_list(
+                                            frame,
+                                            frame.area(),
+                                            "",
+                                            &rows,
+                                            source_labels,
+                                            selected,
+                                            Some(&media_id),
+                                            paused,
+                                            None,
+                                            true,
+                                            theme.heading,
+                                            &theme,
+                                        );
+                                    })
+                                    .unwrap();
+                                let buffer = terminal.backend().buffer();
+                                let line = |y| {
+                                    (0..120)
+                                        .map(|x| buffer[(x, y)].symbol())
+                                        .collect::<String>()
+                                };
+                                let current = line(0);
+                                let prefix = current.split("Current item").next().unwrap();
+                                assert!(
+                                    !prefix.contains(['●', '◐', '○']),
+                                    "source={source:?}, compact={compact}, paused={paused}, selected={selected}, progress={percent}: {current}"
+                                );
+                                assert!(prefix.contains(if paused { "||" } else { "▶" }));
+                                let other = line(row_list_height(&rows));
+                                assert!(
+                                    other.split("Other item").next().unwrap().contains(marker),
+                                    "Nonplaying rows must retain their listening state: {other}"
+                                );
+                                if percent > 0 {
+                                    let metadata = if compact { current } else { line(1) };
+                                    assert!(
+                                        metadata.contains(&format!(" {percent}%")),
+                                        "Listening percentages must remain visible: {metadata}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A recording indicator is not a listening circle, even though both can use a dot.
+    #[test]
+    fn playing_rows_omit_only_progress_circles_and_preserve_recording_and_other_markers() {
+        let media_id = MediaId::new(SourceKind::Radio, "recording-fixture");
+        let rows = [
+            RowView {
+                media_id: Some(media_id.clone()),
+                title: "Current recording".to_owned(),
+                compact: true,
+                playback_started: true,
+                watched_percent: 42,
+                radio_favorite: true,
+                local_marked: true,
+                download_marked: true,
+                downloaded: true,
+                ..RowView::default()
+            },
+            RowView {
+                compact: true,
+                ..RowView::default()
+            },
+        ];
+        for paused in [false, true] {
+            let mut terminal = Terminal::new(TestBackend::new(100, 2)).unwrap();
+            terminal
+                .draw(|frame| {
+                    let theme = Theme::new(false);
+                    render_row_list(
+                        frame,
+                        frame.area(),
+                        "",
+                        &rows,
+                        RowSourceLabels::All,
+                        1,
+                        Some(&media_id),
+                        paused,
+                        Some(&media_id.external_id),
+                        true,
+                        theme.heading,
+                        &theme,
+                    );
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let text = (0..100)
+                .map(|x| buffer[(x, 0)].symbol())
+                .collect::<String>();
+            let expected = format!(
+                "{} ★ ● ✓ [x] ↓ Current recording 42%",
+                if paused { "||" } else { "▶" }
+            );
+            assert_eq!(text.trim_end(), expected);
+            let recording = (0..100).find(|x| buffer[(*x, 0)].symbol() == "●").unwrap();
+            assert_eq!(buffer[(recording, 0)].fg, Color::Red);
+        }
+    }
+
     /// Black-without-bold contrast changes only the selected playing combination.
     #[test]
     fn black_playing_selection_preserves_other_row_states() {
@@ -24621,12 +24800,12 @@ for encoded, expected in json.load(sys.stdin):
             (false, false, true, 0, false, false, false, "◐ "),
             (false, false, true, 28, false, false, false, "◐ "),
             (false, false, true, 100, false, false, false, "○ "),
-            (true, false, true, 28, false, false, false, "▶ ◐ "),
-            (true, true, true, 28, false, false, false, "|| ◐ "),
+            (true, false, true, 28, false, false, false, "▶ "),
+            (true, true, true, 28, false, false, false, "|| "),
             (false, false, false, 0, true, false, false, "◆ ● "),
             (false, false, false, 0, false, true, false, "● [x] "),
             (false, false, false, 0, false, false, true, "● ↓ "),
-            (true, true, true, 28, true, true, true, "|| ◆ ◐ [x] ↓ "),
+            (true, true, true, 28, true, true, true, "|| ◆ [x] ↓ "),
         ] {
             for selected in 0..=1 {
                 let mut terminal = Terminal::new(TestBackend::new(120, 12)).expect("terminal");
@@ -24956,7 +25135,7 @@ for encoded, expected in json.load(sys.stdin):
         let selected_row = playing_row.saturating_add(1);
         assert_eq!(buffer[(hit_map.rows.x, playing_row)].symbol(), "|");
         assert_eq!(buffer[(hit_map.rows.x + 1, playing_row)].symbol(), "|");
-        let playing_title = &buffer[(hit_map.rows.x.saturating_add(5), playing_row)];
+        let playing_title = &buffer[(hit_map.rows.x.saturating_add(3), playing_row)];
         assert_eq!(playing_title.symbol(), "p");
         assert!(playing_title.modifier.contains(Modifier::BOLD));
         assert_eq!(playing_title.fg, Color::Cyan);
