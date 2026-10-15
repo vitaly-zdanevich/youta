@@ -2295,9 +2295,9 @@ The rendering integration uses
 ## Mouse input on a Linux virtual console
 
 In terminals that report mouse movement, such as Kitty, hovering over an
-inactive tab or an enabled button adds a subtle background without changing
-selection or activating the control. Selected colors remain unchanged;
-disabled controls and controls behind a popup do not highlight. Movement
+inactive tab or an enabled button adds a subtle background with black text
+without changing selection or activating the control. Selected colors remain
+unchanged; disabled controls and controls behind a popup do not highlight. Movement
 within the same control does not cause extra redraws. This uses the existing
 [Crossterm mouse events](https://docs.rs/crossterm/0.29.0/crossterm/event/enum.MouseEventKind.html)
 and also works with GPM motion events on a Linux console.

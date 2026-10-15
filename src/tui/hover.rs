@@ -35,7 +35,7 @@ impl HoverState {
         self.target.take().is_some()
     }
 
-    /// Applies feedback using the fresh frame's geometry and existing styles.
+    /// Applies black text on light gray within the fresh frame's eligible controls.
     pub(super) fn render(&mut self, frame: &mut Frame<'_>, hit_map: &HitMap, view: &ViewModel) {
         self.target = self
             .pointer
@@ -64,7 +64,7 @@ impl HoverState {
         }
         for y in area.y..area.bottom() {
             for x in area.x..area.right() {
-                buffer[(x, y)].set_bg(Color::DarkGray);
+                buffer[(x, y)].set_bg(Color::Gray).set_fg(Color::Black);
             }
         }
     }
@@ -222,7 +222,7 @@ mod tests {
     }
 
     #[test]
-    fn inactive_tab_receives_background_on_exact_label_cells() {
+    fn inactive_tab_receives_black_text_on_exact_label_cells() {
         let view = ViewModel::default();
         let area = Rect::new(2, 0, 5, 1);
         let hit_map = HitMap {
@@ -233,15 +233,18 @@ mod tests {
         assert!(hover.update_mouse(moved(3, 0), &hit_map, &view));
         let terminal = paint(&mut hover, &hit_map, &view, area, Style::default());
         for x in area.x..area.right() {
-            assert_eq!(terminal.backend().buffer()[(x, 0)].bg, Color::DarkGray);
+            assert_eq!(terminal.backend().buffer()[(x, 0)].bg, Color::Gray);
+            assert_eq!(terminal.backend().buffer()[(x, 0)].fg, Color::Black);
         }
         assert_eq!(terminal.backend().buffer()[(1, 0)].bg, Color::Reset);
+        assert_eq!(terminal.backend().buffer()[(1, 0)].fg, Color::Reset);
         assert_eq!(terminal.backend().buffer()[(7, 0)].bg, Color::Reset);
+        assert_eq!(terminal.backend().buffer()[(7, 0)].fg, Color::Reset);
         assert_eq!(terminal.backend().buffer()[(3, 1)].bg, Color::Reset);
     }
 
     #[test]
-    fn button_feedback_preserves_foreground_and_modifiers() {
+    fn button_feedback_uses_black_text_and_preserves_modifiers() {
         let view = ViewModel::default();
         let area = Rect::new(2, 2, 5, 1);
         let hit_map = HitMap {
@@ -255,9 +258,29 @@ mod tests {
         assert!(hover.update_mouse(moved(3, 2), &hit_map, &view));
         let terminal = paint(&mut hover, &hit_map, &view, area, style);
         let cell = &terminal.backend().buffer()[(3, 2)];
-        assert_eq!(cell.bg, Color::DarkGray);
-        assert_eq!(cell.fg, Color::Cyan);
+        assert_eq!(cell.bg, Color::Gray);
+        assert_eq!(cell.fg, Color::Black);
         assert_eq!(cell.modifier, Modifier::BOLD | Modifier::ITALIC);
+    }
+
+    #[test]
+    fn leaving_a_button_restores_its_original_text_color() {
+        let view = ViewModel::default();
+        let area = Rect::new(2, 2, 5, 1);
+        let hit_map = HitMap {
+            detail_buttons: vec![(UiAction::CopyLink, area)],
+            ..HitMap::default()
+        };
+        let style = Style::default().fg(Color::Cyan);
+        let mut hover = HoverState::default();
+        assert!(hover.update_mouse(moved(3, 2), &hit_map, &view));
+        let hovered = paint(&mut hover, &hit_map, &view, area, style);
+        assert_eq!(hovered.backend().buffer()[(3, 2)].fg, Color::Black);
+
+        assert!(hover.update_mouse(moved(8, 2), &hit_map, &view));
+        let restored = paint(&mut hover, &hit_map, &view, area, style);
+        assert_eq!(restored.backend().buffer()[(3, 2)].fg, Color::Cyan);
+        assert_eq!(restored.backend().buffer()[(3, 2)].bg, Color::Reset);
     }
 
     #[test]
@@ -413,7 +436,7 @@ mod tests {
             area,
             Style::default().fg(Color::Cyan),
         );
-        assert_eq!(terminal.backend().buffer()[(3, 2)].bg, Color::DarkGray);
+        assert_eq!(terminal.backend().buffer()[(3, 2)].bg, Color::Gray);
     }
 
     #[test]
@@ -459,7 +482,7 @@ mod tests {
             modal,
             Style::default().fg(Color::Cyan),
         );
-        assert_eq!(terminal.backend().buffer()[(3, 2)].bg, Color::DarkGray);
+        assert_eq!(terminal.backend().buffer()[(3, 2)].bg, Color::Gray);
     }
 
     #[test]
@@ -483,7 +506,7 @@ mod tests {
             Rect::new(2, 0, 9, 1),
             Style::default(),
         );
-        assert_eq!(terminal.backend().buffer()[(5, 0)].bg, Color::DarkGray);
+        assert_eq!(terminal.backend().buffer()[(5, 0)].bg, Color::Gray);
         assert_eq!(terminal.backend().buffer()[(3, 0)].bg, Color::Reset);
         assert_eq!(terminal.backend().buffer()[(8, 0)].bg, Color::Reset);
     }
@@ -599,8 +622,8 @@ mod tests {
         let mut hover = HoverState::default();
         assert!(hover.update_mouse(moved(29, 4), &hit_map, &view));
         let terminal = paint(&mut hover, &hit_map, &view, area, Style::default());
-        assert_eq!(terminal.backend().buffer()[(29, 4)].bg, Color::DarkGray);
-        assert_eq!(terminal.backend().buffer()[(29, 5)].bg, Color::DarkGray);
+        assert_eq!(terminal.backend().buffer()[(29, 4)].bg, Color::Gray);
+        assert_eq!(terminal.backend().buffer()[(29, 5)].bg, Color::Gray);
     }
 
     #[test]
@@ -683,7 +706,7 @@ mod tests {
                 .find_map(|(action, area)| (*action == UiAction::OpenInBrowser).then_some(*area))
                 .expect("original page button");
             let mut expected = terminal.backend().buffer()[(area.x, area.y)].clone();
-            expected.set_bg(Color::DarkGray);
+            expected.set_bg(Color::Gray).set_fg(Color::Black);
             let mut hover = HoverState::default();
             assert!(hover.update_mouse(moved(area.x, area.y), &hit_map, &view));
             terminal

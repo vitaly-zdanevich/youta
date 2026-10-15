@@ -33,7 +33,7 @@ fn tab_fixture() -> (ViewModel, HitMap, hover::HoverState, VirtualCursor) {
 
 /// The actual tab renderer and overlay agree on hitboxes without changing labels or selection.
 #[test]
-fn real_frame_hover_changes_only_the_inactive_tab_background() {
+fn real_frame_hover_changes_only_the_inactive_tab_colors() {
     let view = ViewModel::default();
     let settings = UiSettings::default();
     let mut hit_map = HitMap::default();
@@ -62,12 +62,13 @@ fn real_frame_hover_changes_only_the_inactive_tab_background() {
             let before_cell = &before[(x, y)];
             let after_cell = &after[(x, y)];
             assert_eq!(before_cell.symbol(), after_cell.symbol());
-            assert_eq!(before_cell.fg, after_cell.fg);
             assert_eq!(before_cell.modifier, after_cell.modifier);
             if contains(area, x, y) {
-                assert_eq!(after_cell.bg, Color::DarkGray);
+                assert_eq!(after_cell.bg, Color::Gray);
+                assert_eq!(after_cell.fg, Color::Black);
             } else {
                 assert_eq!(before_cell.bg, after_cell.bg);
+                assert_eq!(before_cell.fg, after_cell.fg);
             }
         }
     }
