@@ -998,6 +998,26 @@ entry for tracks without an album. Funkwhale places the hotkey on its Artist
 link instead of showing a duplicate button. Missing artist identities omit the action.
 Esc or Alt+Left restores the previous catalogue.
 .PP
+Press
+.B d
+to enqueue an explicit Funkwhale track download.
+Youta resolves advertised original-pod audio directly, without passing page or
+embed URLs to yt-dlp.
+.B subscriptions.audio_format=original
+keeps the audio bytes and embedded tags unchanged.
+The default
+.B opus
+policy copies existing advertised Opus audio without re-encoding.
+When no Opus upload is advertised, Youta asks whether to keep the original
+file or explicitly convert to Opus before fetching audio. This confirmation
+applies only to the captured download, without changing the saved preference.
+.B transcode-opus
+explicitly allows encoding to Opus without asking;
+.B original
+also skips the question. The downloader still validates actual audio bytes,
+so incorrect pod metadata cannot silently enable re-encoding.
+Downloads use the normal queue and retain the canonical track URL for retries.
+.PP
 The independent
 .B funkwhale
 Cargo feature is enabled by default in both frontends.

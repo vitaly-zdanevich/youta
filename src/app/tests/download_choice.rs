@@ -2,6 +2,10 @@
 
 use super::*;
 
+#[cfg(feature = "funkwhale")]
+#[path = "funkwhale_download_choice.rs"]
+mod funkwhale;
+
 fn confirm_current_choice(controller: &mut AppController) {
     let generation = controller
         .view

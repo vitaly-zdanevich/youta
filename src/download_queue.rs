@@ -268,6 +268,28 @@ impl DownloadSource {
                     );
                 }
             }
+            SourceKind::Funkwhale => {
+                let path = self.webpage_url.path();
+                let path = path.strip_suffix('/').unwrap_or(path);
+                let number = path
+                    .rsplit_once("/library/tracks/")
+                    .map(|(_, number)| number);
+                if self.kind != MediaKind::Audio
+                    || self.webpage_url.query().is_some()
+                    || self.media_id.external_id != self.webpage_url.as_str()
+                    || self.download_url != self.webpage_url
+                    || !number.is_some_and(|number| {
+                        number
+                            .parse::<u64>()
+                            .is_ok_and(|id| id > 0 && id.to_string() == number)
+                    })
+                {
+                    return Err(
+                        "download Funkwhale source must retain a canonical original-pod track page"
+                            .to_owned(),
+                    );
+                }
+            }
             _ => {}
         }
         Ok(())
@@ -504,6 +526,40 @@ pub(crate) mod tests {
             let restored: DownloadQueue =
                 serde_json::from_str(&serde_json::to_string(&queue).unwrap()).unwrap();
             assert_eq!(restored, queue);
+        }
+    }
+
+    /// Restartable Funkwhale intent contains its original page, never an embed or signed stream.
+    #[test]
+    fn funkwhale_queue_accepts_only_matching_canonical_track_pages() {
+        for page in [
+            "https://pod.example/library/tracks/27",
+            "https://pod.example/prefix/library/tracks/27/",
+        ] {
+            let mut queue = fixture();
+            let source = &mut queue.entries[0].source;
+            source.media_id = MediaId::new(SourceKind::Funkwhale, page);
+            source.kind = MediaKind::Audio;
+            source.webpage_url = Url::parse(page).unwrap();
+            source.download_url = source.webpage_url.clone();
+            queue.validate().unwrap();
+            for invalid in [
+                "https://pod.example/embed.html?id=27",
+                "https://pod.example/library/tracks/027",
+                "https://pod.example/library/tracks/27//",
+                "https://pod.example/library/tracks/0",
+                "https://pod.example/library/tracks/27?token=private",
+            ] {
+                let mut invalid_queue = queue.clone();
+                invalid_queue.entries[0].source.webpage_url = Url::parse(invalid).unwrap();
+                invalid_queue.entries[0].source.download_url = Url::parse(invalid).unwrap();
+                invalid_queue.entries[0].source.media_id.external_id = invalid.to_owned();
+                assert!(invalid_queue.validate().is_err());
+            }
+            let mut stale = queue.clone();
+            stale.entries[0].source.download_url =
+                Url::parse("https://later.example/library/tracks/27").unwrap();
+            assert!(stale.validate().is_err());
         }
     }
 

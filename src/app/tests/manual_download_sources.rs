@@ -25,6 +25,122 @@ fn source_test_controller() -> (
     (controller, requests, directory)
 }
 
+/// A selected Funkwhale track is downloaded from its API, never its HTML embed.
+#[cfg(feature = "funkwhale")]
+#[test]
+fn funkwhale_manual_download_uses_native_audio_and_keeps_only_stable_intent() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let _guard = crate::app::funkwhale_download::test_guard();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let base = format!("http://{}/prefix/", listener.local_addr().unwrap());
+    let page = format!("{base}library/tracks/27");
+    let audio = b"ID3\x03\0fixture original encoded audio TAG unchanged";
+    let requested = Arc::new(Mutex::new(Vec::new()));
+    let observed = Arc::clone(&requested);
+    let stopped = Arc::new(AtomicBool::new(false));
+    let stop = Arc::clone(&stopped);
+    let server = thread::spawn(move || {
+        while !stop.load(AtomicOrdering::Acquire) {
+            let (mut stream, _) = match listener.accept() {
+                Ok(connection) => connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(2));
+                    continue;
+                }
+                Err(error) => panic!("fixture accept: {error}"),
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut input = [0; 8192];
+            let count = stream.read(&mut input).unwrap();
+            let request = String::from_utf8_lossy(&input[..count]);
+            let path = request.split_whitespace().nth(1).unwrap().to_owned();
+            observed.lock().unwrap().push(path.clone());
+            let (content_type, body) = if path == "/prefix/api/v1/tracks/27/" {
+                ("application/json", serde_json::to_vec(&serde_json::json!({
+                    "id": 27, "title": "Original track", "is_playable": true,
+                    "listen_url": "/prefix/api/v1/listen/track/?signature=temporary-private",
+                    "uploads": [{"uuid": "12345678-1234-1234-1234-123456789abc", "size": audio.len(), "extension": "mp3", "mimetype": "audio/mpeg", "duration": 123}]
+                })).unwrap())
+            } else if path.starts_with("/prefix/api/v1/listen/track/?") {
+                ("audio/mpeg", audio.to_vec())
+            } else {
+                panic!("The native downloader must not fetch the HTML page: {path}");
+            };
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+            stream.write_all(&body).unwrap();
+        }
+    });
+    let (mut controller, generic_requests, _directory) = source_test_controller();
+    controller.config.subscriptions.audio_format = "original".to_owned();
+    controller.config.providers.funkwhale_instance_url =
+        Some(url::Url::parse("https://later-preference.example/").unwrap());
+    let mut source = resolved_source_fixture(SourceKind::Funkwhale, &page, &page);
+    source.external_id = page.clone();
+    source.title = "Native track".to_owned();
+    controller.resolved_direct = Some(source);
+    controller.dispatch(UiAction::Download);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        controller.poll_download_at(Instant::now());
+        if controller.store.download_queue().unwrap().entries[0].state
+            == DownloadQueueState::Completed
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    stopped.store(true, AtomicOrdering::Release);
+    server.join().unwrap();
+    assert!(
+        generic_requests.lock().unwrap().is_empty(),
+        "Funkwhale HTML cannot reach yt-dlp"
+    );
+    let queue = controller.store.download_queue().unwrap();
+    assert_eq!(
+        queue.entries[0].state,
+        DownloadQueueState::Completed,
+        "{}",
+        controller.view.status_line
+    );
+    let output = controller
+        .config
+        .downloads_dir()
+        .join(queue.entries[0].completed_path.as_ref().unwrap());
+    assert_eq!(std::fs::read(&output).unwrap(), audio);
+    assert_eq!(output.extension().unwrap(), "mp3");
+    assert!(
+        output
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("Native track [27]")
+    );
+    assert_eq!(queue.entries[0].source.download_url.as_str(), page);
+    assert_eq!(queue.entries[0].source.webpage_url.as_str(), page);
+    assert!(
+        !serde_json::to_string(&queue)
+            .unwrap()
+            .contains("temporary-private")
+    );
+    let requested = requested.lock().unwrap();
+    assert_eq!(
+        requested.len(),
+        2,
+        "One fresh track lookup and one audio transfer"
+    );
+    assert!(requested[1].contains("signature=temporary-private"));
+    let download = controller.view.download.as_ref().unwrap();
+    assert_eq!(download.downloaded_bytes, audio.len() as u64);
+    assert_eq!(download.completed_files, 1);
+}
+
 /// Original-first playback leaves an explicitly requested MP3 download independent.
 #[cfg(feature = "archive-org")]
 #[test]
@@ -131,7 +247,6 @@ fn download_marks_capture_mixed_direct_sources_without_retaining_transient_strea
         SourceKind::Rumble,
         SourceKind::Bilibili,
         SourceKind::PeerTube,
-        SourceKind::Funkwhale,
         SourceKind::Vimeo,
         SourceKind::RuTube,
         SourceKind::SoundCloud,

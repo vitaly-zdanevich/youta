@@ -29,6 +29,8 @@ mod download_choice;
 mod email_links;
 mod end_pause;
 mod funkwhale;
+#[cfg(all(feature = "funkwhale", feature = "yt-dlp"))]
+mod funkwhale_download;
 mod invidious_instances;
 #[cfg(feature = "yt-dlp")]
 mod live_start;
@@ -3530,6 +3532,16 @@ trait RunningDownload: Send {
     fn take_error_reader(&mut self) -> Option<Box<dyn BufRead + Send>>;
     fn try_wait(&mut self) -> Result<Option<DownloadExit>, String>;
     fn cancel(&mut self) -> Result<(), String>;
+
+    /// Keeps existing extractor diagnostics while allowing a native worker's concise failure.
+    fn failure_description(&self, exit: &DownloadExit) -> String {
+        format!("yt-dlp exited with {}", exit.description)
+    }
+
+    /// Native service failures need no unrelated system-information report.
+    fn concise_errors(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(feature = "yt-dlp")]
@@ -21244,11 +21256,26 @@ impl AppController {
     #[cfg(feature = "yt-dlp")]
     fn start_prepared_manual_download(&mut self, item: QueueItem, request: DownloadRequest) {
         let destination = request.destination.clone();
-        let process = match self.download_launcher.start(&request) {
+        let process = match if item.media.id.source == SourceKind::Funkwhale {
+            #[cfg(feature = "funkwhale")]
+            {
+                funkwhale_download::NativeDownload::start(&item, &request, &self.config)
+            }
+            #[cfg(not(feature = "funkwhale"))]
+            {
+                Err("This build omits Funkwhale download support".to_owned())
+            }
+        } else {
+            self.download_launcher.start(&request)
+        } {
             Ok(process) => process,
             Err(error) => {
                 mark_download_inactive(&mut self.view);
-                self.show_error_message("Download could not start", error);
+                if item.media.id.source == SourceKind::Funkwhale {
+                    self.show_actionable_message("Download could not start", error);
+                } else {
+                    self.show_error_message("Download could not start", error);
+                }
                 self.finish_manual_download(Err(()));
                 return;
             }
@@ -21401,13 +21428,20 @@ impl AppController {
             // A private or unavailable channel must not prevent the remaining
             // opted-in channels from being checked on the following tick.
             mark_download_inactive(&mut self.view);
-            self.show_error_message(
-                "Download failed",
-                append_download_diagnostics(
-                    format!("yt-dlp exited with {}", exit.description),
-                    &diagnostics,
-                ),
-            );
+            if active.process.concise_errors() {
+                self.show_actionable_message(
+                    "Download failed",
+                    active.process.failure_description(&exit),
+                );
+            } else {
+                self.show_error_message(
+                    "Download failed",
+                    append_download_diagnostics(
+                        active.process.failure_description(&exit),
+                        &diagnostics,
+                    ),
+                );
+            }
             if let Some(owner) = active.manual_queue_owner {
                 self.finish_manual_download_for(owner, Err(()));
             }

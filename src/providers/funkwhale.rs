@@ -8,12 +8,16 @@
 
 mod albums;
 mod discovery;
+#[cfg(feature = "yt-dlp")]
+mod download;
 mod text;
 mod upload;
 mod uploader;
 
 pub use albums::{FunkwhaleAlbum, FunkwhaleAlbumPage};
 pub use discovery::{FunkwhalePod, PUBLIC_PODS_URL, discover_public_pods, parse_public_pods};
+#[cfg(feature = "yt-dlp")]
+pub(crate) use download::FunkwhaleDownloadSource;
 pub use upload::FunkwhaleUploadMetadata;
 pub use uploader::FunkwhaleUploader;
 

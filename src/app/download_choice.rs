@@ -8,6 +8,9 @@ use crate::config::DownloadMode;
 use crate::providers::archive_org::{ArchiveOrgDownloadVariant, ArchiveOrgFileProvenance};
 use crate::view::DownloadChoicePopupView;
 
+#[cfg(feature = "funkwhale")]
+mod funkwhale;
+
 /// The item captured at invocation, never reconstructed from mutable rendered labels.
 pub(super) struct PendingDownloadChoice {
     generation: u64,
@@ -18,6 +21,8 @@ pub(super) struct PendingDownloadChoice {
 enum DownloadChoiceStage {
     #[cfg(feature = "archive-org")]
     LoadingArchive,
+    #[cfg(feature = "funkwhale")]
+    LoadingFunkwhale(funkwhale::MetadataLookup),
     Options(Vec<DownloadOption>),
 }
 
@@ -55,6 +60,8 @@ impl AppController {
                 let source_url = item.media.webpage_url.clone();
                 self.choose_video_download(item, source_url, false);
             }
+            #[cfg(feature = "funkwhale")]
+            SourceKind::Funkwhale => self.choose_funkwhale_download(item),
             #[cfg(feature = "archive-org")]
             SourceKind::ArchiveOrg => {
                 self.download_choice_generation = self.download_choice_generation.wrapping_add(1);
@@ -96,6 +103,10 @@ impl AppController {
 
     /// Resolves only the captured Archive source through its bounded metadata worker.
     pub(super) fn poll_manual_download_choice(&mut self) {
+        #[cfg(feature = "funkwhale")]
+        if self.poll_funkwhale_download_choice() {
+            return;
+        }
         #[cfg(feature = "archive-org")]
         {
             let Some(pending) = &self.pending_download_choice else {
@@ -300,6 +311,8 @@ impl AppController {
             DownloadChoiceStage::Options(options) => options,
             #[cfg(feature = "archive-org")]
             DownloadChoiceStage::LoadingArchive => return,
+            #[cfg(feature = "funkwhale")]
+            DownloadChoiceStage::LoadingFunkwhale(_) => return,
         };
         match options
             .into_iter()
