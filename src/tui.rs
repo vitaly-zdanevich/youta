@@ -192,6 +192,22 @@ trait ThumbnailRenderer {
         None
     }
     fn synchronize(&mut self, source: Option<&url::Url>, area: Rect) -> bool;
+    /// Tries advertised alternatives only after the selected image fails.
+    fn synchronize_with_fallbacks(
+        &mut self,
+        preferred: Option<&url::Url>,
+        fallbacks: &[url::Url],
+        area: Rect,
+        fullscreen: bool,
+    ) -> bool {
+        if fullscreen {
+            self.synchronize_with_fallback(preferred, fallbacks.first(), area)
+        } else {
+            self.synchronize(preferred, area)
+        }
+    }
+    /// Uses a concise pod-specific warning when optional artwork cannot be recovered.
+    fn use_pod_artwork_warning(&mut self, _enabled: bool) {}
     /// Synchronizes a preferred artwork URL with a lower-resolution fallback.
     ///
     /// Renderers without failure tracking retain the preferred URL. Terminal
@@ -243,6 +259,7 @@ struct TerminalThumbnailRenderer {
     cache_directory: Option<PathBuf>,
     ffmpeg_executable: PathBuf,
     tty_images_enabled: bool,
+    pod_artwork_warning: bool,
     tty_image_policy_applies: bool,
     suspended_tty_manager: Option<ThumbnailManager>,
     /// Retained across live TTY artwork toggles, including newly created managers.
@@ -292,6 +309,7 @@ impl TerminalThumbnailRenderer {
             cache_directory,
             ffmpeg_executable,
             tty_images_enabled,
+            pod_artwork_warning: false,
             tty_image_policy_applies,
             suspended_tty_manager: None,
             worker_waker: None,
@@ -336,6 +354,29 @@ impl TerminalThumbnailRenderer {
 
 #[cfg(feature = "images")]
 impl ThumbnailRenderer for TerminalThumbnailRenderer {
+    fn use_pod_artwork_warning(&mut self, enabled: bool) {
+        self.pod_artwork_warning = enabled;
+    }
+
+    fn synchronize_with_fallbacks(
+        &mut self,
+        preferred: Option<&url::Url>,
+        fallbacks: &[url::Url],
+        area: Rect,
+        fullscreen: bool,
+    ) -> bool {
+        self.reset_fallback();
+        self.visible_source = preferred.cloned();
+        let changed = self
+            .manager
+            .synchronize_with_fallbacks(preferred, fallbacks, area, fullscreen);
+        if changed {
+            self.clear_before_ready = false;
+            self.followup_frame_pending = false;
+        }
+        changed
+    }
+
     fn set_worker_waker(&mut self, waker: Option<std::task::Waker>) {
         self.manager.set_worker_waker(waker.clone());
         // Disabled artwork must not wake the terminal for hidden completions.
@@ -572,10 +613,14 @@ impl ThumbnailRenderer for TerminalThumbnailRenderer {
             ThumbnailState::Failed(error) => {
                 self.followup_frame_pending = false;
                 frame.render_widget(
-                    Paragraph::new(format!("Thumbnail unavailable: {error}"))
-                        .style(theme.muted)
-                        .alignment(Alignment::Center)
-                        .wrap(Wrap { trim: true }),
+                    Paragraph::new(if self.pod_artwork_warning {
+                        "Artwork unavailable on this pod".to_owned()
+                    } else {
+                        format!("Thumbnail unavailable: {error}")
+                    })
+                    .style(theme.muted)
+                    .alignment(Alignment::Center)
+                    .wrap(Wrap { trim: true }),
                     area,
                 );
             }
@@ -2505,8 +2550,18 @@ fn render_fullscreen_thumbnail_overlay(
         .saturating_sub(u16::from(view.playback_activity_pending()));
 
     if let Some(local_video) = visible_local_video {
+        renderer.use_pod_artwork_warning(false);
         renderer.synchronize_local_video_fullscreen(local_video, area);
+    } else if view.screen == Screen::Funkwhale {
+        renderer.use_pod_artwork_warning(true);
+        renderer.synchronize_with_fallbacks(
+            visible_thumbnail_url,
+            &details.thumbnail_fallback_urls,
+            area,
+            true,
+        );
     } else {
+        renderer.use_pod_artwork_warning(false);
         renderer.synchronize_with_fallback(visible_thumbnail_url, fallback_thumbnail_url, area);
     }
     let prepared = renderer.prepared_artwork_area(area).unwrap_or(area);
@@ -6440,8 +6495,18 @@ fn render_information_panel(
             let available_thumbnail_area =
                 Rect::new(inner.x, cursor_y, artwork_width, rendered_thumbnail_height);
             if let Some(local_video) = visible_local_video {
+                renderer.use_pod_artwork_warning(false);
                 renderer.synchronize_local_video(local_video, available_thumbnail_area);
+            } else if view.screen == Screen::Funkwhale {
+                renderer.use_pod_artwork_warning(true);
+                renderer.synchronize_with_fallbacks(
+                    visible_thumbnail_url,
+                    &details.thumbnail_fallback_urls,
+                    available_thumbnail_area,
+                    false,
+                );
             } else {
+                renderer.use_pod_artwork_warning(false);
                 renderer.synchronize(visible_thumbnail_url, available_thumbnail_area);
             }
             // The worker aspect-fits and encodes ready artwork for this exact
@@ -17500,6 +17565,8 @@ mod tests {
     struct MockThumbnailRenderer {
         enabled: bool,
         synchronized: Vec<(Option<url::Url>, Rect)>,
+        fallback_requests: Vec<(Option<url::Url>, Vec<url::Url>, bool)>,
+        pod_warnings: Vec<bool>,
         synchronized_local_videos: Vec<(LocalVideoThumbnailView, Rect)>,
         prefetch_batches: Vec<Vec<url::Url>>,
         expansion_prefetches: Vec<(Option<url::Url>, Rect)>,
@@ -17568,6 +17635,22 @@ mod tests {
         fn synchronize(&mut self, source: Option<&url::Url>, area: Rect) -> bool {
             self.synchronized.push((source.cloned(), area));
             true
+        }
+
+        fn synchronize_with_fallbacks(
+            &mut self,
+            preferred: Option<&url::Url>,
+            fallbacks: &[url::Url],
+            area: Rect,
+            fullscreen: bool,
+        ) -> bool {
+            self.fallback_requests
+                .push((preferred.cloned(), fallbacks.to_vec(), fullscreen));
+            self.synchronize(preferred, area)
+        }
+
+        fn use_pod_artwork_warning(&mut self, enabled: bool) {
+            self.pod_warnings.push(enabled);
         }
 
         fn synchronize_local_video(
@@ -37018,6 +37101,94 @@ for encoded, expected in json.load(sys.stdin):
         assert!(rendered_text(&terminal).contains("Description remains below"));
     }
 
+    /// Both artwork sizes carry only the selected track's advertised fallback URLs.
+    #[test]
+    fn funkwhale_artwork_forwards_selected_fallbacks_in_preview_and_fullscreen() {
+        let preview = url::Url::parse(
+            "https://audio.example/api/v1/attachments/a/proxy/?next=large_square_crop",
+        )
+        .unwrap();
+        let full =
+            url::Url::parse("https://audio.example/api/v1/attachments/a/proxy/?next=original")
+                .unwrap();
+        let album = url::Url::parse("https://audio.example/media/album.png").unwrap();
+        let fallbacks = vec![full.clone(), album];
+        let mut view = ViewModel {
+            screen: Screen::Funkwhale,
+            details: Some(DetailView {
+                media_id: Some(MediaId::new(
+                    SourceKind::Funkwhale,
+                    "https://audio.example/library/tracks/7",
+                )),
+                thumbnail_url: Some(preview.clone()),
+                expanded_thumbnail_url: Some(full.clone()),
+                thumbnail_fallback_urls: fallbacks.clone(),
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+        let mut hits = HitMap::default();
+        let mut renderer = MockThumbnailRenderer {
+            enabled: true,
+            ..MockThumbnailRenderer::default()
+        };
+        terminal
+            .draw(|frame| {
+                render_frame(
+                    frame,
+                    &view,
+                    &UiSettings::default(),
+                    &mut hits,
+                    Some(&mut renderer),
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            renderer.fallback_requests,
+            [(Some(preview), fallbacks.clone(), false)]
+        );
+        assert_eq!(renderer.pod_warnings.last(), Some(&true));
+        renderer.fallback_requests.clear();
+        view.details.as_mut().unwrap().thumbnail_expanded = true;
+        terminal
+            .draw(|frame| {
+                render_frame(
+                    frame,
+                    &view,
+                    &UiSettings::default(),
+                    &mut hits,
+                    Some(&mut renderer),
+                )
+            })
+            .unwrap();
+        assert!(
+            renderer
+                .fallback_requests
+                .iter()
+                .any(|request| request == &(Some(full.clone()), fallbacks.clone(), true))
+        );
+        view.screen = Screen::Search;
+        view.details.as_mut().unwrap().thumbnail_expanded = false;
+        renderer.fallback_requests.clear();
+        terminal
+            .draw(|frame| {
+                render_frame(
+                    frame,
+                    &view,
+                    &UiSettings::default(),
+                    &mut hits,
+                    Some(&mut renderer),
+                )
+            })
+            .unwrap();
+        assert!(
+            renderer.fallback_requests.is_empty(),
+            "other sources keep their existing image policy"
+        );
+        assert_eq!(renderer.pod_warnings.last(), Some(&false));
+    }
+
     #[test]
     fn ready_fitted_artwork_leaves_one_blank_row_before_following_details() {
         let backend = TestBackend::new(120, 44);
@@ -38060,6 +38231,14 @@ for encoded, expected in json.load(sys.stdin):
         let rendered = rendered_text(&terminal);
         assert!(!rendered.contains("Loading thumbnail..."));
         assert!(rendered.contains("Thumbnail unavailable: thumbnail download failed"));
+
+        thumbnails.use_pod_artwork_warning(true);
+        terminal
+            .draw(|frame| thumbnails.render(frame, frame.area(), &Theme::new(false)))
+            .unwrap();
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("Artwork unavailable on this pod"));
+        assert!(!rendered.contains("thumbnail download failed"));
     }
 
     #[cfg(feature = "images")]

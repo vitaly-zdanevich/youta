@@ -53,6 +53,105 @@ function text(element) {
 const { Description } = load(new URL('./components/Description.tsx', import.meta.url));
 const { Details } = load(new URL('./components/Details.tsx', import.meta.url));
 
+/** Exercise the real artwork component while retaining hook state between renders. */
+function artworkRenderer() {
+	const state = [];
+	const refs = [];
+	let stateIndex = 0;
+	let refIndex = 0;
+	const hooks = {
+		useEffect: () => {},
+		useRef(initial) {
+			const index = refIndex++;
+			if (!(index in refs)) refs[index] = { current: initial };
+			return refs[index];
+		},
+		useState(initial) {
+			const index = stateIndex++;
+			if (!(index in state)) state[index] = initial;
+			return [state[index], (value) => { state[index] = typeof value === 'function' ? value(state[index]) : value; }];
+		},
+	};
+	const compiled = ts.transpileModule(readFileSync(new URL('./components/Artwork.tsx', import.meta.url), 'utf8'), {
+		compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.ReactJSX },
+	}).outputText;
+	const module = { exports: {} };
+	new Function('require', 'module', 'exports', compiled)((name) => {
+		if (name === 'react') return { ...React, ...hooks };
+		if (name === '../ipc') return { artworkSource: (url) => url ? `guarded:${url}` : null };
+		return require(name);
+	}, module, module.exports);
+	return (props) => {
+		stateIndex = 0;
+		refIndex = 0;
+		return module.exports.Artwork({ className: 'preview', ...props });
+	};
+}
+
+/** Missing pod crops and error-XML originals must not hide valid album artwork. */
+test('Funkwhale artwork retries advertised alternatives lazily through the guarded backend', () => {
+	const render = artworkRenderer();
+	const props = { url: 'https://audio.example/track-large.jpg',
+		fallbackUrls: ['https://audio.example/track-original.png', 'https://audio.example/album-large.jpg'],
+		unavailableLabel: 'Artwork unavailable on this pod' };
+	let image = render(props);
+	assert.equal(image.type, 'img');
+	assert.equal(image.props.src, `guarded:${props.url}`);
+	image.props.onError();
+	image = render(props);
+	assert.equal(image.type, 'img');
+	assert.equal(image.props.src, `guarded:${props.fallbackUrls[0]}`);
+	image.props.onError();
+	image = render(props);
+	assert.equal(image.type, 'img');
+	assert.equal(image.props.src, `guarded:${props.fallbackUrls[1]}`);
+	image.props.onLoad();
+	assert.equal(render(props).props.src, `guarded:${props.fallbackUrls[1]}`);
+	image.props.onError();
+	const warning = render(props);
+	assert.equal(warning.type, 'div');
+	assert.equal(text(warning), 'Artwork unavailable on this pod');
+	assert.notEqual(warning.props['aria-hidden'], true);
+	const next = { ...props, url: 'https://audio.example/new-track.jpg' };
+	assert.equal(render(next).props.src, `guarded:${next.url}`, 'a new owner resets exhausted artwork');
+	image.props.onError();
+	assert.equal(render(next).props.src, `guarded:${next.url}`, 'a retired image cannot fail its replacement');
+});
+
+/** Artwork fallback keeps first-working-track preference and a fixed attempt bound. */
+test('Funkwhale artwork keeps working track images and deduplicates bounded alternatives', () => {
+	const render = artworkRenderer();
+	const props = { url: 'https://audio.example/primary.jpg',
+		fallbackUrls: ['https://audio.example/primary.jpg', ...Array.from({ length: 12 }, (_, index) => `https://audio.example/album-${index}.jpg`)] };
+	let image = render(props);
+	image.props.onLoad();
+	assert.equal(render(props).props.src, `guarded:${props.url}`);
+	const sources = [];
+	while (image.type === 'img') {
+		sources.push(image.props.src);
+		image.props.onError();
+		image = render(props);
+	}
+	assert.equal(new Set(sources).size, sources.length);
+	assert.ok(sources.length <= 9, 'at most the primary and eight alternatives');
+});
+
+/** Details must use the bounded preview, while retaining the album-fallback contract. */
+test('Funkwhale Details forward advertised artwork alternatives without loading originals first', () => {
+	const fallbacks = ['https://audio.example/track-original.png', 'https://audio.example/album-large.jpg'];
+	const view = {
+		screen: 'Funkwhale', playlist_item: null, custom_command_buttons: [], yandex_music_actions: {},
+		details: { source: 'Funkwhale', title: 'Track', media_id: { source: 'funkwhale', external_id: 'track' },
+			channel_id: '', playlist_names: [], links: [], description: '', timecodes: [], video_links: [], wikidata_entities: [], dearrow_title: null,
+			thumbnail_url: 'https://audio.example/track-large.jpg', expanded_thumbnail_url: fallbacks[0], thumbnail_fallback_urls: fallbacks },
+	};
+	const tree = Details({ kind: 'Generic', view });
+	const artwork = React.Children.toArray(tree.props.children)[0];
+	assert.equal(artwork.props.url, view.details.thumbnail_url);
+	assert.deepEqual(artwork.props.fallbackUrls, fallbacks);
+	assert.equal(artwork.props.unavailableLabel, 'Artwork unavailable on this pod');
+	assert.equal(artwork.props.prefetchUrl, null, 'only selected visible candidates load');
+});
 const tags = ['рок', 'field recording', '<script>literal</script>'];
 const description = `🎵 Track notes\n\nTags: ${tags.join(', ')}`;
 const links = tags.map((tag) => {

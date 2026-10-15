@@ -42,9 +42,9 @@ pub(crate) const MAX_DOWNLOAD_BYTES: usize = 4 * 1024 * 1024;
 /// Bounded wait for one artwork request.
 #[cfg(feature = "remote-artwork")]
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-/// Maximum explicitly validated CDN redirects for one Archive.org image.
+/// Maximum explicitly validated CDN or same-pod attachment redirects per image.
 #[cfg(feature = "remote-artwork")]
-const MAX_ARCHIVE_ARTWORK_REDIRECTS: usize = 3;
+const MAX_ARTWORK_REDIRECTS: usize = 3;
 /// Bound for a redirect target before parsing or following its Location value.
 #[cfg(feature = "remote-artwork")]
 const MAX_ARTWORK_REDIRECT_URL_BYTES: usize = 4 * 1024;
@@ -110,6 +110,15 @@ impl std::fmt::Display for ThumbnailFailure {
 #[cfg(feature = "images")]
 pub(crate) trait ThumbnailTransport: Send + 'static {
     fn fetch(&mut self, source: &Url) -> Result<DownloadedThumbnail, ThumbnailFailure>;
+
+    /// Shares a selected item's remaining deadline across advertised fallback images.
+    fn fetch_with_timeout(
+        &mut self,
+        source: &Url,
+        _timeout: Duration,
+    ) -> Result<DownloadedThumbnail, ThumbnailFailure> {
+        self.fetch(source)
+    }
 }
 
 /// Image bytes with explicit provenance for cache admission.
@@ -138,8 +147,8 @@ impl DownloadedThumbnail {
 
 /// Builds the agent every artwork request uses.
 ///
-/// Automatic redirects stay disabled. Archive.org CDN redirects are checked
-/// explicitly by the fetcher, and every new connection still uses the public
+/// Automatic redirects stay disabled. Archive.org CDN and Funkwhale same-pod
+/// attachment redirects are checked explicitly, and every connection uses the public
 /// address resolver so a redirect cannot reach a private destination.
 #[cfg(feature = "remote-artwork")]
 pub(crate) fn thumbnail_agent() -> ureq::Agent {
@@ -238,6 +247,17 @@ impl HttpThumbnailTransport {
 impl ThumbnailTransport for HttpThumbnailTransport {
     fn fetch(&mut self, source: &Url) -> Result<DownloadedThumbnail, ThumbnailFailure> {
         fetch_thumbnail(&self.agent, source)
+    }
+
+    fn fetch_with_timeout(
+        &mut self,
+        source: &Url,
+        timeout: Duration,
+    ) -> Result<DownloadedThumbnail, ThumbnailFailure> {
+        if !is_safe_remote_thumbnail_source(source, false) {
+            return Err(ThumbnailFailure::InvalidSource);
+        }
+        fetch_remote_thumbnail_with_fallback(&self.agent, source, Instant::now(), timeout)
     }
 }
 
@@ -664,8 +684,8 @@ fn fetch_remote_thumbnail(
             break response;
         }
         if !matches!(status, 301 | 302 | 303 | 307 | 308)
-            || *redirects == MAX_ARCHIVE_ARTWORK_REDIRECTS
-            || !is_archive_artwork_redirect_url(&current)
+            || *redirects == MAX_ARTWORK_REDIRECTS
+            || !artwork_redirect_source_allowed(source, &current)
         {
             return Err(ThumbnailFailure::DownloadFailed);
         }
@@ -680,7 +700,7 @@ fn fetch_remote_thumbnail(
         let target = current
             .join(location)
             .map_err(|_| ThumbnailFailure::InvalidSource)?;
-        if !is_archive_artwork_redirect_url(&target) {
+        if !artwork_redirect_target_allowed(source, &current, &target) {
             return Err(ThumbnailFailure::InvalidSource);
         }
         current = target;
@@ -709,6 +729,70 @@ fn fetch_remote_thumbnail(
     } else {
         Ok(bytes)
     }
+}
+
+/// Restricts manual redirects to recognized Archive routes or advertised pod proxies.
+#[cfg(feature = "remote-artwork")]
+fn artwork_redirect_source_allowed(initial: &Url, current: &Url) -> bool {
+    if is_archive_artwork_redirect_url(current) {
+        return true;
+    }
+    #[cfg(feature = "funkwhale")]
+    if is_funkwhale_artwork_proxy(initial) && initial.origin() == current.origin() {
+        return true;
+    }
+    let _ = initial;
+    false
+}
+
+/// Keeps a Funkwhale attachment proxy on public media paths of its original origin.
+#[cfg(feature = "remote-artwork")]
+fn artwork_redirect_target_allowed(initial: &Url, current: &Url, target: &Url) -> bool {
+    if is_archive_artwork_redirect_url(current) {
+        return is_archive_artwork_redirect_url(target);
+    }
+    #[cfg(feature = "funkwhale")]
+    if is_funkwhale_artwork_proxy(initial) {
+        return initial.origin() == target.origin()
+            && target.fragment().is_none()
+            && target.path().contains("/media/")
+            && is_safe_remote_thumbnail_source(target, false);
+    }
+    let _ = (initial, target);
+    false
+}
+
+/// Recognizes the exact attachment-proxy shape without trusting arbitrary redirects.
+#[cfg(all(feature = "remote-artwork", feature = "funkwhale"))]
+fn is_funkwhale_artwork_proxy(source: &Url) -> bool {
+    let Some((_, route)) = source.path().rsplit_once("/api/") else {
+        return false;
+    };
+    let parts = route.trim_end_matches('/').split('/').collect::<Vec<_>>();
+    let [version, "attachments", uuid, "proxy"] = parts.as_slice() else {
+        return false;
+    };
+    let uuid_valid = uuid.len() == 36
+        && uuid.bytes().enumerate().all(|(index, byte)| {
+            if [8, 13, 18, 23].contains(&index) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        });
+    let mut query = source.query_pairs();
+    let rendition_valid = query.next().is_some_and(|(key, value)| {
+        key == "next"
+            && matches!(
+                value.as_ref(),
+                "original" | "small_square_crop" | "medium_square_crop" | "large_square_crop"
+            )
+    }) && query.next().is_none();
+    matches!(*version, "v1" | "v2")
+        && uuid_valid
+        && rendition_valid
+        && source.fragment().is_none()
+        && is_safe_remote_thumbnail_source(source, false)
 }
 
 /// Recognizes the canonical native waveform route without any metadata request.
@@ -882,7 +966,7 @@ pub struct Artwork {
 /// This is the whole surface an out-of-process front-end needs, and it is
 /// deliberately narrow. Every protection stays on this side of the boundary:
 /// only public `http`/`https` origins are accepted, redirects are refused except
-/// for bounded Archive.org CDN hops, responses are size-capped, and the bytes
+/// for bounded Archive.org CDN or same-pod attachment hops, responses are size-capped, and the bytes
 /// must be an image. Requested images use the confined private cache; temporary
 /// item-tile fallbacks are displayed without satisfying the full-image cache key. A window
 /// that fetched artwork itself would keep none of that, and would additionally
@@ -1441,6 +1525,48 @@ mod public_surface_tests {
         );
         assert_eq!(calls.load(Ordering::Relaxed), 0);
     }
+    /// A pod can expose a valid image only through its advertised attachment proxy.
+    #[cfg(feature = "funkwhale")]
+    #[test]
+    fn funkwhale_thumbnail_proxy_follows_only_its_public_same_origin_media_redirect() {
+        let source = Url::parse("https://audio.example/api/v2/attachments/3daba23b-d9c6-43c2-ad5e-eca91a9d79b1/proxy?next=large_square_crop").unwrap();
+        let target = "https://audio.example/media/__sized__/attachments/cover-600x600.jpg";
+        let image = b"\x89PNG\r\n\x1a\nfixture";
+        let (agent, calls) = scripted_thumbnail_agent(vec![
+            (source.as_str(), 302, Some(target), Vec::new()),
+            (target, 200, None, image.to_vec()),
+        ]);
+        assert_eq!(
+            super::fetch_thumbnail(&agent, &source),
+            Ok(super::DownloadedThumbnail::primary(image.to_vec()))
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
+    /// A pod attachment proxy cannot authorize another host, protocol, or private target.
+    #[cfg(feature = "funkwhale")]
+    #[test]
+    fn funkwhale_thumbnail_proxy_redirects_preserve_the_existing_security_boundary() {
+        let source = Url::parse("https://audio.example/api/v2/attachments/3daba23b-d9c6-43c2-ad5e-eca91a9d79b1/proxy?next=original").unwrap();
+        for target in [
+            "https://other.example/media/cover.png",
+            "http://audio.example/media/cover.png",
+            "https://127.0.0.1/media/cover.png",
+            "https://audio.example:8443/media/cover.png",
+            "https://user:secret@audio.example/media/cover.png",
+            "https://audio.example/api/v2/users/",
+        ] {
+            let (agent, calls) =
+                scripted_thumbnail_agent(vec![(source.as_str(), 302, Some(target), Vec::new())]);
+            assert_eq!(
+                super::fetch_thumbnail(&agent, &source),
+                Err(ThumbnailFailure::InvalidSource),
+                "{target}"
+            );
+            assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        }
+    }
+
     /// LibriVox's stable cover URL redirects to the Archive.org image CDN.
     #[test]
     fn archive_thumbnail_redirects_fetch_the_cover_for_standard_redirect_statuses() {

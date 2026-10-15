@@ -18,7 +18,9 @@ export function ArtworkPopup({ details }: { details: DetailView | null }) {
 			onDismiss={collapse} dismissLabel='Close artwork'>
 			<button type='button' aria-label='Collapse artwork' onClick={collapse}
 				className='block h-[calc(100vh-130px)] w-full cursor-zoom-out p-3 focus-visible:outline-2 focus-visible:outline-accent'>
-				<Artwork url={url} className='block h-full w-full object-contain' />
+				<Artwork url={url} fallbackUrls={details.thumbnail_fallback_urls}
+					unavailableLabel={details.media_id?.source === 'funkwhale' ? 'Artwork unavailable on this pod' : undefined}
+					className='block h-full w-full object-contain' />
 			</button>
 		</Popup>
 	);

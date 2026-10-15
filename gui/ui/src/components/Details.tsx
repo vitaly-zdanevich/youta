@@ -439,6 +439,7 @@ export function Details({ view, kind }: { view: ViewModel; kind: InformationPane
 		&& details.channel_id.length <= 128 && /^UC[A-Za-z0-9_-]+$/.test(details.channel_id);
 	const isArchiveOrg = details.media_id?.source === 'archive-org';
 	const isSoundCloud = details.media_id?.source === 'sound-cloud';
+	const isFunkwhale = details.media_id?.source === 'funkwhale';
   const openable =
     view.external_opener_available &&
     (kind === "Video" || kind === "Podcast" || kind === "Radio" || kind === "YandexMusic" ||
@@ -469,7 +470,9 @@ export function Details({ view, kind }: { view: ViewModel; kind: InformationPane
     >
       <Artwork
 		key={isSoundCloud ? JSON.stringify([details.media_id, details.thumbnail_url, details.expanded_thumbnail_url]) : undefined}
-        url={isSoundCloud ? details.thumbnail_url : details.expanded_thumbnail_url ?? details.thumbnail_url}
+        url={isSoundCloud || isFunkwhale ? details.thumbnail_url : details.expanded_thumbnail_url ?? details.thumbnail_url}
+		fallbackUrls={details.thumbnail_fallback_urls}
+		unavailableLabel={isFunkwhale ? 'Artwork unavailable on this pod' : undefined}
 		prefetchUrl={isSoundCloud ? details.expanded_thumbnail_url : null}
         className="mb-3 block max-h-[220px] w-full rounded-md object-cover"
         onClick={() => void dispatch("ToggleThumbnailExpansion")}

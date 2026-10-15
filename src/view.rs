@@ -1014,6 +1014,11 @@ pub struct DetailView {
     /// Image-enabled renderers may warm this separate target before the user
     /// clicks the visible preview.
     pub expanded_thumbnail_url: Option<url::Url>,
+    /// Advertised alternatives tried lazily if the selected artwork is unavailable.
+    ///
+    /// These URLs are not speculative downloads. Image workers validate and
+    /// cache each successful source under its own URL, within existing bounds.
+    pub thumbnail_fallback_urls: Vec<url::Url>,
     /// Source pixel dimensions used to reserve an aspect-correct preview area.
     pub thumbnail_dimensions: Option<(u32, u32)>,
     /// Lazy midpoint-frame target for a selected local video.

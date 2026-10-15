@@ -1978,6 +1978,9 @@ Details show `Artist [g]: NAME`, with its canonical URL on the next line, and
 one unified `Album [b] NAME - URL` line when available. Click the name or URL,
 or press its hotkey, to browse that exact artist or album inside Youta. Album
 tracks follow disc and track order; HTTP URLs remain visible for copying.
+Selected artwork lazily tries advertised track and album image alternatives.
+If none works, Details shows **Artwork unavailable on this pod** rather than
+a long download error. Some pods advertise missing or broken artwork.
 Tags in Details are clickable: they search the same pod using its exact tag
 filter, without changing the tag into a title search. Esc or Alt+Left restores
 the previous catalogue, artist view, selection and query.

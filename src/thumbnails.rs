@@ -26,9 +26,7 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
-#[cfg(feature = "local-video-thumbnails")]
-use std::time::Instant;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded};
 use image::{
@@ -49,8 +47,8 @@ use crate::worker_wake::WorkerNotifier;
 
 const MAX_DOWNLOAD_BYTES: usize = 4 * 1024 * 1024;
 use crate::artwork::{
-    HttpThumbnailTransport, ThumbnailCache, ThumbnailTransport, is_archive_waveform_url,
-    is_safe_thumbnail_source,
+    HttpThumbnailTransport, REQUEST_TIMEOUT, ThumbnailCache, ThumbnailTransport,
+    is_archive_waveform_url, is_safe_thumbnail_source,
 };
 // The renderer's tests still exercise the pipeline end to end, so they reach
 // into the neutral half for its fetch entry points and guarded resolver.
@@ -69,6 +67,8 @@ const REQUEST_DEBOUNCE: Duration = Duration::from_millis(150);
 const FALLBACK_FONT_SIZE: (u16, u16) = (10, 20);
 const MAX_PREFETCH_SOURCES: usize = 512;
 const MAX_PREFETCH_URL_BYTES: usize = 4 * 1024;
+/// Maximum advertised alternatives tried lazily for one selected artwork target.
+const MAX_ARTWORK_FALLBACKS: usize = 8;
 const PREPARED_THUMBNAIL_CACHE_ENTRIES: usize = 100;
 const PREPARED_THUMBNAIL_CACHE_MAX_DECODED_BYTES: usize = 100 * 1024 * 1024;
 const LOCAL_PREVIEW_CACHE_KEY_VERSION: &[u8] = b"youta-local-preview-v1\0";
@@ -298,6 +298,8 @@ enum ThumbnailSizing {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ThumbnailTarget {
     source: Url,
+    /// Ordered alternatives belong to this exact selection and cache identity.
+    fallback_sources: Vec<Url>,
     local_video_midpoint: Option<LocalVideoMidpoint>,
     area: Rect,
     sizing: ThumbnailSizing,
@@ -354,6 +356,7 @@ impl Drop for WorkerResultSender {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PreparedThumbnailKey {
     source: Url,
+    fallback_sources: Vec<Url>,
     local_video_midpoint: Option<LocalVideoMidpoint>,
     width: u16,
     height: u16,
@@ -365,6 +368,7 @@ impl From<&ThumbnailTarget> for PreparedThumbnailKey {
     fn from(target: &ThumbnailTarget) -> Self {
         Self {
             source: target.source.clone(),
+            fallback_sources: target.fallback_sources.clone(),
             local_video_midpoint: target.local_video_midpoint,
             width: target.area.width,
             height: target.area.height,
@@ -402,6 +406,7 @@ impl PreparedThumbnailKey {
 
     fn same_target(&self, other: &Self) -> bool {
         self.source == other.source
+            && self.fallback_sources == other.fallback_sources
             && self.local_video_midpoint == other.local_video_midpoint
             && self.width == other.width
             && self.height == other.height
@@ -1141,6 +1146,48 @@ impl ThumbnailManager {
         self.synchronize_with_sizing(source, area, ThumbnailSizing::Fullscreen)
     }
 
+    /// Lazily tries bounded provider-advertised alternatives for the selected image.
+    ///
+    /// All candidates use the existing guarded transport, byte/decode limits,
+    /// and one shared network deadline. Altering their order invalidates only
+    /// this target's prepared-cache identity; unrelated artwork keeps its policy.
+    pub fn synchronize_with_fallbacks(
+        &mut self,
+        source: Option<&Url>,
+        fallbacks: &[Url],
+        area: Rect,
+        fullscreen: bool,
+    ) -> bool {
+        if !self.is_enabled() {
+            return false;
+        }
+        let Some(source) = source.filter(|_| !area.is_empty()) else {
+            return self.clear();
+        };
+        let mut fallback_sources = Vec::new();
+        for fallback in fallbacks.iter().take(MAX_ARTWORK_FALLBACKS) {
+            if fallback != source
+                && fallback.as_str().len() <= MAX_PREFETCH_URL_BYTES
+                && matches!(fallback.scheme(), "http" | "https")
+                && is_safe_thumbnail_source(fallback)
+                && !fallback_sources.contains(fallback)
+            {
+                fallback_sources.push(fallback.clone());
+            }
+        }
+        self.synchronize_target(ThumbnailTarget {
+            source: source.clone(),
+            fallback_sources,
+            local_video_midpoint: None,
+            area,
+            sizing: if fullscreen {
+                ThumbnailSizing::Fullscreen
+            } else {
+                ThumbnailSizing::Native
+            },
+        })
+    }
+
     /// Applies the visible URL with an explicit preparation/cache sizing identity.
     fn synchronize_with_sizing(
         &mut self,
@@ -1156,6 +1203,7 @@ impl ThumbnailManager {
         };
         let target = ThumbnailTarget {
             source: source.clone(),
+            fallback_sources: Vec::new(),
             local_video_midpoint: None,
             area,
             sizing,
@@ -1187,6 +1235,7 @@ impl ThumbnailManager {
         }
         let target = ThumbnailTarget {
             source: source.clone(),
+            fallback_sources: Vec::new(),
             local_video_midpoint: None,
             area,
             sizing: ThumbnailSizing::Fullscreen,
@@ -1412,6 +1461,7 @@ impl ThumbnailManager {
         };
         self.synchronize_target(ThumbnailTarget {
             source,
+            fallback_sources: Vec::new(),
             local_video_midpoint: Some(LocalVideoMidpoint(midpoint_ms)),
             area,
             sizing,
@@ -1930,6 +1980,7 @@ fn spawn_visible_worker_with_transport<T: ThumbnailTransport>(
     transport: T,
     cache: Option<ThumbnailCache>,
     debounce: Duration,
+    current_generation: Arc<AtomicU64>,
 ) -> bool {
     spawn_visible_worker_with_transport_and_extractor(
         picker,
@@ -1939,7 +1990,7 @@ fn spawn_visible_worker_with_transport<T: ThumbnailTransport>(
         FfmpegVideoFrameExtractor::default(),
         cache,
         debounce,
-        Arc::new(AtomicU64::new(0)),
+        current_generation,
     )
 }
 
@@ -2039,6 +2090,7 @@ fn spawn_worker_with_transport<T: ThumbnailTransport>(
     mut transport: T,
     mut cache: Option<ThumbnailCache>,
     debounce: Duration,
+    current_generation: Arc<AtomicU64>,
 ) -> bool {
     thread::Builder::new()
         .name("youta-thumbnail".to_owned())
@@ -2047,7 +2099,6 @@ fn spawn_worker_with_transport<T: ThumbnailTransport>(
                 cache.as_ref().is_some_and(|cache| cache.prepare().is_ok());
             let mut prefetch_backlog = VecDeque::new();
             let mut extractor = FfmpegVideoFrameExtractor::default();
-            let current_generation = Arc::new(AtomicU64::new(0));
             loop {
                 match latest_worker_request(&requests) {
                     WorkerInput::Item(request) => {
@@ -2340,6 +2391,41 @@ fn load_thumbnail(
         return load_local_thumbnail(cache, picker, target);
     }
 
+    let started = Instant::now();
+    let mut failure = ThumbnailFailure::DownloadFailed;
+    for source in std::iter::once(&target.source).chain(target.fallback_sources.iter()) {
+        if cancellation.is_cancelled() || started.elapsed() >= REQUEST_TIMEOUT {
+            return Err(ThumbnailFailure::DownloadFailed);
+        }
+        let candidate = ThumbnailTarget {
+            source: source.clone(),
+            fallback_sources: Vec::new(),
+            ..target.clone()
+        };
+        match load_remote_thumbnail_candidate(
+            transport,
+            cache.as_deref_mut(),
+            picker,
+            &candidate,
+            started,
+        ) {
+            Ok(loaded) => return Ok(loaded),
+            // A refused redirect invalidates only this source. Each next
+            // advertised URL still passes its own guarded transport boundary.
+            Err(error) => failure = error,
+        }
+    }
+    Err(failure)
+}
+
+/// Loads and caches only one actual advertised URL, never an unrelated fallback's key.
+fn load_remote_thumbnail_candidate(
+    transport: &mut impl ThumbnailTransport,
+    mut cache: Option<&mut ThumbnailCache>,
+    picker: &Picker,
+    target: &ThumbnailTarget,
+    started: Instant,
+) -> Result<LoadedThumbnail, ThumbnailFailure> {
     let persistent_cache_allowed = matches!(target.source.scheme(), "http" | "https");
     if persistent_cache_allowed
         && let Some(result) = load_cached_thumbnail(cache.as_deref_mut(), picker, target)
@@ -2356,7 +2442,11 @@ fn load_thumbnail(
         });
     }
 
-    let downloaded = transport.fetch(&target.source)?;
+    let remaining = REQUEST_TIMEOUT
+        .checked_sub(started.elapsed())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or(ThumbnailFailure::DownloadFailed)?;
+    let downloaded = transport.fetch_with_timeout(&target.source, remaining)?;
     let image = decode_thumbnail(&downloaded.bytes)?;
     if persistent_cache_allowed
         && !downloaded.is_fallback
@@ -3417,6 +3507,172 @@ pub(crate) mod tests {
         }
     }
 
+    /// Reproduces missing Funkwhale crops followed by cached storage-error XML.
+    #[test]
+    fn advertised_artwork_fallback_uses_valid_album_without_caching_broken_track_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut manager, replies, observed) =
+            manager_with_mock_transport_in_cache(Some(directory.path().join("art")));
+        let primary = Url::parse("https://audio.example/media/track-large.jpg").unwrap();
+        let original = Url::parse("https://audio.example/media/track-original.png").unwrap();
+        let album = Url::parse("https://audio.example/media/album-large.jpg").unwrap();
+        let fallbacks = vec![original.clone(), album.clone()];
+        assert!(manager.synchronize_with_fallbacks(
+            Some(&primary),
+            &fallbacks,
+            Rect::new(0, 0, 20, 8),
+            false,
+        ));
+        assert_eq!(
+            observed.recv_timeout(Duration::from_secs(1)).unwrap(),
+            primary
+        );
+        replies.send(Err(ThumbnailFailure::DownloadFailed)).unwrap();
+        assert_eq!(
+            observed.recv_timeout(Duration::from_secs(1)).unwrap(),
+            original
+        );
+        replies
+            .send(Ok(
+                b"<?xml version=\"1.0\"?><Error><Code>TimeExpired</Code></Error>".to_vec(),
+            ))
+            .unwrap();
+        assert_eq!(
+            observed.recv_timeout(Duration::from_secs(1)).unwrap(),
+            album
+        );
+        replies.send(Ok(fixture_png())).unwrap();
+        assert_eq!(wait_for_terminal_state(&mut manager), ThumbnailState::Ready);
+        let cache = ThumbnailCache::new(directory.path().join("art"));
+        assert!(cache.read(&primary).unwrap().is_none());
+        assert!(cache.read(&original).unwrap().is_none());
+        assert_eq!(cache.read(&album).unwrap(), Some(fixture_png()));
+        assert!(!manager.synchronize_with_fallbacks(
+            Some(&primary),
+            &fallbacks,
+            Rect::new(0, 0, 20, 8),
+            false,
+        ));
+        assert!(
+            observed.try_recv().is_err(),
+            "an unchanged selection must not retry"
+        );
+    }
+
+    /// Rejecting one redirect cannot invalidate another independently guarded cover.
+    #[test]
+    fn advertised_artwork_fallback_recovers_after_a_rejected_redirect() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut manager, replies, observed) =
+            manager_with_mock_transport_in_cache(Some(directory.path().join("art")));
+        let primary = Url::parse("https://audio.example/media/track.jpg").unwrap();
+        let unsafe_alternative = Url::parse("http://127.0.0.1/media/private.jpg").unwrap();
+        let album = Url::parse("https://audio.example/media/album.jpg").unwrap();
+        // The guarded transport refuses the primary's unsafe redirect without
+        // following it. Unsafe advertised alternatives must not reach it either.
+        replies.send(Err(ThumbnailFailure::InvalidSource)).unwrap();
+        replies.send(Ok(fixture_png())).unwrap();
+        assert!(manager.synchronize_with_fallbacks(
+            Some(&primary),
+            &[unsafe_alternative, album.clone()],
+            Rect::new(0, 0, 20, 8),
+            false,
+        ));
+        assert_eq!(wait_for_terminal_state(&mut manager), ThumbnailState::Ready);
+        assert_eq!(
+            observed.try_iter().collect::<Vec<_>>(),
+            vec![primary.clone(), album.clone()]
+        );
+        let cache = ThumbnailCache::new(directory.path().join("art"));
+        assert!(cache.read(&primary).unwrap().is_none());
+        assert_eq!(cache.read(&album).unwrap(), Some(fixture_png()));
+    }
+
+    /// A working track cover must win without fetching its album or original.
+    #[test]
+    fn advertised_artwork_fallback_stays_lazy_and_is_owned_by_target_identity() {
+        let (mut manager, replies, observed) = manager_with_mock_transport();
+        let primary = Url::parse("https://audio.example/media/track.jpg").unwrap();
+        let album = Url::parse("https://audio.example/media/album.jpg").unwrap();
+        let area = Rect::new(0, 0, 20, 8);
+        assert!(manager.synchronize_with_fallbacks(
+            Some(&primary),
+            std::slice::from_ref(&album),
+            area,
+            false,
+        ));
+        assert_eq!(
+            observed.recv_timeout(Duration::from_secs(1)).unwrap(),
+            primary
+        );
+        replies.send(Ok(fixture_png())).unwrap();
+        assert_eq!(wait_for_terminal_state(&mut manager), ThumbnailState::Ready);
+        assert!(observed.try_recv().is_err());
+        let original_key = manager.protocol_key.clone().unwrap();
+        assert_eq!(original_key.fallback_sources, vec![album]);
+        assert!(manager.synchronize_with_fallbacks(Some(&primary), &[], area, false));
+        assert_eq!(
+            observed.recv_timeout(Duration::from_secs(1)).unwrap(),
+            primary
+        );
+        replies.send(Ok(fixture_png())).unwrap();
+        assert_eq!(wait_for_terminal_state(&mut manager), ThumbnailState::Ready);
+        assert_ne!(manager.protocol_key.as_ref(), Some(&original_key));
+    }
+
+    /// Selection changes revoke queued alternatives instead of probing the abandoned album.
+    #[test]
+    fn advertised_artwork_fallback_stops_when_another_track_is_selected() {
+        let (mut manager, replies, observed) = manager_with_mock_transport();
+        let first = Url::parse("https://audio.example/media/first.jpg").unwrap();
+        let album = Url::parse("https://audio.example/media/first-album.jpg").unwrap();
+        let second = Url::parse("https://audio.example/media/second.jpg").unwrap();
+        let area = Rect::new(0, 0, 20, 8);
+        manager.synchronize_with_fallbacks(Some(&first), &[album], area, false);
+        assert_eq!(
+            observed.recv_timeout(Duration::from_secs(2)).unwrap(),
+            first
+        );
+        manager.synchronize_with_fallbacks(Some(&second), &[], area, false);
+        replies.send(Err(ThumbnailFailure::DownloadFailed)).unwrap();
+        assert_eq!(
+            observed.recv_timeout(Duration::from_secs(2)).unwrap(),
+            second
+        );
+        replies.send(Ok(fixture_png())).unwrap();
+        assert_eq!(wait_for_terminal_state(&mut manager), ThumbnailState::Ready);
+        assert_eq!(manager.target.as_ref().unwrap().source, second);
+        assert!(observed.try_recv().is_err());
+    }
+
+    /// A spent aggregate deadline cannot start another bounded network operation.
+    #[test]
+    fn advertised_artwork_fallback_does_not_reset_the_network_deadline() {
+        let (observed, requests) = bounded(1);
+        let (_replies, responses) = bounded(1);
+        let mut transport = MockTransport {
+            observed,
+            replies: responses,
+        };
+        let target = ThumbnailTarget {
+            source: Url::parse("https://audio.example/media/album.jpg").unwrap(),
+            fallback_sources: Vec::new(),
+            local_video_midpoint: None,
+            area: Rect::new(0, 0, 20, 8),
+            sizing: ThumbnailSizing::Native,
+        };
+        let picker = picker_for_protocol(ThumbnailProtocol::Kitty, FALLBACK_FONT_SIZE);
+        let result = load_remote_thumbnail_candidate(
+            &mut transport,
+            None,
+            &picker,
+            &target,
+            Instant::now() - REQUEST_TIMEOUT - Duration::from_secs(1),
+        );
+        assert_eq!(result.err(), Some(ThumbnailFailure::DownloadFailed));
+        assert!(requests.try_recv().is_err());
+    }
+
     /// Supplies explicit fallback provenance without network or response deadlines.
     struct SequencedThumbnailTransport {
         responses: VecDeque<DownloadedThumbnail>,
@@ -4283,6 +4539,7 @@ pub(crate) mod tests {
         let picker = picker_for_protocol(ThumbnailProtocol::Kitty, FALLBACK_FONT_SIZE);
         let target = ThumbnailTarget {
             source: Url::from_file_path(&path).expect("benchmark file URL"),
+            fallback_sources: Vec::new(),
             local_video_midpoint: None,
             area: Rect::new(0, 0, 120, 40),
             sizing: ThumbnailSizing::Native,
@@ -4402,6 +4659,7 @@ pub(crate) mod tests {
         let picker = picker_for_protocol(ThumbnailProtocol::Kitty, FALLBACK_FONT_SIZE);
         let target = ThumbnailTarget {
             source: Url::parse("https://images.example/sixteen-bit.png").unwrap(),
+            fallback_sources: Vec::new(),
             local_video_midpoint: None,
             area: Rect::new(0, 0, 40, 10),
             sizing: ThumbnailSizing::Fullscreen,
@@ -4588,6 +4846,7 @@ pub(crate) mod tests {
         let area = Rect::new(0, 0, 20, 10);
         let target = ThumbnailTarget {
             source: source.clone(),
+            fallback_sources: Vec::new(),
             local_video_midpoint: None,
             area,
             sizing: ThumbnailSizing::Native,
@@ -5593,6 +5852,7 @@ pub(crate) mod tests {
             transport,
             Some(ThumbnailCache::new(cache_directory.clone())),
             Duration::ZERO,
+            Arc::clone(&manager.current_generation),
         ));
         manager.request_sender = Some(requests);
         manager.result_receiver = Some(result_receiver);
@@ -5909,6 +6169,7 @@ pub(crate) mod tests {
         };
         let first = PreparedThumbnailKey {
             source: Url::parse("https://images.example/first-budget.png").expect("first URL"),
+            fallback_sources: Vec::new(),
             local_video_midpoint: None,
             width: area.width,
             height: area.height,
@@ -5917,6 +6178,7 @@ pub(crate) mod tests {
         };
         let second = PreparedThumbnailKey {
             source: Url::parse("https://images.example/second-budget.png").expect("second URL"),
+            fallback_sources: Vec::new(),
             local_video_midpoint: None,
             width: area.width,
             height: area.height,
@@ -5926,6 +6188,7 @@ pub(crate) mod tests {
         let oversized = PreparedThumbnailKey {
             source: Url::parse("https://images.example/oversized-budget.png")
                 .expect("oversized URL"),
+            fallback_sources: Vec::new(),
             local_video_midpoint: None,
             width: area.width,
             height: area.height,
@@ -6050,6 +6313,7 @@ pub(crate) mod tests {
         let (visible_observed_sender, visible_observed) = bounded(1);
         let (visible_reply_sender, visible_reply_receiver) = bounded(1);
         let worker_notifier = WorkerNotifier::default();
+        let current_generation = Arc::new(AtomicU64::new(0));
         assert!(spawn_visible_worker_with_transport(
             picker_for_protocol(ThumbnailProtocol::Kitty, FALLBACK_FONT_SIZE),
             visible_request_receiver,
@@ -6060,6 +6324,7 @@ pub(crate) mod tests {
             },
             Some(ThumbnailCache::new(cache_directory.clone())),
             Duration::ZERO,
+            Arc::clone(&current_generation),
         ));
 
         let (prefetch_sender, prefetch_receiver) = bounded(1);
@@ -6079,7 +6344,7 @@ pub(crate) mod tests {
             capability: ThumbnailCapability::Supported(ThumbnailProtocol::Kitty),
             state: ThumbnailState::Idle,
             generation: 0,
-            current_generation: Arc::new(AtomicU64::new(0)),
+            current_generation,
             target: None,
             protocol: None,
             protocol_render_size: None,
@@ -6390,6 +6655,7 @@ pub(crate) mod tests {
             current_generation: Arc::new(AtomicU64::new(1)),
             target: Some(ThumbnailTarget {
                 source,
+                fallback_sources: Vec::new(),
                 local_video_midpoint: None,
                 area: Rect::new(0, 0, 20, 8),
                 sizing: ThumbnailSizing::Native,
@@ -6544,6 +6810,7 @@ pub(crate) mod tests {
         let (reply_sender, reply_receiver) = bounded(4);
         let picker = picker_for_protocol(ThumbnailProtocol::Kitty, FALLBACK_FONT_SIZE);
         let worker_notifier = WorkerNotifier::default();
+        let current_generation = Arc::new(AtomicU64::new(0));
         assert!(spawn_worker_with_transport(
             picker,
             request_receiver,
@@ -6555,13 +6822,14 @@ pub(crate) mod tests {
             },
             cache_directory.clone().map(ThumbnailCache::new),
             debounce,
+            Arc::clone(&current_generation),
         ));
         (
             ThumbnailManager {
                 capability: ThumbnailCapability::Supported(ThumbnailProtocol::Kitty),
                 state: ThumbnailState::Idle,
                 generation: 0,
-                current_generation: Arc::new(AtomicU64::new(0)),
+                current_generation,
                 target: None,
                 protocol: None,
                 protocol_render_size: None,

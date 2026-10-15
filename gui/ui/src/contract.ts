@@ -313,6 +313,8 @@ export interface DetailView {
   wikidata_entities: DetailWikidataEntityView[];
   thumbnail_url: string | null;
   expanded_thumbnail_url: string | null;
+	/** Advertised alternatives; requested only after the selected artwork fails. */
+	thumbnail_fallback_urls: string[];
   thumbnail_expanded: boolean;
   local_renamable: boolean;
 	local_copyable: boolean;

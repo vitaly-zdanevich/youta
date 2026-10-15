@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 import { artworkSource } from "../ipc";
 
@@ -11,19 +11,31 @@ import { artworkSource } from "../ipc";
  */
 export function Artwork({
   url,
+	fallbackUrls = [],
+	unavailableLabel,
 	prefetchUrl,
   className,
   onClick,
 }: {
   url: string | null | undefined;
+	/** Ordered provider-advertised alternatives; only the selected failing image advances. */
+	fallbackUrls?: readonly string[];
+	/** Optional concise source-specific warning after all advertised images fail. */
+	unavailableLabel?: string | undefined;
 	/** Selected Details only: warm this rendition after the visible image loads. */
 	prefetchUrl?: string | null;
   className: string;
   onClick?: () => void;
 }) {
-  const [failed, setFailed] = useState(false);
+	const candidates = [...new Set([url, ...fallbackUrls.slice(0, 8)].filter((value): value is string => !!value))];
+	const owner = JSON.stringify(candidates);
+	const currentOwner = useRef(owner);
+	currentOwner.current = owner;
+	const [attempt, setAttempt] = useState({ owner, index: 0 });
+	const index = attempt.owner === owner ? attempt.index : 0;
+	const failed = candidates.length > 0 && index >= candidates.length;
 	const [loadedSource, setLoadedSource] = useState<string | null>(null);
-  const source = artworkSource(url);
+  const source = artworkSource(candidates[index]);
 	const prefetchSource = artworkSource(prefetchUrl);
 
 	useEffect(() => {
@@ -47,10 +59,13 @@ export function Artwork({
 	}, [source, loadedSource, prefetchSource]);
 
   if (source === null || failed) {
-    return <div className={`${className} bg-raised`} aria-hidden="true" />;
+    return <div className={`${className} bg-raised`} aria-hidden={failed && unavailableLabel ? undefined : true}>
+			{failed ? unavailableLabel : undefined}
+		</div>;
   }
   return (
     <img
+		key={source}
       className={onClick ? `${className} cursor-zoom-in` : className}
       src={source}
       alt=""
@@ -58,7 +73,10 @@ export function Artwork({
       decoding="async"
       onClick={onClick}
 		onLoad={() => { if (prefetchSource) setLoadedSource(source); }}
-      onError={() => setFailed(true)}
+      onError={() => {
+				if (currentOwner.current !== owner) return;
+				setAttempt({ owner, index: index + 1 });
+			}}
     />
   );
 }

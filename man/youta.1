@@ -958,6 +958,9 @@ Details show Artist [g]: NAME with its canonical URL on the next line,
 and one unified Album [b] NAME - URL line. Click the name or URL, or use its
 hotkey, to browse that exact artist or album inside Youta. Album tracks follow
 disc and track order. Canonical HTTP URLs remain visible for copying.
+Selected artwork lazily tries advertised track and album image alternatives.
+If none works, Details shows Artwork unavailable on this pod instead of a long
+download error. Pod-provided artwork may be missing or broken.
 Tags in Details are clickable and search the same pod using its exact tag
 filter. Esc or Alt+Left restores the previous catalogue, artist view, selection
 and query. Descriptions render as plain text with clickable URLs; recognizable legacy

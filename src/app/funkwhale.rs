@@ -875,6 +875,7 @@ impl AppController {
                             .thumbnails
                             .first()
                             .map(|thumbnail| thumbnail.url.clone()),
+                        thumbnail_fallback_urls: artwork_candidates(&album.thumbnails),
                         links: vec![DetailLinkView {
                             label: album.title.clone(),
                             url: album.url.to_string(),
@@ -1803,6 +1804,38 @@ fn track_album(summary: &VideoSummary, details: Option<&VideoDetails>) -> Option
     None
 }
 
+/// Keeps original track artwork before advertised album alternatives without probing them.
+///
+/// Large and original images precede smaller crops; renderers try this bounded
+/// list only when selected artwork actually needs loading, and deduplicate the
+/// visible primary URL themselves (including fullscreen expansion).
+#[cfg(feature = "funkwhale")]
+fn artwork_candidates(thumbnails: &[crate::providers::Thumbnail]) -> Vec<url::Url> {
+    let mut candidates = Vec::new();
+    for quality in [
+        "large_square_crop",
+        "original",
+        "album_large_square_crop",
+        "album_original",
+        "medium_square_crop",
+        "album_medium_square_crop",
+        "small_square_crop",
+        "album_small_square_crop",
+        "source",
+        "album_source",
+    ] {
+        for thumbnail in thumbnails {
+            if thumbnail.quality.as_deref() == Some(quality)
+                && candidates.len() < 8
+                && !candidates.contains(&thumbnail.url)
+            {
+                candidates.push(thumbnail.url.clone());
+            }
+        }
+    }
+    candidates
+}
+
 /// Distinguishes source metadata from YouTube facts without inventing missing counts.
 #[cfg(feature = "funkwhale")]
 fn detail_view(summary: &VideoSummary, details: Option<&VideoDetails>) -> DetailView {
@@ -1911,6 +1944,7 @@ fn detail_view(summary: &VideoSummary, details: Option<&VideoDetails>) -> Detail
             .find(|thumbnail| thumbnail.quality.as_deref() == Some("original"))
             .or(thumbnails.first())
             .map(|thumbnail| thumbnail.url.clone()),
+        thumbnail_fallback_urls: artwork_candidates(thumbnails),
         ..DetailView::default()
     }
 }

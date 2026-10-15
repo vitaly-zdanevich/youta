@@ -686,12 +686,26 @@ impl FunkwhaleProvider {
             .transpose()
     }
 
+    /// Retains album artwork as lazy fallback without replacing an advertised track cover.
+    ///
+    /// Federated pods can advertise a broken track attachment beside a usable
+    /// album attachment. Preserve both identities so renderers can try the
+    /// album only after the selected track's own image fails validation.
     fn track_thumbnails(&self, raw: &RawTrack) -> Vec<Thumbnail> {
-        self.cover_thumbnails(
-            raw.cover
-                .as_ref()
-                .or_else(|| raw.album.as_ref().and_then(|album| album.cover.as_ref())),
-        )
+        let mut thumbnails = self.cover_thumbnails(raw.cover.as_ref());
+        for mut thumbnail in
+            self.cover_thumbnails(raw.album.as_ref().and_then(|album| album.cover.as_ref()))
+        {
+            if thumbnails
+                .iter()
+                .any(|existing| existing.url == thumbnail.url)
+            {
+                continue;
+            }
+            thumbnail.quality = thumbnail.quality.map(|quality| format!("album_{quality}"));
+            thumbnails.push(thumbnail);
+        }
+        thumbnails
     }
 
     fn cover_thumbnails(&self, cover: Option<&RawCover>) -> Vec<Thumbnail> {
@@ -1801,6 +1815,57 @@ mod tests {
                 .any(|pair| pair == ("page".into(), "2".into()))
         );
         assert_eq!(artists_url.path(), "/prefix/api/v2/artists/");
+    }
+
+    #[test]
+    fn track_artwork_retains_album_fallbacks_without_replacing_the_track_cover() {
+        let raw: RawTrack = serde_json::from_value(serde_json::json!({
+            "id": 27378,
+            "title": "Strata",
+            "cover": {"urls": {
+                "large_square_crop": "/media/track-large.jpg",
+                "original": "/media/track-original.png"
+            }},
+            "album": {"cover": {"urls": {
+                "large_square_crop": "/media/album-large.jpg",
+                "original": "/media/album-original.png"
+            }}}
+        }))
+        .expect("realistic track and album covers");
+
+        let thumbnails = provider().track_thumbnails(&raw);
+        assert_eq!(
+            thumbnails
+                .iter()
+                .map(|image| image.url.path())
+                .collect::<Vec<_>>(),
+            vec![
+                "/media/track-large.jpg",
+                "/media/track-original.png",
+                "/media/album-large.jpg",
+                "/media/album-original.png",
+            ]
+        );
+        assert_eq!(thumbnails[0].quality.as_deref(), Some("large_square_crop"));
+        assert_eq!(
+            thumbnails[2].quality.as_deref(),
+            Some("album_large_square_crop")
+        );
+        assert_eq!(thumbnails[3].quality.as_deref(), Some("album_original"));
+    }
+
+    /// Shared track/album attachments do not multiply network attempts.
+    #[test]
+    fn track_artwork_deduplicates_shared_album_cover_urls() {
+        let raw: RawTrack = serde_json::from_value(serde_json::json!({
+            "id": 1, "title": "Track",
+            "cover": {"urls": {"large_square_crop": "/media/shared.jpg"}},
+            "album": {"cover": {"urls": {"large_square_crop": "/media/shared.jpg"}}}
+        }))
+        .unwrap();
+        let thumbnails = provider().track_thumbnails(&raw);
+        assert_eq!(thumbnails.len(), 1);
+        assert_eq!(thumbnails[0].quality.as_deref(), Some("large_square_crop"));
     }
 
     #[test]
