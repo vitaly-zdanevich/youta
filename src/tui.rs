@@ -47293,6 +47293,10 @@ prose 07:25 remains clickable but is not a chapter";
             ]
         );
         for (screen, label) in [
+            #[cfg(feature = "funkwhale")]
+            (Screen::Funkwhale, "Funkwhale"),
+            #[cfg(feature = "archive-org")]
+            (Screen::ArchiveOrg, "archive.org"),
             (Screen::Playlists, "Lists"),
             (Screen::Downloaded, "Offline"),
             (Screen::Subscriptions, "Subs"),
@@ -47883,7 +47887,7 @@ prose 07:25 remains clickable but is not a chapter";
             .expect("archive.org tab");
         let archive = Screen::ALL[archive_index];
         assert_eq!(Screen::ALL[archive_index + 1], Screen::LibriVox);
-        assert_eq!(archive.compact_label(), "archive.org");
+        assert_eq!(archive.compact_label(), "WebArchive");
         assert_eq!(archive.enabled(), cfg!(feature = "archive-org"));
         assert_eq!(archive.details_kind(), InformationPanelKind::Generic);
         assert_eq!(archive.search_verb(), Some("Search"));
@@ -47917,6 +47921,10 @@ prose 07:25 remains clickable but is not a chapter";
 
     #[test]
     fn source_tabs_use_space_saving_labels_and_keep_librivox_order() {
+        assert_eq!(Screen::Funkwhale.label(), "Funkwhale");
+        assert_eq!(Screen::Funkwhale.compact_label(), "FW");
+        assert_eq!(Screen::ArchiveOrg.label(), "archive.org");
+        assert_eq!(Screen::ArchiveOrg.compact_label(), "WebArchive");
         assert_eq!(Screen::Search.label(), "YT");
         assert_eq!(Screen::Search.compact_label(), "YT");
         assert_eq!(Screen::YouTubeMusic.label(), "YT Music");
@@ -47938,6 +47946,10 @@ prose 07:25 remains clickable but is not a chapter";
     #[test]
     fn narrow_tab_strip_keeps_the_active_tab_visible_and_clickable() {
         let active_screens = [
+            #[cfg(feature = "funkwhale")]
+            Screen::Funkwhale,
+            #[cfg(feature = "archive-org")]
+            Screen::ArchiveOrg,
             #[cfg(feature = "apple-podcasts")]
             Screen::ApplePodcasts,
             Screen::TrackerMusic,
