@@ -41,6 +41,8 @@ pub enum ArchiveUploadSource {
     Local,
     /// Original pod-scoped audio track page, resolved only after confirmation.
     Funkwhale,
+    /// Canonical VK audio page; authenticated media locators remain private.
+    Vk,
 }
 
 /// Editable publication metadata; defaults are deliberately not publishable.
@@ -138,6 +140,30 @@ impl ArchiveUploadDraft {
         Ok(draft)
     }
 
+    /// Creates an audio-only VK review without resolving media or reading cookies.
+    ///
+    /// # Errors
+    /// Rejects unavailable VK support, a noncanonical source or invalid metadata.
+    pub fn new_vk(
+        source_url: Url,
+        title: String,
+        description: String,
+        creator: Option<String>,
+    ) -> Result<Self, String> {
+        canonical_vk_source(source_url.as_str())?;
+        let draft = Self {
+            identifier: format!("vk-{}", identifier_suffix()?),
+            title,
+            description,
+            creator: creator.unwrap_or_default(),
+            source: ArchiveUploadSource::Vk,
+            source_url: source_url.into(),
+            upload_video: false,
+        };
+        draft.validate_metadata()?;
+        Ok(draft)
+    }
+
     /// Validates the editable fields and immutable source before confirmation.
     ///
     /// # Errors
@@ -187,6 +213,12 @@ impl ArchiveUploadDraft {
                     return Err("Funkwhale uploads support audio only".to_owned());
                 }
             }
+            ArchiveUploadSource::Vk => {
+                canonical_vk_source(&self.source_url)?;
+                if self.upload_video {
+                    return Err("VK uploads support audio only".to_owned());
+                }
+            }
         }
         Ok(())
     }
@@ -197,6 +229,20 @@ impl ArchiveUploadDraft {
     /// Rejects unsafe identifiers, invalid sources or invalid metadata text.
     pub fn validate(&self) -> Result<(), String> {
         self.validate_metadata()
+    }
+}
+
+/// Accepts only canonical public VK identities, excluding credentials and access hashes.
+fn canonical_vk_source(source: &str) -> Result<(), String> {
+    #[cfg(feature = "vk")]
+    {
+        let url = Url::parse(source).map_err(|_| "VK upload requires a canonical audio page")?;
+        crate::archive_upload_media::vk::canonical_source(&url).map(|_| ())
+    }
+    #[cfg(not(feature = "vk"))]
+    {
+        let _ = source;
+        Err("This build omits VK upload support".to_owned())
     }
 }
 
@@ -966,6 +1012,54 @@ mod tests {
 
     fn source() -> Url {
         Url::parse("https://www.youtube.com/watch?v=abcdefghijk").expect("fixture source")
+    }
+
+    /// VK provenance remains public and canonical, and exports cannot request video.
+    #[cfg(feature = "vk")]
+    #[test]
+    fn vk_drafts_keep_only_canonical_audio_provenance() {
+        let source = Url::parse("https://vk.ru/audio-123_456").unwrap();
+        let mut draft = ArchiveUploadDraft::new_vk(
+            source.clone(),
+            "Track".to_owned(),
+            "Album: Release".to_owned(),
+            Some("Artist".to_owned()),
+        )
+        .unwrap();
+        assert_eq!(draft.source, ArchiveUploadSource::Vk);
+        assert_eq!(draft.source_url, source.as_str());
+        assert!(draft.identifier.starts_with("vk-"));
+        assert!(draft.validate().is_ok());
+        let encoded = serde_json::to_string(&draft).unwrap();
+        assert!(encoded.contains("\"source\":\"Vk\""));
+        draft.upload_video = true;
+        assert!(draft.validate().is_err());
+        draft.upload_video = false;
+        for source in [
+            "https://vk.ru/audio-123_456?access_hash=private",
+            "https://vk.ru/audio-123_456#private",
+            "https://vk.com/audio-123_456",
+            "https://psv4.vkuseraudio.ru/private.mp3?token=private",
+        ] {
+            draft.source_url = source.to_owned();
+            assert!(draft.validate().is_err(), "{source}");
+        }
+    }
+
+    /// Unsupported provider builds reject imported VK drafts before publication.
+    #[cfg(not(feature = "vk"))]
+    #[test]
+    fn vk_drafts_require_native_provider_support() {
+        assert!(
+            ArchiveUploadDraft::new_vk(
+                Url::parse("https://vk.ru/audio-123_456").unwrap(),
+                "Track".to_owned(),
+                String::new(),
+                None
+            )
+            .unwrap_err()
+            .contains("omits VK")
+        );
     }
 
     /// Funkwhale provenance is a canonical original track page, never a transient stream.

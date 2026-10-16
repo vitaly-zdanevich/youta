@@ -13,6 +13,52 @@ fn repository_path(relative: impl AsRef<Path>) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(relative)
 }
 
+/// Authenticated VK browsing is removable from both frontends and default packages.
+#[test]
+fn vk_is_default_but_independently_removable_in_both_frontends() {
+    let manifest = manifest();
+    assert!(feature_entries(&manifest, "default").contains(&"vk"));
+    for profile in ["app", "app-core", "sources", "controller", "tui"] {
+        assert!(
+            !feature_closure(&manifest, profile).contains("vk"),
+            "{profile}"
+        );
+    }
+    let gui: toml::Value = toml::from_str(&read_repository_file("gui/Cargo.toml")).unwrap();
+    assert!(feature_entries(&gui, "default").contains(&"vk"));
+    assert_eq!(feature_entries(&gui, "vk"), ["youta/vk"]);
+    let ebuild = read_repository_file("packaging/gentoo/youta.ebuild");
+    assert!(ebuild.contains("+vimeo +vk"));
+    assert!(ebuild.contains("$(usev vk)"));
+    assert!(ebuild.contains("gui_features+=,vk"));
+    assert!(ebuild.contains("gui_test_features+=vk"));
+    let ci = read_repository_file(".github/workflows/ci.yml");
+    for features in ["vk", "tui,vk"] {
+        assert!(ci.contains(&format!(
+            "feature_arguments: --no-default-features --features {features}\n"
+        )));
+    }
+    for (path, prefix) in [
+        ("scripts/package-release.sh", "cargo_features="),
+        (
+            ".github/workflows/ci.yml",
+            "cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features ",
+        ),
+    ] {
+        let source = read_repository_file(path);
+        let variants = source
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix(prefix))
+            .collect::<Vec<_>>();
+        assert_eq!(variants.len(), 8);
+        assert!(
+            variants
+                .iter()
+                .all(|variant| variant.split(',').any(|feature| feature == "vk"))
+        );
+    }
+}
+
 /// Funkwhale is a default source that each frontend can remove independently.
 #[test]
 fn funkwhale_is_default_but_independently_removable_in_both_frontends() {
@@ -1130,14 +1176,14 @@ fn release_script_builds_gpm_and_linux_no_gpm_non_sqlite_executables() {
 
     assert!(!script.contains("--features bundled-sqlite"));
     for feature_set in [
-        "cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,gpm,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info,web-browser,youtube-captions",
-        "cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,gpm,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info,web-browser,youtube-captions",
-        "cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,gpm,images,local-archives,nyan-cat,sponsorblock,summary,url-info,web-browser,youtube-captions",
-        "cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,gpm,local-archives,nyan-cat,sponsorblock,summary,url-info,web-browser,youtube-captions",
-        "cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info,web-browser,youtube-captions",
-        "cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info,web-browser,youtube-captions",
-        "cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,images,local-archives,nyan-cat,sponsorblock,summary,url-info,web-browser,youtube-captions",
-        "cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,local-archives,nyan-cat,sponsorblock,summary,url-info,web-browser,youtube-captions",
+        "cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,gpm,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info,vk,web-browser,youtube-captions",
+        "cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,gpm,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info,vk,web-browser,youtube-captions",
+        "cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,gpm,images,local-archives,nyan-cat,sponsorblock,summary,url-info,vk,web-browser,youtube-captions",
+        "cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,gpm,local-archives,nyan-cat,sponsorblock,summary,url-info,vk,web-browser,youtube-captions",
+        "cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info,vk,web-browser,youtube-captions",
+        "cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info,vk,web-browser,youtube-captions",
+        "cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,images,local-archives,nyan-cat,sponsorblock,summary,url-info,vk,web-browser,youtube-captions",
+        "cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,local-archives,nyan-cat,sponsorblock,summary,url-info,vk,web-browser,youtube-captions",
     ] {
         assert!(
             script
@@ -1459,14 +1505,14 @@ fn workflows_validate_and_publish_the_documented_platform_contract() {
     assert!(ci.contains("sudo apt-get install --yes gcc-multilib libc6-dev-i386"));
     assert!(ci.contains("cargo build --locked --release --target i686-unknown-linux-gnu"));
     for feature_set in [
-        "app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,gpm,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info",
-        "app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,gpm,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info",
-        "app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,gpm,images,local-archives,nyan-cat,sponsorblock,summary,url-info",
-        "app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,gpm,local-archives,nyan-cat,sponsorblock,summary,url-info",
-        "app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info",
-        "app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info",
-        "app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,images,local-archives,nyan-cat,sponsorblock,summary,url-info",
-        "app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,local-archives,nyan-cat,sponsorblock,summary,url-info",
+        "app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,gpm,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info,vk",
+        "app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,gpm,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info,vk",
+        "app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,gpm,images,local-archives,nyan-cat,sponsorblock,summary,url-info,vk",
+        "app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,gpm,local-archives,nyan-cat,sponsorblock,summary,url-info,vk",
+        "app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info,vk",
+        "app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info,vk",
+        "app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,images,local-archives,nyan-cat,sponsorblock,summary,url-info,vk",
+        "app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,local-archives,nyan-cat,sponsorblock,summary,url-info,vk",
     ] {
         assert!(
             ci.contains(&format!(

@@ -37,6 +37,7 @@
     feature = "ascii-visualizer",
     feature = "audio-quality",
     feature = "yt-dlp",
+    all(feature = "vk", feature = "acoustid"),
     all(feature = "web-browser", feature = "local-metadata")
 ))]
 use std::process::Child;
@@ -71,6 +72,7 @@ pub fn quiet(command: &mut Command) -> &mut Command {
     feature = "ascii-visualizer",
     feature = "audio-quality",
     feature = "yt-dlp",
+    all(feature = "vk", feature = "acoustid"),
     all(feature = "web-browser", feature = "local-metadata")
 ))]
 pub fn supervised(command: &mut Command) -> &mut Command {
@@ -91,6 +93,7 @@ pub fn supervised(command: &mut Command) -> &mut Command {
     feature = "ascii-visualizer",
     feature = "audio-quality",
     feature = "yt-dlp",
+    all(feature = "vk", feature = "acoustid"),
     all(feature = "web-browser", feature = "local-metadata")
 ))]
 pub fn kill_descendants(pid: u32) {
@@ -121,6 +124,7 @@ pub fn kill_descendants(pid: u32) {
     feature = "ascii-visualizer",
     feature = "audio-quality",
     feature = "yt-dlp",
+    all(feature = "vk", feature = "acoustid"),
     all(feature = "web-browser", feature = "local-metadata")
 ))]
 pub fn terminate_tree(child: &mut Child) {
@@ -162,6 +166,7 @@ pub fn terminate_tree(child: &mut Child) {
             feature = "ascii-visualizer",
             feature = "audio-quality",
             feature = "yt-dlp",
+            all(feature = "vk", feature = "acoustid"),
             all(feature = "web-browser", feature = "local-metadata")
         )
     ),

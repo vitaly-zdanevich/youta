@@ -2,7 +2,9 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+#[cfg(feature = "yt-dlp")]
+use std::process::Stdio;
+use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -10,7 +12,9 @@ use std::time::{Duration, Instant};
 
 use crate::config::Config;
 use crate::domain::{MediaItem, SourceKind};
+#[cfg(feature = "yt-dlp")]
 use crate::links::{LinkTarget, parse_youtube_url};
+#[cfg(feature = "yt-dlp")]
 use crate::playback::ytdlp::{
     DownloadEvent, DownloadFormat, DownloadRequest, DownloadScope, YtDlpConfig,
     build_download_command, parse_download_event,
@@ -21,6 +25,10 @@ pub(crate) mod funkwhale;
 pub(crate) mod local;
 #[cfg(feature = "funkwhale")]
 pub use funkwhale::prepare_funkwhale_archive_media;
+#[cfg(feature = "vk")]
+pub(crate) mod vk;
+#[cfg(feature = "vk")]
+pub use vk::{VkExportSource, prepare_vk_archive_media, prepare_vk_archive_media_from_session};
 
 /// A private staged file whose temporary directory is removed when this guard drops.
 #[derive(Debug)]
@@ -57,6 +65,7 @@ pub(crate) const MAX_PREPARATION_TIME: Duration = Duration::from_secs(30 * 60);
 /// # Errors
 /// Returns an explanation for invalid sources, cancellation, staging limits,
 /// helper failures or output escaping the private temporary directory.
+#[cfg(feature = "yt-dlp")]
 pub fn prepare_archive_media(
     config: &Config,
     media: &MediaItem,
@@ -181,6 +190,7 @@ fn local_source_path(location: &str) -> Option<PathBuf> {
 }
 
 /// Upload-only sorting keeps resolution and frame rate ahead of codec preferences.
+#[cfg(feature = "yt-dlp")]
 const VIDEO_FORMAT_SORT: &str = "res,fps,hdr:12,vcodec:av1,channels,acodec:opus";
 const MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_LINE_BYTES: usize = 16 * 1024;
@@ -215,6 +225,7 @@ struct OutputState {
     done: usize,
 }
 
+#[cfg(feature = "yt-dlp")]
 fn prepare_with_limits(
     config: &Config,
     media: &MediaItem,
@@ -412,6 +423,7 @@ pub(crate) fn supervise_staging_command(
 }
 
 /// Only the selected public YouTube identity can reach the fixed download command.
+#[cfg(feature = "yt-dlp")]
 fn validated_source(media: &MediaItem) -> Result<url::Url, String> {
     if media.id.source != SourceKind::YouTube
         || crate::providers::validate_youtube_video_id(&media.id.external_id).is_err()
@@ -427,6 +439,7 @@ fn validated_source(media: &MediaItem) -> Result<url::Url, String> {
     .ok_or_else(|| "Invalid YouTube upload source".to_owned())
 }
 
+#[cfg(feature = "yt-dlp")]
 fn staging_command(
     config: &Config,
     source_url: url::Url,
@@ -447,6 +460,7 @@ fn staging_command(
 
 /// Reuses the normal download format policy; an exporter may require final MKV
 /// remuxing without changing the existing manual/Archive upload behavior.
+#[cfg(feature = "yt-dlp")]
 pub(crate) fn provider_staging_command(
     config: &Config,
     source_url: url::Url,
@@ -662,6 +676,7 @@ fn consume_line(line: &[u8], state: &Mutex<OutputState>) -> Result<(), String> {
         output.progress = Some((bytes, None));
         return Ok(());
     }
+    #[cfg(feature = "yt-dlp")]
     match parse_download_event(text) {
         Some(DownloadEvent::Progress {
             downloaded_bytes,
@@ -685,7 +700,7 @@ fn consume_line(line: &[u8], state: &Mutex<OutputState>) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "yt-dlp"))]
 mod tests {
     use super::*;
 

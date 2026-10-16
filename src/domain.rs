@@ -1386,6 +1386,8 @@ pub enum Screen {
     SoundCloud,
     /// Yandex Music recommendations, catalogue results, and album tracks.
     YandexMusic,
+    /// VK audio search and saved-library results.
+    Vk,
     /// Bandcamp track and album search results.
     Bandcamp,
     /// Track search on the configured Funkwhale pod.
@@ -1553,6 +1555,9 @@ pub struct SessionState {
     /// Last selected row in the independent Yandex Music result list.
     #[serde(default)]
     pub yandex_music_selected_row: Option<usize>,
+    /// Last selected row in the independent VK result list.
+    #[serde(default)]
+    pub vk_selected_row: Option<usize>,
     /// Last selected row in the independent Bandcamp result list.
     #[serde(default)]
     pub bandcamp_selected_row: Option<usize>,
@@ -1593,6 +1598,9 @@ pub struct SessionState {
     /// Last search text entered on the independent Yandex Music tab.
     #[serde(default)]
     pub yandex_music_search_text: String,
+    /// Last query submitted to VK; authentication remains outside session state.
+    #[serde(default)]
+    pub vk_search_text: String,
     /// Last search text entered on the independent Bandcamp tab.
     #[serde(default)]
     pub bandcamp_search_text: String,
@@ -1641,6 +1649,7 @@ impl Default for SessionState {
             youtube_music_selected_row: None,
             soundcloud_selected_row: None,
             yandex_music_selected_row: None,
+            vk_selected_row: None,
             bandcamp_selected_row: None,
             funkwhale_selected_row: None,
             apple_podcasts_selected_row: None,
@@ -1654,6 +1663,7 @@ impl Default for SessionState {
             youtube_music_search_text: String::new(),
             soundcloud_search_text: String::new(),
             yandex_music_search_text: String::new(),
+            vk_search_text: String::new(),
             bandcamp_search_text: String::new(),
             funkwhale_search_text: String::new(),
             apple_podcasts_search_text: String::new(),
@@ -1683,6 +1693,7 @@ impl SessionState {
             | Screen::YouTubeMusic
             | Screen::SoundCloud
             | Screen::YandexMusic
+            | Screen::Vk
             | Screen::Bandcamp
             | Screen::Funkwhale
             | Screen::ApplePodcasts
@@ -1710,6 +1721,7 @@ impl SessionState {
         self.youtube_music_selected_row = None;
         self.soundcloud_selected_row = None;
         self.yandex_music_selected_row = None;
+        self.vk_selected_row = None;
         self.bandcamp_selected_row = None;
         self.funkwhale_selected_row = None;
         self.apple_podcasts_selected_row = None;
@@ -1722,6 +1734,7 @@ impl SessionState {
         self.youtube_music_search_text.clear();
         self.soundcloud_search_text.clear();
         self.yandex_music_search_text.clear();
+        self.vk_search_text.clear();
         self.bandcamp_search_text.clear();
         self.funkwhale_search_text.clear();
         self.apple_podcasts_search_text.clear();
@@ -2089,6 +2102,7 @@ mod tests {
             youtube_music_selected_row: Some(2),
             soundcloud_selected_row: Some(3),
             yandex_music_selected_row: Some(4),
+            vk_selected_row: Some(11),
             bandcamp_selected_row: Some(5),
             funkwhale_selected_row: Some(10),
             apple_podcasts_selected_row: Some(6),
@@ -2102,6 +2116,7 @@ mod tests {
             youtube_music_search_text: "private-youtube-music".to_owned(),
             soundcloud_search_text: "private-soundcloud".to_owned(),
             yandex_music_search_text: "private-yandex-music".to_owned(),
+            vk_search_text: "private-vk".to_owned(),
             bandcamp_search_text: "private-bandcamp".to_owned(),
             funkwhale_search_text: "private-funkwhale".to_owned(),
             apple_podcasts_search_text: "private-apple-podcasts".to_owned(),
@@ -2131,6 +2146,7 @@ mod tests {
             Screen::YouTubeMusic,
             Screen::SoundCloud,
             Screen::YandexMusic,
+            Screen::Vk,
             Screen::Bandcamp,
             Screen::ApplePodcasts,
             Screen::ArchiveOrg,
@@ -2267,6 +2283,36 @@ mod tests {
             serde_json::from_value::<SessionState>(encoded).unwrap(),
             session
         );
+    }
+
+    /// VK navigation survives restarts while old sessions need no migration or credentials.
+    #[test]
+    fn vk_sessions_round_trip_and_accept_older_sessions_without_credentials() {
+        let session = SessionState {
+            screen: Screen::Vk,
+            vk_selected_row: Some(4),
+            vk_search_text: "ambient Мінск".to_owned(),
+            soundcloud_selected_row: Some(2),
+            soundcloud_search_text: "independent query".to_owned(),
+            ..SessionState::default()
+        };
+        let encoded = serde_json::to_value(&session).unwrap();
+        assert_eq!(encoded["screen"]["screen"], "vk");
+        assert_eq!(
+            serde_json::from_value::<SessionState>(encoded.clone()).unwrap(),
+            session
+        );
+        let mut old = encoded;
+        let object = old.as_object_mut().unwrap();
+        object.remove("vk_selected_row");
+        object.remove("vk_search_text");
+        let restored: SessionState = serde_json::from_value(old).unwrap();
+        assert_eq!(restored.screen, Screen::Vk);
+        assert_eq!(restored.vk_selected_row, None);
+        assert!(restored.vk_search_text.is_empty());
+        assert_eq!(restored.soundcloud_selected_row, Some(2));
+        assert_eq!(restored.soundcloud_search_text, "independent query");
+        assert!(!serde_json::to_string(&session).unwrap().contains("cookie"));
     }
 
     #[test]

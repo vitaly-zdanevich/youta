@@ -1395,7 +1395,12 @@ fn source_search_page_capacities(
 
 /// Publishes available result slots before an initial tick or search action can fetch a page.
 fn synchronize_search_page_capacities(controller: &mut impl UiController, area: Rect) {
-    for screen in [Screen::ArchiveOrg, Screen::SoundCloud, Screen::Funkwhale] {
+    for screen in [
+        Screen::ArchiveOrg,
+        Screen::SoundCloud,
+        Screen::Vk,
+        Screen::Funkwhale,
+    ] {
         let capacities = source_search_page_capacities(area, controller.view(), screen);
         controller.set_search_page_capacities(screen, capacities);
     }
@@ -3448,6 +3453,7 @@ fn search_panel_title(view: &ViewModel) -> String {
             ),
             Screen::YouTubeMusic
             | Screen::SoundCloud
+            | Screen::Vk
             | Screen::Funkwhale
             | Screen::Bandcamp
             | Screen::ApplePodcasts
@@ -3675,6 +3681,7 @@ fn main_list_pane_areas(mut pane: Rect, screen: Screen) -> (Rect, Rect) {
         | Screen::YouTubeMusic
         | Screen::ArchiveOrg
         | Screen::SoundCloud
+        | Screen::Vk
         | Screen::Funkwhale
         | Screen::ApplePodcasts
         | Screen::TrackerMusic
@@ -3752,6 +3759,7 @@ fn render_body(
             | Screen::YouTubeMusic
             | Screen::ArchiveOrg
             | Screen::SoundCloud
+            | Screen::Vk
             | Screen::Funkwhale
             | Screen::ApplePodcasts
             | Screen::TrackerMusic
@@ -3841,6 +3849,7 @@ fn render_catalog_playback_controls(
     for (key, label, action) in ((view.screen == Screen::ArchiveOrg
         && view.archive_org_back_available)
         || (view.screen == Screen::SoundCloud && view.soundcloud_back_available)
+        || (cfg!(feature = "vk") && view.screen == Screen::Vk && view.vk_back_available)
         || (view.screen == Screen::Funkwhale && view.funkwhale_back_available))
         .then_some(("Esc", "Back", UiAction::GoBack))
         .into_iter()
@@ -4798,6 +4807,7 @@ fn completed_search_has_no_rows(view: &ViewModel) -> bool {
         Screen::Search
         | Screen::YouTubeMusic
         | Screen::SoundCloud
+        | Screen::Vk
         | Screen::Funkwhale
         | Screen::Bandcamp
         | Screen::ApplePodcasts
@@ -5476,22 +5486,23 @@ fn render_information_panel(
             UiAction::ToggleRadioRecording,
         );
     }
-    if (kind == InformationPanelKind::Local || view.screen == Screen::Funkwhale)
+    if (kind == InformationPanelKind::Local
+        || matches!(view.screen, Screen::Funkwhale | Screen::Vk))
         && details.local_fingerprint_available
     {
-        let funkwhale = view.screen == Screen::Funkwhale;
+        let remote = matches!(view.screen, Screen::Funkwhale | Screen::Vk);
         let action_text = if details.local_fingerprint_pending {
             let frame = ASCII_ACTIVITY_FRAMES
                 [view.local_fingerprint_animation_frame % ASCII_ACTIVITY_FRAMES.len()];
             format!(
                 "{} {frame}",
-                if funkwhale {
+                if remote {
                     "Identifying"
                 } else {
                     "Fingerprinting"
                 }
             )
-        } else if funkwhale {
+        } else if remote {
             "AcoustID".to_owned()
         } else {
             "Fingerprint".to_owned()
@@ -5644,18 +5655,19 @@ fn render_information_panel(
                 UiAction::ToggleYandexMusicDislike,
             )
         });
-    let artist_button =
-        (view.selected_artist_available && view.screen != Screen::Funkwhale).then(|| {
-            push_left_detail_button(
-                &mut lines,
-                &right_buttons,
-                &mut next_left_row,
-                inner.width,
-                button("g", "Artist", show_hotkeys),
-                theme.accent,
-                UiAction::OpenSelectedArtist,
-            )
-        });
+    let artist_button = (view.selected_artist_available
+        && !matches!(view.screen, Screen::Funkwhale | Screen::Vk))
+    .then(|| {
+        push_left_detail_button(
+            &mut lines,
+            &right_buttons,
+            &mut next_left_row,
+            inner.width,
+            button("g", "Artist", show_hotkeys),
+            theme.accent,
+            UiAction::OpenSelectedArtist,
+        )
+    });
     let yandex_album_button = (view.screen == Screen::YandexMusic
         && view.yandex_music_actions.album_available)
         .then(|| {
@@ -6605,7 +6617,10 @@ fn render_information_panel(
             link_rows.push(Some((index, link)));
             if matches!(
                 link.internal_target,
-                Some(DetailLinkInternalTarget::FunkwhaleArtist(_))
+                Some(
+                    DetailLinkInternalTarget::FunkwhaleArtist(_)
+                        | DetailLinkInternalTarget::VkArtist(_)
+                )
             ) {
                 // The artist's labelled name and canonical URL own distinct rows.
                 link_rows.push(Some((index, link)));
@@ -6657,19 +6672,26 @@ fn render_information_panel(
                 let link_area = Rect::new(inner.x, cursor_y, inner.width, 1);
                 let mut content_offset = 0_u16;
                 let mut spans = Vec::new();
-                if let Some(target @ DetailLinkInternalTarget::FunkwhaleArtist(_)) =
-                    link.internal_target.as_ref()
+                if let Some(
+                    target @ (DetailLinkInternalTarget::FunkwhaleArtist(_)
+                    | DetailLinkInternalTarget::VkArtist(_)),
+                ) = link.internal_target.as_ref()
                 {
                     let url_row = row_index > 0
                         && link_rows[row_index - 1]
                             .as_ref()
                             .is_some_and(|(previous, _)| previous == index);
+                    let artist_name = if matches!(target, DetailLinkInternalTarget::VkArtist(_)) {
+                        &link.label
+                    } else {
+                        &details.channel_name
+                    };
                     let label = if url_row {
                         link.url.clone()
                     } else if show_hotkeys {
-                        format!("Artist [g]: {}", details.channel_name)
+                        format!("Artist [g]: {artist_name}")
                     } else {
-                        format!("Artist: {}", details.channel_name)
+                        format!("Artist: {artist_name}")
                     };
                     let width = terminal_text_width(&label).min(link_area.width);
                     let style = if url_row && view.selected_detail_link == Some(*index) {
@@ -6726,9 +6748,9 @@ fn render_information_panel(
                     content_offset =
                         content_offset.saturating_add(terminal_text_width(&link.prefix));
                 }
-                // Funkwhale catalogue navigation belongs beside its canonical
+                // Catalogue navigation belongs beside its canonical
                 // HTTP URL, replacing its redundant action-column button.
-                let funkwhale_catalogue = match link.internal_target.as_ref() {
+                let catalogue = match link.internal_target.as_ref() {
                     Some(target @ DetailLinkInternalTarget::FunkwhaleArtist(_)) => {
                         Some(("Artist", "g", false, target))
                     }
@@ -6742,9 +6764,12 @@ fn render_information_panel(
                         true,
                         target,
                     )),
+                    Some(target @ DetailLinkInternalTarget::VkAlbum(_)) => {
+                        Some(("Album", "b", true, target))
+                    }
                     _ => None,
                 };
-                if let Some((kind, hotkey, album, target)) = funkwhale_catalogue {
+                if let Some((kind, hotkey, album, target)) = catalogue {
                     let catalogue_style = theme.accent.add_modifier(Modifier::UNDERLINED);
                     let mut catalogue_label = kind.to_owned();
                     if show_hotkeys {
@@ -18855,6 +18880,9 @@ for encoded, expected in json.load(sys.stdin):
         assert_eq!(search_panel_title(&view), " | ambient ");
         view.search_activity = None;
         assert_eq!(search_panel_title(&view), " ambient ");
+        view.screen = Screen::Vk;
+        view.search_activity = Some(SearchActivity::Vk);
+        assert_eq!(search_panel_title(&view), " | ambient ");
         view.screen = Screen::Bandcamp;
         view.search_activity = Some(SearchActivity::Bandcamp);
         assert_eq!(search_panel_title(&view), " | ambient ");
@@ -19058,6 +19086,7 @@ for encoded, expected in json.load(sys.stdin):
         for screen in [
             Screen::YouTubeMusic,
             Screen::SoundCloud,
+            Screen::Vk,
             Screen::Bandcamp,
             Screen::Funkwhale,
             Screen::ApplePodcasts,
@@ -19421,6 +19450,127 @@ for encoded, expected in json.load(sys.stdin):
         }
     }
 
+    /// VK catalogue metadata stays inline, keeps source order, and works without a browser.
+    #[test]
+    fn vk_artist_album_links_keep_inline_actions_and_original_url_first() {
+        let original = "https://vk.ru/audio7_11";
+        let album = "https://vk.ru/music/album/-2000123_456";
+        let artist = "https://vk.ru/artist/fixture";
+        let id = MediaId::new(SourceKind::Vk, "7_11");
+        let mut view = ViewModel {
+            screen: Screen::Vk,
+            selected_artist_available: true,
+            external_opener_available: false,
+            rows: vec![RowView {
+                media_id: Some(id.clone()),
+                ..RowView::default()
+            }],
+            details: Some(DetailView {
+                title: "Fixture track".to_owned(),
+                channel_name: "Fixture artist and collaborator".to_owned(),
+                media_id: Some(id),
+                local_fingerprint_available: true,
+                links: vec![
+                    DetailLinkView {
+                        label: "VK original".to_owned(),
+                        url: original.to_owned(),
+                        presentation: DetailLinkPresentation::UrlOnly,
+                        ..DetailLinkView::default()
+                    },
+                    DetailLinkView {
+                        label: "Fixture album".to_owned(),
+                        url: album.to_owned(),
+                        internal_target: Some(DetailLinkInternalTarget::VkAlbum(album.to_owned())),
+                        ..DetailLinkView::default()
+                    },
+                    DetailLinkView {
+                        label: "Fixture artist".to_owned(),
+                        url: artist.to_owned(),
+                        internal_target: Some(DetailLinkInternalTarget::VkArtist(
+                            artist.to_owned(),
+                        )),
+                        ..DetailLinkView::default()
+                    },
+                ],
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(220, 30)).unwrap();
+        let mut hits = HitMap::default();
+        for external in [false, true] {
+            view.external_opener_available = external;
+            terminal
+                .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hits))
+                .unwrap();
+            let rendered = rendered_text(&terminal);
+            assert!(rendered.contains("Album [b] Fixture album"));
+            assert!(rendered.contains("Artist [g]: Fixture artist"));
+            assert!(rendered.contains("[f] AcoustID"));
+            assert!(!rendered.contains("VK original"));
+            assert!(!rendered.contains("[g] Artist"));
+            assert!(rendered.find(original).unwrap() < rendered.find("Album [b]").unwrap());
+            for (index, expected) in [
+                (1, UiAction::OpenVkAlbum(album.to_owned())),
+                (2, UiAction::OpenVkArtist(artist.to_owned())),
+            ] {
+                let target = hits
+                    .detail_buttons
+                    .iter()
+                    .find_map(|(action, area)| (action == &expected).then_some(*area))
+                    .unwrap();
+                assert_eq!(
+                    mouse_action(
+                        MouseEvent {
+                            kind: MouseEventKind::Down(MouseButton::Left),
+                            column: target.x,
+                            row: target.y,
+                            modifiers: KeyModifiers::NONE
+                        },
+                        &hits,
+                        &view
+                    ),
+                    Some(expected)
+                );
+                let url = hits
+                    .detail_links
+                    .iter()
+                    .find_map(|(candidate, area)| (*candidate == index).then_some(*area))
+                    .unwrap();
+                assert_eq!(
+                    mouse_action(
+                        MouseEvent {
+                            kind: MouseEventKind::Down(MouseButton::Left),
+                            column: url.x,
+                            row: url.y,
+                            modifiers: KeyModifiers::NONE
+                        },
+                        &hits,
+                        &view
+                    ),
+                    Some(UiAction::ActivateDetailLink(index))
+                );
+            }
+        }
+        terminal
+            .draw(|frame| {
+                render(
+                    frame,
+                    &view,
+                    &UiSettings {
+                        show_hotkeys: false,
+                        ..UiSettings::default()
+                    },
+                    &mut hits,
+                )
+            })
+            .unwrap();
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("Artist: Fixture artist"));
+        assert!(!rendered.contains("[g]"));
+        assert!(!rendered.contains("[b]"));
+    }
+
     /// Funkwhale catalogue controls share their metadata row, not the action column.
     #[test]
     fn funkwhale_artist_album_links_have_inline_hotkeys_and_separate_source_targets() {
@@ -19552,7 +19702,7 @@ for encoded, expected in json.load(sys.stdin):
         );
         assert_eq!(
             key_action(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE), &view),
-            Some(UiAction::OpenFunkwhaleAlbum(album_url.to_owned()))
+            cfg!(feature = "funkwhale").then(|| UiAction::OpenFunkwhaleAlbum(album_url.to_owned()))
         );
         for modifiers in [KeyModifiers::ALT, KeyModifiers::CONTROL] {
             assert_ne!(
@@ -22768,27 +22918,31 @@ for encoded, expected in json.load(sys.stdin):
         );
     }
 
-    /// Terminal geometry reaches the controller before an initial tick or submitted search.
+    /// Archive and VK geometry reaches the controller before an initial tick or search.
     #[test]
     fn archive_search_capacity_is_published_before_actions_and_after_resize() {
         #[derive(Default)]
         struct CapacityController {
             view: ViewModel,
             capacity: usize,
-            observed: Vec<usize>,
+            vk_capacity: usize,
+            observed: Vec<(usize, usize)>,
         }
         impl UiController for CapacityController {
             fn view(&self) -> &ViewModel {
                 &self.view
             }
             fn dispatch(&mut self, _: UiAction) {
-                self.observed.push(self.capacity);
+                self.observed.push((self.capacity, self.vk_capacity));
             }
             fn tick(&mut self) {
-                self.observed.push(self.capacity);
+                self.observed.push((self.capacity, self.vk_capacity));
             }
             fn set_archive_org_search_page_capacity(&mut self, capacity: usize) {
                 self.capacity = capacity;
+            }
+            fn set_vk_search_page_capacity(&mut self, capacity: usize) {
+                self.vk_capacity = capacity;
             }
         }
         let mut controller = CapacityController::default();
@@ -22796,7 +22950,7 @@ for encoded, expected in json.load(sys.stdin):
         controller.tick();
         synchronize_search_page_capacities(&mut controller, Rect::new(0, 0, 120, 80));
         controller.dispatch(UiAction::SubmitSearch);
-        assert_eq!(controller.observed, [17, 73]);
+        assert_eq!(controller.observed, [(17, 17), (73, 73)]);
     }
 
     /// Dormant providers receive both layouts instead of inheriting the active tab's query.
@@ -22831,6 +22985,12 @@ for encoded, expected in json.load(sys.stdin):
                 ..Controller::default()
             };
             synchronize_search_page_capacities(&mut controller, Rect::new(0, 0, 120, 24));
+            assert!(
+                controller
+                    .capacities
+                    .iter()
+                    .any(|(screen, _)| *screen == Screen::Vk)
+            );
             for (screen, capacities) in controller.capacities {
                 assert_eq!(
                     capacities,
@@ -29047,6 +29207,111 @@ for encoded, expected in json.load(sys.stdin):
         assert!(!rendered.contains("Select an item to load details lazily"));
     }
 
+    /// VK offers the shared empty-search prompt only after its request completes.
+    #[test]
+    fn vk_empty_results_wait_for_search_completion() {
+        let mut terminal = Terminal::new(TestBackend::new(90, 18)).unwrap();
+        let mut view = ViewModel {
+            screen: Screen::Vk,
+            search_query: "missing fixture".to_owned(),
+            search_activity: Some(SearchActivity::Vk),
+            ..ViewModel::default()
+        };
+        let mut hit_map = HitMap::default();
+        for searching in [true, false] {
+            view.search_activity = searching.then_some(SearchActivity::Vk);
+            terminal
+                .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
+                .unwrap();
+            let rendered = rendered_text(&terminal);
+            assert_eq!(rendered.contains("To search, press /"), !searching);
+            assert_eq!(completed_search_has_no_rows(&view), !searching);
+            assert!(!rendered.contains("Nothing found"));
+        }
+    }
+
+    /// A real failed VK request must render its explanation even without playback or a footer.
+    #[cfg(feature = "vk")]
+    #[test]
+    fn vk_failed_search_is_visible_without_playback_or_footer() {
+        let directory = crate::test_support::canonical_tempdir("VK visible search failure");
+        let mut config = crate::config::Config::for_dir(directory.path().join("config"));
+        // An absent file fails before bootstrap, guaranteeing this test performs no HTTP requests.
+        config.providers.vk_cookies_file = Some(directory.path().join("absent-vk-cookies"));
+        let mut controller = crate::app::AppController::new(
+            config,
+            crate::persistence::StateStore::open_in_memory().unwrap(),
+            None,
+            None,
+        );
+        controller.dispatch(UiAction::ShowScreen(Screen::Vk));
+        controller.dispatch(UiAction::BeginSearch);
+        for character in "minsk".chars() {
+            controller.dispatch(UiAction::AppendSearch(character));
+        }
+        controller.dispatch(UiAction::SubmitSearch);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while controller.view().search_activity.is_some() && std::time::Instant::now() < deadline {
+            controller.tick();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(controller.view().search_activity.is_none());
+        assert!(
+            controller
+                .view()
+                .status_line
+                .contains("VK cookie file cannot be read")
+        );
+        assert!(controller.view().playback.idle);
+        assert!(controller.view().transient_footer_notice.is_none());
+        for (width, height) in [(90, 18), (60, 24)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let mut hits = HitMap::default();
+            terminal
+                .draw(|frame| render(frame, controller.view(), &UiSettings::default(), &mut hits))
+                .unwrap();
+            let rendered = rendered_text(&terminal)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            let compact = rendered
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .collect::<String>();
+            assert!(
+                compact.contains("VKcookiefilecannotbereadasaregularfile"),
+                "{rendered}"
+            );
+            assert!(!rendered.contains("To search, press /"));
+            assert!(!rendered.contains("Nothing found"));
+            assert!(hits.detail_links.is_empty());
+            assert!(!hits.detail_buttons.iter().any(|(action, _)| matches!(
+                action,
+                UiAction::OpenSelectedArtist
+                    | UiAction::OpenVkAlbum(_)
+                    | UiAction::OpenVkArtist(_)
+                    | UiAction::FingerprintLocalAudio
+            )));
+            #[cfg(feature = "commons-upload")]
+            assert!(
+                !hits
+                    .detail_buttons
+                    .iter()
+                    .any(|(action, _)| matches!(action, UiAction::OpenCommonsUpload))
+            );
+            #[cfg(feature = "archive-upload")]
+            assert!(
+                !hits
+                    .detail_buttons
+                    .iter()
+                    .any(|(action, _)| matches!(action, UiAction::OpenArchiveUpload))
+            );
+            controller.dispatch(UiAction::ShowScreen(Screen::Local));
+            controller.dispatch(UiAction::ShowScreen(Screen::Vk));
+            controller.tick();
+        }
+    }
+
     #[test]
     fn details_omit_playlist_membership_line_when_the_item_has_none() {
         let backend = TestBackend::new(100, 20);
@@ -33340,13 +33605,17 @@ for encoded, expected in json.load(sys.stdin):
         }
     }
 
-    /// Nested Funkwhale catalogues expose Back without requiring an active search.
+    /// Nested Funkwhale and VK catalogues expose Back without an active search.
     #[test]
-    fn funkwhale_back_control_matches_its_escape_shortcut() {
-        for available in [false, true] {
+    fn music_catalogue_back_control_matches_its_escape_shortcut() {
+        for (screen, available) in [Screen::Funkwhale, Screen::Vk]
+            .into_iter()
+            .flat_map(|screen| [false, true].map(|available| (screen, available)))
+        {
             let view = ViewModel {
-                screen: Screen::Funkwhale,
+                screen,
                 funkwhale_back_available: available,
+                vk_back_available: available,
                 ..ViewModel::default()
             };
             let mut terminal = Terminal::new(TestBackend::new(70, 2)).unwrap();
@@ -33363,13 +33632,14 @@ for encoded, expected in json.load(sys.stdin):
                     )
                 })
                 .unwrap();
-            assert_eq!(rendered_text(&terminal).contains("[Esc] Back"), available);
+            let expected = available && (screen != Screen::Vk || cfg!(feature = "vk"));
+            assert_eq!(rendered_text(&terminal).contains("[Esc] Back"), expected);
             assert_eq!(
                 hit_map
                     .detail_buttons
                     .iter()
                     .any(|(action, _)| *action == UiAction::GoBack),
-                available
+                expected
             );
         }
     }
@@ -33445,6 +33715,7 @@ for encoded, expected in json.load(sys.stdin):
             Screen::YouTubeMusic,
             Screen::ArchiveOrg,
             Screen::SoundCloud,
+            Screen::Vk,
             Screen::ApplePodcasts,
             Screen::TrackerMusic,
             Screen::Local,
@@ -33752,6 +34023,7 @@ for encoded, expected in json.load(sys.stdin):
         for screen in [
             Screen::YouTubeMusic,
             Screen::SoundCloud,
+            Screen::Vk,
             Screen::ArchiveOrg,
             Screen::Local,
         ] {
@@ -33771,6 +34043,7 @@ for encoded, expected in json.load(sys.stdin):
             Screen::YouTubeMusic,
             Screen::ArchiveOrg,
             Screen::SoundCloud,
+            Screen::Vk,
             Screen::ApplePodcasts,
             Screen::TrackerMusic,
             Screen::Local,
@@ -47269,6 +47542,8 @@ prose 07:25 remains clickable but is not a chapter";
                 Screen::SoundCloud,
                 #[cfg(feature = "yandex-music")]
                 Screen::YandexMusic,
+                #[cfg(feature = "vk")]
+                Screen::Vk,
                 #[cfg(feature = "bandcamp")]
                 Screen::Bandcamp,
                 #[cfg(feature = "funkwhale")]
@@ -47293,6 +47568,8 @@ prose 07:25 remains clickable but is not a chapter";
             ]
         );
         for (screen, label) in [
+            #[cfg(feature = "vk")]
+            (Screen::Vk, "VK"),
             #[cfg(feature = "funkwhale")]
             (Screen::Funkwhale, "Funkwhale"),
             #[cfg(feature = "archive-org")]
@@ -47946,6 +48223,8 @@ prose 07:25 remains clickable but is not a chapter";
     #[test]
     fn narrow_tab_strip_keeps_the_active_tab_visible_and_clickable() {
         let active_screens = [
+            #[cfg(feature = "vk")]
+            Screen::Vk,
             #[cfg(feature = "funkwhale")]
             Screen::Funkwhale,
             #[cfg(feature = "archive-org")]

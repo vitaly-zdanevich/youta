@@ -25,6 +25,7 @@ export type ActionScreen =
 	| 'YouTubeMusic'
 	| 'SoundCloud'
 	| 'YandexMusic'
+	| 'Vk'
 	| 'Bandcamp'
 	| 'Funkwhale'
 	| 'ApplePodcasts'
@@ -296,6 +297,9 @@ export interface UiActionPayloads {
 	OpenSoundCloudArtist: string;
 	OpenSoundCloudArtistAlbums: string;
 	OpenFunkwhaleAlbum: string;
+	/** Exact public VK catalogue URLs supplied by selected Details. */
+	OpenVkAlbum: string;
+	OpenVkArtist: string;
 	SearchSoundCloudTag: string;
 	SearchFunkwhaleTag: string;
 	SearchYouTubeHashtag: string;

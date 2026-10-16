@@ -30,12 +30,26 @@ use crate::providers::yandex_music_media::YandexMusicMediaFetcher;
 const MAXIMUM_PREPARATION_DIAGNOSTIC_BYTES: usize = 64 * 1024;
 
 /// Provider media locator retained privately while an export is reviewed.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum OpusAudioSource {
     /// Credential-free public page or direct media URL handled by `yt-dlp`.
     PublicPage(Url),
     /// Original Funkwhale track page resolved natively only after export approval.
     Funkwhale(Url),
+    /// Canonical VK audio resolved through an explicitly supplied cookie file.
+    Vk {
+        /// Stable public audio page; signed media locators must never be stored here.
+        source_url: Url,
+        /// Public title used only to refresh the exact selected identity.
+        title: String,
+        /// Public artist text used only to refresh the exact selected identity.
+        artist: String,
+        /// Explicit absolute cookie path, read only by the native VK client.
+        cookie_file: PathBuf,
+    },
+    /// Exact selected VK recording with its process-local authenticated owner.
+    #[cfg(feature = "vk")]
+    VkSession(crate::archive_upload_media::VkExportSource),
     /// Authenticated Yandex Music track resolved through Youta's native client.
     YandexMusic {
         /// Stable track identifier.
@@ -45,6 +59,26 @@ pub enum OpusAudioSource {
     },
     /// Existing local media copied or transcoded through the configured `FFmpeg`.
     LocalFile(PathBuf),
+}
+
+impl std::fmt::Debug for OpusAudioSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PublicPage(source) => formatter.debug_tuple("PublicPage").field(source).finish(),
+            Self::Funkwhale(source) => formatter.debug_tuple("Funkwhale").field(source).finish(),
+            Self::Vk { source_url, .. } => formatter
+                .debug_struct("Vk")
+                .field("source_url", source_url)
+                .finish_non_exhaustive(),
+            #[cfg(feature = "vk")]
+            Self::VkSession(source) => formatter.debug_tuple("VkSession").field(source).finish(),
+            Self::YandexMusic { track_id, .. } => formatter
+                .debug_struct("YandexMusic")
+                .field("track_id", track_id)
+                .finish_non_exhaustive(),
+            Self::LocalFile(path) => formatter.debug_tuple("LocalFile").field(path).finish(),
+        }
+    }
 }
 
 /// Copies, downloads, or transcodes selected media into one private Opus file.
@@ -99,6 +133,49 @@ pub fn prepare_provider_opus(
                 let _ = (source_url, ffmpeg_executable, progress);
                 Err("This build omits Funkwhale audio export support".to_owned())
             }
+        }
+        OpusAudioSource::Vk {
+            source_url,
+            title,
+            artist,
+            cookie_file,
+        } => {
+            #[cfg(feature = "vk")]
+            {
+                crate::archive_upload_media::vk::prepare_opus_in_directory(
+                    source_url,
+                    title,
+                    artist,
+                    cookie_file,
+                    staging_directory,
+                    ffmpeg_executable,
+                    progress,
+                )
+            }
+            #[cfg(not(feature = "vk"))]
+            {
+                let _ = (
+                    source_url,
+                    title,
+                    artist,
+                    cookie_file,
+                    ffmpeg_executable,
+                    progress,
+                );
+                Err("This build omits VK audio export support".to_owned())
+            }
+        }
+        #[cfg(feature = "vk")]
+        OpusAudioSource::VkSession(source) => {
+            crate::archive_upload_media::vk::prepare_bounded_session_opus(
+                source,
+                staging_directory,
+                ffmpeg_executable,
+                &std::sync::atomic::AtomicBool::new(false),
+                crate::archive_upload_media::MAX_STAGING_BYTES,
+                crate::archive_upload_media::MAX_PREPARATION_TIME,
+                progress,
+            )
         }
         OpusAudioSource::YandexMusic { track_id, token } => {
             #[cfg(feature = "yandex-music")]
@@ -178,6 +255,24 @@ fn prepare_public_page_opus(
     yt_dlp_executable: &Path,
     mut progress: impl FnMut(u64, Option<u64>),
 ) -> Result<PathBuf, String> {
+    if source_url.host_str().is_some_and(|host| {
+        [
+            "vk.ru",
+            "vk.com",
+            "vkuseraudio.ru",
+            "vkuseraudio.net",
+            "vkuseraudio.com",
+        ]
+        .iter()
+        .any(|root| {
+            host == *root
+                || host
+                    .strip_suffix(root)
+                    .is_some_and(|prefix| prefix.ends_with('.'))
+        })
+    }) {
+        return Err("VK audio requires the native authenticated export source".to_owned());
+    }
     let client = YtDlp::new(YtDlpConfig {
         executable: yt_dlp_executable.to_owned(),
         allow_plugins: false,
@@ -310,6 +405,63 @@ mod tests {
     use std::io::Write as _;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+
+    /// VK public pages must never enter the generic downloader, including omitted builds.
+    #[test]
+    fn vk_public_pages_never_fall_through_to_yt_dlp() {
+        for source in [
+            "https://vk.ru/audio-123_456",
+            "https://m.vk.com/audio-123_456",
+            "https://psv4.vkuseraudio.ru/audio.mp3?token=secret",
+        ] {
+            let temporary = crate::test_support::canonical_tempdir("VK generic export rejected");
+            let error = prepare_provider_opus(
+                &OpusAudioSource::PublicPage(Url::parse(source).unwrap()),
+                &temporary.path().join("staging"),
+                Path::new("yt-dlp-must-not-run"),
+                Path::new("ffmpeg-must-not-run"),
+                |_, _| {},
+            )
+            .unwrap_err();
+            assert!(error.contains("native authenticated"));
+            assert!(!error.contains("token=secret"));
+        }
+    }
+
+    /// Source debug output retains canonical provenance without disclosing a private path.
+    #[test]
+    fn vk_export_source_debug_redacts_the_cookie_file() {
+        let source = OpusAudioSource::Vk {
+            source_url: Url::parse("https://vk.ru/audio-123_456").unwrap(),
+            title: "Track".to_owned(),
+            artist: "Artist".to_owned(),
+            cookie_file: PathBuf::from("/private/account-session.txt"),
+        };
+        let debug = format!("{source:?}");
+        assert!(debug.contains("audio-123_456"));
+        assert!(!debug.contains("account-session"));
+    }
+
+    /// Feature-trimmed builds fail closed without launching any external helper.
+    #[cfg(not(feature = "vk"))]
+    #[test]
+    fn feature_disabled_vk_export_never_invokes_a_downloader() {
+        let temporary = crate::test_support::canonical_tempdir("disabled VK export");
+        let error = prepare_provider_opus(
+            &OpusAudioSource::Vk {
+                source_url: Url::parse("https://vk.ru/audio-123_456").unwrap(),
+                title: "Track".to_owned(),
+                artist: "Artist".to_owned(),
+                cookie_file: temporary.path().join("cookies-must-not-be-read"),
+            },
+            &temporary.path().join("staging"),
+            Path::new("yt-dlp-must-not-run"),
+            Path::new("ffmpeg-must-not-run"),
+            |_, _| {},
+        )
+        .unwrap_err();
+        assert!(error.contains("omits VK"));
+    }
 
     /// Omitted native support cannot fall through to an HTML downloader.
     #[cfg(not(feature = "funkwhale"))]

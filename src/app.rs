@@ -60,6 +60,9 @@ mod soundcloud;
 mod subscription_confirmation;
 #[cfg(feature = "url-info")]
 mod url_info;
+mod vk;
+#[cfg(all(feature = "vk", feature = "acoustid"))]
+mod vk_fingerprint;
 #[cfg(feature = "web-browser")]
 mod web;
 #[cfg(all(feature = "web-browser", feature = "local-metadata"))]
@@ -828,6 +831,8 @@ pub enum SearchRoute {
     SoundCloud,
     /// The Yandex Music tab queries the authenticated private catalogue.
     YandexMusic,
+    /// The VK tab queries only the explicitly imported web session's audio catalogue.
+    Vk,
     /// The Bandcamp tab queries public track and album search pages.
     Bandcamp,
     /// Track catalogue on the explicitly configured Funkwhale pod.
@@ -1846,6 +1851,8 @@ enum LocalFingerprintWorkerRequest {
     },
     #[cfg(feature = "funkwhale")]
     IdentifyFunkwhale(funkwhale_fingerprint::Request),
+    #[cfg(feature = "vk")]
+    IdentifyVk(vk_fingerprint::Request),
     Shutdown,
 }
 
@@ -1857,6 +1864,8 @@ impl LocalFingerprintWorkerRequest {
             Self::Identify { cancellation, .. } => cancellation.cancel(),
             #[cfg(feature = "funkwhale")]
             Self::IdentifyFunkwhale(request) => request.cancellation.cancel(),
+            #[cfg(feature = "vk")]
+            Self::IdentifyVk(request) => request.cancellation.cancel(),
             Self::Shutdown => {}
         }
     }
@@ -2135,7 +2144,7 @@ fn classify_known_host(host: &str, path: &str) -> SourceKind {
         SourceKind::Rumble
     } else if host_matches(host, "bilibili.com") || host == "b23.tv" {
         SourceKind::Bilibili
-    } else if host_matches(host, "vk.com") {
+    } else if host_matches(host, "vk.com") || host_matches(host, "vk.ru") {
         SourceKind::Vk
     } else if host_matches(host, "archive.org") {
         SourceKind::ArchiveOrg
@@ -2450,6 +2459,7 @@ pub const fn search_route(screen: Screen) -> SearchRoute {
         Screen::YouTubeMusic => SearchRoute::YouTubeMusic,
         Screen::SoundCloud => SearchRoute::SoundCloud,
         Screen::YandexMusic => SearchRoute::YandexMusic,
+        Screen::Vk => SearchRoute::Vk,
         Screen::Bandcamp => SearchRoute::Bandcamp,
         Screen::Funkwhale => SearchRoute::Funkwhale,
         Screen::ApplePodcasts => SearchRoute::ApplePodcasts,
@@ -3242,6 +3252,9 @@ struct CommonsUploadSelection {
     source: CommonsAudioSource,
     /// The exact reviewed artist page, independent of later selection changes.
     channel_url: Option<url::Url>,
+    /// Revokes reviewed VK credentials when the explicit import is replaced.
+    #[cfg(feature = "vk")]
+    vk_owner: Option<vk::VkExportOwner>,
 }
 
 /// Provider identity and audio locator retained while an Evernote note is reviewed.
@@ -3474,7 +3487,10 @@ impl EvernoteSelection {
                 OpusAudioSource::LocalFile(_) => String::new(),
                 OpusAudioSource::PublicPage(_)
                 | OpusAudioSource::Funkwhale(_)
+                | OpusAudioSource::Vk { .. }
                 | OpusAudioSource::YandexMusic { .. } => self.media.webpage_url.to_string(),
+                #[cfg(feature = "vk")]
+                OpusAudioSource::VkSession(_) => self.media.webpage_url.to_string(),
             },
         }
     }
@@ -3949,6 +3965,12 @@ enum AutoplayOrigin {
     },
     #[cfg(feature = "funkwhale")]
     Funkwhale {
+        items: Arc<[QueueItem]>,
+        index: usize,
+    },
+    #[cfg(feature = "vk")]
+    Vk {
+        /// Canonical audio identities, never private reload hashes or signed URLs.
         items: Arc<[QueueItem]>,
         index: usize,
     },
@@ -4877,6 +4899,8 @@ pub struct AppController {
     soundcloud: soundcloud::SoundCloudState,
     /// Pod-scoped catalogue, lazy directory, and bounded notified request lane.
     funkwhale: funkwhale::FunkwhaleState,
+    /// Session-scoped VK catalogue and independently owned playback requests.
+    vk: vk::VkState,
     /// Query retained independently for the tracker-archive tab.
     tracker_search_query: String,
     /// Selected tracker row retained while another tab is visible.
@@ -5211,6 +5235,9 @@ pub struct AppController {
     /// Explicit public-track identification sharing the Local worker and rate limiter.
     #[cfg(all(feature = "acoustid", feature = "funkwhale"))]
     funkwhale_fingerprint: funkwhale_fingerprint::State,
+    /// Explicit VK identification uses the shared identifier and private native staging.
+    #[cfg(all(feature = "acoustid", feature = "vk"))]
+    vk_fingerprint: vk_fingerprint::State,
     /// Exact in-flight P4404 lookup requested by Local fingerprint details.
     #[cfg(all(feature = "acoustid", feature = "wikidata"))]
     pending_local_fingerprint_wikidata: Option<PendingLocalFingerprintWikidata>,
@@ -6166,6 +6193,8 @@ impl AppController {
             search_query: match saved.screen {
                 StoredScreen::YouTubeMusic => saved.youtube_music_search_text.clone(),
                 StoredScreen::SoundCloud => saved.soundcloud_search_text.clone(),
+                #[cfg(feature = "vk")]
+                StoredScreen::Vk => saved.vk_search_text.clone(),
                 #[cfg(feature = "yandex-music")]
                 StoredScreen::YandexMusic => saved.yandex_music_search_text.clone(),
                 #[cfg(feature = "bandcamp")]
@@ -6579,6 +6608,7 @@ impl AppController {
             archive_org_selected,
             soundcloud: soundcloud::SoundCloudState::restored(&saved),
             funkwhale: funkwhale::FunkwhaleState::restored(&saved),
+            vk: vk::VkState::restored(&saved),
             librivox_search_query,
             librivox_selected,
             #[cfg(feature = "web-browser")]
@@ -6740,6 +6770,8 @@ impl AppController {
             local_fingerprint_disconnect_reported: false,
             #[cfg(all(feature = "acoustid", feature = "funkwhale"))]
             funkwhale_fingerprint: funkwhale_fingerprint::State::new(worker_notifier.clone()),
+            #[cfg(all(feature = "acoustid", feature = "vk"))]
+            vk_fingerprint: vk_fingerprint::State::new(worker_notifier.clone()),
             #[cfg(all(feature = "acoustid", feature = "wikidata"))]
             pending_local_fingerprint_wikidata: None,
             #[cfg(feature = "waveform")]
@@ -7375,6 +7407,8 @@ impl AppController {
         let preparing = preparing || self.live_start.preparing();
         #[cfg(feature = "funkwhale")]
         let preparing = preparing || self.funkwhale_playback_pending();
+        #[cfg(feature = "vk")]
+        let preparing = preparing || self.vk_playback_pending();
         let was_pending = self.view.playback_activity_pending();
         self.view.playback_preparing = preparing
             && !self.view.quitting
@@ -8018,6 +8052,7 @@ impl AppController {
                 Err(error) => self.view.status_line = error.to_owned(),
             },
             SearchRoute::SoundCloud => self.submit_soundcloud_search(query),
+            SearchRoute::Vk => self.submit_vk_search(query),
             SearchRoute::Funkwhale => self.submit_funkwhale_search(query),
             SearchRoute::YandexMusic if query.is_empty() => {
                 #[cfg(feature = "yandex-music")]
@@ -8228,6 +8263,15 @@ impl AppController {
     }
 
     fn open_direct_source(&mut self, direct: DirectSourceInput) {
+        #[cfg(feature = "vk")]
+        if direct.source == SourceKind::Vk
+            && crate::providers::vk::VkAudioId::from_page_url(&direct.url).is_ok()
+        {
+            self.show_screen(Screen::Vk);
+            self.view.search_query = direct.url.to_string();
+            self.submit_vk_search(self.view.search_query.clone());
+            return;
+        }
         #[cfg(feature = "bbc-radio")]
         if direct.source == SourceKind::BbcRadio {
             self.open_direct_bbc_station(&direct.url);
@@ -9533,6 +9577,8 @@ impl AppController {
         queue_cursor_already_positioned: bool,
         origin: Option<AutoplayOrigin>,
     ) {
+        #[cfg(feature = "vk")]
+        self.cancel_vk_playback();
         #[cfg(feature = "funkwhale")]
         self.cancel_funkwhale_playback();
         #[cfg(feature = "soundcloud")]
@@ -16057,6 +16103,7 @@ impl AppController {
             Screen::YouTubeMusic
             | Screen::SoundCloud
             | Screen::YandexMusic
+            | Screen::Vk
             | Screen::Bandcamp
             | Screen::Funkwhale
             | Screen::ApplePodcasts
@@ -16113,6 +16160,7 @@ impl AppController {
                         Screen::YouTubeMusic
                         | Screen::SoundCloud
                         | Screen::YandexMusic
+                        | Screen::Vk
                         | Screen::Bandcamp
                         | Screen::Funkwhale
                         | Screen::ApplePodcasts
@@ -16153,6 +16201,7 @@ impl AppController {
                 Screen::YouTubeMusic
                 | Screen::SoundCloud
                 | Screen::YandexMusic
+                | Screen::Vk
                 | Screen::Bandcamp
                 | Screen::Funkwhale
                 | Screen::ApplePodcasts
@@ -17469,6 +17518,10 @@ impl AppController {
 
     fn update_non_youtube_detail(&mut self) {
         match self.view.screen {
+            Screen::Vk => {
+                self.update_vk_detail();
+                return;
+            }
             Screen::Funkwhale => {
                 self.update_funkwhale_detail();
                 return;
@@ -17709,6 +17762,8 @@ impl AppController {
             }
         } else if self.view.screen == Screen::SoundCloud {
             self.update_soundcloud_detail();
+        } else if self.view.screen == Screen::Vk {
+            self.update_vk_detail();
         } else if self.view.screen == Screen::Funkwhale {
             self.update_funkwhale_detail();
         } else if self.view.screen == Screen::Bandcamp {
@@ -17780,6 +17835,8 @@ impl AppController {
             }
         } else if self.view.screen == Screen::SoundCloud {
             self.update_soundcloud_detail();
+        } else if self.view.screen == Screen::Vk {
+            self.update_vk_detail();
         } else if self.view.screen == Screen::Funkwhale {
             self.update_funkwhale_detail();
         } else if self.view.screen == Screen::Bandcamp {
@@ -17854,6 +17911,9 @@ impl AppController {
     }
 
     fn selected_queue_item(&self) -> Result<QueueItem, String> {
+        if self.view.screen == Screen::Vk {
+            return self.selected_vk_queue_item();
+        }
         if self.view.screen == Screen::Funkwhale {
             return self.selected_funkwhale_queue_item();
         }
@@ -18122,6 +18182,11 @@ impl AppController {
         if self.view.screen == Screen::SoundCloud {
             return self
                 .selected_soundcloud_queue_item()
+                .and_then(|item| playlist_snapshot_from_queue_item(&item));
+        }
+        if self.view.screen == Screen::Vk {
+            return self
+                .selected_vk_queue_item()
                 .and_then(|item| playlist_snapshot_from_queue_item(&item));
         }
         if self.view.screen == Screen::Bandcamp {
@@ -18466,6 +18531,7 @@ impl AppController {
                     item.media.id.source,
                     SourceKind::YouTube | SourceKind::YandexMusic | SourceKind::ApplePodcasts
                 ) || funkwhale_upload::supported(&item)
+                    || vk::export_supported(&item)
             });
         }
         #[cfg(feature = "evernote")]
@@ -18693,6 +18759,7 @@ impl AppController {
             | Screen::LibriVox
             | Screen::Web
             | Screen::SoundCloud
+            | Screen::Vk
             | Screen::Funkwhale => {
                 let details = self.view.details.as_ref()?;
                 let media_id = details.media_id.clone()?;
@@ -19736,11 +19803,17 @@ impl AppController {
             }
         };
         let funkwhale_supported = funkwhale_upload::supported(&item);
+        let vk_supported = vk::export_supported(&item);
+        #[cfg(feature = "vk")]
+        let vk_source = self.capture_vk_export_source(&item);
+        #[cfg(feature = "vk")]
+        let vk_owner = vk_source.as_ref().and_then(|_| self.vk_export_owner());
         let mut media = item.media;
         if !matches!(
             media.id.source,
             SourceKind::YouTube | SourceKind::YandexMusic | SourceKind::ApplePodcasts
         ) && !funkwhale_supported
+            && !vk_supported
         {
             "Commons audio upload is not available for this selection"
                 .clone_into(&mut self.view.status_line);
@@ -19764,6 +19837,29 @@ impl AppController {
                 details.channel_webpage_url.clone()
             });
         let source = match media.id.source {
+            #[cfg(feature = "vk")]
+            SourceKind::Vk => {
+                if let Some(source) = vk_source {
+                    CommonsAudioSource::VkSession(source)
+                } else {
+                    if self.view.screen == Screen::Vk {
+                        "The selected VK session is unavailable; search for the track again"
+                            .clone_into(&mut self.view.status_line);
+                        return;
+                    }
+                    let Some(cookie_file) = self.config.providers.vk_cookies_file.clone() else {
+                        "Configure VK before exporting its audio"
+                            .clone_into(&mut self.view.status_line);
+                        return;
+                    };
+                    CommonsAudioSource::Vk {
+                        source_url: media.webpage_url.clone(),
+                        title: media.title.clone(),
+                        artist: media.creator.clone().unwrap_or_default(),
+                        cookie_file,
+                    }
+                }
+            }
             #[cfg(feature = "funkwhale")]
             SourceKind::Funkwhale => CommonsAudioSource::Funkwhale(media.webpage_url.clone()),
             SourceKind::YouTube => CommonsAudioSource::PublicPage(media.webpage_url.clone()),
@@ -19793,6 +19889,8 @@ impl AppController {
             media,
             source,
             channel_url,
+            #[cfg(feature = "vk")]
+            vk_owner,
         };
         self.commons_upload_selection = Some(selection);
         if let Some(discovered) = discover_commons_authentication(&self.config) {
@@ -20575,6 +20673,18 @@ impl AppController {
         let Some(selection) = self.commons_upload_selection.clone() else {
             return;
         };
+        #[cfg(feature = "vk")]
+        if selection
+            .vk_owner
+            .as_ref()
+            .is_some_and(|owner| !self.vk_export_owner_is_current(owner))
+        {
+            if let Some(popup) = self.view.commons_upload_popup.as_mut() {
+                popup.validation_error =
+                    Some("VK session changed; close and reopen the review".to_owned());
+            }
+            return;
+        }
         let Some(authentication) = self.commons_upload_authentication.clone() else {
             "Wikimedia Commons credentials are unavailable".clone_into(&mut self.view.status_line);
             return;
@@ -21573,6 +21683,10 @@ impl AppController {
     }
 
     fn activate_selection(&mut self) {
+        if self.view.screen == Screen::Vk {
+            self.activate_vk_selection();
+            return;
+        }
         if self.view.screen == Screen::Funkwhale {
             self.activate_funkwhale_selection();
             return;
@@ -21731,6 +21845,8 @@ impl AppController {
                 return;
             }
         };
+        #[cfg(feature = "vk")]
+        self.cancel_vk_playback();
         #[cfg(feature = "funkwhale")]
         self.cancel_funkwhale_playback();
         match self.bandcamp_resolution.request(
@@ -22122,6 +22238,8 @@ impl AppController {
 
     /// Resolves a stable first-class provider page before replaying History.
     fn resolve_history_selection(&mut self, entry: HistoryEntry, url: url::Url) {
+        #[cfg(feature = "vk")]
+        self.cancel_vk_playback();
         self.supersede_search_generation();
         let generation = self.search_generation;
         let source = entry.media_id.source.clone();
@@ -22413,6 +22531,8 @@ impl AppController {
         request.display_name = Some(title.clone());
         request.allow_insecure_http =
             item.insecure_transport && self.config.providers.allow_insecure_http;
+        #[cfg(feature = "vk")]
+        self.cancel_vk_playback();
         if !self.send_provider_request(
             ProviderRequest::PrepareTracker {
                 generation: self.search_generation,
@@ -23254,6 +23374,10 @@ impl AppController {
             return;
         }
         if self.restore_now_playing_location() {
+            return;
+        }
+        #[cfg(feature = "vk")]
+        if self.view.screen == Screen::Vk && self.back_vk_catalogue() {
             return;
         }
         #[cfg(feature = "soundcloud")]
@@ -24409,6 +24533,8 @@ impl AppController {
     fn cancel_local_fingerprint(&mut self) {
         #[cfg(feature = "funkwhale")]
         self.cancel_funkwhale_fingerprint();
+        #[cfg(feature = "vk")]
+        self.cancel_vk_fingerprint();
         if let Some(pending) = self.pending_local_fingerprint.take() {
             pending.cancellation.cancel();
         }
@@ -24613,6 +24739,11 @@ impl AppController {
     /// Starts one explicit identity-bound Chromaprint and AcoustID lookup.
     #[cfg(feature = "acoustid")]
     fn fingerprint_selected_local_audio(&mut self) {
+        #[cfg(feature = "vk")]
+        if self.view.screen == Screen::Vk {
+            self.fingerprint_selected_vk_audio();
+            return;
+        }
         #[cfg(feature = "funkwhale")]
         if self.view.screen == Screen::Funkwhale {
             self.fingerprint_selected_funkwhale_audio();
@@ -25845,6 +25976,8 @@ impl AppController {
         let pending = self.pending_local_fingerprint.is_some();
         #[cfg(feature = "funkwhale")]
         let pending = pending || self.funkwhale_fingerprint_pending();
+        #[cfg(feature = "vk")]
+        let pending = pending || self.vk_fingerprint_pending();
         if self.animation_tick_due && pending {
             self.view.local_fingerprint_animation_frame =
                 self.view.local_fingerprint_animation_frame.wrapping_add(1);
@@ -26030,6 +26163,10 @@ impl AppController {
 
     /// Identifies the same-source cursor represented by a queue item.
     fn autoplay_origin_for_media(&self, media_id: &MediaId) -> Option<AutoplayOrigin> {
+        #[cfg(feature = "vk")]
+        if self.view.screen == Screen::Vk {
+            return self.vk_autoplay_origin(media_id);
+        }
         #[cfg(feature = "funkwhale")]
         if self.view.screen == Screen::Funkwhale {
             return self.funkwhale_autoplay_origin(media_id);
@@ -26418,6 +26555,18 @@ impl AppController {
                     })
                 })
             }
+            #[cfg(feature = "vk")]
+            AutoplayOrigin::Vk { items, index } => {
+                neighbour_list_step(items, *index, direction, |index, item: &QueueItem| {
+                    Some(AutoplayStep::Play {
+                        item: Box::new(item.clone()),
+                        origin: AutoplayOrigin::Vk {
+                            items: Arc::clone(items),
+                            index,
+                        },
+                    })
+                })
+            }
             #[cfg(feature = "soundcloud")]
             AutoplayOrigin::SoundCloud { items, index } => {
                 neighbour_list_step(items, *index, direction, |index, item: &QueueItem| {
@@ -26667,6 +26816,31 @@ impl AppController {
         origin: Option<AutoplayOrigin>,
         resolved_input: Option<PlaybackInput>,
     ) {
+        #[cfg(feature = "vk")]
+        if item.media.id.source == SourceKind::Vk
+            && item.media.kind == MediaKind::Audio
+            && crate::providers::vk::VkAudioId::parse(&item.media.id.external_id).is_ok()
+        {
+            if vk::audio_identity(&item).is_none() {
+                self.view.status_line =
+                    "VK audio identity does not match its canonical page".to_owned();
+                return;
+            }
+            if resolved_input.is_none() || !self.vk_resolved_candidate(&item.media.id) {
+                self.request_vk_playback(item, queue_cursor_already_positioned, origin);
+                return;
+            }
+        } else {
+            self.cancel_vk_playback();
+        }
+        #[cfg(not(feature = "vk"))]
+        if item.media.id.source == SourceKind::Vk
+            && item.media.kind == MediaKind::Audio
+            && item.media.webpage_url.path() == format!("/audio{}", item.media.id.external_id)
+        {
+            self.view.status_line = "This build omits the `vk` feature".to_owned();
+            return;
+        }
         #[cfg(feature = "funkwhale")]
         if item.media.id.source == SourceKind::Funkwhale {
             if resolved_input.is_none() || !self.funkwhale_resolved_candidate(&item.media.id) {
@@ -27573,7 +27747,7 @@ impl AppController {
                     self.persist_position();
                 }
                 let autoplay_origin = self.current_autoplay_origin.clone();
-                #[cfg(any(feature = "soundcloud", feature = "funkwhale"))]
+                #[cfg(any(feature = "soundcloud", feature = "funkwhale", feature = "vk"))]
                 let ended_media = self.current_media.clone();
                 #[cfg(feature = "waveform")]
                 let local_waveform_follow_from = self.local_waveform_follow_intent_after_eof();
@@ -27581,6 +27755,27 @@ impl AppController {
                 #[cfg(feature = "waveform")]
                 {
                     self.local_waveform_follow_from = local_waveform_follow_from;
+                }
+                #[cfg(feature = "vk")]
+                if self.vk_playback_pending() {
+                    if !self.vk_playback_owns_queue_cursor()
+                        && self
+                            .playback_queue
+                            .current()
+                            .is_some_and(|item| Some(&item.media.id) == ended_media.as_ref())
+                    {
+                        self.playback_queue.current_index = self
+                            .playback_queue
+                            .current_index
+                            .and_then(|index| index.checked_add(1))
+                            .filter(|index| *index < self.playback_queue.items.len());
+                    }
+                    #[cfg(feature = "waveform")]
+                    {
+                        self.local_waveform_follow_from = None;
+                    }
+                    self.view.status_line = "Resolving VK playback...".to_owned();
+                    return;
                 }
                 #[cfg(feature = "funkwhale")]
                 if self.funkwhale_playback_pending() {
@@ -27690,6 +27885,8 @@ impl AppController {
                 }
             }
             PlaybackEndReason::Stop => {
+                #[cfg(feature = "vk")]
+                self.cancel_vk_playback();
                 #[cfg(feature = "funkwhale")]
                 self.cancel_funkwhale_playback();
                 #[cfg(feature = "soundcloud")]
@@ -28077,6 +28274,10 @@ impl AppController {
             self.view.right_panel_mode = RightPanelMode::Details;
         }
         match screen {
+            Screen::Vk => {
+                self.view.search_query.clone_from(&self.vk.query);
+                self.view.selected = self.vk.selected;
+            }
             Screen::Funkwhale => {
                 self.view.search_query.clone_from(&self.funkwhale.query);
                 self.view.selected = self.funkwhale.selected;
@@ -28231,6 +28432,7 @@ impl AppController {
 
     fn populate_local_screen(&mut self) {
         match self.view.screen {
+            Screen::Vk => self.populate_vk(),
             Screen::Funkwhale => self.populate_funkwhale(),
             Screen::Search => {
                 if !self.local_results.is_empty() {
@@ -28843,6 +29045,8 @@ impl AppController {
         queue_cursor_already_positioned: bool,
         origin: Option<AutoplayOrigin>,
     ) {
+        #[cfg(feature = "vk")]
+        self.cancel_vk_playback();
         #[cfg(feature = "funkwhale")]
         self.cancel_funkwhale_playback();
         let station_id = item.media.id.external_id.clone();
@@ -29728,6 +29932,8 @@ impl AppController {
                 return;
             }
         };
+        #[cfg(feature = "vk")]
+        self.cancel_vk_playback();
         self.supersede_search_generation();
         let generation = self.search_generation;
         let source = owner.entry.media.id.source.clone();
@@ -31469,6 +31675,12 @@ impl AppController {
     }
 
     fn current_url(&self) -> Option<String> {
+        if self.view.screen == Screen::Vk {
+            return self
+                .selected_vk_queue_item()
+                .ok()
+                .map(|item| item.media.webpage_url.to_string());
+        }
         if self.view.screen == Screen::SoundCloud {
             return self
                 .view
@@ -31744,6 +31956,8 @@ impl AppController {
                     let _ = tag;
                 }
                 DetailLinkInternalTarget::FunkwhaleArtist(_) => self.open_selected_artist(),
+                DetailLinkInternalTarget::VkAlbum(url) => self.open_vk_album(url),
+                DetailLinkInternalTarget::VkArtist(url) => self.open_vk_artist(url),
                 DetailLinkInternalTarget::FunkwhaleAlbum(url) => {
                     #[cfg(feature = "funkwhale")]
                     self.open_funkwhale_album(url);
@@ -35967,6 +36181,9 @@ impl AppController {
         } else if self.view.screen == Screen::Funkwhale {
             self.funkwhale.query.clone_from(&self.view.search_query);
             self.funkwhale.selected = self.view.selected;
+        } else if self.view.screen == Screen::Vk {
+            self.vk.query.clone_from(&self.view.search_query);
+            self.vk.selected = self.view.selected;
         } else if self.view.screen == Screen::YandexMusic {
             self.yandex_music_search_query
                 .clone_from(&self.view.search_query);
@@ -36063,6 +36280,7 @@ impl AppController {
             youtube_music_selected_row: Some(self.youtube_music_selected),
             soundcloud_selected_row: Some(self.soundcloud.selected),
             funkwhale_selected_row: Some(self.funkwhale.selected),
+            vk_selected_row: Some(self.vk.selected),
             yandex_music_selected_row: Some(self.yandex_music_selected),
             #[cfg(feature = "bandcamp")]
             bandcamp_selected_row: Some(self.bandcamp_selected),
@@ -36085,6 +36303,7 @@ impl AppController {
             youtube_music_search_text: self.youtube_music_search_query.clone(),
             soundcloud_search_text: self.soundcloud.query.clone(),
             funkwhale_search_text: self.funkwhale.query.clone(),
+            vk_search_text: self.vk.query.clone(),
             yandex_music_search_text: self.yandex_music_search_query.clone(),
             #[cfg(feature = "bandcamp")]
             bandcamp_search_text: self.bandcamp_search_query.clone(),
@@ -36141,6 +36360,7 @@ impl AppController {
     }
 
     fn shutdown(&mut self) -> bool {
+        self.shutdown_vk();
         #[cfg(feature = "funkwhale")]
         self.shutdown_funkwhale();
         #[cfg(feature = "soundcloud")]
@@ -36303,6 +36523,8 @@ impl UiController for AppController {
             Screen::SoundCloud => self.update_soundcloud_search_page_capacities(capacities),
             #[cfg(feature = "funkwhale")]
             Screen::Funkwhale => self.update_funkwhale_search_page_capacities(capacities),
+            #[cfg(feature = "vk")]
+            Screen::Vk => self.update_vk_search_page_capacities(capacities),
             _ => {
                 let _ = capacities;
             }
@@ -36322,6 +36544,11 @@ impl UiController for AppController {
     #[cfg(feature = "funkwhale")]
     fn set_funkwhale_search_page_capacity(&mut self, rows: usize) {
         self.update_funkwhale_search_page_capacity(rows);
+    }
+
+    #[cfg(feature = "vk")]
+    fn set_vk_search_page_capacity(&mut self, rows: usize) {
+        self.update_vk_search_page_capacities(crate::view::SearchPageCapacities::fixed(rows));
     }
 
     fn dispatch(&mut self, action: UiAction) {
@@ -36415,6 +36642,7 @@ impl UiController for AppController {
                     self.view.status_line =
                         "Wait for the Local move to finish before quitting".to_owned();
                 } else {
+                    self.shutdown_vk();
                     #[cfg(feature = "soundcloud")]
                     self.cancel_pending_soundcloud_playback();
                     #[cfg(feature = "funkwhale")]
@@ -37429,6 +37657,8 @@ impl UiController for AppController {
                 #[cfg(not(feature = "funkwhale"))]
                 let _ = url;
             }
+            UiAction::OpenVkAlbum(url) => self.open_vk_album(url),
+            UiAction::OpenVkArtist(url) => self.open_vk_artist(url),
             UiAction::OpenFunkwhaleUploader => {
                 #[cfg(feature = "funkwhale")]
                 self.open_funkwhale_uploader();
@@ -38118,6 +38348,7 @@ impl UiController for AppController {
         }
         self.poll_soundcloud_worker();
         self.poll_funkwhale_worker();
+        self.poll_vk_worker();
         #[cfg(feature = "soundcloud")]
         self.poll_soundcloud_comments();
         #[cfg(feature = "soundcloud")]
@@ -38197,6 +38428,8 @@ impl UiController for AppController {
         self.drain_local_fingerprint_responses();
         #[cfg(all(feature = "acoustid", feature = "funkwhale"))]
         self.drain_funkwhale_fingerprint_responses();
+        #[cfg(all(feature = "acoustid", feature = "vk"))]
+        self.drain_vk_fingerprint_responses();
         #[cfg(feature = "waveform")]
         self.drain_local_waveform_responses();
         #[cfg(feature = "sponsorblock")]
@@ -38977,6 +39210,14 @@ fn local_fingerprint_worker(
         let command = match command {
             LocalFingerprintWorkerRequest::IdentifyFunkwhale(request) => {
                 funkwhale_fingerprint::identify(request, identifier.as_mut(), &mut remote_cache);
+                continue;
+            }
+            command => command,
+        };
+        #[cfg(feature = "vk")]
+        let command = match command {
+            LocalFingerprintWorkerRequest::IdentifyVk(request) => {
+                vk_fingerprint::identify(request, identifier.as_mut());
                 continue;
             }
             command => command,
@@ -45254,6 +45495,8 @@ fn search_item_url(item: &SearchItem) -> Option<String> {
 
 fn stored_screen_from_tui(screen: Screen) -> StoredScreen {
     match screen {
+        Screen::Vk if cfg!(feature = "vk") => StoredScreen::Vk,
+        Screen::Vk => StoredScreen::Search,
         Screen::SoundCloud if cfg!(feature = "soundcloud") => StoredScreen::SoundCloud,
         Screen::SoundCloud => StoredScreen::Search,
         Screen::Search => StoredScreen::Search,
@@ -45332,6 +45575,8 @@ fn restored_playlists_route(
 
 fn tui_screen_from_stored(screen: &StoredScreen) -> Screen {
     match screen {
+        StoredScreen::Vk if cfg!(feature = "vk") => Screen::Vk,
+        StoredScreen::Vk => Screen::Search,
         StoredScreen::SoundCloud if cfg!(feature = "soundcloud") => Screen::SoundCloud,
         StoredScreen::SoundCloud => Screen::Search,
         StoredScreen::Search => Screen::Search,

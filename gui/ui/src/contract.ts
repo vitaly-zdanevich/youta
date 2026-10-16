@@ -124,6 +124,8 @@ export type DetailLinkInternalTarget =
 	| { SoundCloudArtistAlbums: string }
 	| { FunkwhaleArtist: string }
 	| { FunkwhaleAlbum: string }
+	| { VkAlbum: string }
+	| { VkArtist: string }
 	| { FunkwhaleUploader: string }
 	| { FunkwhaleTag: string }
 	| { SoundCloudTag: string };
@@ -1023,7 +1025,7 @@ export interface S3CredentialsEditorView {
 /** Public metadata reviewed before creating an Archive.org item. */
 export interface ArchiveUploadDraft {
 	/** Public source kind; Local drafts do not carry private filesystem paths. */
-	source: 'YouTube' | 'Local' | 'Funkwhale';
+	source: 'YouTube' | 'Local' | 'Funkwhale' | 'Vk';
 	identifier: string;
 	title: string;
 	description: string;
@@ -1090,6 +1092,8 @@ export interface ViewModel {
 	soundcloud_back_available: boolean;
 	/** A nested Funkwhale catalogue retains its previous route and cursor. */
 	funkwhale_back_available: boolean;
+	/** A nested VK album or artist catalogue retains its parent route. */
+	vk_back_available: boolean;
   selected_wikidata_media: number | null;
   subscriptions: SubscriptionsView;
   waveform: WaveformView;

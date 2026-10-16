@@ -10,6 +10,8 @@ impl AppController {
             Screen::SoundCloud => self.selected_soundcloud_artist_url().is_some(),
             #[cfg(feature = "funkwhale")]
             Screen::Funkwhale => self.can_open_funkwhale_artist(),
+            #[cfg(feature = "vk")]
+            Screen::Vk => self.view.vk_artist_url().is_some(),
             #[cfg(feature = "yandex-music")]
             Screen::YandexMusic => self.selected_yandex_music_artist_id().is_some(),
             _ => false,
@@ -27,6 +29,12 @@ impl AppController {
             }
             #[cfg(feature = "funkwhale")]
             Screen::Funkwhale => self.open_funkwhale_artist(),
+            #[cfg(feature = "vk")]
+            Screen::Vk => {
+                if let Some(url) = self.view.vk_artist_url().map(str::to_owned) {
+                    self.open_vk_artist(url);
+                }
+            }
             #[cfg(feature = "yandex-music")]
             Screen::YandexMusic => self.open_selected_yandex_music_artist(),
             _ => {}

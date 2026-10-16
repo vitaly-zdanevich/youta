@@ -298,9 +298,15 @@ function Links({
 				const target = link.internal_target;
 				const funkwhaleArtist = target !== null && 'FunkwhaleArtist' in target;
 				const funkwhaleAlbum = target !== null && 'FunkwhaleAlbum' in target ? target.FunkwhaleAlbum : null;
-				if (funkwhaleArtist) return <li key={`${link.url}-${index}`}>
+				const vkArtist = target !== null && 'VkArtist' in target ? target.VkArtist : null;
+				const vkAlbum = target !== null && 'VkAlbum' in target ? target.VkAlbum : null;
+				const artistAction: UiAction | null = funkwhaleArtist ? 'OpenSelectedArtist'
+					: vkArtist !== null ? { OpenVkArtist: vkArtist } : null;
+				const albumAction: UiAction | null = funkwhaleAlbum !== null ? { OpenFunkwhaleAlbum: funkwhaleAlbum }
+					: vkAlbum !== null ? { OpenVkAlbum: vkAlbum } : null;
+				if (artistAction !== null) return <li key={`${link.url}-${index}`}>
 					<span className='block'>
-						<CatalogueLink title='Open inside Youta' action='OpenSelectedArtist'>Artist [g]: {details.channel_name}</CatalogueLink>
+						<CatalogueLink title='Open inside Youta' action={artistAction}>Artist [g]: {vkArtist !== null ? link.label : details.channel_name}</CatalogueLink>
 					</span>
 					<span className='block'>
 						<CatalogueLink title='Open inside Youta' action={{ ActivateDetailLink: index }} selectIndex={index} selected={index === selectedLink}>
@@ -308,12 +314,12 @@ function Links({
 						</CatalogueLink>
 					</span>
 				</li>;
-				if (funkwhaleArtist || funkwhaleAlbum !== null) return <li key={`${link.url}-${index}`}>
+				if (albumAction !== null) return <li key={`${link.url}-${index}`}>
 					<span className='flex flex-wrap items-baseline gap-x-[6px]'>
-						<CatalogueLink title='Open inside Youta' action={funkwhaleArtist ? 'OpenSelectedArtist' : { OpenFunkwhaleAlbum: funkwhaleAlbum! }}>
-							{funkwhaleArtist ? 'Artist [g]' : <>Album [{details.media_id === null ? 'Enter' : 'b'}] <SearchHighlight text={link.label} ranges={highlightRanges(details.search_highlights, { LinkLabel: index })} /></>}
+						<CatalogueLink title='Open inside Youta' action={albumAction}>
+							Album [{funkwhaleAlbum !== null && details.media_id === null ? 'Enter' : 'b'}] <SearchHighlight text={link.label} ranges={highlightRanges(details.search_highlights, { LinkLabel: index })} />
 						</CatalogueLink>
-						{funkwhaleArtist ? null : <span className='text-ink-faint'>-</span>}
+						<span className='text-ink-faint'>-</span>
 						<CatalogueLink title='Open inside Youta'
 							action={{ ActivateDetailLink: index }} selectIndex={index} selected={index === selectedLink}>
 							<SearchHighlight text={link.url} ranges={highlightRanges(details.search_highlights, { LinkUrl: index })} />
@@ -652,7 +658,7 @@ export function Details({ view, kind }: { view: ViewModel; kind: InformationPane
         ) : null}
         {details.local_fingerprint_available ? (
           <Action onClick={() => void dispatch("FingerprintLocalAudio")}>
-            {details.local_fingerprint_pending ? "Identifying..." : view.screen === 'Funkwhale' ? '[f] AcoustID' : "Identify"}
+						{details.local_fingerprint_pending ? 'Identifying...' : ['Funkwhale', 'Vk'].includes(view.screen) ? '[f] AcoustID' : 'Identify'}
           </Action>
         ) : null}
         {view.audio_quality_supported &&
@@ -681,7 +687,7 @@ export function Details({ view, kind }: { view: ViewModel; kind: InformationPane
             </Action>
           </>
         ) : null}
-		{view.selected_artist_available && view.screen !== 'Funkwhale' ? (
+		{view.selected_artist_available && !['Funkwhale', 'Vk'].includes(view.screen) ? (
 			<Action onClick={() => void dispatch('OpenSelectedArtist')}>[g] Artist</Action>
         ) : null}
         {kind === "YandexMusic" && yandex.album_available ? (

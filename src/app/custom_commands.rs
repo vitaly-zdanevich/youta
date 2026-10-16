@@ -185,6 +185,7 @@ impl AppController {
                 Screen::ArchiveOrg => Some(SourceKind::ArchiveOrg),
                 Screen::LibriVox => Some(SourceKind::LibriVox),
                 Screen::YandexMusic => Some(SourceKind::YandexMusic),
+                Screen::Vk => Some(SourceKind::Vk),
                 Screen::Radio => Some(SourceKind::Radio),
                 Screen::TrackerMusic => Some(SourceKind::ModArchive),
                 Screen::Web => Some(SourceKind::RemoteFiles),

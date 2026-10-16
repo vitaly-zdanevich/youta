@@ -44,6 +44,7 @@ fn disabled_history_does_not_restore_online_queries_or_cached_results() {
         StoredScreen::YouTubeMusic,
         StoredScreen::SoundCloud,
         StoredScreen::YandexMusic,
+        StoredScreen::Vk,
         StoredScreen::Bandcamp,
         StoredScreen::ApplePodcasts,
         StoredScreen::ArchiveOrg,

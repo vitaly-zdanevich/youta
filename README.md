@@ -738,6 +738,9 @@ resolver:
   official REST API for public audio search and playback. No pod is preset.
   See [Funkwhale pods](#funkwhale-pods) for setup and the
   [official API schema](https://docs.funkwhale.audio/swagger/schema.yml).
+- **VK Music** has a tab after Yandex for authenticated search and profile music.
+  It uses an explicitly supplied browser-session cookie export, not an application
+  API token. See [VK Music](#vk-music) for setup and limitations.
 - **Jamendo** is a first-class music provider using only the official v3 tracks
   API. It offers bounded paginated search, duration/release filters,
   total-listen ordering, direct track lookup, artwork, stream links, and
@@ -1173,7 +1176,7 @@ dependencies, or the optional Linux virtual-console mouse client with:
 
 ```sh
 cargo build --release --locked --no-default-features \
-	--features app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info,web-browser,youtube-captions
+	--features app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info,vk,web-browser,youtube-captions
 ```
 
 The `app` profile includes the experimental YandexMusic adapter but does not
@@ -1184,7 +1187,7 @@ with:
 
 ```sh
 cargo build --release --locked --no-default-features \
-	--features app-core,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info,web-browser,youtube-captions
+	--features app-core,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info,vk,web-browser,youtube-captions
 ```
 
 Omit `images` from that command for the Yandex-free text-only variant. Omit
@@ -1217,6 +1220,7 @@ leave it out of an explicit `--no-default-features` feature list:
 | `qr` | Offline QR encoding. |
 | `sponsorblock` | SponsorBlock UI, networking, cache, and playback skipping. |
 | `summary` | Explicit Codex video summaries. |
+| `vk` | Authenticated VK Music search, profile browsing, and native audio playback. |
 | `web-browser` | Web tab and its HTML directory parser; selected-file metadata uses `local-metadata`, covers use `local-artwork`. |
 | `youtube-captions` | Searchable captions and the current-cue line. |
 
@@ -1938,6 +1942,96 @@ profiles. Cancellation terminates the active caption or Codex process tree.
 Windows descendant termination is best-effort through `taskkill /T`, matching
 Youta's existing helper-process boundary. Youta does not retry a failed summary
 automatically.
+
+### VK Music
+
+The **VK** tab follows Yandex in both frontends. It searches and plays music
+accessible to your signed-in VK account using a private, best-effort web adapter.
+It does not bypass private profiles, regional restrictions, or subscription limits.
+
+Selecting a track loads its album name in Details when VK provides an album
+reference. Album names are fetched lazily and cached in memory; missing album
+information is omitted and does not prevent playback.
+The bare original track URL appears directly below the artwork. When VK
+advertises an album or artist identity, click its Details link or press `b`
+(Album) / `g` (Artist) to browse its tracks inside Youta. `Alt+Left` or `Esc`
+returns to the previous results and selection without repeating the search.
+Artist links are omitted when VK supplies only a name, not an exact identity.
+
+`U` (**To Commons**) and `I` (**To archive.org**) open the existing upload review
+for the selected track; only upload audio you have permission to publish under
+the chosen license. VK audio is resolved natively, without sending its cookies
+to the downloader or upload destination. `f` (**AcoustID**) identifies the
+selected track on demand using the configured AcoustID key. Identification
+uses bounded temporary audio and removes it afterwards.
+
+VK requires a Netscape `cookies.txt` export, not an API token. Treat this file
+like a password: anyone with its contents may be able to use your account.
+Youta reads only VK cookies and never discovers browser profiles automatically.
+Cookies exported only for `vk.com` are not sent to the separate `vk.ru` domain.
+
+To export from Firefox:
+
+1. Install [cookies.txt by Lennon Hill](https://addons.mozilla.org/en-US/firefox/addon/cookies-txt/)
+   from Mozilla Add-ons. Review its permissions: a cookie exporter can access
+   login sessions, so use an extension you trust.
+2. In the Firefox profile/container you use for VK, open
+   [VK Music](https://vk.ru/audio), sign in, and confirm that music searches work.
+   Youta can use the desktop session when VK's mobile page asks you to sign in again.
+3. Prepare a private destination on Linux/macOS:
+
+   ```sh
+   mkdir -p ~/.config/youta/secrets
+   chmod 700 ~/.config/youta/secrets
+   ```
+
+4. With the signed-in VK tab active, open the extension from Firefox's toolbar
+   or Extensions menu. Click **Download** beside **Current Container and Site**.
+   This limits the export to that site's cookies in the active container,
+   including Firefox's default container. Do not choose **ALL** or
+   **Current Container**, which also export unrelated sites. Save directly as
+   `~/.config/youta/secrets/vk-cookies.txt` (enter your full home-directory path
+   in the save dialog if needed). This extension exports Netscape format;
+   JSON or a copied `Cookie:` header will not work.
+5. Restrict the saved file's permissions:
+
+   ```sh
+   chmod 600 ~/.config/youta/secrets/vk-cookies.txt
+   ```
+
+   You can then disable/remove the extension in `about:addons`. Remove any extra
+   export copies from Downloads, and never attach cookies to a bug report.
+
+Youta contacts both `vk.ru` and `m.vk.ru`; preserve the export's original cookie
+domains and subdomain flags, including shared `.vk.ru` session cookies.
+In `~/.config/youta/secrets/credentials.toml`, add to the existing `[providers]`
+table (use your actual absolute path; `~` is not expanded):
+
+```toml
+[providers]
+vk_cookies_file = '/home/username/.config/youta/secrets/vk-cookies.txt'
+```
+
+Restart Youta after saving this setting, then search from its VK tab.
+`YOUTA_PROVIDERS__VK_COOKIES_FILE` overrides the saved path. No password, cookie
+contents, automatically extracted account ID, reload hash, or signed stream address is saved in search
+history or playlists. Keep the export under `secrets/` or otherwise outside Git
+sync. When the session expires, replace the export and restart Youta.
+
+Press `/` in VK and enter ordinary words or numbers, such as `2032`, to search
+tracks. Enter `@profile_name`, `profile:profile_name`, `id123`, `profile:123`, or a
+`https://vk.ru/profile_name` / `https://vk.com/profile_name` link to browse that
+profile's accessible music.
+Enter plays a selected track; the original VK link remains in Details. More
+results load explicitly, and Autoplay/Repeat use Youta's normal controls.
+Uncached saved tracks are looked up again and must match the exact VK track ID;
+if that bounded lookup cannot find them, browse/search for the track again.
+
+The default-on `vk` Cargo feature can be omitted from an explicit
+`--no-default-features` build in either frontend. The next-release Gentoo source
+template maps `USE="-vk"` to the same removal. VK's private web interface may
+change without notice; the wire-format reference is the maintained
+[vk_api audio adapter](https://github.com/python273/vk_api/blob/master/vk_api/audio.py).
 
 ### Funkwhale pods
 
@@ -2950,7 +3044,7 @@ The roadmap is intentionally tiered:
    bidirectional local/YouTube subscription sync, Last.fm scrobbling, Discord,
    ListenBrainz, Google Drive, WebDAV, SSH, and optional one-way backups.
 4. **Experimental adapters:** Odysee, Rumble, Bilibili, Telegram, Yandex Disk,
-   VK, cloud.mail.ru, 4duk, knizhnyvoz, additional archive formats, and
+   cloud.mail.ru, 4duk, knizhnyvoz, additional archive formats, and
    torrent-backed sources. Read-only ZIP/RAR Local folders are already implemented.
 
 Additional proprietary or scraper-dependent providers are not promised until
@@ -3588,7 +3682,7 @@ conventional `USE="-images"` and `USE="-qr"` overrides.
 
 The source package maps the default-enabled `ascii-visualizer`, `audio-quality`, `cache`,
 `commons-upload`, `evernote`, `funkwhale`, `lan-sharing`, `local-archives`, `nyan-cat`,
-`sponsorblock`, `summary`, and `youtube-captions` flags to their Cargo features.
+`sponsorblock`, `summary`, `vk`, and `youtube-captions` flags to their Cargo features.
 
 | Source package override | What it removes |
 | --- | --- |
@@ -3604,6 +3698,7 @@ The source package maps the default-enabled `ascii-visualizer`, `audio-quality`,
 | `USE="-local-archives"` | ZIP/RAR Local folders and the RAR helper dependency. |
 | `USE="-sponsorblock"` | SponsorBlock API client, preference, cache, and playback skipping. |
 | `USE="-summary"` | Codex summary UI and backend. |
+| `USE="-vk"` (next release template) | Authenticated VK Music tab and client in both frontends. |
 | `USE="-youtube-captions"` | Caption loading, search, and seeking; `summary` and `evernote` remain independent. |
 | `USE="-nyan-cat"` | Rainbow seek-bar renderers and preference. |
 

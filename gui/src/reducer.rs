@@ -549,6 +549,8 @@ pub fn start<R: Runtime>(
             // used by explicit GUI searches; this never starts hidden-tab work.
             #[cfg(feature = "funkwhale")]
             controller.set_funkwhale_search_page_capacity(50);
+            #[cfg(feature = "vk")]
+            controller.set_vk_search_page_capacity(50);
             controller.set_worker_waker(Some(Waker::from(worker_wake.clone())));
 
             published_artwork.record(controller.view());

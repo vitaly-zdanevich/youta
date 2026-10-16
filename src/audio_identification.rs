@@ -107,6 +107,12 @@ impl AudioIdentificationCancellation {
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
     }
+
+    /// Shares this exact cancellation signal with native VK process supervision.
+    #[cfg(feature = "vk")]
+    pub(crate) fn as_atomic(&self) -> &AtomicBool {
+        &self.cancelled
+    }
 }
 
 impl fmt::Debug for AudioIdentificationCancellation {

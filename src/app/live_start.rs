@@ -151,6 +151,8 @@ impl AppController {
         {
             return;
         }
+        #[cfg(feature = "vk")]
+        self.cancel_vk_playback();
         self.live_start.cancel_pending();
         self.live_start.reap();
         let generation = self.live_start.generation;

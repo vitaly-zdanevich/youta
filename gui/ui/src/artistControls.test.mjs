@@ -105,6 +105,57 @@ test('Funkwhale retains Commons and Archive upload buttons when core capabilitie
 	assert.deepEqual(actions, ['OpenCommonsUpload', 'OpenArchiveUpload']);
 });
 
+/** VK retains public URL order and gives each verified catalogue identity its own action. */
+test('VK artist and album links navigate internally while the original stays a bare first URL', () => {
+	const original = 'https://vk.ru/audio7_11';
+	const album = 'https://vk.ru/music/album/-2000123_456';
+	const artist = 'https://vk.ru/artist/fixture';
+	const tree = module.exports.Details({ kind: 'Generic', view: {
+		screen: 'Vk', selected_artist_available: true, external_opener_available: false,
+		playlist_item: null, custom_command_buttons: [], yandex_music_actions: {},
+		commons_upload_available: true, archive_upload_supported: true, archive_upload_available: true,
+		details: { title: 'Track', source: 'VK', media_id: { source: 'vk', external_id: '7_11' },
+			channel_id: '', channel_name: 'Fixture artist and collaborator', playlist_names: [], description: '',
+			timecodes: [], video_links: [], wikidata_entities: [], dearrow_title: null, local_fingerprint_available: true,
+			links: [
+				{ prefix: '', label: 'VK original', url: original, presentation: 'UrlOnly', internal_target: null, wikidata_item_id: null },
+				{ prefix: '', label: 'Fixture album', url: album, presentation: 'LabelAndUrl', internal_target: { VkAlbum: album }, wikidata_item_id: null },
+				{ prefix: '', label: 'Fixture artist', url: artist, presentation: 'LabelAndUrl', internal_target: { VkArtist: artist }, wikidata_item_id: null },
+			],
+		},
+	} });
+	const all = nodes(tree);
+	const buttons = all.filter((node) => node.type === 'button');
+	assert.equal(text(all.find((node) => node.type === 'li')), original);
+	assert.equal(text(tree).includes('VK original'), false);
+	assert.equal(buttons.some((node) => text(node) === '[g] Artist'), false);
+	assert.equal(buttons.some((node) => text(node) === '↪'), false);
+	for (const [label, action] of [
+		['Album [b] Fixture album', { OpenVkAlbum: album }],
+		['Artist [g]: Fixture artist', { OpenVkArtist: artist }],
+		['[U] To Commons', 'OpenCommonsUpload'],
+		['[I] To archive.org', 'OpenArchiveUpload'],
+		['[f] AcoustID', 'FingerprintLocalAudio'],
+	]) {
+		const button = buttons.find((node) => text(node) === label);
+		assert.ok(button, label);
+		assert.notEqual(button.props.disabled, true);
+		actions.length = 0;
+		button.props.onClick();
+		assert.deepEqual(actions, [action]);
+	}
+	for (const [index, url] of [[1, album], [2, artist]]) {
+		const button = buttons.find((node) => text(node) === url);
+		assert.ok(button, url);
+		assert.notEqual(button.props.disabled, true);
+		actions.length = 0;
+		const events = [];
+		button.props.onKeyDown({ key: 'Enter', preventDefault: () => events.push('prevent'), stopPropagation: () => events.push('stop') });
+		assert.deepEqual(events, ['prevent', 'stop']);
+		assert.deepEqual(actions, [{ ActivateDetailLink: index }]);
+	}
+});
+
 /** Album folders use Enter; b belongs to a selected track's album metadata. */
 test('Funkwhale album directory advertises its working Enter shortcut', () => {
 	const buttons = nodes(funkwhaleRail(false, {}, true)).filter((node) => node.type === 'button');

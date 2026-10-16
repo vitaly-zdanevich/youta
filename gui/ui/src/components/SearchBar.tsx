@@ -80,6 +80,7 @@ export function SearchBar({
 		|| (view.screen === 'TrackerMusic' && view.search_activity === 'TrackerArchives');
 	const backAvailable = view.screen === 'ArchiveOrg' ? view.archive_org_back_available
 		: view.screen === 'SoundCloud' ? view.soundcloud_back_available
+			: view.screen === 'Vk' ? view.vk_back_available
 			: view.screen === 'Funkwhale' && view.funkwhale_back_available;
 	const routeLabel = view.screen === 'YandexMusic'
 		? { Recommendations: 'My Wave', Album: 'Album', Artist: 'Artist', Search: '' }[view.yandex_music_route]

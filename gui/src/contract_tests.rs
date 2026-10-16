@@ -476,6 +476,41 @@ fn funkwhale_artist_album_links_keep_their_typed_window_destinations() {
     }
 }
 
+/// VK catalogue destinations retain canonical URLs and browser-independent action types.
+#[test]
+fn vk_artist_album_links_keep_their_typed_window_destinations() {
+    use youta::view::{DetailLinkInternalTarget, UiAction};
+    for (target, wire, action) in [
+        (
+            DetailLinkInternalTarget::VkAlbum("https://vk.ru/music/album/-2000123_456".to_owned()),
+            "VkAlbum",
+            UiAction::OpenVkAlbum("https://vk.ru/music/album/-2000123_456".to_owned()),
+        ),
+        (
+            DetailLinkInternalTarget::VkArtist("https://vk.ru/artist/fixture".to_owned()),
+            "VkArtist",
+            UiAction::OpenVkArtist("https://vk.ru/artist/fixture".to_owned()),
+        ),
+    ] {
+        assert_eq!(target.action(), action);
+        let serialized = serde_json::to_value(&target).unwrap();
+        assert!(
+            serialized
+                .get(wire)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .starts_with("https://vk.ru/")
+        );
+        assert_eq!(
+            serde_json::from_value::<UiAction>(serde_json::to_value(&action).unwrap()).unwrap(),
+            action
+        );
+        assert!(contract_source().contains(&format!("{{ {wire}: string }}")));
+    }
+    assert!(contract_source().contains("vk_back_available: boolean"));
+}
+
 /// Typed Funkwhale tags cross IPC as exact strings while rendering reuses indexed links.
 #[test]
 fn funkwhale_tags_keep_exact_internal_identity_in_the_window_contract() {
@@ -508,7 +543,18 @@ fn funkwhale_archive_source_is_declared_by_the_window_review_contract() {
         .split('}')
         .next()
         .unwrap();
-    assert!(draft.contains("source: 'YouTube' | 'Local' | 'Funkwhale';"));
+    assert!(draft.contains("source: 'YouTube' | 'Local' | 'Funkwhale' | 'Vk';"));
+}
+
+/// VK audio exports retain their public source kind across the review bridge.
+#[cfg(feature = "archive-upload")]
+#[test]
+fn vk_archive_source_is_declared_by_the_window_review_contract() {
+    assert_eq!(
+        serde_json::to_value(youta::archive_upload::ArchiveUploadSource::Vk).unwrap(),
+        serde_json::json!("Vk")
+    );
+    assert!(contract_source().contains("source: 'YouTube' | 'Local' | 'Funkwhale' | 'Vk';"));
 }
 
 /// Every declared field must exist in the JSON the reducer publishes.
@@ -978,6 +1024,21 @@ fn funkwhale_tab_follows_bandcamp_and_respects_the_gui_feature() {
     if let Some(index) = funkwhale {
         assert_eq!(screens[index - 1]["id"], "Bandcamp");
         assert_eq!(screens[index]["label"], "Funkwhale");
+        assert_eq!(screens[index]["search_verb"], "Search");
+        assert_eq!(screens[index]["details_kind"], "Generic");
+    }
+}
+
+/// The desktop exposes the optional VK source in the same order as the TUI.
+#[test]
+fn vk_tab_follows_yandex_and_respects_the_gui_feature() {
+    let screens = serde_json::to_value(super::screens()).unwrap();
+    let screens = screens.as_array().unwrap();
+    let position = screens.iter().position(|screen| screen["id"] == "Vk");
+    assert_eq!(position.is_some(), cfg!(feature = "vk"));
+    if let Some(index) = position {
+        assert_eq!(screens[index - 1]["id"], "YandexMusic");
+        assert_eq!(screens[index]["label"], "VK");
         assert_eq!(screens[index]["search_verb"], "Search");
         assert_eq!(screens[index]["details_kind"], "Generic");
     }

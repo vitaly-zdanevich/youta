@@ -67,35 +67,35 @@ esac
 case "${variant}" in
 	images)
 		executable_suffix=
-		cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,gpm,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info,web-browser,youtube-captions
+		cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,gpm,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info,vk,web-browser,youtube-captions
 		;;
 	text)
 		executable_suffix=-text
-		cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,gpm,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info,web-browser,youtube-captions
+		cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,gpm,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info,vk,web-browser,youtube-captions
 		;;
 	images-no-qr)
 		executable_suffix=-no-qr
-		cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,gpm,images,local-archives,nyan-cat,sponsorblock,summary,url-info,web-browser,youtube-captions
+		cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,gpm,images,local-archives,nyan-cat,sponsorblock,summary,url-info,vk,web-browser,youtube-captions
 		;;
 	text-no-qr)
 		executable_suffix=-text-no-qr
-		cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,gpm,local-archives,nyan-cat,sponsorblock,summary,url-info,web-browser,youtube-captions
+		cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,gpm,local-archives,nyan-cat,sponsorblock,summary,url-info,vk,web-browser,youtube-captions
 		;;
 	images-no-gpm)
 		executable_suffix=-no-gpm
-		cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info,web-browser,youtube-captions
+		cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info,vk,web-browser,youtube-captions
 		;;
 	text-no-gpm)
 		executable_suffix=-text-no-gpm
-		cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info,web-browser,youtube-captions
+		cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info,vk,web-browser,youtube-captions
 		;;
 	images-no-qr-no-gpm)
 		executable_suffix=-no-qr-no-gpm
-		cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,images,local-archives,nyan-cat,sponsorblock,summary,url-info,web-browser,youtube-captions
+		cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,images,local-archives,nyan-cat,sponsorblock,summary,url-info,vk,web-browser,youtube-captions
 		;;
 	text-no-qr-no-gpm)
 		executable_suffix=-text-no-qr-no-gpm
-		cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,local-archives,nyan-cat,sponsorblock,summary,url-info,web-browser,youtube-captions
+		cargo_features=app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,local-archives,nyan-cat,sponsorblock,summary,url-info,vk,web-browser,youtube-captions
 		;;
 	*)
 		echo "Unsupported release variant: ${variant}" >&2

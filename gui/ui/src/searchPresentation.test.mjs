@@ -76,6 +76,14 @@ test('empty-body prompt includes completed empty searches but not loading, selec
 	]) assert.equal(presentation.emptySearchPromptVisible({ ...base, ...patch }), false, JSON.stringify(patch));
 });
 
+/** VK uses the same empty-search guidance, without covering setup instructions. */
+test('VK hides an empty query and keeps setup or loading visible', () => {
+	assert.equal(presentation.searchEditorVisible({ ...base, screen: 'Vk' }), false);
+	assert.equal(presentation.emptySearchPromptVisible({ ...base, screen: 'Vk' }), true);
+	assert.equal(presentation.emptySearchPromptVisible({ ...base, screen: 'Vk', details: { title: 'VK Music setup' } }), false);
+	assert.equal(presentation.emptySearchPromptVisible({ ...base, screen: 'Vk', search_activity: 'Vk' }), false);
+});
+
 test('nonempty catalogues retain a compact mouse search button without a duplicate empty editor', () => {
 	for (const patch of [{ rows: [{}] }, { details: {} }]) {
 		actions.length = 0;
@@ -90,11 +98,11 @@ test('nonempty catalogues retain a compact mouse search button without a duplica
 	}
 });
 
-/** Funkwhale nested catalogues expose the same reversible navigation as the TUI. */
-test('Funkwhale Back stays available with an empty search row', () => {
-	for (const available of [false, true]) {
+/** Nested music catalogues expose the same reversible navigation as the TUI. */
+test('Funkwhale and VK Back stay available with an empty search row', () => {
+	for (const [screen, available] of ['Funkwhale', 'Vk'].flatMap((screen) => [false, true].map((available) => [screen, available]))) {
 		actions.length = 0;
-		const tree = renderSearch({ screen: 'Funkwhale', funkwhale_back_available: available });
+		const tree = renderSearch({ screen, funkwhale_back_available: available, vk_back_available: available });
 		const back = nodes(tree).find((node) => node.type === 'button' && text(node).includes('Back'));
 		assert.equal(Boolean(back), available);
 		if (back) {

@@ -534,6 +534,93 @@ mod wire_tests {
         );
     }
 
+    /// VK catalogue shortcuts preserve query input, modifiers and selected-row ownership.
+    #[cfg(feature = "vk")]
+    #[test]
+    fn vk_catalogue_shortcuts_keep_query_modifiers_and_selection_isolated() {
+        use crate::view::{DetailLinkInternalTarget, DetailLinkView, RowView, Screen};
+
+        let id = crate::domain::MediaId::new(crate::domain::SourceKind::Vk, "7_11");
+        let album = "https://vk.ru/music/album/-2000123_456";
+        let artist = "https://vk.ru/artist/fixture";
+        let mut view = ViewModel {
+            screen: Screen::Vk,
+            external_opener_available: false,
+            selected_artist_available: true,
+            vk_back_available: true,
+            rows: vec![RowView {
+                media_id: Some(id.clone()),
+                ..RowView::default()
+            }],
+            details: Some(DetailView {
+                media_id: Some(id),
+                links: vec![
+                    DetailLinkView {
+                        internal_target: Some(DetailLinkInternalTarget::VkAlbum(album.to_owned())),
+                        ..DetailLinkView::default()
+                    },
+                    DetailLinkView {
+                        internal_target: Some(DetailLinkInternalTarget::VkArtist(
+                            artist.to_owned(),
+                        )),
+                        ..DetailLinkView::default()
+                    },
+                ],
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        for (character, expected) in [
+            ('b', UiAction::OpenVkAlbum(album.to_owned())),
+            ('g', UiAction::OpenVkArtist(artist.to_owned())),
+        ] {
+            assert_eq!(
+                key_action(KeyPress::new(Key::Char(character)), &view, None, None),
+                Some(expected.clone())
+            );
+            for modifiers in 1..8 {
+                let key = KeyPress {
+                    ctrl: modifiers & 1 != 0,
+                    alt: modifiers & 2 != 0,
+                    shift: modifiers & 4 != 0,
+                    ..KeyPress::new(Key::Char(character))
+                };
+                assert_ne!(key_action(key, &view, None, None), Some(expected.clone()));
+            }
+            view.search_editing = true;
+            assert_eq!(
+                key_action(KeyPress::new(Key::Char(character)), &view, None, None),
+                Some(UiAction::AppendSearch(character))
+            );
+            view.search_editing = false;
+            view.selected = 1;
+            assert_ne!(
+                key_action(KeyPress::new(Key::Char(character)), &view, None, None),
+                Some(expected)
+            );
+            view.selected = 0;
+        }
+        assert_eq!(
+            key_action(KeyPress::new(Key::Esc), &view, None, None),
+            Some(UiAction::GoBack)
+        );
+        view.vk_back_available = false;
+        assert_ne!(
+            key_action(KeyPress::new(Key::Esc), &view, None, None),
+            Some(UiAction::GoBack)
+        );
+        view.details.as_mut().unwrap().local_fingerprint_available = true;
+        assert_eq!(
+            key_action(KeyPress::new(Key::Char('f')), &view, None, None),
+            Some(UiAction::FingerprintLocalAudio)
+        );
+        view.details.as_mut().unwrap().local_fingerprint_available = false;
+        assert_ne!(
+            key_action(KeyPress::new(Key::Char('f')), &view, None, None),
+            Some(UiAction::FingerprintLocalAudio)
+        );
+    }
+
     /// Nested Funkwhale routes support Back and ordinary viewport navigation.
     #[cfg(feature = "funkwhale")]
     #[test]
@@ -4804,9 +4891,15 @@ fn unfiltered_key_action(
         Key::Char('X') if view.youtube_channel_auto_download_available() => {
             Some(UiAction::ToggleChannelAutoDownload)
         }
+        Key::Char('g') if !key.modified() && view.screen == Screen::Vk => view
+            .vk_artist_url()
+            .map(|url| UiAction::OpenVkArtist(url.to_owned())),
         Key::Char('g') if !key.modified() && view.selected_artist_available => {
             Some(UiAction::OpenSelectedArtist)
         }
+        Key::Char('b') if !key.modified() && view.screen == Screen::Vk => view
+            .vk_album_url()
+            .map(|url| UiAction::OpenVkAlbum(url.to_owned())),
         Key::Char('b') if !key.modified() && view.screen == Screen::Funkwhale => view
             .funkwhale_album_url()
             .map(|url| UiAction::OpenFunkwhaleAlbum(url.to_owned())),
@@ -4835,7 +4928,7 @@ fn unfiltered_key_action(
         }
         Key::Char('f')
             if !key.modified()
-                && (view.screen == Screen::Local || view.screen == Screen::Funkwhale)
+                && matches!(view.screen, Screen::Local | Screen::Funkwhale | Screen::Vk)
                 && view
                     .details
                     .as_ref()
@@ -4978,6 +5071,9 @@ fn unfiltered_key_action(
             if (view.screen == Screen::ArchiveOrg && view.archive_org_back_available)
                 || (view.screen == Screen::SoundCloud && view.soundcloud_back_available) =>
         {
+            Some(UiAction::GoBack)
+        }
+        Key::Esc if cfg!(feature = "vk") && view.screen == Screen::Vk && view.vk_back_available => {
             Some(UiAction::GoBack)
         }
         Key::Esc if view.screen == Screen::Funkwhale && view.funkwhale_back_available => {

@@ -202,6 +202,10 @@ jobs:
             feature_arguments: --no-default-features --features tui,bandcamp
           - feature_set: standalone SoundCloud provider
             feature_arguments: --no-default-features --features soundcloud
+          - feature_set: standalone VK Music provider
+            feature_arguments: --no-default-features --features vk
+          - feature_set: TUI with VK Music
+            feature_arguments: --no-default-features --features tui,vk
           - feature_set: standalone Funkwhale provider
             feature_arguments: --no-default-features --features funkwhale
           - feature_set: TUI with Funkwhale
@@ -356,14 +360,14 @@ jobs:
       # tagged release cannot be the first attempt to link the 32-bit target.
       - name: Compile all release variants
         run: |
-          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,gpm,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info
-          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,gpm,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info
-          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,gpm,images,local-archives,nyan-cat,sponsorblock,summary,url-info
-          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,gpm,local-archives,nyan-cat,sponsorblock,summary,url-info
-          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info
-          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info
-          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,images,local-archives,nyan-cat,sponsorblock,summary,url-info
-          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,local-archives,nyan-cat,sponsorblock,summary,url-info
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,gpm,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info,vk
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,gpm,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info,vk
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,gpm,images,local-archives,nyan-cat,sponsorblock,summary,url-info,vk
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,gpm,local-archives,nyan-cat,sponsorblock,summary,url-info,vk
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,images,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info,vk
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,lan-sharing,local-archives,nyan-cat,qr,sponsorblock,summary,url-info,vk
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,images,local-archives,nyan-cat,sponsorblock,summary,url-info,vk
+          cargo build --locked --release --target i686-unknown-linux-gnu --no-default-features --features app,archive-org,archive-upload,ascii-visualizer,audio-quality,cache,cmd,commons-upload,evernote,funkwhale,hover,local-archives,nyan-cat,sponsorblock,summary,url-info,vk
 
       - name: Validate and start the i686 executable
         run: |

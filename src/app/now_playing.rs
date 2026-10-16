@@ -36,6 +36,8 @@ struct Location {
 /// Real controller adapters used by a focused source page and its Back destination.
 #[derive(Clone)]
 enum Content {
+    #[cfg(feature = "vk")]
+    Vk(super::vk::VkNavigationSnapshot),
     #[cfg(feature = "funkwhale")]
     Funkwhale(super::funkwhale::FunkwhaleNavigationSnapshot),
     Search(Box<SearchLocation>),
@@ -85,6 +87,35 @@ struct AppleLocation {
 }
 
 impl AppController {
+    /// Drops only VK private catalogue snapshots when its imported cookie owner changes.
+    #[cfg(feature = "vk")]
+    pub(super) fn revoke_vk_now_playing_navigation(&mut self) {
+        if self
+            .now_playing_navigation
+            .accepted
+            .as_ref()
+            .is_some_and(|(id, _)| id.source == SourceKind::Vk)
+        {
+            self.now_playing_navigation.accepted = None;
+        }
+        if self
+            .now_playing_navigation
+            .pending
+            .as_ref()
+            .is_some_and(|(id, _)| id.source == SourceKind::Vk)
+        {
+            self.now_playing_navigation.pending = None;
+        }
+        if self
+            .now_playing_navigation
+            .back
+            .as_ref()
+            .is_some_and(|back| back.screen == Screen::Vk || back.location.screen == Screen::Vk)
+        {
+            self.now_playing_navigation.back = None;
+        }
+    }
+
     /// Preserves the outgoing source and revokes stale UI work without populating a destination.
     pub(super) fn prepare_screen_transition(&mut self, screen: Screen) {
         #[cfg(feature = "archive-org")]
@@ -118,6 +149,7 @@ impl AppController {
             self.radio_filter_edit_snapshot = None;
         }
         match self.view.screen {
+            Screen::Vk => self.leave_vk_screen(),
             Screen::Funkwhale => self.leave_funkwhale_screen(),
             Screen::Search => {
                 self.youtube_search_query
@@ -335,6 +367,8 @@ impl AppController {
             SourceKind::YandexMusic => Screen::YandexMusic,
             SourceKind::Bandcamp => Screen::Bandcamp,
             SourceKind::Funkwhale => Screen::Funkwhale,
+            #[cfg(feature = "vk")]
+            SourceKind::Vk if super::vk::audio_identity(item).is_some() => Screen::Vk,
             SourceKind::ApplePodcasts => Screen::ApplePodcasts,
             SourceKind::ArchiveOrg => Screen::ArchiveOrg,
             SourceKind::LibriVox => Screen::LibriVox,
@@ -431,6 +465,12 @@ impl AppController {
     fn now_playing_location(&self, item: &QueueItem) -> Option<Location> {
         let id = &item.media.id;
         let (screen, content, selected) = match id.source {
+            #[cfg(feature = "vk")]
+            SourceKind::Vk if super::vk::audio_identity(item).is_some() => (
+                Screen::Vk,
+                Content::Vk(self.vk_navigation_snapshot(item)?),
+                0,
+            ),
             #[cfg(feature = "funkwhale")]
             SourceKind::Funkwhale => (
                 Screen::Funkwhale,
@@ -667,6 +707,7 @@ impl AppController {
             return &self.view.search_query;
         }
         match screen {
+            Screen::Vk => &self.vk.query,
             Screen::Funkwhale => &self.funkwhale.query,
             Screen::YouTubeMusic => &self.youtube_music_search_query,
             Screen::YandexMusic => &self.yandex_music_search_query,
@@ -684,6 +725,8 @@ impl AppController {
     /// Combines global and provider-local ownership for a reversible focused page.
     fn now_playing_location_generation(&self, screen: Screen) -> (u64, u64) {
         let provider = match screen {
+            #[cfg(feature = "vk")]
+            Screen::Vk => self.vk_navigation_generation(),
             #[cfg(feature = "funkwhale")]
             Screen::Funkwhale => self.funkwhale_navigation_generation(),
             #[cfg(feature = "yandex-music")]
@@ -708,6 +751,7 @@ impl AppController {
             self.view.selected
         } else {
             match screen {
+                Screen::Vk => self.vk.selected,
                 Screen::Funkwhale => self.funkwhale.selected,
                 Screen::YouTubeMusic => self.youtube_music_selected,
                 Screen::YandexMusic => self.yandex_music_selected,
@@ -728,6 +772,8 @@ impl AppController {
         };
         self.supersede_search_generation();
         match &mut location.content {
+            #[cfg(feature = "vk")]
+            Content::Vk(snapshot) => self.swap_vk_navigation(snapshot),
             #[cfg(feature = "funkwhale")]
             Content::Funkwhale(snapshot) => self.swap_funkwhale_navigation(snapshot),
             Content::Search(search) => {
@@ -826,6 +872,10 @@ impl AppController {
         self.view.search_query = query.clone();
         self.view.selected = selected;
         match screen {
+            Screen::Vk => {
+                self.vk.query = query;
+                self.vk.selected = selected;
+            }
             Screen::Funkwhale => {
                 self.funkwhale.query = query;
                 self.funkwhale.selected = selected;
@@ -888,6 +938,10 @@ impl AppController {
     /// Reveals existing typed provider data before using the legacy queue-only fallback.
     pub(super) fn reveal_cached_now_playing(&mut self, item: &QueueItem) -> bool {
         let id = &item.media.id;
+        #[cfg(feature = "vk")]
+        if self.reveal_vk_now_playing(id) {
+            return true;
+        }
         #[cfg(feature = "funkwhale")]
         if self.reveal_funkwhale_now_playing(id) {
             return true;

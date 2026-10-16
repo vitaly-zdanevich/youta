@@ -68,6 +68,7 @@ impl<T> Drop for ResponseSender<T> {
 /// detaches only final thread cleanup, never an in-flight provider operation.
 #[cfg(any(
     feature = "soundcloud",
+    feature = "vk",
     feature = "funkwhale",
     feature = "archive-org",
     feature = "invidious",

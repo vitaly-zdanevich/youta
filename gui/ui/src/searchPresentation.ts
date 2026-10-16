@@ -3,7 +3,7 @@ import type { ViewModel } from './contract';
 /** Sources whose ordinary empty body can offer a new search, not folder navigation. */
 function isSearchRoute(view: ViewModel): boolean {
 	if (view.screen === 'YandexMusic') return view.yandex_music_route === 'Search';
-	return ['Search', 'YouTubeMusic', 'SoundCloud', 'Funkwhale', 'Bandcamp',
+	return ['Search', 'YouTubeMusic', 'SoundCloud', 'Vk', 'Funkwhale', 'Bandcamp',
 		'ApplePodcasts', 'ArchiveOrg', 'LibriVox', 'TrackerMusic'].includes(view.screen);
 }
 

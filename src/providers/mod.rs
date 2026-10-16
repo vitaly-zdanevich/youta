@@ -57,6 +57,8 @@ pub mod sponsorblock;
 pub mod station_icon;
 #[cfg(feature = "tracker-music")]
 pub mod tracker;
+#[cfg(feature = "vk")]
+pub mod vk;
 #[cfg(feature = "wikidata")]
 pub mod wikidata;
 #[cfg(feature = "yandex-music")]

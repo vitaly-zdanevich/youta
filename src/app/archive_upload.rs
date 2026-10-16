@@ -18,6 +18,9 @@ pub(super) struct ArchiveUploadJob {
     pub(super) playback_location: String,
     pub(super) draft: ArchiveUploadDraft,
     pub(super) credentials: ArchiveUploadCredentials,
+    /// Exact review-owned provider scope; absent only for legacy queue-only replay.
+    #[cfg(feature = "vk")]
+    pub(super) vk_source: Option<crate::archive_upload_media::VkExportSource>,
 }
 
 /// Injectable side-effect boundary; controller tests never fetch credentials or upload.
@@ -53,6 +56,41 @@ impl ArchiveUploadService for SystemArchiveUploadService {
                 cancellation,
                 |bytes, total| progress(ArchiveUploadPhase::Preparing, bytes, total),
             )?
+        } else if job.media.id.source == SourceKind::Vk {
+            if job.draft.source != ArchiveUploadSource::Vk
+                || job.draft.source_url != job.media.webpage_url.as_str()
+            {
+                return Err(
+                    "The reviewed VK source no longer matches its selected track".to_owned(),
+                );
+            }
+            #[cfg(feature = "vk")]
+            {
+                if let Some(source) = job.vk_source.as_ref() {
+                    crate::archive_upload_media::prepare_vk_archive_media_from_session(
+                        &job.config,
+                        &job.media,
+                        &job.playback_location,
+                        job.draft.upload_video,
+                        cancellation,
+                        |bytes, total| progress(ArchiveUploadPhase::Preparing, bytes, total),
+                        source,
+                    )?
+                } else {
+                    crate::archive_upload_media::prepare_vk_archive_media(
+                        &job.config,
+                        &job.media,
+                        &job.playback_location,
+                        job.draft.upload_video,
+                        cancellation,
+                        |bytes, total| progress(ArchiveUploadPhase::Preparing, bytes, total),
+                    )?
+                }
+            }
+            #[cfg(not(feature = "vk"))]
+            {
+                return Err("This build omits VK support".to_owned());
+            }
         } else if job.media.id.source == SourceKind::Funkwhale {
             if job.draft.source != ArchiveUploadSource::Funkwhale
                 || job.draft.source_url != job.media.webpage_url.as_str()
@@ -152,6 +190,8 @@ mod wake_tests {
             .run(
                 ArchiveUploadJob {
                     config: Config::for_dir(directory.path()),
+                    #[cfg(feature = "vk")]
+                    vk_source: None,
                     playback_location: page.into(),
                     media,
                     draft,
@@ -217,6 +257,11 @@ pub(super) struct ArchiveUploadState {
     /// Failed publication requires explicit replacement rather than rediscovering the same keys.
     require_manual_credentials: bool,
     selection: Option<QueueItem>,
+    /// Private source and import generation retained independently of row changes.
+    #[cfg(feature = "vk")]
+    vk_source: Option<crate::archive_upload_media::VkExportSource>,
+    #[cfg(feature = "vk")]
+    vk_owner: Option<vk::VkExportOwner>,
     generation: u64,
     worker: Option<ArchiveUploadWorker>,
 }
@@ -228,6 +273,10 @@ impl Default for ArchiveUploadState {
             credentials: None,
             require_manual_credentials: false,
             selection: None,
+            #[cfg(feature = "vk")]
+            vk_source: None,
+            #[cfg(feature = "vk")]
+            vk_owner: None,
             generation: 0,
             worker: None,
         }
@@ -287,6 +336,19 @@ impl AppController {
             }
         };
         let video_available = archive_upload_video_available(&item).unwrap_or(false);
+        #[cfg(feature = "vk")]
+        let vk_source = self.capture_vk_export_source(&item);
+        #[cfg(feature = "vk")]
+        let vk_owner = vk_source.as_ref().and_then(|_| self.vk_export_owner());
+        #[cfg(feature = "vk")]
+        if item.media.id.source == SourceKind::Vk
+            && self.view.screen == Screen::Vk
+            && vk_source.is_none()
+        {
+            "The selected VK session is unavailable; search for the track again"
+                .clone_into(&mut self.view.status_line);
+            return;
+        }
         let media = &mut item.media;
         if matches!(media.id.source, SourceKind::YouTube | SourceKind::Funkwhale)
             && let Some(details) = self
@@ -305,6 +367,13 @@ impl AppController {
         // Local details contain filesystem paths, which are never public metadata.
         let draft = if media.id.source == SourceKind::Local {
             ArchiveUploadDraft::new_local(media.title.clone(), String::new(), media.creator.clone())
+        } else if media.id.source == SourceKind::Vk {
+            ArchiveUploadDraft::new_vk(
+                media.webpage_url.clone(),
+                media.title.clone(),
+                media.description.clone().unwrap_or_default(),
+                media.creator.clone(),
+            )
         } else if media.id.source == SourceKind::Funkwhale {
             ArchiveUploadDraft::new_funkwhale(
                 media.webpage_url.clone(),
@@ -330,6 +399,11 @@ impl AppController {
         draft.upload_video = video_available && self.config.archive_upload.upload_video;
         self.archive_upload.generation = self.archive_upload.generation.wrapping_add(1);
         self.archive_upload.selection = Some(item);
+        #[cfg(feature = "vk")]
+        {
+            self.archive_upload.vk_source = vk_source;
+            self.archive_upload.vk_owner = vk_owner;
+        }
         self.view.archive_credentials_popup = None;
         self.view.archive_upload_popup = Some(ArchiveUploadPopupView {
             generation: self.archive_upload.generation,
@@ -429,6 +503,21 @@ impl AppController {
         let Some(item) = self.archive_upload.selection.clone() else {
             return;
         };
+        #[cfg(feature = "vk")]
+        if self
+            .archive_upload
+            .vk_owner
+            .as_ref()
+            .is_some_and(|owner| !self.vk_export_owner_is_current(owner))
+        {
+            self.view
+                .archive_upload_popup
+                .as_mut()
+                .unwrap()
+                .validation_error =
+                Some("VK session changed; close and reopen the review".to_owned());
+            return;
+        }
         let validation = draft.validate().and_then(|()| {
             let source_matches = match (&item.media.id.source, draft.source) {
                 (SourceKind::YouTube, ArchiveUploadSource::YouTube) => {
@@ -437,6 +526,10 @@ impl AppController {
                 (SourceKind::Local, ArchiveUploadSource::Local) => draft.source_url.is_empty(),
                 (SourceKind::Funkwhale, ArchiveUploadSource::Funkwhale) => {
                     funkwhale_upload::supported(&item)
+                        && draft.source_url == item.media.webpage_url.as_str()
+                }
+                (SourceKind::Vk, ArchiveUploadSource::Vk) => {
+                    vk::export_supported(&item)
                         && draft.source_url == item.media.webpage_url.as_str()
                 }
                 _ => false,
@@ -487,6 +580,8 @@ impl AppController {
             playback_location: item.playback_location,
             draft,
             credentials,
+            #[cfg(feature = "vk")]
+            vk_source: self.archive_upload.vk_source.clone(),
         };
         let service = Arc::clone(&self.archive_upload.service);
         let cancellation = Arc::new(AtomicBool::new(false));
@@ -623,6 +718,11 @@ impl AppController {
         self.view.archive_upload_popup = None;
         self.view.archive_credentials_popup = None;
         self.archive_upload.selection = None;
+        #[cfg(feature = "vk")]
+        {
+            self.archive_upload.vk_source = None;
+            self.archive_upload.vk_owner = None;
+        }
     }
 
     /// Edits keys only in the in-memory credential view, which serializes lengths alone.
@@ -700,12 +800,17 @@ impl AppController {
         }
         self.view.archive_credentials_popup = None;
         self.archive_upload.credentials = None;
+        #[cfg(feature = "vk")]
+        {
+            self.archive_upload.vk_source = None;
+            self.archive_upload.vk_owner = None;
+        }
     }
 }
 
 /// Returns finite source capabilities without resolving or disclosing local paths.
 fn archive_upload_video_available(item: &QueueItem) -> Option<bool> {
-    if funkwhale_upload::supported(item) {
+    if funkwhale_upload::supported(item) || vk::export_supported(item) {
         return Some(false);
     }
     match item.media.id.source {

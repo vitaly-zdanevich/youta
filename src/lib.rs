@@ -28,7 +28,9 @@ pub mod archive_upload;
 #[cfg(any(
     feature = "archive-upload",
     feature = "s3-upload",
-    all(feature = "commons-upload", feature = "funkwhale")
+    all(feature = "commons-upload", any(feature = "funkwhale", feature = "vk")),
+    all(feature = "evernote", feature = "vk"),
+    all(feature = "acoustid", feature = "vk")
 ))]
 pub mod archive_upload_media;
 pub mod bug_report;

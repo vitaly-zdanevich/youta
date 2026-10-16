@@ -921,6 +921,96 @@ clicks, and
 or
 .B F8
 exits pointer mode.
+.SH VK MUSIC
+The VK tab follows Yandex in both frontends. It provides authenticated track
+search and profile music through a best-effort private web adapter.
+Only music accessible to the signed-in account is available; private profiles,
+regional restrictions, and subscription limits are not bypassed.
+.PP
+Selecting a track loads its album name in Details when VK provides an album
+reference. Album names are fetched lazily and cached in memory. Missing album
+information is omitted and does not prevent playback.
+.PP
+The bare original track URL appears directly below the artwork.
+Click Album or press b to browse its tracks inside Youta; click Artist or press g
+to browse the exact advertised artist. Artist links require an identity, not
+just a displayed name. Alt+Left or Esc restores the previous results and selection.
+.PP
+U (To Commons) and I (To archive.org) open the upload review. Only publish audio
+you have permission to redistribute under the selected license. VK audio is
+resolved natively; cookies are never forwarded to helpers or upload destinations.
+f (AcoustID) identifies the selected track on demand with the configured key,
+using bounded temporary audio removed afterwards.
+.PP
+VK requires a Netscape cookies.txt export, not an API token.
+Treat the export like a password and keep it private.
+.PP
+To export from Firefox:
+.IP "1." 4
+Install cookies.txt by Lennon Hill from Mozilla Add-ons:
+.UR https://addons.mozilla.org/en-US/firefox/addon/cookies-txt/
+cookies.txt for Firefox
+.UE .
+Review its permissions and use an exporter you trust: it can access login
+sessions.
+.IP "2." 4
+In the Firefox profile/container you use for VK, open https://vk.ru/audio and
+sign in. Confirm that music searches work. Youta can use the desktop session
+when VK's mobile page asks you to sign in again.
+.IP "3." 4
+Prepare a private destination on Linux/macOS:
+.RS
+.nf
+mkdir \-p ~/.config/youta/secrets
+chmod 700 ~/.config/youta/secrets
+.fi
+.RE
+.IP "4." 4
+With the signed-in VK tab active, open the extension from Firefox's toolbar or
+Extensions menu. Click Download beside Current Container and Site. This selects
+only that site's cookies in the active container, including the default
+container.
+Do not choose ALL or Current Container, which also export unrelated sites.
+Save directly as ~/.config/youta/secrets/vk-cookies.txt; enter the full
+home-directory path in the save dialog if needed. The extension exports
+Netscape format; JSON and copied Cookie: headers are not accepted.
+.IP "5." 4
+Restrict the saved file's permissions:
+.RS
+.nf
+chmod 600 ~/.config/youta/secrets/vk-cookies.txt
+.fi
+.RE
+.PP
+You can then disable/remove the extension in about:addons. Remove extra export
+copies from Downloads and never attach cookies to a bug report.
+Youta contacts both vk.ru and m.vk.ru; preserve the original cookie domains and
+subdomain flags, including shared .vk.ru session cookies.
+Cookies exported only for vk.com are not sent to vk.ru.
+.PP
+Set
+.B providers.vk_cookies_file
+to its absolute path under the existing [providers] table in
+~/.config/youta/secrets/credentials.toml, or use
+.BR YOUTA_PROVIDERS__VK_COOKIES_FILE .
+The path does not expand a leading tilde. Youta never discovers browser profiles
+automatically. Restart Youta after configuration. Replace expired cookies and
+restart Youta to authenticate again.
+.PP
+Press / and enter ordinary text or numbers, such as 2032, to search tracks.
+Enter @profile_name, profile:profile_name, id123, profile:123, or a vk.ru/vk.com profile link to browse
+that user's accessible music. Enter plays the selected track. More results load
+explicitly; Autoplay and Repeat use the normal controls. Details keeps the
+original track link. Saved tracks are resolved again by exact identity; if the
+bounded lookup cannot find one, browse or search for it again.
+.PP
+Cookie contents, automatically extracted account IDs, private reload hashes, and signed stream URLs do
+not enter search history or playlists. Keep cookie exports outside Git sync.
+The default-on
+.B vk
+Cargo feature is independently removable from both frontends. The next-release
+Gentoo source template exposes
+.BR USE="-vk" .
 .SH FUNKWHALE PODS
 The Funkwhale tab follows Bandcamp in the terminal and desktop.
 Its first visit opens pod setup; no pod is preset.

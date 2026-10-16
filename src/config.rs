@@ -116,6 +116,9 @@ pub const YOUTUBE_API_KEY_ENV: &str = "YOUTA_PROVIDERS__YOUTUBE_API_KEY";
 /// Environment variable that overrides the Yandex Music OAuth access token.
 pub const YANDEX_MUSIC_TOKEN_ENV: &str = "YOUTA_PROVIDERS__YANDEX_MUSIC_TOKEN";
 
+/// Explicit path to a private Netscape export for VK Music authentication.
+pub const VK_COOKIES_FILE_ENV: &str = "YOUTA_PROVIDERS__VK_COOKIES_FILE";
+
 /// Environment override for the user-selected Funkwhale pod address.
 pub const FUNKWHALE_INSTANCE_URL_ENV: &str = "YOUTA_PROVIDERS__FUNKWHALE_INSTANCE_URL";
 
@@ -174,6 +177,7 @@ struct CredentialsFile {
 struct ProviderCredentials {
     youtube_api_key: Option<String>,
     yandex_music_token: Option<String>,
+    vk_cookies_file: Option<PathBuf>,
     evernote_auth_token: Option<String>,
     wikimedia_commons_username: Option<String>,
     wikimedia_commons_password: Option<String>,
@@ -360,6 +364,9 @@ impl Config {
         }
         if let Some(token) = self.providers.yandex_music_token.as_deref() {
             validate_generic_credential("providers.yandex_music_token", token)?;
+        }
+        if let Some(path) = self.providers.vk_cookies_file.as_deref() {
+            validate_vk_cookies_path(path)?;
         }
         if let Some(token) = self.providers.evernote_auth_token.as_deref() {
             validate_generic_credential("providers.evernote_auth_token", token)?;
@@ -1998,6 +2005,11 @@ pub struct ProviderConfig {
     pub youtube_api_key: Option<String>,
     /// Optional OAuth access token for the user's Yandex Music account.
     pub yandex_music_token: Option<String>,
+    /// Explicit Netscape cookie export for authenticated VK Music requests.
+    ///
+    /// Only the path is configured; file contents are loaded lazily into memory.
+    /// Prefer the private credentials file and keep the export outside Git sync.
+    pub vk_cookies_file: Option<PathBuf>,
     /// Optional Evernote OAuth or personal developer authentication token.
     pub evernote_auth_token: Option<String>,
     /// Optional Wikimedia Commons account or `BotPassword` username.
@@ -2058,6 +2070,10 @@ impl fmt::Debug for ProviderConfig {
                 &self.yandex_music_token.as_ref().map(|_| "[REDACTED]"),
             )
             .field(
+                "vk_cookies_file",
+                &self.vk_cookies_file.as_ref().map(|_| "[CONFIGURED]"),
+            )
+            .field(
                 "evernote_auth_token",
                 &self.evernote_auth_token.as_ref().map(|_| "[REDACTED]"),
             )
@@ -2110,6 +2126,7 @@ impl Default for ProviderConfig {
             funkwhale_instance_url: None,
             youtube_api_key: None,
             yandex_music_token: None,
+            vk_cookies_file: None,
             evernote_auth_token: None,
             wikimedia_commons_username: None,
             wikimedia_commons_password: None,
@@ -2339,6 +2356,10 @@ fn validate_credentials_file(path: &Path) -> Result<(), ConfigError> {
         validate_generic_credential("providers.yandex_music_token", token)
             .map_err(|error| credential_file_error(path, error))?;
     }
+    if let Some(cookie_path) = credentials.providers.vk_cookies_file.as_deref() {
+        validate_vk_cookies_path(cookie_path)
+            .map_err(|error| credential_file_error(path, error))?;
+    }
     if let Some(token) = credentials.providers.evernote_auth_token.as_deref() {
         validate_generic_credential("providers.evernote_auth_token", token)
             .map_err(|error| credential_file_error(path, error))?;
@@ -2373,6 +2394,20 @@ fn credential_file_error(path: &Path, error: ConfigError) -> ConfigError {
         }
         other => other,
     }
+}
+
+/// Validates a reference without opening an authentication file at startup.
+fn validate_vk_cookies_path(path: &Path) -> Result<(), ConfigError> {
+    if !path.is_absolute()
+        || path
+            .to_str()
+            .is_none_or(|value| value.chars().any(char::is_control))
+    {
+        return Err(ConfigError::Invalid(
+            "providers.vk_cookies_file must be an absolute path without control characters".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn read_limited_utf8_file(path: &Path, limit: u64, label: &str) -> Result<String, ConfigError> {
@@ -2567,6 +2602,7 @@ fn migrate_legacy_provider_credentials(
         for field in [
             "youtube_api_key",
             "yandex_music_token",
+            "vk_cookies_file",
             "evernote_auth_token",
             "wikimedia_commons_username",
             "wikimedia_commons_password",
@@ -4245,6 +4281,7 @@ youtube_api_key = "keep-this-existing-secret"
         let mut providers = ProviderConfig {
             youtube_api_key: Some("youtube-secret-canary".to_owned()),
             yandex_music_token: Some("yandex-oauth-secret-canary".to_owned()),
+            vk_cookies_file: Some(PathBuf::from("/private/vk-cookie-path-canary")),
             evernote_auth_token: Some("evernote-secret-canary".to_owned()),
             mod_archive_api_key: Some("mod-secret-canary".to_owned()),
             jamendo_client_id: Some("jamendo-client-canary".to_owned()),
@@ -4257,6 +4294,7 @@ youtube_api_key = "keep-this-existing-secret"
         for secret in [
             "youtube-secret-canary",
             "yandex-oauth-secret-canary",
+            "vk-cookie-path-canary",
             "evernote-secret-canary",
             "mod-secret-canary",
             "jamendo-client-canary",
@@ -4430,6 +4468,43 @@ youtube_api_key = "keep-this-existing-secret"
             config.providers.youtube_api_key.as_deref(),
             Some("AIzaPrivate_key_12345678901234567")
         );
+    }
+
+    /// Loading configuration must not open the referenced authentication export.
+    #[test]
+    fn vk_cookie_path_loads_from_private_credentials_without_reading_cookies() {
+        let directory = tempdir().unwrap();
+        let private = directory.path().join("secrets");
+        fs::create_dir(&private).unwrap();
+        let cookie_path = private.join("vk-cookies.txt");
+        let path_string = cookie_path.to_str().unwrap();
+        let document = toml::to_string(&toml::toml! {
+            [providers]
+            vk_cookies_file = path_string
+        })
+        .unwrap();
+        fs::write(private.join("credentials.toml"), document).unwrap();
+        let config =
+            Config::load_from_dir_with_environment(directory.path().to_owned(), false).unwrap();
+        assert_eq!(config.providers.vk_cookies_file, Some(cookie_path.clone()));
+        assert!(
+            !cookie_path.exists(),
+            "startup must not create or read a cookie export"
+        );
+    }
+
+    #[test]
+    fn vk_cookie_path_rejects_relative_or_control_bearing_values_without_echoing_them() {
+        for path in [
+            "vk-cookie-path-canary.txt",
+            "/private/vk-cookie-path-canary\n",
+        ] {
+            let mut config = Config::default();
+            config.providers.vk_cookies_file = Some(PathBuf::from(path));
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains("absolute path without control characters"));
+            assert!(!error.contains("canary"));
+        }
     }
 
     #[test]

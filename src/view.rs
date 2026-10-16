@@ -105,6 +105,8 @@ pub enum Screen {
     SoundCloud,
     /// Personalized recommendations and catalogue search through Yandex Music.
     YandexMusic,
+    /// VK audio search and saved-library browsing using a configured cookie file.
+    Vk,
     /// Artist, album, and track discovery through `Bandcamp`.
     Bandcamp,
     /// Audio tracks from one user-configured Funkwhale pod.
@@ -137,11 +139,12 @@ pub enum Screen {
 
 impl Screen {
     /// Stable ordering shared by the terminal, desktop tabs, and native menus.
-    pub const ALL: [Self; 18] = [
+    pub const ALL: [Self; 19] = [
         Self::Search,
         Self::YouTubeMusic,
         Self::SoundCloud,
         Self::YandexMusic,
+        Self::Vk,
         Self::Bandcamp,
         Self::Funkwhale,
         Self::ApplePodcasts,
@@ -164,6 +167,7 @@ impl Screen {
             Self::YouTubeMusic => cfg!(feature = "youtube-music"),
             Self::SoundCloud => cfg!(feature = "soundcloud"),
             Self::YandexMusic => cfg!(feature = "yandex-music"),
+            Self::Vk => cfg!(feature = "vk"),
             Self::Bandcamp => cfg!(feature = "bandcamp"),
             Self::Funkwhale => cfg!(feature = "funkwhale"),
             Self::ApplePodcasts => cfg!(feature = "apple-podcasts"),
@@ -199,6 +203,7 @@ impl Screen {
             Self::Radio => InformationPanelKind::Radio,
             Self::YandexMusic => InformationPanelKind::YandexMusic,
             Self::SoundCloud
+            | Self::Vk
             | Self::Bandcamp
             | Self::Funkwhale
             | Self::ArchiveOrg
@@ -224,6 +229,7 @@ impl Screen {
             | Self::YouTubeMusic
             | Self::SoundCloud
             | Self::YandexMusic
+            | Self::Vk
             | Self::Bandcamp
             | Self::Funkwhale
             | Self::ApplePodcasts
@@ -248,6 +254,7 @@ impl Screen {
             Self::YouTubeMusic => "YT Music",
             Self::SoundCloud => "SoundCloud",
             Self::YandexMusic => "Yandex",
+            Self::Vk => "VK",
             Self::Bandcamp => "Bandcamp",
             Self::Funkwhale => "Funkwhale",
             Self::ApplePodcasts => "Podcasts",
@@ -273,6 +280,7 @@ impl Screen {
             Self::YouTubeMusic => "YT Music",
             Self::SoundCloud => "SoundCloud",
             Self::YandexMusic => "Yandex",
+            Self::Vk => "VK",
             Self::Bandcamp => "Bandcamp",
             Self::Funkwhale => "FW",
             Self::ApplePodcasts => "Podcasts",
@@ -553,6 +561,8 @@ pub enum SearchActivity {
     SoundCloud,
     /// A Yandex Music catalogue search.
     YandexMusic,
+    /// A VK audio search or saved-library request.
+    Vk,
     /// A public track and album search through `Bandcamp`.
     Bandcamp,
     /// A public track search through the selected Funkwhale pod.
@@ -578,6 +588,7 @@ impl SearchActivity {
             Self::YouTubeMusic => Screen::YouTubeMusic,
             Self::SoundCloud => Screen::SoundCloud,
             Self::YandexMusic => Screen::YandexMusic,
+            Self::Vk => Screen::Vk,
             Self::Bandcamp => Screen::Bandcamp,
             Self::Funkwhale => Screen::Funkwhale,
             Self::ApplePodcasts => Screen::ApplePodcasts,
@@ -1972,6 +1983,10 @@ pub enum DetailLinkInternalTarget {
     FunkwhaleArtist(String),
     /// Browse an exact album on the selected track's original Funkwhale pod.
     FunkwhaleAlbum(String),
+    /// Browse one validated public VK release album.
+    VkAlbum(String),
+    /// Browse one validated public VK artist catalogue.
+    VkArtist(String),
     /// Browse public uploads belonging to the selected upload's exact actor.
     FunkwhaleUploader(String),
     /// One stable Yandex Music artist identifier.
@@ -2000,6 +2015,8 @@ impl DetailLinkInternalTarget {
             Self::FunkwhaleTag(tag) => UiAction::SearchFunkwhaleTag(tag.clone()),
             Self::FunkwhaleArtist(_) => UiAction::OpenSelectedArtist,
             Self::FunkwhaleAlbum(url) => UiAction::OpenFunkwhaleAlbum(url.clone()),
+            Self::VkAlbum(url) => UiAction::OpenVkAlbum(url.clone()),
+            Self::VkArtist(url) => UiAction::OpenVkArtist(url.clone()),
             Self::FunkwhaleUploader(_) => UiAction::OpenFunkwhaleUploader,
             Self::YandexMusicArtist(id) => UiAction::OpenYandexMusicArtistById(id.clone()),
             Self::YandexMusicAlbum(id) => UiAction::OpenYandexMusicAlbumById(id.clone()),
@@ -3515,6 +3532,8 @@ pub struct ViewModel {
     pub soundcloud_back_available: bool,
     /// Whether a nested Funkwhale catalogue has a retained Back destination.
     pub funkwhale_back_available: bool,
+    /// Whether a nested VK album or artist catalogue has a retained Back destination.
+    pub vk_back_available: bool,
     /// Authoritative playback-source tab, retained while paused; idle playback hides its marker.
     pub playing_screen: Option<Screen>,
     /// Selected Commons media control inside the expanded Wikidata spoiler.
@@ -3944,6 +3963,8 @@ impl ViewModel {
                                 | DetailLinkInternalTarget::FunkwhaleTag(_)
                                 | DetailLinkInternalTarget::FunkwhaleArtist(_)
                                 | DetailLinkInternalTarget::FunkwhaleAlbum(_)
+                                | DetailLinkInternalTarget::VkAlbum(_)
+                                | DetailLinkInternalTarget::VkArtist(_)
                                 | DetailLinkInternalTarget::FunkwhaleUploader(_)
                         )
                     )
@@ -3974,6 +3995,39 @@ impl ViewModel {
             .iter()
             .find_map(|link| match &link.internal_target {
                 Some(DetailLinkInternalTarget::FunkwhaleAlbum(url)) => Some(url.as_str()),
+                _ => None,
+            })
+    }
+
+    /// Returns only the links owned by the selected VK track in an enabled build.
+    fn selected_vk_links(&self) -> Option<&[DetailLinkView]> {
+        if !cfg!(feature = "vk") || self.screen != Screen::Vk {
+            return None;
+        }
+        let selected = self.rows.get(self.selected)?.media_id.as_ref()?;
+        let details = self.details.as_ref()?;
+        (selected.source == SourceKind::Vk && details.media_id.as_ref() == Some(selected))
+            .then_some(details.links.as_slice())
+    }
+
+    /// Exposes the selected VK track's exact album for its browser-independent shortcut.
+    #[must_use]
+    pub fn vk_album_url(&self) -> Option<&str> {
+        self.selected_vk_links()?
+            .iter()
+            .find_map(|link| match &link.internal_target {
+                Some(DetailLinkInternalTarget::VkAlbum(url)) => Some(url.as_str()),
+                _ => None,
+            })
+    }
+
+    /// Exposes the selected VK track's first verified artist without guessing from its name.
+    #[must_use]
+    pub fn vk_artist_url(&self) -> Option<&str> {
+        self.selected_vk_links()?
+            .iter()
+            .find_map(|link| match &link.internal_target {
+                Some(DetailLinkInternalTarget::VkArtist(url)) => Some(url.as_str()),
                 _ => None,
             })
     }
@@ -4212,6 +4266,7 @@ impl Default for ViewModel {
             archive_org_back_available: false,
             soundcloud_back_available: false,
             funkwhale_back_available: false,
+            vk_back_available: false,
             playing_screen: None,
             selected_wikidata_media: None,
             right_panel_mode: RightPanelMode::Details,
@@ -5008,6 +5063,10 @@ pub enum UiAction {
     SearchFunkwhaleTag(String),
     /// Browse an exact selected Funkwhale album without leaving its original pod.
     OpenFunkwhaleAlbum(String),
+    /// Browse one exact public VK album advertised by the current selection.
+    OpenVkAlbum(String),
+    /// Browse one exact public VK artist advertised by the current selection.
+    OpenVkArtist(String),
     /// Opens all public playable uploads of the selected Funkwhale uploader.
     OpenFunkwhaleUploader,
     /// Search `YouTube` videos for one validated hashtag without the leading hash.
@@ -5471,6 +5530,8 @@ pub trait UiController {
     /// Reports visible SoundCloud track slots, excluding its continuation row.
     /// Frontends without terminal geometry may retain the controller's default.
     fn set_soundcloud_search_page_capacity(&mut self, _rows: usize) {}
+    /// Reports visible VK track slots, excluding its continuation row.
+    fn set_vk_search_page_capacity(&mut self, _rows: usize) {}
     /// Reports visible Funkwhale track slots, excluding its continuation row.
     fn set_funkwhale_search_page_capacity(&mut self, _rows: usize) {}
 
@@ -5484,6 +5545,7 @@ pub trait UiController {
                 self.set_archive_org_search_page_capacity(capacities.with_heading)
             }
             Screen::SoundCloud => self.set_soundcloud_search_page_capacity(capacities.with_heading),
+            Screen::Vk => self.set_vk_search_page_capacity(capacities.with_heading),
             Screen::Funkwhale => self.set_funkwhale_search_page_capacity(capacities.with_heading),
             _ => {}
         }
@@ -5558,6 +5620,70 @@ pub trait UiController {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// VK catalogue links retain exact internal destinations without a browser.
+    #[test]
+    fn vk_catalogue_links_require_matching_selection_and_keep_internal_actions() {
+        let album = "https://vk.ru/music/album/-2000123_456";
+        let artist = "https://vk.ru/artist/fixture";
+        let id = MediaId::new(SourceKind::Vk, "7_11");
+        let mut view = ViewModel {
+            screen: Screen::Vk,
+            external_opener_available: false,
+            rows: vec![RowView {
+                media_id: Some(id.clone()),
+                ..RowView::default()
+            }],
+            details: Some(DetailView {
+                media_id: Some(id),
+                links: vec![
+                    DetailLinkView {
+                        internal_target: Some(DetailLinkInternalTarget::VkAlbum(album.to_owned())),
+                        ..DetailLinkView::default()
+                    },
+                    DetailLinkView {
+                        internal_target: Some(DetailLinkInternalTarget::VkArtist(
+                            artist.to_owned(),
+                        )),
+                        ..DetailLinkView::default()
+                    },
+                ],
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        };
+        for (index, expected) in [
+            UiAction::OpenVkAlbum(album.to_owned()),
+            UiAction::OpenVkArtist(artist.to_owned()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                view.details.as_ref().unwrap().links[index]
+                    .internal_target
+                    .as_ref()
+                    .unwrap()
+                    .action(),
+                expected
+            );
+            assert!(!view.action_requires_external_opener(&UiAction::ActivateDetailLink(index)));
+            assert!(!expected.requires_external_opener());
+        }
+        assert_eq!(view.vk_album_url(), cfg!(feature = "vk").then_some(album));
+        assert_eq!(view.vk_artist_url(), cfg!(feature = "vk").then_some(artist));
+        view.rows[0].media_id = Some(MediaId::new(SourceKind::Vk, "7_12"));
+        assert!(view.vk_album_url().is_none());
+        assert!(view.vk_artist_url().is_none());
+        view.rows[0].media_id = view.details.as_ref().unwrap().media_id.clone();
+        view.screen = Screen::Funkwhale;
+        assert!(view.vk_album_url().is_none());
+        assert!(view.vk_artist_url().is_none());
+        view.screen = Screen::Vk;
+        view.rows.clear();
+        assert!(view.vk_album_url().is_none());
+        assert!(view.vk_artist_url().is_none());
+    }
 
     /// Visible source URLs remain internal actions even without a terminal URL opener.
     #[test]
@@ -6104,7 +6230,7 @@ mod tests {
             .iter()
             .position(|screen| *screen == Screen::Local)
             .unwrap();
-        assert_eq!(Screen::ALL.len(), 18);
+        assert_eq!(Screen::ALL.len(), 19);
         assert_eq!(Screen::ALL[local + 1], Screen::Web);
         assert_eq!(Screen::ALL[local + 2], Screen::Playlists);
         assert_eq!(Screen::Web.label(), "Web");
@@ -6137,6 +6263,28 @@ mod tests {
             InformationPanelKind::Generic
         );
         assert_eq!(SearchActivity::SoundCloud.screen(), Screen::SoundCloud);
+    }
+
+    /// VK has a stable tab identity and shares the generic searchable music layout.
+    #[test]
+    fn vk_tab_follows_yandex_and_exposes_generic_track_search() {
+        let yandex = Screen::ALL
+            .iter()
+            .position(|screen| *screen == Screen::YandexMusic)
+            .unwrap();
+        assert_eq!(Screen::ALL[yandex + 1], Screen::Vk);
+        assert_eq!(Screen::ALL[yandex + 2], Screen::Bandcamp);
+        assert_eq!(Screen::Vk.label(), "VK");
+        assert_eq!(Screen::Vk.compact_label(), "VK");
+        assert_eq!(Screen::Vk.enabled(), cfg!(feature = "vk"));
+        assert_eq!(Screen::Vk.search_verb(), Some("Search"));
+        assert_eq!(Screen::Vk.details_kind(), InformationPanelKind::Generic);
+        assert_eq!(SearchActivity::Vk.screen(), Screen::Vk);
+        assert_eq!(serde_json::to_value(Screen::Vk).unwrap(), "Vk");
+        assert_eq!(
+            serde_json::from_value::<Screen>(serde_json::json!("Vk")).unwrap(),
+            Screen::Vk
+        );
     }
 
     #[test]

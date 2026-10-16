@@ -36,7 +36,7 @@ IUSE="
 	+commons-upload +funkwhale +generic-ytdlp google-drive gpm gpodder gui +hover +invidious jack +jamendo
 	keyring +lan-sharing +lastfm +librivox +litres +local +local-archives +mpv native +nyan-cat odysee +peertube pipewire
 	podcast-index pulseaudio +qr +radio +rss rumble +rutube s3-upload +soundcloud +soundstream
-	+sponsorblock sqlite ssh +summary telegram test +images torrent +tracker-music +tui +vimeo vk
+	+sponsorblock sqlite ssh +summary telegram test +images torrent +tracker-music +tui +vimeo +vk
 	+url-info +waveform +web-browser webdav +wikidata wikimedia yandex-disk yandex-music +youtube-music
 	+youtube-captions +youtube-official +yt-dlp
 "
@@ -261,6 +261,9 @@ src_compile() {
 		if use funkwhale; then
 			gui_features+=,funkwhale
 		fi
+		if use vk; then
+			gui_features+=,vk
+		fi
 		if use archive-org; then
 			gui_features+=,archive-org
 		fi
@@ -337,6 +340,10 @@ src_test() {
 		if use funkwhale; then
 			[[ -n ${gui_test_features} ]] && gui_test_features+=,
 			gui_test_features+=funkwhale
+		fi
+		if use vk; then
+			[[ -n ${gui_test_features} ]] && gui_test_features+=,
+			gui_test_features+=vk
 		fi
 		if use archive-org; then
 			[[ -n ${gui_test_features} ]] && gui_test_features+=,
