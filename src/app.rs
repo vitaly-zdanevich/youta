@@ -16394,7 +16394,7 @@ impl AppController {
         }
     }
 
-    /// Applies one isolated Local listing only when its route is still current.
+    /// Caches a current Local response without repainting a different active screen.
     fn handle_local_directory_response(
         &mut self,
         generation: u64,
@@ -16430,8 +16430,6 @@ impl AppController {
                     .map(|(_, child)| child);
                 self.local_listing = Some(listing);
                 self.sort_local_listing();
-                self.view.selected = selected;
-                self.select_local_path(reselected_path.as_deref());
                 #[cfg(any(
                     feature = "local-move",
                     feature = "local-copy",
@@ -16453,6 +16451,11 @@ impl AppController {
                         .retain(|marked| visible_paths.contains(marked));
                 }
                 self.hydrate_local_progress_cache();
+                if self.view.screen != Screen::Local {
+                    return;
+                }
+                self.view.selected = selected;
+                self.select_local_path(reselected_path.as_deref());
                 self.refresh_local_browser_rows();
                 self.schedule_local_folder_sizes();
                 self.view.status_line = if truncated {
@@ -16465,6 +16468,9 @@ impl AppController {
             Err(error) => {
                 self.pending_local_reselection = None;
                 self.local_listing = None;
+                if self.view.screen != Screen::Local {
+                    return;
+                }
                 self.view.details = None;
                 self.view.private_note_available = false;
                 self.view.rows.clear();

@@ -3,6 +3,121 @@
 use super::*;
 use std::task::{Wake, Waker};
 
+/// A hidden Local listing must be cached without replacing another screen's details.
+#[cfg(feature = "local-browser")]
+#[test]
+fn local_completion_preserves_active_search_after_success() {
+    assert_late_local_response_preserves_active_screen(true);
+}
+
+/// A failed hidden Local request must not replace another screen with a Local popup.
+#[cfg(feature = "local-browser")]
+#[test]
+fn local_completion_preserves_active_search_after_failure() {
+    assert_late_local_response_preserves_active_screen(false);
+}
+
+/// Holds the Local response until synthetic search results own the shared view again.
+#[cfg(feature = "local-browser")]
+fn assert_late_local_response_preserves_active_screen(success: bool) {
+    let fixture = crate::test_support::canonical_tempdir("held Local response");
+    let (mut app, _) = controller_with_mock_statuses([]);
+    app.shutdown_local_browse_worker();
+    let (requests, captured) = unbounded();
+    let (responses, received) = unbounded();
+    app.local_browse_requests = Some(requests);
+    app.local_browse_responses = received;
+    app.config.ui.show_local_folder_sizes = false;
+    app.view.local_folder_sizes_enabled = false;
+    app.view.local_path = fixture.path().display().to_string();
+    app.show_screen(Screen::Local);
+    let LocalBrowseRequest::Browse {
+        generation,
+        directory,
+        ..
+    } = captured.try_recv().expect("held Local request")
+    else {
+        panic!("expected a Local browse request");
+    };
+    assert_eq!(directory, fixture.path());
+    assert!(app.view.local_browse_pending);
+    app.show_screen(Screen::Search);
+    app.view.search_query = "fixture query".to_owned();
+    app.view.rows = ["First search result", "Second search result"]
+        .into_iter()
+        .map(|title| RowView {
+            title: title.to_owned(),
+            ..RowView::default()
+        })
+        .collect();
+    app.view.details = Some(DetailView {
+        title: "Second search result".to_owned(),
+        description: "Fixture search details".to_owned(),
+        ..DetailView::default()
+    });
+    app.view.status_line = "Fixture search status".to_owned();
+    app.view.selected = 1;
+    let rows = app.view.rows.clone();
+    let details = app.view.details.clone();
+    let status = app.view.status_line.clone();
+    let selected = app.view.selected;
+    let listing = crate::local_browser::LocalDirectoryListing {
+        path: directory.clone(),
+        parent: None,
+        entries: vec![crate::local_browser::LocalEntry {
+            name: "held-local-directory".into(),
+            path: directory.join("held-local-directory"),
+            kind: crate::local_browser::LocalEntryKind::Directory,
+            size_bytes: None,
+            image_dimensions: None,
+            directory_identity: None,
+        }],
+        truncated: false,
+        inspected_entries: 1,
+    };
+    responses
+        .send(LocalBrowseResponse::Browse {
+            generation,
+            result: if success {
+                Ok(listing.clone())
+            } else {
+                Err("Fixture Local failure".to_owned())
+            },
+        })
+        .expect("deliver held Local response");
+    app.drain_local_browse_responses(true);
+    assert_eq!(app.view.screen, Screen::Search);
+    assert_eq!(
+        app.view.rows, rows,
+        "a hidden Local response must not replace active rows"
+    );
+    assert_eq!(
+        app.view.details, details,
+        "a hidden Local response must not replace active details"
+    );
+    assert_eq!(app.view.status_line, status);
+    assert_eq!(app.view.selected, selected);
+    assert!(app.view.error_popup.is_none());
+    assert!(!app.view.local_browse_pending);
+    assert!(captured.is_empty());
+    if success {
+        assert_eq!(app.local_listing.as_ref(), Some(&listing));
+        app.show_screen(Screen::Local);
+        assert!(
+            app.view
+                .rows
+                .iter()
+                .any(|row| row.title == "held-local-directory")
+        );
+        assert!(
+            captured.is_empty(),
+            "returning to a cached Local listing must not browse again"
+        );
+    } else {
+        assert!(app.local_listing.is_none());
+    }
+}
+
 /// Drains immediately when woken, exposing a notification sent before its data.
 struct ResponseProbe {
     responses: Receiver<LocalBrowseResponse>,
