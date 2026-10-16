@@ -1389,7 +1389,7 @@ fn source_search_page_capacities(
     };
     SearchPageCapacities {
         with_heading: capacity(true),
-        without_heading: capacity(false),
+        without_heading: capacity(vk_search_mode_control_fits(list, screen)),
     }
 }
 
@@ -3738,8 +3738,14 @@ fn render_body(
 
     let panes = main_body_panes(area);
 
-    let search_title = search_panel_title(view);
-    let (list_area, controls) = main_list_pane_areas(panes[0], view.screen);
+    let mut search_title = search_panel_title(view);
+    let (mut list_area, controls) = main_list_pane_areas(panes[0], view.screen);
+    if let Some(content) =
+        render_vk_search_mode_heading(frame, list_area, view, show_hotkeys, theme, hit_map)
+    {
+        list_area = content;
+        search_title.clear();
+    }
     let show_empty_prompt = empty_search_prompt_visible(view);
     if show_empty_prompt && !area.is_empty() {
         hit_map.rows =
@@ -3818,6 +3824,52 @@ fn render_body(
             );
         }
     }
+}
+
+/// Uses the longest mode label so both modes and hidden-hotkey layouts reserve identical rows.
+fn vk_search_mode_control_fits(area: Rect, screen: Screen) -> bool {
+    cfg!(feature = "vk") && screen == Screen::Vk && area.height > 0 && area.width >= 10
+}
+
+/// Renders the query and independent VK mode control in disjoint parts of one heading row.
+///
+/// Returns `None` when the control would crowd an active editor, allowing the caller
+/// to retain its ordinary full-width heading and unchanged result-row budget.
+fn render_vk_search_mode_heading(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    view: &ViewModel,
+    show_hotkeys: bool,
+    theme: &Theme,
+    hit_map: &mut HitMap,
+) -> Option<Rect> {
+    if !vk_search_mode_control_fits(area, view.screen) {
+        return None;
+    }
+    let title = search_panel_title(view);
+    let label = button("v", view.vk_search_kind.title_label(), show_hotkeys);
+    let width = terminal_text_width(&label);
+    let query_width = area.width.saturating_sub(width + 1);
+    if view.search_editing && terminal_text_width(title.trim()) > query_width {
+        return None;
+    }
+    let control = Rect::new(area.right() - width, area.y, width, 1);
+    let query = Rect::new(area.x, area.y, query_width, 1);
+    frame.render_widget(Paragraph::new(title.trim()).style(theme.heading), query);
+    frame.render_widget(
+        Paragraph::new(label).style(if view.search_editing {
+            theme.muted
+        } else {
+            theme.accent
+        }),
+        control,
+    );
+    if !view.search_editing {
+        hit_map
+            .detail_buttons
+            .push((UiAction::CycleVkSearchKind, control));
+    }
+    Some(main_panel_content_area(area, true))
 }
 
 /// Shares playback toggles, YT Shorts visibility, and parent navigation below catalogue lists.
@@ -9139,6 +9191,8 @@ fn centered_line_x(area: Rect, line_width: u16) -> u16 {
 fn search_kind_help(view: &ViewModel) -> &'static str {
     if view.screen == Screen::YandexMusic {
         "  v all/music/podcasts/audiobooks search"
+    } else if cfg!(feature = "vk") && view.screen == Screen::Vk {
+        "  VK: v tracks/albums search   Enter open/play   Esc back"
     } else if view.screen == Screen::ArchiveOrg {
         "  archive.org: / search   Enter open/play   d download   F6 comments   Esc back"
     } else if view.screen == Screen::Web {
@@ -19289,6 +19343,167 @@ for encoded, expected in json.load(sys.stdin):
         }
     }
 
+    /// VK keeps a compact mode control without reintroducing an empty query placeholder.
+    #[cfg(feature = "vk")]
+    #[test]
+    fn vk_search_mode_control_is_visible_clickable_and_respects_heading_geometry() {
+        for kind in [VkSearchKind::Tracks, VkSearchKind::Albums] {
+            for query in ["", "fixture query"] {
+                for editing in [false, true] {
+                    let view = ViewModel {
+                        screen: Screen::Vk,
+                        vk_search_kind: kind,
+                        search_query: query.to_owned(),
+                        search_editing: editing,
+                        search_cursor_byte: query.len(),
+                        ..ViewModel::default()
+                    };
+                    let area = Rect::new(0, 0, 120, 24);
+                    let mut terminal =
+                        Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+                    let mut hits = HitMap::default();
+                    terminal
+                        .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hits))
+                        .unwrap();
+                    let body = main_frame_sections(area, &view)[1];
+                    let (list, _) = main_list_pane_areas(main_body_panes(body)[0], Screen::Vk);
+                    let control = format!("[v] {}", kind.title_label());
+                    let x = list.right() - control.len() as u16;
+                    let label = (x..list.right())
+                        .map(|column| terminal.backend().buffer()[(column, list.y)].symbol())
+                        .collect::<String>();
+                    assert_eq!(label, control, "query={query:?}, editing={editing}");
+                    assert_eq!(hits.rows.y, list.y + 1);
+                    assert_eq!(
+                        hits.detail_buttons
+                            .iter()
+                            .filter(|(action, _)| *action == UiAction::CycleVkSearchKind)
+                            .count(),
+                        usize::from(!editing)
+                    );
+                    if !editing {
+                        assert_eq!(
+                            mouse_action(
+                                MouseEvent {
+                                    kind: MouseEventKind::Down(MouseButton::Left),
+                                    column: x,
+                                    row: list.y,
+                                    modifiers: KeyModifiers::NONE,
+                                },
+                                &hits,
+                                &view
+                            ),
+                            Some(UiAction::CycleVkSearchKind)
+                        );
+                    }
+                    let capacities = source_search_page_capacities(area, &view, Screen::Vk);
+                    assert_eq!(capacities.with_heading, capacities.without_heading);
+                    if query.is_empty() && !editing {
+                        assert_eq!(search_panel_title(&view), "");
+                        assert!(rendered_text(&terminal).contains("To search, press /"));
+                    }
+                }
+            }
+        }
+    }
+
+    /// A mode control that cannot fit must not consume a blank row on a tiny terminal.
+    #[cfg(feature = "vk")]
+    #[test]
+    fn vk_search_mode_control_preserves_tiny_terminal_rows() {
+        let view = ViewModel {
+            screen: Screen::Vk,
+            ..ViewModel::default()
+        };
+        let area = Rect::new(0, 0, 9, 24);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        let mut hits = HitMap::default();
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hits))
+            .unwrap();
+        let body = main_frame_sections(area, &view)[1];
+        assert_eq!(hits.rows.y, main_body_panes(body)[0].y);
+        assert!(
+            !hits
+                .detail_buttons
+                .iter()
+                .any(|(action, _)| *action == UiAction::CycleVkSearchKind)
+        );
+        let capacities = source_search_page_capacities(area, &view, Screen::Vk);
+        assert_eq!(capacities.with_heading + 1, capacities.without_heading);
+    }
+
+    /// The disabled mode selector must not hide a query caret that fits in the full heading.
+    #[cfg(feature = "vk")]
+    #[test]
+    fn vk_search_editor_keeps_its_caret_when_the_mode_control_would_crowd_it() {
+        for (width, query) in [(18, ""), (24, "abcdefgh"), (24, "世界abcdef")] {
+            let view = ViewModel {
+                screen: Screen::Vk,
+                search_editing: true,
+                search_query: query.to_owned(),
+                search_cursor_byte: query.len(),
+                ..ViewModel::default()
+            };
+            let area = Rect::new(0, 0, width, 24);
+            let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+            let mut hits = HitMap::default();
+            terminal
+                .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hits))
+                .unwrap();
+            let body = main_frame_sections(area, &view)[1];
+            let (list, _) = main_list_pane_areas(main_body_panes(body)[0], Screen::Vk);
+            let heading = search_panel_title(&view);
+            let caret_column = terminal_text_width(heading.trim()) - 1;
+            assert_eq!(
+                terminal.backend().buffer()[(list.x + caret_column, list.y)].symbol(),
+                "|",
+                "width={width}, query={query:?}"
+            );
+            let line = (list.x..list.right())
+                .map(|column| terminal.backend().buffer()[(column, list.y)].symbol())
+                .collect::<String>();
+            assert!(
+                !line.contains("[v]"),
+                "the inactive mode control must yield its space: {line}"
+            );
+            assert_eq!(hits.rows, main_panel_content_area(list, true));
+            let capacities = source_search_page_capacities(area, &view, Screen::Vk);
+            assert_eq!(usize::from(hits.rows.height), capacities.with_heading + 1);
+            assert_eq!(capacities.with_heading, capacities.without_heading);
+        }
+    }
+
+    /// Long queries clip before the right-aligned mode without sharing cells or click targets.
+    #[cfg(feature = "vk")]
+    #[test]
+    fn vk_search_mode_control_does_not_overlap_a_narrow_query() {
+        let view = ViewModel {
+            screen: Screen::Vk,
+            vk_search_kind: VkSearchKind::Albums,
+            search_query: "abcdefghijklmnopqrstuvwxyz".to_owned(),
+            ..ViewModel::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(24, 24)).unwrap();
+        let mut hits = HitMap::default();
+        terminal
+            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hits))
+            .unwrap();
+        let body = main_frame_sections(Rect::new(0, 0, 24, 24), &view)[1];
+        let line = (0..24)
+            .map(|column| terminal.backend().buffer()[(column, body.y)].symbol())
+            .collect::<String>();
+        assert_eq!(line, "abcdefghijklm [v] Albums");
+        assert_eq!(
+            hits.detail_buttons
+                .iter()
+                .find(|(action, _)| *action == UiAction::CycleVkSearchKind)
+                .unwrap()
+                .1,
+            Rect::new(14, body.y, 10, 1)
+        );
+    }
+
     /// Real work, selection and source-specific browsing must not be covered by empty guidance.
     #[test]
     fn empty_search_prompt_preserves_loading_details_errors_and_browse_routes() {
@@ -23039,7 +23254,11 @@ for encoded, expected in json.load(sys.stdin):
                     capacities,
                     SearchPageCapacities {
                         with_heading: 17,
-                        without_heading: 18
+                        without_heading: if cfg!(feature = "vk") && screen == Screen::Vk {
+                            17
+                        } else {
+                            18
+                        }
                     }
                 );
                 for own_query in ["", "submitted fixture"] {

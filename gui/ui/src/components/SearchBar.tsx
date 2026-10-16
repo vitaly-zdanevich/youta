@@ -86,8 +86,13 @@ export function SearchBar({
 		? { Recommendations: 'My Wave', Album: 'Album', Artist: 'Artist', Search: '' }[view.yandex_music_route]
 		: '';
 	const compactSearch = !editorVisible && ((view.rows?.length ?? 0) > 0 || view.details != null);
-	const hasControls = web || view.screen === 'Search' || view.screen === 'Funkwhale' || backAvailable || compactSearch;
+	const hasControls = web || view.screen === 'Search' || view.screen === 'Funkwhale' || view.screen === 'Vk' || backAvailable || compactSearch;
 	if (!editorVisible && !hasControls && !loading && !routeLabel) return null;
+	/** Mode activation consumes button keys before the window's playback shortcuts. */
+	const cycleVkMode = (event: MouseEvent<HTMLButtonElement> | KeyboardEvent<HTMLButtonElement>) => {
+		event.currentTarget.blur();
+		void dispatch('CycleVkSearchKind');
+	};
 
   return (
     <div
@@ -129,6 +134,21 @@ export function SearchBar({
         )}
       </div></> : routeLabel ? <span className='flex-1 text-[13px] text-ink-dim'>{routeLabel}</span> : null}
 		{compactSearch ? <SearchButton className='shrink-0 rounded-[5px] px-[8px] py-[3px] text-[11px] text-accent focus-visible:outline-2 focus-visible:outline-accent'>Search</SearchButton> : null}
+		{/* This is a saved search preference, not the kind of an open album's child rows. */}
+		{view.screen === 'Vk' ? (
+			<button type='button' disabled={view.search_editing}
+				aria-label={`VK search mode: ${view.vk_search_kind}`}
+				onClick={cycleVkMode}
+				onKeyDown={(event) => {
+					if (event.ctrlKey || event.altKey || event.metaKey || (event.key !== 'Enter' && event.key !== ' ')) return;
+					event.preventDefault();
+					event.stopPropagation();
+					if (!event.repeat) cycleVkMode(event);
+				}}
+				className='ml-auto shrink-0 rounded-[5px] px-[8px] py-[3px] text-[11px] whitespace-nowrap text-accent disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent'>
+				[v] {view.vk_search_kind}
+			</button>
+		) : null}
 		{/* Search and Subscriptions share the same saved Shorts preference. */}
 		{view.screen === 'Funkwhale' ? (
 			<button type='button' disabled={view.search_editing}

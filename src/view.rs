@@ -44,6 +44,7 @@ use crate::config::{
     ArchiveDownloadPreference, ArchivePlaybackPreference, BandcampAudioFormat, DownloadMode,
     SubscriptionsLayout, VideoSummaryBackend, YouTubeThumbnailSize,
 };
+pub use crate::domain::VkSearchKind;
 use crate::domain::{Chapter, MediaId, MediaKind, SourceKind};
 #[cfg(feature = "evernote")]
 use crate::evernote::EvernoteNoteDraft;
@@ -3468,6 +3469,8 @@ pub struct ViewModel {
     pub youtube_creative_commons_only: bool,
     /// Exact category queried by the Yandex Music tab.
     pub yandex_music_search_kind: YandexMusicSearchKind,
+    /// Saved VK catalogue search mode, including while browsing an album's tracks.
+    pub vk_search_kind: VkSearchKind,
     /// Active recommendations, search, or album route in the Yandex Music tab.
     pub yandex_music_route: YandexMusicRouteView,
     /// Submitted provider search that has not reached a terminal response.
@@ -4241,6 +4244,7 @@ impl Default for ViewModel {
             youtube_search_sort: YouTubeSearchSort::Relevance,
             youtube_creative_commons_only: false,
             yandex_music_search_kind: YandexMusicSearchKind::All,
+            vk_search_kind: VkSearchKind::Tracks,
             yandex_music_route: YandexMusicRouteView::Recommendations,
             search_activity: None,
             local_browse_pending: false,
@@ -4527,6 +4531,8 @@ pub enum UiAction {
     ToggleYouTubeCreativeCommons,
     /// Cycle Yandex Music search through music, podcasts, and audiobooks.
     CycleYandexMusicSearchKind,
+    /// Switch VK catalogue search between tracks and albums.
+    CycleVkSearchKind,
     /// Toggle the selected Yandex Music track's liked state.
     ToggleYandexMusicLike,
     /// Toggle the selected Yandex Music track's disliked state.

@@ -5,10 +5,13 @@
 //! by one source-specific worker lane and are never delegated to yt-dlp.
 
 use super::*;
+#[cfg(feature = "vk")]
+use crate::domain::VkSearchKind;
 
 #[cfg(feature = "vk")]
 use crate::providers::vk::{
-    VkAudioId, VkClient, VkPage, VkPageCursor, VkPlaybackUrl, VkQuery, VkTrack,
+    VkAlbum, VkAlbumPage, VkAudioId, VkClient, VkPage, VkPageCursor, VkPlaybackUrl, VkQuery,
+    VkTrack,
 };
 
 /// Keeps navigation independent even when the source is omitted from a build.
@@ -16,6 +19,11 @@ use crate::providers::vk::{
 pub(super) struct VkState {
     pub(super) query: String,
     pub(super) selected: usize,
+    /// Displayed content can be tracks while the search selector remains Albums.
+    #[cfg(feature = "vk")]
+    results_kind: VkSearchKind,
+    #[cfg(feature = "vk")]
+    albums: Vec<VkAlbum>,
     #[cfg(feature = "vk")]
     items: Vec<VkTrack>,
     #[cfg(feature = "vk")]
@@ -58,6 +66,9 @@ pub(super) struct VkState {
     cookie_generation: u64,
     #[cfg(feature = "vk")]
     restore: bool,
+    /// Survives rendering the empty startup list until the restored first page arrives.
+    #[cfg(feature = "vk")]
+    restore_selected: Option<usize>,
     #[cfg(feature = "vk")]
     page_turn: Option<usize>,
     #[cfg(feature = "vk")]
@@ -99,6 +110,11 @@ impl VkState {
             selected: saved.vk_selected_row.unwrap_or_default(),
             #[cfg(feature = "vk")]
             restore: !saved.vk_search_text.trim().is_empty(),
+            #[cfg(feature = "vk")]
+            restore_selected: (!saved.vk_search_text.trim().is_empty())
+                .then_some(saved.vk_selected_row.unwrap_or_default()),
+            #[cfg(feature = "vk")]
+            results_kind: saved.vk_search_kind,
             ..Self::default()
         }
     }
@@ -125,6 +141,7 @@ pub(super) struct VkExportOwner {
 struct SearchJob {
     generation: u64,
     query: crate::providers::vk::VkQuery,
+    kind: VkSearchKind,
     cursor: Option<VkPageCursor>,
 }
 
@@ -136,13 +153,23 @@ enum BrowseKind {
     Artist,
 }
 
-/// Exact scoped provider track retained while a catalogue request is queued.
+/// Exact scoped provider result retained while a catalogue request is queued.
 #[cfg(feature = "vk")]
 #[derive(Clone)]
 struct BrowseJob {
     generation: u64,
-    track: Box<VkTrack>,
-    kind: BrowseKind,
+    source: BrowseSource,
+}
+
+/// Album search results and track metadata retain their own provider request references.
+#[cfg(feature = "vk")]
+#[derive(Clone)]
+enum BrowseSource {
+    Track {
+        track: Box<VkTrack>,
+        kind: BrowseKind,
+    },
+    Album(Box<VkAlbum>),
 }
 
 /// Bounded, process-local return location for artist/album browsing.
@@ -186,6 +213,7 @@ enum Job {
 #[cfg(feature = "vk")]
 enum Reply {
     Page(VkPage),
+    Albums(VkAlbumPage),
     Playback(Box<VkTrack>, VkPlaybackUrl),
     Album(Option<String>),
 }
@@ -211,6 +239,9 @@ struct Worker {
 #[cfg(feature = "vk")]
 #[derive(Clone)]
 pub(super) struct VkNavigationSnapshot {
+    search_kind: VkSearchKind,
+    results_kind: VkSearchKind,
+    albums: Vec<VkAlbum>,
     items: Vec<VkTrack>,
     next: Option<VkPageCursor>,
     route: Option<(String, String)>,
@@ -267,7 +298,16 @@ impl AppController {
             } else if let Some(error) = self.current_vk_search_error() {
                 error.to_owned()
             } else {
-                format!("{} VK tracks · / Search · Enter Play", self.vk.items.len())
+                format!(
+                    "{} VK {} · / Search · v Tracks/Albums · Enter {}",
+                    self.vk_result_count(),
+                    self.vk.results_kind.label(),
+                    if self.vk.results_kind == VkSearchKind::Albums {
+                        "Open"
+                    } else {
+                        "Play"
+                    },
+                )
             };
             if self.vk.pending_search.is_some()
                 || self.vk.pending_browse.is_some()
@@ -275,7 +315,11 @@ impl AppController {
                     .vk
                     .worker
                     .as_ref()
-                    .is_some_and(|worker| matches!(worker.job, Job::Search(_) | Job::Browse(_)))
+                    .is_some_and(|worker| match &worker.job {
+                        Job::Search(job) => job.generation == self.vk.generation,
+                        Job::Browse(job) => job.generation == self.vk.generation,
+                        Job::Playback(_) | Job::Album(_) => false,
+                    })
             {
                 self.begin_search_activity(SearchActivity::Vk);
             }
@@ -300,25 +344,55 @@ impl AppController {
             {
                 self.vk.page_turn = None;
             }
-            self.view.details = self
-                .vk
-                .items
-                .get(self.view.selected)
-                .map(|track| DetailView {
-                    media_id: Some(media_id(track.id)),
-                    title: track.title.clone(),
-                    channel_name: track.artist.clone(),
-                    channel_webpage_url: track.artist_webpage_url(),
-                    source: "VK".to_owned(),
-                    webpage_url: Some(track.id.webpage_url()),
-                    length: track
-                        .duration_seconds
-                        .map_or_else(String::new, format_seconds),
-                    thumbnail_url: track.artwork_url.clone(),
-                    thumbnail_dimensions: track.artwork_dimensions,
-                    links: track_links(track),
-                    ..DetailView::default()
-                });
+            self.view.details = if self.vk.results_kind == VkSearchKind::Albums {
+                self.vk.albums.get(self.view.selected).map(|album| {
+                    let url = album.webpage_url();
+                    let mut description = Vec::new();
+                    if let Some(year) = album.year {
+                        description.push(year.to_string());
+                    }
+                    if let Some(count) = album.track_count {
+                        description.push(format!(
+                            "{count} track{}",
+                            if count == 1 { "" } else { "s" }
+                        ));
+                    }
+                    DetailView {
+                        title: album.title.clone(),
+                        channel_name: album.artist.clone(),
+                        source: "VK".to_owned(),
+                        webpage_url: Some(url.clone()),
+                        description: description.join(" · "),
+                        thumbnail_url: album.artwork_url.clone(),
+                        thumbnail_dimensions: album.artwork_dimensions,
+                        links: vec![DetailLinkView {
+                            url: url.to_string(),
+                            presentation: DetailLinkPresentation::UrlOnly,
+                            ..DetailLinkView::default()
+                        }],
+                        ..DetailView::default()
+                    }
+                })
+            } else {
+                self.vk
+                    .items
+                    .get(self.view.selected)
+                    .map(|track| DetailView {
+                        media_id: Some(media_id(track.id)),
+                        title: track.title.clone(),
+                        channel_name: track.artist.clone(),
+                        channel_webpage_url: track.artist_webpage_url(),
+                        source: "VK".to_owned(),
+                        webpage_url: Some(track.id.webpage_url()),
+                        length: track
+                            .duration_seconds
+                            .map_or_else(String::new, format_seconds),
+                        thumbnail_url: track.artwork_url.clone(),
+                        thumbnail_dimensions: track.artwork_dimensions,
+                        links: track_links(track),
+                        ..DetailView::default()
+                    })
+            };
             if self.view.details.is_none() && self.config.providers.vk_cookies_file.is_none() {
                 self.view.details = Some(Self::vk_setup_details());
             } else if self.view.details.is_none()
@@ -347,6 +421,7 @@ impl AppController {
         #[cfg(feature = "vk")]
         {
             self.vk.restore = false;
+            self.vk.restore_selected = None;
             let parsed = match crate::providers::vk::parse_query(&query) {
                 Ok(parsed) => parsed,
                 Err(error) => {
@@ -354,25 +429,35 @@ impl AppController {
                     return;
                 }
             };
+            // Explicit profile/audio identities retain their established track-browsing meaning.
+            let kind = if matches!(parsed, VkQuery::Search(_)) {
+                self.view.vk_search_kind
+            } else {
+                VkSearchKind::Tracks
+            };
+            self.view.vk_search_kind = kind;
             self.vk.pending_browse = None;
             self.vk.route = None;
             self.vk.back.clear();
             self.vk.query = query;
             self.vk.search_error = None;
+            self.vk.results_kind = kind;
+            self.refresh_vk_cookie_owner();
             if self.config.providers.vk_cookies_file.is_none() {
                 self.populate_vk();
                 return;
             }
-            self.refresh_vk_cookie_owner();
             self.vk.generation = self.vk.generation.wrapping_add(1);
             self.vk.selected = 0;
             self.vk.album_attempted.clear();
             self.vk.items.clear();
+            self.vk.albums.clear();
             self.vk.next = None;
             self.vk.page_turn = None;
             self.vk.pending_search = Some(SearchJob {
                 generation: self.vk.generation,
                 query: parsed,
+                kind,
                 cursor: None,
             });
             self.view.selected = 0;
@@ -385,6 +470,89 @@ impl AppController {
         {
             let _ = query;
             self.populate_vk();
+        }
+    }
+
+    /// Changes only the VK search category and reuses its existing explicit worker lane.
+    pub(super) fn cycle_vk_search_kind(&mut self) {
+        if self.view.screen != Screen::Vk {
+            return;
+        }
+        #[cfg(feature = "vk")]
+        {
+            let query = self.view.search_query.clone();
+            if !query.trim().is_empty() {
+                if let Err(error) = crate::providers::vk::parse_query(&query) {
+                    self.view.status_line = error.to_string();
+                    return;
+                }
+                self.view.vk_search_kind = self.view.vk_search_kind.next();
+                self.submit_vk_search(query);
+            } else {
+                self.view.vk_search_kind = self.view.vk_search_kind.next();
+                self.vk.generation = self.vk.generation.wrapping_add(1);
+                self.vk.results_kind = self.view.vk_search_kind;
+                self.vk.items.clear();
+                self.vk.albums.clear();
+                self.vk.next = None;
+                self.vk.pending_search = None;
+                self.vk.pending_browse = None;
+                self.vk.route = None;
+                self.vk.back.clear();
+                self.vk.restore = false;
+                self.vk.restore_selected = None;
+                self.vk.page_turn = None;
+                self.vk.search_error = None;
+                self.vk.selected = 0;
+                self.vk.query.clear();
+                self.finish_search_activity(SearchActivity::Vk);
+                self.populate_vk();
+            }
+            self.refresh_selected_playlist_state();
+        }
+        #[cfg(not(feature = "vk"))]
+        self.populate_vk();
+    }
+
+    /// Returns only a canonical public page for the selected track or album.
+    pub(super) fn selected_vk_public_url(&self) -> Option<String> {
+        #[cfg(feature = "vk")]
+        {
+            if self.vk.results_kind == VkSearchKind::Albums {
+                return self
+                    .vk
+                    .albums
+                    .get(self.view.selected)
+                    .map(|album| album.webpage_url().to_string());
+            }
+            self.selected_vk_queue_item()
+                .ok()
+                .map(|item| item.media.webpage_url.to_string())
+        }
+        #[cfg(not(feature = "vk"))]
+        None
+    }
+
+    /// Saves the root search row, since private nested catalogue references are process-local.
+    pub(super) fn vk_session_selection(&self) -> usize {
+        #[cfg(feature = "vk")]
+        {
+            if let Some(parent) = self.vk.back.front() {
+                return parent.selected;
+            }
+            if let Some(selected) = self.vk.restore_selected {
+                return selected;
+            }
+        }
+        self.vk.selected
+    }
+
+    /// Counts the current catalogue kind without conflating album rows with playable tracks.
+    #[cfg(feature = "vk")]
+    fn vk_result_count(&self) -> usize {
+        match self.vk.results_kind {
+            VkSearchKind::Tracks => self.vk.items.len(),
+            VkSearchKind::Albums => self.vk.albums.len(),
         }
     }
 
@@ -409,6 +577,9 @@ impl AppController {
             }
             self.vk.cookie_generation = self.vk.cookie_generation.wrapping_add(1);
             self.vk.search_error = None;
+            if !self.vk.restore {
+                self.vk.restore_selected = None;
+            }
             self.vk.retained.clear();
             self.vk.album_attempted.clear();
             self.vk.generation = self.vk.generation.wrapping_add(1);
@@ -417,6 +588,7 @@ impl AppController {
             self.vk.route = None;
             self.vk.back.clear();
             self.vk.items.clear();
+            self.vk.albums.clear();
             self.vk.next = None;
             self.cancel_vk_playback();
         }
@@ -426,7 +598,7 @@ impl AppController {
     pub(super) fn activate_vk_selection(&mut self) {
         #[cfg(feature = "vk")]
         {
-            if self.view.selected == self.vk.items.len() {
+            if self.view.selected == self.vk_result_count() {
                 if self.vk.pending_search.is_none()
                     && self.vk.pending_browse.is_none()
                     && self
@@ -440,11 +612,16 @@ impl AppController {
                     self.vk.pending_search = Some(SearchJob {
                         generation: self.vk.generation,
                         query: VkQuery::Search(self.vk.query.clone()),
+                        kind: self.vk.results_kind,
                         cursor: Some(cursor),
                     });
                     self.begin_search_activity(SearchActivity::Vk);
                     self.poll_vk_worker();
                 }
+                return;
+            }
+            if self.vk.results_kind == VkSearchKind::Albums {
+                self.open_selected_vk_album();
                 return;
             }
             match self.selected_vk_queue_item() {
@@ -458,6 +635,9 @@ impl AppController {
     pub(super) fn selected_vk_queue_item(&self) -> Result<QueueItem, String> {
         #[cfg(feature = "vk")]
         {
+            if self.vk.results_kind != VkSearchKind::Tracks {
+                return Err("Open a VK album and select a track".to_owned());
+            }
             self.vk
                 .items
                 .get(self.view.selected)
@@ -487,7 +667,10 @@ impl AppController {
     /// Captures a bounded parent page before starting explicit native catalogue work.
     #[cfg(feature = "vk")]
     fn browse_vk_catalogue(&mut self, url: String, kind: BrowseKind) {
-        if self.view.screen != Screen::Vk || self.config.providers.vk_cookies_file.is_none() {
+        if self.view.screen != Screen::Vk
+            || self.config.providers.vk_cookies_file.is_none()
+            || self.vk.results_kind != VkSearchKind::Tracks
+        {
             return;
         }
         self.refresh_vk_cookie_owner();
@@ -512,11 +695,44 @@ impl AppController {
         {
             return;
         }
+        self.begin_vk_browse(
+            BrowseSource::Track {
+                track: Box::new(track),
+                kind,
+            },
+            url,
+            title,
+        );
+    }
+
+    /// Opens the exact selected album result using its private provider-owned reference.
+    #[cfg(feature = "vk")]
+    fn open_selected_vk_album(&mut self) {
+        if self.view.screen != Screen::Vk || self.config.providers.vk_cookies_file.is_none() {
+            return;
+        }
+        self.refresh_vk_cookie_owner();
+        let Some(album) = self.vk.albums.get(self.view.selected).cloned() else {
+            return;
+        };
+        let url = album.webpage_url().to_string();
+        let title = album.title.clone();
+        self.begin_vk_browse(BrowseSource::Album(Box::new(album)), url, title);
+    }
+
+    /// Moves a parent into bounded history, retaining the root search and seven recent parents.
+    ///
+    /// The root owns the restart-safe search selection even after intermediate pages expire.
+    #[cfg(feature = "vk")]
+    fn begin_vk_browse(&mut self, source: BrowseSource, url: String, title: String) {
         if self.vk.back.len() == 8 {
-            self.vk.back.pop_front();
+            self.vk.back.remove(1);
         }
         self.vk.back.push_back(BrowseReturn {
             page: VkNavigationSnapshot {
+                search_kind: self.view.vk_search_kind,
+                results_kind: self.vk.results_kind,
+                albums: std::mem::take(&mut self.vk.albums),
                 items: std::mem::take(&mut self.vk.items),
                 next: self.vk.next.take(),
                 route: self.vk.route.take(),
@@ -526,19 +742,21 @@ impl AppController {
             selected: self.view.selected,
         });
         self.vk.generation = self.vk.generation.wrapping_add(1);
+        self.vk.results_kind = VkSearchKind::Tracks;
         self.vk.pending_search = None;
         self.vk.restore = false;
+        self.vk.restore_selected = None;
         self.vk.page_turn = None;
         self.vk.album_attempted.clear();
         self.vk.route = Some((url, title));
         self.vk.selected = 0;
         self.vk.pending_browse = Some(BrowseJob {
             generation: self.vk.generation,
-            track: Box::new(track),
-            kind,
+            source,
         });
         self.view.selected = 0;
         self.populate_vk();
+        self.refresh_selected_playlist_state();
         self.begin_search_activity(SearchActivity::Vk);
         "Loading VK tracks...".clone_into(&mut self.view.status_line);
         if !self.diagnostic_only {
@@ -563,36 +781,51 @@ impl AppController {
         self.view.selected_detail_link = None;
         self.finish_search_activity(SearchActivity::Vk);
         self.populate_vk();
+        self.refresh_selected_playlist_state();
         true
     }
 
     /// Shares the existing compact progress-row projection with other music sources.
     #[cfg(feature = "vk")]
     fn refresh_vk_rows(&mut self) {
-        self.view.rows = self
-            .vk
-            .items
-            .iter()
-            .map(|track| {
-                let id = media_id(track.id);
-                let progress = self.store.progress(&id).ok().flatten();
-                let playback = PlaybackRowState::from_progress(progress.as_ref());
-                RowView {
-                    media_id: Some(id),
-                    title: track.title.clone(),
-                    subtitle: track.artist.clone(),
+        self.view.rows = if self.vk.results_kind == VkSearchKind::Albums {
+            self.vk
+                .albums
+                .iter()
+                .map(|album| RowView {
+                    title: album.title.clone(),
+                    subtitle: album.artist.clone(),
                     source: "VK".to_owned(),
-                    thumbnail_url: track.artwork_url.clone(),
-                    watched_percent: playback.watched_percent,
-                    playback_started: playback.playback_started,
+                    thumbnail_url: album.artwork_url.clone(),
                     compact: true,
                     ..RowView::default()
-                }
-            })
-            .collect();
+                })
+                .collect()
+        } else {
+            self.vk
+                .items
+                .iter()
+                .map(|track| {
+                    let id = media_id(track.id);
+                    let progress = self.store.progress(&id).ok().flatten();
+                    let playback = PlaybackRowState::from_progress(progress.as_ref());
+                    RowView {
+                        media_id: Some(id),
+                        title: track.title.clone(),
+                        subtitle: track.artist.clone(),
+                        source: "VK".to_owned(),
+                        thumbnail_url: track.artwork_url.clone(),
+                        watched_percent: playback.watched_percent,
+                        playback_started: playback.playback_started,
+                        compact: true,
+                        ..RowView::default()
+                    }
+                })
+                .collect()
+        };
         if self.vk.next.is_some() {
             self.view.rows.push(RowView {
-                title: "Load more tracks...".to_owned(),
+                title: format!("Load more {}...", self.vk.results_kind.label()),
                 compact: true,
                 ..RowView::default()
             });
@@ -610,6 +843,8 @@ impl AppController {
         match result {
             Ok(page) => {
                 self.vk.search_error = None;
+                self.vk.results_kind = VkSearchKind::Tracks;
+                self.vk.albums.clear();
                 if !append {
                     self.vk.items.clear();
                 }
@@ -626,6 +861,9 @@ impl AppController {
                 self.vk.next = (self.vk.items.len() > previous && self.vk.items.len() < 1_000)
                     .then_some(page.next)
                     .flatten();
+                if let Some(selected) = self.vk.restore_selected.take() {
+                    self.vk.selected = selected;
+                }
                 if self
                     .vk
                     .page_turn
@@ -659,6 +897,76 @@ impl AppController {
                     self.view.status_line = message;
                 }
             }
+        }
+    }
+
+    /// Publishes bounded album results only to their current navigation and imported session.
+    #[cfg(feature = "vk")]
+    fn apply_vk_album_page(
+        &mut self,
+        generation: u64,
+        append: bool,
+        result: Result<VkAlbumPage, String>,
+    ) {
+        if generation != self.vk.generation {
+            return;
+        }
+        let page = match result {
+            Ok(page) => page,
+            Err(error) => {
+                self.apply_vk_page(generation, append, Err(error));
+                return;
+            }
+        };
+        self.finish_search_activity(SearchActivity::Vk);
+        self.vk.search_error = None;
+        self.vk.results_kind = VkSearchKind::Albums;
+        self.vk.items.clear();
+        if !append {
+            self.vk.albums.clear();
+        }
+        let previous = self.vk.albums.len();
+        for album in page.albums {
+            if self.vk.albums.len() >= 1_000 {
+                break;
+            }
+            if !self
+                .vk
+                .albums
+                .iter()
+                .any(|old| old.webpage_url() == album.webpage_url())
+            {
+                self.vk.albums.push(album);
+            }
+        }
+        self.vk.next = (self.vk.albums.len() > previous && self.vk.albums.len() < 1_000)
+            .then_some(page.next)
+            .flatten();
+        if let Some(selected) = self.vk.restore_selected.take() {
+            self.vk.selected = selected;
+        }
+        if self
+            .vk
+            .page_turn
+            .take()
+            .is_some_and(|row| self.view.screen == Screen::Vk && self.view.selected == row)
+            && self.vk.albums.len() > previous
+        {
+            let viewport = self
+                .vk
+                .capacity
+                .map_or(50, |capacity| capacity.for_query(&self.vk.query));
+            self.vk.selected = if self.vk.albums.len() - previous > viewport {
+                previous.saturating_add(viewport.saturating_sub(1))
+            } else if self.vk.next.is_some() {
+                self.vk.albums.len()
+            } else {
+                self.vk.albums.len().saturating_sub(1)
+            };
+        }
+        if self.view.screen == Screen::Vk {
+            self.populate_vk();
+            self.refresh_selected_playlist_state();
         }
     }
 
@@ -772,12 +1080,14 @@ impl AppController {
             }
             if !self.config.persistence.save_playback_history {
                 self.vk.restore = false;
+                self.vk.restore_selected = None;
             }
             if self.view.screen == Screen::Vk && self.vk.restore && !self.view.search_editing {
                 self.vk.restore = false;
-                let selected = self.vk.selected;
+                let selected = self.vk.restore_selected.take().unwrap_or(self.vk.selected);
                 self.submit_vk_search(self.vk.query.clone());
                 self.vk.selected = selected;
+                self.vk.restore_selected = Some(selected);
                 return;
             }
             let completed =
@@ -808,12 +1118,21 @@ impl AppController {
                     }
                     self.vk.client = completion.client;
                     match worker.job {
+                        Job::Search(job) if job.kind == VkSearchKind::Albums => self
+                            .apply_vk_album_page(
+                                job.generation,
+                                job.cursor.is_some(),
+                                completion.result.and_then(|reply| match reply {
+                                    Reply::Albums(page) => Ok(page),
+                                    _ => Err("VK worker returned the wrong response".to_owned()),
+                                }),
+                            ),
                         Job::Search(job) => self.apply_vk_page(
                             job.generation,
                             job.cursor.is_some(),
                             completion.result.and_then(|reply| match reply {
                                 Reply::Page(page) => Ok(page),
-                                Reply::Playback(..) | Reply::Album(_) => {
+                                Reply::Albums(_) | Reply::Playback(..) | Reply::Album(_) => {
                                     Err("VK worker returned the wrong response".to_owned())
                                 }
                             }),
@@ -985,6 +1304,7 @@ impl AppController {
     fn selected_vk_album_job(&self) -> Option<AlbumJob> {
         if self.diagnostic_only
             || self.view.screen != Screen::Vk
+            || self.vk.results_kind != VkSearchKind::Tracks
             || self.view.search_editing
             || self.config.providers.vk_cookies_file.is_none()
         {
@@ -1063,6 +1383,7 @@ impl AppController {
             self.vk.pending_search = None;
             self.vk.pending_browse = None;
             self.vk.restore = false;
+            self.vk.restore_selected = None;
             self.vk.client = None;
             #[cfg(any(
                 feature = "commons-upload",
@@ -1089,6 +1410,9 @@ impl AppController {
     /// Captures canonical same-source playback order independently of later searches.
     #[cfg(feature = "vk")]
     pub(super) fn vk_autoplay_origin(&self, id: &MediaId) -> Option<AutoplayOrigin> {
+        if self.vk.results_kind != VkSearchKind::Tracks {
+            return None;
+        }
         let items = self.vk.items.iter().map(queue_item).collect::<Vec<_>>();
         let index = items.iter().position(|item| &item.media.id == id)?;
         Some(AutoplayOrigin::Vk {
@@ -1117,6 +1441,9 @@ impl AppController {
             .or_else(|| self.vk.items.iter().find(|track| track.id == id))?
             .clone();
         Some(VkNavigationSnapshot {
+            search_kind: VkSearchKind::Tracks,
+            results_kind: VkSearchKind::Tracks,
+            albums: Vec::new(),
             items: vec![track],
             next: None,
             route: None,
@@ -1133,6 +1460,10 @@ impl AppController {
         self.vk.pending_browse = None;
         self.vk.page_turn = None;
         self.vk.restore = false;
+        self.vk.restore_selected = None;
+        std::mem::swap(&mut self.view.vk_search_kind, &mut snapshot.search_kind);
+        std::mem::swap(&mut self.vk.results_kind, &mut snapshot.results_kind);
+        std::mem::swap(&mut self.vk.albums, &mut snapshot.albums);
         std::mem::swap(&mut self.vk.items, &mut snapshot.items);
         std::mem::swap(&mut self.vk.next, &mut snapshot.next);
         std::mem::swap(&mut self.vk.route, &mut snapshot.route);
@@ -1143,6 +1474,9 @@ impl AppController {
     #[cfg(feature = "vk")]
     pub(super) fn reveal_vk_now_playing(&mut self, id: &MediaId) -> bool {
         self.refresh_vk_cookie_owner();
+        if self.vk.results_kind != VkSearchKind::Tracks {
+            return false;
+        }
         let Some(index) = self
             .vk
             .items
@@ -1209,9 +1543,16 @@ fn run_job(
             .set_page_size(page_size);
         let client = client.as_mut().expect("authenticated VK client");
         match job {
-            Job::Browse(job) => match job.kind {
-                BrowseKind::Album => client.album_tracks(&job.track),
-                BrowseKind::Artist => client.artist_tracks(&job.track),
+            Job::Browse(job) => match job.source {
+                BrowseSource::Track {
+                    track,
+                    kind: BrowseKind::Album,
+                } => client.album_tracks(&track),
+                BrowseSource::Track {
+                    track,
+                    kind: BrowseKind::Artist,
+                } => client.artist_tracks(&track),
+                BrowseSource::Album(album) => client.album_tracks_from_result(&album),
             }
             .map(Reply::Page)
             .map_err(|error| error.to_string()),
@@ -1220,6 +1561,16 @@ fn run_job(
                 .map(Reply::Album)
                 .map_err(|error| error.to_string()),
             Job::Search(job) => {
+                if job.kind == VkSearchKind::Albums {
+                    let page = if let Some(cursor) = job.cursor {
+                        client.next_album_search_page(&cursor)
+                    } else if let VkQuery::Search(query) = job.query {
+                        client.search_albums(&query)
+                    } else {
+                        return Err("Album search requires an album name".to_owned());
+                    };
+                    return page.map(Reply::Albums).map_err(|error| error.to_string());
+                }
                 let page = if let Some(cursor) = job.cursor {
                     client
                         .next_page(&cursor)
@@ -1345,6 +1696,9 @@ mod cross_provider_tests;
 
 #[cfg(all(test, feature = "vk"))]
 mod album_tests;
+
+#[cfg(all(test, feature = "vk"))]
+mod album_search_tests;
 
 #[cfg(all(test, feature = "vk"))]
 mod browse_tests;

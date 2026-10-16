@@ -534,6 +534,66 @@ mod wire_tests {
         );
     }
 
+    /// VK mode switching is a browse shortcut, never an editor command.
+    #[cfg(feature = "vk")]
+    #[test]
+    fn vk_search_mode_shortcut_preserves_query_editing() {
+        use crate::view::{Screen, VkSearchKind};
+        let mut view = ViewModel {
+            screen: Screen::Vk,
+            ..ViewModel::default()
+        };
+        for kind in [VkSearchKind::Tracks, VkSearchKind::Albums] {
+            view.vk_search_kind = kind;
+            assert_eq!(
+                key_action(KeyPress::new(Key::Char('v')), &view, None, None),
+                Some(UiAction::CycleVkSearchKind)
+            );
+            view.search_editing = true;
+            assert_eq!(
+                key_action(KeyPress::new(Key::Char('v')), &view, None, None),
+                Some(UiAction::AppendSearch('v'))
+            );
+            view.search_editing = false;
+        }
+        assert_eq!(
+            key_action(
+                KeyPress {
+                    ctrl: true,
+                    ..KeyPress::new(Key::Char('v'))
+                },
+                &view,
+                None,
+                None
+            ),
+            None
+        );
+        view.screen = Screen::Search;
+        assert_eq!(
+            key_action(KeyPress::new(Key::Char('v')), &view, None, None),
+            Some(UiAction::ToggleSearchKind)
+        );
+        view.screen = Screen::YandexMusic;
+        assert_eq!(
+            key_action(KeyPress::new(Key::Char('v')), &view, None, None),
+            Some(UiAction::CycleYandexMusicSearchKind)
+        );
+    }
+
+    /// A disabled provider cannot expose its catalogue-mode action through a stale snapshot.
+    #[cfg(not(feature = "vk"))]
+    #[test]
+    fn vk_search_mode_shortcut_is_inert_without_the_feature() {
+        let view = ViewModel {
+            screen: crate::view::Screen::Vk,
+            ..ViewModel::default()
+        };
+        assert_eq!(
+            key_action(KeyPress::new(Key::Char('v')), &view, None, None),
+            None
+        );
+    }
+
     /// VK catalogue shortcuts preserve query input, modifiers and selected-row ownership.
     #[cfg(feature = "vk")]
     #[test]
@@ -4826,6 +4886,9 @@ fn unfiltered_key_action(
         Key::F(12) if !key.modified() => Some(UiAction::ShowScreen(Screen::Downloaded)),
         Key::Char('v') if view.screen == Screen::YandexMusic => {
             Some(UiAction::CycleYandexMusicSearchKind)
+        }
+        Key::Char('v') if view.screen == Screen::Vk => {
+            (cfg!(feature = "vk") && !key.modified()).then_some(UiAction::CycleVkSearchKind)
         }
         Key::Char('v') => Some(UiAction::ToggleSearchKind),
         Key::Char('N') => Some(UiAction::ToggleYouTubeSearchSort),

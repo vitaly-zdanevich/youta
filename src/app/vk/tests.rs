@@ -350,6 +350,7 @@ fn vk_searches_coalesce_behind_an_owned_worker_without_starting_parallel_http() 
         job: Job::Search(SearchJob {
             generation: 0,
             query: VkQuery::Search("old".to_owned()),
+            kind: VkSearchKind::Tracks,
             cursor: None,
         }),
         cookie_file: path,
@@ -392,6 +393,7 @@ fn vk_numeric_music_queries_queue_search_instead_of_profile_browsing() {
         job: Job::Search(SearchJob {
             generation: 0,
             query: VkQuery::Search("held fixture".to_owned()),
+            kind: VkSearchKind::Tracks,
             cursor: None,
         }),
         cookie_file: path,
@@ -635,6 +637,7 @@ fn vk_cookie_path_round_trip_does_not_adopt_an_obsolete_client() {
         job: Job::Search(SearchJob {
             generation: 0,
             query: VkQuery::Search("obsolete".to_owned()),
+            kind: VkSearchKind::Tracks,
             cursor: None,
         }),
         cookie_file: original.clone(),

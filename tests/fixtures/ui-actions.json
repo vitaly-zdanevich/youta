@@ -80,6 +80,7 @@
 	"CycleCommonsUploadLicense",
 	"CycleDownloadModePreference",
 	"CycleVideoSummaryBackend",
+	"CycleVkSearchKind",
 	"CycleYouTubeThumbnailSize",
 	"DismissArchiveCredentials",
 	"DismissArchivePlaybackChoice",

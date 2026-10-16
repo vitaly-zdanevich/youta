@@ -2018,8 +2018,11 @@ contents, automatically extracted account ID, reload hash, or signed stream addr
 history or playlists. Keep the export under `secrets/` or otherwise outside Git
 sync. When the session expires, replace the export and restart Youta.
 
-Press `/` in VK and enter ordinary words or numbers, such as `2032`, to search
-tracks. Enter `@profile_name`, `profile:profile_name`, `id123`, `profile:123`, or a
+Press `v` while browsing VK, or click the Tracks/Albums control, to choose the
+search mode. Press `/` and enter ordinary words or numbers, such as `2032`, to
+search that catalogue. The mode is retained while browsing an album's tracks;
+typed `v` remains text while editing the query. Enter opens a selected album.
+Enter `@profile_name`, `profile:profile_name`, `id123`, `profile:123`, or a
 `https://vk.ru/profile_name` / `https://vk.com/profile_name` link to browse that
 profile's accessible music.
 Enter plays a selected track; the original VK link remains in Details. More

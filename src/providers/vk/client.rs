@@ -16,8 +16,8 @@ use url::Url;
 use super::bootstrap;
 use super::catalog::{self, AlbumReference, CursorKind};
 use super::{
-    ProfileReference, VkCookieHeader, VkCookieJar, VkPage, VkPageCursor, VkPlaybackUrl, VkTrack,
-    decode_audio_url,
+    ProfileReference, VkAlbum, VkAlbumPage, VkCookieHeader, VkCookieJar, VkPage, VkPageCursor,
+    VkPlaybackUrl, VkTrack, decode_audio_url,
 };
 use crate::providers::ProviderError;
 
@@ -155,6 +155,60 @@ impl VkClient {
     /// # Errors
     /// Rejects invalid queries, unauthenticated clients and unsupported responses.
     pub fn search(&self, query: &str) -> Result<VkPage, ProviderError> {
+        catalog::search_page(&self.search_response(query)?, &self.scope)
+    }
+
+    /// Searches VK's advertised Albums section, independently from user-created playlists.
+    ///
+    /// The mixed search discovers a private section token; one fixed catalogue
+    /// request retrieves releases. No JavaScript or returned navigation URL is executed.
+    ///
+    /// # Errors
+    /// Rejects invalid queries, authentication failures and ambiguous catalogue metadata.
+    pub fn search_albums(&self, query: &str) -> Result<VkAlbumPage, ProviderError> {
+        let response = self.search_response(query)?;
+        let Some(section) = catalog::album_search_section(&response)? else {
+            return Ok(VkAlbumPage {
+                albums: Vec::new(),
+                next: None,
+            });
+        };
+        self.album_search_page(&section, None)
+    }
+
+    /// Loads one album-search continuation from the same authenticated client session.
+    ///
+    /// # Errors
+    /// Rejects stale or non-album cursors before HTTP, and nonadvancing provider responses.
+    pub fn next_album_search_page(
+        &self,
+        cursor: &VkPageCursor,
+    ) -> Result<VkAlbumPage, ProviderError> {
+        self.account()?;
+        cursor.validate_scope(&self.scope)?;
+        let CursorKind::SearchAlbums { section, offset } = &cursor.kind else {
+            return Err(catalog::invalid_catalogue());
+        };
+        self.album_search_page(section, Some(offset))
+    }
+
+    /// Opens the exact selected release using only its private session-scoped reference.
+    ///
+    /// # Errors
+    /// Rejects another client's result before HTTP, and mismatched release responses.
+    pub fn album_tracks_from_result(&self, album: &VkAlbum) -> Result<VkPage, ProviderError> {
+        self.account()?;
+        let reference = album.reference(&self.scope)?;
+        catalog::album_page(
+            &self.album_response(reference, 0)?,
+            reference,
+            0,
+            &self.scope,
+        )
+    }
+
+    /// Keeps the existing track-search request identical while sharing section discovery.
+    fn search_response(&self, query: &str) -> Result<Value, ProviderError> {
         let account = self.account()?;
         if query.trim().is_empty() || query.len() > 2 * 1024 || query.chars().any(char::is_control)
         {
@@ -175,7 +229,25 @@ impl VkClient {
                 ("count", self.page_size.to_string()),
             ],
         )?;
-        catalog::search_page(&response, &self.scope)
+        Ok(response)
+    }
+
+    /// Follows only an already-validated opaque section and continuation on the fixed origin.
+    fn album_search_page(
+        &self,
+        section: &str,
+        previous: Option<&str>,
+    ) -> Result<VkAlbumPage, ProviderError> {
+        let response = self.post(
+            DESKTOP_AUDIO,
+            &[
+                ("al", "1".to_owned()),
+                ("act", "load_catalog_section".to_owned()),
+                ("section_id", section.to_owned()),
+                ("start_from", previous.unwrap_or_default().to_owned()),
+            ],
+        )?;
+        catalog::album_search_page(&response, section, previous, &self.scope)
     }
 
     /// Lists music visible to the authenticated account on one exact user profile.
@@ -248,6 +320,7 @@ impl VkClient {
                 )?;
                 catalog::next_artist_page(&response, cursor, &self.scope)
             }
+            CursorKind::SearchAlbums { .. } => Err(catalog::invalid_catalogue()),
         }
     }
 
@@ -740,6 +813,100 @@ fn authentication_required() -> ProviderError {
 
 #[cfg(test)]
 mod tests {
+    /// Album search follows only the website-advertised section and exact scoped release.
+    #[test]
+    fn album_search_pages_and_open_use_fixed_routes_and_private_scoped_tokens() {
+        let (mut client, transport) = client(vec![
+            html("<script>window.vk={id:123};</script>"),
+            json_response(&catalog::tests::album_search_fixture()),
+            json_response(&catalog::tests::album_catalogue_fixture("private-next")),
+            json_response(&catalog::tests::album_catalogue_fixture("")),
+            json_response(
+                &json!({"payload":[0,[{"ownerId":-123,"id":456,"title":"Album","list":[catalog::tests::row(2)],"hasMore":false}]]}),
+            ),
+        ]);
+        client.authenticate().unwrap();
+        let page = client.search_albums("minsk").unwrap();
+        let next = client
+            .next_album_search_page(page.next.as_ref().unwrap())
+            .unwrap();
+        assert_eq!(next.albums.len(), 1);
+        assert!(next.next.is_none());
+        assert_eq!(
+            client
+                .album_tracks_from_result(&page.albums[0])
+                .unwrap()
+                .tracks
+                .len(),
+            1
+        );
+        assert!(client.next_page(page.next.as_ref().unwrap()).is_err());
+        assert!(!format!("{page:?} {client:?}").contains("private-"));
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests.len(), 5);
+        assert!(
+            requests
+                .iter()
+                .skip(1)
+                .all(|request| request.0 == DESKTOP_AUDIO)
+        );
+        assert!(
+            requests[2]
+                .1
+                .contains(&("act".into(), "load_catalog_section".into()))
+        );
+        assert!(
+            requests[2]
+                .1
+                .contains(&("section_id".into(), "private-album-section".into()))
+        );
+        assert!(requests[2].1.contains(&("start_from".into(), "".into())));
+        assert!(
+            requests[3]
+                .1
+                .contains(&("start_from".into(), "private-next".into()))
+        );
+        assert!(
+            requests[4]
+                .1
+                .contains(&("access_hash".into(), "private-album-hash".into()))
+        );
+    }
+
+    #[test]
+    fn album_search_rejects_foreign_objects_and_invalid_queries_before_http() {
+        let (mut first, _) = client(vec![
+            html("<script>window.vk={id:123};</script>"),
+            json_response(&catalog::tests::album_search_fixture()),
+            json_response(&catalog::tests::album_catalogue_fixture("private-next")),
+        ]);
+        first.authenticate().unwrap();
+        let page = first.search_albums("minsk").unwrap();
+        let (mut other, transport) = client(vec![html("<script>window.vk={id:123};</script>")]);
+        other.authenticate().unwrap();
+        assert!(other.album_tracks_from_result(&page.albums[0]).is_err());
+        assert!(
+            other
+                .next_album_search_page(page.next.as_ref().unwrap())
+                .is_err()
+        );
+        for query in ["", " ", "private\nquery"] {
+            assert!(other.search_albums(query).is_err());
+        }
+        assert_eq!(transport.requests.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn absent_album_search_header_is_empty_without_catalogue_request() {
+        let (mut client, transport) = client(vec![
+            html("<script>window.vk={id:123};</script>"),
+            json_response(&json!({"payload":[0,["<div>No album results</div>",{}]]})),
+        ]);
+        client.authenticate().unwrap();
+        let page = client.search_albums("minsk").unwrap();
+        assert!(page.albums.is_empty() && page.next.is_none());
+        assert_eq!(transport.requests.lock().unwrap().len(), 2);
+    }
     use super::*;
     use serde_json::json;
     use std::collections::VecDeque;

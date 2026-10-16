@@ -69,8 +69,11 @@ fn vk_album_navigation_rejects_stale_targets_and_restores_search() {
     app.open_vk_album(url.clone());
     assert_eq!(app.vk.back.len(), 1);
     assert!(matches!(
-        app.vk.pending_browse.as_ref().unwrap().kind,
-        BrowseKind::Album
+        app.vk.pending_browse.as_ref().unwrap().source,
+        BrowseSource::Track {
+            kind: BrowseKind::Album,
+            ..
+        }
     ));
     assert_eq!(app.vk.route.as_ref().unwrap().0, url);
     let generation = app.vk.generation;
@@ -155,8 +158,11 @@ fn vk_artist_link_and_action_open_the_selected_artist() {
     );
     app.dispatch(UiAction::OpenVkArtist(url));
     assert!(matches!(
-        app.vk.pending_browse.as_ref().unwrap().kind,
-        BrowseKind::Artist
+        app.vk.pending_browse.as_ref().unwrap().source,
+        BrowseSource::Track {
+            kind: BrowseKind::Artist,
+            ..
+        }
     ));
     assert!(app.back_vk_catalogue());
     assert_eq!(app.view.selected, 1);

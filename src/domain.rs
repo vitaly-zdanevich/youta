@@ -1530,6 +1530,45 @@ impl ArchiveOrgSessionLocation {
     }
 }
 
+/// Catalogue category selected for VK search and restart restoration.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub enum VkSearchKind {
+    /// Search individual playable audio tracks.
+    #[default]
+    Tracks,
+    /// Search albums by title before opening their track lists.
+    Albums,
+}
+
+impl VkSearchKind {
+    /// Returns the next category in the VK search selector.
+    #[must_use]
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Tracks => Self::Albums,
+            Self::Albums => Self::Tracks,
+        }
+    }
+
+    /// Returns the compact category label used in status text.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Tracks => "tracks",
+            Self::Albums => "albums",
+        }
+    }
+
+    /// Returns the title-cased category label used in controls.
+    #[must_use]
+    pub const fn title_label(self) -> &'static str {
+        match self {
+            Self::Tracks => "Tracks",
+            Self::Albums => "Albums",
+        }
+    }
+}
+
 /// Restart-safe terminal navigation and selection state.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SessionState {
@@ -1601,6 +1640,9 @@ pub struct SessionState {
     /// Last query submitted to VK; authentication remains outside session state.
     #[serde(default)]
     pub vk_search_text: String,
+    /// Category belonging to the saved VK search; older sessions search tracks.
+    #[serde(default)]
+    pub vk_search_kind: VkSearchKind,
     /// Last search text entered on the independent Bandcamp tab.
     #[serde(default)]
     pub bandcamp_search_text: String,
@@ -1664,6 +1706,7 @@ impl Default for SessionState {
             soundcloud_search_text: String::new(),
             yandex_music_search_text: String::new(),
             vk_search_text: String::new(),
+            vk_search_kind: VkSearchKind::default(),
             bandcamp_search_text: String::new(),
             funkwhale_search_text: String::new(),
             apple_podcasts_search_text: String::new(),
@@ -1735,6 +1778,7 @@ impl SessionState {
         self.soundcloud_search_text.clear();
         self.yandex_music_search_text.clear();
         self.vk_search_text.clear();
+        self.vk_search_kind = VkSearchKind::default();
         self.bandcamp_search_text.clear();
         self.funkwhale_search_text.clear();
         self.apple_podcasts_search_text.clear();
@@ -2117,6 +2161,7 @@ mod tests {
             soundcloud_search_text: "private-soundcloud".to_owned(),
             yandex_music_search_text: "private-yandex-music".to_owned(),
             vk_search_text: "private-vk".to_owned(),
+            vk_search_kind: VkSearchKind::Albums,
             bandcamp_search_text: "private-bandcamp".to_owned(),
             funkwhale_search_text: "private-funkwhale".to_owned(),
             apple_podcasts_search_text: "private-apple-podcasts".to_owned(),
@@ -2292,6 +2337,7 @@ mod tests {
             screen: Screen::Vk,
             vk_selected_row: Some(4),
             vk_search_text: "ambient Мінск".to_owned(),
+            vk_search_kind: VkSearchKind::Albums,
             soundcloud_selected_row: Some(2),
             soundcloud_search_text: "independent query".to_owned(),
             ..SessionState::default()
@@ -2306,10 +2352,12 @@ mod tests {
         let object = old.as_object_mut().unwrap();
         object.remove("vk_selected_row");
         object.remove("vk_search_text");
+        object.remove("vk_search_kind");
         let restored: SessionState = serde_json::from_value(old).unwrap();
         assert_eq!(restored.screen, Screen::Vk);
         assert_eq!(restored.vk_selected_row, None);
         assert!(restored.vk_search_text.is_empty());
+        assert_eq!(restored.vk_search_kind, VkSearchKind::Tracks);
         assert_eq!(restored.soundcloud_selected_row, Some(2));
         assert_eq!(restored.soundcloud_search_text, "independent query");
         assert!(!serde_json::to_string(&session).unwrap().contains("cookie"));

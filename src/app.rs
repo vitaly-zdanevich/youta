@@ -6227,6 +6227,7 @@ impl AppController {
                 && matches!(saved.screen, StoredScreen::Local),
             show_chapter_timestamps: !saved.chapter_timestamps_hidden,
             playback_history_enabled: config.persistence.save_playback_history,
+            vk_search_kind: saved.vk_search_kind,
             nyan_cat_seekbar: cfg!(feature = "nyan-cat") && config.ui.nyan_cat_seekbar,
             ..ViewModel::default()
         };
@@ -8269,6 +8270,7 @@ impl AppController {
         {
             self.show_screen(Screen::Vk);
             self.view.search_query = direct.url.to_string();
+            self.view.vk_search_kind = crate::domain::VkSearchKind::Tracks;
             self.submit_vk_search(self.view.search_query.clone());
             return;
         }
@@ -31676,10 +31678,7 @@ impl AppController {
 
     fn current_url(&self) -> Option<String> {
         if self.view.screen == Screen::Vk {
-            return self
-                .selected_vk_queue_item()
-                .ok()
-                .map(|item| item.media.webpage_url.to_string());
+            return self.selected_vk_public_url();
         }
         if self.view.screen == Screen::SoundCloud {
             return self
@@ -36280,7 +36279,7 @@ impl AppController {
             youtube_music_selected_row: Some(self.youtube_music_selected),
             soundcloud_selected_row: Some(self.soundcloud.selected),
             funkwhale_selected_row: Some(self.funkwhale.selected),
-            vk_selected_row: Some(self.vk.selected),
+            vk_selected_row: Some(self.vk_session_selection()),
             yandex_music_selected_row: Some(self.yandex_music_selected),
             #[cfg(feature = "bandcamp")]
             bandcamp_selected_row: Some(self.bandcamp_selected),
@@ -36304,6 +36303,7 @@ impl AppController {
             soundcloud_search_text: self.soundcloud.query.clone(),
             funkwhale_search_text: self.funkwhale.query.clone(),
             vk_search_text: self.vk.query.clone(),
+            vk_search_kind: self.view.vk_search_kind,
             yandex_music_search_text: self.yandex_music_search_query.clone(),
             #[cfg(feature = "bandcamp")]
             bandcamp_search_text: self.bandcamp_search_query.clone(),
@@ -36784,6 +36784,7 @@ impl UiController for AppController {
                     }
                 }
             }
+            UiAction::CycleVkSearchKind => self.cycle_vk_search_kind(),
             UiAction::CycleYandexMusicSearchKind => {
                 #[cfg(feature = "yandex-music")]
                 {

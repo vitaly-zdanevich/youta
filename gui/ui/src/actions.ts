@@ -130,6 +130,7 @@ export type UnitUiAction =
 	| 'CycleCommonsUploadLicense'
 	| 'CycleDownloadModePreference'
 	| 'CycleVideoSummaryBackend'
+	| 'CycleVkSearchKind'
 	| 'CycleYouTubeThumbnailSize'
 	| 'DismissArchiveCredentials'
 	| 'DismissArchivePlaybackChoice'

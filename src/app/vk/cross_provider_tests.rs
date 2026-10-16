@@ -117,6 +117,7 @@ fn newer_vk_intent_revokes_an_older_bbc_resolver_before_starting_http() {
         Job::Search(SearchJob {
             generation: 0,
             query: VkQuery::Search("old fixture query".to_owned()),
+            kind: VkSearchKind::Tracks,
             cursor: None,
         }),
     );

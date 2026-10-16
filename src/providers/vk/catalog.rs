@@ -194,6 +194,87 @@ pub struct VkPage {
     pub next: Option<VkPageCursor>,
 }
 
+/// One safe album-search result with its private opener scoped to the originating client.
+#[derive(Clone)]
+pub struct VkAlbum {
+    /// Entity-decoded, terminal-safe release title.
+    pub title: String,
+    /// Entity-decoded artist credits advertised by the release metadata.
+    pub artist: String,
+    /// Release year when explicitly advertised; currently absent from the verified web schema.
+    pub year: Option<u32>,
+    /// Advertised number of tracks, when representable.
+    pub track_count: Option<u32>,
+    /// Validated advertised cover, fetched independently without account cookies.
+    pub artwork_url: Option<Url>,
+    /// Validated dimensions advertised by the exact cover URL.
+    pub artwork_dimensions: Option<(u32, u32)>,
+    album: AlbumReference,
+    scope: Arc<()>,
+}
+
+impl fmt::Debug for VkAlbum {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VkAlbum")
+            .field("title", &self.title)
+            .field("artist", &self.artist)
+            .field("year", &self.year)
+            .field("track_count", &self.track_count)
+            .field("private_session_data", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
+
+impl VkAlbum {
+    /// Returns the public release page without exposing its private access hash.
+    #[must_use]
+    pub fn webpage_url(&self) -> Url {
+        let mut url = Url::parse("https://vk.ru/").expect("fixed VK origin");
+        url.set_path(&format!(
+            "/music/album/{}_{}",
+            self.album.owner, self.album.id
+        ));
+        url
+    }
+
+    /// Admits an album opener only within the exact client session that obtained it.
+    pub(super) fn reference(&self, scope: &Arc<()>) -> Result<&AlbumReference, ProviderError> {
+        if !Arc::ptr_eq(&self.scope, scope) {
+            return Err(stale_session());
+        }
+        Ok(&self.album)
+    }
+
+    /// Builds a synthetic release for controller projections without authenticated HTTP.
+    #[cfg(test)]
+    pub(crate) fn fixture(owner: i64, id: u64, title: &str, artist: &str) -> Self {
+        Self {
+            title: title.to_owned(),
+            artist: artist.to_owned(),
+            year: None,
+            track_count: None,
+            artwork_url: None,
+            artwork_dimensions: None,
+            album: AlbumReference {
+                owner,
+                id,
+                access_hash: "fixture-album-hash".to_owned(),
+            },
+            scope: Arc::new(()),
+        }
+    }
+}
+
+/// One bounded album catalogue page, separate from playable track results.
+#[derive(Clone, Debug)]
+pub struct VkAlbumPage {
+    /// Valid releases in upstream order, deduplicated by public album identity.
+    pub albums: Vec<VkAlbum>,
+    /// Private session-scoped continuation, never persisted or displayed.
+    pub next: Option<VkPageCursor>,
+}
+
 /// An opaque, non-persistable page locator owned by one client session.
 #[derive(Clone)]
 pub struct VkPageCursor {
@@ -220,6 +301,10 @@ pub(super) enum CursorKind {
         section: String,
         offset: String,
     },
+    SearchAlbums {
+        section: String,
+        offset: String,
+    },
 }
 
 impl fmt::Debug for VkPageCursor {
@@ -229,6 +314,18 @@ impl fmt::Debug for VkPageCursor {
 }
 
 impl VkPageCursor {
+    /// Supplies an opaque synthetic continuation for controller paging tests only.
+    #[cfg(test)]
+    pub(crate) fn fixture_album_search() -> Self {
+        Self {
+            kind: CursorKind::SearchAlbums {
+                section: "fixture-private-section".to_owned(),
+                offset: "fixture-private-next".to_owned(),
+            },
+            scope: Arc::new(()),
+        }
+    }
+
     pub(super) fn validate_scope(&self, scope: &Arc<()>) -> Result<(), ProviderError> {
         if Arc::ptr_eq(&self.scope, scope) {
             Ok(())
@@ -812,6 +909,220 @@ fn global_search_block(html: &str) -> Result<String, ProviderError> {
     selected.ok_or_else(invalid_catalogue)
 }
 
+/// Discovers the Albums-only section advertised by its exact search header.
+///
+/// The validated href is never followed. Its opaque `type` token is used only
+/// with the fixed catalogue endpoint, as verified against the live web client.
+pub(super) fn album_search_section(value: &Value) -> Result<Option<String>, ProviderError> {
+    if value.pointer("/payload/0").and_then(Value::as_i64) != Some(0) {
+        return Err(invalid_catalogue());
+    }
+    let html = value
+        .pointer("/payload/1/0")
+        .and_then(Value::as_str)
+        .filter(|html| html.len() <= 2 * 1024 * 1024)
+        .ok_or_else(invalid_catalogue)?;
+    let mut emitter = DefaultEmitter::default();
+    emitter.naively_switch_states(true);
+    let mut stack: Vec<Vec<u8>> = Vec::new();
+    let mut header_depth = None;
+    let mut headers = 0;
+    let mut section = None;
+    for token in Tokenizer::new_with_emitter(html, emitter) {
+        match token {
+            Ok(Token::StartTag(tag)) => {
+                let class = tag.attributes.get(b"class".as_slice());
+                let has_class = |wanted: &[u8]| {
+                    class.is_some_and(|value| {
+                        value
+                            .split(u8::is_ascii_whitespace)
+                            .any(|part| part == wanted)
+                    })
+                };
+                let void = matches!(
+                    tag.name.as_ref(),
+                    b"area"
+                        | b"base"
+                        | b"br"
+                        | b"col"
+                        | b"embed"
+                        | b"hr"
+                        | b"img"
+                        | b"input"
+                        | b"link"
+                        | b"meta"
+                        | b"param"
+                        | b"source"
+                        | b"track"
+                        | b"wbr"
+                );
+                if has_class(b"CatalogBlock__search_global_albums_header") {
+                    headers += 1;
+                    if headers != 1 || void || tag.self_closing {
+                        return Err(invalid_catalogue());
+                    }
+                    header_depth = Some(stack.len());
+                }
+                if header_depth.is_some() && has_class(b"audio_page_block__show_all_link") {
+                    if tag.name.as_ref() != b"a" || section.is_some() {
+                        return Err(invalid_catalogue());
+                    }
+                    let href = tag
+                        .attributes
+                        .get(b"href".as_slice())
+                        .and_then(|value| std::str::from_utf8(value).ok())
+                        .filter(|value| value.len() <= 4 * 1024)
+                        .ok_or_else(invalid_catalogue)?;
+                    let url = Url::parse("https://vk.ru/")
+                        .expect("fixed VK origin")
+                        .join(href)
+                        .map_err(|_| invalid_catalogue())?;
+                    if url.scheme() != "https"
+                        || url.host_str() != Some("vk.ru")
+                        || url.path() != "/audio"
+                        || url.port_or_known_default() != Some(443)
+                        || !url.username().is_empty()
+                        || url.password().is_some()
+                        || url.fragment().is_some()
+                    {
+                        return Err(invalid_catalogue());
+                    }
+                    let mut tokens = url.query_pairs().filter(|(key, _)| key == "type");
+                    let (_, token) = tokens.next().ok_or_else(invalid_catalogue)?;
+                    if tokens.next().is_some() {
+                        return Err(invalid_catalogue());
+                    }
+                    section = Some(bounded_token(&token)?);
+                }
+                if !void && !tag.self_closing {
+                    if stack.len() >= 64 {
+                        return Err(invalid_catalogue());
+                    }
+                    stack.push(tag.name.as_ref().to_vec());
+                }
+            }
+            Ok(Token::EndTag(tag)) => {
+                if let Some(position) = stack
+                    .iter()
+                    .rposition(|name| name.as_slice() == tag.name.as_ref())
+                {
+                    stack.truncate(position);
+                    if header_depth.is_some_and(|depth| depth >= position) {
+                        header_depth = None;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if headers == 0 {
+        return Ok(None);
+    }
+    if header_depth.is_some() {
+        return Err(invalid_catalogue());
+    }
+    section.map(Some).ok_or_else(invalid_catalogue)
+}
+
+/// Projects only releases from the exact successful Albums section and advancing cursor.
+pub(super) fn album_search_page(
+    value: &Value,
+    section: &str,
+    previous: Option<&str>,
+    scope: &Arc<()>,
+) -> Result<VkAlbumPage, ProviderError> {
+    if value.pointer("/payload/0").and_then(Value::as_i64) != Some(0) {
+        return Err(invalid_catalogue());
+    }
+    let data = value
+        .pointer("/payload/1/1")
+        .ok_or_else(invalid_catalogue)?;
+    if data.get("sectionId").and_then(Value::as_str) != Some(section) {
+        return Err(invalid_catalogue());
+    }
+    let token = |key: &str| match data.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) if value.is_empty() => Ok(None),
+        Some(Value::String(value)) => bounded_token(value).map(Some),
+        _ => Err(invalid_catalogue()),
+    };
+    let camel = token("nextFrom")?;
+    let snake = token("next_from")?;
+    if data.get("nextFrom").is_some() && data.get("next_from").is_some() && camel != snake {
+        return Err(invalid_catalogue());
+    }
+    let offset = camel.or(snake);
+    if offset
+        .as_deref()
+        .is_some_and(|offset| Some(offset) == previous)
+    {
+        return Err(invalid_catalogue());
+    }
+    let values = data
+        .get("playlists")
+        .and_then(Value::as_array)
+        .filter(|values| values.len() <= MAX_PLAYLISTS)
+        .ok_or_else(invalid_catalogue)?;
+    let mut seen = HashSet::new();
+    let albums = values
+        .iter()
+        .filter_map(|value| parse_search_album(value, scope))
+        .filter(|album| seen.insert((album.album.owner, album.album.id)))
+        .collect();
+    let next = offset.map(|offset| VkPageCursor {
+        kind: CursorKind::SearchAlbums {
+            section: section.to_owned(),
+            offset,
+        },
+        scope: Arc::clone(scope),
+    });
+    Ok(VkAlbumPage { albums, next })
+}
+
+/// Omits malformed releases and optional fields without admitting unvalidated private references.
+fn parse_search_album(value: &Value, scope: &Arc<()>) -> Option<VkAlbum> {
+    let owner = value.get("ownerId")?.as_i64()?;
+    let id = value.get("id")?.as_u64()?;
+    VkAudioId::new(owner, id).ok()?;
+    let hash = value.get("accessHash")?.as_str()?;
+    if hash.is_empty()
+        || hash.len() > 256
+        || !hash
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return None;
+    }
+    let title = plain_label(value.get("title")?.as_str()?).filter(|title| !title.is_empty())?;
+    let artist = value
+        .get("authorName")
+        .and_then(Value::as_str)
+        .and_then(plain_label)
+        .unwrap_or_default();
+    let artwork_url = value
+        .get("coverUrl")
+        .and_then(Value::as_str)
+        .and_then(artwork_url);
+    let artwork_dimensions = artwork_url.as_ref().and_then(artwork_dimensions);
+    Some(VkAlbum {
+        title,
+        artist,
+        year: None,
+        track_count: value
+            .get("totalCount")
+            .and_then(Value::as_u64)
+            .and_then(|count| u32::try_from(count).ok()),
+        artwork_url,
+        artwork_dimensions,
+        album: AlbumReference {
+            owner,
+            id,
+            access_hash: hash.to_owned(),
+        },
+        scope: Arc::clone(scope),
+    })
+}
+
 fn plain_label(value: &str) -> Option<String> {
     if value.len() > MAX_LABEL_BYTES {
         return None;
@@ -895,6 +1206,122 @@ fn stale_session() -> ProviderError {
 
 #[cfg(test)]
 pub(super) mod tests {
+    /// Synthetic mixed-search response separates Albums from user-created playlists.
+    pub(in crate::providers::vk) fn album_search_fixture() -> Value {
+        json!({"payload":[0,["<div class='CatalogBlock__search_global_playlists_header'><a class='audio_page_block__show_all_link' href='/audio?section=anything&amp;type=private-wrong-section'>Other</a></div><div class='CatalogBlock__search_global_albums_header'><a class='audio_page_block__show_all_link' href='/audio?section=anything&amp;type=private-album-section'>All</a></div>",{}]]})
+    }
+
+    /// Mirrors the verified album catalogue envelope without real identities or hashes.
+    pub(in crate::providers::vk) fn album_catalogue_fixture(next: &str) -> Value {
+        json!({"payload":[0,[["<div>Cards</div>"],{
+            "sectionId":"private-album-section","nextFrom":next,"next_from":next,
+            "playlists":[{"ownerId":-123,"id":456,"accessHash":"private-album-hash",
+                "title":"<b>Album &amp; title</b>","authorName":"Artist &amp; guest",
+                "totalCount":7,"coverUrl":"https://sun1.userapi.com/cover.jpg?size=300x300&token=private-cover"}]
+        }]]})
+    }
+
+    #[test]
+    fn album_search_uses_exact_header_scoped_metadata_and_redacted_debug() {
+        let scope = Arc::new(());
+        let section = album_search_section(&album_search_fixture())
+            .unwrap()
+            .unwrap();
+        assert_eq!(section, "private-album-section");
+        let page = album_search_page(
+            &album_catalogue_fixture("private-next"),
+            &section,
+            None,
+            &scope,
+        )
+        .unwrap();
+        let album = &page.albums[0];
+        assert_eq!(album.title, "Album & title");
+        assert_eq!(album.artist, "Artist & guest");
+        assert_eq!(album.track_count, Some(7));
+        assert_eq!(album.year, None);
+        assert_eq!(album.artwork_dimensions, Some((300, 300)));
+        assert_eq!(
+            album.webpage_url().as_str(),
+            "https://vk.ru/music/album/-123_456"
+        );
+        assert!(album.reference(&scope).is_ok());
+        assert!(album.reference(&Arc::new(())).is_err());
+        assert!(!format!("{page:?}").contains("private-"));
+        assert!(matches!(
+            page.next.unwrap().kind,
+            CursorKind::SearchAlbums { .. }
+        ));
+        let fixture = VkAlbum::fixture(-123, 456, "Fixture", "Artist");
+        assert_eq!(fixture.webpage_url(), album.webpage_url());
+        assert!(!format!("{:?}", VkPageCursor::fixture_album_search()).contains("fixture-private"));
+    }
+
+    #[test]
+    fn album_search_rejects_ambiguous_foreign_or_outside_header_routes() {
+        let base = album_search_fixture();
+        let html = base.pointer("/payload/1/0").unwrap().as_str().unwrap();
+        for changed in [
+            format!("{html}{html}"),
+            html.replace("type=private-album-section", "type=private-album-section&amp;type=other"),
+            html.replace("/audio?section=anything&amp;type=private-album-section", "https://evil.test/audio?type=private-album-section"),
+            html.replace("private-album-section", &"x".repeat(MAX_TOKEN_BYTES + 1)),
+            "<div class='CatalogBlock__search_global_albums_header'></div><a class='audio_page_block__show_all_link' href='/audio?type=private-album-section'>Outside</a>".to_owned(),
+        ] {
+            assert!(album_search_section(&json!({"payload":[0,[changed,{}]]})).is_err());
+        }
+        assert!(
+            album_search_section(&json!({"payload":[0,["<div>No albums</div>",{}]]}))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            album_search_section(
+                &json!({"payload":[0,[format!("<script>const fake = `{html}`;</script>"),{}]]})
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(album_search_section(&json!({"payload":[1,["",{}]]})).is_err());
+    }
+
+    #[test]
+    fn album_search_pages_validate_identity_pagination_and_optional_metadata() {
+        let scope = Arc::new(());
+        let original = album_catalogue_fixture("next");
+        let mut failed = original.clone();
+        failed["payload"][0] = json!(1);
+        assert!(album_search_page(&failed, "private-album-section", None, &scope).is_err());
+        for (key, value) in [
+            ("sectionId", json!("wrong")),
+            ("next_from", json!("different")),
+            ("nextFrom", json!(0)),
+        ] {
+            let mut response = original.clone();
+            response["payload"][1][1][key] = value;
+            assert!(album_search_page(&response, "private-album-section", None, &scope).is_err());
+        }
+        assert!(
+            album_search_page(&original, "private-album-section", Some("next"), &scope).is_err()
+        );
+        let mut malformed = original.clone();
+        let list = malformed["payload"][1][1]["playlists"]
+            .as_array_mut()
+            .unwrap();
+        let duplicate = list[0].clone();
+        list.push(duplicate);
+        list.push(json!({"ownerId":1,"id":2,"accessHash":"bad secret","title":"Invalid"}));
+        list[0]["coverUrl"] = json!("https://evil.test/private");
+        list[0]["totalCount"] = json!(-1);
+        let page = album_search_page(&malformed, "private-album-section", None, &scope).unwrap();
+        assert_eq!(page.albums.len(), 1);
+        assert!(page.albums[0].artwork_url.is_none());
+        assert!(page.albums[0].track_count.is_none());
+        let mut empty = album_catalogue_fixture("");
+        empty["payload"][1][1]["playlists"] = json!([]);
+        let page = album_search_page(&empty, "private-album-section", None, &scope).unwrap();
+        assert!(page.albums.is_empty() && page.next.is_none());
+    }
     use super::*;
     use serde_json::json;
 

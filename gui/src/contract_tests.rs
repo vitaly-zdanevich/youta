@@ -476,6 +476,29 @@ fn funkwhale_artist_album_links_keep_their_typed_window_destinations() {
     }
 }
 
+/// VK search modes and their unit action retain the same spellings across IPC.
+#[test]
+fn vk_search_mode_matches_the_window_contract() {
+    use youta::view::{UiAction, VkSearchKind};
+    assert_eq!(ViewModel::default().vk_search_kind, VkSearchKind::Tracks);
+    for (kind, wire) in [
+        (VkSearchKind::Tracks, "Tracks"),
+        (VkSearchKind::Albums, "Albums"),
+    ] {
+        let view = ViewModel {
+            vk_search_kind: kind,
+            ..ViewModel::default()
+        };
+        assert_eq!(serde_json::to_value(view).unwrap()["vk_search_kind"], wire);
+        assert_eq!(kind.next().next(), kind);
+    }
+    assert_eq!(
+        serde_json::from_value::<UiAction>(serde_json::json!("CycleVkSearchKind")).unwrap(),
+        UiAction::CycleVkSearchKind
+    );
+    assert!(contract_source().contains("vk_search_kind: 'Tracks' | 'Albums';"));
+}
+
 /// VK catalogue destinations retain canonical URLs and browser-independent action types.
 #[test]
 fn vk_artist_album_links_keep_their_typed_window_destinations() {

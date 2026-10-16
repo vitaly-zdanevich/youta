@@ -1068,6 +1068,8 @@ export interface ViewModel {
 	youtube_channel_browsing: boolean;
   playback_history_enabled: boolean;
   search_editing: boolean;
+	/** Saved VK search mode, retained while an album's tracks are open. */
+	vk_search_kind: 'Tracks' | 'Albums';
 	/** Non-search Yandex routes retain their own meaningful context instead of empty guidance. */
 	yandex_music_route: 'Recommendations' | 'Search' | 'Album' | 'Artist';
 	/** Active provider/directory request, including the session-only Web browser. */

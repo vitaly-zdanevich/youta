@@ -13,7 +13,7 @@ mod cookies;
 mod identity;
 
 pub use audio_url::{VkPlaybackUrl, decode_audio_url};
-pub use catalog::{VkPage, VkPageCursor, VkTrack};
+pub use catalog::{VkAlbum, VkAlbumPage, VkPage, VkPageCursor, VkTrack};
 pub use client::VkClient;
 pub use cookies::{VkCookieHeader, VkCookieJar};
 pub use identity::{ProfileReference, VkAudioId, VkQuery, parse_query};

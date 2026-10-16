@@ -9,6 +9,7 @@ const React = require('react');
 const ts = require('typescript');
 const actions = [];
 const base = { screen: 'Search', search_query: '', search_cursor_byte: 0, search_editing: false,
+	vk_search_kind: 'Tracks',
 	rows: [], details: null, search_activity: null, help_open: false,
 	subscriptions: { show_youtube_shorts: true }, playback: { idle: true }, playback_history_enabled: true };
 
@@ -82,6 +83,36 @@ test('VK hides an empty query and keeps setup or loading visible', () => {
 	assert.equal(presentation.emptySearchPromptVisible({ ...base, screen: 'Vk' }), true);
 	assert.equal(presentation.emptySearchPromptVisible({ ...base, screen: 'Vk', details: { title: 'VK Music setup' } }), false);
 	assert.equal(presentation.emptySearchPromptVisible({ ...base, screen: 'Vk', search_activity: 'Vk' }), false);
+});
+
+/** The VK mode is independent of the query editor, including before the first search. */
+test('VK search mode stays visible, cycles through the reducer, and respects editing', () => {
+	for (const vk_search_kind of ['Tracks', 'Albums']) {
+		actions.length = 0;
+		const tree = renderSearch({ screen: 'Vk', vk_search_kind });
+		const control = nodes(tree).find((node) => node.type === 'button' && text(node) === `[v] ${vk_search_kind}`);
+		assert.ok(control, `${vk_search_kind} mode must remain accessible with an empty query`);
+		assert.equal(control.props.disabled, false);
+		assert.doesNotMatch(text(tree), /Search Fixture|Press \/|⌕/);
+		let blurred = false;
+		control.props.onClick({ currentTarget: { blur: () => { blurred = true; } } });
+		assert.equal(blurred, true);
+		assert.deepEqual(actions, ['CycleVkSearchKind']);
+		for (const key of ['Enter', ' ']) {
+			actions.length = 0;
+			let prevented = false;
+			let stopped = false;
+			const event = { key, repeat: false, preventDefault: () => { prevented = true; },
+				stopPropagation: () => { stopped = true; }, currentTarget: { blur: () => {} } };
+			control.props.onKeyDown(event);
+			assert.ok(prevented && stopped, 'button activation must not reach global playback shortcuts');
+			control.props.onKeyDown({ ...event, repeat: true });
+			assert.deepEqual(actions, ['CycleVkSearchKind']);
+		}
+	}
+	const editing = renderSearch({ screen: 'Vk', search_editing: true });
+	assert.equal(nodes(editing).find((node) => text(node) === '[v] Tracks').props.disabled, true);
+	assert.equal(nodes(renderSearch({ screen: 'SoundCloud' })).some((node) => text(node).includes('[v] Tracks')), false);
 });
 
 test('nonempty catalogues retain a compact mouse search button without a duplicate empty editor', () => {
