@@ -1019,7 +1019,7 @@ fn youtube_thumbnail_height(
         .max(MIN_THUMBNAIL_HEIGHT)
 }
 
-/// Chooses a Yandex artwork height that displays the selected square source
+/// Chooses a Yandex or VK artwork height that displays the selected source
 /// at its useful pixel size without upscaling it beyond that source.
 ///
 /// The ordinary thumbnail-height preference remains the minimum requested
@@ -4873,7 +4873,12 @@ impl ThumbnailSizing {
             details.thumbnail_dimensions,
             self.terminal_window,
         );
-        if details.source.starts_with("Yandex Music") {
+        if details.source.starts_with("Yandex Music")
+            || details
+                .media_id
+                .as_ref()
+                .is_some_and(|id| id.source == SourceKind::Vk)
+        {
             yandex_music_thumbnail_height(
                 height,
                 artwork_width,
@@ -6295,6 +6300,44 @@ fn render_information_panel(
             + 2 * u16::from(!details.url_info.is_empty())
             + u16::from(expanded_url)
     };
+    if !details.thumbnail_expanded
+        && details
+            .media_id
+            .as_ref()
+            .is_some_and(|id| id.source == SourceKind::Vk)
+    {
+        // Keep VK's original URL and catalogue actions below a native-sized
+        // cover, including while its loading placeholder fills the whole block.
+        // The existing link reserve owns the separator; retain each visible row too.
+        let link_rows = details
+            .links
+            .iter()
+            .enumerate()
+            .filter(|(_, link)| link.description_range.is_none())
+            .fold(0_u16, |rows, (index, link)| {
+                let artist_row = u16::from(matches!(
+                    link.internal_target,
+                    Some(DetailLinkInternalTarget::VkArtist(_))
+                ));
+                let next_is_wikidata = details
+                    .links
+                    .get(index.saturating_add(1))
+                    .is_some_and(|next| next.wikidata_item_id.is_some());
+                let spacer = u16::from(
+                    !next_is_wikidata
+                        && matches!(
+                            link.presentation,
+                            DetailLinkPresentation::LabelAndUrlSpaced
+                                | DetailLinkPresentation::LabelOnlySpaced
+                                | DetailLinkPresentation::UrlOnlySpaced
+                        ),
+                );
+                rows.saturating_add(1)
+                    .saturating_add(artist_row)
+                    .saturating_add(spacer)
+            });
+        text_reserve = text_reserve.saturating_add(link_rows);
+    }
     let compact_metadata_height = u16::try_from(
         lines
             .iter()
@@ -37474,6 +37517,175 @@ for encoded, expected in json.load(sys.stdin):
             requested_area.height > DEFAULT_THUMBNAIL_HEIGHT,
             "an 800×800 source in a full-HD terminal must render larger than the 400×400 fallback"
         );
+    }
+
+    /// Keeps artwork and its exact catalogue links together in layout-only fixtures.
+    fn vk_artwork_layout_view(dimensions: Option<(u32, u32)>) -> ViewModel {
+        let original = "https://vk.ru/audio7_11";
+        let artist = "https://vk.ru/artist/fixture";
+        let album = "https://vk.ru/music/album/-7_11";
+        let id = MediaId::new(SourceKind::Vk, "7_11");
+        ViewModel {
+            screen: Screen::Vk,
+            external_opener_available: true,
+            rows: vec![RowView {
+                media_id: Some(id.clone()),
+                ..RowView::default()
+            }],
+            details: Some(DetailView {
+                media_id: Some(id),
+                title: "VK artwork fixture".to_owned(),
+                source: "VK".to_owned(),
+                length: "3:22".to_owned(),
+                thumbnail_url: Some(
+                    url::Url::parse("https://sun1.userapi.com/fixture.jpg").unwrap(),
+                ),
+                thumbnail_dimensions: dimensions,
+                links: vec![
+                    DetailLinkView {
+                        url: original.to_owned(),
+                        presentation: DetailLinkPresentation::UrlOnly,
+                        ..DetailLinkView::default()
+                    },
+                    DetailLinkView {
+                        label: "Artist".to_owned(),
+                        url: artist.to_owned(),
+                        internal_target: Some(DetailLinkInternalTarget::VkArtist(
+                            artist.to_owned(),
+                        )),
+                        ..DetailLinkView::default()
+                    },
+                    DetailLinkView {
+                        label: "Album".to_owned(),
+                        url: album.to_owned(),
+                        internal_target: Some(DetailLinkInternalTarget::VkAlbum(album.to_owned())),
+                        ..DetailLinkView::default()
+                    },
+                ],
+                ..DetailView::default()
+            }),
+            ..ViewModel::default()
+        }
+    }
+
+    /// Width and native aspect ratio control VK sizing, independently of YouTube's height rule.
+    #[test]
+    fn vk_artwork_sizing_uses_native_dimensions_without_changing_other_sources() {
+        let metrics = TerminalWindowMetrics::new(120, 40, 1_200, 800);
+        let mut details = vk_artwork_layout_view(Some((600, 600))).details.unwrap();
+        for (dimensions, configured, expected) in [
+            (Some((600, 600)), 20, 30),
+            (Some((600, 1_200)), 20, 60),
+            (Some((1_200, 600)), 20, 20),
+            (Some((300, 300)), 4, 15),
+            (Some((300, 150)), 4, 8),
+            (None, 20, 20),
+            (Some((0, 300)), 20, 20),
+            (Some((300, 0)), 20, 20),
+        ] {
+            details.thumbnail_dimensions = dimensions;
+            assert_eq!(
+                ThumbnailSizing::adaptive_youtube(configured, metrics)
+                    .preferred_height(&details, 60, 60),
+                expected,
+                "{dimensions:?}"
+            );
+        }
+        details.thumbnail_dimensions = Some((600, 600));
+        assert_eq!(
+            ThumbnailSizing::adaptive_youtube(20, None).preferred_height(&details, 60, 60),
+            30
+        );
+        for source in [
+            SourceKind::SoundCloud,
+            SourceKind::Funkwhale,
+            SourceKind::Bandcamp,
+        ] {
+            details.media_id = Some(MediaId::new(source, "fixture"));
+            assert_eq!(
+                ThumbnailSizing::adaptive_youtube(20, metrics).preferred_height(&details, 60, 60),
+                20
+            );
+        }
+        details.source = "Yandex Music".to_owned();
+        assert_eq!(
+            ThumbnailSizing::adaptive_youtube(20, metrics).preferred_height(&details, 60, 60),
+            30
+        );
+    }
+
+    /// A 1200-pixel-wide terminal can use larger advertised covers below 1080 pixels high.
+    #[test]
+    fn vk_artwork_grows_in_a_1200_pixel_wide_terminal() {
+        let view = vk_artwork_layout_view(Some((600, 600)));
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        let mut hits = HitMap::default();
+        let mut renderer = MockThumbnailRenderer {
+            enabled: true,
+            ..MockThumbnailRenderer::default()
+        };
+        terminal
+            .draw(|frame| {
+                render_details_with_terminal_window(
+                    frame,
+                    Rect::new(60, 0, 60, 38),
+                    &view,
+                    true,
+                    DEFAULT_THUMBNAIL_HEIGHT,
+                    TerminalWindowMetrics::new(120, 40, 1_200, 800),
+                    &Theme::new(false),
+                    &mut hits,
+                    Some(&mut renderer),
+                );
+            })
+            .unwrap();
+        assert!(renderer.synchronized[0].1.height > DEFAULT_THUMBNAIL_HEIGHT);
+        assert!(rendered_text(&terminal).contains("https://vk.ru/audio7_11"));
+    }
+
+    /// Small panes reserve the original, artist and album links while a large cover loads.
+    #[test]
+    fn vk_artwork_preserves_catalogue_links_in_short_terminals() {
+        let view = vk_artwork_layout_view(Some((600, 600)));
+        for (width, height) in [(40, 14), (24, 10)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let mut hits = HitMap::default();
+            let mut renderer = MockThumbnailRenderer {
+                enabled: true,
+                ..MockThumbnailRenderer::default()
+            };
+            terminal
+                .draw(|frame| {
+                    render_details_with_terminal_window(
+                        frame,
+                        frame.area(),
+                        &view,
+                        true,
+                        DEFAULT_THUMBNAIL_HEIGHT,
+                        TerminalWindowMetrics::new(width, height, width * 10, height * 20),
+                        &Theme::new(false),
+                        &mut hits,
+                        Some(&mut renderer),
+                    );
+                })
+                .unwrap();
+            for index in 0..3 {
+                let (_, area) = hits
+                    .detail_links
+                    .iter()
+                    .find(|(link, _)| *link == index)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "missing link {index} in {width}x{height}: {}",
+                            rendered_text(&terminal)
+                        )
+                    });
+                assert_eq!(area.intersection(Rect::new(0, 0, width, height)), *area);
+            }
+            for (_, area) in &renderer.synchronized {
+                assert_eq!(area.intersection(Rect::new(0, 0, width, height)), *area);
+            }
+        }
     }
 
     #[test]

@@ -315,6 +315,7 @@ impl AppController {
                         .duration_seconds
                         .map_or_else(String::new, format_seconds),
                     thumbnail_url: track.artwork_url.clone(),
+                    thumbnail_dimensions: track.artwork_dimensions,
                     links: track_links(track),
                     ..DetailView::default()
                 });

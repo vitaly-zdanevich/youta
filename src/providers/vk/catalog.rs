@@ -35,6 +35,8 @@ pub struct VkTrack {
     pub duration_seconds: Option<u64>,
     /// Public HTTPS VK artwork, fetched separately without session cookies.
     pub artwork_url: Option<Url>,
+    /// Bounded pixel dimensions advertised by the selected cover URL, when present.
+    pub artwork_dimensions: Option<(u32, u32)>,
     reload: ReloadKey,
     album: Option<AlbumReference>,
     main_artist: Option<String>,
@@ -145,6 +147,7 @@ impl VkTrack {
             album_title: None,
             duration_seconds: Some(120),
             artwork_url: None,
+            artwork_dimensions: None,
             reload: ReloadKey {
                 action: "fixture-action".to_owned(),
                 locator: "fixture-locator".to_owned(),
@@ -673,7 +676,17 @@ fn parse_track(value: &Value, scope: &Arc<()>) -> Option<VkTrack> {
         .get(14)
         .and_then(Value::as_str)
         .filter(|value| value.len() <= 16 * 1024)
-        .and_then(|value| value.split(',').take(4).filter_map(artwork_url).last());
+        .and_then(|value| {
+            value
+                .split(',')
+                .take(4)
+                .filter_map(artwork_url)
+                .max_by_key(|url| {
+                    artwork_dimensions(url)
+                        .map_or(0, |(width, height)| u64::from(width) * u64::from(height))
+                })
+        });
+    let artwork_dimensions = artwork_url.as_ref().and_then(artwork_dimensions);
     Some(VkTrack {
         id,
         title,
@@ -681,6 +694,7 @@ fn parse_track(value: &Value, scope: &Arc<()>) -> Option<VkTrack> {
         album_title: None,
         duration_seconds,
         artwork_url,
+        artwork_dimensions,
         reload: ReloadKey {
             action: action.to_owned(),
             locator: locator.to_owned(),
@@ -816,6 +830,29 @@ fn plain_label(value: &str) -> Option<String> {
     }
     let output = output.split_whitespace().collect::<Vec<_>>().join(" ");
     (output.len() <= MAX_LABEL_BYTES).then_some(output)
+}
+
+/// Reads the rendition VK actually advertised without rewriting signed CDN URLs.
+///
+/// Dimensionless URLs retain their previous last-valid fallback ordering. A
+/// duplicate, malformed or excessive size is unknown, not an allocation hint.
+fn artwork_dimensions(url: &Url) -> Option<(u32, u32)> {
+    let mut sizes = url.query_pairs().filter(|(key, _)| key == "size");
+    let (_, size) = sizes.next()?;
+    if sizes.next().is_some() {
+        return None;
+    }
+    let (width, height) = size.split_once('x')?;
+    let parse = |value: &str| {
+        if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        value
+            .parse::<u32>()
+            .ok()
+            .filter(|size| (1..=4096).contains(size))
+    };
+    Some((parse(width)?, parse(height)?))
 }
 
 fn artwork_url(raw: &str) -> Option<Url> {
@@ -1115,6 +1152,57 @@ pub(super) mod tests {
                 {"id":"found-in-text", "type":"search", "list":[row(3)], "hasMore":false}
             ], "playlist":{"id":"found-in-text", "list":[row(3)]}
         }]]})
+    }
+
+    /// VK can advertise a large cover before its compact rendition.
+    #[test]
+    fn artwork_selects_largest_advertised_size_independent_of_url_order() {
+        let scope = Arc::new(());
+        let large = "https://sun1.userapi.com/cover.jpg?size=300x300&token=fixture";
+        let small = "https://sun1.userapi.com/cover.jpg?size=160x160&token=fixture";
+        for urls in [format!("{large},{small}"), format!("{small},{large}")] {
+            let mut item = row(1);
+            item[14] = json!(urls);
+            let track = parse_track(&item, &scope).unwrap();
+            assert_eq!(track.artwork_url.as_ref().unwrap().as_str(), large);
+            assert_eq!(track.artwork_dimensions, Some((300, 300)));
+        }
+    }
+
+    /// Unknown dimensions must not invent sizes or admit untrusted artwork hosts.
+    #[test]
+    fn artwork_size_validation_preserves_safe_fallbacks() {
+        for size in [
+            "0x300",
+            "300x0",
+            "-1x300",
+            "+300x300",
+            "300",
+            "300x300x300",
+            "999999999999x1",
+            "4097x300",
+            "300x300&size=1200x1200",
+        ] {
+            let url =
+                Url::parse(&format!("https://sun1.userapi.com/cover.jpg?size={size}")).unwrap();
+            assert_eq!(artwork_dimensions(&url), None);
+        }
+        let mut item = row(1);
+        item[14] = json!(
+            "https://sun1.userapi.com/cover.jpg?size=300x300,https://evil.test/larger.jpg?size=1200x1200,https://sun1.userapi.com/unknown.jpg"
+        );
+        let track = parse_track(&item, &Arc::new(())).unwrap();
+        assert_eq!(track.artwork_url.as_ref().unwrap().path(), "/cover.jpg");
+        assert_eq!(track.artwork_dimensions, Some((300, 300)));
+        let unknown = parse_track(&row(1), &Arc::new(())).unwrap();
+        assert_eq!(unknown.artwork_url.as_ref().unwrap().path(), "/large.jpg");
+        assert_eq!(unknown.artwork_dimensions, None);
+        item[14] = json!(
+            "https://sun1.userapi.com/full.jpg?size=1200x1200,https://sun1.userapi.com/preview.jpg?size=300x300"
+        );
+        let full = parse_track(&item, &Arc::new(())).unwrap();
+        assert_eq!(full.artwork_url.as_ref().unwrap().path(), "/full.jpg");
+        assert_eq!(full.artwork_dimensions, Some((1200, 1200)));
     }
 
     #[test]

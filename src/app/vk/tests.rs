@@ -239,6 +239,7 @@ fn vk_selected_track_album_details_do_not_leak_into_tracks_without_albums() {
     album_track.album_title = Some("Fixture album".to_owned());
     album_track.artwork_url =
         Some(url::Url::parse("https://sun1.userapi.com/fixture.jpg").unwrap());
+    album_track.artwork_dimensions = Some((300, 300));
     let mut blank_album_track = track(3);
     blank_album_track.album_title = Some(" \t\n ".to_owned());
     app.apply_vk_page(
@@ -260,6 +261,7 @@ fn vk_selected_track_album_details_do_not_leak_into_tracks_without_albums() {
     assert_eq!(details.source, "VK");
     assert_eq!(details.length, "2:00");
     assert_eq!(details.thumbnail_url, album_track.artwork_url);
+    assert_eq!(details.thumbnail_dimensions, Some((300, 300)));
     assert_eq!(details.webpage_url, Some(album_track.id.webpage_url()));
     assert_eq!(details.links.len(), 2);
     assert!(details.links[0].label.is_empty());
@@ -267,6 +269,10 @@ fn vk_selected_track_album_details_do_not_leak_into_tracks_without_albums() {
 
     app.select_row(0);
     assert!(app.view.details.as_ref().unwrap().description.is_empty());
+    assert_eq!(
+        app.view.details.as_ref().unwrap().thumbnail_dimensions,
+        None
+    );
     app.select_row(1);
     assert_eq!(
         app.view.details.as_ref().unwrap().links[1].label,
