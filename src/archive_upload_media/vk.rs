@@ -23,14 +23,18 @@ use crate::providers::vk::{VkAudioId, VkClient, VkPage, VkPlaybackUrl, VkTrack};
 #[derive(Clone)]
 pub struct VkExportSource {
     client: VkClient,
-    track: VkTrack,
+    /// Keeps catalogue metadata from inflating export and fingerprint worker enums.
+    track: Box<VkTrack>,
 }
 
 impl VkExportSource {
     /// Captures an already authenticated client and its exact selected catalogue row.
     #[must_use]
     pub fn new(client: VkClient, track: VkTrack) -> Self {
-        Self { client, track }
+        Self {
+            client,
+            track: Box::new(track),
+        }
     }
 
     /// Returns only the canonical public identity, never a private reload or media URL.

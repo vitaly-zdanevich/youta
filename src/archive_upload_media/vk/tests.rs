@@ -6,6 +6,18 @@ use crate::providers::vk::VkPage;
 use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 
+/// Retained rows must not inflate every export or fingerprint worker request.
+#[test]
+fn retained_export_source_keeps_catalogue_metadata_out_of_line() {
+    let snapshot_bytes = std::mem::size_of::<VkExportSource>();
+    let client_bytes = std::mem::size_of::<VkClient>();
+    let pointer_with_padding = 2 * std::mem::size_of::<usize>();
+    assert!(
+        snapshot_bytes <= client_bytes + pointer_with_padding,
+        "VK export snapshot is {snapshot_bytes} bytes beside a {client_bytes}-byte client"
+    );
+}
+
 /// Records native requests and can hold authentication until cancellation is visible.
 struct MockResolver {
     calls: Arc<Mutex<Vec<&'static str>>>,
