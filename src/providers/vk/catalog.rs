@@ -1123,6 +1123,7 @@ fn parse_search_album(value: &Value, scope: &Arc<()>) -> Option<VkAlbum> {
     })
 }
 
+/// Decodes display markup, repairs strongly indicated mojibake, then removes terminal controls.
 fn plain_label(value: &str) -> Option<String> {
     if value.len() > MAX_LABEL_BYTES {
         return None;
@@ -1132,15 +1133,39 @@ fn plain_label(value: &str) -> Option<String> {
     let mut output = String::new();
     for token in Tokenizer::new_with_emitter(value, emitter) {
         if let Ok(Token::String(text)) = token {
-            output.extend(
-                String::from_utf8_lossy(text.value.as_ref())
-                    .chars()
-                    .filter(|character| !character.is_control()),
-            );
+            output.push_str(&String::from_utf8_lossy(text.value.as_ref()));
         }
     }
+    if let Some(repaired) = repaired_windows_1252_utf8_label(&output) {
+        output = repaired;
+    }
+    output.retain(|character| !character.is_control());
     let output = output.split_whitespace().collect::<Vec<_>>().join(" ");
     (output.len() <= MAX_LABEL_BYTES).then_some(output)
+}
+
+/// Recovers only a lossless whole-label UTF-8-as-Windows-1252 Cyrillic signature.
+///
+/// Three recovered Cyrillic characters provide repeated evidence; short, malformed,
+/// already-correct or mixed-encoding labels remain untouched. This runs after
+/// entity decoding but before controls such as U+009D lose recoverable bytes.
+/// It applies only to display labels, never identities, hashes or URLs.
+fn repaired_windows_1252_utf8_label(value: &str) -> Option<String> {
+    let (bytes, _, had_errors) = encoding_rs::WINDOWS_1252.encode(value);
+    if had_errors {
+        return None;
+    }
+    let decoded = std::str::from_utf8(bytes.as_ref()).ok()?;
+    if decoded
+        .chars()
+        .filter(|&character| matches!(character, '\u{0400}'..='\u{052f}'))
+        .take(3)
+        .count()
+        < 3
+    {
+        return None;
+    }
+    Some(decoded.to_owned())
 }
 
 /// Reads the rendition VK actually advertised without rewriting signed CDN URLs.
@@ -1255,6 +1280,88 @@ pub(super) mod tests {
         let fixture = VkAlbum::fixture(-123, 456, "Fixture", "Artist");
         assert_eq!(fixture.webpage_url(), album.webpage_url());
         assert!(!format!("{:?}", VkPageCursor::fixture_album_search()).contains("fixture-private"));
+    }
+
+    /// Recover the reported labels before C1 controls erase recoverable Cyrillic bytes.
+    #[test]
+    fn album_labels_repair_windows_1252_decoded_utf8_before_control_filtering() {
+        let title = "Ð‘Ð¾Ð»ÐµÐ½ Ð½Ðµ Ñ‚Ð¾Ð±Ð¾Ð¹";
+        let artist = "Ð\u{009d}ÐžÐ’Ð«Ð• ÐŸÐ•Ð¡Ð\u{009d}Ð˜ Ð¥Ð˜Ð¢Ð« 2024";
+        let scope = Arc::new(());
+        for entities in [false, true] {
+            let label = |value: &str| {
+                if entities {
+                    value
+                        .chars()
+                        .map(|character| format!("&#{};", u32::from(character)))
+                        .collect::<String>()
+                } else {
+                    value.to_owned()
+                }
+            };
+            let mut response = album_catalogue_fixture("");
+            let metadata = &mut response["payload"][1][1]["playlists"][0];
+            metadata["title"] = json!(if entities {
+                format!("<b>{}</b>", label(title))
+            } else {
+                title.replacen("Ð‘", "<b>Ð</b>‘", 1)
+            });
+            metadata["authorName"] = json!(label(artist));
+            let original = metadata.clone();
+            let page = album_search_page(&response, "private-album-section", None, &scope).unwrap();
+            let album = &page.albums[0];
+            assert_eq!(album.title, "Болен не тобой");
+            assert_eq!(album.artist, "НОВЫЕ ПЕСНИ ХИТЫ 2024");
+            assert_eq!(album.album.owner, -123);
+            assert_eq!(album.album.id, 456);
+            assert_eq!(album.album.access_hash, "private-album-hash");
+            assert_eq!(
+                album.artwork_url.as_ref().unwrap().as_str(),
+                original["coverUrl"].as_str().unwrap()
+            );
+            assert_eq!(
+                album.webpage_url().as_str(),
+                "https://vk.ru/music/album/-123_456"
+            );
+            assert!(album.reference(&scope).is_ok());
+            assert!(album.reference(&Arc::new(())).is_err());
+            assert!(!format!("{album:?}").contains("private-"));
+            assert_eq!(response["payload"][1][1]["playlists"][0], original);
+        }
+    }
+
+    /// Lossy, short or mixed encodings must not invite speculative label rewrites.
+    #[test]
+    fn label_encoding_repair_preserves_correct_ambiguous_and_mixed_text() {
+        for value in [
+            "Болен не тобой · НОВЫЕ ПЕСНИ ХИТЫ 2024",
+            "Björk · déjà vu · François · Straße",
+            "Ðani · Þór · Ñandú",
+            "ASCII album 2024",
+            "Ð°Ð±",
+            "Ð‘Ð¾Ð»ÐµÐ½ Ð",
+            "Ð‘Ð¾Ð»ÐµÐ½ �",
+            "Болен · Ð‘Ð¾Ð»ÐµÐ½",
+            "Björk · Ð‘Ð¾Ð»ÐµÐ½",
+            "東京 · Ð‘Ð¾Ð»ÐµÐ½",
+            "Â£ · CafÃ©",
+        ] {
+            assert_eq!(plain_label(value).as_deref(), Some(value), "{value}");
+        }
+    }
+
+    /// Repair precedes sanitization but never relaxes terminal safety or label bounds.
+    #[test]
+    fn label_encoding_repair_retains_sanitization_and_size_limits() {
+        assert_eq!(
+            plain_label("<b>Ð‘Ð¾Ð»ÐµÐ½</b> &amp; live\u{001b}\u{0007}\n").as_deref(),
+            Some("Болен & live")
+        );
+        assert_eq!(
+            plain_label("unchanged\u{001b}\u{0007}").as_deref(),
+            Some("unchanged")
+        );
+        assert!(plain_label(&"Ð‘Ð¾Ð»ÐµÐ½".repeat(MAX_LABEL_BYTES)).is_none());
     }
 
     #[test]
