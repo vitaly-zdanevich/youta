@@ -13,7 +13,8 @@ fn controller() -> (AppController, Receiver<LocalFingerprintWorkerRequest>) {
     );
     app.diagnostic_only = true;
     app.shutdown_local_fingerprint_worker();
-    app.config.providers.vk_cookies_file = Some(PathBuf::from("/tmp/vk-identify-fixture-cookies"));
+    app.config.providers.vk_cookies_file =
+        Some(std::env::temp_dir().join("vk-identify-fixture-cookies"));
     app.config.providers.acoustid_client_key = Some("fixture-client-key".to_owned());
     let (sender, receiver) = bounded(1);
     app.local_fingerprint_requests = Some(sender);
@@ -133,7 +134,7 @@ fn vk_fingerprint_selection_session_and_hidden_tabs_reject_late_results() {
             0 => select(&mut app, 12),
             1 => {
                 app.config.providers.vk_cookies_file =
-                    Some(PathBuf::from("/tmp/vk-other-fixture-cookies"))
+                    Some(std::env::temp_dir().join("vk-other-fixture-cookies"))
             }
             _ => app.view.screen = Screen::Local,
         }

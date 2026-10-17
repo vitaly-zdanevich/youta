@@ -14,7 +14,7 @@ fn controller() -> AppController {
     app.show_screen(Screen::Vk);
     app.vk.query = "fixture search".into();
     app.view.search_query = app.vk.query.clone();
-    app.config.providers.vk_cookies_file = Some(PathBuf::from("/tmp/vk-browse-cookies"));
+    app.config.providers.vk_cookies_file = Some(std::env::temp_dir().join("vk-browse-cookies"));
     app.vk.cookie_file = app.config.providers.vk_cookies_file.clone();
     app.vk.items = (1..=2)
         .map(|id| {
@@ -104,7 +104,7 @@ fn vk_album_navigation_rejects_stale_targets_and_restores_search() {
 fn vk_cookie_change_discards_private_album_navigation() {
     let mut app = controller();
     app.open_vk_album(app.vk.items[1].album_webpage_url().unwrap().to_string());
-    app.config.providers.vk_cookies_file = Some(PathBuf::from("/tmp/vk-other-cookies"));
+    app.config.providers.vk_cookies_file = Some(std::env::temp_dir().join("vk-other-cookies"));
     app.refresh_vk_cookie_owner();
     assert!(app.vk.back.is_empty());
     assert!(app.vk.route.is_none());
@@ -234,7 +234,7 @@ fn vk_cookie_change_revokes_the_accepted_now_playing_snapshot() {
     let item = queue_item(&app.vk.items[0]);
     app.remember_now_playing_context(&item);
     app.current_media = Some(item.media.id.clone());
-    app.config.providers.vk_cookies_file = Some(PathBuf::from("/tmp/vk-other-session"));
+    app.config.providers.vk_cookies_file = Some(std::env::temp_dir().join("vk-other-session"));
     app.refresh_vk_cookie_owner();
     assert!(!app.reveal_retained_now_playing(&item));
     assert!(app.vk.items.is_empty());

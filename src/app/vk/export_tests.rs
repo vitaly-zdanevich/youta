@@ -11,7 +11,7 @@ fn controller() -> AppController {
         None,
     );
     app.diagnostic_only = true;
-    let cookie = PathBuf::from("/tmp/youta-vk-exact-export-cookies");
+    let cookie = std::env::temp_dir().join("youta-vk-exact-export-cookies");
     app.config.providers.vk_cookies_file = Some(cookie.clone());
     let track = VkTrack::fixture(
         VkAudioId::new(-7, 999).unwrap(),
@@ -21,6 +21,23 @@ fn controller() -> AppController {
     app.vk = VkState::export_fixture(track, cookie);
     app.show_screen(Screen::Vk);
     app
+}
+
+/// Synthetic credentials use the platform's absolute temporary root without reading a cookie file.
+#[test]
+fn exact_vk_export_fixture_has_a_valid_platform_cookie_owner() {
+    let app = controller();
+    let cookie_file = app.config.providers.vk_cookies_file.as_ref().unwrap();
+    assert!(
+        cookie_file.is_absolute(),
+        "fixture cookies require an absolute path"
+    );
+    assert_eq!(cookie_file.parent(), Some(std::env::temp_dir().as_path()));
+    let owner = app
+        .vk_export_owner()
+        .expect("valid synthetic session owner");
+    assert_eq!(&owner.cookie_file, cookie_file);
+    assert!(app.vk_export_owner_is_current(&owner));
 }
 
 /// Export capture keeps the exact selected identity while the catalogue worker owns its client.
@@ -52,7 +69,7 @@ fn exact_vk_export_rejects_stale_session_and_mismatched_item() {
     let item = app.selected_vk_queue_item().unwrap();
     app.take_vk_worker_client();
     app.config.providers.vk_cookies_file =
-        Some(PathBuf::from("/tmp/youta-vk-other-export-cookies"));
+        Some(std::env::temp_dir().join("youta-vk-other-export-cookies"));
     assert!(!app.vk_export_owner_is_current(&owner));
     assert!(app.capture_vk_export_source(&item).is_none());
     app.refresh_vk_cookie_owner();
@@ -77,7 +94,7 @@ fn vk_commons_review_captures_session_and_rejects_credential_replacement() {
     let draft = CommonsUploadDraft::from_media(&selection.media, selection.channel_url.as_ref());
     app.open_commons_review(draft);
     let original = app.config.providers.vk_cookies_file.clone();
-    app.config.providers.vk_cookies_file = Some(PathBuf::from("/tmp/vk-review-new-owner"));
+    app.config.providers.vk_cookies_file = Some(std::env::temp_dir().join("vk-review-new-owner"));
     app.refresh_vk_cookie_owner();
     app.config.providers.vk_cookies_file = original;
     app.refresh_vk_cookie_owner();
@@ -112,7 +129,7 @@ fn vk_archive_review_rejects_replaced_session_before_submission() {
     let mut app = controller();
     app.open_archive_upload();
     let generation = app.view.archive_upload_popup.as_ref().unwrap().generation;
-    app.config.providers.vk_cookies_file = Some(PathBuf::from("/tmp/vk-archive-new-owner"));
+    app.config.providers.vk_cookies_file = Some(std::env::temp_dir().join("vk-archive-new-owner"));
     app.submit_archive_upload(generation);
     let popup = app.view.archive_upload_popup.as_ref().unwrap();
     assert!(
