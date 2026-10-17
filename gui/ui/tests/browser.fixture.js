@@ -996,7 +996,8 @@
 			const selection = window.getSelection();
 			selection.removeAllRanges();
 			selection.addRange(range);
-			assert(styles.userSelect === 'text' && selection.toString() === path,
+			// Native WebKit exposes the prefixed computed-style property.
+			assert((styles.userSelect ?? styles.webkitUserSelect) === 'text' && selection.toString() === path,
 				`The complete Local path remains selectable without timestamp text: ${path}`);
 			selection.removeAllRanges();
 			assert(rendered.querySelector('button, a') === null,
@@ -1720,7 +1721,8 @@
 		await until(() => {
 			const bounds = document.querySelector('[data-detail-link="4"]')?.getBoundingClientRect();
 			const panel = document.querySelector('[aria-label=Details]').getBoundingClientRect();
-			return bounds && bounds.top >= panel.top && bounds.bottom <= panel.bottom;
+			// Native scrolling can round to whole pixels while bounds retain fractions.
+			return bounds && bounds.top > panel.top - 1 && bounds.bottom < panel.bottom + 1;
 		}, 'keyboard reveals distant inline link');
 		checks.push('Keyboard selection reveals an offscreen inline value');
 		snapshot({ detail_link_reveal: null });
