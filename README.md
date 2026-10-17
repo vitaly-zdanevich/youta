@@ -1958,6 +1958,11 @@ advertises an album or artist identity, click its Details link or press `b`
 returns to the previous results and selection without repeating the search.
 Artist links are omitted when VK supplies only a name, not an exact identity.
 
+During playback, Details shows the observed codec and measured bitrate, for
+example `MP3 192 kb/s, 4,3 MB`. The size appears only for a known standalone
+source file, not an HLS manifest. Unknown values are omitted; these facts come
+from mpv's playback events without additional media downloads or probing.
+
 `U` (**To Commons**) and `I` (**To archive.org**) open the existing upload review
 for the selected track; only upload audio you have permission to publish under
 the chosen license. VK audio is resolved natively, without sending its cookies

@@ -35,6 +35,12 @@ mod backend {
     const MAX_WARNING_LINES: usize = 12;
     const MAX_DIAGNOSTIC_CHARS: usize = 512;
     const MAX_STREAM_TITLE_BYTES: usize = 512;
+    /// Codec identifiers are short ASCII names, not arbitrary decoder or URL descriptions.
+    const MAX_AUDIO_CODEC_BYTES: usize = 64;
+    /// Bound selected-track inspection independently of the number of advertised streams.
+    const MAX_AUDIO_METADATA_TRACKS: usize = 64;
+    /// Includes high-resolution PCM while excluding implausible or malformed packet rates.
+    const MAX_AUDIO_BITRATE_BPS: f64 = 1_000_000_000.0;
     const MAX_RESOLVED_HTTP_HEADERS: usize = 32;
     const MAX_RESOLVED_HTTP_HEADER_BYTES: usize = 16 * 1024;
     const ICY_TITLE_OBSERVER_ID: u64 = 1;
@@ -42,7 +48,7 @@ mod backend {
     const EOF_OBSERVER_ID: u64 = 2;
     const EOF_PROPERTY: &str = "eof-reached";
     /// Ordered initial reads and observation IDs share one allowlisted vocabulary.
-    const STATUS_PROPERTIES: [&str; 10] = [
+    const STATUS_PROPERTIES: [&str; 14] = [
         "idle-active",
         "time-pos",
         "duration",
@@ -53,6 +59,10 @@ mod backend {
         "paused-for-cache",
         "demuxer-cache-state",
         "media-title",
+        "track-list",
+        "audio-bitrate",
+        "file-format",
+        "file-size",
     ];
     /// Keeps snapshot observations separate from ICY and held-EOF observations.
     const STATUS_OBSERVER_BASE: u64 = 10;
@@ -72,6 +82,14 @@ mod backend {
         stream_title: Option<String>,
         /// Latest values from the initial snapshot and ordered property observations.
         status: PlaybackStatus,
+        /// Raw source bytes remain private until the demuxed format is a standalone file.
+        source_file_size: Option<u64>,
+        /// Manifest and timeline formats never qualify as a complete source file.
+        standalone_audio_file: bool,
+        /// A separate selected audio file cannot borrow the main file's byte length.
+        main_audio_selected: bool,
+        /// Track changes invalidate the last packet rate even if the codec name is unchanged.
+        audio_track_id: Option<u64>,
         /// Missing properties are initialized too; absence is not a reason to poll.
         status_initialized: bool,
         observations_configured: bool,
@@ -253,6 +271,7 @@ mod backend {
             #[cfg(feature = "cache")] generation: u64,
         ) -> Result<()> {
             self.ipc.stream_title = None;
+            self.ipc.clear_audio_metadata();
             if let Some(cache) = &self.ipc.cache_export {
                 cache.begin_load(&input.location);
             }
@@ -463,6 +482,10 @@ mod backend {
                 warnings: VecDeque::new(),
                 stream_title: None,
                 status: PlaybackStatus::default(),
+                source_file_size: None,
+                standalone_audio_file: false,
+                main_audio_selected: false,
+                audio_track_id: None,
                 status_initialized: false,
                 observations_configured: false,
                 keep_open: false,
@@ -675,6 +698,70 @@ mod backend {
             self.status.buffering = false;
             self.status.buffered_ranges.clear();
             self.status.title = None;
+            self.clear_audio_metadata();
+        }
+
+        /// Removes all file-owned technical values and their private eligibility state.
+        fn clear_audio_metadata(&mut self) {
+            self.status.audio_codec = None;
+            self.status.audio_bitrate_bps = None;
+            self.status.file_size_bytes = None;
+            self.source_file_size = None;
+            self.standalone_audio_file = false;
+            self.main_audio_selected = false;
+            self.audio_track_id = None;
+        }
+
+        /// Accepts technical observations only for a fully loaded, still-current source.
+        fn apply_audio_metadata_property(&mut self, name: &str, value: &Value) {
+            if !self.media_loaded || self.pending_keep_open.is_some() || self.status.idle {
+                self.clear_audio_metadata();
+                return;
+            }
+            match name {
+                "track-list" => {
+                    let audio = selected_audio_track(value);
+                    let codec = audio
+                        .and_then(|track| track.get("codec"))
+                        .and_then(Value::as_str)
+                        .and_then(normalize_audio_codec);
+                    let main_audio = audio.is_some_and(|track| {
+                        track.get("external").and_then(Value::as_bool) == Some(false)
+                    });
+                    let track_id = audio
+                        .and_then(|track| track.get("id"))
+                        .and_then(Value::as_u64)
+                        .filter(|id| *id > 0);
+                    if track_id != self.audio_track_id
+                        || codec != self.status.audio_codec
+                        || main_audio != self.main_audio_selected
+                    {
+                        self.status.audio_bitrate_bps = None;
+                    }
+                    self.audio_track_id = track_id;
+                    self.status.audio_codec = codec;
+                    self.main_audio_selected = main_audio;
+                }
+                "audio-bitrate" => {
+                    self.status.audio_bitrate_bps =
+                        value.as_f64().and_then(normalize_audio_bitrate);
+                }
+                "file-format" => {
+                    // Match the whole value: hls, dash, edl/mp3 and other compound formats
+                    // can report only a manifest or segment size. Unknown formats stay absent.
+                    self.standalone_audio_file = matches!(
+                        value.as_str(),
+                        Some(
+                            "mp3" | "flac" | "wav" | "aiff" | "ape" | "wv" | "tta" | "aac" | "ogg"
+                        )
+                    );
+                }
+                "file-size" => self.source_file_size = value.as_u64().filter(|size| *size > 0),
+                _ => {}
+            }
+            self.status.file_size_bytes = (self.standalone_audio_file && self.main_audio_selected)
+                .then_some(self.source_file_size)
+                .flatten();
         }
 
         /// Applies only allowlisted properties using the same missing-value defaults as GET.
@@ -685,7 +772,12 @@ mod backend {
                     .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
             };
             match name {
-                "idle-active" => self.status.idle = value.as_bool().unwrap_or(false),
+                "idle-active" => {
+                    self.status.idle = value.as_bool().unwrap_or(false);
+                    if self.status.idle {
+                        self.clear_audio_metadata();
+                    }
+                }
                 "time-pos" => {
                     self.status.position = seconds().unwrap_or(Duration::ZERO);
                     #[cfg(feature = "cache")]
@@ -718,6 +810,9 @@ mod backend {
                 "paused-for-cache" => self.status.buffering = value.as_bool().unwrap_or(false),
                 "demuxer-cache-state" => self.status.buffered_ranges = parse_buffered_ranges(value),
                 "media-title" => self.status.title = value.as_str().map(ToOwned::to_owned),
+                "track-list" | "audio-bitrate" | "file-format" | "file-size" => {
+                    self.apply_audio_metadata_property(name, value);
+                }
                 _ => {}
             }
         }
@@ -935,6 +1030,43 @@ mod backend {
             .collect::<String>();
         bounded.push_str("...");
         bounded
+    }
+
+    /// Finds one unambiguous selected audio stream without trusting a fixed track index.
+    fn selected_audio_track(value: &Value) -> Option<&Value> {
+        let tracks = value
+            .as_array()
+            .filter(|tracks| tracks.len() <= MAX_AUDIO_METADATA_TRACKS)?;
+        let mut selected = tracks.iter().filter(|track| {
+            track.get("type").and_then(Value::as_str) == Some("audio")
+                && track.get("selected").and_then(Value::as_bool) == Some(true)
+        });
+        let audio = selected.next()?;
+        selected.next().is_none().then_some(audio)
+    }
+
+    /// Keeps canonical codec names safe for both terminal and desktop presentation.
+    fn normalize_audio_codec(codec: &str) -> Option<String> {
+        let codec = codec.trim();
+        (!codec.is_empty()
+            && codec.len() <= MAX_AUDIO_CODEC_BYTES
+            && codec.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'+')
+            }))
+        .then(|| codec.to_ascii_lowercase())
+    }
+
+    /// Rounds a finite packet-derived rate without inventing an average or nominal bitrate.
+    fn normalize_audio_bitrate(bitrate: f64) -> Option<u64> {
+        if !bitrate.is_finite() || !(1.0..=MAX_AUDIO_BITRATE_BPS).contains(&bitrate) {
+            return None;
+        }
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "finite positive bitrate is bounded to one billion before rounding"
+        )]
+        Some(bitrate.round() as u64)
     }
 
     /// Normalizes untrusted ICY text for one terminal line.
@@ -2530,11 +2662,24 @@ mod backend {
         fn backend_with_properties(
             properties: impl IntoIterator<Item = (&'static str, Value)>,
         ) -> (MpvBackend, thread::JoinHandle<()>) {
+            let (backend, _commands, server) = backend_with_recorded_properties(properties);
+            (backend, server)
+        }
+
+        /// Records initial property reads and later commands without a real media process.
+        fn backend_with_recorded_properties(
+            properties: impl IntoIterator<Item = (&'static str, Value)>,
+        ) -> (
+            MpvBackend,
+            mpsc::Receiver<Vec<Value>>,
+            thread::JoinHandle<()>,
+        ) {
             let properties = properties
                 .into_iter()
                 .map(|(name, value)| (name.to_owned(), value))
                 .collect::<BTreeMap<_, _>>();
             let (client, server) = UnixStream::pair().expect("mock IPC pair");
+            let (sender, commands) = mpsc::channel();
             let server_thread = thread::spawn(move || {
                 let mut reader = BufReader::new(server);
                 loop {
@@ -2557,6 +2702,7 @@ mod backend {
                         .and_then(Value::as_array)
                         .expect("command array");
                     let name = command.first().and_then(Value::as_str).unwrap_or_default();
+                    let _ = sender.send(command.clone());
                     let data = if name == "get_property" {
                         command
                             .get(1)
@@ -2606,6 +2752,7 @@ mod backend {
                     #[cfg(feature = "cache")]
                     ram: None,
                 },
+                commands,
                 server_thread,
             )
         }
@@ -3577,6 +3724,283 @@ mod backend {
             server_thread.join().expect("mock status server");
         }
 
+        /// Audio metadata is read once per loaded file, including equal values on replacement.
+        #[test]
+        fn technical_audio_status_reads_once_and_resynchronizes_per_load() {
+            let (mut backend, commands, server) = backend_with_recorded_properties([
+                ("idle-active", json!(false)),
+                (
+                    "track-list",
+                    json!([
+                        {"type": "audio", "selected": false, "codec": "aac"},
+                        {"type": "video", "selected": true, "codec": "h264"},
+                        {"type": "audio", "selected": true, "external": false, "codec": "MP3"},
+                    ]),
+                ),
+                ("audio-bitrate", json!(192_499.6)),
+                ("file-format", json!("mp3")),
+                ("file-size", json!(4_300_000)),
+            ]);
+            backend.ipc.handle_event(&json!({"event": "file-loaded"}));
+            let status = backend.status().unwrap();
+            assert_eq!(status.audio_codec.as_deref(), Some("mp3"));
+            assert_eq!(status.audio_bitrate_bps, Some(192_500));
+            assert_eq!(status.file_size_bytes, Some(4_300_000));
+            let initial = commands.try_iter().collect::<Vec<_>>();
+            for property in ["track-list", "audio-bitrate", "file-format", "file-size"] {
+                assert!(
+                    initial
+                        .iter()
+                        .any(|command| command[0] == "observe_property" && command[2] == property)
+                );
+                assert!(
+                    initial
+                        .iter()
+                        .any(|command| command == &[json!("get_property"), json!(property)])
+                );
+            }
+            backend.status().unwrap();
+            assert!(
+                commands.try_recv().is_err(),
+                "audio metadata must not add polling"
+            );
+            backend.ipc.handle_event(&json!({"event": "start-file"}));
+            assert_eq!(backend.ipc.status.audio_codec, None);
+            assert_eq!(backend.ipc.status.audio_bitrate_bps, None);
+            assert_eq!(backend.ipc.status.file_size_bytes, None);
+            backend.ipc.handle_event(&json!({"event": "file-loaded"}));
+            let replacement = backend.status().unwrap();
+            assert_eq!(replacement.audio_codec, status.audio_codec);
+            assert_eq!(replacement.audio_bitrate_bps, status.audio_bitrate_bps);
+            assert_eq!(replacement.file_size_bytes, status.file_size_bytes);
+            assert_eq!(commands.try_iter().count(), STATUS_PROPERTIES.len());
+            backend.status().unwrap();
+            assert!(commands.try_recv().is_err());
+            backend.shutdown().unwrap();
+            server.join().unwrap();
+        }
+
+        /// Unavailable or malformed technical values never become misleading display facts.
+        #[test]
+        fn technical_audio_metadata_rejects_unavailable_or_malformed_values() {
+            let (client, _server) = UnixStream::pair().unwrap();
+            let mut ipc = MpvIpc::new(IpcLink::over(client));
+            ipc.media_loaded = true;
+            ipc.status.idle = false;
+            let valid = json!([{"type": "audio", "selected": true, "codec": " pcm_s16le "}]);
+            ipc.apply_status_property("track-list", &valid);
+            assert_eq!(ipc.status.audio_codec.as_deref(), Some("pcm_s16le"));
+            let mut malformed = vec![
+                Value::Null,
+                json!({}),
+                json!([]),
+                json!([{"type": "video", "selected": true, "codec": "h264"}]),
+                json!([{"type": "audio", "selected": false, "codec": "mp3"}]),
+                json!([{"type": "audio", "selected": true}]),
+                json!([
+                    {"type": "audio", "selected": true, "codec": "mp3"},
+                    {"type": "audio", "selected": true, "codec": "aac"},
+                ]),
+                json!(vec![
+                    json!({"type": "audio", "selected": true, "codec": "mp3"});
+                    65
+                ]),
+            ];
+            for codec in [
+                "".to_owned(),
+                " ".to_owned(),
+                "mp3\u{1b}[31m".to_owned(),
+                "mp3\nsecret".to_owned(),
+                "https://secret.invalid/codec".to_owned(),
+                "a".repeat(65),
+            ] {
+                malformed.push(json!([{"type": "audio", "selected": true, "codec": codec}]));
+            }
+            for value in malformed {
+                ipc.apply_status_property("track-list", &valid);
+                ipc.apply_status_property("track-list", &value);
+                assert_eq!(ipc.status.audio_codec, None, "{value:?}");
+            }
+            for value in [
+                Value::Null,
+                json!(0),
+                json!(-1),
+                json!(0.1),
+                json!("192000"),
+                json!([]),
+                json!(1_000_000_001_u64),
+                json!(u64::MAX),
+                json!(f64::NAN),
+                json!(f64::INFINITY),
+            ] {
+                ipc.apply_status_property("audio-bitrate", &json!(192_000));
+                assert_eq!(ipc.status.audio_bitrate_bps, Some(192_000));
+                ipc.apply_status_property("audio-bitrate", &value);
+                assert_eq!(ipc.status.audio_bitrate_bps, None, "{value:?}");
+            }
+        }
+
+        /// Switching selected streams cannot pair the new codec with the previous packet rate.
+        #[test]
+        fn technical_audio_track_switch_clears_the_previous_measured_rate() {
+            let (client, _server) = UnixStream::pair().unwrap();
+            let mut ipc = MpvIpc::new(IpcLink::over(client));
+            ipc.media_loaded = true;
+            ipc.status.idle = false;
+            let first = json!([{"id": 1, "type": "audio", "selected": true, "external": false, "codec": "mp3"}]);
+            ipc.apply_status_property("track-list", &first);
+            ipc.apply_status_property("audio-bitrate", &json!(192_000));
+            ipc.apply_status_property("track-list", &first);
+            assert_eq!(ipc.status.audio_bitrate_bps, Some(192_000));
+            for (id, codec) in [(2, "mp3"), (2, "aac")] {
+                ipc.apply_status_property("track-list", &json!([{"id": id, "type": "audio", "selected": true, "external": false, "codec": codec}]));
+                assert_eq!(ipc.status.audio_codec.as_deref(), Some(codec));
+                assert_eq!(ipc.status.audio_bitrate_bps, None);
+                ipc.apply_status_property("audio-bitrate", &json!(256_000));
+                assert_eq!(ipc.status.audio_bitrate_bps, Some(256_000));
+            }
+            ipc.apply_status_property("track-list", &json!([]));
+            assert_eq!(ipc.status.audio_codec, None);
+            assert_eq!(ipc.status.audio_bitrate_bps, None);
+        }
+
+        /// Prior-file observations cannot restore facts while loading, stopped, or idle.
+        #[test]
+        fn technical_audio_metadata_clears_and_ignores_inactive_observations() {
+            let (client, _server) = UnixStream::pair().unwrap();
+            let mut ipc = MpvIpc::new(IpcLink::over(client));
+            for boundary in [
+                json!({"event": "start-file"}),
+                json!({"event": "end-file", "reason": "eof"}),
+                json!({"event": "end-file", "reason": "redirect"}),
+                json!({"event": "property-change", "id": STATUS_OBSERVER_BASE, "name": "idle-active", "data": true}),
+            ] {
+                ipc.media_loaded = true;
+                ipc.status.idle = false;
+                ipc.apply_status_property("track-list", &json!([{"type": "audio", "selected": true, "external": false, "codec": "mp3"}]));
+                ipc.apply_status_property("audio-bitrate", &json!(192_000));
+                ipc.apply_status_property("file-format", &json!("mp3"));
+                ipc.apply_status_property("file-size", &json!(4_300_000));
+                assert_eq!(ipc.status.audio_codec.as_deref(), Some("mp3"));
+                assert_eq!(ipc.status.audio_bitrate_bps, Some(192_000));
+                assert_eq!(ipc.status.file_size_bytes, Some(4_300_000));
+                ipc.handle_event(&boundary);
+                ipc.apply_status_property(
+                    "track-list",
+                    &json!([{"type": "audio", "selected": true, "codec": "aac"}]),
+                );
+                ipc.apply_status_property("audio-bitrate", &json!(256_000));
+                ipc.apply_status_property("file-format", &json!("aac"));
+                ipc.apply_status_property("file-size", &json!(6_000_000));
+                assert_eq!(ipc.status.audio_codec, None, "{boundary:?}");
+                assert_eq!(ipc.status.audio_bitrate_bps, None, "{boundary:?}");
+                assert_eq!(ipc.status.file_size_bytes, None, "{boundary:?}");
+            }
+        }
+
+        /// Load acknowledgement cannot briefly expose the previous file's technical facts.
+        #[test]
+        fn technical_audio_load_clears_metadata_before_start_file_arrives() {
+            let (mut backend, commands, server) = backend_with_command_recorder();
+            backend.ipc.media_loaded = true;
+            backend.ipc.status.idle = false;
+            backend.ipc.status.audio_codec = Some("mp3".to_owned());
+            backend.ipc.status.audio_bitrate_bps = Some(192_000);
+            backend.ipc.status.file_size_bytes = Some(4_300_000);
+            backend
+                .play(&PlaybackInput::new("https://media.example/audio.mp3"))
+                .unwrap();
+            assert_eq!(commands.try_iter().count(), 1);
+            backend.ipc.apply_status_property(
+                "track-list",
+                &json!([{"type": "audio", "selected": true, "external": false, "codec": "mp3"}]),
+            );
+            backend
+                .ipc
+                .apply_status_property("audio-bitrate", &json!(192_000));
+            backend
+                .ipc
+                .apply_status_property("file-format", &json!("mp3"));
+            backend
+                .ipc
+                .apply_status_property("file-size", &json!(4_300_000));
+            assert_eq!(backend.ipc.status.audio_codec, None);
+            assert_eq!(backend.ipc.status.audio_bitrate_bps, None);
+            assert_eq!(backend.ipc.status.file_size_bytes, None);
+            backend.shutdown().unwrap();
+            server.join().unwrap();
+        }
+
+        /// Source sizes require a known standalone format and the main file's selected audio.
+        #[test]
+        fn technical_audio_file_size_excludes_manifests_and_external_audio() {
+            let (client, _server) = UnixStream::pair().unwrap();
+            let mut ipc = MpvIpc::new(IpcLink::over(client));
+            ipc.media_loaded = true;
+            ipc.status.idle = false;
+            let main_audio =
+                json!([{"type": "audio", "selected": true, "external": false, "codec": "mp3"}]);
+            ipc.apply_status_property("file-size", &json!(4_300_000));
+            assert_eq!(ipc.status.file_size_bytes, None);
+            ipc.apply_status_property("track-list", &main_audio);
+            assert_eq!(ipc.status.file_size_bytes, None);
+            for format in [
+                "mp3", "flac", "wav", "aiff", "ape", "wv", "tta", "aac", "ogg",
+            ] {
+                ipc.apply_status_property("file-format", &json!(format));
+                assert_eq!(ipc.status.file_size_bytes, Some(4_300_000), "{format}");
+            }
+            for format in [
+                Value::Null,
+                json!("hls"),
+                json!("dash"),
+                json!("edl/mp3"),
+                json!("multi/mp3"),
+                json!("dash/aac"),
+                json!("concat"),
+                json!("m3u"),
+                json!("unknown"),
+                json!("mp3,hls"),
+                json!("mov,mp4,m4a,3gp,3g2,mj2"),
+            ] {
+                ipc.apply_status_property("file-format", &format);
+                assert_eq!(ipc.status.file_size_bytes, None, "{format}");
+            }
+            ipc.apply_status_property("file-format", &json!("mp3"));
+            for value in [
+                Value::Null,
+                json!(-1),
+                json!(0),
+                json!(1.5),
+                json!("4300000"),
+            ] {
+                ipc.apply_status_property("file-size", &value);
+                assert_eq!(ipc.status.file_size_bytes, None, "{value}");
+            }
+            ipc.apply_status_property("file-size", &json!(4_300_000));
+            for audio in [
+                json!([{"type": "audio", "selected": true, "external": true, "codec": "mp3"}]),
+                json!([{"type": "audio", "selected": true, "codec": "mp3"}]),
+                json!([]),
+            ] {
+                ipc.apply_status_property("track-list", &audio);
+                assert_eq!(ipc.status.file_size_bytes, None, "{audio}");
+            }
+            ipc.apply_status_property("track-list", &main_audio);
+            assert_eq!(ipc.status.file_size_bytes, Some(4_300_000));
+            ipc.handle_event(&json!({"event": "start-file"}));
+            assert_eq!(ipc.status.file_size_bytes, None);
+            ipc.apply_status_property("file-size", &json!(4_300_000));
+            ipc.handle_event(&json!({"event": "file-loaded"}));
+            ipc.apply_status_property("idle-active", &json!(false));
+            ipc.apply_status_property("track-list", &main_audio);
+            ipc.apply_status_property("file-format", &json!("mp3"));
+            assert_eq!(
+                ipc.status.file_size_bytes, None,
+                "the next file cannot reuse prior bytes"
+            );
+        }
+
         /// An unchanged snapshot must not issue another batch of property requests.
         #[test]
         fn repeated_status_uses_observed_properties_without_more_ipc_requests() {
@@ -3658,6 +4082,10 @@ mod backend {
                 json!(true),
                 json!({"seekable-ranges": [{"start": 1.0, "end": 20.0}]}),
                 json!("Fixture title"),
+                json!([{"type": "audio", "selected": true, "external": false, "codec": "mp3"}]),
+                json!(192_000),
+                json!("mp3"),
+                json!(4_300_000),
             ];
             let mut events = STATUS_PROPERTIES.iter().enumerate().map(|(index, name)| json!({"event": "property-change", "id": STATUS_OBSERVER_BASE + index as u64, "name": name, "data": values[index]})).collect::<Vec<_>>();
             events.push(json!({"event": "property-change", "id": ICY_TITLE_OBSERVER_ID, "name": ICY_TITLE_PROPERTY, "data": "Artist - Song"}));
@@ -3665,6 +4093,7 @@ mod backend {
                 backend_with_command_recorder_script(events, None);
             backend.ipc.status_initialized = true;
             backend.ipc.observations_configured = true;
+            backend.ipc.media_loaded = true;
             backend.command(PlayerCommand::SetVolume(38)).unwrap();
             assert_eq!(commands.try_iter().count(), 1);
             let status = backend.status().unwrap();
@@ -3676,6 +4105,9 @@ mod backend {
             assert_eq!(status.chapter, Some(2));
             assert_eq!(status.title.as_deref(), Some("Fixture title"));
             assert_eq!(status.stream_title.as_deref(), Some("Artist - Song"));
+            assert_eq!(status.audio_codec.as_deref(), Some("mp3"));
+            assert_eq!(status.audio_bitrate_bps, Some(192_000));
+            assert_eq!(status.file_size_bytes, Some(4_300_000));
             assert_eq!(
                 status.buffered_ranges,
                 [BufferedRange {
@@ -3699,6 +4131,9 @@ mod backend {
                     && missing.buffered_ranges.is_empty()
             );
             assert_eq!(missing.volume, 100);
+            assert_eq!(missing.audio_codec, None);
+            assert_eq!(missing.audio_bitrate_bps, None);
+            assert_eq!(missing.file_size_bytes, None);
             backend.shutdown().unwrap();
             server.join().unwrap();
         }

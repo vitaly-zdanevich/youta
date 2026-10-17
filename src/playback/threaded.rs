@@ -273,7 +273,17 @@ fn run<B>(
                 epoch,
             }) => {
                 processed_epoch = epoch;
-                let _ = reply.send(backend.play(&input));
+                let result = backend.play(&input);
+                if result.is_ok() {
+                    // A started event can reach the reducer before the next
+                    // snapshot. Revoke source-owned technical metadata before
+                    // acknowledging this load or forwarding its lifecycle events.
+                    let mut guard = shared.lock().unwrap_or_else(PoisonError::into_inner);
+                    guard.status.audio_codec = None;
+                    guard.status.audio_bitrate_bps = None;
+                    guard.status.file_size_bytes = None;
+                }
+                let _ = reply.send(result);
             }
             Ok(Job::Command {
                 command,
@@ -675,6 +685,112 @@ mod tests {
             after - before < 50,
             "reducer reads must not become backend round-trips: {before} -> {after}"
         );
+    }
+
+    /// A started replacement cannot borrow technical metadata while its first
+    /// snapshot is still blocked; rejected loads leave the current source intact.
+    #[test]
+    fn replacement_clears_technical_metadata_before_started_snapshot() {
+        /// Holds the replacement's first snapshot behind an explicit test signal.
+        struct ReplacementBackend {
+            replaced: bool,
+            started: bool,
+            blocked: Sender<()>,
+            release: Receiver<()>,
+        }
+
+        impl PlaybackBackend for ReplacementBackend {
+            fn set_worker_waker(&mut self, waker: Option<Waker>) -> bool {
+                if let Some(waker) = waker {
+                    waker.wake();
+                }
+                true
+            }
+
+            fn play(&mut self, input: &PlaybackInput) -> Result<()> {
+                if input.location == "reject" {
+                    return Err(PlaybackError::Protocol("rejected fixture".to_owned()));
+                }
+                self.replaced = true;
+                self.started = true;
+                Ok(())
+            }
+
+            fn command(&mut self, _: PlayerCommand) -> Result<()> {
+                Ok(())
+            }
+
+            fn status(&mut self) -> Result<PlaybackStatus> {
+                if self.replaced {
+                    let _ = self.blocked.send(());
+                    let _ = self.release.recv_timeout(Duration::from_secs(5));
+                }
+                Ok(PlaybackStatus {
+                    idle: false,
+                    audio_codec: Some(if self.replaced { "opus" } else { "mp3" }.to_owned()),
+                    audio_bitrate_bps: Some(if self.replaced { 128_000 } else { 192_000 }),
+                    file_size_bytes: Some(if self.replaced { 2_000_000 } else { 4_300_000 }),
+                    volume: 37,
+                    speed: 1.25,
+                    ..PlaybackStatus::default()
+                })
+            }
+
+            fn poll_event(&mut self) -> Result<Option<PlaybackEvent>> {
+                Ok(std::mem::take(&mut self.started).then_some(PlaybackEvent::PlaybackStarted))
+            }
+
+            fn shutdown(&mut self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let (blocked, entered) = channel();
+        let (release, released) = channel();
+        let mut handle = ThreadedBackend::new(ReplacementBackend {
+            replaced: false,
+            started: false,
+            blocked,
+            release: released,
+        });
+        assert!(wait_until(|| {
+            handle.status().unwrap().audio_codec.as_deref() == Some("mp3")
+        }));
+        let original = handle.status().unwrap();
+        assert!(handle.play(&PlaybackInput::new("reject")).is_err());
+        assert_eq!(handle.status().unwrap(), original);
+
+        handle
+            .play(&PlaybackInput::new(
+                "https://example.invalid/replacement.opus",
+            ))
+            .expect("accept replacement");
+        let started = handle.events.recv_timeout(Duration::from_secs(5));
+        let blocked = entered.recv_timeout(Duration::from_secs(5));
+        let snapshots = (0..50).map(|_| handle.status()).collect::<Vec<_>>();
+        // Release before asserting so a regression cannot trap fixture teardown.
+        release.send(()).expect("release replacement snapshot");
+        let refreshed =
+            wait_until(|| handle.status().unwrap().audio_codec.as_deref() == Some("opus"));
+        let current = handle.status().unwrap();
+        handle.shutdown().expect("stop fixture worker");
+
+        assert_eq!(started.unwrap(), PlaybackEvent::PlaybackStarted);
+        blocked.expect("replacement snapshot is held after the started event");
+        for snapshot in snapshots {
+            let snapshot = snapshot.unwrap();
+            assert_eq!(snapshot.audio_codec, None);
+            assert_eq!(snapshot.audio_bitrate_bps, None);
+            assert_eq!(snapshot.file_size_bytes, None);
+            assert_eq!(snapshot.volume, 37);
+            assert_eq!(snapshot.speed, 1.25);
+        }
+        assert!(
+            refreshed,
+            "the new source eventually publishes its own metadata"
+        );
+        assert_eq!(current.audio_bitrate_bps, Some(128_000));
+        assert_eq!(current.file_size_bytes, Some(2_000_000));
     }
 
     #[test]

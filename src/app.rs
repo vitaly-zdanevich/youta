@@ -23223,6 +23223,8 @@ impl AppController {
         self.view.right_panel_mode = snapshot.right_panel_mode;
         self.view.waveform_visible = snapshot.waveform_visible;
         self.active_description_video = snapshot.active_description_video;
+        #[cfg(feature = "vk")]
+        self.refresh_vk_audio_details();
 
         let pending_video_id = self.active_description_video.as_ref().and_then(|linked| {
             self.view
@@ -27195,6 +27197,8 @@ impl AppController {
                     title: Some(item.media.title.clone()),
                     ..PlaybackStatus::default()
                 };
+                #[cfg(feature = "vk")]
+                self.refresh_vk_audio_details();
                 #[cfg(feature = "waveform")]
                 self.refresh_local_waveform_playback_match();
                 self.view.playback_chapters = chapters;
@@ -27438,12 +27442,21 @@ impl AppController {
                 self.normalize_playback_status(&mut status);
                 if self.playback_phase == PlaybackPhase::Idle {
                     self.view.playback = status;
+                    #[cfg(feature = "vk")]
+                    self.refresh_vk_audio_details();
                     return;
                 }
                 if status.idle {
                     // `idle-active` is not an end reason. In particular, it can
                     // change during yt-dlp loading. Only an `end-file` event may
                     // finish or fail the current queue item.
+                    #[cfg(feature = "vk")]
+                    {
+                        self.view.playback.audio_codec = None;
+                        self.view.playback.audio_bitrate_bps = None;
+                        self.view.playback.file_size_bytes = None;
+                        self.refresh_vk_audio_details();
+                    }
                     return;
                 }
                 if self.playback_phase != PlaybackPhase::Playing {
@@ -27465,6 +27478,8 @@ impl AppController {
                 // replace it with a long, expiring, potentially sensitive URL.
                 status.title = Some(self.current_playback_title());
                 self.view.playback = status;
+                #[cfg(feature = "vk")]
+                self.refresh_vk_audio_details();
                 #[cfg(feature = "waveform")]
                 self.refresh_local_waveform_playback_match();
                 #[cfg(feature = "radio")]
@@ -28098,6 +28113,8 @@ impl AppController {
             speed: f64::from(self.config.playback.speed_percent) / 100.0,
             ..PlaybackStatus::default()
         };
+        #[cfg(feature = "vk")]
+        self.refresh_vk_audio_details();
     }
 
     fn fail_player<E>(&mut self, title: &str, error: &E, elapsed: Duration)

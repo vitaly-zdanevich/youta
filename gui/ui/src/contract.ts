@@ -56,6 +56,12 @@ export interface PlaybackStatus {
   buffered_ranges: BufferedRange[];
   title: string | null;
   stream_title: string | null;
+	/** Encoded audio format identifier, not the decoder implementation name. */
+	audio_codec: string | null;
+	/** Current packet-measured audio bitrate in bits per second, when known. */
+	audio_bitrate_bps: number | null;
+	/** Source-file bytes for recognized standalone formats; excludes manifests and estimates. */
+	file_size_bytes: number | null;
 }
 
 /** Reducer-owned fullscreen ASCII frame backed by CAVA FFT bands. */

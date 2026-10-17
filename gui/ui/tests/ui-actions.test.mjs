@@ -106,6 +106,21 @@ const action = { SearchYouTubeHashtag: 'Беларусь' } satisfies UiAction;`
 	expectNoDiagnostics(diagnostics);
 });
 
+/** Playback facts remain nullable wire values; only the reducer formats Details text. */
+test('Playback technical metadata retains optional codec, bitrate and source-file size types', () => {
+	const { diagnostics } = compile(`import type { PlaybackStatus } from '../src/contract';
+type TechnicalMetadata = Pick<PlaybackStatus, 'audio_codec' | 'audio_bitrate_bps' | 'file_size_bytes'>;
+const known = { audio_codec: 'mp3', audio_bitrate_bps: 192000, file_size_bytes: 4500000 } satisfies TechnicalMetadata;
+const unknown = { audio_codec: null, audio_bitrate_bps: null, file_size_bytes: null } satisfies TechnicalMetadata;
+// @ts-expect-error Codecs cross IPC as names, not numeric identifiers.
+const invalidCodec = { ...known, audio_codec: 3 } satisfies TechnicalMetadata;
+// @ts-expect-error Bitrate remains numeric bits per second, not formatted text.
+const invalidBitrate = { ...known, audio_bitrate_bps: '192 kb/s' } satisfies TechnicalMetadata;
+// @ts-expect-error Source-file size remains numeric bytes, not formatted text.
+const invalidSize = { ...known, file_size_bytes: '4,3 MB' } satisfies TechnicalMetadata;`);
+	expectNoDiagnostics(diagnostics);
+});
+
 test('UiAction rejects unknown names, incorrect payloads, null identities and multiple tags', () => {
 	const invalid = [
 		'\'SeekAbsoluteSeconds\'',

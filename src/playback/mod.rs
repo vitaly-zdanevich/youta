@@ -352,6 +352,16 @@ pub struct PlaybackStatus {
     /// Youta owns the stable station title, while ICY or equivalent metadata
     /// may change for every song.
     pub stream_title: Option<String>,
+    /// Bounded canonical codec identifier for the selected audio stream, when known.
+    /// This is the encoded format (for example `mp3`), not the decoder implementation.
+    pub audio_codec: Option<String>,
+    /// Current packet-measured audio bitrate in bits per second, when available.
+    /// This may fluctuate and is neither a nominal rate nor a whole-track average.
+    pub audio_bitrate_bps: Option<u64>,
+    /// Source-file bytes for recognized standalone formats, when known.
+    /// Manifest/timeline lengths and bitrate-based estimates are excluded; the value
+    /// describes the loaded source, not its provenance or selected audio payload alone.
+    pub file_size_bytes: Option<u64>,
 }
 
 impl PlaybackStatus {
@@ -392,6 +402,9 @@ impl Default for PlaybackStatus {
             buffered_ranges: Vec::new(),
             title: None,
             stream_title: None,
+            audio_codec: None,
+            audio_bitrate_bps: None,
+            file_size_bytes: None,
         }
     }
 }

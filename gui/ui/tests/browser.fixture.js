@@ -69,6 +69,7 @@
 		{ id: 'SoundCloud', label: 'SoundCloud', details_kind: 'Generic', search_verb: 'Search' },
 		{ id: 'Bandcamp', label: 'Bandcamp', details_kind: 'Generic', search_verb: 'Search' },
 		{ id: 'Funkwhale', label: 'Funkwhale', details_kind: 'Generic', search_verb: 'Search' },
+		{ id: 'Vk', label: 'VK', details_kind: 'Generic', search_verb: 'Search' },
 		{ id: 'ApplePodcasts', label: 'Podcasts', details_kind: 'Podcast', search_verb: 'Search' },
 		{ id: 'ArchiveOrg', label: 'archive.org', details_kind: 'Generic', search_verb: 'Search' },
 		{ id: 'LibriVox', label: 'LibriVox', details_kind: 'Podcast', search_verb: 'Search' },
@@ -954,6 +955,38 @@
 		snapshot({ details: null });
 		await until(() => !document.querySelector('[aria-label=Details]'), 'cleared selected artwork owner');
 	}
+	/** VK technical facts remain the reducer's compact text, with unknown values omitted. */
+	async function checkVkTechnicalMetadata() {
+		const previous = clone(view);
+		for (const [label, description, metadata] of [
+			['complete', 'MP3 192 kb/s, 4,3 MB', { audio_codec: 'mp3', audio_bitrate_bps: 192000, file_size_bytes: 4500000 }],
+			['unknown size', 'MP3 192 kb/s', { audio_codec: 'mp3', audio_bitrate_bps: 192000, file_size_bytes: null }],
+			['unknown', '', { audio_codec: null, audio_bitrate_bps: null, file_size_bytes: null }],
+		]) {
+			const title = `VK technical metadata: ${label}`;
+			snapshot({ screen: 'Vk',
+				playback: { ...view.playback, idle: false, live: false, ...metadata },
+				details: { ...clone(defaults.DetailView), title, source: 'VK', description,
+					media_id: { source: 'vk', external_id: '7_11' },
+				},
+			});
+			await until(() => document.querySelector('[aria-label=Details] h2')?.textContent === title, title);
+			const rendered = document.querySelector('[aria-label=Details] [data-description]');
+			assert((rendered?.textContent ?? '') === description,
+				`VK Details preserves the shared technical description: ${label}`);
+			if (description) {
+				const range = document.createRange();
+				range.selectNodeContents(rendered);
+				assert(range.getBoundingClientRect().height <= Number.parseFloat(getComputedStyle(rendered).lineHeight) + 1,
+					`VK technical metadata stays on one compact line: ${label}`);
+				assert(rendered.querySelector('button, a') === null,
+					`VK technical metadata remains plain text without seek controls: ${label}`);
+			} else {
+				assert(rendered === null, 'Unknown VK technical metadata does not fabricate an empty description row');
+			}
+		}
+		snapshot(previous);
+	}
 	/** Local timestamps follow the selectable standalone path without becoming seek controls. */
 	async function checkLocalFullPath() {
 		const previous = clone(view);
@@ -1462,6 +1495,7 @@
 		await checkUrlInformation();
 		await checkSiteFiles();
 		await checkLiveDuration();
+		await checkVkTechnicalMetadata();
 		await checkLocalFullPath();
 		await checkLocalTrackMetadata();
 		await checkLocalActionOrder();

@@ -383,6 +383,7 @@ impl AppController {
                         channel_name: track.artist.clone(),
                         channel_webpage_url: track.artist_webpage_url(),
                         source: "VK".to_owned(),
+                        description: self.vk_audio_description(&media_id(track.id)),
                         webpage_url: Some(track.id.webpage_url()),
                         length: track
                             .duration_seconds
@@ -414,6 +415,45 @@ impl AppController {
         self.refresh_selected_private_note_state();
         #[cfg(all(feature = "vk", feature = "acoustid"))]
         self.apply_vk_fingerprint_details();
+    }
+
+    /// Projects only the loaded recording's observed audio facts; paused playback stays eligible.
+    #[cfg(feature = "vk")]
+    fn vk_audio_description(&self, selected: &MediaId) -> String {
+        if self.current_media.as_ref() != Some(selected)
+            || self.playback_phase != PlaybackPhase::Playing
+            || self.view.playback.idle
+        {
+            return String::new();
+        }
+        compact_audio_description(&self.view.playback)
+    }
+
+    /// Refreshes cached playback text without rebuilding links, notes or other enrichment.
+    #[cfg(feature = "vk")]
+    pub(super) fn refresh_vk_audio_details(&mut self) {
+        if self.view.screen != Screen::Vk || self.vk.results_kind != VkSearchKind::Tracks {
+            return;
+        }
+        let Some(track) = self.vk.items.get(self.view.selected) else {
+            return;
+        };
+        let selected = media_id(track.id);
+        if self
+            .view
+            .details
+            .as_ref()
+            .and_then(|details| details.media_id.as_ref())
+            != Some(&selected)
+        {
+            return;
+        }
+        let description = self.vk_audio_description(&selected);
+        if let Some(details) = self.view.details.as_mut()
+            && details.description != description
+        {
+            details.description = description;
+        }
     }
 
     /// Accepts text, explicit numeric/profile queries or canonical track identities.
@@ -1698,6 +1738,9 @@ mod cross_provider_tests;
 mod album_tests;
 
 #[cfg(all(test, feature = "vk"))]
+mod audio_details_tests;
+
+#[cfg(all(test, feature = "vk"))]
 mod album_search_tests;
 
 #[cfg(all(test, feature = "vk"))]
@@ -1713,6 +1756,50 @@ mod browse_tests;
     )
 ))]
 mod export_tests;
+
+/// Formats observed codec/packet bitrate and standalone source bytes without unknown placeholders.
+///
+/// Bitrate is mpv's measured value, not a guarantee of constant encoding quality. Sizes use
+/// decimal units and a comma decimal separator; manifests and multipart sizes are omitted upstream.
+#[cfg(feature = "vk")]
+fn compact_audio_description(status: &PlaybackStatus) -> String {
+    use std::fmt::Write as _;
+    const UNITS: [&str; 7] = ["B", "kB", "MB", "GB", "TB", "PB", "EB"];
+
+    let mut audio = Vec::new();
+    if let Some(codec) = status.audio_codec.as_deref() {
+        audio.push(match codec {
+            "opus" => "Opus".to_owned(),
+            "vorbis" => "Vorbis".to_owned(),
+            other => other.to_ascii_uppercase(),
+        });
+    }
+    if let Some(bitrate) = status.audio_bitrate_bps.filter(|value| *value > 0) {
+        audio.push(format!(
+            "{} kb/s",
+            bitrate.saturating_add(500).saturating_div(1000).max(1)
+        ));
+    }
+    let mut text = audio.join(" ");
+    if let Some(bytes) = status.file_size_bytes.filter(|value| *value > 0) {
+        if !text.is_empty() {
+            text.push_str(", ");
+        }
+        let mut scale = 1_u128;
+        let mut unit = 0;
+        while u128::from(bytes) >= scale * 1000 && unit + 1 < UNITS.len() {
+            scale *= 1000;
+            unit += 1;
+        }
+        if unit == 0 {
+            let _ = write!(text, "{bytes} B");
+        } else {
+            let tenths = (u128::from(bytes) * 10 + scale / 2) / scale;
+            let _ = write!(text, "{},{} {}", tenths / 10, tenths % 10, UNITS[unit]);
+        }
+    }
+    text
+}
 
 /// Places the public track URL first and exposes only validated public catalogue links.
 #[cfg(feature = "vk")]
