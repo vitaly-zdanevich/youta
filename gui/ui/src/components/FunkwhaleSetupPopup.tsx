@@ -4,7 +4,7 @@ import type { KeyboardEvent, ReactNode } from 'react';
 import type { UiAction } from '../actions';
 import type { FunkwhaleSetupPopupView } from '../contract';
 import { dispatch } from '../ipc';
-import { Popup, PopupButton, PopupError } from './Popup';
+import { isTopmostPopup, Popup, PopupButton, PopupError } from './Popup';
 import { LAYER } from './popups';
 
 /** Explicit controls consume activation once instead of also invoking the modal keymap. */
@@ -99,6 +99,8 @@ export function FunkwhaleSetupPopup({ popup }: { popup: FunkwhaleSetupPopupView 
 	/** Native focus stays inside setup; button-focused typing must update the same local draft. */
 	const dialogKey = (event: KeyboardEvent<HTMLDivElement>) => {
 		if (event.metaKey || event.altKey) return;
+		// Covered header activation belongs to the upper popup, never the parked URL draft.
+		if (!isTopmostPopup(event.currentTarget)) return;
 		if (event.key === 'Tab' && !event.ctrlKey) {
 			event.stopPropagation();
 			const controls = [...event.currentTarget.querySelectorAll<HTMLElement>('button:not([disabled]), input:not([disabled]), [tabindex="0"]')]

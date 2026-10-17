@@ -1,6 +1,13 @@
 import * as Dialog from "@radix-ui/react-dialog";
 import type { KeyboardEvent, ReactNode } from 'react';
 
+/** Only the highest popup layer may handle a focused control's keyboard activation. */
+export function isTopmostPopup(target: Element): boolean {
+	const dialog = target.closest<HTMLElement>('[role="dialog"]');
+	return dialog !== null && ![...target.ownerDocument.querySelectorAll<HTMLElement>('[role="dialog"]')].some((other) =>
+		Number(other.parentElement?.style.zIndex) > Number(dialog.parentElement?.style.zIndex));
+}
+
 /**
  * The shell every popup is drawn in.
  *
@@ -83,6 +90,8 @@ export function Popup({
                 onClick={onDismiss}
 								onKeyDown={(event) => {
 									if (event.ctrlKey || event.altKey || event.metaKey || (event.key !== 'Enter' && event.key !== ' ')) return;
+									// Covered controls leave activation to the topmost popup's shared keymap.
+									if (!isTopmostPopup(event.currentTarget)) return;
 									event.preventDefault();
 									event.stopPropagation();
 									if (!dismissDisabled && !event.repeat) onDismiss();

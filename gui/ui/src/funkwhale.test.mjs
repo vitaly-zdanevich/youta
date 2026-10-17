@@ -56,6 +56,7 @@ async function load(relative) {
 		if (name === '@radix-ui/react-dialog') return Object.fromEntries(['Root', 'Portal', 'Content', 'Title']
 			.map((name) => [name, ({ children, ...props }) => React.createElement('div', props, children)]));
 		if (name === './Popup') return {
+			isTopmostPopup: (target) => chrome.isTopmostPopup(target),
 			Popup: ({ children, footer }) => React.createElement('section', null, children, footer),
 			PopupButton: (props) => React.createElement('button', props),
 			PopupError: ({ message }) => message ? React.createElement('p', { role: 'alert' }, message) : null,
@@ -146,11 +147,18 @@ test('picker selection replaces the URL even when returning input focus precedes
 const input = (tree) => nodes(tree).find((node) => node.type === 'input');
 const picker = { pods: [], selected: 0, loading: false, error: null };
 
+/** A DOM-shaped setup dialog lets the real popup layer guard run without a browser. */
+function setupDialog(covered = false) {
+	const dialog = { parentElement: { style: { zIndex: '250' } } };
+	const other = { parentElement: { style: { zIndex: covered ? '1650' : '150' } } };
+	return { closest: () => dialog, ownerDocument: { querySelectorAll: () => [other, dialog] } };
+}
+
 /** Observe both default prevention and propagation when a control owns a key. */
 function key(props, name, patch = {}) {
 	let prevented = false;
 	let stopped = false;
-	props.onKeyDown({ key: name, ctrlKey: false, altKey: false, metaKey: false, repeat: false,
+	props.onKeyDown({ key: name, ctrlKey: false, altKey: false, metaKey: false, repeat: false, currentTarget: setupDialog(),
 		preventDefault: () => { prevented = true; }, stopPropagation: () => { stopped = true; }, ...patch });
 	return { prevented, stopped };
 }
@@ -246,16 +254,34 @@ test('an empty pod draft remains saveable to remove the configured pod', () => {
 /** Header activation must cancel, rather than reaching the modal Enter/save shortcut. */
 test('popup header Enter and Space dismiss once without reaching the document keymap', () => {
 	let dismissed = 0;
+	const dialog = { parentElement: { style: { zIndex: '250' } } };
+	const lower = { parentElement: { style: { zIndex: '150' } } };
+	const currentTarget = { closest: () => dialog, ownerDocument: { querySelectorAll: () => [dialog, lower] } };
 	const tree = chrome.Popup({ title: 'Funkwhale pod setup', layer: 2, dismissLabel: 'Cancel',
 		onDismiss: () => { dismissed++; }, children: null });
 	const close = button(tree, 'Cancel');
 	assert.equal(typeof close.props.onKeyDown, 'function');
 	for (const name of ['Enter', ' ']) {
-		assert.deepEqual(key(close.props, name), { prevented: true, stopped: true });
+		assert.deepEqual(key(close.props, name, { currentTarget }), { prevented: true, stopped: true });
 	}
 	assert.equal(dismissed, 2);
-	key(close.props, 'Enter', { repeat: true });
+	key(close.props, 'Enter', { currentTarget, repeat: true });
 	assert.equal(dismissed, 2, 'held activation must not dismiss a second modal');
+});
+
+/** A covered header must leave activation to the shared keymap, regardless of portal order. */
+test('covered popup header Enter and Space do not dismiss or stop the shared keyboard route', () => {
+	let dismissed = 0;
+	const dialog = { parentElement: { style: { zIndex: '250' } } };
+	const higher = { parentElement: { style: { zIndex: '1650' } } };
+	const currentTarget = { closest: () => dialog, ownerDocument: { querySelectorAll: () => [higher, dialog] } };
+	const tree = chrome.Popup({ title: 'Funkwhale pod setup', layer: 2, dismissLabel: 'Cancel',
+		onDismiss: () => { dismissed++; }, children: null });
+	const close = button(tree, 'Cancel');
+	for (const name of ['Enter', ' ']) {
+		assert.deepEqual(key(close.props, name, { currentTarget }), { prevented: false, stopped: false });
+	}
+	assert.equal(dismissed, 0, 'the higher popup owns keyboard activation');
 });
 
 /** Native URL editing requires keyboard access to each explicit dialog control. */
@@ -265,7 +291,7 @@ test('setup owns native Tab focus and wraps within the dialog instead of source 
 	assert.equal(typeof tree.props.onKeyDown, 'function');
 	let focused = null;
 	const controls = [0, 1, 2].map((index) => ({ tabIndex: 0, focus: () => { focused = index; } }));
-	const currentTarget = { querySelectorAll: () => controls };
+	const currentTarget = { ...setupDialog(), querySelectorAll: () => controls };
 	assert.deepEqual(key(tree.props, 'Tab', { target: controls[1], currentTarget }), { prevented: false, stopped: true });
 	assert.equal(focused, null, 'the browser advances between ordinary controls');
 	assert.deepEqual(key(tree.props, 'Tab', { target: controls[2], currentTarget }), { prevented: true, stopped: true });
@@ -291,6 +317,19 @@ test('typing and clearing while a setup button is focused also update the visibl
 	assert.deepEqual(key(tree.props, 'u', { target, ctrlKey: true }), { prevented: true, stopped: true });
 	assert.equal(actions.pop(), 'ClearFunkwhalePodUrl');
 	assert.equal(input(render({ url: '' })).props.value, '');
+});
+
+/** Bubbling from a covered header must not edit the parked setup draft or consume the upper popup's keys. */
+test('covered setup dialog preserves its draft and forwards header Enter and Space', () => {
+	reset();
+	const url = 'https://';
+	const tree = render({ url });
+	for (const name of ['Enter', ' ']) {
+		const result = key(tree.props, name, { target: {}, currentTarget: setupDialog(true) });
+		assert.deepEqual(actions, [], 'covered setup must not dispatch URL edits or control actions');
+		assert.equal(input(render({ url })).props.value, url, 'covered setup must preserve the local draft');
+		assert.deepEqual(result, { prevented: false, stopped: false });
+	}
 });
 
 test('loading, empty and failed pod lists remain closable and retryable', () => {

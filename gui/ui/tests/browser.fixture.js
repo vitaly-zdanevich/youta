@@ -141,6 +141,21 @@
 			&& call.args.press.ctrl === Boolean(options.ctrlKey)), `forward ${keyName}`);
 		checks.push(`Keyboard ${keyName} uses the shared Rust keymap IPC`);
 	};
+	/** Covered controls must preserve the topmost popup's shared Enter/Space bindings. */
+	const coveredKey = async (control, label) => {
+		control.focus();
+		for (const [keyName, expected] of [['Enter', 'Enter'], [' ', { Char: ' ' }]]) {
+			const start = calls.length;
+			const event = new KeyboardEvent('keydown', { key: keyName, bubbles: true, cancelable: true });
+			control.dispatchEvent(event);
+			await until(() => calls.slice(start).some((call) => call.command === 'key'
+				&& JSON.stringify(call.args.press.key) === JSON.stringify(expected)), `topmost modal keyboard routing from ${label}`);
+			assert(event.defaultPrevented && calls.slice(start).filter((call) => call.command === 'key').length === 1,
+				`Covered ${label} forwards ${JSON.stringify(keyName)} exactly once and suppresses the native click`);
+			assert(!calls.slice(start).some((call) => call.command === 'dispatch'),
+				`Covered ${label} cannot intercept the topmost modal keyboard action`);
+		}
+	};
 	/** Function keys stay shared so the core can preserve modal-specific actions. */
 	const forwardFunctionKey = async (number, target, context, shift = false) => {
 		const start = calls.length;
@@ -549,6 +564,18 @@
 		snapshot({ funkwhale_setup_popup: { ...setup }, status_line: 'Partial URL remains private', transient_footer_notice: null });
 		await until(() => document.body.textContent.includes('Partial URL remains private'), 'redacted setup snapshot');
 		assert(input.value === 'https://', 'Redacted native snapshots preserve partially typed URL text');
+		const coveredCancel = button('Cancel', dialog());
+		coveredCancel.focus();
+		snapshot({ error_popup: {
+			title: 'Fixture error above Funkwhale setup', report: 'Mock failure', scroll_offset: 0,
+			gh_available: false, reportable: false, action_status: null,
+			yt_dlp_forbidden: null, github_issue_submission: 'Idle',
+		} });
+		await until(() => dialog()?.textContent.includes('Fixture error above Funkwhale setup'), 'error covering Funkwhale setup');
+		await coveredKey(coveredCancel, 'Funkwhale header');
+		assert(input.value === 'https://', 'Covered Funkwhale header keys preserve the partial URL draft');
+		snapshot({ error_popup: null });
+		await until(() => document.querySelectorAll('[role=dialog]').length === 1, 'uncovered Funkwhale setup');
 		const custom = 'https://custom.example/';
 		await action({ SetFunkwhalePodUrl: custom }, () => {
 			Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, custom);
@@ -716,6 +743,7 @@
 		const playbackLayer = Number.parseInt(getComputedStyle(dialog().parentElement).zIndex, 10);
 		assert(Number.isInteger(playbackLayer) && playbackLayer > preferenceLayer,
 			'The playback chooser has a valid integer CSS layer above Preferences');
+		await coveredKey(button('Close', stacked[0]), 'Preferences header');
 		snapshot({ preferences_popup: null });
 		await until(() => document.querySelectorAll('[role=dialog]').length === 1, 'lower Preferences closed');
 		assert(dialog().textContent.includes(popup.explanation), 'Playback explanation comes from the controller');
@@ -751,6 +779,7 @@
 		button('Play', dialog()).click();
 		assert(calls.length === start, 'An empty playback stage cannot dispatch Play');
 		const coveredCancel = button('Cancel', dialog());
+		const coveredFooterCancel = button('Cancel', dialog().querySelector('footer'));
 		snapshot({ error_popup: {
 			title: 'Fixture error above playback chooser', report: 'Mock failure', scroll_offset: 0,
 			gh_available: false, reportable: false, action_status: null,
@@ -759,11 +788,8 @@
 		await until(() => dialog()?.textContent.includes('Fixture error above playback chooser'), 'covering error popup');
 		assert(Number.parseInt(getComputedStyle(dialog().parentElement).zIndex, 10) > playbackLayer,
 			'The error dialog has a higher computed CSS layer than the playback chooser');
-		const beforeCovered = calls.length;
-		coveredCancel.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
-		await until(() => calls.slice(beforeCovered).some((call) => call.command === 'key' && call.args.press.key === 'Enter'), 'topmost modal keyboard routing');
-		assert(!calls.slice(beforeCovered).some((call) => call.command === 'dispatch'),
-			'A covered playback button cannot intercept the topmost modal keyboard action');
+		await coveredKey(coveredCancel, 'playback header');
+		await coveredKey(coveredFooterCancel, 'playback footer');
 		snapshot({ archive_playback_choice_popup: null, error_popup: null, preferences_popup: {
 			...clone(defaults.PreferencesPopupView), archive_playback_supported: true,
 			archive_playback_preference: 'audio-only', auto_download_supported: false,

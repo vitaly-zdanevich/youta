@@ -59,7 +59,7 @@ import type {
 import { dispatch } from "../ipc";
 import { humanBytes } from '../format';
 import { annotate } from '../spans';
-import { Popup, PopupButton, PopupError } from "./Popup";
+import { isTopmostPopup, Popup, PopupButton, PopupError } from './Popup';
 import { ScrollingText } from "./ScrollingText";
 
 /** Stacking order, matching `render_frame` in `src/tui.rs`. */
@@ -1690,9 +1690,7 @@ export function ArchivePlaybackChoicePopup({ popup }: { popup: ArchivePlaybackCh
 				|| !(event.target instanceof HTMLButtonElement)) return;
 			// An error or another higher popup still owns the shared keyboard map,
 			// even if a covered format button retained browser focus.
-			const dialog = event.target.closest('[role="dialog"]');
-			if (!dialog || [...document.querySelectorAll('[role="dialog"]')].some((other) =>
-				Number(other.parentElement?.style.zIndex) > Number(dialog.parentElement?.style.zIndex))) return;
+			if (!isTopmostPopup(event.target)) return;
 			event.preventDefault();
 			event.stopPropagation();
 			if (!event.repeat) event.target.click();
