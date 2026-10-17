@@ -54,12 +54,7 @@ impl Pod {
                     }
                     Err(error) => panic!("mock pod accept: {error}"),
                 };
-                socket
-                    .set_read_timeout(Some(Duration::from_secs(1)))
-                    .unwrap();
-                socket
-                    .set_write_timeout(Some(Duration::from_secs(1)))
-                    .unwrap();
+                crate::test_support::configure_http_fixture_stream(&socket, Duration::from_secs(1));
                 let mut request = Vec::new();
                 while !request.ends_with(b"\r\n\r\n") && request.len() < 8192 {
                     let mut byte = [0];
@@ -126,9 +121,56 @@ impl Drop for Pod {
     fn drop(&mut self) {
         self.stopped.store(true, Ordering::Relaxed);
         if let Some(thread) = self.thread.take() {
-            thread.join().unwrap();
+            let result = thread.join();
+            if !std::thread::panicking() {
+                result.expect("fingerprint pod fixture worker completed");
+            }
         }
     }
+}
+
+/// A failed fixture worker must not abort the harness while another panic unwinds.
+#[test]
+fn fixture_drop_preserves_original_panic_when_worker_panics() {
+    const CHILD: &str = "YOUTA_FUNKWHALE_FIXTURE_DROP_TEST_CHILD";
+    const COMPLETED: &str = "fixture cleanup preserved original panic";
+    if std::env::var_os(CHILD).is_none() {
+        let directory = crate::test_support::canonical_tempdir("fixture panic subprocess");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+			.args([
+				"--exact",
+				"app::funkwhale_fingerprint::tests::fixture_drop_preserves_original_panic_when_worker_panics",
+				"--nocapture",
+			])
+			.env(CHILD, "1")
+			.env("RUST_BACKTRACE", "0")
+			.current_dir(directory.path())
+			.output()
+			.expect("fixture panic subprocess");
+        assert!(
+            output.status.success(),
+            "fixture cleanup must preserve the original panic: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains(COMPLETED));
+        return;
+    }
+
+    let result = std::panic::catch_unwind(|| {
+        let _pod = Pod {
+            base: url::Url::parse("http://127.0.0.1/").unwrap(),
+            requests: Arc::new(Mutex::new(Vec::new())),
+            revision: Arc::new(AtomicUsize::new(0)),
+            stopped: Arc::new(AtomicBool::new(false)),
+            thread: Some(thread::spawn(|| panic!("fixture worker panic"))),
+        };
+        panic!("original fixture panic");
+    });
+    assert_eq!(
+        result.unwrap_err().downcast_ref::<&str>(),
+        Some(&"original fixture panic")
+    );
+    println!("{COMPLETED}");
 }
 
 /// Records the actual private complete file, replacing both fpcalc and AcoustID.

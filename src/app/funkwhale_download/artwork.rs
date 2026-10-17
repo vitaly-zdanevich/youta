@@ -322,9 +322,7 @@ mod tests {
                     }
                     Err(error) => panic!("fixture accept: {error}"),
                 };
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(1)))
-                    .unwrap();
+                crate::test_support::configure_http_fixture_stream(&stream, Duration::from_secs(1));
                 let mut input = [0_u8; 4096];
                 let count = stream.read(&mut input).unwrap();
                 let request = String::from_utf8_lossy(&input[..count]);

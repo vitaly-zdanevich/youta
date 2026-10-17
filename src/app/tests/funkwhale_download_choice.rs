@@ -49,9 +49,7 @@ impl Pod {
                     }
                     Err(error) => panic!("fixture accept: {error}"),
                 };
-                socket
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .unwrap();
+                crate::test_support::configure_http_fixture_stream(&socket, Duration::from_secs(2));
                 let mut request = Vec::new();
                 while !request.ends_with(b"\r\n\r\n") && request.len() < 8192 {
                     let mut byte = [0];

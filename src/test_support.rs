@@ -10,6 +10,26 @@ use std::path::PathBuf;
 
 use tempfile::TempDir;
 
+/// Restores blocking HTTP fixture I/O with finite read and write budgets.
+///
+/// Windows inherits a listener's nonblocking mode on accepted connections;
+/// request parsers need blocking reads to wait for bytes within their timeout.
+#[cfg(feature = "funkwhale")]
+pub(crate) fn configure_http_fixture_stream(
+    stream: &std::net::TcpStream,
+    timeout: std::time::Duration,
+) {
+    stream
+        .set_nonblocking(false)
+        .expect("blocking fixture stream");
+    stream
+        .set_read_timeout(Some(timeout))
+        .expect("fixture read timeout");
+    stream
+        .set_write_timeout(Some(timeout))
+        .expect("fixture write timeout");
+}
+
 /// Creates a temporary directory whose own path is already canonical.
 ///
 /// Local listings, moves, and media identifiers report paths that came back
@@ -59,6 +79,32 @@ fn canonical_temporary_root() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Simulates Windows' inherited socket mode without depending on packet timing.
+    #[cfg(all(unix, feature = "funkwhale", feature = "acoustid"))]
+    #[test]
+    fn http_fixture_stream_clears_inherited_nonblocking_mode() {
+        use rustix::fs::{OFlags, fcntl_getfl};
+        use std::net::{TcpListener, TcpStream};
+        use std::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("fixture listener");
+        let _client =
+            TcpStream::connect_timeout(&listener.local_addr().unwrap(), Duration::from_secs(2))
+                .expect("fixture client");
+        let (stream, _) = listener.accept().expect("fixture connection");
+        stream.set_nonblocking(true).expect("inherited socket mode");
+        assert!(fcntl_getfl(&stream).unwrap().contains(OFlags::NONBLOCK));
+
+        configure_http_fixture_stream(&stream, Duration::from_secs(2));
+
+        assert!(
+            !fcntl_getfl(&stream).unwrap().contains(OFlags::NONBLOCK),
+            "fixture parsing must wait for request bytes on every platform"
+        );
+        assert!(stream.read_timeout().unwrap().is_some());
+        assert!(stream.write_timeout().unwrap().is_some());
+    }
 
     #[test]
     fn fixture_paths_survive_canonicalization_unchanged() {

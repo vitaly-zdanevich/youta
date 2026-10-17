@@ -46,12 +46,10 @@ impl RecentPodFixture {
                     }
                     Err(error) => panic!("local pod accept: {error}"),
                 };
-                socket
-                    .set_read_timeout(Some(Duration::from_millis(500)))
-                    .unwrap();
-                socket
-                    .set_write_timeout(Some(Duration::from_millis(500)))
-                    .unwrap();
+                crate::test_support::configure_http_fixture_stream(
+                    &socket,
+                    Duration::from_millis(500),
+                );
                 let mut request = Vec::new();
                 while !request.ends_with(b"\r\n\r\n") && request.len() < 8192 {
                     let mut byte = [0_u8; 1];

@@ -198,12 +198,10 @@ mod tests {
                         }
                         Err(error) => panic!("mock uploader pod accept: {error}"),
                     };
-                    socket
-                        .set_read_timeout(Some(Duration::from_secs(1)))
-                        .unwrap();
-                    socket
-                        .set_write_timeout(Some(Duration::from_secs(1)))
-                        .unwrap();
+                    crate::test_support::configure_http_fixture_stream(
+                        &socket,
+                        Duration::from_secs(1),
+                    );
                     let mut reader = BufReader::new(&mut socket);
                     let mut line = String::new();
                     reader.read_line(&mut line).unwrap();

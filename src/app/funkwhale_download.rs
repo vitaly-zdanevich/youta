@@ -922,9 +922,7 @@ mod tests {
                     Err(error) => panic!("fixture accept: {error}"),
                 }
             };
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
+            crate::test_support::configure_http_fixture_stream(&stream, Duration::from_secs(2));
             let mut input = Vec::new();
             while !input.ends_with(b"\r\n\r\n") && input.len() < 8192 {
                 let mut byte = [0];
@@ -1071,9 +1069,7 @@ mod tests {
                         Err(error) => panic!("fixture accept: {error}"),
                     }
                 };
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .unwrap();
+                crate::test_support::configure_http_fixture_stream(&stream, Duration::from_secs(2));
                 let mut input = Vec::new();
                 while !input.ends_with(b"\r\n\r\n") && input.len() < 8192 {
                     let mut byte = [0];
