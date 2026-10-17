@@ -2024,7 +2024,8 @@ history or playlists. Keep the export under `secrets/` or otherwise outside Git
 sync. When the session expires, replace the export and restart Youta.
 
 Press `v` while browsing VK, or click the Tracks/Albums control, to choose the
-search mode. Press `/` and enter ordinary words or numbers, such as `2032`, to
+search mode. In the TUI, this control follows Autoplay and Repeat at the bottom
+of the list. Press `/` and enter ordinary words or numbers, such as `2032`, to
 search that catalogue. The mode is retained while browsing an album's tracks;
 typed `v` remains text while editing the query. Enter opens a selected album.
 Enter `@profile_name`, `profile:profile_name`, `id123`, `profile:123`, or a

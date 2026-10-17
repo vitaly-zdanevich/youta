@@ -1389,7 +1389,7 @@ fn source_search_page_capacities(
     };
     SearchPageCapacities {
         with_heading: capacity(true),
-        without_heading: capacity(vk_search_mode_control_fits(list, screen)),
+        without_heading: capacity(false),
     }
 }
 
@@ -3738,14 +3738,8 @@ fn render_body(
 
     let panes = main_body_panes(area);
 
-    let mut search_title = search_panel_title(view);
-    let (mut list_area, controls) = main_list_pane_areas(panes[0], view.screen);
-    if let Some(content) =
-        render_vk_search_mode_heading(frame, list_area, view, show_hotkeys, theme, hit_map)
-    {
-        list_area = content;
-        search_title.clear();
-    }
+    let search_title = search_panel_title(view);
+    let (list_area, controls) = main_list_pane_areas(panes[0], view.screen);
     let show_empty_prompt = empty_search_prompt_visible(view);
     if show_empty_prompt && !area.is_empty() {
         hit_map.rows =
@@ -3826,53 +3820,7 @@ fn render_body(
     }
 }
 
-/// Uses the longest mode label so both modes and hidden-hotkey layouts reserve identical rows.
-fn vk_search_mode_control_fits(area: Rect, screen: Screen) -> bool {
-    cfg!(feature = "vk") && screen == Screen::Vk && area.height > 0 && area.width >= 10
-}
-
-/// Renders the query and independent VK mode control in disjoint parts of one heading row.
-///
-/// Returns `None` when the control would crowd an active editor, allowing the caller
-/// to retain its ordinary full-width heading and unchanged result-row budget.
-fn render_vk_search_mode_heading(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    view: &ViewModel,
-    show_hotkeys: bool,
-    theme: &Theme,
-    hit_map: &mut HitMap,
-) -> Option<Rect> {
-    if !vk_search_mode_control_fits(area, view.screen) {
-        return None;
-    }
-    let title = search_panel_title(view);
-    let label = button("v", view.vk_search_kind.title_label(), show_hotkeys);
-    let width = terminal_text_width(&label);
-    let query_width = area.width.saturating_sub(width + 1);
-    if view.search_editing && terminal_text_width(title.trim()) > query_width {
-        return None;
-    }
-    let control = Rect::new(area.right() - width, area.y, width, 1);
-    let query = Rect::new(area.x, area.y, query_width, 1);
-    frame.render_widget(Paragraph::new(title.trim()).style(theme.heading), query);
-    frame.render_widget(
-        Paragraph::new(label).style(if view.search_editing {
-            theme.muted
-        } else {
-            theme.accent
-        }),
-        control,
-    );
-    if !view.search_editing {
-        hit_map
-            .detail_buttons
-            .push((UiAction::CycleVkSearchKind, control));
-    }
-    Some(main_panel_content_area(area, true))
-}
-
-/// Shares playback toggles, YT Shorts visibility, and parent navigation below catalogue lists.
+/// Shares playback toggles, source modes, and parent navigation below catalogue lists.
 /// Every catalogue advertises the global tilde shortcut for Repeat.
 fn render_catalog_playback_controls(
     frame: &mut Frame<'_>,
@@ -3934,6 +3882,13 @@ fn render_catalog_playback_controls(
                 UiAction::ToggleRepeat,
             ),
         ])
+        .chain(
+            (cfg!(feature = "vk") && view.screen == Screen::Vk).then_some((
+                "v",
+                view.vk_search_kind.title_label(),
+                UiAction::CycleVkSearchKind,
+            )),
+        )
     {
         let label = button(key, label, show_hotkeys);
         let width = terminal_text_width(&label).min(area.right().saturating_sub(x));
@@ -3941,8 +3896,15 @@ fn render_catalog_playback_controls(
             break;
         }
         let target = Rect::new(x, area.y, width, 1);
-        frame.render_widget(Paragraph::new(label).style(theme.accent), target);
-        hit_map.detail_buttons.push((action, target));
+        // A mode click must not submit or discard the search editor's unfinished query.
+        let enabled = action != UiAction::CycleVkSearchKind || !view.search_editing;
+        frame.render_widget(
+            Paragraph::new(label).style(if enabled { theme.accent } else { theme.muted }),
+            target,
+        );
+        if enabled {
+            hit_map.detail_buttons.push((action, target));
+        }
         x = x.saturating_add(width).saturating_add(2);
     }
 }
@@ -19343,37 +19305,65 @@ for encoded, expected in json.load(sys.stdin):
         }
     }
 
-    /// VK keeps a compact mode control without reintroducing an empty query placeholder.
+    /// VK mode follows playback toggles without reserving an otherwise empty heading.
     #[cfg(feature = "vk")]
     #[test]
-    fn vk_search_mode_control_is_visible_clickable_and_respects_heading_geometry() {
+    fn vk_search_mode_control_follows_playback_footer_and_respects_editing() {
         for kind in [VkSearchKind::Tracks, VkSearchKind::Albums] {
             for query in ["", "fixture query"] {
-                for editing in [false, true] {
+                for (editing, show_hotkeys) in [false, true]
+                    .into_iter()
+                    .flat_map(|editing| [false, true].map(|hotkeys| (editing, hotkeys)))
+                {
                     let view = ViewModel {
                         screen: Screen::Vk,
                         vk_search_kind: kind,
                         search_query: query.to_owned(),
                         search_editing: editing,
                         search_cursor_byte: query.len(),
+                        autoplay: true,
                         ..ViewModel::default()
                     };
-                    let area = Rect::new(0, 0, 120, 24);
+                    let area = Rect::new(0, 0, 160, 24);
                     let mut terminal =
                         Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
                     let mut hits = HitMap::default();
                     terminal
-                        .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hits))
+                        .draw(|frame| {
+                            render(
+                                frame,
+                                &view,
+                                &UiSettings {
+                                    show_hotkeys,
+                                    ..UiSettings::default()
+                                },
+                                &mut hits,
+                            )
+                        })
                         .unwrap();
                     let body = main_frame_sections(area, &view)[1];
-                    let (list, _) = main_list_pane_areas(main_body_panes(body)[0], Screen::Vk);
-                    let control = format!("[v] {}", kind.title_label());
-                    let x = list.right() - control.len() as u16;
-                    let label = (x..list.right())
-                        .map(|column| terminal.backend().buffer()[(column, list.y)].symbol())
+                    let (list, footer) = main_list_pane_areas(main_body_panes(body)[0], Screen::Vk);
+                    let prefix = format!(
+                        "{}  {}  ",
+                        button("A", "Autoplay: on", show_hotkeys),
+                        button("~", "Repeat: off", show_hotkeys)
+                    );
+                    let control = button("v", kind.title_label(), show_hotkeys);
+                    let x = footer.x + terminal_text_width(&prefix);
+                    let target = Rect::new(x, footer.y, terminal_text_width(&control), 1);
+                    let label = (footer.x..footer.right())
+                        .map(|column| terminal.backend().buffer()[(column, footer.y)].symbol())
                         .collect::<String>();
-                    assert_eq!(label, control, "query={query:?}, editing={editing}");
-                    assert_eq!(hits.rows.y, list.y + 1);
+                    assert_eq!(
+                        label.trim_end(),
+                        format!("{prefix}{control}"),
+                        "query={query:?}, editing={editing}, hotkeys={show_hotkeys}"
+                    );
+                    assert_eq!(
+                        hits.rows,
+                        main_panel_content_area(list, !search_panel_title(&view).is_empty())
+                    );
+                    assert!(hits.rows.intersection(target).is_empty());
                     assert_eq!(
                         hits.detail_buttons
                             .iter()
@@ -19381,23 +19371,23 @@ for encoded, expected in json.load(sys.stdin):
                             .count(),
                         usize::from(!editing)
                     );
-                    if !editing {
+                    for column in [target.x, target.right() - 1] {
                         assert_eq!(
                             mouse_action(
                                 MouseEvent {
                                     kind: MouseEventKind::Down(MouseButton::Left),
-                                    column: x,
-                                    row: list.y,
+                                    column,
+                                    row: footer.y,
                                     modifiers: KeyModifiers::NONE,
                                 },
                                 &hits,
                                 &view
                             ),
-                            Some(UiAction::CycleVkSearchKind)
+                            (!editing).then_some(UiAction::CycleVkSearchKind)
                         );
                     }
                     let capacities = source_search_page_capacities(area, &view, Screen::Vk);
-                    assert_eq!(capacities.with_heading, capacities.without_heading);
+                    assert_eq!(capacities.with_heading + 1, capacities.without_heading);
                     if query.is_empty() && !editing {
                         assert_eq!(search_panel_title(&view), "");
                         assert!(rendered_text(&terminal).contains("To search, press /"));
@@ -19407,36 +19397,103 @@ for encoded, expected in json.load(sys.stdin):
         }
     }
 
-    /// A mode control that cannot fit must not consume a blank row on a tiny terminal.
+    /// VK mode follows existing footer clipping without taking rows or out-of-bounds clicks.
     #[cfg(feature = "vk")]
     #[test]
-    fn vk_search_mode_control_preserves_tiny_terminal_rows() {
-        let view = ViewModel {
-            screen: Screen::Vk,
-            ..ViewModel::default()
-        };
-        let area = Rect::new(0, 0, 9, 24);
-        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
-        let mut hits = HitMap::default();
-        terminal
-            .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hits))
-            .unwrap();
-        let body = main_frame_sections(area, &view)[1];
-        assert_eq!(hits.rows.y, main_body_panes(body)[0].y);
-        assert!(
-            !hits
-                .detail_buttons
-                .iter()
-                .any(|(action, _)| *action == UiAction::CycleVkSearchKind)
-        );
-        let capacities = source_search_page_capacities(area, &view, Screen::Vk);
-        assert_eq!(capacities.with_heading + 1, capacities.without_heading);
+    fn vk_search_mode_control_preserves_tiny_terminal_rows_and_clips_safely() {
+        for width in [1, 9, 24, 36, 37, 40, 45, 46, 60, 80, 120] {
+            for back in [false, true] {
+                for show_hotkeys in [false, true] {
+                    let view = ViewModel {
+                        screen: Screen::Vk,
+                        vk_back_available: back,
+                        ..ViewModel::default()
+                    };
+                    let area = Rect::new(0, 0, width, 24);
+                    let mut terminal = Terminal::new(TestBackend::new(width, area.height)).unwrap();
+                    let mut hits = HitMap::default();
+                    terminal
+                        .draw(|frame| {
+                            render(
+                                frame,
+                                &view,
+                                &UiSettings {
+                                    show_hotkeys,
+                                    ..UiSettings::default()
+                                },
+                                &mut hits,
+                            )
+                        })
+                        .unwrap();
+                    let body = main_frame_sections(area, &view)[1];
+                    let (list, footer) = main_list_pane_areas(main_body_panes(body)[0], Screen::Vk);
+                    assert_eq!(hits.rows, list);
+                    for (_, target) in &hits.detail_buttons {
+                        assert_eq!(target.y, footer.y);
+                        assert_eq!(target.height, 1);
+                        assert!(target.right() <= footer.right());
+                        assert!(hits.rows.intersection(*target).is_empty());
+                    }
+                    let mut prefix = if back {
+                        format!("{}  ", button("Esc", "Back", show_hotkeys))
+                    } else {
+                        String::new()
+                    };
+                    prefix.push_str(&format!(
+                        "{}  {}  ",
+                        button("A", "Autoplay: off", show_hotkeys),
+                        button("~", "Repeat: off", show_hotkeys)
+                    ));
+                    let x = footer.x + terminal_text_width(&prefix);
+                    let remaining = footer.right().saturating_sub(x);
+                    let expected = (remaining > 0).then(|| {
+                        Rect::new(
+                            x,
+                            footer.y,
+                            terminal_text_width(&button("v", "Tracks", show_hotkeys))
+                                .min(remaining),
+                            1,
+                        )
+                    });
+                    let target = hits.detail_buttons.iter().find_map(|(action, target)| {
+                        (*action == UiAction::CycleVkSearchKind).then_some(*target)
+                    });
+                    assert_eq!(
+                        target, expected,
+                        "width={width}, back={back}, hotkeys={show_hotkeys}"
+                    );
+                    if let Some(target) = target {
+                        for column in [target.x, target.right() - 1] {
+                            assert_eq!(
+                                mouse_action(
+                                    MouseEvent {
+                                        kind: MouseEventKind::Down(MouseButton::Left),
+                                        column,
+                                        row: target.y,
+                                        modifiers: KeyModifiers::NONE
+                                    },
+                                    &hits,
+                                    &view
+                                ),
+                                Some(UiAction::CycleVkSearchKind)
+                            );
+                        }
+                    }
+                    assert_eq!(
+                        key_action(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE), &view),
+                        Some(UiAction::CycleVkSearchKind)
+                    );
+                    let capacities = source_search_page_capacities(area, &view, Screen::Vk);
+                    assert_eq!(capacities.with_heading + 1, capacities.without_heading);
+                }
+            }
+        }
     }
 
-    /// The disabled mode selector must not hide a query caret that fits in the full heading.
+    /// Footer controls never reduce the search editor's full-width heading or caret.
     #[cfg(feature = "vk")]
     #[test]
-    fn vk_search_editor_keeps_its_caret_when_the_mode_control_would_crowd_it() {
+    fn vk_search_editor_keeps_its_full_width_caret_above_the_mode_footer() {
         for (width, query) in [(18, ""), (24, "abcdefgh"), (24, "世界abcdef")] {
             let view = ViewModel {
                 screen: Screen::Vk,
@@ -19470,14 +19527,14 @@ for encoded, expected in json.load(sys.stdin):
             assert_eq!(hits.rows, main_panel_content_area(list, true));
             let capacities = source_search_page_capacities(area, &view, Screen::Vk);
             assert_eq!(usize::from(hits.rows.height), capacities.with_heading + 1);
-            assert_eq!(capacities.with_heading, capacities.without_heading);
+            assert_eq!(capacities.with_heading + 1, capacities.without_heading);
         }
     }
 
-    /// Long queries clip before the right-aligned mode without sharing cells or click targets.
+    /// Long queries retain the full heading now that mode selection belongs to the footer.
     #[cfg(feature = "vk")]
     #[test]
-    fn vk_search_mode_control_does_not_overlap_a_narrow_query() {
+    fn vk_search_mode_footer_does_not_clip_a_narrow_query_heading() {
         let view = ViewModel {
             screen: Screen::Vk,
             vk_search_kind: VkSearchKind::Albums,
@@ -19493,14 +19550,11 @@ for encoded, expected in json.load(sys.stdin):
         let line = (0..24)
             .map(|column| terminal.backend().buffer()[(column, body.y)].symbol())
             .collect::<String>();
-        assert_eq!(line, "abcdefghijklm [v] Albums");
-        assert_eq!(
+        assert_eq!(line, "abcdefghijklmnopqrstuvwx");
+        assert!(
             hits.detail_buttons
                 .iter()
-                .find(|(action, _)| *action == UiAction::CycleVkSearchKind)
-                .unwrap()
-                .1,
-            Rect::new(14, body.y, 10, 1)
+                .all(|(_, target)| target.y != body.y)
         );
     }
 
@@ -23254,11 +23308,7 @@ for encoded, expected in json.load(sys.stdin):
                     capacities,
                     SearchPageCapacities {
                         with_heading: 17,
-                        without_heading: if cfg!(feature = "vk") && screen == Screen::Vk {
-                            17
-                        } else {
-                            18
-                        }
+                        without_heading: 18,
                     }
                 );
                 for own_query in ["", "submitted fixture"] {
