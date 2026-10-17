@@ -163,7 +163,10 @@ fn field_belongs_to_disabled_feature(interface: &str, field: &str) -> bool {
         && ((!cfg!(feature = "ascii-visualizer")
             && matches!(field, "ascii_visualizer" | "ascii_visualizer_supported"))
             || (!cfg!(feature = "cmd")
-                && matches!(field, "custom_command_buttons" | "custom_command_output"))
+                && matches!(
+                    field,
+                    "custom_command_buttons" | "custom_command_output" | "local_command_open"
+                ))
             || (!cfg!(feature = "commons-upload")
                 && matches!(
                     field,
@@ -226,6 +229,10 @@ fn action_belongs_to_disabled_feature(name: &str) -> bool {
 
 #[test]
 fn optional_contract_exemptions_follow_the_compiled_feature_set() {
+    assert_eq!(
+        field_belongs_to_disabled_feature("ViewModel", "local_command_open"),
+        !cfg!(feature = "cmd")
+    );
     assert_eq!(
         field_belongs_to_disabled_feature("ViewModel", "custom_command_buttons"),
         !cfg!(feature = "cmd")
