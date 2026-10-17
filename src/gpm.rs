@@ -540,16 +540,30 @@ mod tests {
     fn gpm_socket_disconnect_retains_final_mouse_packet_and_allows_reconnect() {
         let token = Token(117);
         let (mut poll, mut input, mut peer, directory) = socket_fixture(token);
+        // Parallel process creation can retain a duplicate descriptor until exec.
+        let inherited_peer = peer.try_clone().expect("inherited daemon socket fixture");
         peer.write_all(&encoded_event(fixture_event(GPM_DOWN, 2, 3)))
             .expect("final packet");
+        // Close the write side even if a child still owns a duplicated descriptor.
+        peer.shutdown(std::net::Shutdown::Write)
+            .expect("finish daemon packets independently of duplicate handles");
         drop(peer);
         await_socket(&mut poll, token);
         assert_eq!(
             input.drain_ready().unwrap_err().kind(),
             io::ErrorKind::ConnectionAborted
         );
-        assert!(matches!(input.read(), Some(CrosstermEvent::Mouse(_))));
+        assert_eq!(
+            input.read(),
+            Some(CrosstermEvent::Mouse(mouse_event(
+                MouseEventKind::Down(MouseButton::Left),
+                1,
+                2,
+                KeyModifiers::NONE,
+            )))
+        );
         assert_eq!(input.read(), None);
+        drop(inherited_peer);
         drop(input);
         // A separate daemon socket models the caller's explicit F8 reconnect.
         let path = directory.path().join("restarted-gpmctl");
