@@ -53,9 +53,16 @@ fn funkwhale_manual_download_uses_native_audio_and_keeps_only_stable_intent() {
                 }
                 Err(error) => panic!("fixture accept: {error}"),
             };
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
+            // Reproduce Windows' inherited mode even when accept defaults to blocking.
+            stream.set_nonblocking(true).unwrap();
+            crate::test_support::configure_http_fixture_stream(&stream, Duration::from_secs(2));
+            #[cfg(all(unix, feature = "acoustid"))]
+            assert!(
+                !rustix::fs::fcntl_getfl(&stream)
+                    .unwrap()
+                    .contains(rustix::fs::OFlags::NONBLOCK),
+                "manual download fixture must wait for HTTP request bytes"
+            );
             let mut input = [0; 8192];
             let count = stream.read(&mut input).unwrap();
             let request = String::from_utf8_lossy(&input[..count]);

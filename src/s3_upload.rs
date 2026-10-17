@@ -1070,9 +1070,14 @@ mod tests {
                         std::thread::sleep(std::time::Duration::from_millis(2));
                         continue;
                     };
+                    // Reproduce Windows inheritance even when this fixture runs on Unix.
                     socket
-                        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
-                        .expect("timeout");
+                        .set_nonblocking(true)
+                        .expect("inherited fixture socket mode");
+                    crate::test_support::configure_http_fixture_stream(
+                        &socket,
+                        std::time::Duration::from_secs(2),
+                    );
                     let mut header = Vec::new();
                     let mut byte = [0];
                     while !header.ends_with(b"\r\n\r\n") && header.len() < 64 * 1024 {

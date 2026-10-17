@@ -14,7 +14,11 @@ use tempfile::TempDir;
 ///
 /// Windows inherits a listener's nonblocking mode on accepted connections;
 /// request parsers need blocking reads to wait for bytes within their timeout.
-#[cfg(feature = "funkwhale")]
+#[cfg(any(
+    feature = "funkwhale",
+    all(feature = "url-info", feature = "controller"),
+    feature = "s3-upload"
+))]
 pub(crate) fn configure_http_fixture_stream(
     stream: &std::net::TcpStream,
     timeout: std::time::Duration,

@@ -2149,12 +2149,11 @@ mod tests {
                         Err(error) => panic!("mock accept failed: {error}"),
                     }
                 };
+                // Reproduce Windows inheritance even when this fixture runs on Unix.
                 stream
-                    .set_read_timeout(Some(Duration::from_secs(1)))
-                    .unwrap();
-                stream
-                    .set_write_timeout(Some(Duration::from_secs(1)))
-                    .unwrap();
+                    .set_nonblocking(true)
+                    .expect("inherited fixture socket mode");
+                crate::test_support::configure_http_fixture_stream(&stream, Duration::from_secs(1));
                 let mut request = Vec::new();
                 let mut byte = [0_u8; 1];
                 while !request.ends_with(b"\r\n\r\n") {
@@ -2233,9 +2232,11 @@ mod tests {
                     }
                     Err(error) => panic!("mock accept failed: {error}"),
                 };
+                // Reproduce Windows inheritance even when this fixture runs on Unix.
                 stream
-                    .set_read_timeout(Some(Duration::from_secs(1)))
-                    .unwrap();
+                    .set_nonblocking(true)
+                    .expect("inherited fixture socket mode");
+                crate::test_support::configure_http_fixture_stream(&stream, Duration::from_secs(1));
                 let mut request = Vec::new();
                 let mut byte = [0_u8; 1];
                 while !request.ends_with(b"\r\n\r\n") {
