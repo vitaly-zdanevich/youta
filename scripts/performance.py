@@ -41,6 +41,10 @@ PROCESS_METRICS = [
 	'startup_seconds', 'idle_wall_seconds', 'idle_cpu_seconds',
 	'idle_cpu_percent_single_core', 'rss_bytes',
 ]
+# Ratatui can skip blank cells with cursor moves instead of writing spaces.
+EMPTY_STATE_PROMPT = re.compile(
+	rb'(?:\s|\x1b\[[0-9;]*[Hm])+'.join([b'To', b'search,', b'press', b'/'])
+)
 
 
 def load_fixture():
@@ -75,6 +79,10 @@ class TerminalReader:
 		self.descriptor = descriptor
 		self.tail = b''
 		self.query_tail = b''
+
+	def ready(self):
+		"""Recognize the empty-search prompt across cursor moves and read chunks."""
+		return EMPTY_STATE_PROMPT.search(self.tail) is not None
 
 	def drain(self, timeout):
 		"""Read at most one bounded chunk; the caller owns the overall deadline."""
@@ -149,7 +157,7 @@ def measure_process(command, fixture):
 			slave = None
 			reader = TerminalReader(master)
 			deadline = started + fixture['readiness_timeout_seconds']
-			while b'Video search' not in reader.tail:
+			while not reader.ready():
 				if child.poll() is not None or time.perf_counter() >= deadline:
 					raise RuntimeError('TUI readiness marker was not reached before exit/deadline')
 				reader.drain(min(0.05, deadline - time.perf_counter()))
@@ -283,7 +291,7 @@ def markdown(report):
 		f"Probe source SHA-256: `{report['fixture']['probe_sources_sha256']}`.", '',
 		'Navigation includes selection dispatch and preliminary details, not rendering or network requests.',
 		'Rendering uses Ratatui TestBackend with a fixed large list and wrapped description, not terminal I/O.',
-		f"Process startup ends at the first recognizable Video search frame in a drained {report['fixture']['definition']['terminal_columns']}×{report['fixture']['definition']['terminal_rows']} PTY.",
+		f"Process startup ends at the first recognizable empty-search prompt in a drained {report['fixture']['definition']['terminal_columns']}×{report['fixture']['definition']['terminal_rows']} PTY.",
 		'Idle CPU/RSS sample only that child after readiness and settling; RSS is the end sample, not peak RSS.',
 		'Empty-state startup is not populated-library startup. No playback, images, GUI, or network adapters are enabled.',
 		'CPU is quantized to procfs ticks; zero means below that observation resolution. Shared-runner noise remains.',

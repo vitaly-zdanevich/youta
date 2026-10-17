@@ -104,15 +104,40 @@ class PerformanceTests(unittest.TestCase):
 
 	def test_terminal_output_retention_is_bounded_and_split_queries_are_answered(self):
 		reader = performance.TerminalReader(42)
-		chunks = [b'x' * 65536 + b'\x1b[', b'6nVideo search']
+		chunks = [b'x' * 65536 + b'\x1b[', b'6nTo search, press /']
 		with mock.patch.object(performance.select, 'select', return_value=([42], [], [])):
 			with mock.patch.object(performance.os, 'read', side_effect=chunks):
 				with mock.patch.object(performance.os, 'write') as write:
 					reader.drain(0)
 					reader.drain(0)
 		self.assertEqual(len(reader.tail), 65536)
-		self.assertTrue(reader.tail.endswith(b'Video search'))
+		self.assertTrue(reader.tail.endswith(b'To search, press /'))
 		write.assert_called_once_with(42, b'\x1b[1;1R')
+
+	def test_readiness_waits_for_complete_prompt_across_cursor_moves_and_reads(self):
+		"""Model Ratatui skipping blank cells and a PTY read splitting a CSI escape."""
+		reader = performance.TerminalReader(42)
+		chunks = [b'To\x1b[21;55Hsearch,\x1b[21;63Hpress\x1b[21;', b'69H/']
+		with mock.patch.object(performance.select, 'select', return_value=([42], [], [])):
+			with mock.patch.object(performance.os, 'read', side_effect=chunks):
+				reader.drain(0)
+				self.assertFalse(reader.ready())
+				reader.drain(0)
+				self.assertTrue(reader.ready())
+
+	def test_readiness_accepts_plain_and_styled_prompts_but_rejects_partial_text(self):
+		"""Readiness requires all prompt words, including the final search shortcut."""
+		reader = performance.TerminalReader(42)
+		for text, ready in [
+			(b'To search, press /', True),
+			(b'To \x1b[39msearch,\x1b[21;63Hpress /', True),
+			(b'Video search', False),
+			(b'To search, press ', False),
+			(b'To search, wait /', False),
+		]:
+			with self.subTest(text=text):
+				reader.tail = text
+				self.assertEqual(reader.ready(), ready)
 
 	def test_cleanup_signals_remaining_group_members_after_leader_exit(self):
 		child = mock.Mock(pid=1234)
@@ -209,9 +234,10 @@ class PerformanceTests(unittest.TestCase):
 	@unittest.skipUnless(sys.platform == 'linux', 'Linux PTY/procfs runner')
 	def test_ready_mock_process_produces_finite_child_samples_and_exits_cleanly(self):
 		fixture = copy.deepcopy(performance.load_fixture())
-		fixture.update(idle_seconds=0.02, settle_seconds=0.01)
+		fixture.update(idle_seconds=0.02, settle_seconds=0.01, readiness_timeout_seconds=1)
 		command = [sys.executable, '-c',
-			'import os, tty; tty.setraw(0); os.write(1, b"Video search"); os.read(0, 1)']
+			'import os, tty; tty.setraw(0); '
+			'os.write(1, b"To\\x1b[21;55Hsearch,\\x1b[21;63Hpress\\x1b[21;69H/"); os.read(0, 1)']
 		sample = performance.measure_process(command, fixture)
 		self.assertTrue(all(performance.finite_metric(sample[key]) for key in performance.PROCESS_METRICS))
 		self.assertGreater(sample['rss_bytes'], 0)

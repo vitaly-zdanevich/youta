@@ -3393,7 +3393,7 @@ latency or terminal output throughput.
 The [standard-library Python runner](scripts/performance.py) separately launches
 the already-built executable three times in a 120×40 Linux PTY with an empty
 temporary configuration and helper path. Startup ends at the first recognizable
-`Video search` frame. After 200 ms of settling, each process is observed idle for
+`To search, press /` prompt. After 200 ms of settling, each process is observed idle for
 three seconds using its own `/proc/<pid>/stat`: user+system CPU, elapsed wall time,
 CPU percentage relative to one core, and end-of-observation RSS, not peak RSS.
 The runner drains bounded terminal output, handles cursor queries, and always
