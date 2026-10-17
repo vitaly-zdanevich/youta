@@ -16,6 +16,33 @@ mod metadata;
 
 pub use metadata::CommandMetadata;
 
+/// Builds the Bash process used by both command wrappers and their execution fixtures.
+fn bash_command() -> Command {
+    #[cfg(windows)]
+    let program = windows_bash_program_from_path(std::env::var_os("PATH").as_deref());
+    #[cfg(not(windows))]
+    let program = OsString::from("bash");
+    Command::new(program)
+}
+
+/// Resolves Windows Bash in PATH order before the implicit system-directory lookup.
+///
+/// Rust searches System32 before the inherited PATH for bare program names, so
+/// the legacy WSL launcher can shadow Git Bash. Selecting an absolute executable
+/// preserves the caller's PATH choice without rewriting command source or data.
+#[cfg(any(windows, test))]
+fn windows_bash_program_from_path(search_path: Option<&std::ffi::OsStr>) -> OsString {
+    if let Some(search_path) = search_path {
+        for directory in std::env::split_paths(search_path).filter(|path| path.is_absolute()) {
+            let candidate = directory.join("bash.exe");
+            if candidate.is_file() {
+                return candidate.into_os_string();
+            }
+        }
+    }
+    OsString::from("bash")
+}
+
 /// A user-authored command with an optional captured local path or original provider URL.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ShellCommandPlan {
@@ -129,7 +156,7 @@ impl ShellCommandPlan {
         let expanded = self.expanded_source()?;
         let metadata_path = self.metadata_argument()?;
         let playback_position = self.playback_position_argument()?;
-        let mut command = Command::new("bash");
+        let mut command = bash_command();
         command
             .args([
                 "--noprofile",
@@ -170,7 +197,7 @@ impl ShellCommandPlan {
         let expanded = self.expanded_source()?;
         let metadata_path = self.metadata_argument()?;
         let playback_position = self.playback_position_argument()?;
-        let mut command = Command::new("bash");
+        let mut command = bash_command();
         command
             .args(["--noprofile", "--norc", "-c"])
             .arg(expanded)
@@ -567,10 +594,72 @@ fn expand_targets(template: &str) -> Result<TargetExpansion, String> {
 mod tests {
     use super::*;
 
+    /// Native Bash on PATH must win over Windows' implicit System32 WSL launcher lookup.
+    #[test]
+    fn windows_bash_resolution_uses_absolute_path_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let native = directory.path().join("Git bin");
+        let system = directory.path().join("System32");
+        std::fs::create_dir(&native).unwrap();
+        std::fs::create_dir(&system).unwrap();
+        let native_bash = native.join("bash.exe");
+        let system_bash = system.join("bash.exe");
+        std::fs::write(&native_bash, b"native Bash fixture").unwrap();
+        std::fs::write(&system_bash, b"WSL launcher fixture").unwrap();
+        for (directories, expected) in [
+            ([&native, &system], &native_bash),
+            ([&system, &native], &system_bash),
+        ] {
+            let search_path = std::env::join_paths(directories).unwrap();
+            assert_eq!(
+                windows_bash_program_from_path(Some(&search_path)),
+                expected.as_os_str()
+            );
+        }
+    }
+
+    /// Explicit lookup ignores missing files, directories, and relative PATH entries.
+    #[test]
+    fn windows_bash_resolution_ignores_unusable_candidates_and_preserves_fallback() {
+        let directory = tempfile::tempdir().unwrap();
+        let directory_candidate = directory.path().join("not-an-executable");
+        std::fs::create_dir(&directory_candidate).unwrap();
+        std::fs::create_dir(directory_candidate.join("bash.exe")).unwrap();
+        let native = directory.path().join("Git bin");
+        std::fs::create_dir(&native).unwrap();
+        std::fs::write(native.join("bash.exe"), b"native Bash fixture").unwrap();
+        let relative_directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        std::fs::write(
+            relative_directory.path().join("bash.exe"),
+            b"relative shell fixture",
+        )
+        .unwrap();
+        let working = std::env::current_dir().unwrap();
+        let relative = relative_directory.path().strip_prefix(&working).unwrap();
+        let missing = directory.path().join("missing");
+        let search_path = std::env::join_paths([
+            relative,
+            missing.as_path(),
+            directory_candidate.as_path(),
+            native.as_path(),
+        ])
+        .unwrap();
+        assert_eq!(
+            windows_bash_program_from_path(Some(&search_path)),
+            native.join("bash.exe").as_os_str()
+        );
+        for search_path in [None, Some(OsString::new()), Some(missing.into_os_string())] {
+            assert_eq!(
+                windows_bash_program_from_path(search_path.as_deref()),
+                "bash"
+            );
+        }
+    }
+
     /// The playback marker uses its own argument instead of appending `t` to the selection.
     #[test]
     fn playback_marker_uses_fifth_argument_instead_of_selected_path() {
-        let output = Command::new("bash")
+        let output = bash_command()
             .args(["--noprofile", "--norc", "-c"])
             .arg(expand_targets("printf '%s' %t").unwrap().source)
             .args(["youta", "/tmp/selected file", "", "", "", "01:02:03.456"])
@@ -791,11 +880,14 @@ mod tests {
     /// The requested command-position macro saves the complete selected description.
     #[test]
     fn metadata_command_redirects_description_without_added_newlines() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = tempfile::Builder::new()
+            .prefix("youta metadata Мінск ")
+            .tempdir()
+            .unwrap();
         let description = "Selected description\nSecond line\n\n";
-        let metadata = directory.path().join("metadata");
+        let metadata = directory.path().join("metadata ' & description");
         std::fs::write(&metadata, description).unwrap();
-        let output = Command::new("bash")
+        let output = bash_command()
             .args(["--noprofile", "--norc", "-c"])
             .arg(expand_targets("%m > mynote").unwrap().source)
             .args(["youta", "original", "", ""])
@@ -830,13 +922,40 @@ mod tests {
     /// Keeps the foreground argv mapping while omitting job control from pipe-based tests.
     fn metadata_test_commands(plan: &ShellCommandPlan) -> [Command; 2] {
         let terminal = plan.command().unwrap();
-        let mut outer = Command::new("bash");
+        let mut outer = Command::new(terminal.get_program());
         outer
             .args(terminal.get_args().filter(|argument| *argument != "-i"))
             .current_dir(&plan.directory)
             .env_remove("BASH_ENV")
             .env_remove("ENV");
         [outer, plan.noninteractive_command().unwrap()]
+    }
+
+    /// Windows-style paths stay opaque arguments through both wrappers, alongside private metadata.
+    #[test]
+    fn command_wrappers_preserve_windows_paths_and_hostile_arguments() {
+        let directory = tempfile::tempdir().unwrap();
+        let original = r"C:\Media folder\Мінск ' $(touch COMMAND_INJECTION).flac";
+        let downloaded = r"D:\Saved media\%track [01].flac";
+        let image = r"E:\Artwork\cover ' & image.png";
+        let description = "Selected description ' \" $(touch COMMAND_INJECTION)\n\n";
+        let mut plan = metadata_plan("set -- replacement; printf '%s\\0' % %d %i %m", description);
+        plan.argument = original.into();
+        plan.downloaded_path = Some(PathBuf::from(downloaded));
+        plan.image_path = Some(PathBuf::from(image));
+        plan.directory = directory.path().to_path_buf();
+        let expected = [original, downloaded, image, description]
+            .map(|value| format!("{value}\0"))
+            .concat();
+        for mut command in metadata_test_commands(&plan) {
+            let output = command
+                .output()
+                .expect("Windows-path shell argument fixture");
+            assert!(output.status.success(), "{output:?}");
+            assert!(output.stderr.is_empty(), "{output:?}");
+            assert_eq!(output.stdout, expected.as_bytes());
+        }
+        assert!(!directory.path().join("COMMAND_INJECTION").exists());
     }
 
     /// Metadata has a distinct requirement and remains literal when quoted or embedded.
@@ -1089,7 +1208,7 @@ mod tests {
     /// The fixed file-read error does not disclose a missing private path or description.
     #[test]
     fn metadata_loading_reports_missing_files_without_private_paths() {
-        let output = Command::new("bash")
+        let output = bash_command()
             .args(["--noprofile", "--norc", "-c"])
             .arg(expand_targets("%m").unwrap().source)
             .args(["youta", "", "", "", "/missing/private-description-path"])
@@ -1398,7 +1517,7 @@ mod tests {
                 );
                 assert!(arguments[4].to_str().unwrap().contains("\"$4\""));
                 // Omit interactive job control for the fixture while retaining the outer argv mapping.
-                let mut outer = Command::new("bash");
+                let mut outer = Command::new(terminal.get_program());
                 outer
                     .args(arguments.into_iter().filter(|argument| *argument != "-i"))
                     .env_remove("BASH_ENV")
@@ -1577,7 +1696,7 @@ mod tests {
             b"/tmp/'\";$(printf INJECTED)`printf INJECTED`\\\n%*.mp3".to_vec(),
             b"/tmp/non-utf8-\xff\xfe.mp3".to_vec(),
         ] {
-            let output = Command::new("bash")
+            let output = bash_command()
                 .args(["--noprofile", "--norc", "-c"])
                 .arg(expand_selected_path("printf '%s\\0' %").unwrap())
                 .arg("youta")
@@ -1604,7 +1723,7 @@ mod tests {
             "printf '%s\\0' \"escaped \\\" %s\" %",
             "printf '%s\\0' \"$(printf '%s' \"%\")\"",
         ] {
-            let output = Command::new("bash")
+            let output = bash_command()
                 .args(["--noprofile", "--norc", "-c"])
                 .arg(expand_selected_path(template).unwrap())
                 .args(["youta", path])
@@ -1633,7 +1752,7 @@ mod tests {
         let template = "tmp=1; printf '%s' $((1000%))";
         let script = expand_selected_path(template).unwrap();
         assert_eq!(script, template);
-        let output = Command::new("bash")
+        let output = bash_command()
             .args(["--noprofile", "--norc", "-c", &script, "youta"])
             .arg("/tmp/x[$(printf INJECTED >&2)]")
             .env_remove("BASH_ENV")
@@ -1659,7 +1778,7 @@ mod tests {
         shell_plan.image_path = Some(PathBuf::from("/private/artwork.png"));
         assert_eq!(format!("{shell_plan:?}"), "ShellCommandPlan { .. }");
         let command = plan.command().unwrap();
-        assert_eq!(command.get_program(), "bash");
+        assert_eq!(command.get_program(), bash_command().get_program());
         assert_eq!(command.get_current_dir(), Some(plan.directory.as_path()));
         let arguments = command.get_args().collect::<Vec<_>>();
         assert_eq!(arguments[arguments.len() - 5], plan.path.as_os_str());
