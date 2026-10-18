@@ -734,33 +734,7 @@ impl Provider for InvidiousProvider {
         let mut url = self.endpoint("api/v1/resolveurl")?;
         url.query_pairs_mut().append_pair("url", source.as_str());
         let resolved: RawResolvedChannelUrl = self.request_json(&url)?;
-        if resolved.page_type != "WEB_PAGE_TYPE_CHANNEL"
-            || resolved.video_id.is_some()
-            || resolved.playlist_id.is_some()
-            || resolved.post_id.is_some()
-        {
-            return Err(ProviderError::InvalidResponse(
-                "handle did not resolve to a channel page".into(),
-            ));
-        }
-        let channel_id = resolved
-            .ucid
-            .as_deref()
-            .or(resolved.browse_id.as_deref())
-            .ok_or_else(|| {
-                ProviderError::InvalidResponse("handle resolution has no channel identity".into())
-            })?;
-        validate_resolved_youtube_channel_id(channel_id)?;
-        if resolved
-            .browse_id
-            .as_deref()
-            .is_some_and(|id| id != channel_id)
-        {
-            return Err(ProviderError::InvalidResponse(
-                "handle resolution has ambiguous channel identities".into(),
-            ));
-        }
-        self.full_channel_details(channel_id)
+        self.full_channel_details(resolved.channel_id()?)
     }
 
     fn video_details(&self, video_id: &str) -> Result<VideoDetails, ProviderError> {
@@ -955,6 +929,35 @@ struct RawResolvedChannelUrl {
     video_id: Option<String>,
     playlist_id: Option<String>,
     post_id: Option<String>,
+}
+
+impl RawResolvedChannelUrl {
+    /// Validates the page family and returns one unambiguous channel ID before metadata I/O.
+    fn channel_id(&self) -> Result<&str, ProviderError> {
+        if self.page_type != "WEB_PAGE_TYPE_CHANNEL"
+            || self.video_id.is_some()
+            || self.playlist_id.is_some()
+            || self.post_id.is_some()
+        {
+            return Err(ProviderError::InvalidResponse(
+                "handle did not resolve to a channel page".into(),
+            ));
+        }
+        let channel_id = self
+            .ucid
+            .as_deref()
+            .or(self.browse_id.as_deref())
+            .ok_or_else(|| {
+                ProviderError::InvalidResponse("handle resolution has no channel identity".into())
+            })?;
+        validate_resolved_youtube_channel_id(channel_id)?;
+        if self.browse_id.as_deref().is_some_and(|id| id != channel_id) {
+            return Err(ProviderError::InvalidResponse(
+                "handle resolution has ambiguous channel identities".into(),
+            ));
+        }
+        Ok(channel_id)
+    }
 }
 
 fn validate_resource_id(value: &str, field: &str) -> Result<(), ProviderError> {
@@ -1981,26 +1984,58 @@ mod tests {
         assert!(server.finish().is_empty());
     }
 
-    /// Resolution must identify precisely one channel, never a video, playlist, or mixed result.
+    /// Schema validation uses the production deserializer without depending on HTTP timing.
+    #[test]
+    fn channel_handle_resolution_rejects_invalid_response_schema() {
+        for response in [
+            r#"{}"#,
+            r#"[]"#,
+            r#"{"pageType":null}"#,
+            r#"{"pageType":"WEB_PAGE_TYPE_CHANNEL","ucid":123}"#,
+        ] {
+            let error = serde_json::from_str::<RawResolvedChannelUrl>(response)
+                .err()
+                .unwrap_or_else(|| panic!("invalid resolution schema accepted: {response}"));
+            assert!(error.is_data(), "{response}: {error}");
+        }
+    }
+
+    /// Either channel ID field is accepted, provided both agree when supplied together.
+    #[test]
+    fn channel_handle_resolution_accepts_unambiguous_channel_identity() {
+        for response in [
+            r#"{"pageType":"WEB_PAGE_TYPE_CHANNEL","ucid":"UC_x5XG1OV2P6uZZ5FSM9Ttw"}"#,
+            r#"{"pageType":"WEB_PAGE_TYPE_CHANNEL","browseId":"UC_x5XG1OV2P6uZZ5FSM9Ttw"}"#,
+            r#"{"pageType":"WEB_PAGE_TYPE_CHANNEL","ucid":"UC_x5XG1OV2P6uZZ5FSM9Ttw","browseId":"UC_x5XG1OV2P6uZZ5FSM9Ttw"}"#,
+        ] {
+            let raw: RawResolvedChannelUrl = serde_json::from_str(response).unwrap();
+            let channel_id = raw
+                .channel_id()
+                .unwrap_or_else(|error| panic!("{response}: {error:?}"));
+            assert_eq!(channel_id, "UC_x5XG1OV2P6uZZ5FSM9Ttw", "{response}");
+        }
+    }
+
+    /// Identity validation rejects missing, conflicting, or nonchannel IDs without HTTP work.
     #[test]
     fn channel_handle_resolution_rejects_missing_ambiguous_and_nonchannel_results() {
         for response in [
-            r#"{}"#,
             r#"{"pageType":"WEB_PAGE_TYPE_CHANNEL"}"#,
             r#"{"pageType":"WEB_PAGE_TYPE_CHANNEL","ucid":"invalid"}"#,
+            r#"{"pageType":"WEB_PAGE_TYPE_CHANNEL","browseId":"invalid"}"#,
             r#"{"pageType":"WEB_PAGE_TYPE_CHANNEL","ucid":"UC_x5XG1OV2P6uZZ5FSM9Ttw","browseId":"UCabcdefghijkabcdefghijk"}"#,
             r#"{"pageType":"WEB_PAGE_TYPE_WATCH","videoId":"dQw4w9WgXcQ"}"#,
+            r#"{"pageType":"WEB_PAGE_TYPE_WATCH","ucid":"UC_x5XG1OV2P6uZZ5FSM9Ttw"}"#,
             r#"{"pageType":"WEB_PAGE_TYPE_CHANNEL","ucid":"UC_x5XG1OV2P6uZZ5FSM9Ttw","videoId":"dQw4w9WgXcQ"}"#,
             r#"{"pageType":"WEB_PAGE_TYPE_CHANNEL","ucid":"UC_x5XG1OV2P6uZZ5FSM9Ttw","playlistId":"PLfixture"}"#,
-            r#"[]"#,
+            r#"{"pageType":"WEB_PAGE_TYPE_CHANNEL","ucid":"UC_x5XG1OV2P6uZZ5FSM9Ttw","postId":"Ugfixture"}"#,
         ] {
-            let server = MockServer::spawn(vec![json_response("200 OK", response)]);
-            let provider = InvidiousProvider::new(server.base_url.clone()).unwrap();
-            assert!(matches!(
-                provider.resolve_channel_handle("@missing"),
-                Err(ProviderError::InvalidResponse(_))
-            ));
-            assert_eq!(server.finish().len(), 1);
+            let raw: RawResolvedChannelUrl = serde_json::from_str(response).unwrap();
+            let result = raw.channel_id();
+            assert!(
+                matches!(&result, Err(ProviderError::InvalidResponse(_))),
+                "{response}: {result:?}"
+            );
         }
     }
 
