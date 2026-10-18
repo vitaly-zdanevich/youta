@@ -23,6 +23,8 @@ mod local_command;
 #[cfg(all(test, target_os = "linux", feature = "cmd"))]
 mod local_command_tests;
 #[cfg(test)]
+mod paused_chapter_tests;
+#[cfg(test)]
 mod performance;
 #[cfg(test)]
 mod seek_status_tests;
@@ -8156,16 +8158,15 @@ fn append_description_unlinked_spans<'a>(
     }
 }
 
-/// Finds the complete physical description line for the chapter that owns the
-/// current playback position.
+/// Finds the chapter line for the playing item or its queued loading timestamp.
 fn active_description_chapter_line(
     view: &ViewModel,
     details: &DetailView,
 ) -> Option<std::ops::Range<usize>> {
-    if details.media_id.as_ref() != view.playing_media_id.as_ref() {
+    if details.media_id.as_ref() != view.chapter_media_id() {
         return None;
     }
-    let active = current_chapter_index(&view.playback_chapters, view.playback.position)?;
+    let active = current_chapter_index(&view.playback_chapters, view.chapter_position())?;
     let seconds = view.playback_chapters.get(active)?.start_seconds;
     let timecode = details
         .timecodes
@@ -8534,8 +8535,7 @@ fn render_waveform(
     let played_columns =
         if view.waveform_playback_matches && !duration.is_zero() && !view.playback.idle {
             usize::try_from(
-                view.playback
-                    .position
+                view.chapter_position()
                     .as_nanos()
                     .saturating_mul(columns as u128)
                     .checked_div(duration.as_nanos())
@@ -8664,8 +8664,9 @@ fn render_seek_bar(
     let terminal_area = frame.area();
     let status_text_area = |area| playback_activity_text_area(area, terminal_area, view);
     let duration = view.playback.duration.unwrap_or(Duration::ZERO);
-    // Share the native playhead between labels and compact gauge coloring.
-    let position = view.playback.position;
+    // An accepted paused seek owns the displayed playhead, including its footer,
+    // while the native audio clock remains available for listening accounting.
+    let position = view.chapter_position();
     let ratio = if duration.is_zero() {
         0.0
     } else {
@@ -9036,8 +9037,7 @@ fn render_chapter_timeline(
     }
 
     let marker_action = |seconds| {
-        view.playing_media_id
-            .as_ref()
+        view.chapter_media_id()
             .map(|media_id| UiAction::ActivateTimecode {
                 media_id: media_id.clone(),
                 seconds,
@@ -9114,7 +9114,7 @@ fn render_chapter_navigation_labels(
             }),
             label_rect,
         );
-        if let Some(media_id) = view.playing_media_id.as_ref() {
+        if let Some(media_id) = view.chapter_media_id() {
             hit_map.seek_markers.push((
                 UiAction::ActivateTimecode {
                     media_id: media_id.clone(),
@@ -9163,7 +9163,7 @@ fn visible_chapter_indices(view: &ViewModel, duration: Duration) -> Vec<usize> {
 
 fn current_visible_chapter_index(view: &ViewModel, visible: &[usize]) -> Option<usize> {
     visible.iter().copied().rfind(|index| {
-        view.playback_chapters[*index].start_seconds <= view.playback.position.as_secs()
+        view.playback_chapters[*index].start_seconds <= view.chapter_position().as_secs()
     })
 }
 
@@ -9200,7 +9200,7 @@ fn truncate_terminal_text(value: &str, maximum_width: usize) -> String {
     output
 }
 
-/// Paints cached spans after the displayed playhead.
+/// Paints cached spans after the displayed playhead, including accepted paused seeks.
 fn render_buffered_ranges(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -17405,10 +17405,21 @@ fn mouse_action_unfiltered(
             if contains(hit_map.details_panel, mouse.column, mouse.row) {
                 return Some(UiAction::SetDetailsFocus(true));
             }
-            if view.playback.seeking_available() && !view.playback.live {
+            if !view.playback.live {
                 for (action, area) in &hit_map.seek_markers {
                     if contains(*area, mouse.column, mouse.row) {
-                        return Some(action.clone());
+                        // A loading snapshot can still be idle; only its exact pending
+                        // item may accept a chapter click before native seeking is ready.
+                        let available = if view.playback_starting && view.playing_media_id.is_none()
+                        {
+                            matches!(action, UiAction::ActivateTimecode { media_id, .. }
+								if view.chapter_media_id() == Some(media_id))
+                        } else {
+                            view.playback.seeking_available()
+                        };
+                        if available {
+                            return Some(action.clone());
+                        }
                     }
                 }
             }

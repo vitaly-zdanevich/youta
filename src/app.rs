@@ -7378,6 +7378,7 @@ impl AppController {
 
     /// Starts one event-authoritative playback attempt at its first ASCII frame.
     fn begin_playback_start_activity(&mut self) {
+        self.view.loading_chapter_seek = None;
         self.view.playback_starting = true;
         self.view.playback_start_animation_frame = 0;
         self.view.playing_media_id = None;
@@ -7385,6 +7386,7 @@ impl AppController {
 
     /// Clears transient playback-start feedback without changing player state.
     fn clear_playback_start_activity(&mut self) {
+        self.view.loading_chapter_seek = None;
         self.view.playback_starting = false;
         self.view.playback_start_animation_frame = 0;
     }
@@ -23690,7 +23692,7 @@ impl AppController {
             self.view.status_line = "That timecode is outside the media duration".to_owned();
             return;
         }
-        let previous = self.view.playback.position;
+        let previous = self.view.chapter_position();
         if !self.seek_player_command(PlayerCommand::SeekAbsolute(target)) {
             return;
         }
@@ -26131,7 +26133,7 @@ impl AppController {
         }
         let started_chapter_count = navigable.partition_point(|index| {
             self.view.playback_chapters[*index].start_seconds
-                <= self.view.playback.position.as_secs()
+                <= self.view.chapter_position().as_secs()
         });
         // The interval before the first marker is virtual chapter -1, so one
         // forward step reaches chapter 0. Checked bounds make absent previous
@@ -27171,6 +27173,7 @@ impl AppController {
                     current_progress
                 });
                 self.current_autoplay_origin = origin;
+                self.view.paused_chapter_seek = None;
                 self.playback_phase = PlaybackPhase::Loading;
                 self.playback_held_at_end = false;
                 self.view.playback_end_releasing = false;
@@ -27234,6 +27237,15 @@ impl AppController {
     }
 
     fn player_command(&mut self, command: PlayerCommand) {
+        if matches!(&command, PlayerCommand::Stop) {
+            self.view.loading_chapter_seek = None;
+        }
+        if matches!(
+            &command,
+            PlayerCommand::TogglePause | PlayerCommand::SetPaused(false) | PlayerCommand::Stop
+        ) {
+            self.view.paused_chapter_seek = None;
+        }
         let Some(player) = self.player.as_mut() else {
             self.view.status_line = "Nothing is playing".to_owned();
             return;
@@ -27339,11 +27351,42 @@ impl AppController {
             self.view.status_line = "Nothing is playing".to_owned();
             return false;
         };
+        // Supersede the cursor only once this command can run. A drained
+        // same-item retry still needs the previously accepted loading target.
+        self.view.loading_chapter_seek = None;
+        self.view.paused_chapter_seek = None;
         // Displayed duration can differ from native EOF. For absolute seeks,
         // only a backend restart confirms this was not a clamped end seek.
         let clear_held = !matches!(&command, PlayerCommand::SeekAbsolute(_));
+        let loading_chapter_seek = match &command {
+            PlayerCommand::SeekAbsolute(target)
+                if matches!(
+                    self.playback_phase,
+                    PlaybackPhase::Loading | PlaybackPhase::Loaded
+                ) && !self.view.playback.live =>
+            {
+                self.current_media
+                    .clone()
+                    .map(|media_id| (media_id, *target))
+            }
+            _ => None,
+        };
+        let paused_chapter_seek = match &command {
+            PlayerCommand::SeekAbsolute(target)
+                if self.playback_phase == PlaybackPhase::Playing
+                    && self.view.playback.paused
+                    && !self.playback_held_at_end =>
+            {
+                self.current_media
+                    .clone()
+                    .map(|media_id| (media_id, *target))
+            }
+            _ => None,
+        };
         match player.command(command) {
             Ok(()) => {
+                self.view.loading_chapter_seek = loading_chapter_seek;
+                self.view.paused_chapter_seek = paused_chapter_seek;
                 if clear_held && std::mem::take(&mut self.playback_held_at_end) {
                     self.view.playback.paused = false;
                     self.view.status_line = format!("Playing {}", self.current_playback_title());
@@ -27446,6 +27489,7 @@ impl AppController {
                 self.reconcile_pending_volume(&mut status);
                 self.normalize_playback_status(&mut status);
                 if self.playback_phase == PlaybackPhase::Idle {
+                    self.view.paused_chapter_seek = None;
                     self.view.playback = status;
                     #[cfg(feature = "vk")]
                     self.refresh_vk_audio_details();
@@ -27463,6 +27507,9 @@ impl AppController {
                         self.refresh_vk_audio_details();
                     }
                     return;
+                }
+                if !status.paused {
+                    self.view.paused_chapter_seek = None;
                 }
                 if self.playback_phase != PlaybackPhase::Playing {
                     status.paused = true;
@@ -27541,7 +27588,7 @@ impl AppController {
         let Some(media_id) = self.current_media.clone() else {
             return false;
         };
-        let position = self.view.playback.position.as_secs();
+        let position = self.view.chapter_position().as_secs();
         let matching = self.view.playback_chapters.iter().find(|chapter| {
             is_advertisement_chapter_title(&chapter.title)
                 && chapter.end_seconds.is_some_and(|end| {
@@ -27587,7 +27634,7 @@ impl AppController {
             .sponsorblock_segment_cache
             .get(&media_id.external_id)
             .and_then(|segments| {
-                skip_decision_at(segments, self.view.playback.position.as_secs_f64())
+                skip_decision_at(segments, self.view.chapter_position().as_secs_f64())
             });
         let Some(decision) = decision else {
             self.skipped_sponsorblock_segment = None;
@@ -27634,6 +27681,10 @@ impl AppController {
                             format!("Playing {}", self.current_playback_title());
                     }
                     if self.playback_phase != PlaybackPhase::Playing {
+                        // A manual pause during loading still owns the accepted
+                        // target after startup; the next active status retires it
+                        // if audio is running instead of paused.
+                        self.view.paused_chapter_seek = self.view.loading_chapter_seek.take();
                         self.playback_phase = PlaybackPhase::Playing;
                         #[cfg(feature = "funkwhale")]
                         self.clear_funkwhale_playback_retry();
@@ -28008,14 +28059,24 @@ impl AppController {
         }
 
         let title = item.media.title.clone();
-        let start_at = self
-            .pending_history
-            .as_ref()
-            .map_or(self.view.playback.position.as_secs(), |history| {
-                history.position_seconds
+        let loading_chapter_seek =
+            self.view.loading_chapter_seek.clone().filter(|(owner, _)| {
+                owner == media_id && self.view.chapter_media_id() == Some(owner)
             });
+        let start_at = loading_chapter_seek.as_ref().map_or_else(
+            || {
+                Duration::from_secs(
+                    self.pending_history
+                        .as_ref()
+                        .map_or(self.view.playback.position.as_secs(), |history| {
+                            history.position_seconds
+                        }),
+                )
+            },
+            |(_, target)| *target,
+        );
         let mut input = PlaybackInput::new(item.playback_location);
-        input.start_at = Duration::from_secs(start_at);
+        input.start_at = start_at;
         input.title = Some(title.clone());
         input.keep_open = item.media.kind != MediaKind::LiveStream;
         input.verify_remote_format = next_kind == PlaybackLoadKind::YouTubeChecked;
@@ -28027,15 +28088,17 @@ impl AppController {
         match result {
             Ok(()) => {
                 self.playback_load_kind = next_kind;
+                self.view.paused_chapter_seek = None;
                 self.playback_phase = PlaybackPhase::Loading;
                 self.youtube_live_time_origin = None;
                 self.view.live_elapsed_seconds =
                     (item.media.kind == MediaKind::LiveStream).then_some(0);
                 self.begin_playback_start_activity();
+                self.view.loading_chapter_seek = loading_chapter_seek;
                 self.ignore_replaced_stop = true;
                 self.last_tick = Instant::now();
                 self.view.playback.idle = false;
-                self.view.playback.position = Duration::from_secs(start_at);
+                self.view.playback.position = start_at;
                 self.view.playback.paused = true;
                 self.view.playback.buffering = true;
                 self.view.playback.buffered_ranges.clear();
@@ -28107,6 +28170,7 @@ impl AppController {
         self.current_autoplay_origin = None;
         self.seek_back.clear();
         self.view.playback_chapters.clear();
+        self.view.paused_chapter_seek = None;
         self.view.radio_now_playing = None;
         #[cfg(feature = "waveform")]
         {
@@ -48682,6 +48746,8 @@ mod tests {
     mod manual_download_sources_tests;
     #[path = "now_playing.rs"]
     mod now_playing_tests;
+    #[path = "paused_chapter_seek.rs"]
+    mod paused_chapter_seek_tests;
     #[cfg(feature = "tui")]
     #[path = "performance.rs"]
     mod performance_tests;
@@ -74563,8 +74629,15 @@ mod tests {
 
     #[test]
     fn advertisement_chapter_is_skipped_once_until_playback_leaves_it() {
-        let (mut controller, state) = controller_with_mock_statuses([]);
+        let (mut controller, state, _, events) = controller_with_mock_lifecycle([], []);
         controller.play_queue_item(fixture_direct_item("advertisement-skip"), false);
+        // Automatic skipping only runs after playback has started, not while
+        // a pending loading seek owns the displayed chapter cursor.
+        events
+            .lock()
+            .expect("mock events")
+            .push_back(PlaybackEvent::PlaybackStarted);
+        controller.update_player();
         controller.view.playback_chapters = vec![
             Chapter {
                 title: "Introduction".to_owned(),

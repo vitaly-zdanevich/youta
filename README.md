@@ -633,8 +633,11 @@ written to its own tty; the window uses the platform clipboard directly, since
 it has no tty and an escape there would be written into nothing and then
 reported as a successful copy.
 
-Description timecodes become chapter splits and exact mouse-seek actions. Chapter
-navigation stays on one row: the current name is centered, with adjacent chapter
+Description timecodes become chapter splits and exact mouse-seek actions. If audio
+is still loading, the latest clicked timecode highlights immediately and is applied
+when the stream is ready.
+While paused, the TUI time label and chapter highlight retain the requested position.
+Chapter navigation stays on one row: the current name is centered, with adjacent chapter
 titles and directional arrows when they fit, or compact `◀ Prev` / `Next ▶`
 controls when space is limited. Proportional splits stay
 on the track; splits that round to one terminal cell share a composite marker.

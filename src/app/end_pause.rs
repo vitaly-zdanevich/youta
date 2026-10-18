@@ -45,6 +45,7 @@ impl AppController {
     /// retained item is still the same seek target; releasing one may immediately
     /// load a successor, so its old keyboard input must not cross that boundary.
     pub(super) fn handle_held_playback_end(&mut self, elapsed: Duration) -> bool {
+        self.view.paused_chapter_seek = None;
         if self.view.playback_end_releasing {
             return true;
         }

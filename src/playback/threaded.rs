@@ -193,6 +193,9 @@ fn worker_gone() -> PlaybackError {
 }
 
 /// Stores a snapshot without discarding an unread failure.
+///
+/// Paused seeks wake immediately because a quiet backend may publish no later
+/// position change to trigger a redraw after the active playback throttle.
 fn publish_status(shared: &Arc<Mutex<Shared>>, status: PlaybackStatus) {
     let mut guard = shared.lock().unwrap_or_else(PoisonError::into_inner);
     let mut semantic_previous = guard.status.clone();
@@ -202,6 +205,7 @@ fn publish_status(shared: &Arc<Mutex<Shared>>, status: PlaybackStatus) {
         .clone_from(&status.buffered_ranges);
     let notify = guard.status != status
         && (semantic_previous != status
+            || (status.paused && guard.status.position != status.position)
             || guard
                 .last_motion_notice
                 .is_none_or(|last| last.elapsed() >= ACTIVE_REFRESH));
@@ -439,6 +443,53 @@ mod tests {
 
     use super::*;
     use crate::playback::{PlaybackEnd, PlaybackEndReason};
+
+    /// Paused seeks need an immediate redraw even within the active playback cadence.
+    #[test]
+    fn paused_position_changes_bypass_active_playback_notification_throttling() {
+        /// Counts published readiness without scheduling any frontend work.
+        #[derive(Default)]
+        struct NoticeCounter(AtomicUsize);
+
+        impl Wake for NoticeCounter {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        for paused in [false, true] {
+            let notices = Arc::new(NoticeCounter::default());
+            let shared = Arc::new(Mutex::new(Shared {
+                waker: Some(Waker::from(notices.clone())),
+                // Keep the throttle closed without depending on test execution speed.
+                last_motion_notice: Some(Instant::now() + Duration::from_secs(3600)),
+                status: PlaybackStatus {
+                    idle: false,
+                    paused,
+                    ..PlaybackStatus::default()
+                },
+                ..Shared::default()
+            }));
+            for (index, seconds) in [10, 20].into_iter().enumerate() {
+                let mut status = shared.lock().unwrap().status.clone();
+                status.position = Duration::from_secs(seconds);
+                publish_status(&shared, status.clone());
+                assert_eq!(shared.lock().unwrap().status, status);
+                assert_eq!(
+                    notices.0.load(Ordering::Relaxed),
+                    if paused { index + 1 } else { 0 },
+                    "paused position changes wake immediately; active motion stays throttled"
+                );
+
+                publish_status(&shared, status);
+                assert_eq!(
+                    notices.0.load(Ordering::Relaxed),
+                    if paused { index + 1 } else { 0 },
+                    "an unchanged position does not need another wake"
+                );
+            }
+        }
+    }
 
     /// A paused event-capable backend needs no recurring status timer.
     #[test]

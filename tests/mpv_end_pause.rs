@@ -1,7 +1,8 @@
 //! Opt-in real-mpv checks for retaining seekable media at its natural end.
 //!
 //! These tests create a small PCM WAV locally and use mpv's null audio output;
-//! they require neither network access, yt-dlp, ffmpeg, nor an audio device.
+//! they require neither external network access, yt-dlp, ffmpeg, nor an audio device.
+//! Loading-seek checks use a gated loopback HTTP fixture.
 //! Run explicitly with:
 //!
 //! ```text
@@ -566,5 +567,199 @@ fn manually_paused_seeks_remain_paused() {
             assert_eq!(events.eof, 0);
             std::thread::sleep(POLL_INTERVAL);
         }
+    }
+}
+
+/// Holds a tiny HTTP audio response until the test has submitted its early seek.
+struct DelayedAudio {
+    url: String,
+    requested: std::sync::mpsc::Receiver<()>,
+    release: Option<std::sync::mpsc::Sender<()>>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl DelayedAudio {
+    /// Serves only the generated fixture, with bounded reads and teardown on panic.
+    fn new(bytes: Vec<u8>) -> Self {
+        use std::io::{BufRead as _, Write as _};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}/delayed.wav", listener.local_addr().unwrap());
+        let (request, requested) = std::sync::mpsc::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let worker_stop = std::sync::Arc::clone(&stop);
+        let worker = std::thread::spawn(move || {
+            let mut released = false;
+            while !worker_stop.load(Ordering::Acquire) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(_) => return,
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream.set_read_timeout(Some(WAIT_LIMIT)).unwrap();
+                stream.set_write_timeout(Some(WAIT_LIMIT)).unwrap();
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                for _ in 0..64 {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                if !released {
+                    let _ = request.send(());
+                    if wait.recv_timeout(WAIT_LIMIT).is_err() {
+                        return;
+                    }
+                    released = true;
+                }
+                if worker_stop.load(Ordering::Acquire) {
+                    return;
+                }
+                if write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    bytes.len()
+                ).is_ok() {
+                    let _ = stream.write_all(&bytes);
+                }
+            }
+        });
+        Self {
+            url,
+            requested,
+            release: Some(release),
+            stop,
+            worker: Some(worker),
+        }
+    }
+
+    /// Releases the response only after the test's commands have been accepted.
+    fn release(&mut self) {
+        self.release.take().unwrap().send(()).unwrap();
+    }
+}
+
+impl Drop for DelayedAudio {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        self.release.take();
+        if let Some(worker) = self.worker.take() {
+            let result = worker.join();
+            if !std::thread::panicking() {
+                result.expect("delayed audio fixture worker");
+            }
+        }
+    }
+}
+
+/// Timestamp clicks during extraction/loading are accepted; the last click wins.
+#[test]
+#[ignore = "requires mpv; run the command documented at the top of this file"]
+fn timestamp_before_audio_load_is_applied_when_ready() {
+    let temporary = tempfile::tempdir().expect("private test directory");
+    let (mut backend, mut input) = fixture(temporary.path(), true);
+    let mut server = DelayedAudio::new(std::fs::read(&input.location).unwrap());
+    input.location.clone_from(&server.url);
+    backend
+        .play(&input)
+        .expect("start the delayed HTTP fixture");
+    server
+        .requested
+        .recv_timeout(WAIT_LIMIT)
+        .expect("mpv is opening the stream");
+    let mut events = Events::default();
+    events.observe(&mut backend);
+    assert_eq!(events.loaded, 0, "no audio headers have been sent yet");
+    for target in [750, 1_250] {
+        backend
+            .command(PlayerCommand::SeekAbsolute(Duration::from_millis(target)))
+            .expect("accept a timestamp before audio is loaded");
+    }
+    backend
+        .command(PlayerCommand::SetPaused(true))
+        .expect("retain a stable position after loading");
+    server.release();
+    wait_for(
+        &mut backend,
+        &mut events,
+        "latest requested timestamp",
+        |status, events| {
+            events.loaded == 1
+                && events.started > 0
+                && !status.idle
+                && status.paused
+                && status.position >= Duration::from_millis(1_000)
+                && status.position < Duration::from_millis(1_750)
+        },
+    );
+    assert_eq!(
+        events.loaded, 1,
+        "the timestamp must not restart extraction"
+    );
+}
+
+/// An abandoned load's timestamp must never seek a replacement file.
+#[test]
+#[ignore = "requires mpv; run the command documented at the top of this file"]
+fn timestamp_before_audio_load_does_not_leak_after_stop_or_replacement() {
+    for stop_first in [false, true] {
+        let temporary = tempfile::tempdir().expect("private test directory");
+        let (mut backend, input) = fixture(temporary.path(), true);
+        let bytes = std::fs::read(&input.location).unwrap();
+        let mut server = DelayedAudio::new(bytes.clone());
+        let mut replacement_server = DelayedAudio::new(bytes);
+        let mut delayed = input.clone();
+        delayed.location.clone_from(&server.url);
+        backend
+            .play(&delayed)
+            .expect("start the delayed HTTP fixture");
+        server
+            .requested
+            .recv_timeout(WAIT_LIMIT)
+            .expect("mpv is opening the stream");
+        backend
+            .command(PlayerCommand::SeekAbsolute(Duration::from_millis(1_250)))
+            .expect("accept a timestamp before audio is loaded");
+        if stop_first {
+            backend
+                .command(PlayerCommand::Stop)
+                .expect("cancel the pending load");
+        }
+        let mut replacement = input;
+        replacement.location.clone_from(&replacement_server.url);
+        backend
+            .play(&replacement)
+            .expect("replace the loading fixture");
+        replacement_server
+            .requested
+            .recv_timeout(WAIT_LIMIT)
+            .expect("mpv is opening the replacement");
+        backend
+            .command(PlayerCommand::SetPaused(true))
+            .expect("pause before the replacement receives audio bytes");
+        server.release();
+        replacement_server.release();
+        let mut events = Events::default();
+        wait_for(
+            &mut backend,
+            &mut events,
+            "replacement starting at zero",
+            |status, events| {
+                events.loaded == 1
+                    && events.started > 0
+                    && !status.idle
+                    && status.paused
+                    && status.position < Duration::from_millis(500)
+            },
+        );
+        assert_eq!(events.held, 0);
     }
 }

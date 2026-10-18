@@ -99,6 +99,10 @@ mod backend {
         pending_keep_open: Option<bool>,
         /// Ignore observer values while loading, redirecting, or idle.
         media_loaded: bool,
+        /// An accepted load is still opening its media, including extractor redirects.
+        load_in_progress: bool,
+        /// Latest absolute timestamp requested before the current file becomes seekable.
+        pending_absolute_seek: Option<Duration>,
         /// One held-EOF event per timeline traversal; cleared by a backward seek.
         eof_held: bool,
         /// Detects an EOF edge interleaved with a command's IPC response.
@@ -270,6 +274,8 @@ mod backend {
             command: &[Value],
             #[cfg(feature = "cache")] generation: u64,
         ) -> Result<()> {
+            self.ipc.pending_absolute_seek = None;
+            self.ipc.load_in_progress = true;
             self.ipc.stream_title = None;
             self.ipc.clear_audio_metadata();
             if let Some(cache) = &self.ipc.cache_export {
@@ -282,6 +288,8 @@ mod backend {
             }
             if let Err(error) = self.send(command) {
                 self.ipc.pending_keep_open = None;
+                self.ipc.load_in_progress = false;
+                self.ipc.pending_absolute_seek = None;
                 #[cfg(feature = "cache")]
                 {
                     self.ipc.ram.pending_generation = None;
@@ -289,6 +297,24 @@ mod backend {
                 return Err(error);
             }
             Ok(())
+        }
+
+        /// Applies a retained timestamp only after its own file-loaded event.
+        ///
+        /// Event parsing cannot send recursive IPC requests. Both event and status
+        /// consumers service this one-slot queue before publishing ready media.
+        fn service_pending_absolute_seek(&mut self) -> Result<()> {
+            if !self.ipc.media_loaded
+                || self.ipc.load_in_progress
+                || self.ipc.pending_keep_open.is_some()
+            {
+                return Ok(());
+            }
+            let Some(position) = self.ipc.pending_absolute_seek.take() else {
+                return Ok(());
+            };
+            // Reuse normal held-EOF bounds and manual-pause semantics.
+            self.command(PlayerCommand::SeekAbsolute(position))
         }
 
         /// Registration only changes in-memory routing; HTTP stays on the proxy
@@ -389,6 +415,7 @@ mod backend {
 
         /// Return queued lifecycle events after servicing the optional RAM retry.
         fn next_queued_event(&mut self) -> Result<Option<PlaybackEvent>> {
+            self.service_pending_absolute_seek()?;
             while let Some(event) = self.ipc.events.pop_front() {
                 #[cfg(feature = "cache")]
                 if self.retry_ram_failure(&event)? {
@@ -407,6 +434,8 @@ mod backend {
                 return Ok(None);
             };
             self.process_exit_reported = true;
+            self.ipc.pending_absolute_seek = None;
+            self.ipc.load_in_progress = false;
             if let Some(cache) = &self.ipc.cache_export {
                 cache.shutdown();
             }
@@ -491,6 +520,8 @@ mod backend {
                 keep_open: false,
                 pending_keep_open: None,
                 media_loaded: false,
+                load_in_progress: false,
+                pending_absolute_seek: None,
                 eof_held: false,
                 held_eof_generation: 0,
                 #[cfg(feature = "cache")]
@@ -536,6 +567,7 @@ mod backend {
         fn handle_event(&mut self, message: &Value) {
             match message.get("event").and_then(Value::as_str) {
                 Some("start-file") => {
+                    self.load_in_progress = true;
                     #[cfg(feature = "cache")]
                     {
                         self.ram.generation = self.ram.pending_generation.take().unwrap_or(0);
@@ -556,6 +588,9 @@ mod backend {
                     self.eof_held = false;
                 }
                 Some("file-loaded") => {
+                    if self.pending_keep_open.is_none() {
+                        self.load_in_progress = false;
+                    }
                     if let Some(cache) = &self.cache_export {
                         cache.loaded();
                     }
@@ -575,9 +610,13 @@ mod backend {
                         if self.ram.endings.len() == MAX_PENDING_EVENTS {
                             self.ram.endings.pop_front();
                         }
-                        self.ram
-                            .endings
-                            .push_back((self.ram.generation, self.ram.position));
+                        // An internal RAM fallback retries this same item at
+                        // its requested timestamp, not a stale pre-load clock.
+                        let position = self
+                            .pending_absolute_seek
+                            .filter(|_| self.pending_keep_open.is_none())
+                            .or(self.ram.position);
+                        self.ram.endings.push_back((self.ram.generation, position));
                     }
                     if let Some(cache) = &self.cache_export {
                         cache.invalidate();
@@ -596,7 +635,14 @@ mod backend {
                         // not the logical end of Youta's queue item.
                         self.warnings.clear();
                         self.stream_title = None;
+                        self.load_in_progress = true;
                         return;
+                    }
+                    // A replaced file can end before the next start-file event;
+                    // its completion must not cancel that replacement's timestamp.
+                    if self.pending_keep_open.is_none() {
+                        self.load_in_progress = false;
+                        self.pending_absolute_seek = None;
                     }
                     self.keep_open = false;
                     let reason = match reason_text {
@@ -1596,6 +1642,17 @@ mod backend {
         }
 
         fn command(&mut self, command: PlayerCommand) -> Result<()> {
+            if matches!(
+                &command,
+                PlayerCommand::SeekAbsolute(_)
+                    | PlayerCommand::SeekRelative(_)
+                    | PlayerCommand::SeekPercent(_)
+                    | PlayerCommand::ChangeChapter(_)
+            ) {
+                // A newer timeline action must not be overwritten by an older
+                // timestamp that became ready before the worker serviced it.
+                self.ipc.pending_absolute_seek = None;
+            }
             match command {
                 PlayerCommand::TogglePause => {
                     self.send(&[json!("cycle"), json!("pause")])?;
@@ -1614,6 +1671,10 @@ mod backend {
                     )?;
                 }
                 PlayerCommand::SeekAbsolute(position) => {
+                    if self.ipc.load_in_progress {
+                        self.ipc.pending_absolute_seek = Some(position);
+                        return Ok(());
+                    }
                     if self.ipc.eof_held
                         && self
                             .property("time-pos")?
@@ -1702,6 +1763,8 @@ mod backend {
                     self.set_property("stream-record", stream_recording_property_value(path)?)?;
                 }
                 PlayerCommand::Stop => {
+                    self.ipc.pending_absolute_seek = None;
+                    self.ipc.load_in_progress = false;
                     #[cfg(feature = "cache")]
                     if let Some(ram) = &mut self.ram {
                         ram.playback = None;
@@ -1722,6 +1785,7 @@ mod backend {
             self.ipc.drain_ready()?;
             #[cfg(feature = "cache")]
             self.service_ram_requests()?;
+            self.service_pending_absolute_seek()?;
             if !self.ipc.status_initialized {
                 // Set this before reading: file-loaded can arrive inside any GET
                 // and invalidate a snapshot that spans two different media files.
@@ -1737,6 +1801,8 @@ mod backend {
                     self.ipc.apply_status_property(name, &value);
                 }
             }
+            // Initial property reads may themselves consume file-loaded.
+            self.service_pending_absolute_seek()?;
             let mut status = self.ipc.status.clone();
             status.stream_title.clone_from(&self.ipc.stream_title);
             Ok(status)
@@ -1781,6 +1847,8 @@ mod backend {
         }
 
         fn shutdown(&mut self) -> Result<()> {
+            self.ipc.pending_absolute_seek = None;
+            self.ipc.load_in_progress = false;
             if let Some(cache) = &self.ipc.cache_export {
                 cache.shutdown();
             }
@@ -2763,6 +2831,326 @@ mod backend {
             thread::JoinHandle<()>,
         ) {
             backend_with_command_recorder_script(Vec::new(), None)
+        }
+
+        /// Timestamp clicks during extraction wait for loaded media and keep only the latest target.
+        #[test]
+        fn loading_absolute_seeks_wait_for_file_loaded_and_latest_target_wins() {
+            let (mut backend, commands, server) = backend_with_command_recorder();
+            let input = PlaybackInput::new("https://example.invalid/audio.opus");
+            backend.play(&input).expect("accept asynchronous load");
+            let load = commands.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert_eq!(load[0], json!("loadfile"));
+            for seconds in [95, 150] {
+                backend
+                    .command(PlayerCommand::SeekAbsolute(Duration::from_secs(seconds)))
+                    .expect("retain early timestamp");
+            }
+            let before_loaded = commands.try_iter().collect::<Vec<_>>();
+            backend.ipc.handle_event(&json!({"event": "start-file"}));
+            backend.ipc.handle_event(&json!({"event": "file-loaded"}));
+            let loaded = backend.poll_event().expect("service loaded media");
+            backend.shutdown().expect("shutdown mock backend");
+            server.join().expect("mock command server");
+            assert!(
+                before_loaded.is_empty(),
+                "an unopened file cannot accept seeks: {before_loaded:?}"
+            );
+            assert_eq!(loaded, Some(PlaybackEvent::MediaLoaded));
+            assert_eq!(
+                commands.into_iter().collect::<Vec<_>>(),
+                [
+                    vec![json!("seek"), json!(150.0), json!("absolute")],
+                    vec![json!("quit")]
+                ],
+            );
+        }
+
+        /// Extractor redirects and start-file events remain part of the same loading intent.
+        #[test]
+        fn loading_absolute_seek_survives_start_and_redirect_without_changing_pause() {
+            let (mut backend, commands, server) = backend_with_command_recorder();
+            backend
+                .play(&PlaybackInput::new("https://example.invalid/audio.opus"))
+                .unwrap();
+            commands.recv_timeout(Duration::from_secs(1)).unwrap();
+            backend.ipc.handle_event(&json!({"event": "start-file"}));
+            backend
+                .command(PlayerCommand::SeekAbsolute(Duration::from_secs(95)))
+                .unwrap();
+            backend.command(PlayerCommand::SetPaused(true)).unwrap();
+            assert_eq!(
+                commands.recv_timeout(Duration::from_secs(1)).unwrap(),
+                vec![json!("set_property"), json!("pause"), json!(true)]
+            );
+            backend
+                .ipc
+                .handle_event(&json!({"event": "end-file", "reason": "redirect"}));
+            assert_eq!(backend.poll_event().unwrap(), None);
+            let premature = commands.try_iter().collect::<Vec<_>>();
+            backend.ipc.handle_event(&json!({"event": "start-file"}));
+            backend.ipc.handle_event(&json!({"event": "file-loaded"}));
+            let loaded = backend.poll_event().unwrap();
+            backend.shutdown().unwrap();
+            server.join().unwrap();
+            assert!(premature.is_empty());
+            assert_eq!(loaded, Some(PlaybackEvent::MediaLoaded));
+            assert_eq!(
+                commands.into_iter().collect::<Vec<_>>(),
+                [
+                    vec![json!("seek"), json!(95.0), json!("absolute")],
+                    vec![json!("quit")]
+                ]
+            );
+        }
+
+        /// Canceled loading seeks never attach themselves to a later or replacement file.
+        #[test]
+        fn loading_absolute_seek_is_cleared_by_replacement_stop_and_terminal_events() {
+            for cancellation in ["replacement", "stop", "eof", "error", "quit"] {
+                let (mut backend, commands, server) = backend_with_command_recorder();
+                backend
+                    .play(&PlaybackInput::new("https://example.invalid/first.opus"))
+                    .unwrap();
+                commands.recv_timeout(Duration::from_secs(1)).unwrap();
+                backend.ipc.handle_event(&json!({"event": "start-file"}));
+                backend
+                    .command(PlayerCommand::SeekAbsolute(Duration::from_secs(95)))
+                    .unwrap();
+                match cancellation {
+                    "replacement" => backend
+                        .play(&PlaybackInput::new("https://example.invalid/second.opus"))
+                        .unwrap(),
+                    "stop" => backend.command(PlayerCommand::Stop).unwrap(),
+                    reason => backend
+                        .ipc
+                        .handle_event(&json!({"event": "end-file", "reason": reason})),
+                }
+                let canceled = backend.ipc.pending_absolute_seek.is_none();
+                backend.ipc.handle_event(&json!({"event": "start-file"}));
+                backend.ipc.handle_event(&json!({"event": "file-loaded"}));
+                backend.poll_event().unwrap();
+                backend.shutdown().unwrap();
+                server.join().unwrap();
+                assert!(canceled, "{cancellation}");
+                assert!(
+                    !commands
+                        .into_iter()
+                        .any(|command| command[0] == json!("seek")),
+                    "{cancellation}"
+                );
+            }
+        }
+
+        /// Old completion events before a replacement starts cannot consume its queued seek.
+        #[test]
+        fn loading_absolute_seek_waits_for_the_replacement_not_old_loaded_events() {
+            let (mut backend, commands, server) = backend_with_command_recorder();
+            backend.ipc.media_loaded = true;
+            backend
+                .play(&PlaybackInput::new(
+                    "https://example.invalid/replacement.opus",
+                ))
+                .unwrap();
+            commands.recv_timeout(Duration::from_secs(1)).unwrap();
+            backend
+                .command(PlayerCommand::SeekAbsolute(Duration::from_secs(95)))
+                .unwrap();
+            backend.ipc.handle_event(&json!({"event": "file-loaded"}));
+            assert_eq!(
+                backend.poll_event().unwrap(),
+                Some(PlaybackEvent::MediaLoaded)
+            );
+            backend
+                .ipc
+                .handle_event(&json!({"event": "end-file", "reason": "stop"}));
+            let before_start = commands.try_iter().collect::<Vec<_>>();
+            backend.ipc.handle_event(&json!({"event": "start-file"}));
+            backend.ipc.handle_event(&json!({"event": "file-loaded"}));
+            backend.poll_event().unwrap();
+            backend.shutdown().unwrap();
+            server.join().unwrap();
+            assert!(before_start.is_empty());
+            assert_eq!(
+                commands.into_iter().collect::<Vec<_>>(),
+                [
+                    vec![json!("seek"), json!(95.0), json!("absolute")],
+                    vec![json!("quit")]
+                ]
+            );
+        }
+
+        /// New timeline actions supersede a deferred timestamp even if readiness raced them.
+        #[test]
+        fn loading_absolute_seek_does_not_override_newer_ready_timeline_commands() {
+            for (command, expected) in [
+                (
+                    PlayerCommand::SeekAbsolute(Duration::from_secs(150)),
+                    vec![json!("seek"), json!(150.0), json!("absolute")],
+                ),
+                (
+                    PlayerCommand::SeekRelative(-5),
+                    vec![json!("seek"), json!(-5), json!("relative")],
+                ),
+                (
+                    PlayerCommand::SeekPercent(25.0),
+                    vec![json!("seek"), json!(25.0), json!("absolute-percent")],
+                ),
+                (
+                    PlayerCommand::ChangeChapter(1),
+                    vec![json!("add"), json!("chapter"), json!(1)],
+                ),
+            ] {
+                let (mut backend, commands, server) = backend_with_command_recorder();
+                backend
+                    .play(&PlaybackInput::new("https://example.invalid/audio.opus"))
+                    .unwrap();
+                commands.recv_timeout(Duration::from_secs(1)).unwrap();
+                backend
+                    .command(PlayerCommand::SeekAbsolute(Duration::from_secs(95)))
+                    .unwrap();
+                backend.ipc.handle_event(&json!({"event": "start-file"}));
+                backend.ipc.handle_event(&json!({"event": "file-loaded"}));
+                backend.command(command).unwrap();
+                backend.poll_event().unwrap();
+                backend.shutdown().unwrap();
+                server.join().unwrap();
+                assert_eq!(
+                    commands.into_iter().collect::<Vec<_>>(),
+                    [expected, vec![json!("quit")]]
+                );
+            }
+        }
+
+        /// No loading request means the backend must still report native idle seek errors.
+        #[test]
+        fn loading_absolute_seek_deferral_does_not_hide_idle_commands() {
+            let (mut backend, commands, server) = backend_with_command_recorder();
+            backend
+                .command(PlayerCommand::SeekAbsolute(Duration::from_secs(95)))
+                .unwrap();
+            backend.shutdown().unwrap();
+            server.join().unwrap();
+            assert_eq!(
+                commands.into_iter().collect::<Vec<_>>(),
+                [
+                    vec![json!("seek"), json!(95.0), json!("absolute")],
+                    vec![json!("quit")]
+                ]
+            );
+        }
+
+        /// A retained EOF is still the requested file and can be rewound by a pending timestamp.
+        #[test]
+        fn loading_absolute_seek_rewinds_a_file_that_reaches_held_eof_before_service() {
+            let (mut backend, commands, server) =
+                backend_with_command_recorder_script(Vec::new(), Some(180.0));
+            let mut input = PlaybackInput::new("https://example.invalid/audio.opus");
+            input.keep_open = true;
+            backend.play(&input).unwrap();
+            commands.recv_timeout(Duration::from_secs(1)).unwrap();
+            backend
+                .command(PlayerCommand::SeekAbsolute(Duration::from_secs(95)))
+                .unwrap();
+            backend.ipc.handle_event(&json!({"event": "start-file"}));
+            backend.ipc.handle_event(&json!({"event": "file-loaded"}));
+            backend.ipc.handle_event(&eof_notification(true));
+            backend.poll_event().unwrap();
+            let held = backend.ipc.eof_held;
+            backend.shutdown().unwrap();
+            server.join().unwrap();
+            assert!(!held);
+            assert_eq!(
+                commands.into_iter().collect::<Vec<_>>(),
+                [
+                    vec![json!("get_property"), json!("time-pos")],
+                    vec![json!("seek"), json!(95.0), json!("absolute")],
+                    vec![json!("set_property"), json!("pause"), json!(false)],
+                    vec![json!("quit")]
+                ]
+            );
+        }
+
+        /// A queued timestamp past retained EOF keeps the same no-op semantics as a ready seek.
+        #[test]
+        fn loading_absolute_seek_past_held_eof_does_not_resume_it() {
+            let (mut backend, commands, server) =
+                backend_with_command_recorder_script(Vec::new(), Some(90.0));
+            let mut input = PlaybackInput::new("https://example.invalid/audio.opus");
+            input.keep_open = true;
+            backend.play(&input).unwrap();
+            commands.recv_timeout(Duration::from_secs(1)).unwrap();
+            backend
+                .command(PlayerCommand::SeekAbsolute(Duration::from_secs(95)))
+                .unwrap();
+            backend.ipc.handle_event(&json!({"event": "start-file"}));
+            backend.ipc.handle_event(&json!({"event": "file-loaded"}));
+            backend.ipc.handle_event(&eof_notification(true));
+            backend.poll_event().unwrap();
+            let held = backend.ipc.eof_held;
+            backend.shutdown().unwrap();
+            server.join().unwrap();
+            assert!(held);
+            assert_eq!(
+                commands.into_iter().collect::<Vec<_>>(),
+                [
+                    vec![json!("get_property"), json!("time-pos")],
+                    vec![json!("quit")]
+                ]
+            );
+        }
+
+        /// Snapshot-only consumers also apply a ready timestamp without needing an event poll.
+        #[test]
+        fn loading_absolute_seek_is_serviced_before_a_ready_status_snapshot() {
+            let (mut backend, commands, server) = backend_with_command_recorder();
+            backend
+                .play(&PlaybackInput::new("https://example.invalid/audio.opus"))
+                .unwrap();
+            commands.recv_timeout(Duration::from_secs(1)).unwrap();
+            backend
+                .command(PlayerCommand::SeekAbsolute(Duration::from_secs(95)))
+                .unwrap();
+            backend.ipc.handle_event(&json!({"event": "start-file"}));
+            backend.ipc.handle_event(&json!({"event": "file-loaded"}));
+            backend.ipc.observations_configured = true;
+            backend.ipc.status_initialized = true;
+            backend.status().unwrap();
+            backend.status().unwrap();
+            backend.shutdown().unwrap();
+            server.join().unwrap();
+            assert_eq!(
+                commands.into_iter().collect::<Vec<_>>(),
+                [
+                    vec![json!("seek"), json!(95.0), json!("absolute")],
+                    vec![json!("quit")]
+                ]
+            );
+        }
+
+        /// Internal RAM retries inherit the queued target only for the file that actually failed.
+        #[cfg(feature = "cache")]
+        #[test]
+        fn loading_absolute_seek_becomes_the_same_item_ram_retry_position() {
+            for replacing in [false, true] {
+                let mut ipc = ipc_after_script(Vec::new());
+                ipc.ram.generation = 42;
+                ipc.ram.position = Some(Duration::from_secs(3));
+                ipc.pending_absolute_seek = Some(Duration::from_secs(95));
+                ipc.pending_keep_open = replacing.then_some(false);
+                ipc.handle_event(&json!({"event": "end-file", "reason": "error"}));
+                assert_eq!(
+                    ipc.ram.endings.pop_front(),
+                    Some((
+                        42,
+                        Some(Duration::from_secs(if replacing { 3 } else { 95 }))
+                    ))
+                );
+                assert_eq!(
+                    ipc.pending_absolute_seek,
+                    replacing.then_some(Duration::from_secs(95))
+                );
+            }
         }
 
         /// Injects first-command events and an optional exact EOF position.

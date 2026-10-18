@@ -217,6 +217,9 @@ to close it.
 The TUI status row keeps playback time and volume at the left edge.
 Speed is shown only when changed from 1x.
 The clickable track title stays at the right edge and is shortened to fit.
+Timestamp clicks during audio loading highlight immediately and wait until the
+stream is ready; the latest click wins. While paused, the TUI time label and
+chapter highlight retain the requested position.
 .TP
 .B Space
 Toggle pause.

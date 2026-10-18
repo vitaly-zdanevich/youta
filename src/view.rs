@@ -3572,6 +3572,15 @@ pub struct ViewModel {
     pub radio_recording: Option<RadioRecordingView>,
     /// Chapters inferred for the authoritative playing media.
     pub playback_chapters: Vec<Chapter>,
+    /// Accepted absolute seek that owns the displayed cursor during a manual pause.
+    ///
+    /// Audio-output buffering can leave mpv's clock slightly before the requested
+    /// boundary. Chapters, the seek bar and its time label share this marker,
+    /// separate from measured playback/listening time.
+    /// The controller clears it on another seek, resume, reload, or playback end.
+    pub paused_chapter_seek: Option<(MediaId, Duration)>,
+    /// Latest accepted timestamp awaiting startup, without claiming audio has started.
+    pub loading_chapter_seek: Option<(MediaId, Duration)>,
     /// Whether chapter labels include their timestamps.
     pub show_chapter_timestamps: bool,
     /// Whether exact `Реклама` chapters are hidden from navigation and skipped.
@@ -3811,6 +3820,51 @@ pub struct ViewModel {
 }
 
 impl ViewModel {
+    /// Returns the owner used for chapter highlighting and timestamp click targets.
+    #[must_use]
+    pub fn chapter_media_id(&self) -> Option<&MediaId> {
+        self.loading_chapter_cursor()
+            .map(|(media_id, _)| media_id)
+            .or(self.playing_media_id.as_ref())
+    }
+
+    /// Validates pending presentation independently of placeholder native status.
+    fn loading_chapter_cursor(&self) -> Option<&(MediaId, Duration)> {
+        self.loading_chapter_seek.as_ref().filter(|(_, target)| {
+            self.playback_starting
+                && self.playing_media_id.is_none()
+                && !self.playback.live
+                && self
+                    .playback
+                    .duration
+                    .is_none_or(|duration| *target < duration)
+        })
+    }
+
+    /// Returns the displayed seek/chapter cursor without rounding ordinary timestamps.
+    ///
+    /// Only an accepted loading or paused seek may override the audio clock.
+    /// A newly learned duration can invalidate an out-of-range target.
+    #[must_use]
+    pub fn chapter_position(&self) -> Duration {
+        if let Some((_, target)) = self.loading_chapter_cursor() {
+            return *target;
+        }
+        if !self.playback.idle
+            && self.playback.paused
+            && !self.playback.live
+            && let Some((media_id, target)) = &self.paused_chapter_seek
+            && self.playing_media_id.as_ref() == Some(media_id)
+            && self
+                .playback
+                .duration
+                .is_none_or(|duration| *target < duration)
+        {
+            return *target;
+        }
+        self.playback.position
+    }
+
     /// Projects transient channel panes onto YouTube without changing their adapter.
     #[must_use]
     pub fn displayed_screen(&self) -> Screen {
@@ -4283,6 +4337,8 @@ impl Default for ViewModel {
             radio_now_playing: None,
             radio_recording: None,
             playback_chapters: Vec::new(),
+            paused_chapter_seek: None,
+            loading_chapter_seek: None,
             show_chapter_timestamps: false,
             skip_advertisement_chapters: true,
             nyan_cat_seekbar: false,
