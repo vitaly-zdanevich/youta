@@ -510,6 +510,9 @@ when seeking is available.
 While a requested track is being resolved or waiting for playback to start,
 an ASCII spinner appears at the bottom-left of the TUI's last line. It shares
 the existing status row without reducing the space available for results.
+Playback time and volume stay at the left edge of this row; speed appears only
+when changed from `1x`. The clickable track title stays at the right edge and is
+shortened when space is limited.
 
 Volume changes are remembered in `config.toml` and restored after restarting,
 even when log and search saving is disabled. You can also adjust the volume

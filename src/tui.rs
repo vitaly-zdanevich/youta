@@ -24,6 +24,8 @@ mod local_command;
 mod local_command_tests;
 #[cfg(test)]
 mod performance;
+#[cfg(test)]
+mod seek_status_tests;
 
 use std::io::{self, IsTerminal, Stdout};
 use std::path::PathBuf;
@@ -8662,10 +8664,12 @@ fn render_seek_bar(
     let terminal_area = frame.area();
     let status_text_area = |area| playback_activity_text_area(area, terminal_area, view);
     let duration = view.playback.duration.unwrap_or(Duration::ZERO);
+    // Share the native playhead between labels and compact gauge coloring.
+    let position = view.playback.position;
     let ratio = if duration.is_zero() {
         0.0
     } else {
-        (view.playback.position.as_secs_f64() / duration.as_secs_f64()).clamp(0.0, 1.0)
+        (position.as_secs_f64() / duration.as_secs_f64()).clamp(0.0, 1.0)
     };
     let state = if view.playback.idle {
         None
@@ -8677,11 +8681,6 @@ fn render_seek_bar(
         None
     };
     let state_suffix = state.map_or_else(String::new, |state| format!(" {state}"));
-    let title_spacing = if !view.playback.idle && view.playback.title.is_some() {
-        " "
-    } else {
-        ""
-    };
     let live_seekable =
         view.playback.live && view.playback.live_seekable_range.is_some() && !duration.is_zero();
     let recording_prefix = view
@@ -8700,34 +8699,37 @@ fn render_seek_bar(
             .playing_media_id
             .as_ref()
             .is_some_and(|id| id.source == SourceKind::Radio);
-    // Keep the speed suffix ASCII so plain TTY fonts can display it.
+    // Normal speed is implicit. Keep non-default rates ASCII for plain TTY fonts.
+    let speed = trim_speed(view.playback.speed);
+    let speed_suffix = if speed == "1" {
+        String::new()
+    } else {
+        format!("  {speed}x")
+    };
     let status_prefix = if radio {
         format!(
-            "{recording_prefix}radio  {}x  vol {}%{state_suffix}{title_spacing}",
-            trim_speed(view.playback.speed),
+            "{recording_prefix}radio{speed_suffix}  vol {}%{state_suffix}",
             view.playback.volume
         )
     } else if view.playback.live {
         // A rolling rewind buffer is not the broadcast's total duration.
         format!(
-            "{recording_prefix}LIVE {}  {}x  vol {}%{state_suffix}{title_spacing}",
+            "{recording_prefix}LIVE {}{speed_suffix}  vol {}%{state_suffix}",
             format_duration(
                 view.live_elapsed_seconds
                     .map_or(view.playback.position, Duration::from_secs)
             ),
-            trim_speed(view.playback.speed),
             view.playback.volume,
         )
     } else {
         format!(
-            "{} / {}  {}x  vol {}%{}{state_suffix}{title_spacing}",
-            format_duration(view.playback.position),
+            "{} / {}{speed_suffix}  vol {}%{}{state_suffix}",
+            format_duration(position),
             if duration.is_zero() {
                 "--:--".to_owned()
             } else {
                 format_duration(duration)
             },
-            trim_speed(view.playback.speed),
             view.playback.volume,
             if view.repeating { "  repeat" } else { "" },
         )
@@ -8741,12 +8743,6 @@ fn render_seek_bar(
                 |metadata| format!("{title} · {metadata}"),
             )
         });
-    let title_offset = title.as_ref().map(|_| terminal_text_width(&status_prefix));
-    let title_width = title
-        .as_deref()
-        .map(terminal_text_width)
-        .unwrap_or_default();
-    let label = format!("{status_prefix}{}", title.as_deref().unwrap_or_default());
     if view.waveform_visible {
         let waveform_height = area.height.saturating_sub(1).min(WAVEFORM_ROWS);
         let waveform_area = Rect::new(area.x, area.y, area.width, waveform_height);
@@ -8761,9 +8757,8 @@ fn render_seek_bar(
             render_seek_status(
                 frame,
                 status_text_area(status_area),
-                &label,
-                title_offset,
-                title_width,
+                &status_prefix,
+                title.as_deref(),
                 recording_active,
                 hit_map,
             );
@@ -8779,9 +8774,8 @@ fn render_seek_bar(
         render_seek_status(
             frame,
             status_text_area(status_area),
-            &label,
-            title_offset,
-            title_width,
+            &status_prefix,
+            title.as_deref(),
             recording_active,
             hit_map,
         );
@@ -8804,7 +8798,7 @@ fn render_seek_bar(
             .ratio(ratio)
             .label("");
         frame.render_widget(gauge, track_area);
-        render_buffered_ranges(frame, track_area, &view.playback, duration, theme);
+        render_buffered_ranges(frame, track_area, &view.playback, position, duration, theme);
         render_nyan_cat_seekbar(frame, track_area, view, ratio);
         render_chapter_timeline(
             frame, label_area, track_area, view, duration, theme, hit_map,
@@ -8812,9 +8806,8 @@ fn render_seek_bar(
         render_seek_status(
             frame,
             status_text_area(status_area),
-            &label,
-            title_offset,
-            title_width,
+            &status_prefix,
+            title.as_deref(),
             recording_active,
             hit_map,
         );
@@ -8831,7 +8824,7 @@ fn render_seek_bar(
             .ratio(ratio)
             .label("");
         frame.render_widget(gauge, track_area);
-        render_buffered_ranges(frame, track_area, &view.playback, duration, theme);
+        render_buffered_ranges(frame, track_area, &view.playback, position, duration, theme);
         render_nyan_cat_seekbar(frame, track_area, view, ratio);
         if !view.playback_chapters.is_empty() {
             render_chapter_timeline(
@@ -8847,24 +8840,38 @@ fn render_seek_bar(
         render_seek_status(
             frame,
             status_text_area(status_area),
-            &label,
-            title_offset,
-            title_width,
+            &status_prefix,
+            title.as_deref(),
             recording_active,
             hit_map,
         );
         hit_map.seek_bar = track_area;
     } else {
         let area = status_text_area(area);
-        let visible_label = truncate_terminal_text(&label, usize::from(area.width));
+        let (prefix, title) = seek_status_layout(area, &status_prefix, title.as_deref());
+        let played_end = area
+            .x
+            .saturating_add(rounded_duration_column(position, duration, area.width));
         let gauge = Gauge::default()
             .gauge_style(theme.progress)
             .ratio(ratio)
-            .label(visible_label.clone());
+            .label("");
         frame.render_widget(gauge, area);
-        render_buffered_ranges(frame, area, &view.playback, duration, theme);
-        restore_seek_label(frame, area, &visible_label);
-        set_now_playing_target(area, &visible_label, title_offset, title_width, hit_map);
+        // Gauge reserves a centered label cell even for an empty label. This
+        // layout owns both edge labels, so restore that cell to the filled bar.
+        let center = area.x.saturating_add(area.width / 2);
+        if !area.is_empty() && center < played_end {
+            frame.buffer_mut()[(center, area.y)]
+                .set_symbol(ratatui::symbols::block::FULL)
+                .set_fg(theme.progress.fg.unwrap_or(Color::Reset))
+                .set_bg(theme.progress.bg.unwrap_or(Color::Reset));
+        }
+        render_buffered_ranges(frame, area, &view.playback, position, duration, theme);
+        restore_seek_label(frame, area, &prefix, true, played_end);
+        if let Some((title_area, title)) = title {
+            restore_seek_label(frame, title_area, &title, false, played_end);
+            hit_map.now_playing = Some(title_area);
+        }
         hit_map.seek_bar = area;
     }
 }
@@ -8927,18 +8934,47 @@ fn render_nyan_cat_seekbar(frame: &mut Frame<'_>, area: Rect, view: &ViewModel, 
 #[cfg(not(feature = "nyan-cat"))]
 fn render_nyan_cat_seekbar(_frame: &mut Frame<'_>, _area: Rect, _view: &ViewModel, _ratio: f64) {}
 
-/// Renders the status beneath the seek track and records only the visible
-/// now-playing title as a mouse target.
+/// Keeps playback metadata left and the active title right, with a two-cell gap.
+///
+/// Metadata takes priority on narrow displays. Titles are truncated by terminal
+/// cell width, preserving graphemes; the returned rectangle covers visible text
+/// only, so neither the gap nor metadata becomes a now-playing mouse target.
+fn seek_status_layout(
+    area: Rect,
+    prefix: &str,
+    title: Option<&str>,
+) -> (String, Option<(Rect, String)>) {
+    if area.is_empty() {
+        return (String::new(), None);
+    }
+    let prefix = truncate_terminal_text(prefix, usize::from(area.width));
+    let available = area
+        .width
+        .saturating_sub(terminal_text_width(&prefix))
+        .saturating_sub(2);
+    let title = title
+        .map(|title| truncate_terminal_text(title, usize::from(available)))
+        .filter(|title| !title.is_empty())
+        .map(|title| {
+            let width = terminal_text_width(&title);
+            (
+                Rect::new(area.right().saturating_sub(width), area.y, width, 1),
+                title,
+            )
+        });
+    (prefix, title)
+}
+
+/// Renders opposite-edge status labels and maps only the visible title for clicks.
 fn render_seek_status(
     frame: &mut Frame<'_>,
     area: Rect,
-    label: &str,
-    title_offset: Option<u16>,
-    title_width: u16,
+    prefix: &str,
+    title: Option<&str>,
     recording_active: bool,
     hit_map: &mut HitMap,
 ) {
-    let visible_label = truncate_terminal_text(label, usize::from(area.width));
+    let (visible_label, title) = seek_status_layout(area, prefix, title);
     let line = if recording_active && visible_label.starts_with("● REC  ") {
         Line::from(vec![
             Span::styled(
@@ -8953,36 +8989,12 @@ fn render_seek_status(
             Span::raw(visible_label[4..].to_owned()),
         ])
     } else {
-        Line::raw(visible_label.clone())
+        Line::raw(visible_label)
     };
-    frame.render_widget(Paragraph::new(line).alignment(Alignment::Center), area);
-    set_now_playing_target(area, &visible_label, title_offset, title_width, hit_map);
-}
-
-/// Maps the visible title portion of a centered seek-status label.
-fn set_now_playing_target(
-    area: Rect,
-    visible_label: &str,
-    title_offset: Option<u16>,
-    title_width: u16,
-    hit_map: &mut HitMap,
-) {
-    let Some(title_offset) = title_offset else {
-        return;
-    };
-    let visible_width = terminal_text_width(visible_label).min(area.width);
-    if title_offset >= visible_width {
-        return;
-    }
-    let label_x = centered_line_x(area, visible_width);
-    let visible_title_width = title_width.min(visible_width.saturating_sub(title_offset));
-    if visible_title_width > 0 {
-        hit_map.now_playing = Some(Rect::new(
-            label_x.saturating_add(title_offset),
-            area.y,
-            visible_title_width,
-            1,
-        ));
+    frame.render_widget(Paragraph::new(line), area);
+    if let Some((title_area, title)) = title {
+        frame.render_widget(Paragraph::new(title), title_area);
+        hit_map.now_playing = Some(title_area);
     }
 }
 
@@ -9188,17 +9200,19 @@ fn truncate_terminal_text(value: &str, maximum_width: usize) -> String {
     output
 }
 
+/// Paints cached spans after the displayed playhead.
 fn render_buffered_ranges(
     frame: &mut Frame<'_>,
     area: Rect,
     playback: &PlaybackStatus,
+    position: Duration,
     duration: Duration,
     theme: &Theme,
 ) {
     if area.is_empty() || duration.is_zero() {
         return;
     }
-    let played_end = rounded_duration_column(playback.position, duration, area.width);
+    let played_end = rounded_duration_column(position, duration, area.width);
     for range in &playback.buffered_ranges {
         let start = range.start.min(duration);
         let end = range.end.min(duration);
@@ -9259,18 +9273,30 @@ fn rounded_duration_column(value: Duration, duration: Duration, width: u16) -> u
     u16::try_from(column).unwrap_or(width).min(width)
 }
 
-/// Restores the seek label over cache colors, highlighting a player-owned live prefix.
-fn restore_seek_label(frame: &mut Frame<'_>, area: Rect, label: &str) {
+/// Overlays a compact label, retaining played backgrounds and untouched gap glyphs.
+fn restore_seek_label(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    label: &str,
+    status_prefix: bool,
+    played_end: u16,
+) {
     if area.is_empty() {
         return;
     }
-    let live = label.starts_with("LIVE ");
+    let live = status_prefix && label.starts_with("LIVE ");
     let label = Span::raw(label);
     let width = u16::try_from(label.width())
         .unwrap_or(u16::MAX)
         .min(area.width);
-    let x = area.x.saturating_add(area.width.saturating_sub(width) / 2);
+    let x = area.x;
     let y = area.y.saturating_add(area.height / 2);
+    // Replace full blocks with contrasting text on the same filled background,
+    // matching Gauge's own label inversion only inside the played interval.
+    for column in x..x.saturating_add(width).min(played_end) {
+        let cell = &mut frame.buffer_mut()[(column, y)];
+        std::mem::swap(&mut cell.fg, &mut cell.bg);
+    }
     // A raw span has no foreground or background fields, so `set_span`
     // replaces the glyphs while preserving the played/cached cell styles.
     frame.buffer_mut().set_span(x, y, &label, width);
@@ -17717,12 +17743,12 @@ fn format_binary_unit(bytes: u64, unit: u64, suffix: &str) -> String {
     format!("{}.{} {suffix}", tenths / 10, tenths % 10)
 }
 
+/// Formats configured one-percent speed increments without redundant decimals.
 fn trim_speed(speed: f64) -> String {
-    let mut result = format!("{speed:.1}");
-    if result.ends_with(".0") {
-        result.truncate(result.len() - 2);
-    }
-    result
+    format!("{speed:.2}")
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_owned()
 }
 
 struct Theme {
@@ -40227,7 +40253,7 @@ for encoded, expected in json.load(sys.stdin):
         terminal
             .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
             .expect("draw after playback starts or fails");
-        assert_eq!(terminal.backend().buffer()[(0, 11)].symbol(), " ");
+        assert_eq!(terminal.backend().buffer()[(0, 11)].symbol(), "0");
     }
 
     #[test]
@@ -40845,7 +40871,7 @@ for encoded, expected in json.load(sys.stdin):
                 })
                 .unwrap();
             let rendered = rendered_text(&terminal);
-            assert!(rendered.contains("radio  1x  vol 70%"));
+            assert!(rendered.contains("radio  vol 70%"));
             assert!(rendered.contains("Fixture station · Track: Artist — Track"));
             assert!(
                 !rendered.contains("LIVE")
@@ -42117,12 +42143,12 @@ prose 07:25 remains clickable but is not a chapter";
         let status_row = (0..120)
             .map(|x| terminal.backend().buffer()[(x, 1)].symbol())
             .collect::<String>();
-        let expected = "18:28 / 1:33:06  1x  vol 80% ||";
+        let expected = "18:28 / 1:33:06  vol 80% ||";
         assert!(!track_row.contains(expected));
         assert!(status_row.contains(expected));
     }
 
-    /// All playback timelines use an ASCII speed suffix supported by plain TTY fonts.
+    /// Normal speed is implicit; other rates use a TTY-safe ASCII suffix on all timelines.
     #[test]
     fn seek_status_speed_marker_is_ascii_for_all_timelines() {
         for (live, radio, seekable) in [
@@ -42132,7 +42158,14 @@ prose 07:25 remains clickable but is not a chapter";
             (true, true, false),
             (true, true, true),
         ] {
-            for (speed, label) in [(0.9, "0.9x"), (1.0, "1x"), (1.5, "1.5x")] {
+            for (speed, label) in [
+                (0.9, "0.9x"),
+                (0.99, "0.99x"),
+                (1.0, ""),
+                (1.01, "1.01x"),
+                (1.25, "1.25x"),
+                (1.5, "1.5x"),
+            ] {
                 let view = ViewModel {
                     playing_media_id: radio.then(|| MediaId::new(SourceKind::Radio, "fixture")),
                     playback: PlaybackStatus {
@@ -42171,6 +42204,9 @@ prose 07:25 remains clickable but is not a chapter";
                     status.contains(&format!("{label}  vol 80%")),
                     "unexpected speed label: {status}"
                 );
+                if label.is_empty() {
+                    assert!(!status.contains("1x"), "normal speed is implicit: {status}");
+                }
                 assert!(!status.contains('\u{00d7}'));
             }
         }
