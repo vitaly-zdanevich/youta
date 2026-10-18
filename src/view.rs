@@ -2032,10 +2032,11 @@ impl DetailLinkInternalTarget {
 /// Text and vertical-spacing treatment for one external Details link.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 pub enum DetailLinkPresentation {
-    /// Render the human label followed by an em dash and the URL.
+    /// Render plain external links as a wrapped label above the complete URL.
+    /// Catalogue and Wikidata links retain their combined inline controls.
     #[default]
     LabelAndUrl,
-    /// Render the human label and URL, then reserve one non-clickable row.
+    /// Apply the same label/URL layout, then reserve one non-clickable row.
     LabelAndUrlSpaced,
     /// Render only the human-readable label.
     LabelOnly,

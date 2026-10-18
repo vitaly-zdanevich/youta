@@ -5,6 +5,8 @@
 
 mod bug_report;
 #[cfg(test)]
+mod detail_link_wrapping_tests;
+#[cfg(test)]
 mod empty_tab_tests;
 #[cfg(feature = "funkwhale")]
 mod funkwhale;
@@ -5270,6 +5272,139 @@ fn append_details_body_section(body: &mut String, heading: &str, content: &str) 
     body.push_str(content);
 }
 
+/// Identifies original fields without copying their text into navigation entries.
+#[derive(Clone, Copy)]
+enum DetailLinkRowPart {
+    /// Existing catalogue, Wikidata or single-value presentation.
+    Original,
+    /// Byte range in the concatenated, separately styled prefix and label.
+    Label { start_byte: usize, end_byte: usize },
+    /// Byte range in the original external URL.
+    Url { start_byte: usize, end_byte: usize },
+}
+
+/// One physical Details row still owned by its original logical link.
+struct DetailLinkRow<'a> {
+    index: usize,
+    link: &'a DetailLinkView,
+    part: DetailLinkRowPart,
+    /// Real source newlines before this fragment; soft wraps contribute none.
+    source_line_breaks: Option<usize>,
+}
+
+/// Shares expanded link heights between artwork sizing, selection and painting.
+///
+/// Plain external links put their complete URL below the label so terminal text
+/// selection cannot copy a clipped identifier. Existing catalogue/Wikidata rows
+/// retain their inline controls and layout; blank rows retain provider spacing.
+fn detail_link_rows(
+    details: &DetailView,
+    screen: Screen,
+    width: u16,
+) -> Vec<Option<DetailLinkRow<'_>>> {
+    let mut rows = Vec::with_capacity(details.links.len().saturating_mul(2));
+    for (index, link) in details.links.iter().enumerate() {
+        if link.description_range.is_some() {
+            continue;
+        }
+        let apple_caption = screen == Screen::ApplePodcasts
+            && matches!(
+                link.label.as_str(),
+                "Apple Podcasts" | "Apple Podcasts episode" | "Apple Podcasts show"
+            );
+        if link.internal_target.is_none()
+            && link.wikidata_item_id.is_none()
+            && !apple_caption
+            && !link.url.is_empty()
+            && matches!(
+                link.presentation,
+                DetailLinkPresentation::LabelAndUrl | DetailLinkPresentation::LabelAndUrlSpaced
+            )
+        {
+            let label = format!("{}{}", link.prefix, link.label);
+            let mut previous_copy_end: Option<usize> = None;
+            for line in wrap_description_source(&label, usize::from(width), &[], &[]) {
+                let source_line_breaks = Some(previous_copy_end.map_or(1, |end| {
+                    label[end..line.start_byte]
+                        .bytes()
+                        .filter(|byte| *byte == b'\n')
+                        .count()
+                }));
+                if line.start_byte < line.end_byte {
+                    previous_copy_end = Some(line.end_byte);
+                }
+                rows.push(Some(DetailLinkRow {
+                    index,
+                    link,
+                    part: DetailLinkRowPart::Label {
+                        start_byte: line.start_byte,
+                        end_byte: line.end_byte,
+                    },
+                    source_line_breaks,
+                }));
+            }
+            let mut previous_copy_end: Option<usize> = None;
+            for line in wrap_description_source(&link.url, usize::from(width), &[], &[]) {
+                let source_line_breaks = Some(previous_copy_end.map_or(1, |end| {
+                    link.url[end..line.start_byte]
+                        .bytes()
+                        .filter(|byte| *byte == b'\n')
+                        .count()
+                }));
+                if line.start_byte < line.end_byte {
+                    previous_copy_end = Some(line.end_byte);
+                }
+                rows.push(Some(DetailLinkRow {
+                    index,
+                    link,
+                    part: DetailLinkRowPart::Url {
+                        start_byte: line.start_byte,
+                        end_byte: line.end_byte,
+                    },
+                    source_line_breaks,
+                }));
+            }
+        } else {
+            rows.push(Some(DetailLinkRow {
+                index,
+                link,
+                part: DetailLinkRowPart::Original,
+                source_line_breaks: None,
+            }));
+            if matches!(
+                link.internal_target,
+                Some(
+                    DetailLinkInternalTarget::FunkwhaleArtist(_)
+                        | DetailLinkInternalTarget::VkArtist(_)
+                )
+            ) {
+                // The artist's labelled name and canonical URL own distinct rows.
+                rows.push(Some(DetailLinkRow {
+                    index,
+                    link,
+                    part: DetailLinkRowPart::Original,
+                    source_line_breaks: None,
+                }));
+            }
+        }
+        let next_is_wikidata = details
+            .links
+            .get(index.saturating_add(1))
+            .is_some_and(|next| next.wikidata_item_id.is_some());
+        if !next_is_wikidata
+            && matches!(
+                link.presentation,
+                DetailLinkPresentation::LabelAndUrlSpaced
+                    | DetailLinkPresentation::LabelOnlySpaced
+                    | DetailLinkPresentation::UrlOnlySpaced
+            )
+        {
+            rows.push(None);
+        }
+    }
+    rows
+}
+
 fn render_information_panel(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -6315,6 +6450,7 @@ fn render_information_panel(
                 .min(details.url_info.len().saturating_sub(1)),
         )
         .is_some_and(|info| info.expanded);
+    let link_rows = detail_link_rows(details, view.screen, inner.width);
     let mut text_reserve = if details.thumbnail_expanded {
         0
     } else {
@@ -6334,34 +6470,8 @@ fn render_information_panel(
         // Keep VK's original URL and catalogue actions below a native-sized
         // cover, including while its loading placeholder fills the whole block.
         // The existing link reserve owns the separator; retain each visible row too.
-        let link_rows = details
-            .links
-            .iter()
-            .enumerate()
-            .filter(|(_, link)| link.description_range.is_none())
-            .fold(0_u16, |rows, (index, link)| {
-                let artist_row = u16::from(matches!(
-                    link.internal_target,
-                    Some(DetailLinkInternalTarget::VkArtist(_))
-                ));
-                let next_is_wikidata = details
-                    .links
-                    .get(index.saturating_add(1))
-                    .is_some_and(|next| next.wikidata_item_id.is_some());
-                let spacer = u16::from(
-                    !next_is_wikidata
-                        && matches!(
-                            link.presentation,
-                            DetailLinkPresentation::LabelAndUrlSpaced
-                                | DetailLinkPresentation::LabelOnlySpaced
-                                | DetailLinkPresentation::UrlOnlySpaced
-                        ),
-                );
-                rows.saturating_add(1)
-                    .saturating_add(artist_row)
-                    .saturating_add(spacer)
-            });
-        text_reserve = text_reserve.saturating_add(link_rows);
+        text_reserve =
+            text_reserve.saturating_add(u16::try_from(link_rows.len()).unwrap_or(u16::MAX));
     }
     let compact_metadata_height = u16::try_from(
         lines
@@ -6677,37 +6787,6 @@ fn render_information_panel(
         } else {
             0
         };
-        let mut link_rows = Vec::with_capacity(details.links.len().saturating_mul(2));
-        for (index, link) in details.links.iter().enumerate() {
-            if link.description_range.is_some() {
-                continue;
-            }
-            link_rows.push(Some((index, link)));
-            if matches!(
-                link.internal_target,
-                Some(
-                    DetailLinkInternalTarget::FunkwhaleArtist(_)
-                        | DetailLinkInternalTarget::VkArtist(_)
-                )
-            ) {
-                // The artist's labelled name and canonical URL own distinct rows.
-                link_rows.push(Some((index, link)));
-            }
-            let next_is_wikidata = details
-                .links
-                .get(index.saturating_add(1))
-                .is_some_and(|next| next.wikidata_item_id.is_some());
-            if !next_is_wikidata
-                && matches!(
-                    link.presentation,
-                    DetailLinkPresentation::LabelAndUrlSpaced
-                        | DetailLinkPresentation::LabelOnlySpaced
-                        | DetailLinkPresentation::UrlOnlySpaced
-                )
-            {
-                link_rows.push(None);
-            }
-        }
         let desired_link_height = u16::try_from(link_rows.len()).unwrap_or(u16::MAX);
         let link_height =
             desired_link_height.min(remaining_height.saturating_sub(description_reserve));
@@ -6718,14 +6797,27 @@ fn render_information_panel(
                 .min(details.links.len().saturating_sub(1));
             let selected_row = link_rows
                 .iter()
-                .position(|row| {
-                    row.as_ref()
-                        .is_some_and(|(index, _)| *index == selected_link)
-                })
+                .position(|row| row.as_ref().is_some_and(|row| row.index == selected_link))
                 .unwrap_or_default();
-            let first_row = selected_row
+            // Reveal an external link's final URL continuation as well as its
+            // label when the viewport can contain the complete selected link.
+            let selected_last_row = if link_rows
+                .get(selected_row)
+                .and_then(Option::as_ref)
+                .is_some_and(|row| !matches!(row.part, DetailLinkRowPart::Original))
+            {
+                link_rows
+                    .iter()
+                    .rposition(|row| row.as_ref().is_some_and(|row| row.index == selected_link))
+                    .unwrap_or(selected_row)
+            } else {
+                selected_row
+            };
+            let first_row = selected_last_row
                 .saturating_add(1)
-                .saturating_sub(usize::from(link_height));
+                .saturating_sub(usize::from(link_height))
+                .min(selected_row);
+            let mut previous_copy_owner = None;
             for row in link_rows
                 .iter()
                 .enumerate()
@@ -6733,13 +6825,100 @@ fn render_information_panel(
                 .take(usize::from(link_height))
             {
                 let (row_index, row) = row;
-                let Some((index, link)) = row else {
+                let Some(DetailLinkRow {
+                    index,
+                    link,
+                    part,
+                    source_line_breaks,
+                }) = row
+                else {
                     cursor_y = cursor_y.saturating_add(1);
                     continue;
                 };
                 let link_area = Rect::new(inner.x, cursor_y, inner.width, 1);
                 let mut content_offset = 0_u16;
                 let mut spans = Vec::new();
+                if !matches!(part, DetailLinkRowPart::Original) {
+                    let (field, source, range, style) = match *part {
+                        DetailLinkRowPart::Label {
+                            start_byte,
+                            end_byte,
+                        } => {
+                            let prefix_end = end_byte.min(link.prefix.len());
+                            let prefix_start = start_byte.min(prefix_end);
+                            append_highlighted_detail_source(
+                                details,
+                                DetailHighlightField::LinkPrefix(*index),
+                                &link.prefix,
+                                prefix_start..prefix_end,
+                                theme.base,
+                                &mut spans,
+                            );
+                            content_offset =
+                                terminal_text_width(&link.prefix[prefix_start..prefix_end]);
+                            (
+                                DetailHighlightField::LinkLabel(*index),
+                                link.label.as_str(),
+                                start_byte.saturating_sub(link.prefix.len())
+                                    ..end_byte.saturating_sub(link.prefix.len()),
+                                theme.base,
+                            )
+                        }
+                        DetailLinkRowPart::Url {
+                            start_byte,
+                            end_byte,
+                        } => (
+                            DetailHighlightField::LinkUrl(*index),
+                            link.url.as_str(),
+                            start_byte..end_byte,
+                            theme.muted,
+                        ),
+                        DetailLinkRowPart::Original => {
+                            unreachable!("handled by the original layout")
+                        }
+                    };
+                    let width = terminal_text_width(&source[range.clone()]);
+                    append_highlighted_detail_source(
+                        details, field, source, range, style, &mut spans,
+                    );
+                    frame.render_widget(Paragraph::new(Line::from(spans)), link_area);
+                    if show_text_selection {
+                        // Preserve source spaces and join only soft wraps when
+                        // copying. A label-to-URL boundary remains a real newline.
+                        capture_selectable_details_cells(
+                            frame,
+                            hit_map,
+                            Rect::new(
+                                link_area.x,
+                                link_area.y,
+                                content_offset.saturating_add(width).min(link_area.width),
+                                1,
+                            ),
+                            false,
+                        );
+                        if let Some(captured) = hit_map
+                            .detail_text_rows
+                            .last_mut()
+                            .filter(|captured| captured.y == link_area.y)
+                        {
+                            let owner = (*index, matches!(part, DetailLinkRowPart::Url { .. }));
+                            if previous_copy_owner == Some(owner) {
+                                captured.source_line_breaks = *source_line_breaks;
+                            }
+                            previous_copy_owner = Some(owner);
+                        }
+                    }
+                    let offset = content_offset.min(link_area.width);
+                    let width = width.min(link_area.width.saturating_sub(offset));
+                    if view.external_opener_available && width > 0 {
+                        hit_map.detail_links.push((
+                            *index,
+                            Rect::new(link_area.x.saturating_add(offset), link_area.y, width, 1),
+                        ));
+                    }
+                    cursor_y = cursor_y.saturating_add(1);
+                    continue;
+                }
                 if let Some(
                     target @ (DetailLinkInternalTarget::FunkwhaleArtist(_)
                     | DetailLinkInternalTarget::VkArtist(_)),
@@ -6748,7 +6927,7 @@ fn render_information_panel(
                     let url_row = row_index > 0
                         && link_rows[row_index - 1]
                             .as_ref()
-                            .is_some_and(|(previous, _)| previous == index);
+                            .is_some_and(|previous| previous.index == *index);
                     let artist_name = if matches!(target, DetailLinkInternalTarget::VkArtist(_)) {
                         &link.label
                     } else {
@@ -33282,7 +33461,9 @@ for encoded, expected in json.load(sys.stdin):
         assert!(rendered.contains(&format!("[O] {} homepage", system_url_opener_name())));
         assert!(!rendered.contains("External links"));
         assert!(!rendered.contains("Station website"));
-        assert!(rendered.contains("Homepage — https://sectorradio.com/"));
+        assert!(rendered.contains("Homepage"));
+        assert!(rendered.contains("https://sectorradio.com/"));
+        assert!(!rendered.contains("Homepage — https://sectorradio.com/"));
         assert!(rendered.contains("Lossless progressive electronic music."));
         assert!(!rendered.contains("[B] Sort:"));
         assert!(!rendered.contains("Length:"));
@@ -44841,31 +45022,48 @@ prose 07:25 remains clickable but is not a chapter";
             .draw(|frame| render(frame, &view, &UiSettings::default(), &mut hit_map))
             .expect("draw short external link");
 
-        let (_, link_area) = hit_map.detail_links[0];
-        assert_eq!(link_area.height, 1);
-        assert_eq!(
-            link_area.width,
-            terminal_text_width("Home — https://example.org/"),
-            "the removed marker must not leave invisible clickable columns"
-        );
-        assert!(
-            link_area.right() < hit_map.details_panel.right(),
-            "a short link must not make blank trailing panel cells clickable"
-        );
         let click = |column, row| MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column,
             row,
             modifiers: KeyModifiers::NONE,
         };
-        assert_eq!(
-            mouse_action(
-                click(link_area.right().saturating_sub(1), link_area.y),
-                &hit_map,
-                &view
-            ),
-            Some(UiAction::ActivateDetailLink(0))
-        );
+        assert_eq!(hit_map.detail_links.len(), 2);
+        for ((index, link_area), text) in hit_map
+            .detail_links
+            .iter()
+            .zip(["Home", "https://example.org/"])
+        {
+            assert_eq!(*index, 0);
+            assert_eq!(link_area.height, 1);
+            assert_eq!(
+                link_area.width,
+                terminal_text_width(text),
+                "each row must exclude invisible clickable columns"
+            );
+            assert!(
+                link_area.right() < hit_map.details_panel.right(),
+                "a short link must not make blank trailing panel cells clickable"
+            );
+            assert_eq!(
+                mouse_action(
+                    click(link_area.right().saturating_sub(1), link_area.y),
+                    &hit_map,
+                    &view
+                ),
+                Some(UiAction::ActivateDetailLink(0))
+            );
+            assert_eq!(
+                mouse_action(
+                    click(hit_map.details_panel.right().saturating_sub(1), link_area.y),
+                    &hit_map,
+                    &view
+                ),
+                Some(UiAction::SetDetailsFocus(true)),
+                "blank cells after either row must only focus Details"
+            );
+        }
+        let (_, link_area) = hit_map.detail_links[0];
         assert_eq!(
             mouse_action(
                 click(link_area.x, link_area.y.saturating_sub(1)),
@@ -44874,15 +45072,6 @@ prose 07:25 remains clickable but is not a chapter";
             ),
             Some(UiAction::SetDetailsFocus(true)),
             "the row before a link must not select it"
-        );
-        assert_eq!(
-            mouse_action(
-                click(hit_map.details_panel.right().saturating_sub(1), link_area.y),
-                &hit_map,
-                &view
-            ),
-            Some(UiAction::SetDetailsFocus(true)),
-            "blank cells after a short link must only focus Details"
         );
     }
 
@@ -45463,7 +45652,7 @@ prose 07:25 remains clickable but is not a chapter";
         assert_eq!(rendered.matches("Douglas Adams (Q42)").count(), 1);
         assert!(!rendered.contains("Wikidata:"));
         assert!(rendered.contains("Telegram: Fixture"));
-        assert_eq!(hit_map.detail_links.len(), 2);
+        assert_eq!(hit_map.detail_links.len(), 3);
         assert!(
             hit_map
                 .detail_buttons
