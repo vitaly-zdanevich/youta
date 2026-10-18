@@ -231,6 +231,10 @@ remain back and forward navigation.
 .TP
 .BR Up ", " Down
 Increase or decrease volume by five percentage points.
+Changes are saved in config.toml and restored on restart, even with log and
+search saving disabled. Volume can also be adjusted before playback starts.
+If YOUTA_PLAYBACK__VOLUME_PERCENT is set, changes apply only to this session.
+Direct/audiophile output does not allow software-volume changes.
 Use
 .B j
 and

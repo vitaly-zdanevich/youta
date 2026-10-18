@@ -511,6 +511,12 @@ While a requested track is being resolved or waiting for playback to start,
 an ASCII spinner appears at the bottom-left of the TUI's last line. It shares
 the existing status row without reducing the space available for results.
 
+Volume changes are remembered in `config.toml` and restored after restarting,
+even when log and search saving is disabled. You can also adjust the volume
+before starting playback. `YOUTA_PLAYBACK__VOLUME_PERCENT` remains an explicit
+startup override; while it is set, volume changes apply only to the current
+session. Direct/audiophile output does not allow software-volume changes.
+
 Youta prepares the selected YouTube video's audio by default so `Enter` can
 start playback without first waiting for a complete foreground resolution.
 Selection must remain unchanged for 200 ms before one bounded worker invokes

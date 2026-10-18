@@ -53,6 +53,9 @@ pub const NYAN_CAT_SEEKBAR_ENV: &str = "YOUTA_UI__NYAN_CAT_SEEKBAR";
 /// Environment variable that overrides automatic same-source queue continuation.
 pub const AUTOPLAY_ENV: &str = "YOUTA_PLAYBACK__AUTOPLAY";
 
+/// Environment variable that overrides the remembered startup volume.
+pub const VOLUME_PERCENT_ENV: &str = "YOUTA_PLAYBACK__VOLUME_PERCENT";
+
 /// Environment variable that overrides selected and imminent-next `YouTube` prewarming.
 pub const YOUTUBE_PREWARM_ENV: &str = "YOUTA_PLAYBACK__YOUTUBE_PREWARM";
 
@@ -1159,6 +1162,47 @@ impl Config {
         table["upload_video"] = value(settings.upload_video);
         write_private_config(&path, document.to_string().as_bytes())?;
         self.s3_upload = settings;
+        Ok(())
+    }
+
+    /// Persists an explicitly accepted volume as the next startup value.
+    ///
+    /// Only `playback.volume_percent` changes; existing comments and unrelated
+    /// settings are preserved. [`VOLUME_PERCENT_ENV`] retains precedence and
+    /// prevents saving a value that the next startup would ignore. The
+    /// in-memory preference changes only after the atomic file update succeeds.
+    /// This preference is independent of playback-history saving.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a percentage outside `0..=100`, an environment
+    /// override, an oversized or malformed configuration, or a failed private
+    /// atomic write. Runtime callers may still apply their accepted volume when
+    /// persistence is unavailable, without claiming that it was saved.
+    #[cfg(feature = "controller")]
+    pub fn save_volume_percent(&mut self, volume_percent: u8) -> Result<(), ConfigError> {
+        if volume_percent > 100 {
+            return Err(ConfigError::Invalid(
+                "playback.volume_percent must be in 0..=100".to_owned(),
+            ));
+        }
+        if std::env::var_os(VOLUME_PERCENT_ENV).is_some() {
+            return Err(ConfigError::Invalid(format!(
+                "{VOLUME_PERCENT_ENV} overrides config.toml; change or remove it before saving volume"
+            )));
+        }
+
+        self.ensure_directories()?;
+        let path = self.config_file();
+        let mut document = read_editable_config(&path)?;
+        let playback = editable_table(&mut document, "playback")?;
+        let mut stored_volume = toml_edit::Value::from(i64::from(volume_percent));
+        if let Some(previous) = playback.get("volume_percent").and_then(Item::as_value) {
+            *stored_volume.decor_mut() = previous.decor().clone();
+        }
+        playback["volume_percent"] = Item::Value(stored_volume);
+        write_private_config(&path, document.to_string().as_bytes())?;
+        self.playback.volume_percent = volume_percent;
         Ok(())
     }
 
@@ -3871,6 +3915,144 @@ youtube_api_key = "keep-this-existing-secret"
         assert!(contents.contains("# retain Nyan Cat for another build"));
         assert!(contents.contains("nyan_cat_seekbar = false"));
         assert!(!config.ui.nyan_cat_seekbar);
+    }
+
+    /// Both inclusive volume limits survive restart, including an initially absent config.
+    #[cfg(feature = "controller")]
+    #[test]
+    fn volume_save_roundtrips_inclusive_boundaries() {
+        let directory = tempdir().expect("temporary directory");
+        let mut config = Config::for_dir(directory.path());
+        assert!(!config.config_file().exists());
+
+        for volume in [0, 100] {
+            config.save_volume_percent(volume).expect("save volume");
+            assert_eq!(config.playback.volume_percent, volume);
+            let reloaded =
+                Config::load_from_dir_with_environment(directory.path().to_owned(), false)
+                    .expect("reload saved volume");
+            assert_eq!(reloaded.playback.volume_percent, volume);
+        }
+    }
+
+    /// Saving one playback value does not rewrite unrelated settings or their comments.
+    #[cfg(feature = "controller")]
+    #[test]
+    fn volume_save_preserves_unrelated_configuration() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("config.toml");
+        fs::write(
+            &path,
+            "# keep playback notes\n[playback]\nvolume_percent = 35 # keep volume notes\nspeed_percent = 125 # keep speed notes\n\n[providers]\nyoutube_api_key = 'keep-this-existing-secret'\n",
+        )
+        .expect("write configuration");
+        let mut config = Config::for_dir(directory.path());
+
+        config.save_volume_percent(45).expect("save volume");
+
+        let contents = fs::read_to_string(&path).expect("read updated configuration");
+        assert!(contents.contains("# keep playback notes"));
+        assert!(contents.contains("volume_percent = 45 # keep volume notes"));
+        assert!(contents.contains("speed_percent = 125 # keep speed notes"));
+        assert!(contents.contains("youtube_api_key = 'keep-this-existing-secret'"));
+        let document = contents.parse::<DocumentMut>().expect("valid saved TOML");
+        assert_eq!(
+            document["playback"]["volume_percent"].as_integer(),
+            Some(45)
+        );
+        assert_eq!(config.playback.volume_percent, 45);
+    }
+
+    /// Invalid percentages never mutate either the remembered value or the file.
+    #[cfg(feature = "controller")]
+    #[test]
+    fn volume_save_rejects_out_of_range_without_mutation() {
+        let directory = tempdir().expect("temporary directory");
+        let mut config = Config::for_dir(directory.path());
+        config.playback.volume_percent = 35;
+        let original = "[playback]\nvolume_percent = 35\n";
+        fs::write(config.config_file(), original).expect("write configuration");
+
+        for volume in [101, u8::MAX] {
+            let error = config
+                .save_volume_percent(volume)
+                .expect_err("invalid volume");
+            assert!(error.to_string().contains("0..=100"));
+            assert_eq!(config.playback.volume_percent, 35);
+            assert_eq!(fs::read_to_string(config.config_file()).unwrap(), original);
+        }
+    }
+
+    /// An uneditable file is left intact instead of replacing it with a partial configuration.
+    #[cfg(feature = "controller")]
+    #[test]
+    fn volume_save_rejects_malformed_configuration_without_mutation() {
+        for original in ["[playback\n", "playback = 'not a table'\n"] {
+            let directory = tempdir().expect("temporary directory");
+            let mut config = Config::for_dir(directory.path());
+            config.playback.volume_percent = 35;
+            fs::write(config.config_file(), original).expect("write malformed configuration");
+
+            config
+                .save_volume_percent(45)
+                .expect_err("uneditable configuration");
+
+            assert_eq!(config.playback.volume_percent, 35);
+            assert_eq!(fs::read_to_string(config.config_file()).unwrap(), original);
+        }
+    }
+
+    /// A subprocess isolates environment precedence from concurrently running tests.
+    #[cfg(feature = "controller")]
+    #[test]
+    fn volume_environment_override_prevents_file_and_memory_mutation() {
+        const CHILD_MARKER: &str = "YOUTA_VOLUME_SAVE_TEST_CHILD";
+        const TEST_DIRECTORY: &str = "YOUTA_VOLUME_SAVE_TEST_DIR";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let directory =
+                PathBuf::from(std::env::var(TEST_DIRECTORY).expect("child test directory"));
+            let mut config =
+                Config::load_from_dir(directory.clone()).expect("load overridden configuration");
+            assert_eq!(config.playback.volume_percent, 62);
+            let original = fs::read(config.config_file()).ok();
+
+            let error = config
+                .save_volume_percent(25)
+                .expect_err("environment override");
+
+            assert!(error.to_string().contains(VOLUME_PERCENT_ENV));
+            assert_eq!(config.playback.volume_percent, 62);
+            assert_eq!(fs::read(config.config_file()).ok(), original);
+            return;
+        }
+
+        for existing_file in [false, true] {
+            let directory = tempdir().expect("temporary directory");
+            if existing_file {
+                fs::write(
+                    directory.path().join("config.toml"),
+                    "# retain configured fallback\n[playback]\nvolume_percent = 35\n",
+                )
+                .expect("write configured fallback");
+            }
+            let output = Command::new(std::env::current_exe().expect("test executable"))
+                .args([
+                    "--exact",
+                    "config::tests::volume_environment_override_prevents_file_and_memory_mutation",
+                    "--nocapture",
+                ])
+                .env(CHILD_MARKER, "1")
+                .env(TEST_DIRECTORY, directory.path())
+                .env(CONFIG_DIR_ENV, directory.path())
+                .env(VOLUME_PERCENT_ENV, "62")
+                .output()
+                .expect("run volume environment-lock child");
+            assert!(
+                output.status.success(),
+                "child test failed:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
     #[cfg(feature = "controller")]

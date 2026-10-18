@@ -63,6 +63,7 @@ mod url_info;
 mod vk;
 #[cfg(all(feature = "vk", feature = "acoustid"))]
 mod vk_fingerprint;
+mod volume;
 #[cfg(feature = "web-browser")]
 mod web;
 #[cfg(all(feature = "web-browser", feature = "local-metadata"))]
@@ -5702,6 +5703,8 @@ pub struct AppController {
     playback_phase: PlaybackPhase,
     /// The backend still owns the finite `YouTube` timeline after natural EOF.
     playback_held_at_end: bool,
+    /// Accepted software volume awaiting acknowledgement in a backend snapshot.
+    pending_volume: Option<(u8, Instant)>,
     playback_load_kind: PlaybackLoadKind,
     pending_history: Option<HistoryEntry>,
     ignore_replaced_stop: bool,
@@ -7075,6 +7078,7 @@ impl AppController {
             playback_queue: PlaybackQueue::default(),
             playback_phase: PlaybackPhase::Idle,
             playback_held_at_end: false,
+            pending_volume: None,
             playback_load_kind: PlaybackLoadKind::Regular,
             pending_history: None,
             ignore_replaced_stop: false,
@@ -27439,6 +27443,7 @@ impl AppController {
         }
         match status_result {
             Ok(mut status) => {
+                self.reconcile_pending_volume(&mut status);
                 self.normalize_playback_status(&mut status);
                 if self.playback_phase == PlaybackPhase::Idle {
                     self.view.playback = status;
@@ -28073,6 +28078,7 @@ impl AppController {
     }
 
     fn reset_playback_state(&mut self) {
+        self.pending_volume = None;
         #[cfg(feature = "funkwhale")]
         self.clear_funkwhale_playback_retry();
         #[cfg(feature = "yt-dlp")]
@@ -37151,10 +37157,7 @@ impl UiController for AppController {
                 }
             }
             UiAction::ChangeVolume(delta) => {
-                let volume = i16::from(self.view.playback.volume)
-                    .saturating_add(i16::from(delta))
-                    .clamp(0, 100) as u8;
-                self.player_command(PlayerCommand::SetVolume(volume));
+                self.change_volume(delta);
             }
             UiAction::ChangeSpeed(delta) => {
                 let speed = (self.view.playback.speed + delta).clamp(0.5, 3.0);
@@ -48704,6 +48707,8 @@ mod tests {
     #[cfg(feature = "url-info")]
     #[path = "url_info.rs"]
     mod url_info_tests;
+    #[path = "volume.rs"]
+    mod volume_tests;
     #[cfg(all(feature = "web-browser", feature = "local-metadata"))]
     #[path = "web_metadata.rs"]
     mod web_metadata_tests;
