@@ -4,6 +4,8 @@
 //! writes to the terminal and does not create a second user interface.
 
 mod bug_report;
+#[cfg(test)]
+mod empty_tab_tests;
 #[cfg(feature = "funkwhale")]
 mod funkwhale;
 #[cfg(feature = "hover")]
@@ -3768,6 +3770,15 @@ fn render_body(
         render_catalog_playback_controls(frame, controls, view, show_hotkeys, theme, hit_map);
     }
     if show_empty_prompt {
+        // This route bypasses the information panel's normal owner change.
+        // Rewrite its former physical cells once: terminal-width drift can
+        // leave glyphs in cells that Ratatui already considers blank.
+        if let Some(previous) = hit_map.information_panel_identity.take() {
+            invalidate_terminal_area(frame, previous.area);
+        }
+        if let Some(renderer) = thumbnail_renderer {
+            renderer.clear();
+        }
         return;
     }
     hit_map.rows_row_height = row_list_height(&view.rows);
