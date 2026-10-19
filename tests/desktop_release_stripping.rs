@@ -63,6 +63,29 @@ mod unix {
         .expect("fixture version");
         let tools = root.join("tools");
         mock_tool(
+            &root.join("scripts"),
+            "prepare-appimage-tools.sh",
+            r#"#!/usr/bin/env bash
+prepare_appimage_tools() {
+	[[ $1 == "${FIXTURE_ROOT}/target" ]]
+	[[ $2 == "${FIXTURE_TARGET%%-*}" ]]
+	mkdir -p "$1/.tauri"
+	printf 'launcher fixture\n' > "$1/.tauri/AppRun-$2"
+	chmod 755 "$1/.tauri/AppRun-$2"
+	printf 'prepared\n' > "${FIXTURE_ROOT}/appimage-prepared"
+}
+"#,
+        );
+        mock_tool(
+            &root.join("scripts"),
+            "validate-appimage.sh",
+            r#"#!/usr/bin/env bash
+set -Eeuo pipefail
+[[ $1 == "${FIXTURE_ROOT}/dist/"*.AppImage && -x $1 ]]
+printf 'validated\n' > "${FIXTURE_ROOT}/appimage-validated"
+"#,
+        );
+        mock_tool(
             &tools,
             "rustc",
             "#!/usr/bin/env bash\nset -Eeuo pipefail\n[[ $* == -vV ]]\nprintf 'host: %s\\n' \"${FIXTURE_TARGET}\"\n",
@@ -95,6 +118,10 @@ if [[ ${FIXTURE_CROSS} == 1 ]]; then
 else
 	if [[ ${FIXTURE_PLATFORM} == macos-* && -z ${APPLE_CERTIFICATE:-} ]]; then
 		[[ $* == --no-sign ]]
+	elif [[ ${FIXTURE_PLATFORM} == linux-* ]]; then
+		[[ $# == 2 && $1 == --config && $2 == '{"bundle":{"useLocalToolsDir":true}}' ]]
+		[[ -x ${FIXTURE_ROOT}/target/.tauri/AppRun-${FIXTURE_TARGET%%-*} ]]
+		[[ -f ${FIXTURE_ROOT}/appimage-prepared ]]
 	else
 		[[ $# == 0 ]]
 	fi
@@ -175,18 +202,37 @@ printf 'tauri build\n' >> "${FIXTURE_ROOT}/invocations"
                 &["exe"]
             };
             for extension in extensions {
+                let bundle_platform = if *extension == "AppImage" {
+                    target.split('-').next().unwrap()
+                } else {
+                    platform
+                };
                 expected.push((
-                    format!("youta-desktop-9.8.7-{platform}.{extension}"),
+                    format!("youta-desktop-9.8.7-{bundle_platform}.{extension}"),
                     "signed installer fixture\n",
                 ));
             }
         }
+        let appimage_expected = !cross && platform.starts_with("linux-");
+        assert_eq!(root.join("appimage-prepared").exists(), appimage_expected);
+        assert_eq!(root.join("appimage-validated").exists(), appimage_expected);
         let destination = root.join("dist");
         assert_eq!(
             fs::read_dir(&destination).unwrap().count(),
             expected.len() * 2
         );
         for (name, content) in expected {
+            if name.ends_with(".AppImage") {
+                assert_eq!(
+                    fs::metadata(destination.join(&name))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o755,
+                    "AppImages must be executable by users other than the build owner"
+                );
+            }
             assert_eq!(
                 fs::read(destination.join(&name)).unwrap(),
                 content.as_bytes(),

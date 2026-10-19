@@ -3486,6 +3486,12 @@ macOS amd64 and arm64, and NSIS for Windows amd64. The macOS executable can be
 launched from a terminal; Finder users should use the `.dmg`. GUI binaries are
 stripped during compilation, before bundling and signing; there is no separate
 GUI debug download.
+AppImages use `youta-desktop-VERSION-x86_64.AppImage` or
+`youta-desktop-VERSION-aarch64.AppImage`; the format already implies Linux.
+The packaging script verifies that the finished image's launchers and GUI
+executable are readable and executable by all users, not just the build owner.
+After downloading, run `chmod +x` on the AppImage as described in the
+[AppImage quickstart](https://docs.appimage.org/introduction/quickstart.html).
 `scripts/package-desktop.sh` builds whichever native forms its host can make,
 while `scripts/package-desktop-executable.sh` produces the standalone Linux
 i686 program without pretending to cross-compile an installer. The workflow

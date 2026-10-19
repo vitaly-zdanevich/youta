@@ -1306,8 +1306,10 @@ fn release_asset_gate_requires_debug_binaries_symbols_and_matching_checksums() {
         names.push(format!("youta-gui-1.2.3-{platform}{extension}"));
     }
     for (platform, extensions) in [
-        ("linux-amd64", "deb rpm AppImage"),
-        ("linux-arm64", "deb rpm AppImage"),
+        ("linux-amd64", "deb rpm"),
+        ("linux-arm64", "deb rpm"),
+        ("x86_64", "AppImage"),
+        ("aarch64", "AppImage"),
         ("macos-amd64", "dmg"),
         ("macos-arm64", "dmg"),
         ("windows-amd64", "exe"),
@@ -1715,9 +1717,29 @@ fn the_desktop_window_ships_one_bundle_contract_across_every_file_that_states_it
     );
 
     let release = read_repository_file(".github/workflows/release.yml");
+    let desktop = release
+        .split("  desktop:\n")
+        .nth(1)
+        .expect("native desktop release job")
+        .split("  desktop-i686:")
+        .next()
+        .unwrap();
+    for architecture in ["x86_64", "aarch64"] {
+        assert!(
+            desktop.contains(&format!("appimage_architecture: {architecture}")),
+            "desktop matrix must name the AppImage architecture"
+        );
+    }
+    for suffix in ["AppImage", "AppImage.sha256"] {
+        assert!(desktop.contains(&format!(
+            "path: dist-desktop/youta-desktop-${{{{ env.DESKTOP_VERSION }}}}-${{{{ matrix.appimage_architecture }}}}.{suffix}"
+        )));
+    }
     for platform in [
-        "linux-amd64:deb rpm AppImage",
-        "linux-arm64:deb rpm AppImage",
+        "linux-amd64:deb rpm",
+        "linux-arm64:deb rpm",
+        "x86_64:AppImage",
+        "aarch64:AppImage",
         "macos-amd64:dmg",
         "macos-arm64:dmg",
         "windows-amd64:exe",

@@ -307,11 +307,13 @@ jobs:
           - operating_system: Linux
             artifact_os: linux
             architecture: amd64
+            appimage_architecture: x86_64
             runner: ubuntu-24.04
             executable_extension: ''
           - operating_system: Linux
             artifact_os: linux
             architecture: arm64
+            appimage_architecture: aarch64
             runner: ubuntu-24.04-arm
             executable_extension: ''
           - operating_system: macOS
@@ -469,7 +471,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           archive: false
-          path: dist-desktop/youta-desktop-${{ env.DESKTOP_VERSION }}-${{ matrix.artifact_os }}-${{ matrix.architecture }}.AppImage
+          path: dist-desktop/youta-desktop-${{ env.DESKTOP_VERSION }}-${{ matrix.appimage_architecture }}.AppImage
           if-no-files-found: error
 
       - name: Upload the AppImage checksum
@@ -477,7 +479,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           archive: false
-          path: dist-desktop/youta-desktop-${{ env.DESKTOP_VERSION }}-${{ matrix.artifact_os }}-${{ matrix.architecture }}.AppImage.sha256
+          path: dist-desktop/youta-desktop-${{ env.DESKTOP_VERSION }}-${{ matrix.appimage_architecture }}.AppImage.sha256
           if-no-files-found: error
 
       - name: Upload the macOS disk image
@@ -716,8 +718,10 @@ jobs:
           # job use the version already validated against the release tag.
           desktop_version=${version}
           desktop_bundles=(
-            'linux-amd64:deb rpm AppImage'
-            'linux-arm64:deb rpm AppImage'
+            'linux-amd64:deb rpm'
+            'linux-arm64:deb rpm'
+            'x86_64:AppImage'
+            'aarch64:AppImage'
             'macos-amd64:dmg'
             'macos-arm64:dmg'
             'windows-amd64:exe'

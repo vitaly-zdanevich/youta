@@ -122,6 +122,16 @@ npm --prefix gui/ui run build
 # that file, including the page directory and the icons, is written relative to
 # it. The workspace target directory stays at the repository root regardless.
 configure_desktop_tauri_signing_args "${operating_system}"
+if [[ ${operating_system} == linux ]]; then
+	# Tauri 2.11.4 copies its cached AppRun with mode 0770. Seed the same
+	# checksum-pinned upstream launcher at 0755 before SquashFS makes its
+	# permissions immutable; keep these tools inside this build's target.
+	appimage_architecture=${host_target%%-*}
+	# shellcheck source=scripts/prepare-appimage-tools.sh
+	source "${script_dir}/prepare-appimage-tools.sh"
+	prepare_appimage_tools "${repository_root}/target" "${appimage_architecture}"
+	tauri_signing_args+=(--config '{"bundle":{"useLocalToolsDir":true}}')
+fi
 (cd gui && npx --yes "@tauri-apps/cli@2.11.4" build "${tauri_signing_args[@]}")
 
 produced_executable="target/release/youta-gui${executable_extension}"
@@ -155,6 +165,13 @@ for format in deb rpm appimage dmg nsis msi; do
 			*) continue ;;
 		esac
 		destination="${output_directory}/youta-desktop-${version}-${operating_system}-${architecture}.${extension}"
+		install_mode=644
+		if [[ ${extension} == AppImage ]]; then
+			# AppImage already implies Linux; use its conventional architecture
+			# suffix and preserve executability on the distributable itself.
+			destination="${output_directory}/youta-desktop-${version}-${appimage_architecture}.AppImage"
+			install_mode=755
+		fi
 		# Two bundles claiming one name means the bundler produced something
 		# this script does not understand. Reporting the last one silently
 		# would publish an arbitrary choice.
@@ -163,7 +180,10 @@ for format in deb rpm appimage dmg nsis msi; do
 			exit 1
 		}
 		collected=$((collected + 1))
-		install -m 644 "${produced}" "${destination}"
+		install -m "${install_mode}" "${produced}" "${destination}"
+		if [[ ${extension} == AppImage ]]; then
+			bash "${script_dir}/validate-appimage.sh" "${destination}"
+		fi
 		write_checksum "${destination}"
 		echo "Created ${destination}"
 	done < <(find "${format_directory}" -maxdepth 1 -type f \
