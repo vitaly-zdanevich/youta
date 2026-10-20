@@ -22,7 +22,6 @@ mod native_menu_style;
 mod reducer;
 
 use std::ffi::OsStr;
-use std::path::{Path, PathBuf};
 
 use percent_encoding::percent_decode_str;
 use tauri::DragDropEvent;
@@ -212,7 +211,7 @@ fn key(
 /// reducer put in a snapshot. Without that question this endpoint would read any
 /// path a provider could name; see `reducer::PublishedArtwork`.
 fn serve_artwork(
-    cache_directory: &Path,
+    cache_directory: impl Into<youta::activity_storage::ActivityPath>,
     published_local_artwork: &dyn Fn(&Url) -> bool,
     request: &Request<Vec<u8>>,
 ) -> Response<Vec<u8>> {
@@ -261,9 +260,9 @@ fn serve_artwork(
         Ok(artwork) => Response::builder()
             .status(200)
             .header("Content-Type", artwork.format.media_type())
-            // The bytes are already in Youta's own cache, so the web view keeps
-            // only a short-lived copy.
-            .header("Cache-Control", "max-age=300")
+            // Youta owns cache persistence; the web view must not create an
+            // independent disk cache that bypasses the activity preference.
+            .header("Cache-Control", "no-store")
             .body(artwork.bytes)
             .unwrap_or_else(|_| refuse(500)),
         Err(_) => refuse(404),
@@ -301,7 +300,7 @@ fn main() {
         }
     };
 
-    let artwork_cache: PathBuf = config.thumbnail_cache_dir();
+    let artwork_cache = config.activity_thumbnail_dir();
     let focus = WindowFocus::default();
     let window_focus = focus.clone();
 
@@ -508,6 +507,7 @@ mod tests {
             &request,
         );
         assert_eq!(served.status(), 200);
+        assert_eq!(served.headers().get("Cache-Control").unwrap(), "no-store");
         assert_eq!(
             served
                 .headers()

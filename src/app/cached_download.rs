@@ -219,7 +219,7 @@ pub(super) fn prepare_cached_thumbnail(
     destination: &Path,
 ) -> Option<CachedThumbnail> {
     use std::io::Write;
-    let bytes = crate::artwork::ThumbnailCache::new(config.thumbnail_cache_dir())
+    let bytes = crate::artwork::ThumbnailCache::new(config.activity_thumbnail_dir())
         .read(source?)
         .ok()??;
     let extension = match crate::artwork::ArtworkFormat::sniff(&bytes)? {

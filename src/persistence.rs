@@ -3423,6 +3423,8 @@ mod files;
 
 use files::FileStateStore;
 
+mod activity_privacy;
+
 /// Operations supplied by every restart-state backend.
 ///
 /// The trait is public only so [`StateStore`] can expose normal method syntax
@@ -3782,6 +3784,8 @@ pub trait StateBackend {
 /// Backend-selected restart-safe application state.
 pub struct StateStore {
     backend: Box<dyn StateBackend>,
+    /// Process-local activity overlay while automatic persistence is disabled.
+    activity: Option<FileStateStore>,
 }
 
 impl StateStore {
@@ -3810,7 +3814,12 @@ impl StateStore {
                 }
             }
         };
-        Ok(Self { backend })
+        let mut store = Self {
+            backend,
+            activity: None,
+        };
+        store.set_activity_persistence(config.persistence.save_playback_history)?;
+        Ok(store)
     }
 
     /// Opens an ephemeral human-readable-backend store for tests and transient
@@ -3822,6 +3831,7 @@ impl StateStore {
     pub fn open_in_memory() -> Result<Self, PersistenceError> {
         Ok(Self {
             backend: Box::new(FileStateStore::open_in_memory()?),
+            activity: None,
         })
     }
 }

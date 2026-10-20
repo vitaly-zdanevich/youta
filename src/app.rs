@@ -2293,7 +2293,10 @@ fn prepare_radio_recording_staging_path(
     config
         .ensure_directories()
         .map_err(|error| format!("cannot prepare Youta directories: {error}"))?;
-    let directory = config.runtime_dir().join("radio-recordings");
+    let directory = config
+        .activity_runtime_dir()
+        .map_err(|error| format!("cannot prepare recording scratch storage: {error}"))?
+        .join("radio-recordings");
     std::fs::create_dir_all(&directory)
         .map_err(|error| format!("cannot create private recording directory: {error}"))?;
     #[cfg(unix)]
@@ -2604,6 +2607,7 @@ enum ProviderRequest {
         generation: u64,
         item_key: String,
         request: crate::tracker_media::TrackerMediaRequest,
+        storage: crate::activity_storage::ActivityPath,
     },
     #[cfg(feature = "local-browser")]
     ScanLocal {
@@ -2614,7 +2618,7 @@ enum ProviderRequest {
     LocalArtwork {
         generation: u64,
         path: PathBuf,
-        cache_directory: PathBuf,
+        cache_directory: crate::activity_storage::ActivityPath,
         kind: LocalArtworkKind,
     },
     LocalFolderSize {
@@ -3177,7 +3181,7 @@ enum LocalBrowseRequest {
     OpenArchive {
         generation: u64,
         source: PathBuf,
-        cache_directory: PathBuf,
+        cache_directory: crate::activity_storage::ActivityPath,
         options: crate::local_browser::LocalBrowseOptions,
     },
     /// Lists real directories for the non-blocking Move or Copy chooser.
@@ -5767,10 +5771,15 @@ impl AppController {
     #[must_use]
     pub fn new(
         config: Config,
-        store: StateStore,
+        mut store: StateStore,
         youtube_provider: Option<Box<dyn Provider>>,
         playback_factory: Option<PlaybackFactory>,
     ) -> Self {
+        // Also covers caller-supplied in-memory stores: privacy must apply
+        // before workers and restore paths can publish automatic activity.
+        store
+            .set_activity_persistence(config.persistence.save_playback_history)
+            .expect("empty process-local activity state is valid");
         #[cfg(any(feature = "local-rename", feature = "local-move"))]
         let local_move_reconciliation = reconcile_local_move_journal(&store);
         #[cfg(any(feature = "local-rename", feature = "local-move"))]
@@ -5963,7 +5972,7 @@ impl AppController {
         let yandex_music_reaction_requests = yandex_music_reaction_thread
             .as_ref()
             .map(|_| yandex_music_reaction_request_sender);
-        let provider_storage_root = config.config_dir().to_owned();
+        let provider_storage_root = config.activity_provider_root();
         let provider_thread_result = thread::Builder::new()
             .name("youta-provider-worker".to_owned())
             .spawn(move || {
@@ -6135,16 +6144,11 @@ impl AppController {
             .as_ref()
             .map(|_| local_waveform_request_sender);
 
-        let search_privacy_error = if config.persistence.save_playback_history {
-            None
-        } else {
-            search_privacy::clear_saved_online_searches(&store).err()
-        };
         let (mut saved, session_restore_error) = match store.session() {
             Ok(saved) => (saved.unwrap_or_default(), None),
             Err(error) => (SessionState::default(), Some(error)),
         };
-        // Never restore private browsing state, even when cleanup failed on disk.
+        // Suppress restoration without modifying previously saved browsing data.
         if !config.persistence.save_playback_history {
             saved.clear_online_browsing();
         }
@@ -7187,9 +7191,6 @@ impl AppController {
         }
         if let Some(error) = session_restore_error {
             controller.show_error("Could not restore the previous session", &error);
-        }
-        if let Some(error) = search_privacy_error {
-            controller.show_error("Could not remove saved online searches", &error);
         }
         if let Some(error) = search_restore_error {
             controller.show_error("Could not restore the previous YouTube search", &error);
@@ -9634,15 +9635,11 @@ impl AppController {
             return;
         }
 
-        let directory = self.config.cache_dir().join("yandex-music-playback");
-        if let Err(error) = std::fs::create_dir_all(&directory) {
-            self.clear_playback_start_activity();
-            self.show_error(
-                "Could not prepare Yandex Music's private playback cache",
-                &error,
-            );
-            return;
-        }
+        let directory = self
+            .config
+            .activity_cache_dir()
+            .join("yandex-music-playback")
+            .for_operation();
         let cache_key = yandex_music_playback_cache_key(
             &pending.track_id,
             media.codec.file_extension(),
@@ -9650,13 +9647,23 @@ impl AppController {
             media.bitrate_kbps,
             media.size_bytes,
         );
-        let destination = directory.join(format!("{}.{}", cache_key, media.codec.file_extension()));
-        if let Err(error) = prune_yandex_music_playback_cache(&directory, Some(&destination)) {
-            self.clear_playback_start_activity();
-            self.show_error("Could not bound the Yandex Music playback cache", &error);
-            return;
-        }
-        if yandex_music_playback_cache_file_is_valid(&destination, media.size_bytes) {
+        let filename = format!("{}.{}", cache_key, media.codec.file_extension());
+        let cached = match directory.with_path(|directory| {
+            let destination = directory.join(&filename);
+            yandex_music_playback_cache_file_is_valid(&destination, media.size_bytes)
+                .then_some(destination)
+        }) {
+            Ok(cached) => cached,
+            Err(error) => {
+                self.clear_playback_start_activity();
+                self.show_error(
+                    "Could not prepare Yandex Music's private playback cache",
+                    &error,
+                );
+                return;
+            }
+        };
+        if let Some(destination) = cached {
             self.clear_playback_start_activity();
             let mut input = PlaybackInput::new(destination.to_string_lossy().into_owned());
             input.bypass_ytdl = true;
@@ -9668,52 +9675,48 @@ impl AppController {
             );
             return;
         }
-        match std::fs::symlink_metadata(&destination) {
-            Ok(_) => {
-                if let Err(error) = std::fs::remove_file(&destination) {
-                    self.clear_playback_start_activity();
-                    self.show_error(
-                        "Could not replace an invalid Yandex Music cache file",
-                        &error,
-                    );
-                    return;
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                self.clear_playback_start_activity();
-                self.show_error("Could not inspect the Yandex Music playback cache", &error);
-                return;
-            }
-        }
-
         let generation = pending.generation;
         let track_id = pending.track_id.clone();
         let response_track_id = track_id.clone();
         let response_sender = self.yandex_music_media_job_sender.clone();
-        let worker_destination = destination.clone();
         let cancellation = Arc::new(AtomicBool::new(false));
         let worker_cancellation = Arc::clone(&cancellation);
         let thread = thread::Builder::new()
             .name("youta-yandex-playback".to_owned())
             .spawn(move || {
-                let result = YandexMusicMediaFetcher::default()
-                    .fetch_with_progress_and_cancellation(
-                        &media,
-                        &worker_destination,
-                        &worker_cancellation,
-                        |_| {},
-                    )
-                    .map(|_| {
-                        let _ = prune_yandex_music_playback_cache(
-                            worker_destination
-                                .parent()
-                                .unwrap_or_else(|| Path::new(".")),
-                            Some(&worker_destination),
-                        );
-                        worker_destination
+                let result = directory
+                    .with_path(|directory| -> Result<PathBuf, String> {
+                        crate::private_files::create_private_directory(directory)
+                            .map_err(|error| error.to_string())?;
+                        let worker_destination = directory.join(&filename);
+                        prune_yandex_music_playback_cache(directory, Some(&worker_destination))
+                            .map_err(|error| error.to_string())?;
+                        match std::fs::symlink_metadata(&worker_destination) {
+                            Ok(_) => std::fs::remove_file(&worker_destination)
+                                .map_err(|error| error.to_string())?,
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(error) => return Err(error.to_string()),
+                        }
+                        YandexMusicMediaFetcher::default()
+                            .fetch_with_progress_and_cancellation(
+                                &media,
+                                &worker_destination,
+                                &worker_cancellation,
+                                |_| {},
+                            )
+                            .map(|_| {
+                                let _ = prune_yandex_music_playback_cache(
+                                    worker_destination
+                                        .parent()
+                                        .unwrap_or_else(|| Path::new(".")),
+                                    Some(&worker_destination),
+                                );
+                                worker_destination
+                            })
+                            .map_err(|error| error.to_string())
                     })
-                    .map_err(|error| error.to_string());
+                    .map_err(|error| error.to_string())
+                    .and_then(std::convert::identity);
                 let _ = response_sender.send(YandexMusicMediaJobResponse::Playback {
                     generation,
                     track_id: response_track_id,
@@ -11674,17 +11677,15 @@ impl AppController {
     #[cfg(feature = "lan-sharing")]
     fn share_local_target(&mut self, target: &Path, podcast: bool, first_file: Option<&Path>) {
         let prepared = if podcast {
-            match first_file {
-                Some(first_file) => crate::lan_share::prepare_podcast_share_from(
-                    target,
-                    &self.config.thumbnail_cache_dir(),
-                    first_file,
-                ),
-                None => crate::lan_share::prepare_podcast_share(
-                    target,
-                    &self.config.thumbnail_cache_dir(),
-                ),
-            }
+            self.config
+                .activity_thumbnail_dir()
+                .with_path(|directory| match first_file {
+                    Some(first_file) => {
+                        crate::lan_share::prepare_podcast_share_from(target, directory, first_file)
+                    }
+                    None => crate::lan_share::prepare_podcast_share(target, directory),
+                })
+                .and_then(std::convert::identity)
         } else {
             crate::lan_share::prepare_file_share(target)
         };
@@ -12024,6 +12025,11 @@ impl AppController {
         }
         let executable = self.config.providers.yt_dlp_executable.clone();
         let date_cache = self.config.cache_dir().join("youtube-publication-dates");
+        let activity_cache = self
+            .config
+            .activity_cache_dir()
+            .join("youtube-publication-dates")
+            .for_operation();
         let known_dates = self.youtube_publication_date_cache.for_channel(&channel_id);
         #[cfg(feature = "youtube-official")]
         let official_dates = self
@@ -12050,7 +12056,7 @@ impl AppController {
                 let client = YtDlp::new(YtDlpConfig {
                     executable,
                     ..YtDlpConfig::default()
-                });
+                }).with_activity_cache(activity_cache);
                 let result = client
                     .youtube_channel_collection_cancellable(
                         &response_channel_id,
@@ -16307,7 +16313,7 @@ impl AppController {
         let request = ProviderRequest::LocalArtwork {
             generation,
             path: path.clone(),
-            cache_directory: self.config.thumbnail_cache_dir(),
+            cache_directory: self.config.activity_thumbnail_dir().for_operation(),
             kind,
         };
         if sender.send(request).is_ok() {
@@ -16386,7 +16392,11 @@ impl AppController {
             LocalBrowseRequest::OpenArchive {
                 generation: self.local_generation,
                 source,
-                cache_directory: self.config.cache_dir().join("local-archives"),
+                cache_directory: self
+                    .config
+                    .activity_cache_dir()
+                    .join("local-archives")
+                    .for_operation(),
                 options: crate::local_browser::LocalBrowseOptions {
                     show_all_files: self.view.show_all_local_files,
                     natural_sort: self.config.ui.natural_local_sort,
@@ -20292,9 +20302,14 @@ impl AppController {
         }
         self.evernote_generation = self.evernote_generation.wrapping_add(1);
         let generation = self.evernote_generation;
-        let staging_directory = self
-            .config
-            .runtime_dir()
+        let runtime_directory = match self.config.activity_runtime_dir() {
+            Ok(directory) => directory,
+            Err(error) => {
+                self.show_error("Could not prepare Evernote runtime storage", &error);
+                return;
+            }
+        };
+        let staging_directory = runtime_directory
             .join("evernote")
             .join(generation.to_string());
         let yt_dlp_executable = self.config.providers.yt_dlp_executable.clone();
@@ -20703,9 +20718,14 @@ impl AppController {
         }
         self.commons_upload_generation = self.commons_upload_generation.wrapping_add(1);
         let generation = self.commons_upload_generation;
-        let staging_directory = self
-            .config
-            .runtime_dir()
+        let runtime_directory = match self.config.activity_runtime_dir() {
+            Ok(directory) => directory,
+            Err(error) => {
+                self.show_error("Could not prepare Commons runtime storage", &error);
+                return;
+            }
+        };
+        let staging_directory = runtime_directory
             .join("commons-upload")
             .join(generation.to_string());
         let yt_dlp_executable = self.config.providers.yt_dlp_executable.clone();
@@ -22546,6 +22566,7 @@ impl AppController {
                 generation: self.search_generation,
                 item_key: item_key.clone(),
                 request,
+                storage: self.config.activity_provider_root().for_operation(),
             },
             "Could not prepare the tracker module",
         ) {
@@ -35727,6 +35748,17 @@ impl AppController {
         let local_sort_preference_changed = self.config.ui.natural_local_sort != natural_local_sort;
         let youtube_thumbnail_preference_changed =
             self.config.ui.youtube_thumbnail_size != youtube_thumbnail_size;
+        let previous_activity_saving = self.config.persistence.save_playback_history;
+        if previous_activity_saving
+            && !save_playback_history
+            && let Err(error) = self.apply_activity_persistence(false)
+        {
+            if let Some(preferences) = self.view.preferences_popup.as_mut() {
+                preferences.validation_error = Some(error.to_string());
+            }
+            self.show_error("Could not disable activity saving", &error);
+            return;
+        }
         if let Err(error) = self.config.save_tui_preferences(
             layout,
             skip_advertisement_chapters,
@@ -35745,11 +35777,36 @@ impl AppController {
             archive_download_preference,
             archive_playback_preference,
         ) {
+            if previous_activity_saving && !save_playback_history {
+                // The setting was not saved; restore the previous live policy.
+                let _ = self.apply_activity_persistence(true);
+            }
             if let Some(preferences) = self.view.preferences_popup.as_mut() {
                 preferences.validation_error = Some(error.to_string());
             }
             self.show_error("Could not save Youta preferences", &error);
             return;
+        }
+        if save_playback_history
+            && !previous_activity_saving
+            && let Err(error) = self.apply_activity_persistence(true)
+        {
+            self.show_error("Could not enable activity saving", &error);
+            return;
+        }
+        if previous_activity_saving != save_playback_history {
+            self.unflushed_listen_time = Duration::ZERO;
+            self.last_tick = Instant::now();
+            // Never carry a private maximum position into a newly enabled
+            // checkpoint. Future playback can record its new public position.
+            if save_playback_history {
+                self.current_playback_progress = self
+                    .current_media
+                    .as_ref()
+                    .and_then(|media| self.store.progress(media).ok().flatten());
+            }
+            #[cfg(feature = "cmd")]
+            self.sync_local_command_history_policy();
         }
         #[cfg(feature = "yt-dlp")]
         {
@@ -35761,13 +35818,6 @@ impl AppController {
         }
         if !save_playback_history {
             self.session_dirty = true;
-            if let Err(error) = search_privacy::clear_saved_online_searches(&self.store) {
-                if let Some(preferences) = self.view.preferences_popup.as_mut() {
-                    preferences.validation_error = Some(error.to_string());
-                }
-                self.show_error("Could not remove saved online searches", &error);
-                return;
-            }
         }
         if self.config.providers.bandcamp_audio_format != bandcamp_audio_format
             && let Err(error) = self
@@ -36316,6 +36366,13 @@ impl AppController {
                 .clone_from(&self.view.search_query);
             self.tracker_selected = self.view.selected;
         }
+        if !self.config.persistence.save_playback_history {
+            // Keep live navigation above, but leave the old restart snapshot
+            // byte-for-byte intact.
+            self.session_dirty = false;
+            self.last_session_save = Instant::now();
+            return true;
+        }
         #[cfg(feature = "radio")]
         let selected_radio_station_id = self.radio_selected_station_id.as_deref();
         #[cfg(feature = "radio")]
@@ -36348,7 +36405,7 @@ impl AppController {
         let persisted_archive_org_selected_row = self.archive_org_catalogue_selection();
         #[cfg(not(feature = "archive-org"))]
         let persisted_archive_org_selected_row = self.archive_org_selected;
-        let mut state = SessionState {
+        let state = SessionState {
             screen: stored_session_screen(self.view.displayed_screen(), &self.playlists_route),
             focus: if self.view.details_focused && self.view.screen == self.view.displayed_screen()
             {
@@ -36403,15 +36460,6 @@ impl AppController {
             chapter_timestamps_hidden: !self.view.show_chapter_timestamps,
             ..SessionState::default()
         };
-        if !self.config.persistence.save_playback_history {
-            state.clear_online_browsing();
-            // Retry cleanup at persistence barriers rather than syncing leftover searches.
-            if let Err(error) = search_privacy::clear_saved_online_searches(&self.store) {
-                self.show_session_save_error(&error);
-                self.session_dirty = true;
-                return false;
-            }
-        }
         match self.store.save_session(&state, unix_time()) {
             Ok(()) => {
                 self.session_dirty = false;
@@ -38779,26 +38827,34 @@ fn local_browse_worker(
                 cache_directory,
                 options,
             } => {
-                let result = crate::local_archive::materialize_local_archive(
-                    &source,
-                    &cache_directory,
-                    crate::local_archive::LocalArchiveLimits::default(),
-                )
-                .and_then(|archive| {
-                    crate::local_browser::list_local_directory_with_options(
-                        &archive.root_path,
-                        crate::local_browser::LocalBrowseLimits::default(),
-                        options,
-                    )
-                    .map(|listing| (archive, listing))
-                    .map_err(|error| {
-                        crate::local_archive::LocalArchiveError::Io {
-                            path: source.clone(),
-                            source: std::io::Error::other(error),
-                        }
+                let result = cache_directory
+                    .with_path(|directory| {
+                        crate::local_archive::materialize_local_archive(
+                            &source,
+                            directory,
+                            crate::local_archive::LocalArchiveLimits::default(),
+                        )
                     })
-                })
-                .map_err(|error| error.to_string());
+                    .map_err(|error| crate::local_archive::LocalArchiveError::Io {
+                        path: source.clone(),
+                        source: error,
+                    })
+                    .and_then(std::convert::identity)
+                    .and_then(|archive| {
+                        crate::local_browser::list_local_directory_with_options(
+                            &archive.root_path,
+                            crate::local_browser::LocalBrowseLimits::default(),
+                            options,
+                        )
+                        .map(|listing| (archive, listing))
+                        .map_err(|error| {
+                            crate::local_archive::LocalArchiveError::Io {
+                                path: source.clone(),
+                                source: std::io::Error::other(error),
+                            }
+                        })
+                    })
+                    .map_err(|error| error.to_string());
                 LocalBrowseResponse::OpenArchive { generation, result }
             }
             #[cfg(any(feature = "local-move", feature = "local-copy"))]
@@ -40737,8 +40793,9 @@ fn provider_worker(
     #[cfg(feature = "librivox")] librivox_client: Box<dyn LibrivoxProviderClient>,
     #[cfg(feature = "rss")] rss_client: Box<dyn RssFeedClient>,
     #[cfg(feature = "youtube-music")] youtube_music_client: Box<dyn YouTubeMusicSearchProvider>,
-    provider_storage_root: PathBuf,
+    provider_storage_root: impl Into<crate::activity_storage::ActivityPath>,
 ) {
+    let provider_storage_root = provider_storage_root.into();
     let responses = responses.into();
     let provider = Arc::new(RwLock::new(YouTubeProviderState {
         epoch: 0,
@@ -40949,7 +41006,7 @@ fn general_provider_worker(
     #[cfg(feature = "librivox")] librivox_client: Box<dyn LibrivoxProviderClient>,
     #[cfg(feature = "rss")] rss_client: Box<dyn RssFeedClient>,
     #[cfg(feature = "youtube-music")] youtube_music_client: Box<dyn YouTubeMusicSearchProvider>,
-    provider_storage_root: PathBuf,
+    provider_storage_root: crate::activity_storage::ActivityPath,
 ) {
     let responses = responses.into();
     #[cfg(feature = "rss")]
@@ -41118,23 +41175,6 @@ fn general_provider_worker(
     #[cfg(feature = "tracker-music")]
     let tracker = crate::providers::tracker::TrackerArchiveHub::new(allow_insecure_http);
     #[cfg(feature = "tracker-music")]
-    let mut tracker_preparer = {
-        let limits = crate::tracker_media::TrackerMediaLimits::default();
-        crate::tracker_media::UreqTrackerTransport::for_limits(
-            crate::providers::DEFAULT_REQUEST_TIMEOUT,
-            limits,
-        )
-        .map_err(|error| error.to_string())
-        .and_then(|transport| {
-            crate::tracker_media::TrackerMediaPreparer::new(
-                &provider_storage_root,
-                transport,
-                limits,
-            )
-            .map_err(|error| error.to_string())
-        })
-    };
-    #[cfg(feature = "tracker-music")]
     let mod_archive = mod_archive_api_key
         .and_then(|key| crate::providers::modarchive::ModArchiveProvider::new(key).ok());
     #[cfg(feature = "wikidata")]
@@ -41150,6 +41190,7 @@ fn general_provider_worker(
     #[cfg(feature = "network")]
     let youtube_channel_page =
         crate::providers::youtube_channel_page::YouTubeChannelPageClient::new();
+    let _ = &provider_storage_root;
     #[cfg(not(feature = "tracker-music"))]
     let _ = (
         allow_insecure_http,
@@ -42000,13 +42041,22 @@ fn general_provider_worker(
                 generation,
                 item_key,
                 request,
+                storage,
             } => {
-                let result = match tracker_preparer.as_mut() {
-                    Ok(preparer) => preparer
-                        .prepare(&request)
-                        .map_err(|error| error.to_string()),
-                    Err(error) => Err(error.clone()),
-                };
+                let result = storage
+                    .with_path(|root| {
+                        let limits = crate::tracker_media::TrackerMediaLimits::default();
+                        let transport = crate::tracker_media::UreqTrackerTransport::for_limits(
+                            crate::providers::DEFAULT_REQUEST_TIMEOUT,
+                            limits,
+                        )
+                        .map_err(|error| error.to_string())?;
+                        crate::tracker_media::TrackerMediaPreparer::new(root, transport, limits)
+                            .and_then(|mut preparer| preparer.prepare(&request))
+                            .map_err(|error| error.to_string())
+                    })
+                    .map_err(|error| error.to_string())
+                    .and_then(std::convert::identity);
                 if responses
                     .send(ProviderResponse::TrackerPrepared {
                         generation,
@@ -48697,6 +48747,8 @@ mod tests {
         }
     }
 
+    #[path = "activity_privacy.rs"]
+    mod activity_privacy_tests;
     #[cfg(feature = "archive-org")]
     #[path = "archive_playback_choice.rs"]
     mod archive_playback_choice_tests;
@@ -66324,7 +66376,7 @@ mod tests {
         assert_eq!(generation, controller.local_generation);
         assert_eq!(source, archive);
         assert_eq!(
-            cache_directory,
+            cache_directory.with_path(Path::to_owned).unwrap(),
             controller.config.cache_dir().join("local-archives")
         );
         assert!(state.lock().expect("mock player state").played.is_empty());
@@ -90280,7 +90332,7 @@ mod tests {
         assert!(
             recording
                 .staging_path
-                .starts_with(controller.config.runtime_dir())
+                .starts_with(controller.config.activity_runtime_dir().unwrap())
         );
         assert!(
             recording

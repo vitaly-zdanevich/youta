@@ -578,7 +578,7 @@ impl ProcessPlaybackConfig {
         Self {
             mpv_executable: config.providers.mpv_executable.clone(),
             yt_dlp_executable: config.providers.yt_dlp_executable.clone(),
-            runtime_dir: config.config_dir().join("runtime"),
+            runtime_dir: config.runtime_dir(),
             audio_output,
             audio_device: config.playback.device.clone(),
             profile: if config.playback.audiophile.enabled {
@@ -613,8 +613,11 @@ pub fn configured_playback_factory(config: &Config) -> Option<PlaybackFactory> {
         ConfiguredBackend::Mpv => {
             #[cfg(feature = "backend-mpv")]
             {
-                let process_config = ProcessPlaybackConfig::from_config(config);
+                let mut process_config = ProcessPlaybackConfig::from_config(config);
+                let activity_storage = config.activity_storage();
                 let factory: PlaybackFactory = Box::new(move || {
+                    process_config.runtime_dir =
+                        activity_storage.session_directory()?.join("runtime");
                     // Spawning stays synchronous so a missing mpv or an unusable
                     // runtime directory is still reported to the caller. Only the
                     // per-tick IPC polling moves off the caller's thread.
@@ -714,6 +717,26 @@ mod tests {
         assert!(process.audiophile.exclusive_device);
         assert!(process.audiophile.avoid_resampling);
         assert_eq!(process.audiophile.output_sample_rate_hz, Some(96_000));
+    }
+
+    #[cfg(feature = "backend-mpv")]
+    #[test]
+    fn playback_factory_owns_scratch_outside_persistent_configuration() {
+        let fixture = tempdir().unwrap();
+        let root = fixture.path().join("config");
+        let mut config = Config::for_dir(&root);
+        config.persistence.save_playback_history = false;
+        config.providers.mpv_executable = fixture.path().join("missing-mpv-fixture");
+        let mut factory = super::configured_playback_factory(&config).unwrap();
+        assert!(factory().is_err());
+        let scratch = config.activity_runtime_dir().unwrap();
+        assert!(scratch.exists());
+        assert!(!scratch.starts_with(&root));
+        assert!(!root.exists());
+        drop(config);
+        assert!(scratch.exists(), "factory retains ownership without Config");
+        drop(factory);
+        assert!(!scratch.exists());
     }
 
     /// The native backend is a configuration placeholder with no adapter, so a

@@ -1102,8 +1102,8 @@ account login and OAuth are not implemented.
 The adapter tries v1, falls back to v2 only on 404, and uses advertised audio
 listen URLs directly without yt-dlp. Log and queue entries save canonical
 pod-scoped track-page URLs; replay resolves fresh audio from the original pod.
-Turning off Save log and searches removes saved Funkwhale searches and prevents
-their restoration.
+Turning off Save log and searches stops saving and restoring Funkwhale searches
+without deleting previously saved queries.
 .PP
 On SoundCloud, Funkwhale and Yandex Music,
 .B g
@@ -1316,16 +1316,23 @@ Set
 .B persistence.save_playback_history=false
 in config.toml, or
 .BR YOUTA_PERSISTENCE__SAVE_PLAYBACK_HISTORY=false ,
-to stop new log entries and hide Log. Searches are not saved or restored after
-restart. Previously saved online queries and search results are removed when
-the setting is turned off or Youta starts with it off. Online search tabs stay empty
+to stop new automatic activity writes and hide Log. This includes playback
+logs, progress, listening statistics, session navigation, searches, command
+history, and provider/media/artwork caches. Searches are not restored after
+restart. Online search tabs stay empty
 until an explicit search or browse action, except Funkwhale's recent-track
-catalogue on the configured pod. Online browsing routes are omitted
-from saved sessions.
-Existing playback logs, media/artwork caches, and Git history are retained.
-Playback progress, listening statistics, other session state, and
-graceful-shutdown Git synchronization remain enabled. Re-enabling the setting
-reveals the retained playback history in Log again.
+catalogue on the configured pod.
+Only new writes stop: existing data and Git history are not deleted or
+rewritten.
+Session activity uses memory or temporary session storage. Re-enabling saving
+discards the private state overlay without copying temporary caches back.
+Normal saving then resumes, including the current session and subsequent
+activity. Explicitly saved notes, playlists, bookmarks, subscriptions and
+downloads, settings (including volume), and graceful-shutdown Git
+synchronization remain enabled. Re-enabling the setting reveals the
+retained Log again. This is not secure erasure or an anonymity mode: temporary
+storage, operating-system facilities, external helpers and remote services can
+leave traces outside Youta's saved activity files.
 .PP
 The first unconfigured YouTube search in the terminal offers provider setup.
 It saves API keys in
@@ -1362,6 +1369,8 @@ the description expanded by %m or the playback time expanded by %t.
 Requires the cmd feature. Delete while Youta is
 closed to clear it. Written with owner-only Unix permissions; included in
 configuration Git synchronization. Commands may contain passwords or tokens.
+With Save log and searches off, new commands stay in memory and the existing
+file remains untouched.
 Command text is excluded from diagnostics and bug-report screenshots.
 .TP
 .I state/*.toml

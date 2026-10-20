@@ -2,6 +2,9 @@
 
 mod completion;
 
+#[cfg(test)]
+mod privacy_tests;
+
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -22,6 +25,7 @@ static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 pub(super) struct LocalCommandState {
     history: Vec<String>,
     loaded: bool,
+    history_persistence_enabled: Option<bool>,
     history_position: Option<usize>,
     history_draft: String,
     selection: Option<CommandSelection>,
@@ -33,6 +37,7 @@ pub(super) struct LocalCommandState {
 #[derive(Clone)]
 struct CommandSelection {
     plan: ShellCommandPlan,
+    save_history: bool,
     has_target: bool,
     download: CapturedCommandDownload,
     local_selection: Option<(PathBuf, PathBuf)>,
@@ -61,6 +66,7 @@ pub(super) fn command_action(action: &UiAction) -> bool {
 impl AppController {
     /// Applies only semantic shell-editor actions; no command executes in the controller.
     pub(super) fn dispatch_local_command(&mut self, action: UiAction) {
+        self.sync_local_command_history_policy();
         if self.custom_commands.running || self.view.error_popup.is_some() {
             return;
         }
@@ -138,6 +144,43 @@ impl AppController {
         }
     }
 
+    /// Applies live privacy changes without cancelling an editor or queued command.
+    ///
+    /// Private commands remain navigable in memory until saving is re-enabled,
+    /// when only existing durable history is restored. An unfinished private
+    /// draft stays executable but never becomes eligible for automatic saving.
+    pub(super) fn sync_local_command_history_policy(&mut self) {
+        let enabled = self.config.persistence.save_playback_history;
+        let previous = self
+            .local_command
+            .history_persistence_enabled
+            .replace(enabled);
+        if previous == Some(enabled) {
+            return;
+        }
+        self.local_command.history_save_failed = false;
+        if !enabled {
+            if let Some(selection) = self.local_command.selection.as_mut() {
+                selection.save_history = false;
+            }
+            return;
+        }
+        if previous != Some(false) || !self.local_command.loaded {
+            return;
+        }
+        self.local_command.history = match read_history(&history_path(&self.config)) {
+            Ok(history) => history,
+            Err(_) => {
+                self.view.status_line =
+                    "Command history could not be read; starting with empty history".to_owned();
+                Vec::new()
+            }
+        };
+        self.local_command.history_position = None;
+        self.local_command.history_draft.clear();
+        self.refresh_local_command_matches();
+    }
+
     /// Captures only the selected item, never the playing item or a shortened path.
     fn begin_local_command(&mut self) {
         if !self.view.local_command_available
@@ -190,6 +233,7 @@ impl AppController {
         }
         self.local_command.selection = Some(CommandSelection {
             has_target: target.is_some(),
+            save_history: self.config.persistence.save_playback_history,
             plan: ShellCommandPlan {
                 template: String::new(),
                 argument: target.map(|(_, argument, _)| argument).unwrap_or_default(),
@@ -319,6 +363,7 @@ impl AppController {
         let Some(mut selection) = self.local_command.selection.clone() else {
             return;
         };
+        let save_history = self.config.persistence.save_playback_history && selection.save_history;
         selection.plan.template = template.clone();
         match selection.plan.requires_selection() {
             Ok(true) if !selection.has_target => {
@@ -344,12 +389,20 @@ impl AppController {
             self.view.status_line = error;
             return;
         }
+        // Read durable entries independently: RAM may still contain commands or
+        // unfinished drafts from a private period. A read failure must not replace
+        // the user's prior history with an incomplete in-memory list.
+        self.local_command.history_save_failed = save_history
+            && read_history(&history_path(&self.config))
+                .and_then(|mut history| {
+                    history.push(template.clone());
+                    write_history(&history_path(&self.config), &history)
+                })
+                .is_err();
         self.local_command.history.push(template);
         if self.local_command.history.len() > HISTORY_LIMIT {
             self.local_command.history.remove(0);
         }
-        self.local_command.history_save_failed =
-            write_history(&history_path(&self.config), &self.local_command.history).is_err();
         self.view.local_command = None;
         self.local_command.selection = None;
     }
@@ -481,7 +534,7 @@ mod tests {
     use super::*;
 
     /// Keeps all command controller tests independent of user directories and network helpers.
-    fn fixture() -> (
+    pub(super) fn fixture() -> (
         AppController,
         tempfile::TempDir,
         PathBuf,
@@ -516,7 +569,7 @@ mod tests {
     }
 
     /// Types through real semantic actions rather than setting hidden controller state.
-    fn type_text(controller: &mut AppController, text: &str) {
+    pub(super) fn type_text(controller: &mut AppController, text: &str) {
         for character in text.chars() {
             controller.dispatch(UiAction::AppendLocalCommandCharacter(character));
         }

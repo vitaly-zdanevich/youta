@@ -34,8 +34,13 @@ use ureq::unversioned::resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver
 use ureq::unversioned::transport::{DefaultConnector, NextTimeout};
 use url::Url;
 
+use crate::activity_storage::ActivityPath;
+
 #[cfg(feature = "remote-artwork")]
 use crate::domain::{ip_address_is_non_public, remote_url_has_non_public_host};
+
+#[cfg(test)]
+mod privacy_tests;
 
 /// Largest artwork response accepted from a provider.
 pub(crate) const MAX_DOWNLOAD_BYTES: usize = 4 * 1024 * 1024;
@@ -279,21 +284,49 @@ impl Default for ThumbnailCachePolicy {
 }
 
 pub(crate) struct ThumbnailCache {
-    pub(crate) directory: PathBuf,
+    pub(crate) directory: ActivityPath,
     policy: ThumbnailCachePolicy,
 }
 
 impl ThumbnailCache {
-    pub(crate) fn new(directory: PathBuf) -> Self {
+    /// Retains the policy handle so queued work resolves storage only when used.
+    pub(crate) fn new(directory: impl Into<ActivityPath>) -> Self {
         Self {
-            directory,
+            directory: directory.into(),
             policy: ThumbnailCachePolicy::default(),
         }
     }
 
+    /// Keeps one request private if persistence changes before its deferred write.
+    pub(crate) fn for_operation(&self) -> Self {
+        Self {
+            directory: self.directory.for_operation(),
+            policy: self.policy,
+        }
+    }
+
     #[cfg(all(test, feature = "remote-artwork"))]
-    pub(crate) fn with_policy(directory: PathBuf, policy: ThumbnailCachePolicy) -> Self {
-        Self { directory, policy }
+    pub(crate) fn with_policy(
+        directory: impl Into<ActivityPath>,
+        policy: ThumbnailCachePolicy,
+    ) -> Self {
+        Self {
+            directory: directory.into(),
+            policy,
+        }
+    }
+
+    /// Holds the storage lease through the entire filesystem operation.
+    fn with_cache<T>(
+        &self,
+        operation: impl FnOnce(&LeasedThumbnailCache<'_>) -> io::Result<T>,
+    ) -> io::Result<T> {
+        self.directory.with_path(|directory| {
+            operation(&LeasedThumbnailCache {
+                directory,
+                policy: self.policy,
+            })
+        })?
     }
 
     /// Reads the entry a remote source is cached under.
@@ -303,6 +336,73 @@ impl ThumbnailCache {
     }
 
     pub(crate) fn read_key(&self, key: &[u8]) -> io::Result<Option<Vec<u8>>> {
+        self.with_cache(|cache| cache.read_key(key))
+    }
+
+    /// Prepares only the cache selected by the current activity preference.
+    #[cfg(feature = "remote-artwork")]
+    pub(crate) fn prepare(&self) -> io::Result<()> {
+        self.with_cache(|cache| {
+            cache.secure_directory()?;
+            cache.evict()
+        })
+    }
+
+    #[cfg(feature = "remote-artwork")]
+    pub(crate) fn store(&self, source: &Url, bytes: &[u8]) -> io::Result<()> {
+        self.store_key(source.as_str().as_bytes(), bytes)
+    }
+
+    /// Publishes bytes under one lease, including atomic replacement and eviction.
+    pub(crate) fn store_key(&self, key: &[u8], bytes: &[u8]) -> io::Result<()> {
+        self.with_cache(|cache| cache.store_key(key, bytes))
+    }
+
+    #[cfg(feature = "images")]
+    pub(crate) fn remove(&self, source: &Url) {
+        self.remove_key(source.as_str().as_bytes());
+    }
+
+    /// Invalidates only the currently selected persistent or session cache.
+    pub(crate) fn remove_key(&self, key: &[u8]) {
+        let _ = self.with_cache(|cache| {
+            remove_cache_entry(&cache.entry_path_for_key(key));
+            Ok(())
+        });
+    }
+
+    /// Resolves the published local image while its cache directory is leased.
+    pub(crate) fn canonical_entry_path_for_key(&self, key: &[u8]) -> io::Result<PathBuf> {
+        self.with_cache(|cache| crate::fs_path::canonicalize(cache.entry_path_for_key(key)))
+    }
+
+    #[cfg(all(test, feature = "remote-artwork"))]
+    pub(crate) fn entry_path(&self, source: &Url) -> PathBuf {
+        self.entry_path_for_key(source.as_str().as_bytes())
+    }
+
+    /// Exposes fixture paths only; production filesystem work stays under a lease.
+    #[cfg(test)]
+    pub(crate) fn entry_path_for_key(&self, key: &[u8]) -> PathBuf {
+        self.with_cache(|cache| Ok(cache.entry_path_for_key(key)))
+            .expect("fixture cache storage")
+    }
+
+    /// Prunes entries only in the cache selected when this operation starts.
+    #[cfg(test)]
+    pub(crate) fn evict(&self) -> io::Result<()> {
+        self.with_cache(|cache| cache.evict())
+    }
+}
+
+/// Filesystem helpers whose path cannot outlive the enclosing activity lease.
+struct LeasedThumbnailCache<'a> {
+    directory: &'a Path,
+    policy: ThumbnailCachePolicy,
+}
+
+impl LeasedThumbnailCache<'_> {
+    fn read_key(&self, key: &[u8]) -> io::Result<Option<Vec<u8>>> {
         if !self.directory.exists() {
             return Ok(None);
         }
@@ -341,18 +441,7 @@ impl ThumbnailCache {
         Ok(Some(bytes))
     }
 
-    #[cfg(feature = "remote-artwork")]
-    pub(crate) fn prepare(&self) -> io::Result<()> {
-        self.secure_directory()?;
-        self.evict()
-    }
-
-    #[cfg(feature = "remote-artwork")]
-    pub(crate) fn store(&self, source: &Url, bytes: &[u8]) -> io::Result<()> {
-        self.store_key(source.as_str().as_bytes(), bytes)
-    }
-
-    pub(crate) fn store_key(&self, key: &[u8], bytes: &[u8]) -> io::Result<()> {
+    fn store_key(&self, key: &[u8], bytes: &[u8]) -> io::Result<()> {
         if bytes.is_empty() || bytes.len() > MAX_DOWNLOAD_BYTES {
             return Ok(());
         }
@@ -362,37 +451,23 @@ impl ThumbnailCache {
         self.evict()
     }
 
-    #[cfg(feature = "images")]
-    pub(crate) fn remove(&self, source: &Url) {
-        self.remove_key(source.as_str().as_bytes());
-    }
-
-    pub(crate) fn remove_key(&self, key: &[u8]) {
-        remove_cache_entry(&self.entry_path_for_key(key));
-    }
-
-    #[cfg(all(test, feature = "remote-artwork"))]
-    pub(crate) fn entry_path(&self, source: &Url) -> PathBuf {
-        self.entry_path_for_key(source.as_str().as_bytes())
-    }
-
-    pub(crate) fn entry_path_for_key(&self, key: &[u8]) -> PathBuf {
+    fn entry_path_for_key(&self, key: &[u8]) -> PathBuf {
         let digest = Sha256::digest(key);
         self.directory
             .join(format!("{digest:x}.{CACHE_FILE_EXTENSION}"))
     }
 
     fn secure_directory(&self) -> io::Result<()> {
-        fs::create_dir_all(&self.directory)?;
-        let metadata = fs::symlink_metadata(&self.directory)?;
+        fs::create_dir_all(self.directory)?;
+        let metadata = fs::symlink_metadata(self.directory)?;
         if !metadata.file_type().is_dir() {
             return Err(io::Error::other("thumbnail cache path is not a directory"));
         }
-        set_private_directory_permissions(&self.directory)
+        set_private_directory_permissions(self.directory)
     }
 
     fn is_confined_entry(&self, path: &Path) -> io::Result<bool> {
-        let directory = crate::fs_path::canonicalize(&self.directory)?;
+        let directory = crate::fs_path::canonicalize(self.directory)?;
         let entry = crate::fs_path::canonicalize(path)?;
         Ok(entry.parent() == Some(directory.as_path()))
     }
@@ -422,7 +497,7 @@ impl ThumbnailCache {
             set_private_file_permissions(&temporary)?;
             fs::rename(&temporary, path)?;
             set_private_file_permissions(path)?;
-            let _ = crate::durability::sync_directory(&self.directory);
+            let _ = crate::durability::sync_directory(self.directory);
             Ok(())
         })();
         drop(active_temporary);
@@ -434,7 +509,7 @@ impl ThumbnailCache {
 
     pub(crate) fn evict(&self) -> io::Result<()> {
         let mut entries = Vec::new();
-        for entry in fs::read_dir(&self.directory)? {
+        for entry in fs::read_dir(self.directory)? {
             let entry = entry?;
             if is_cache_temp_name(&entry.file_name()) {
                 let path = entry.path();
@@ -972,6 +1047,9 @@ pub struct Artwork {
 /// that fetched artwork itself would keep none of that, and would additionally
 /// hand a provider a request from the user's browser stack.
 ///
+/// Pass [`ActivityPath`] to retain live privacy policy through delayed responses;
+/// a plain filesystem path selects a fixed cache for callers without that policy.
+///
 /// `file:` sources are rejected here even though the terminal pipeline accepts
 /// them, because this entry point is reachable from a web view and must never
 /// become a way to read the filesystem.
@@ -980,14 +1058,17 @@ pub struct Artwork {
 ///
 /// Returns why the artwork is unavailable, without echoing the URL.
 #[cfg(feature = "remote-artwork")]
-pub fn remote_artwork(cache_directory: &Path, source: &Url) -> Result<Artwork, ThumbnailFailure> {
+pub fn remote_artwork(
+    cache_directory: impl Into<ActivityPath>,
+    source: &Url,
+) -> Result<Artwork, ThumbnailFailure> {
     remote_artwork_with_agent(cache_directory, source, &thumbnail_agent())
 }
 
 /// Shares the guarded GUI cache path with deterministic HTTP fixtures.
 #[cfg(feature = "remote-artwork")]
 fn remote_artwork_with_agent(
-    cache_directory: &Path,
+    cache_directory: impl Into<ActivityPath>,
     source: &Url,
     agent: &ureq::Agent,
 ) -> Result<Artwork, ThumbnailFailure> {
@@ -995,7 +1076,7 @@ fn remote_artwork_with_agent(
         return Err(ThumbnailFailure::InvalidSource);
     }
 
-    let cache = ThumbnailCache::new(cache_directory.to_path_buf());
+    let cache = ThumbnailCache::new(cache_directory).for_operation();
     if let Ok(Some(bytes)) = cache.read(source)
         && let Some(format) = ArtworkFormat::sniff(&bytes)
     {
@@ -1177,6 +1258,50 @@ mod public_surface_tests {
             .build()
             .into();
         (agent, calls)
+    }
+
+    /// A delayed response stays in session storage across either privacy transition.
+    #[test]
+    fn delayed_remote_artwork_never_updates_the_saved_cache_across_privacy_changes() {
+        for initially_enabled in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let config = crate::config::Config::for_dir(directory.path().join("config"));
+            let cache = super::ThumbnailCache::new(config.activity_thumbnail_dir());
+            cache.store_key(b"saved", b"saved bytes").unwrap();
+            let saved_path = cache.entry_path_for_key(b"saved");
+            config.set_activity_persistence(initially_enabled).unwrap();
+            let operation_cache = cache.for_operation();
+            let request_config = config.clone();
+            let image = b"\xFF\xD8\xFFprivate image";
+            let agent = ureq::Agent::config_builder()
+                .middleware(
+                    move |_request: ureq::http::Request<ureq::SendBody>,
+                          _next: ureq::middleware::MiddlewareNext| {
+                        request_config
+                            .set_activity_persistence(!initially_enabled)
+                            .unwrap();
+                        Ok(ureq::http::Response::builder()
+                            .status(200)
+                            .body(ureq::Body::builder().data(image.to_vec()))
+                            .unwrap())
+                    },
+                )
+                .build()
+                .into();
+            let source = Url::parse("https://images.example/private.jpg").unwrap();
+            let artwork =
+                super::remote_artwork_with_agent(config.activity_thumbnail_dir(), &source, &agent)
+                    .unwrap();
+            assert_eq!(artwork.bytes, image);
+            assert_eq!(std::fs::read(&saved_path).unwrap(), b"saved bytes");
+            assert_eq!(
+                std::fs::read_dir(config.thumbnail_cache_dir())
+                    .unwrap()
+                    .count(),
+                1
+            );
+            assert_eq!(operation_cache.read(&source).unwrap(), Some(image.to_vec()));
+        }
     }
 
     /// GUI fallback display must not stop a recovered full waveform from loading.

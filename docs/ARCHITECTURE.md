@@ -117,11 +117,13 @@ an interrupted publish idempotently: progress uses the latest timestamp and
 listening time uses an absolute target, then the checkpoint is cleared last.
 For a non-seekable live stream, the same bounded checkpoint contains only the
 absolute listening target; it never invents a playback-progress row.
-`persistence.save_playback_history = false` gates only the new History row
-normally appended after playback starts. It also removes History from top-level
-navigation, but does not delete existing History or stop progress checkpoints,
-listening statistics, session and cache persistence, or graceful-shutdown Git
-synchronization. Re-enabling it exposes the retained History again.
+`persistence.save_playback_history = false` routes automatic activity writes
+through a process-local state overlay and shared session-temporary cache paths.
+Progress, statistics, session/search snapshots and provider caches therefore do
+not alter existing saved activity. Log is hidden and online searches are not
+restored. Re-enabling saving discards private overlay state instead of flushing
+it. Existing saved data stays untouched; explicit saves, settings and
+graceful-shutdown Git synchronization remain available.
 Other documents use deterministic ordering and same-directory atomic
 replacement so Git diffs remain stable. Configuration and private-file writes
 follow the same atomic-write boundary. Private files are created with user-only

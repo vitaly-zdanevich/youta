@@ -8,8 +8,9 @@ const CACHE_AGE: Duration = Duration::from_mins(5);
 const CACHE_ENTRIES: usize = 128;
 
 /// Injectable worker boundary, including optional artwork publication off the UI thread.
-type MetadataLoader =
-    dyn Fn(&url::Url, &AtomicBool, &Path, &Path) -> LoadedWebMetadata + Send + Sync;
+type MetadataLoader = dyn Fn(&url::Url, &AtomicBool, &Path, &crate::activity_storage::ActivityPath) -> LoadedWebMetadata
+    + Send
+    + Sync;
 
 /// Metadata and a private artwork URL; raw media bytes never enter the controller cache.
 #[derive(Default)]
@@ -224,7 +225,7 @@ impl AppController {
         let worker_url = url.clone();
         let loader = Arc::clone(&self.web.metadata.loader);
         let executable = self.config.providers.ffprobe_executable.clone();
-        let cache_directory = self.config.thumbnail_cache_dir();
+        let cache_directory = self.config.activity_thumbnail_dir().for_operation();
         let (sender, response) = bounded(1);
         let sender = ResponseSender::new(sender, self.worker_notifier.clone());
         if let Ok(thread) = thread::Builder::new()
@@ -254,7 +255,7 @@ fn load_web_metadata(
     url: &url::Url,
     cancelled: &AtomicBool,
     executable: &Path,
-    cache_directory: &Path,
+    cache_directory: &crate::activity_storage::ActivityPath,
 ) -> LoadedWebMetadata {
     let mut metadata = WebMetadataClient::default().read_cancellable(url, cancelled);
     if !cancelled.load(AtomicOrdering::Relaxed) {
@@ -262,7 +263,14 @@ fn load_web_metadata(
     }
     #[cfg(feature = "local-artwork")]
     let artwork = (!cancelled.load(AtomicOrdering::Relaxed))
-        .then(|| cache_web_embedded_artwork(metadata.artwork.take(), cache_directory))
+        .then(|| {
+            cache_directory
+                .with_path(|directory| {
+                    cache_web_embedded_artwork(metadata.artwork.take(), directory)
+                })
+                .ok()
+                .flatten()
+        })
         .flatten();
     #[cfg(not(feature = "local-artwork"))]
     let artwork = {
@@ -289,7 +297,7 @@ fn cache_web_embedded_artwork(
     let key = format!("youta-web-art-v1:{:x}", Sha256::digest(&artwork.bytes));
     let cache = ThumbnailCache::new(directory.to_path_buf());
     cache.store_key(key.as_bytes(), &artwork.bytes).ok()?;
-    let path = crate::fs_path::canonicalize(cache.entry_path_for_key(key.as_bytes())).ok()?;
+    let path = cache.canonical_entry_path_for_key(key.as_bytes()).ok()?;
     url::Url::from_file_path(path).ok()
 }
 

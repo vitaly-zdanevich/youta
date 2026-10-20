@@ -70,9 +70,11 @@ fn disabled_history_does_not_restore_online_queries_or_cached_results() {
         assert!(controller.archive_org_search_query.is_empty());
         assert!(controller.librivox_search_query.is_empty());
         assert!(controller.current_media.is_none());
-        assert!(controller.store.youtube_search().unwrap().is_none());
-        let stored = serde_json::to_string(&controller.store.session().unwrap()).unwrap();
-        assert!(!stored.contains("private"), "{stored}");
+        assert!(controller.store.youtube_search().unwrap().is_some());
+        assert_eq!(
+            controller.store.session().unwrap(),
+            Some(private_session(screen))
+        );
     }
 }
 
@@ -107,9 +109,9 @@ fn disabled_history_keeps_live_search_in_memory_but_not_across_restart() {
     assert!(controller.view.rows.is_empty());
 }
 
-/// Applying the preference removes old saved searches immediately, without closing the tab.
+/// Applying the preference preserves old data and the live query without saving either again.
 #[test]
-fn disabling_history_clears_saved_searches_without_clearing_live_query() {
+fn disabling_history_preserves_saved_searches_without_clearing_live_query() {
     let directory = crate::test_support::canonical_tempdir("private preference");
     let config = Config::for_dir(directory.path().join("config"));
     let store = StateStore::open_in_memory().unwrap();
@@ -130,13 +132,16 @@ fn disabling_history_clears_saved_searches_without_clearing_live_query() {
     controller.dispatch(UiAction::SubmitPreferences);
     assert!(!controller.config.persistence.save_playback_history);
     assert!(controller.view.preferences_popup.is_none());
-    assert!(controller.store.youtube_search().unwrap().is_none());
+    assert!(controller.store.youtube_search().unwrap().is_some());
     assert_eq!(controller.view.search_query, "private active query");
-    let saved = serde_json::to_string(&controller.store.session().unwrap()).unwrap();
-    assert!(!saved.contains("private"), "{saved}");
+    assert!(controller.save_session());
+    assert_eq!(
+        controller.store.session().unwrap(),
+        Some(private_session(StoredScreen::Search))
+    );
 }
 
-/// Late enrichment must not rewrite an old search left behind by a failed cleanup.
+/// Late enrichment must not rewrite an old search retained while saving is off.
 #[test]
 fn disabled_history_does_not_rewrite_saved_search_from_late_details() {
     let directory = crate::test_support::canonical_tempdir("private metadata update");
@@ -165,26 +170,28 @@ fn disabled_history_does_not_rewrite_saved_search_from_late_details() {
 /// The optional transactional backend obeys the same startup and shutdown policy.
 #[cfg(feature = "sqlite-state")]
 #[test]
-fn disabled_history_clears_sqlite_queries_and_does_not_restore_them() {
+fn disabled_history_preserves_sqlite_queries_without_restoring_them() {
     let directory = crate::test_support::canonical_tempdir("private sqlite restart");
     let mut config = Config::for_dir(directory.path().join("config"));
     config.persistence.backend = crate::config::PersistenceBackend::Sqlite;
-    config.persistence.save_playback_history = false;
     let store = StateStore::open(&config).unwrap();
     store
         .save_session(&private_session(StoredScreen::Search), 1)
         .unwrap();
     seed_search(&store);
+    config.persistence.save_playback_history = false;
     let mut controller = AppController::new(config.clone(), store, None, None);
     assert!(controller.youtube_results.is_empty());
     assert!(controller.view.search_query.is_empty());
-    assert!(controller.store.youtube_search().unwrap().is_none());
+    assert!(controller.store.youtube_search().unwrap().is_some());
     controller.view.search_query = "private query after startup".to_owned();
     assert!(controller.save_session());
     drop(controller);
     let store = StateStore::open(&config).unwrap();
     let controller = AppController::new(config, store, None, None);
     assert!(controller.view.search_query.is_empty());
-    let saved = serde_json::to_string(&controller.store.session().unwrap()).unwrap();
-    assert!(!saved.contains("private"), "{saved}");
+    assert_eq!(
+        controller.store.session().unwrap(),
+        Some(private_session(StoredScreen::Search))
+    );
 }

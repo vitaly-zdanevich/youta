@@ -11,7 +11,8 @@
 //! `YOUTA_PLAYBACK__VOLUME_PERCENT=40` overrides
 //! `playback.volume_percent`. `YOUTA_CONFIG_DIR` selects the directory before
 //! the TOML file is read. Every path Youta writes is derived from that one
-//! application directory.
+//! application directory, except private session scratch and automatic caches
+//! while activity saving is disabled.
 
 use std::fmt;
 use std::fs;
@@ -214,13 +215,16 @@ pub struct Config {
     pub video_summary: VideoSummaryConfig,
     /// Network provider endpoints, loaded credentials, and helper executables.
     pub providers: ProviderConfig,
-    /// Root for every file and directory written by Youta.
+    /// Root for persistent files and directories written by Youta.
     ///
     /// This field is selected by [`Config::load`] or
     /// [`Config::load_from_dir`]. It is intentionally skipped in TOML and
     /// environment deserialization so a loaded file cannot redirect writes.
     #[serde(skip, default = "default_config_dir")]
     root_dir: PathBuf,
+    /// Shared runtime policy and ownership of temporary automatic activity.
+    #[serde(skip)]
+    activity_storage: crate::activity_storage::ActivityStorage,
 }
 
 impl Default for Config {
@@ -244,6 +248,7 @@ impl Config {
             video_summary: VideoSummaryConfig::default(),
             providers: ProviderConfig::default(),
             root_dir: config_dir.into(),
+            activity_storage: crate::activity_storage::ActivityStorage::default(),
         }
     }
 
@@ -406,7 +411,7 @@ impl Config {
         Ok(())
     }
 
-    /// Returns the root directory used for all Youta writes.
+    /// Returns the root directory used for persistent Youta writes.
     #[must_use]
     pub fn config_dir(&self) -> &Path {
         &self.root_dir
@@ -478,6 +483,54 @@ impl Config {
     #[must_use]
     pub fn thumbnail_cache_dir(&self) -> PathBuf {
         self.root_dir.join("thumbnail-cache")
+    }
+
+    /// Returns the live policy shared by cache workers and frontend renderers.
+    #[must_use]
+    pub fn activity_storage(&self) -> crate::activity_storage::ActivityStorage {
+        self.activity_storage
+            .initialize(self.persistence.save_playback_history);
+        self.activity_storage.clone()
+    }
+
+    /// Changes automatic activity saving without modifying existing files.
+    ///
+    /// Disabling waits for outstanding filesystem leases and prepares private
+    /// session storage. Failure leaves the current policy unchanged.
+    ///
+    /// # Errors
+    /// Returns an error if the temporary directory cannot be created or secured.
+    pub fn set_activity_persistence(&self, enabled: bool) -> std::io::Result<()> {
+        self.activity_storage().set_enabled(enabled)
+    }
+
+    /// Returns the provider-cache path resolved when a worker performs its I/O.
+    #[must_use]
+    pub fn activity_cache_dir(&self) -> crate::activity_storage::ActivityPath {
+        self.activity_storage().path(self.cache_dir())
+    }
+
+    /// Returns a live-policy thumbnail cache location.
+    #[must_use]
+    pub fn activity_thumbnail_dir(&self) -> crate::activity_storage::ActivityPath {
+        self.activity_storage().path(self.thumbnail_cache_dir())
+    }
+
+    /// Returns a live-policy root for provider caches stored beside config.
+    #[must_use]
+    pub fn activity_provider_root(&self) -> crate::activity_storage::ActivityPath {
+        self.activity_storage().path(self.config_dir().to_owned())
+    }
+
+    /// Returns transient scratch space outside the persistent config tree.
+    ///
+    /// Scratch is always temporary so a playback process created before a
+    /// preference change cannot later write automatic activity under config.
+    ///
+    /// # Errors
+    /// Returns an error if private session storage cannot be created or secured.
+    pub fn activity_runtime_dir(&self) -> std::io::Result<PathBuf> {
+        Ok(self.activity_storage().session_directory()?.join("runtime"))
     }
 
     /// Persists one selected `YouTube` metadata provider in `config.toml`.
@@ -1882,13 +1935,13 @@ pub struct PersistenceConfig {
     pub position_save_interval_seconds: u64,
     /// Completion threshold used by configurable UI and import code.
     pub played_threshold_percent: u8,
-    /// Whether to save log entries and online searches for restart restoration.
+    /// Whether to persist automatic activity, including log, progress and caches.
     ///
-    /// Disabling this hides Log, removes saved online queries/results, and
-    /// omits online browsing routes from saved sessions. Online search tabs remain
-    /// empty until an explicit search/browse action. Existing playback logs,
-    /// media/artwork caches, and Git history remain. Progress, statistics,
-    /// other session state, and graceful-shutdown Git persistence stay enabled.
+    /// Disabling hides Log and suppresses online search restoration. New
+    /// progress, statistics, session/search snapshots, command history and
+    /// caches stay process-local; existing saved data is not deleted or
+    /// rewritten. Explicit user saves, settings and Git synchronization remain
+    /// enabled. Funkwhale can still load its recent-track catalogue.
     pub save_playback_history: bool,
     /// On graceful shutdown, commit and push the application directory when it
     /// belongs to a Git worktree.

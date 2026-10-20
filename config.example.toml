@@ -146,11 +146,13 @@ dos_rpg_mode = false
 # Close Youta before editing state/*.toml by hand.
 backend = 'files'
 
-# Save log and searches. Off: no new log entries; searches are not saved or
-# restored after restart. Previously saved online queries/results are removed.
+# Save log and searches. Off: no new automatic log, progress, statistics,
+# session, search, command-history or cache writes; old data stays untouched.
+# Searches are not restored after restart. Re-enabling resumes normal saving,
+# including the current session. Temporary caches are not copied back.
+# Explicit saves and settings still persist.
 # Online search tabs stay empty until an explicit search/browse; Log is hidden.
-# Existing playback logs, media/artwork caches, and Git history are retained.
-# Progress, statistics, other session state, and Git sync remain enabled.
+# Git history is retained and Git sync remains enabled.
 # YOUTA_PERSISTENCE__SAVE_PLAYBACK_HISTORY has higher precedence.
 save_playback_history = true
 

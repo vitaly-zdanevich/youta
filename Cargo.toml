@@ -4,7 +4,7 @@ resolver = "3"
 
 [package]
 name = "youta"
-version = "1.25.6"
+version = "1.25.7"
 edition = "2024"
 rust-version = "1.95"
 description = "A low-resource YouTube TUI audio player and local subscription manager that uses yt-dlp and saves and shows listening progress"
@@ -168,7 +168,7 @@ lan-sharing = [
 gpm = ["tui", "dep:mio"]
 backend-mpv = ["dep:mio"]
 # Retain original remote audio bytes in RAM between finite-media playback loads.
-cache = ["backend-mpv", "network", "dep:chrono", "dep:getrandom", "dep:tempfile"]
+cache = ["backend-mpv", "network", "dep:chrono", "dep:getrandom"]
 backend-native = []
 alsa = []
 jack = []
@@ -222,10 +222,10 @@ url-info = ["network", "dep:html5gum", "dep:rustls", "dep:webpki-roots", "dep:x5
 # Explicit reviewed public transfers to Internet Archive, removable independently
 # of Archive browsing, Commons and Evernote. Private staging and credentials stay
 # behind this feature; no upload runs without a separate confirmation.
-archive-upload = ["controller", "network", "yt-dlp", "dep:getrandom", "dep:percent-encoding", "dep:tempfile"]
+archive-upload = ["controller", "network", "yt-dlp", "dep:getrandom", "dep:percent-encoding"]
 # Reviewed private-destination AWS S3 exports, intentionally disabled by default.
 # The official SDK and its async runtime are linked only for this capability.
-s3-upload = ["controller", "network", "yt-dlp", "dep:tempfile", "dep:aws-config", "dep:aws-sdk-s3", "dep:aws-credential-types", "dep:aws-runtime", "dep:tokio", "dep:sha2", "dep:base64"]
+s3-upload = ["controller", "network", "yt-dlp", "dep:aws-config", "dep:aws-sdk-s3", "dep:aws-credential-types", "dep:aws-runtime", "dep:tokio", "dep:sha2", "dep:base64"]
 # Explicit, review-first audio transfers to Wikimedia Commons. Cookie and
 # multipart support are kept behind this feature so distributors can remove
 # the authentication and upload code from constrained builds.
@@ -251,7 +251,7 @@ evernote = [
 #
 # The official `fpcalc` helper performs media decoding and fingerprinting, so
 # this feature does not add a second Rust media-decoding stack.
-acoustid = ["network", "local-browser", "dep:tempfile", "dep:rustix"]
+acoustid = ["network", "local-browser", "dep:rustix"]
 # Compatibility umbrella retaining every Local-file capability.
 local = [
     "local-browser",
@@ -267,7 +267,7 @@ local = [
 local-browser = []
 # Explicit foreground Bash commands and private, removable command history.
 # Keep outside `local`/`sources` so distributors can omit it independently.
-cmd = ["local-browser", "dep:tempfile"]
+cmd = ["local-browser"]
 # Bounded HTTP directory listings with direct audio-only playback.
 web-browser = ["network", "local-browser", "dep:html5gum", "dep:percent-encoding", "dep:sha2"]
 # Tag, codec, and technical metadata extraction for Local and selected Web files.
@@ -299,7 +299,7 @@ vimeo = ["yt-dlp"]
 rutube = ["yt-dlp"]
 youtube-official = ["network"]
 youtube-music = ["yt-dlp"]
-yt-dlp = ["dep:chrono", "dep:fs2", "dep:getrandom", "dep:rustix", "dep:tempfile", "dep:sha2"]
+yt-dlp = ["dep:chrono", "dep:fs2", "dep:getrandom", "dep:rustix", "dep:sha2"]
 sponsorblock = ["network"]
 dearrow = ["network"]
 wikidata = ["network"]
@@ -370,7 +370,7 @@ aws-runtime = { version = "1.9.2", optional = true }
 aws-sdk-s3 = { version = "1.146.1", default-features = false, features = ["rt-tokio", "rustls", "default-https-client"], optional = true }
 tokio = { version = "1.53.1", default-features = false, features = ["rt", "time", "fs", "io-util", "macros"], optional = true }
 getrandom = { version = "0.4.3", optional = true }
-tempfile = { version = "3.27.0", optional = true }
+tempfile = "3.27.0"
 aes = { version = "0.8.4", optional = true }
 anyhow = { version = "1.0.104", optional = true }
 base64 = { version = "0.22.1", optional = true }

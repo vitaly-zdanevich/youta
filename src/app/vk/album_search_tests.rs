@@ -417,10 +417,11 @@ fn vk_album_session_saves_parent_search_mode_and_selection() {
     assert!(!serde_json::to_string(&saved).unwrap().contains("hash"));
     app.config.persistence.save_playback_history = false;
     assert!(app.save_session());
-    let saved = app.store.session().unwrap().unwrap();
-    assert_eq!(saved.vk_search_kind, VkSearchKind::Tracks);
-    assert!(saved.vk_search_text.is_empty());
-    assert_eq!(saved.vk_selected_row, None);
+    assert_eq!(
+        app.store.session().unwrap(),
+        Some(saved),
+        "disabling saving preserves the previous session"
+    );
 }
 
 /// Bounded nested browsing preserves the original album search and its persisted row.

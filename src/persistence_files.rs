@@ -820,6 +820,7 @@ impl FileStateStore {
                 &paths.runtime,
                 "runtime session",
                 MAX_RUNTIME_DOCUMENT_BYTES,
+                config.persistence.save_playback_history,
                 RuntimeDocument::empty,
                 |document| ensure_format(document.format_version),
             )?,
@@ -827,6 +828,7 @@ impl FileStateStore {
                 &paths.playback_checkpoint,
                 "playback checkpoint",
                 MAX_PLAYBACK_CHECKPOINT_DOCUMENT_BYTES,
+                config.persistence.save_playback_history,
                 PlaybackCheckpointDocument::empty,
                 validate_playback_checkpoint,
             )?,
@@ -834,6 +836,7 @@ impl FileStateStore {
                 &paths.searches,
                 "search cache",
                 MAX_SEARCH_CACHE_DOCUMENT_BYTES,
+                config.persistence.save_playback_history,
                 SearchCacheDocument::empty,
                 |document| {
                     ensure_format(document.format_version)?;
@@ -844,6 +847,7 @@ impl FileStateStore {
                 &paths.provider_cache,
                 "provider cache",
                 MAX_PROVIDER_CACHE_DOCUMENT_BYTES,
+                config.persistence.save_playback_history,
                 ProviderCacheDocument::empty,
                 |document| {
                     ensure_format(document.format_version)?;
@@ -859,18 +863,22 @@ impl FileStateStore {
                 MAX_DOWNLOAD_QUEUE_BYTES,
                 &documents.downloads,
             )?;
-            write_document(
-                &paths.progress,
-                "progress",
-                MAX_PROGRESS_DOCUMENT_BYTES,
-                &documents.progress,
-            )?;
-            write_document(
-                &paths.history,
-                "history",
-                MAX_HISTORY_DOCUMENT_BYTES,
-                &documents.history,
-            )?;
+            if config.persistence.save_playback_history || !paths.progress.try_exists()? {
+                write_document(
+                    &paths.progress,
+                    "progress",
+                    MAX_PROGRESS_DOCUMENT_BYTES,
+                    &documents.progress,
+                )?;
+            }
+            if config.persistence.save_playback_history || !paths.history.try_exists()? {
+                write_document(
+                    &paths.history,
+                    "history",
+                    MAX_HISTORY_DOCUMENT_BYTES,
+                    &documents.history,
+                )?;
+            }
             write_document(
                 &paths.notes,
                 "notes",
@@ -883,12 +891,14 @@ impl FileStateStore {
                 MAX_BOOKMARKS_DOCUMENT_BYTES,
                 &documents.bookmarks,
             )?;
-            write_document(
-                &paths.statistics,
-                "statistics",
-                MAX_STATISTICS_DOCUMENT_BYTES,
-                &documents.statistics,
-            )?;
+            if config.persistence.save_playback_history || !paths.statistics.try_exists()? {
+                write_document(
+                    &paths.statistics,
+                    "statistics",
+                    MAX_STATISTICS_DOCUMENT_BYTES,
+                    &documents.statistics,
+                )?;
+            }
             write_document(
                 &paths.local_moves,
                 "Local move journal",
@@ -908,30 +918,32 @@ impl FileStateStore {
                 MAX_YANDEX_MUSIC_REACTIONS_DOCUMENT_BYTES,
                 &documents.yandex_music_reactions,
             )?;
-            write_document(
-                &paths.runtime,
-                "runtime session",
-                MAX_RUNTIME_DOCUMENT_BYTES,
-                &documents.runtime,
-            )?;
-            write_document(
-                &paths.playback_checkpoint,
-                "playback checkpoint",
-                MAX_PLAYBACK_CHECKPOINT_DOCUMENT_BYTES,
-                &documents.playback_checkpoint,
-            )?;
-            write_document(
-                &paths.searches,
-                "search cache",
-                MAX_SEARCH_CACHE_DOCUMENT_BYTES,
-                &documents.searches,
-            )?;
-            write_document(
-                &paths.provider_cache,
-                "provider cache",
-                MAX_PROVIDER_CACHE_DOCUMENT_BYTES,
-                &documents.provider_cache,
-            )?;
+            if config.persistence.save_playback_history {
+                write_document(
+                    &paths.runtime,
+                    "runtime session",
+                    MAX_RUNTIME_DOCUMENT_BYTES,
+                    &documents.runtime,
+                )?;
+                write_document(
+                    &paths.playback_checkpoint,
+                    "playback checkpoint",
+                    MAX_PLAYBACK_CHECKPOINT_DOCUMENT_BYTES,
+                    &documents.playback_checkpoint,
+                )?;
+                write_document(
+                    &paths.searches,
+                    "search cache",
+                    MAX_SEARCH_CACHE_DOCUMENT_BYTES,
+                    &documents.searches,
+                )?;
+                write_document(
+                    &paths.provider_cache,
+                    "provider cache",
+                    MAX_PROVIDER_CACHE_DOCUMENT_BYTES,
+                    &documents.provider_cache,
+                )?;
+            }
             // Publish the manifest last so an interrupted first open is
             // retried as initialization rather than accepted as complete.
             write_document(
@@ -958,7 +970,9 @@ impl FileStateStore {
                 &manifest,
             )?;
         }
-        recover_playback_checkpoint_files(&paths, &mut documents)?;
+        if config.persistence.save_playback_history {
+            recover_playback_checkpoint_files(&paths, &mut documents)?;
+        }
         let generations = capture_document_generations(&paths)?;
         Ok(Self {
             paths: Some(paths),
@@ -3678,15 +3692,17 @@ where
     load_document(file, document, maximum_bytes)
 }
 
-/// Loads a disposable document, preserving and resetting only corrupt content.
+/// Loads a disposable document, optionally preserving and resetting corrupt content.
 ///
 /// Operational failures such as permission errors still fail startup. The
 /// caller must use this helper only for state that can be reconstructed without
-/// losing authoritative user data.
+/// losing authoritative user data. When recovery is disabled, corrupt content
+/// produces an empty in-memory document while its original bytes remain intact.
 fn load_regenerable<T>(
     path: &Path,
     document: &'static str,
     maximum_bytes: usize,
+    allow_recovery: bool,
     empty: impl Fn() -> T,
     validate: impl Fn(&T) -> Result<(), PersistenceError>,
 ) -> Result<T, PersistenceError>
@@ -3701,13 +3717,15 @@ where
         Err(error) if is_regenerable_corruption(&error) => {
             let replacement = empty();
             validate(&replacement)?;
-            quarantine_and_reset_regenerable(
-                path,
-                document,
-                maximum_bytes,
-                expected_generation,
-                &replacement,
-            )?;
+            if allow_recovery {
+                quarantine_and_reset_regenerable(
+                    path,
+                    document,
+                    maximum_bytes,
+                    expected_generation,
+                    &replacement,
+                )?;
+            }
             Ok(replacement)
         }
         Err(error) => Err(error),

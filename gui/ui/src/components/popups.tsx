@@ -1819,7 +1819,7 @@ export function PreferencesPopup({ popup, archiveSupported }: {
 									<span className='text-ink-dim'>
 										{label}
 										{field === 'PlaybackHistory' ? (
-											<span className='block text-[11px] leading-[16px] text-ink-faint'>Off: no new log entries; searches are not saved or restored after restart.</span>
+											<span className='block text-[11px] leading-[16px] text-ink-faint'>Off: no new activity saved; searches not restored. Existing data stays.</span>
 										) : null}
 									</span>
 								) : null}

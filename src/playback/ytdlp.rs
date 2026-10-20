@@ -260,13 +260,66 @@ impl Drop for DownloadProcess {
 #[derive(Clone, Debug)]
 pub struct YtDlp {
     config: YtDlpConfig,
+    activity_cache: Option<crate::activity_storage::ActivityPath>,
 }
 
 impl YtDlp {
     /// Creates a client with explicit process settings.
     #[must_use]
     pub fn new(config: YtDlpConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            activity_cache: None,
+        }
+    }
+
+    /// Resolves metadata-cache reads and publications against the live policy.
+    /// Network requests never hold the persistence lease, so switching saving
+    /// off redirects results that arrive after the preference changed.
+    #[must_use]
+    pub fn with_activity_cache(mut self, cache: crate::activity_storage::ActivityPath) -> Self {
+        self.activity_cache = Some(cache.for_operation());
+        self
+    }
+
+    fn cached_podcast_metadata(&self, fallback: &Path, id: &str) -> Option<YouTubeEpisodeMetadata> {
+        self.with_cache_path(fallback, |path| load_podcast_metadata(path, id))
+            .ok()
+            .flatten()
+    }
+
+    fn cached_publication_date(&self, fallback: &Path, id: &str) -> Option<i64> {
+        self.with_cache_path(fallback, |path| load_publication_date(path, id))
+            .ok()
+            .flatten()
+    }
+
+    fn persist_podcast_metadata(
+        &self,
+        fallback: &Path,
+        entry: &CollectionEntry,
+    ) -> std::io::Result<()> {
+        self.with_cache_path(fallback, |path| store_podcast_metadata(path, entry))?
+    }
+
+    fn persist_publication_date(
+        &self,
+        fallback: &Path,
+        id: &str,
+        date: i64,
+    ) -> std::io::Result<()> {
+        self.with_cache_path(fallback, |path| store_publication_date(path, id, date))?
+    }
+
+    fn with_cache_path<T>(
+        &self,
+        fallback: &Path,
+        operation: impl FnOnce(&Path) -> T,
+    ) -> std::io::Result<T> {
+        match &self.activity_cache {
+            Some(cache) => cache.with_path(operation),
+            None => Ok(operation(fallback)),
+        }
     }
 
     /// Returns the installed `yt-dlp` version string.
@@ -646,13 +699,13 @@ impl YtDlp {
                 .published_at
                 .filter(|date| valid_publication_timestamp(*date));
             validate_podcast_description(entry.description.as_deref())?;
-            let cached = load_podcast_metadata(cache_dir, &entry.id);
+            let cached = self.cached_podcast_metadata(cache_dir, &entry.id);
             if !podcast_metadata_complete(entry) {
                 if let Some(cached) = &cached {
                     merge_podcast_metadata(entry, cached, &budget)?;
                 }
                 if entry.published_at.is_none() {
-                    entry.published_at = load_publication_date(cache_dir, &entry.id);
+                    entry.published_at = self.cached_publication_date(cache_dir, &entry.id);
                 }
             }
             if podcast_metadata_complete(entry) {
@@ -661,7 +714,7 @@ impl YtDlp {
                     cached.published_at == entry.published_at
                         && cached.description == entry.description
                 }) {
-                    let _ = store_podcast_metadata(cache_dir, entry);
+                    let _ = self.persist_podcast_metadata(cache_dir, entry);
                 }
             } else if seen.insert(entry.id.clone()) {
                 missing.push(entry.id.clone());
@@ -689,7 +742,7 @@ impl YtDlp {
                 if let Some(item) = batch.get(&entry.id) {
                     merge_podcast_metadata(entry, item, &budget)?;
                     if podcast_metadata_complete(entry) {
-                        let _ = store_podcast_metadata(cache_dir, entry);
+                        let _ = self.persist_podcast_metadata(cache_dir, entry);
                     }
                 }
             }
@@ -706,7 +759,7 @@ impl YtDlp {
                 let workers = batch.iter_mut().map(|entry| {
                     scope.spawn(move || -> Result<()> {
                         ensure_publication_lookup_active(cancellation)?;
-                        let item = match load_podcast_metadata(cache_dir, &entry.id) {
+                        let item = match self.cached_podcast_metadata(cache_dir, &entry.id) {
                             Some(cached) => cached,
                             None => lookup_one(&entry.id)?,
                         };
@@ -718,7 +771,7 @@ impl YtDlp {
                                 entry.id,
                             )));
                         }
-                        let _ = store_podcast_metadata(cache_dir, entry);
+                        let _ = self.persist_podcast_metadata(cache_dir, entry);
                         Ok(())
                     })
                 }).collect::<Vec<_>>();
@@ -774,11 +827,11 @@ impl YtDlp {
                 .filter(|date| valid_publication_timestamp(*date))
             {
                 // Persist reused API metadata too, so a restart needs no new lookup.
-                if load_publication_date(cache_dir, &entry.id) != Some(date) {
-                    let _ = store_publication_date(cache_dir, &entry.id, date);
+                if self.cached_publication_date(cache_dir, &entry.id) != Some(date) {
+                    let _ = self.persist_publication_date(cache_dir, &entry.id, date);
                 }
             } else {
-                entry.published_at = load_publication_date(cache_dir, &entry.id);
+                entry.published_at = self.cached_publication_date(cache_dir, &entry.id);
             }
             if entry.published_at.is_none() && seen.insert(entry.id.clone()) {
                 missing.push(entry.id.clone());
@@ -801,7 +854,7 @@ impl YtDlp {
                 ));
             }
             for (id, date) in batch {
-                let _ = store_publication_date(cache_dir, &id, date);
+                let _ = self.persist_publication_date(cache_dir, &id, date);
                 dates.insert(id, date);
             }
         }
@@ -843,20 +896,22 @@ impl YtDlp {
                                 return Ok(());
                             }
                             validate_publication_video_id(&entry.id)?;
-                            let published_at = match load_publication_date(cache_dir, &entry.id) {
-                                Some(date) => date,
-                                None => {
-                                    let date = lookup(&entry.id)?;
-                                    if !valid_publication_timestamp(date) {
-                                        return Err(PlaybackError::Protocol(
-                                            "YouTube returned an invalid publication date"
-                                                .to_owned(),
-                                        ));
+                            let published_at =
+                                match self.cached_publication_date(cache_dir, &entry.id) {
+                                    Some(date) => date,
+                                    None => {
+                                        let date = lookup(&entry.id)?;
+                                        if !valid_publication_timestamp(date) {
+                                            return Err(PlaybackError::Protocol(
+                                                "YouTube returned an invalid publication date"
+                                                    .to_owned(),
+                                            ));
+                                        }
+                                        let _ = self
+                                            .persist_publication_date(cache_dir, &entry.id, date);
+                                        date
                                     }
-                                    let _ = store_publication_date(cache_dir, &entry.id, date);
-                                    date
-                                }
-                            };
+                                };
                             ensure_publication_lookup_active(cancellation)?;
                             entry.published_at = Some(published_at);
                             Ok(())
@@ -2591,6 +2646,48 @@ mod tests {
                 |_| panic!("cached feed must not make API requests"),
             )
             .expect("repeat feed uses only cache");
+    }
+
+    #[test]
+    fn metadata_arriving_after_saving_is_disabled_stays_in_session_storage() {
+        let root = tempfile::tempdir().unwrap();
+        let config = crate::config::Config::for_dir(root.path().join("config"));
+        let location = config
+            .activity_cache_dir()
+            .join("youtube-publication-dates");
+        let persistent = config.cache_dir().join("youtube-publication-dates");
+        let client = YtDlp::new(YtDlpConfig::default()).with_activity_cache(location.clone());
+        let mut entries = vec![podcast_entry(0)];
+        client
+            .populate_youtube_podcast_metadata_with_batch_lookup_limit(
+                &mut entries,
+                &persistent,
+                &YouTubePrewarmCancellation::new(),
+                |ids| {
+                    config.set_activity_persistence(false).unwrap();
+                    Ok(HashMap::from([(
+                        ids[0].clone(),
+                        YouTubeEpisodeMetadata {
+                            published_at: Some(1_709_164_800),
+                            description: Some("Private fixture episode".to_owned()),
+                        },
+                    )]))
+                },
+                |_| panic!("batch fixture satisfies the request"),
+                1024,
+            )
+            .unwrap();
+        assert!(!persistent.exists());
+        location
+            .with_path(|path| {
+                assert_eq!(
+                    load_podcast_metadata(path, &entries[0].id)
+                        .unwrap()
+                        .description,
+                    Some("Private fixture episode".to_owned())
+                );
+            })
+            .unwrap();
     }
 
     #[test]

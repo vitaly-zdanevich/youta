@@ -532,13 +532,17 @@ impl AppController {
         }
         if plan.requires_image()? && plan.image_path.is_none() {
             let source = download.image.clone()?;
-            let cache_directory = self.config.thumbnail_cache_dir();
+            let cache_directory = self.config.activity_thumbnail_dir().for_operation();
             let (sender, replies) = bounded(1);
             let responses = ResponseSender::new(sender, self.worker_notifier.clone());
             let worker = thread::Builder::new()
                 .name("youta-command-image".to_owned())
                 .spawn(move || {
-                    let _ = responses.send(image::prepare(source, &cache_directory));
+                    let result = cache_directory
+                        .with_path(|directory| image::prepare(source, directory))
+                        .map_err(|error| error.to_string())
+                        .and_then(std::convert::identity);
+                    let _ = responses.send(result);
                 })
                 .map_err(|_| "Cannot start the command image worker".to_owned())?;
             self.custom_commands.waiting_image = Some(PendingCommandImage {

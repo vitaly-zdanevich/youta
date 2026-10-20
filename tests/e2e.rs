@@ -611,7 +611,7 @@ fn tui_subscriptions_openers_and_preferences_persist_end_to_end() {
         "Fixture channel",
         "Save log and searches: on",
         "Save log and searches: off",
-        "Off: no new log entries; searches are not saved or restored after restart.",
+        "Off: no new activity saved; searches not restored. Existing data stays.",
         "Split",
         "Prepare selected YouTube audio: off",
     ] {
@@ -648,8 +648,11 @@ fn tui_subscriptions_openers_and_preferences_persist_end_to_end() {
         &locked_transcript,
         &opened_links,
         Some("drill-down"),
-        "Fixture channel",
+        TUI_IDLE_READINESS,
         &[
+            // Saving was disabled before exit, so that visit to Subs was not
+            // persisted. Open it explicitly rather than expecting restoration.
+            (b"S", 300),
             (b"p", 300),
             (b"s", 200),
             (b"\r", 300),

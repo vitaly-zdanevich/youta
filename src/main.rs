@@ -251,7 +251,7 @@ fn run_tui(config: Config, startup_url: Option<url::Url>) -> Result<()> {
         thumbnails: config.ui.thumbnails,
         thumbnail_height: config.ui.thumbnail_height,
         prefetch_search_thumbnails: config.ui.prefetch_search_thumbnails,
-        thumbnail_cache_dir: Some(config.thumbnail_cache_dir()),
+        thumbnail_cache_dir: Some(config.activity_thumbnail_dir()),
         ffmpeg_executable: config.providers.ffmpeg_executable.clone(),
         ..UiSettings::default()
     };

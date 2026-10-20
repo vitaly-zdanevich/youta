@@ -27,6 +27,7 @@ use std::time::SystemTime;
 use sha2::{Digest, Sha256};
 use url::Url;
 
+use crate::activity_storage::ActivityPath;
 use crate::artwork::{ArtworkFormat, MAX_DOWNLOAD_BYTES, ThumbnailCache};
 
 /// Cumulative tag bytes one media file may be read for.
@@ -90,7 +91,7 @@ pub(crate) enum LocalArtworkError {
 /// only when no sidecar covers for it.
 pub(crate) fn local_media_artwork(
     media_path: &Path,
-    cache_directory: &Path,
+    cache_directory: impl Into<ActivityPath>,
 ) -> Result<Option<Url>, LocalArtworkError> {
     match cached_local_artwork(media_path, cache_directory) {
         Ok(Some(embedded)) => Ok(Some(embedded)),
@@ -218,14 +219,14 @@ fn sidecar_is_image(path: &Path) -> bool {
 /// in the private cache.
 pub(crate) fn cached_local_artwork(
     media_path: &Path,
-    cache_directory: &Path,
+    cache_directory: impl Into<ActivityPath>,
 ) -> Result<Option<Url>, LocalArtworkError> {
     cached_local_artwork_with_extractor(media_path, cache_directory, extract_local_artwork)
 }
 
 fn cached_local_artwork_with_extractor<F>(
     media_path: &Path,
-    cache_directory: &Path,
+    cache_directory: impl Into<ActivityPath>,
     extractor: F,
 ) -> Result<Option<Url>, LocalArtworkError>
 where
@@ -233,7 +234,7 @@ where
 {
     let fingerprint = LocalMediaFingerprint::capture(media_path)?;
     let cache_key = fingerprint.cache_key();
-    let cache = ThumbnailCache::new(cache_directory.to_path_buf());
+    let cache = ThumbnailCache::new(cache_directory).for_operation();
 
     match cache
         .read_key(&cache_key)
@@ -265,7 +266,8 @@ fn cached_local_artwork_url(
     cache: &ThumbnailCache,
     cache_key: &[u8],
 ) -> Result<Url, LocalArtworkError> {
-    let path = crate::fs_path::canonicalize(cache.entry_path_for_key(cache_key))
+    let path = cache
+        .canonical_entry_path_for_key(cache_key)
         .map_err(LocalArtworkError::CacheIo)?;
     Url::from_file_path(path).map_err(|()| LocalArtworkError::CacheUrl)
 }
@@ -745,6 +747,40 @@ mod tests {
             !name.contains("album"),
             "a cache entry must not disclose the media file name"
         );
+    }
+
+    /// An extraction already in progress stays in session storage across either privacy transition.
+    #[test]
+    fn delayed_local_artwork_respects_a_changed_privacy_preference() {
+        for initially_enabled in [false, true] {
+            let directory = tempfile::tempdir().expect("temporary local-media directory");
+            let config = crate::config::Config::for_dir(directory.path().join("config"));
+            config.set_activity_persistence(initially_enabled).unwrap();
+            let media_path = directory.path().join("album.mp3");
+            let bytes = fixture_png(*b"aaa\0");
+            write_tagged_mp3(
+                &media_path,
+                [fixture_picture(bytes.clone(), PictureType::CoverFront)],
+            );
+            let artwork = cached_local_artwork_with_extractor(
+                &media_path,
+                config.activity_thumbnail_dir(),
+                |_| {
+                    config.set_activity_persistence(!initially_enabled).unwrap();
+                    Ok(ValidatedArtwork::from_slice(&bytes))
+                },
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(read_file_url(&artwork), bytes);
+            assert!(!config.thumbnail_cache_dir().exists());
+            assert!(
+                !artwork
+                    .to_file_path()
+                    .unwrap()
+                    .starts_with(directory.path())
+            );
+        }
     }
 
     #[test]

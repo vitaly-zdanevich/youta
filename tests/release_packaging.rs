@@ -186,13 +186,7 @@ fn archive_upload_is_default_but_independently_removable_in_both_frontends() {
         );
     }
     let upload = feature_closure(&manifest, "archive-upload");
-    for required in [
-        "controller",
-        "network",
-        "yt-dlp",
-        "dep:getrandom",
-        "dep:tempfile",
-    ] {
+    for required in ["controller", "network", "yt-dlp", "dep:getrandom"] {
         assert!(upload.contains(required), "{required}");
     }
     for unrelated in ["archive-org", "commons-upload", "evernote"] {
@@ -982,11 +976,9 @@ fn yandex_music_feature_and_credentials_remain_optional_and_documented() {
 fn command_prompt_is_default_but_independently_removable() {
     let manifest = manifest();
     assert!(feature_entries(&manifest, "default").contains(&"cmd"));
-    // Private description files avoid operating-system argument-size limits.
-    assert_eq!(
-        feature_entries(&manifest, "cmd"),
-        ["local-browser", "dep:tempfile"]
-    );
+    // Temporary storage is shared with the core privacy policy, while the
+    // command editor, completion and runner remain independently removable.
+    assert_eq!(feature_entries(&manifest, "cmd"), ["local-browser"]);
     for profile in [
         "local",
         "local-browser",
@@ -1015,6 +1007,21 @@ fn command_prompt_is_default_but_independently_removable() {
             .iter()
             .any(|feature| feature.as_str() == Some("cmd")),
         "the GUI dependency must not force command support when its feature is disabled"
+    );
+}
+
+/// Private session storage remains available when optional commands/uploads are omitted.
+#[test]
+fn temporary_activity_storage_is_available_without_optional_features() {
+    let manifest = manifest();
+    let dependency = manifest["dependencies"]
+        .get("tempfile")
+        .expect("session storage dependency");
+    assert!(
+        !dependency
+            .get("optional")
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(false)
     );
 }
 

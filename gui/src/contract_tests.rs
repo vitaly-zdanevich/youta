@@ -407,7 +407,7 @@ fn window_filters_and_edits_playback_history_from_the_shared_view_policy() {
     }
     for required in [
         "toggle('PlaybackHistory', 'Save log and searches', popup.save_playback_history, 'TogglePlaybackHistorySaving')",
-        "Off: no new log entries; searches are not saved or restored after restart.",
+        "Off: no new activity saved; searches not restored. Existing data stays.",
         "field === 'PlaybackHistory'",
         "controls.map(({ field, label, value, action, on }) =>",
         "onClick={() => void dispatch(action)}",

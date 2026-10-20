@@ -304,7 +304,7 @@ test('log and search preferences always explain disabled restart behavior', () =
 		const control = nodes(module.exports.PreferencesPopup({ popup, archiveSupported: false }))
 			.find((node) => node.props['data-preferences-field'] === 'PlaybackHistory');
 		assert.ok(text(control).includes('Save log and searches'));
-		assert.ok(text(control).includes('Off: no new log entries; searches are not saved or restored after restart.'));
+		assert.ok(text(control).includes('Off: no new activity saved; searches not restored. Existing data stays.'));
 		const button = nodes(control).find((node) => node.type === 'button');
 		assert.equal(text(button), enabled ? 'on' : 'off');
 		actions.length = 0;

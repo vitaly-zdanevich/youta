@@ -18,6 +18,8 @@ pub(crate) mod test_support;
 /// Canonical paths in the crate's one spelling; see the module's own account.
 pub(crate) mod fs_path;
 
+pub mod activity_storage;
+
 #[cfg(all(feature = "archive-org", feature = "yt-dlp", feature = "backend-mpv"))]
 pub(crate) mod archive_playback_cache;
 #[cfg(all(feature = "archive-org", feature = "yt-dlp", feature = "backend-mpv"))]

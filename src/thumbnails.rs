@@ -28,6 +28,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::activity_storage::ActivityPath;
+
 use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded};
 use image::{
     DynamicImage, GenericImageView, GrayAlphaImage, GrayImage, ImageFormat, ImageReader, Limits,
@@ -309,8 +311,26 @@ struct ThumbnailTarget {
 struct WorkerRequest {
     generation: u64,
     target: ThumbnailTarget,
+    /// Captures privacy before this request can wait behind another decode.
+    cache_directory: Option<ActivityPath>,
     /// Already validated native pixels; cloning the handle never resizes on the UI thread.
     native_waveform: Option<Arc<DynamicImage>>,
+}
+
+/// One prefetch batch retains the privacy setting active when it was queued.
+struct PrefetchRequest {
+    sources: Vec<Url>,
+    cache_directory: ActivityPath,
+}
+
+impl PrefetchRequest {
+    /// Keeps each queued source attached to its originating storage policy.
+    fn into_backlog(self) -> VecDeque<(Url, ActivityPath)> {
+        self.sources
+            .into_iter()
+            .map(|source| (source, self.cache_directory.clone()))
+            .collect()
+    }
 }
 
 struct WorkerResult {
@@ -906,12 +926,12 @@ pub struct ThumbnailManager {
     prepared_decoded_bytes: usize,
     expansion: ExpansionPrefetch,
     picker: Option<Picker>,
-    cache_directory: Option<PathBuf>,
+    cache_directory: Option<ActivityPath>,
     video_frame_program: PathBuf,
     request_sender: Option<Sender<WorkerRequest>>,
     request_discarder: Option<Receiver<WorkerRequest>>,
-    prefetch_sender: Option<Sender<Vec<Url>>>,
-    prefetch_discarder: Option<Receiver<Vec<Url>>>,
+    prefetch_sender: Option<Sender<PrefetchRequest>>,
+    prefetch_discarder: Option<Receiver<PrefetchRequest>>,
     prefetch_sources: Vec<Url>,
     result_receiver: Option<Receiver<WorkerResult>>,
     worker_notifier: WorkerNotifier,
@@ -992,12 +1012,17 @@ impl ThumbnailManager {
         )
     }
 
-    /// Detects the current terminal and lazily enables a persistent byte cache.
+    /// Detects the current terminal and lazily enables the configured byte cache.
     ///
     /// The cache directory is not created until a supported terminal requests
     /// visible artwork. Unsupported terminals never read or write the cache.
+    /// An [`ActivityPath`] follows live privacy changes; a filesystem path keeps
+    /// its fixed location.
     #[must_use]
-    pub fn from_current_terminal_with_cache(mode: ThumbnailMode, cache_directory: PathBuf) -> Self {
+    pub fn from_current_terminal_with_cache(
+        mode: ThumbnailMode,
+        cache_directory: impl Into<ActivityPath>,
+    ) -> Self {
         Self::from_current_terminal_with_cache_and_tty_images(mode, cache_directory, true)
     }
 
@@ -1009,13 +1034,13 @@ impl ThumbnailManager {
     #[must_use]
     pub fn from_current_terminal_with_cache_and_tty_images(
         mode: ThumbnailMode,
-        cache_directory: PathBuf,
+        cache_directory: impl Into<ActivityPath>,
         show_images_in_tty: bool,
     ) -> Self {
         Self::from_terminal_info_with_cache(
             mode,
             &TerminalInfo::current(),
-            Some(cache_directory),
+            Some(cache_directory.into()),
             show_images_in_tty,
         )
     }
@@ -1028,7 +1053,7 @@ impl ThumbnailManager {
     fn from_terminal_info_with_cache(
         mode: ThumbnailMode,
         terminal: &TerminalInfo,
-        cache_directory: Option<PathBuf>,
+        cache_directory: Option<ActivityPath>,
         show_images_in_tty: bool,
     ) -> Self {
         if mode == ThumbnailMode::Off {
@@ -1274,6 +1299,7 @@ impl ThumbnailManager {
         self.expansion.target = Some(target.clone());
         let request = WorkerRequest {
             generation: self.expansion.generation,
+            cache_directory: None,
             native_waveform: self.native_waveform_for(&target.source),
             target,
         };
@@ -1527,6 +1553,10 @@ impl ThumbnailManager {
         }
         let request = WorkerRequest {
             generation: self.generation,
+            cache_directory: self
+                .cache_directory
+                .as_ref()
+                .map(ActivityPath::for_operation),
             native_waveform: self.native_waveform_for(&target.source),
             target,
         };
@@ -1656,6 +1686,17 @@ impl ThumbnailManager {
     }
 
     fn send_latest_prefetch(&mut self, sources: Vec<Url>) -> bool {
+        let Some(cache_directory) = self
+            .cache_directory
+            .as_ref()
+            .map(ActivityPath::for_operation)
+        else {
+            return false;
+        };
+        let sources = PrefetchRequest {
+            sources,
+            cache_directory,
+        };
         let (Some(sender), Some(discarder)) = (
             self.prefetch_sender.as_ref(),
             self.prefetch_discarder.as_ref(),
@@ -1956,7 +1997,7 @@ fn spawn_visible_worker(
     picker: Picker,
     requests: Receiver<WorkerRequest>,
     results: WorkerResultSender,
-    cache_directory: Option<PathBuf>,
+    cache_directory: Option<ActivityPath>,
     video_frame_program: PathBuf,
     current_generation: Arc<AtomicU64>,
 ) -> bool {
@@ -2038,7 +2079,10 @@ fn spawn_visible_worker_with_transport_and_extractor<
         .is_ok()
 }
 
-fn spawn_prefetch_worker(prefetch_updates: Receiver<Vec<Url>>, cache_directory: PathBuf) -> bool {
+fn spawn_prefetch_worker(
+    prefetch_updates: Receiver<PrefetchRequest>,
+    cache_directory: ActivityPath,
+) -> bool {
     spawn_prefetch_worker_with_transport(
         prefetch_updates,
         HttpThumbnailTransport::new(),
@@ -2047,9 +2091,9 @@ fn spawn_prefetch_worker(prefetch_updates: Receiver<Vec<Url>>, cache_directory: 
 }
 
 fn spawn_prefetch_worker_with_transport<T: ThumbnailTransport>(
-    prefetch_updates: Receiver<Vec<Url>>,
+    prefetch_updates: Receiver<PrefetchRequest>,
     mut transport: T,
-    mut cache: ThumbnailCache,
+    cache: ThumbnailCache,
 ) -> bool {
     thread::Builder::new()
         .name("youta-thumbnail-prefetch".to_owned())
@@ -2060,13 +2104,19 @@ fn spawn_prefetch_worker_with_transport<T: ThumbnailTransport>(
             let mut backlog = VecDeque::new();
             loop {
                 match latest_prefetch_update(&prefetch_updates) {
-                    WorkerInput::Item(sources) => backlog = sources.into(),
+                    WorkerInput::Item(sources) => backlog = sources.into_backlog(),
                     WorkerInput::Disconnected => break,
                     WorkerInput::Empty => {}
                 }
 
                 if let Some(source) = backlog.pop_front() {
-                    if prefetch_thumbnail(&mut transport, &mut cache, &source).is_err() {
+                    if prefetch_thumbnail(
+                        &mut transport,
+                        &mut ThumbnailCache::new(source.1),
+                        &source.0,
+                    )
+                    .is_err()
+                    {
                         break;
                     }
                     continue;
@@ -2075,7 +2125,7 @@ fn spawn_prefetch_worker_with_transport<T: ThumbnailTransport>(
                 let Ok(sources) = prefetch_updates.recv() else {
                     break;
                 };
-                backlog = sources.into();
+                backlog = sources.into_backlog();
             }
         })
         .is_ok()
@@ -2085,7 +2135,7 @@ fn spawn_prefetch_worker_with_transport<T: ThumbnailTransport>(
 fn spawn_worker_with_transport<T: ThumbnailTransport>(
     picker: Picker,
     requests: Receiver<WorkerRequest>,
-    prefetch_updates: Receiver<Vec<Url>>,
+    prefetch_updates: Receiver<PrefetchRequest>,
     results: WorkerResultSender,
     mut transport: T,
     mut cache: Option<ThumbnailCache>,
@@ -2123,7 +2173,7 @@ fn spawn_worker_with_transport<T: ThumbnailTransport>(
 
                 match latest_prefetch_update(&prefetch_updates) {
                     WorkerInput::Item(sources) => {
-                        prefetch_backlog = sources.into();
+                        prefetch_backlog = sources.into_backlog();
                     }
                     WorkerInput::Disconnected => break,
                     WorkerInput::Empty => {}
@@ -2151,11 +2201,17 @@ fn spawn_worker_with_transport<T: ThumbnailTransport>(
                         }
                         WorkerInput::Disconnected => break,
                         WorkerInput::Empty if prefetch_cache_ready => {
-                            let Some(cache) = cache.as_mut() else {
+                            let Some(_) = cache.as_ref() else {
                                 prefetch_cache_ready = false;
                                 continue;
                             };
-                            if prefetch_thumbnail(&mut transport, cache, &source).is_err() {
+                            if prefetch_thumbnail(
+                                &mut transport,
+                                &mut ThumbnailCache::new(source.1),
+                                &source.0,
+                            )
+                            .is_err()
+                            {
                                 // Fetch and decode failures are intentionally
                                 // swallowed by the helper. An error here means
                                 // persistence itself stopped working, so avoid
@@ -2192,7 +2248,7 @@ fn spawn_worker_with_transport<T: ThumbnailTransport>(
                         let Ok(sources) = sources else {
                             break;
                         };
-                        prefetch_backlog = sources.into();
+                        prefetch_backlog = sources.into_backlog();
                     }
                 }
             }
@@ -2220,7 +2276,7 @@ fn latest_worker_request(requests: &Receiver<WorkerRequest>) -> WorkerInput<Work
     }
 }
 
-fn latest_prefetch_update(prefetch: &Receiver<Vec<Url>>) -> WorkerInput<Vec<Url>> {
+fn latest_prefetch_update(prefetch: &Receiver<PrefetchRequest>) -> WorkerInput<PrefetchRequest> {
     match prefetch.try_recv() {
         Ok(mut sources) => {
             for newer in prefetch.try_iter() {
@@ -2244,7 +2300,12 @@ fn render_worker_request<T: ThumbnailTransport>(
     debounce: Duration,
     current_generation: &Arc<AtomicU64>,
 ) -> bool {
-    let mut cache = cache;
+    // The same request owns both decoding and deferred derivative publication.
+    let mut operation_cache = request
+        .cache_directory
+        .clone()
+        .map(ThumbnailCache::new)
+        .or_else(|| cache.as_ref().map(|cache| cache.for_operation()));
     if let Some(image) = request.native_waveform.take() {
         return results
             .send(WorkerResult {
@@ -2254,7 +2315,8 @@ fn render_worker_request<T: ThumbnailTransport>(
             .is_ok();
     }
     if matches!(request.target.source.scheme(), "http" | "https")
-        && let Some(result) = load_cached_thumbnail(cache.as_deref_mut(), picker, &request.target)
+        && let Some(result) =
+            load_cached_thumbnail(operation_cache.as_mut(), picker, &request.target)
     {
         return results
             .send(WorkerResult {
@@ -2272,6 +2334,12 @@ fn render_worker_request<T: ThumbnailTransport>(
     for newer in requests.try_iter() {
         request = newer;
     }
+    operation_cache = request
+        .cache_directory
+        .clone()
+        .map(ThumbnailCache::new)
+        .or_else(|| cache.as_ref().map(|cache| cache.for_operation()));
+    let mut cache = operation_cache.as_mut();
     if let Some(image) = request.native_waveform.take() {
         return results
             .send(WorkerResult {
@@ -2349,6 +2417,7 @@ fn prefetch_thumbnail(
     cache: &mut ThumbnailCache,
     source: &Url,
 ) -> io::Result<()> {
+    let cache = cache.for_operation();
     match cache.read(source) {
         Ok(Some(bytes)) => {
             if decode_thumbnail(&bytes).is_ok() {
@@ -3899,7 +3968,7 @@ pub(crate) mod tests {
         let mut disabled = ThumbnailManager::from_terminal_info_with_cache(
             ThumbnailMode::Auto,
             &console,
-            Some(cache_directory.clone()),
+            Some(cache_directory.clone().into()),
             false,
         );
         let source = Url::parse("https://images.example/unused.png").expect("fixture URL");
@@ -3952,7 +4021,7 @@ pub(crate) mod tests {
         let mut manager = ThumbnailManager::from_terminal_info_with_cache(
             ThumbnailMode::Auto,
             &terminal,
-            Some(cache_directory.clone()),
+            Some(cache_directory.clone().into()),
             true,
         );
         let source = Url::parse("https://images.example/unused.png").expect("fixture URL");
@@ -5481,6 +5550,53 @@ pub(crate) mod tests {
         );
     }
 
+    /// Work queued while private remains private even if an earlier request delays it until logging resumes.
+    #[test]
+    fn queued_private_artwork_requests_remain_private_after_reenable() {
+        for prefetch in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let config = crate::config::Config::for_dir(root.path().join("config"));
+            let persistent = ThumbnailCache::new(config.activity_thumbnail_dir());
+            persistent.store_key(b"saved", b"saved artwork").unwrap();
+            let saved_path = persistent.entry_path_for_key(b"saved");
+            let (mut manager, replies, observed) =
+                manager_with_mock_transport_in_cache(Some(config.thumbnail_cache_dir()));
+            manager.cache_directory = Some(config.activity_thumbnail_dir());
+            let first = Url::parse("https://images.example/blocking.png").unwrap();
+            let private = Url::parse("https://images.example/private.png").unwrap();
+            let area = Rect::new(1, 1, 20, 8);
+            assert!(manager.synchronize(Some(&first), area));
+            assert_eq!(
+                observed.recv_timeout(Duration::from_secs(2)).unwrap(),
+                first
+            );
+            config.set_activity_persistence(false).unwrap();
+            let private_cache = persistent.for_operation();
+            if prefetch {
+                assert!(manager.synchronize_prefetch(std::slice::from_ref(&private)));
+            } else {
+                assert!(manager.synchronize(Some(&private), area));
+            }
+            config.set_activity_persistence(true).unwrap();
+            replies.send(Err(ThumbnailFailure::DownloadFailed)).unwrap();
+            assert_eq!(
+                observed.recv_timeout(Duration::from_secs(2)).unwrap(),
+                private
+            );
+            replies.send(Ok(fixture_png())).unwrap();
+            wait_for_image_work(
+                || private_cache.read(&private).unwrap().is_some(),
+                "private artwork did not finish",
+            );
+            assert_eq!(persistent.read(&private).unwrap(), None);
+            assert_eq!(fs::read(&saved_path).unwrap(), b"saved artwork");
+            assert_eq!(
+                fs::read_dir(config.thumbnail_cache_dir()).unwrap().count(),
+                1
+            );
+        }
+    }
+
     #[test]
     fn mock_worker_resolves_loading_for_success_fetch_failure_and_decode_failure() {
         let (mut manager, replies, observed) = manager_with_mock_transport();
@@ -5759,7 +5875,7 @@ pub(crate) mod tests {
         let mut disabled = ThumbnailManager::from_terminal_info_with_cache(
             ThumbnailMode::Off,
             &graphical_terminal(),
-            Some(cache_directory.clone()),
+            Some(cache_directory.clone().into()),
             true,
         );
         assert!(!disabled.synchronize_prefetch(std::slice::from_ref(&source)));
@@ -6354,7 +6470,7 @@ pub(crate) mod tests {
             prepared_decoded_bytes: 0,
             expansion: ExpansionPrefetch::default(),
             picker: None,
-            cache_directory: Some(cache_directory),
+            cache_directory: Some(cache_directory.into()),
             video_frame_program: PathBuf::from("ffmpeg"),
             request_sender: Some(visible_request_sender),
             request_discarder: Some(visible_request_discarder),
@@ -6788,7 +6904,7 @@ pub(crate) mod tests {
         ThumbnailManager::from_terminal_info_with_cache(
             ThumbnailMode::Auto,
             &terminal,
-            cache_directory,
+            cache_directory.map(Into::into),
             true,
         )
     }
@@ -6839,7 +6955,7 @@ pub(crate) mod tests {
                 prepared_decoded_bytes: 0,
                 expansion: ExpansionPrefetch::default(),
                 picker: None,
-                cache_directory,
+                cache_directory: cache_directory.map(Into::into),
                 video_frame_program: PathBuf::from("ffmpeg"),
                 request_sender: Some(request_sender),
                 request_discarder: Some(request_discarder),
@@ -6901,7 +7017,7 @@ pub(crate) mod tests {
                 prepared_decoded_bytes: 0,
                 expansion: ExpansionPrefetch::default(),
                 picker: None,
-                cache_directory,
+                cache_directory: cache_directory.map(Into::into),
                 video_frame_program: PathBuf::from("ffmpeg"),
                 request_sender: Some(request_sender),
                 request_discarder: Some(request_discarder),
@@ -6968,7 +7084,7 @@ pub(crate) mod tests {
         ThumbnailManager::from_terminal_info_with_cache(
             ThumbnailMode::Auto,
             &graphical_terminal(),
-            Some(cache_directory),
+            Some(cache_directory.into()),
             true,
         )
     }

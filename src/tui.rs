@@ -135,8 +135,8 @@ pub struct UiSettings {
     pub thumbnail_height: u16,
     /// Prefetch artwork for all currently loaded global Search rows.
     pub prefetch_search_thumbnails: bool,
-    /// Persistent thumbnail byte cache selected by the loaded configuration.
-    pub thumbnail_cache_dir: Option<PathBuf>,
+    /// Thumbnail cache handle following the current activity-persistence policy.
+    pub thumbnail_cache_dir: Option<crate::activity_storage::ActivityPath>,
     /// `FFmpeg` used to extract the one frame a local video is previewed by.
     pub ffmpeg_executable: PathBuf,
     /// Redraw period while playback is active.
@@ -264,7 +264,7 @@ trait ThumbnailRenderer {
 struct TerminalThumbnailRenderer {
     manager: ThumbnailManager,
     mode: ThumbnailMode,
-    cache_directory: Option<PathBuf>,
+    cache_directory: Option<crate::activity_storage::ActivityPath>,
     ffmpeg_executable: PathBuf,
     tty_images_enabled: bool,
     pod_artwork_warning: bool,
@@ -306,7 +306,7 @@ impl TerminalThumbnailRenderer {
     fn new_with_runtime_policy(
         manager: ThumbnailManager,
         mode: ThumbnailMode,
-        cache_directory: Option<PathBuf>,
+        cache_directory: Option<crate::activity_storage::ActivityPath>,
         ffmpeg_executable: PathBuf,
         tty_images_enabled: bool,
         tty_image_policy_applies: bool,
@@ -14559,11 +14559,11 @@ fn render_preferences_content(
     if inner.is_empty() {
         return;
     }
-    let history_help = "Off: no new log entries; searches are not saved or restored after restart.";
+    let history_help = "Off: no new activity saved; searches not restored. Existing data stays.";
     let history_help = if terminal_text_width(history_help) <= inner.width {
         history_help
     } else {
-        "Off: no new log entries;\nsearches are not saved or restored after restart."
+        "Off: no new activity saved; searches not restored.\nExisting data stays."
     };
     let history_help = wrap_text_lines(history_help, inner.width);
     let history_help_height = u16::try_from(history_help.len()).unwrap_or(u16::MAX);
@@ -18048,7 +18048,7 @@ mod tests {
         let mut renderer = TerminalThumbnailRenderer::new_with_runtime_policy(
             manager,
             ThumbnailMode::Auto,
-            Some(cache_directory.clone()),
+            Some(cache_directory.clone().into()),
             PathBuf::from("ffmpeg"),
             true,
             true,
@@ -18073,8 +18073,10 @@ mod tests {
         assert!(renderer.suspended_tty_manager.is_none());
         assert_eq!(renderer.mode, ThumbnailMode::Auto);
         assert_eq!(
-            renderer.cache_directory.as_deref(),
-            Some(cache_directory.as_path())
+            renderer.cache_directory.as_ref(),
+            Some(&crate::activity_storage::ActivityPath::from(
+                cache_directory.clone()
+            ))
         );
         assert!(
             !cache_directory.exists(),
@@ -28561,9 +28563,11 @@ for encoded, expected in json.load(sys.stdin):
         assert!(rendered.contains("[s] Split"));
         assert!(rendered.contains("Save log and searches: on"));
         assert!(!rendered.contains("[h] Save log and searches"));
-        assert!(rendered.contains(
-            "Off: no new log entries; searches are not saved or restored after restart."
-        ));
+        assert!(
+            rendered.contains(
+                "Off: no new activity saved; searches not restored. Existing data stays."
+            )
+        );
         assert!(rendered.contains("[S] SponsorBlock sponsored segments: on"));
         assert!(rendered.contains("[y] Prepare selected YouTube audio: on"));
         assert!(rendered.contains("[e] Download new episodes every hour: on"));
@@ -29336,8 +29340,8 @@ for encoded, expected in json.load(sys.stdin):
             "Subscriptions layout.",
             "Enter to save.",
             "Save log and searches: off",
-            "Off: no new log entries;",
-            "searches are not saved or restored after restart.",
+            "Off: no new activity saved; searches not restored.",
+            "Existing data stays.",
             #[cfg(any(feature = "youtube-official", feature = "invidious"))]
             "[Y] YouTube API / Invidious...",
             "[Enter] Save   [Esc] Cancel",

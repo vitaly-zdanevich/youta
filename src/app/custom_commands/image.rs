@@ -141,7 +141,11 @@ fn export_image(bytes: &[u8], cache_directory: &Path) -> Result<PathBuf, String>
     cache
         .store_key(key.as_bytes(), bytes)
         .map_err(|_| "The selected image could not be saved for %i".to_owned())?;
-    regular_image_path(&cache.entry_path_for_key(key.as_bytes()))
+    regular_image_path(
+        &cache
+            .canonical_entry_path_for_key(key.as_bytes())
+            .map_err(|error| error.to_string())?,
+    )
 }
 
 #[cfg(test)]

@@ -314,8 +314,10 @@ History stores the command you type, never the description expanded by `%m`
 or the playback time expanded by `%t`.
 The latest 100 submitted commands persist as plain text, one command per line,
 in `~/.config/youta/cmd-log` (up to 8192 bytes per command). Delete this file
-while Youta is closed to clear command history. Youta writes it with owner-only
-permissions on Unix. **Commands may contain passwords or tokens: this file is
+while Youta is closed to clear command history. With **Save log and searches**
+off, new commands stay in memory and the existing file is left untouched.
+Youta writes it with owner-only permissions on Unix.
+**Commands may contain passwords or tokens: this file is
 included in configuration Git synchronization**, rather than excluded like a
 cache. Command text is excluded from diagnostics and bug-report screenshots.
 The standalone `cmd` Cargo feature is enabled by default in the TUI and GUI;
@@ -1609,20 +1611,28 @@ activity. Writes use canonical ordering and same-directory atomic replacement
 so diffs remain readable and an interrupted write does not replace the last
 complete document. Each kind of state has its own document, so saving playback
 progress does not rewrite history, notes, bookmarks, statistics, or playlists.
-`persistence.save_playback_history = false` prevents new playback history
-entries and hides the Log tab. It also omits online queries and browsing routes
-from saved sessions, so online search text and results do not reopen after a
-restart on any online tab. Previously saved online queries and search results
-are removed when the setting is turned off or Youta starts with it off. Online
-search tabs stay empty until you explicitly search or browse, except Funkwhale,
-which loads the configured pod's recent tracks without restoring a search. Existing playback logs,
-media/artwork caches, and Git history are retained. Playback progress, listening
-statistics, other session state, and graceful-shutdown Git synchronization
-remain enabled. Setting it back to `true` exposes the retained playback history
-in Log again.
+`persistence.save_playback_history = false` disables new automatic activity
+writes: playback logs, progress, listening statistics, session navigation,
+searches, command history, and provider/media/artwork caches. Log is hidden,
+and online search text and results do not reopen after a restart. Online search
+tabs stay empty until you explicitly search or browse, except Funkwhale, which
+loads the configured pod's recent tracks without restoring a search.
+**Only new writes stop. Existing data and Git history are not deleted or
+rewritten.** Activity needed during the session stays in memory or temporary
+session storage. Re-enabling saving discards the private state overlay and
+does not copy temporary caches back. Normal saving then resumes, including
+the current session and subsequent activity.
+Explicitly saved notes, playlists, bookmarks, subscriptions and downloads,
+settings (including volume), and graceful-shutdown Git synchronization remain
+enabled. Re-enabling saving exposes the retained Log again. This is not secure
+erasure or an anonymity mode: temporary storage, operating-system facilities,
+external helpers and remote services can leave traces outside Youta's saved
+activity files.
 At startup, a corrupt `runtime/` or `cache/` document is preserved beside its
 canonical path under a private hidden `.corrupt` name and replaced with an
-empty valid document. Existing quarantine files are never overwritten.
+empty valid document when activity saving is enabled. With saving disabled,
+invalid activity caches are ignored without rewriting or quarantining them.
+Existing quarantine files are never overwritten.
 Canonical `state/*.toml` documents are not reset or quarantined automatically;
 Youta stops and leaves them untouched for manual recovery.
 
@@ -2129,8 +2139,8 @@ and retains the working version for that provider. Audio uses the advertised
 listen URL directly, without `yt-dlp`. Log and queue entries retain canonical
 pod-scoped track-page URLs; playback resolves a fresh stream from the original
 pod, so equal numeric IDs on different pods cannot select the wrong track.
-Turning off **Save log and searches** also clears saved Funkwhale queries and
-prevents their restoration.
+Turning off **Save log and searches** stops saving and restoring Funkwhale
+queries without deleting previously saved queries.
 
 On SoundCloud, Funkwhale, and Yandex Music, `g` opens the selected
 item's exact artist inside Youta without subscribing or launching a browser.
@@ -2761,14 +2771,12 @@ work, hides cached folder sizes, and removes the Local size-sort control.
 `YOUTA_UI__NATURAL_LOCAL_SORT=true` enables numeric filename ordering in Local.
 `YOUTA_UI__YOUTUBE_THUMBNAIL_SIZE=high` selects the strict 480×360 YouTube
 video-thumbnail entry. `YOUTA_PERSISTENCE__SAVE_PLAYBACK_HISTORY=false` switches
-off **Save log and searches**: no new log entries; searches are not saved or
-restored after restart. Log is hidden, and previously saved online queries and
-search results are removed. Online search tabs stay empty until an explicit search or
-browse action, except Funkwhale's recent-track catalogue on the configured pod.
-Existing playback logs, media/artwork caches, and Git history
-remain; playback progress, listening statistics, other session state, and
-graceful-shutdown Git synchronization remain enabled. Re-enabling it exposes
-the retained playback history in Log again. `YOUTA_VIDEO_SUMMARY__BACKEND=codex`
+off **Save log and searches**: no new automatic activity is persisted, including
+log entries, searches, progress, statistics, session state, command history and
+caches. Existing data stays untouched; online searches do not reopen after
+restart. Explicit saves, settings and Git synchronization remain enabled; see
+the persistence section above for scope and limitations.
+`YOUTA_VIDEO_SUMMARY__BACKEND=codex`
 enables the same explicit summary action without editing the TOML file;
 `YOUTA_VIDEO_SUMMARY__CODEX_EXECUTABLE=/path/to/codex` selects another CLI
 executable. The executable is not edited in Preferences, so that path override
