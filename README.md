@@ -3369,7 +3369,7 @@ guidance is in [docs/AUDIOPHILE.md](docs/AUDIOPHILE.md).
 [Gentoo source and binary ebuilds](https://github.com/vitaly-zdanevich/gentoo-overlay/tree/main/media-sound)
 are available in the maintainer's overlay.
 
-```bash
+```sh
 eselect repository enable vitaly-zdanevich-overlay
 emaint sync --repo vitaly-zdanevich-overlay
 emerge -a youta
